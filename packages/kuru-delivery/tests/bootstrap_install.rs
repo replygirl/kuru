@@ -72,6 +72,12 @@ impl Fixture {
             &tools.join("uname"),
             b"#!/bin/bash\ncase $1 in -s) printf '%s\\n' \"$FIXTURE_OS\";; -m) printf '%s\\n' \"$FIXTURE_ARCH\";; *) exit 90;; esac\n",
         );
+        // Reports Rosetta translation only when a test sets FIXTURE_TRANSLATED;
+        // otherwise it fails like a host without the translation OID.
+        executable(
+            &tools.join("sysctl"),
+            b"#!/bin/bash\nif [[ $1 == -n && $2 == sysctl.proc_translated && -n ${FIXTURE_TRANSLATED:-} ]]; then printf '%s\\n' \"$FIXTURE_TRANSLATED\"; else printf 'sysctl: unknown oid\\n' >&2; exit 1; fi\n",
+        );
         executable(&tools.join("curl"), CURL_FIXTURE.as_bytes());
         let binary = root.path().join("input binary");
         executable(&binary, CANDIDATE);
@@ -595,6 +601,33 @@ async fn intel_macs_are_refused_with_the_last_supporting_release() {
     let mut explicit = fixture.command();
     explicit.args(["--version", "0.2.0", "--target", "x86_64-apple-darwin"]);
     failure(&fixture.run(explicit).await, REFUSAL);
+    fixture.unchanged();
+    assert!(!fixture.path("requests").exists());
+}
+
+#[tokio::test]
+async fn rosetta_translated_shells_select_apple_silicon_and_intel_hosts_stay_refused() {
+    let fixture = Fixture::new("aarch64-apple-darwin", "0.2.0");
+    let mut translated = fixture.command();
+    translated
+        .args(["--version", "0.2.0"])
+        .env("FIXTURE_OS", "Darwin")
+        .env("FIXTURE_ARCH", "x86_64")
+        .env("FIXTURE_TRANSLATED", "1");
+    success(&fixture.run(translated).await);
+    fixture.installed(&fixture.destination);
+
+    let fixture = Fixture::new(TARGETS[0], "0.2.0");
+    let mut native = fixture.command();
+    native
+        .args(["--version", "0.2.0"])
+        .env("FIXTURE_OS", "Darwin")
+        .env("FIXTURE_ARCH", "x86_64")
+        .env("FIXTURE_TRANSLATED", "0");
+    failure(
+        &fixture.run(native).await,
+        "Intel Macs (x86_64-apple-darwin) are no longer supported; v0.9.0 was the last release supporting them",
+    );
     fixture.unchanged();
     assert!(!fixture.path("requests").exists());
 }

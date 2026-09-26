@@ -214,17 +214,25 @@ The release catalog SHALL contain `aarch64-apple-darwin`,
 `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu` and
 `x86_64-pc-windows-msvc`, and SHALL NOT contain `x86_64-apple-darwin`. The
 shell bootstrap MUST refuse an Intel Mac, whether detected from a `Darwin`
-`x86_64` host or selected with `--target x86_64-apple-darwin`, before any
+`x86_64` host that is not Rosetta-translated or selected with
+`--target x86_64-apple-darwin`, before any
 network request, with a non-zero exit and the message
 `kuru: Intel Macs (x86_64-apple-darwin) are no longer supported; v0.9.0 was the last release supporting them`.
 The refusal MUST leave an existing destination executable unchanged. Published
 releases up to v0.9.0 SHALL keep their `x86_64-apple-darwin` assets, and the
 installation documentation SHALL direct Intel Mac users to the v0.9.0 tag's own
-bootstrap with an explicit `--version 0.9.0`.
+bootstrap with an explicit `--version 0.9.0`. A `Darwin` `x86_64` host whose
+`sysctl -n sysctl.proc_translated` reports `1` is an Apple Silicon Mac running a
+Rosetta-translated shell, and the bootstrap MUST select
+`aarch64-apple-darwin` for it.
 
 #### Scenario: Intel Mac host runs the current bootstrap
-- **WHEN** the shell bootstrap runs on a host whose `uname` reports `Darwin` and `x86_64`
+- **WHEN** the shell bootstrap runs on a host whose `uname` reports `Darwin` and `x86_64` and whose `sysctl.proc_translated` is absent or `0`
 - **THEN** it exits non-zero with the v0.9.0 refusal message, makes no download request and leaves the destination unchanged
+
+#### Scenario: Rosetta-translated shell on Apple Silicon
+- **WHEN** the shell bootstrap runs where `uname` reports `Darwin` and `x86_64` and `sysctl.proc_translated` reports `1`
+- **THEN** it selects and installs the verified `aarch64-apple-darwin` archive
 
 #### Scenario: Intel target is selected explicitly
 - **WHEN** the shell bootstrap is invoked with `--target x86_64-apple-darwin` on any host

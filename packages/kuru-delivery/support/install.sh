@@ -88,7 +88,14 @@ fi
 if [[ -z $kuru_target ]]; then
   case "$(uname -s):$(uname -m)" in
     Darwin:arm64) kuru_target=aarch64-apple-darwin ;;
-    Darwin:x86_64) kuru_target=x86_64-apple-darwin ;;
+    Darwin:x86_64)
+      # A Rosetta-translated shell on Apple Silicon also reports x86_64.
+      if [[ $(sysctl -n sysctl.proc_translated 2>/dev/null) == 1 ]]; then
+        kuru_target=aarch64-apple-darwin
+      else
+        kuru_target=x86_64-apple-darwin
+      fi
+      ;;
     Linux:aarch64|Linux:arm64) kuru_target=aarch64-unknown-linux-gnu ;;
     Linux:x86_64) kuru_target=x86_64-unknown-linux-gnu ;;
     *) fail 'unsupported platform; build from source with Rust' ;;

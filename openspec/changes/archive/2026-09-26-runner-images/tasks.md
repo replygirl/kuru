@@ -16,3 +16,10 @@ Evidence (macOS arm64, 2026-09-26; artifacts authored, `validate --strict` passe
 - [x] 2.5 Run the documented lock refresh without `macos-x64` and update the documented platform list; verify the lock diff
 
 Evidence (macOS arm64, 2026-09-26): `mise run //packages/kuru-delivery:test` (185 passed), `//packages/kuru-memory:test` (302 passed) and `//apps/kuru-tui:test` (245 passed, 4 ignored) exited 0; `mise run format:code ::: lint:rust ::: typecheck ::: lint:tooling ::: cospec:validate ::: cospec:managed:check ::: docs:check` exited 0. The installer refusal is exercised through the faked-`uname` bootstrap harness, for both detection and `--target`. `mise lock` 2026.9.13 with the four remaining platforms does not prune `macos-x64` entries, so the three lockfiles are unchanged (verification 3.4). Coverage and hosted CI were not run locally. Past releases keep their archived `x86_64-apple-darwin` assets.
+
+## 3. Review follow-up
+
+- [x] 3.1 Pin the Release `build` leg for `x86_64-unknown-linux-gnu` back to `ubuntu-24.04` so the Linux archives' documented Ubuntu 24.04 glibc floor cannot drift with `ubuntu-latest` (ordinary CI jobs stay on `ubuntu-latest`), and assert both Linux release legs' labels in `tests/release_workflow.rs`
+- [x] 3.2 Detect a Rosetta-translated shell on Apple Silicon in `support/install.sh` (`sysctl -n sysctl.proc_translated` equal to `1` on a `Darwin`/`x86_64` host selects `aarch64-apple-darwin`; otherwise the Intel refusal stands), covered through a faked `sysctl` beside the faked `uname`, with the install docs and the living repository-delivery spec updated
+
+Evidence (macOS arm64, 2026-09-26): `mise run format:code ::: lint:rust ::: typecheck ::: lint:tooling ::: cospec:validate ::: cospec:managed:check ::: docs:check` exited 0 (actionlint and `shellcheck support/install.sh` included); `mise run //packages/kuru-delivery:test` exited 0 with 186 passed, 0 failed, including `rosetta_translated_shells_select_apple_silicon_and_intel_hosts_stay_refused` and the unchanged `intel_macs_are_refused_with_the_last_supporting_release`. Coverage and hosted CI were not run locally.

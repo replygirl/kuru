@@ -94,6 +94,9 @@ fn required_release_checks_precede_the_only_publication_job() {
         "mise run //packages/kuru-delivery:package:shell-support",
         "Get-FileHash -Algorithm SHA256",
         "openssl dgst -sha256",
+        // Linux release archives keep the documented Ubuntu 24.04 glibc floor.
+        "- os: ubuntu-24.04\n            target: x86_64-unknown-linux-gnu\n",
+        "- os: ubuntu-24.04-arm\n            target: aarch64-unknown-linux-gnu\n",
     ] {
         assert!(build.contains(required), "native build lost {required}");
     }

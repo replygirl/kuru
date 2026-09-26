@@ -148,7 +148,9 @@ another supported tar target. PowerShell uses the Windows x86-64 ZIP and accepts
 `-Target x86_64-pc-windows-msvc` explicitly.
 
 Intel Macs (`x86_64-apple-darwin`) are not supported after v0.9.0, and the
-current shell bootstrap refuses them before downloading anything. To install
+current shell bootstrap refuses them before downloading anything. On Apple
+Silicon, a Rosetta-translated shell reports `x86_64`; the bootstrap detects the
+translation and selects `aarch64-apple-darwin` instead. To install
 v0.9.0 on an Intel Mac, use that tag's own bootstrap with an explicit version:
 
 ```sh
