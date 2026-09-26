@@ -7,7 +7,7 @@
 
 - [x] 2.1 Read `take_transition` in `packages/kuru-platform/src/unix.rs` for the already-exited root case and confirm the `tokio` features `kuru-delivery` needs (Unix pipe receiver) before any `Cargo.toml`/`Cargo.lock` change, and verify by recording both findings in the change evidence
 - [x] 2.2 Replace the `#[cfg(not(windows))]` `Command::status()` dispatch with a `TestProcess` over `OwnedProcessGroup` (piped stdout relayed through the unchanged `supervise`, deadline wait, sample, `terminate_before_reap`, bounded `reap_if_exited`, then `presence_after_reap` in the stall report; normal exit through the same terminate/reap path), forward the full child environment including `LLVM_PROFILE_FILE`, remove the `not(windows)` dead-code allowances, and verify with `mise run //packages/kuru-delivery:test`
-- [ ] 2.3 Add `#[cfg(unix)]` tests: a fake process for deadline/sample/terminate ordering, and a real stalled child with a grandchild proving group termination, reap before presence, and a `.stall.json` recording `presence_after_reap`, and verify with `mise run //packages/kuru-delivery:test` on macOS and Linux
+- [x] 2.3 Add `#[cfg(unix)]` tests: a fake process for deadline/sample/terminate ordering, and a real stalled child with a grandchild proving group termination, reap before presence, and a `.stall.json` recording `presence_after_reap`, and verify with `mise run //packages/kuru-delivery:test` on macOS and Linux
 
 ## 3. Rust shard/collect orchestrator (T3)
 
@@ -36,5 +36,5 @@
 
 ## 8. Hosted measurement and stall drill
 
-- [ ] 8.1 (M) From the first green CI run on each OS, record per-shard wall-clock and the compile/test split (runner-ledger first record against job start) in `verification.md`, and verify the numbers cite the run and job IDs
+- [x] 8.1 (M) From the first green CI run on each OS, record per-shard wall-clock and the compile/test split (runner-ledger first record against job start) in `verification.md`, and verify the numbers cite the run and job IDs
 - [ ] 8.2 (D) Push a throwaway draft commit adding a never-ending test to `kuru-core`, and verify on Linux, macOS and Windows that `connectors-core-platform` fails at its deadline (`timeout-minutes` less the 10-minute reserve) with a `…-connectors-core-platform-diagnostics-attempt-<n>` artifact containing a stall report, not a host cancellation; then drop the commit
