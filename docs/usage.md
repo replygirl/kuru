@@ -383,6 +383,11 @@ output item's ID, kind, position and text length, never its text. It does not en
 `RUST_LOG`, capture prompts, tool arguments/results, credentials, or remote error
 text, and it does not change command stdout or TUI rendering. These files are
 operational diagnostics, not conversation history or semantic turn events.
+Each tool a turn executes leaves a `kuru.tool` status record, and so does a turn's
+call refused before dispatch because its name was not offered for that request
+and phase, or because a `pre_tool` hook denied it, failed or returned an invalid
+rewrite. A refusal record carries the `admission` operation and the tool category
+and status only, never the tool name, arguments or a hook's reason.
 For native provider requests, debug records pair the local input-token estimate
 and final body byte length with the provider's reported input and cached subset;
 they do not record the request body or imply that a matching prefix was cached.

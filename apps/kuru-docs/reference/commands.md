@@ -144,6 +144,9 @@ four-file, 64 KiB-per-file operational ring
 `trace-{0..3}.jsonl`; it is separate from durable turn history. Its records
 include the shape of each reconciled provider stream — every streamed and
 terminal output item's ID, kind, position and text length, never its text.
+Each tool a turn executes leaves a status record, and so does a turn's call
+refused before dispatch because its name was not offered or a pre-tool hook
+denied it; a refusal record omits the tool name, arguments and any hook reason.
 
 `/memory` remains conversation inspection. `/notes` and `kuru memory notes ID`
 return a JSON view with the selected `mode`, canonical `identity`, chronological

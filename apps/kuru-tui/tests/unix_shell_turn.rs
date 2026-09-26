@@ -727,7 +727,16 @@ async fn debug_cli_rotates_the_fixed_private_diagnostic_ring() -> Result<()> {
             );
         }
         let logs = diagnostics(&run)?;
-        ensure!(logs.contains("\"status\":\"error\""));
+        // Admission settles each unoffered fixture call before dispatch; those
+        // settlements are the newest tool records left in the rotated ring.
+        ensure!(
+            logs.contains("\"operation\":\"admission\"") && logs.contains("\"status\":\"error\""),
+            "rotated diagnostics lost the settled tool-admission error records"
+        );
+        ensure!(
+            !logs.contains("fixture_unknown_tool"),
+            "settled tool admission recorded the model-chosen tool name"
+        );
         ensure!(
             !logs.contains(PROVIDER_SECRET),
             "provider sentinel leaked to rotated diagnostics: {logs}"

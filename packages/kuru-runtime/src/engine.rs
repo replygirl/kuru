@@ -3860,6 +3860,7 @@ impl Harness {
                             call_id: call.id.clone(),
                             name: call.name.clone(),
                         });
+                        trace_settled_admission(&call, &result, admitted);
                         self.observe_tool(&id, &call, &result, admitted, true);
                         result
                     } else if used >= self.config.max_tool_calls {
@@ -4185,6 +4186,7 @@ impl Harness {
                         call_id: call.id.clone(),
                         name: call.name.clone(),
                     });
+                    trace_settled_admission(&call, &result, admitted);
                     self.observe_tool(&speaker, &call, &result, admitted, true);
                     result
                 } else if used >= self.config.max_tool_calls {
@@ -4304,20 +4306,7 @@ impl Harness {
                                 }
                                 outcome.result
                             });
-                        let status = match &result {
-                            Ok(output)
-                                if call.name == "shell"
-                                    && serde_json::from_str::<Value>(output)
-                                        .ok()
-                                        .and_then(|value| value["success"].as_bool())
-                                        == Some(false) =>
-                            {
-                                "error"
-                            }
-                            Ok(_) => "ok",
-                            Err(error) if turn_was_cancelled(error) => "cancelled",
-                            Err(_) => "error",
-                        };
+                        let status = tool_diagnostic_status(&call, &result);
                         tracing::info!(target: "kuru.tool", parent: &span, status, elapsed_ms = started.elapsed().as_millis() as u64, "external tool finished");
                         self.observe_tool(&speaker, &call, &result, admitted, false);
                         result
@@ -4570,11 +4559,7 @@ impl Harness {
             )
             .instrument(span.clone())
             .await;
-        let status = match &result {
-            Ok(_) => "ok",
-            Err(error) if turn_was_cancelled(error) => "cancelled",
-            Err(_) => "error",
-        };
+        let status = tool_diagnostic_status(call, &result);
         tracing::info!(
             target: "kuru.tool",
             parent: &span,
@@ -5096,6 +5081,41 @@ fn external_tool() -> ToolSpec {
         &["agent", "message"],
     )
 }
+
+/// The operational diagnostic status of one settled tool call. A failed
+/// shell receipt is an error even though the tool host returned it.
+fn tool_diagnostic_status(call: &ToolCall, result: &Result<String>) -> &'static str {
+    match result {
+        Ok(output)
+            if call.name == "shell"
+                && serde_json::from_str::<Value>(output)
+                    .ok()
+                    .and_then(|value| value["success"].as_bool())
+                    == Some(false) =>
+        {
+            "error"
+        }
+        Ok(_) => "ok",
+        Err(error) if turn_was_cancelled(error) => "cancelled",
+        Err(_) => "error",
+    }
+}
+
+/// Record a call that pre-tool admission settled without dispatch: a name not
+/// offered for that request and phase, or a pre-tool hook denial, failure or
+/// invalid rewrite. It carries the tool category and status only, never the
+/// tool name, arguments or a hook's reason.
+fn trace_settled_admission(call: &ToolCall, result: &Result<String>, admitted: std::time::Instant) {
+    tracing::info!(
+        target: "kuru.tool",
+        tool = if is_cognitive(&call.name) { "cognitive" } else { "external" },
+        operation = "admission",
+        status = tool_diagnostic_status(call, result),
+        elapsed_ms = admitted.elapsed().as_millis() as u64,
+        "tool admission settled"
+    );
+}
+
 fn is_cognitive(name: &str) -> bool {
     matches!(
         name,
