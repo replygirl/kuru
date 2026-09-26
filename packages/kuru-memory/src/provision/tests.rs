@@ -85,6 +85,7 @@ impl Fixture {
             executable_sha256: &self.binary_digest,
             license_bytes: LICENSE.len() as u64,
             license_sha256: &self.license_digest,
+            notices: &[],
         }
     }
 

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "version": "2.3.3",
   "upstream_commit": "79caf258c32e638868f17a803eb2c2779c0507ab",
   "assets": [
@@ -8,6 +8,7 @@
       "stem": "dolt-darwin-arm64",
       "format": "tar.gz",
       "executable_name": "dolt",
+      "provenance": "upstream",
       "url": "https://github.com/dolthub/dolt/releases/download/v2.3.3/dolt-darwin-arm64.tar.gz",
       "compressed_bytes": 41132675,
       "archive_sha256": "55c11d34df78d7583f1130a1adef7763340f2aade33e68ccb0046854134ad08b",
@@ -22,6 +23,7 @@
       "stem": "dolt-darwin-amd64",
       "format": "tar.gz",
       "executable_name": "dolt",
+      "provenance": "upstream",
       "url": "https://github.com/dolthub/dolt/releases/download/v2.3.3/dolt-darwin-amd64.tar.gz",
       "compressed_bytes": 43603373,
       "archive_sha256": "e33f4fa00032054e38da78b31314f8e93fa9eb950c587ac5f29ba5c6402b3f2a",
@@ -36,6 +38,7 @@
       "stem": "dolt-linux-arm64",
       "format": "tar.gz",
       "executable_name": "dolt",
+      "provenance": "upstream",
       "url": "https://github.com/dolthub/dolt/releases/download/v2.3.3/dolt-linux-arm64.tar.gz",
       "compressed_bytes": 40750254,
       "archive_sha256": "850a880aece6587cb9251ea0f07eb51fcc0a37450471fd89e03ac2fba1fdaed3",
@@ -50,6 +53,7 @@
       "stem": "dolt-linux-amd64",
       "format": "tar.gz",
       "executable_name": "dolt",
+      "provenance": "upstream",
       "url": "https://github.com/dolthub/dolt/releases/download/v2.3.3/dolt-linux-amd64.tar.gz",
       "compressed_bytes": 43971030,
       "archive_sha256": "4acd730a4c53991996854a72fbb1add102b0a583bd07411320efb65037a43d9d",
@@ -64,6 +68,7 @@
       "stem": "dolt-windows-amd64",
       "format": "zip",
       "executable_name": "dolt.exe",
+      "provenance": "upstream",
       "url": "https://github.com/dolthub/dolt/releases/download/v2.3.3/dolt-windows-amd64.zip",
       "compressed_bytes": 40038677,
       "archive_sha256": "b8a113f7edf236124092de5b19f9b4904eac3c11a37d33379e2e3c2e0d1f6b0d",
@@ -72,6 +77,77 @@
       "executable_sha256": "195a2435c0cbb91769d590e866bad29a25d4c90a011a8f4ff2516f263e867301",
       "license_bytes": 1212811,
       "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386"
+    },
+    {
+      "target": "aarch64-pc-windows-msvc",
+      "stem": "dolt-windows-arm64",
+      "format": "zip",
+      "executable_name": "dolt.exe",
+      "provenance": "built",
+      "build": {
+        "recipe": "dolt-cgo-llvm-mingw-icu-stub/1",
+        "host": "linux-x64",
+        "goos": "windows",
+        "goarch": "arm64",
+        "tags": ["icu_static", "timetzdata"],
+        "sources": {
+          "dolt": {
+            "module": "github.com/dolthub/dolt/go",
+            "version": "v0.40.5-0.20260909181817-79caf258c32e",
+            "sum": "h1:UvzzAyIZXdmbEia/ltgNGDRM30nGMPc7ReWEzalNYmo="
+          },
+          "icu": {
+            "version": "78.3",
+            "url": "https://github.com/unicode-org/icu/releases/download/release-78.3/icu4c-78.3-sources.tgz",
+            "bytes": 27977255,
+            "sha256": "3a2e7a47604ba702f345878308e6fefeca612ee895cf4a5f222e7955fabfe0c0"
+          }
+        },
+        "toolchain": {
+          "go": {
+            "version": "go1.26.2",
+            "url": "https://dl.google.com/go/go1.26.2.linux-amd64.tar.gz",
+            "sha256": "990e6b4bbba816dc3ee129eaeaf4b42f17c2800b88a2166c265ac1a200262282"
+          },
+          "llvm_mingw": {
+            "version": "20260922",
+            "clang_version": "23.1.2",
+            "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64.tar.xz",
+            "bytes": 83924028,
+            "sha256": "bb7bb7654b33d5aa8712acb837c963b2e0c56352560c76105270a3268c665c21"
+          }
+        }
+      },
+      "compressed_bytes": null,
+      "archive_sha256": "unpinned",
+      "expanded_bytes": null,
+      "executable_bytes": null,
+      "executable_sha256": "unpinned",
+      "license_bytes": 1212811,
+      "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386",
+      "notices": [
+        {
+          "name": "LICENSE-ICU",
+          "from": "icu",
+          "path": "icu/LICENSE",
+          "bytes": 27718,
+          "sha256": "e55522d81edc687a341a4411e0776e54ca654e90147f354a90458aaced4116af"
+        },
+        {
+          "name": "LICENSE-LLVM",
+          "from": "llvm_mingw",
+          "path": "LICENSE.TXT",
+          "bytes": null,
+          "sha256": "unpinned"
+        },
+        {
+          "name": "LICENSE-MINGW-W64-RUNTIME",
+          "from": "llvm_mingw",
+          "path": "aarch64-w64-mingw32/share/mingw32/COPYING.MinGW-w64-runtime.txt",
+          "bytes": null,
+          "sha256": "unpinned"
+        }
+      ]
     }
   ]
 }

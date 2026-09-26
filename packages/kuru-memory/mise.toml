@@ -1,4 +1,6 @@
 [vars]
+kuru_go_version = "1.26.2"
+kuru_llvm_mingw_version = "20260922"
 # Capture the consumer target before the preparation task clears Cargo's target.
 kuru_memory_bundle_target = "{{env.CARGO_BUILD_TARGET | default(value='host')}}"
 
@@ -11,6 +13,25 @@ env.CARGO_ENCODED_RUSTFLAGS = false
 env.CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = false
 env.KURU_DOLT_BUNDLE_TARGET = "{{vars.kuru_memory_bundle_target}}"
 run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- bundle prepare"
+
+[tasks."setup:build-tools"]
+description = "Install only the pinned Go and llvm-mingw toolchains used by bundle:build"
+run = "mise install go@{{vars.kuru_go_version}} github:mstorsjo/llvm-mingw@{{vars.kuru_llvm_mingw_version}}"
+
+# Source-built engine archives (manifest `provenance: built`). The recipe's
+# only build host is linux-x64; the delivery helper refuses any other host
+# unless KURU_BUNDLE_BUILD_HOST_OVERRIDE=1 requests non-authoritative iteration.
+[tasks."bundle:build"]
+description = "Build a pinned source-built engine archive on the linux-x64 build host"
+dir = "{{config_root}}/../.."
+env.CARGO_BUILD_TARGET = false
+env.RUSTFLAGS = false
+env.CARGO_ENCODED_RUSTFLAGS = false
+env.CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = false
+tools.go = "{{vars.kuru_go_version}}"
+# Only the linux-x64 package is pinned: its target runtimes define the bytes.
+tools."github:mstorsjo/llvm-mingw" = { version = "{{vars.kuru_llvm_mingw_version}}", platforms = { linux-x64 = { asset_pattern = "llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64.tar.xz" } } }
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- bundle build"
 
 [tasks.build]
 shell = "{% if os() == 'windows' %}cmd /d /s /c{% else %}sh -c{% endif %}"

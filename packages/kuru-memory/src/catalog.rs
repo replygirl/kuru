@@ -17,6 +17,15 @@ pub(crate) struct Asset<'a> {
     pub executable_sha256: &'a str,
     pub license_bytes: u64,
     pub license_sha256: &'a str,
+    /// Third-party notices beside `LICENSES`; empty for upstream archives.
+    pub notices: &'a [Notice<'a>],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Notice<'a> {
+    pub name: &'a str,
+    pub bytes: u64,
+    pub sha256: &'a str,
 }
 
 include!(concat!(env!("OUT_DIR"), "/dolt_catalog.rs"));
@@ -31,7 +40,15 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_str(include_str!("../support/dolt-assets.json")).unwrap();
         assert_eq!(manifest["version"], DOLT_VERSION);
-        assert_eq!(ASSETS.len(), manifest["assets"].as_array().unwrap().len());
+        // Unpinned built assets are refused as inputs and absent from the catalog.
+        let pinned = manifest["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|asset| asset["archive_sha256"] != "unpinned")
+            .count();
+        assert_eq!(ASSETS.len(), pinned);
+        assert!(ASSETS.len() >= 5);
         assert!(
             ASSETS
                 .iter()
