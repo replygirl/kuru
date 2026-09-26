@@ -59,7 +59,7 @@ The connector package carries the crate and asset MIT attributions in
 | --- | --- |
 | `rust` | `1.98.1` |
 | `github:aligned-team/cospec` | `0.7.1` |
-| `aqua:jdx/hk` | `1.58.1` |
+| `aqua:jdx/hk` | `2.2.0` |
 | `aqua:tamasfe/taplo` | `0.10.0` |
 | `aqua:koalaman/shellcheck` | `0.11.0` |
 | `aqua:rhysd/actionlint` | `1.7.12` |

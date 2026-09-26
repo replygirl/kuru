@@ -164,7 +164,7 @@ Release jobs inherit `MISE_LOCKED=1`, including nested package tasks. This keeps
 tool installation from extending lockfiles after source validation. The bump
 and publish jobs explicitly install locked Rust/hk and disable automatic task-tool
 installation. Native build jobs install only Rust and set `MISE_NO_HOOKS=1` to
-omit mise's repository-setup postinstall hook; hk 1.58.1 has no Intel macOS asset,
+omit mise's repository-setup postinstall hook; the pinned hk has no Intel macOS asset,
 and archive construction does not create Git commits. Local Git hooks and the
 release bump, publish, notes and docs jobs retain hk. Native archive subcommands
 do not need the notes toolchain. Reusable quality and native-test workflows skip
