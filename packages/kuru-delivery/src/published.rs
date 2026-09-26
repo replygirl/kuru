@@ -3,25 +3,34 @@
 use crate::{archive, release};
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::{
-    Client, RequestBuilder, Url,
-    header::{AUTHORIZATION, HeaderValue},
+    Client, RequestBuilder, Response, Url,
+    header::{AUTHORIZATION, HeaderValue, LINK},
     redirect::Policy,
 };
 use serde::Deserialize;
-use std::{collections::HashSet, ffi::OsString, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+    time::Duration,
+};
 
 pub(crate) const REPOSITORY: &str = "replygirl/kuru";
 pub(crate) const METADATA_LIMIT: usize = 4 * 1024 * 1024;
 const METADATA_HOST: &str = "api.github.com";
+const MANIFEST_LIMIT: usize = 64 * 1024;
+/// GitHub lists 30 releases per page; this bounds the walk at 3,000 releases.
+/// Reaching it leaves the page chain incomplete, which the no-predecessor
+/// branch refuses.
+const MAX_LISTING_PAGES: usize = 100;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct ReleaseAsset {
     pub(crate) name: String,
     pub(crate) browser_download_url: String,
     pub(crate) digest: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct PublishedRelease {
     pub(crate) tag_name: String,
     pub(crate) draft: bool,
@@ -103,6 +112,12 @@ impl PublicGitHub {
                 && url.fragment().is_none(),
             "published release URL must be credential-free HTTPS"
         );
+        Ok(self.checked_request(url))
+    }
+
+    /// A request for a URL that is either checked by [`Self::request`] or is
+    /// the fixed release-listing page URL built by [`Self::release_page`].
+    fn checked_request(&self, url: Url) -> RequestBuilder {
         let metadata = url.host_str() == Some(METADATA_HOST) && url.port().is_none();
         let mut request = self
             .client
@@ -112,26 +127,37 @@ impl PublicGitHub {
         if let Some(authorization) = self.authorization.as_ref().filter(|_| metadata) {
             request = request.header(AUTHORIZATION, authorization.clone());
         }
-        Ok(request)
+        request
     }
 
     pub(crate) async fn get(&self, url: &str, limit: usize) -> Result<Vec<u8>> {
-        let mut response = self.request(url)?.send().await?.error_for_status()?;
-        ensure!(
-            response
-                .content_length()
-                .is_none_or(|size| size <= limit as u64),
-            "published response exceeds size limit"
-        );
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            ensure!(
-                bytes.len().saturating_add(chunk.len()) <= limit,
-                "published response exceeds size limit"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
+        let response = self.request(url)?.send().await?.error_for_status()?;
+        bounded_body(response, limit).await
+    }
+
+    /// One page (from 1) of the repository's release listing and whether
+    /// GitHub names the page after it. The page URL is always built here from
+    /// the fixed listing path; a server-supplied `Link` URL is never requested,
+    /// it only decides whether the next page exists.
+    async fn release_page(&self, number: usize) -> Result<(Vec<PublishedRelease>, bool)> {
+        let response = self
+            .checked_request(listing_page_url(number)?)
+            .send()
+            .await?
+            .error_for_status()?;
+        let link = response
+            .headers()
+            .get(LINK)
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .context("GitHub release listing Link header is not ASCII")
+            })
+            .transpose()?;
+        let bytes = bounded_body(response, METADATA_LIMIT).await?;
+        let releases = serde_json::from_slice(&bytes).context("invalid GitHub release metadata")?;
+        Ok((releases, next_page(link.as_deref(), number)?))
     }
 
     async fn json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
@@ -177,11 +203,95 @@ impl PublicGitHub {
     }
 }
 
-/// The published stable release immediately preceding a candidate, with its
-/// checksum manifest and one target's core archive already authenticated.
-/// Its own updater is what existing installations of that target run against
-/// the candidate. Acceptance from it is a floor, not the compatibility policy:
-/// updating from any installed release must remain possible.
+/// The fixed URL of one release-listing page.
+fn listing_page_url(number: usize) -> Result<Url> {
+    let mut url = Url::parse(&format!(
+        "https://{METADATA_HOST}/repos/{REPOSITORY}/releases"
+    ))?;
+    url.query_pairs_mut()
+        .append_pair("page", &number.to_string());
+    Ok(url)
+}
+
+async fn bounded_body(mut response: Response, limit: usize) -> Result<Vec<u8>> {
+    ensure!(
+        response
+            .content_length()
+            .is_none_or(|size| size <= limit as u64),
+        "published response exceeds size limit"
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            bytes.len().saturating_add(chunk.len()) <= limit,
+            "published response exceeds size limit"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// Whether a release-listing `Link` header names the page after `current`.
+/// Every entry must be a well-formed `<URL>; rel="..."` link, and a `next`
+/// relation must name exactly that page on the API host. Anything else breaks
+/// the page chain and fails instead of being read as the last page.
+fn next_page(link: Option<&str>, current: usize) -> Result<bool> {
+    let Some(link) = link else {
+        return Ok(false);
+    };
+    let mut next = None;
+    for entry in link.split(',') {
+        let mut parts = entry.split(';');
+        let url = parts
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .strip_prefix('<')
+            .and_then(|reference| reference.strip_suffix('>'))
+            .and_then(|reference| Url::parse(reference).ok());
+        let relation = parts.find_map(|parameter| {
+            parameter
+                .trim()
+                .strip_prefix("rel=\"")
+                .and_then(|relation| relation.strip_suffix('"'))
+        });
+        let (Some(url), Some(relation)) = (url, relation) else {
+            bail!("GitHub release listing Link header is malformed");
+        };
+        if relation == "next" {
+            ensure!(
+                next.replace(url).is_none(),
+                "GitHub release listing names more than one next page"
+            );
+        }
+    }
+    let Some(url) = next else {
+        return Ok(false);
+    };
+    let expected = current
+        .checked_add(1)
+        .context("release listing page overflows")?
+        .to_string();
+    let pages: Vec<_> = url
+        .query_pairs()
+        .filter(|(key, _)| key == "page")
+        .map(|(_, value)| value.into_owned())
+        .collect();
+    ensure!(
+        url.scheme() == "https"
+            && url.host_str() == Some(METADATA_HOST)
+            && pages == [expected.as_str()],
+        "GitHub release listing's next page is not page {expected} on {METADATA_HOST}"
+    );
+    Ok(true)
+}
+
+/// The published stable release immediately preceding a candidate for one
+/// target, with its checksum manifest and that target's core archive already
+/// authenticated. Its own updater is what existing installations of that
+/// target run against the candidate. Acceptance from it is a floor, not the
+/// compatibility policy: updating from any installed release must remain
+/// possible.
 pub struct PreviousRelease {
     pub version: String,
     pub target: &'static str,
@@ -190,6 +300,58 @@ pub struct PreviousRelease {
     /// The paired shell-support envelope, present exactly when the previous
     /// release publishes one for this target.
     pub support: Option<Vec<u8>>,
+    /// Newer stable releases inspected first whose listing and `SHA256SUMS`
+    /// agree that they publish no archive for this target, newest first.
+    pub skipped: Vec<String>,
+}
+
+/// The previous-release decision for one target.
+pub enum Predecessor {
+    /// A published stable release carries the target; its updater must be
+    /// exercised against the candidate.
+    Release(PreviousRelease),
+    /// No published stable release carries the target. Every page of the
+    /// release listing was read, and each inspected release's listing and
+    /// authenticated `SHA256SUMS` agree that it lacks the target's archive.
+    None {
+        target: &'static str,
+        candidate: String,
+        /// Every stable release older than the candidate, newest first.
+        inspected: Vec<String>,
+        /// How much of the listing was read: `across N releases, all pages`.
+        horizon: String,
+    },
+}
+
+impl Predecessor {
+    pub fn target(&self) -> &'static str {
+        match self {
+            Self::Release(previous) => previous.target,
+            Self::None { target, .. } => target,
+        }
+    }
+
+    /// The job-log evidence line for the no-predecessor branch, which is the
+    /// acceptance evidence on a target's first release.
+    pub fn evidence(&self) -> Option<String> {
+        let Self::None {
+            target,
+            inspected,
+            horizon,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let inspected = inspected
+            .iter()
+            .map(|version| format!("v{version}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "no predecessor for {target}: inspected {inspected} {horizon}"
+        ))
+    }
 }
 
 /// The core archive and shell-support envelope names a release publishes for
@@ -201,39 +363,88 @@ fn target_assets(version: &str, target: &str) -> Result<(String, String)> {
     ))
 }
 
+/// Where predecessor selection reads the release listing and each inspected
+/// release's authenticated checksum manifest: public GitHub in production and
+/// in-memory fixtures in tests.
+trait ReleaseSource {
+    /// Page `number` (from 1) of the release listing and whether a next page
+    /// exists.
+    async fn page(&mut self, number: usize) -> Result<(Vec<PublishedRelease>, bool)>;
+    /// The listed release's `SHA256SUMS`, authenticated against its listed
+    /// digest before it is returned.
+    async fn manifest(&mut self, listed: &PublishedRelease) -> Result<Vec<u8>>;
+}
+
+struct GitHubReleases<'a>(&'a PublicGitHub);
+
+impl ReleaseSource for GitHubReleases<'_> {
+    async fn page(&mut self, number: usize) -> Result<(Vec<PublishedRelease>, bool)> {
+        self.0.release_page(number).await
+    }
+
+    async fn manifest(&mut self, listed: &PublishedRelease) -> Result<Vec<u8>> {
+        let version = listed
+            .tag_name
+            .strip_prefix('v')
+            .context("published release tag is not vX.Y.Z")?;
+        let digest = listed_digest(listed, version, "SHA256SUMS")?;
+        let manifest = self
+            .0
+            .get(
+                &format!("https://github.com/{REPOSITORY}/releases/download/v{version}/SHA256SUMS"),
+                MANIFEST_LIMIT,
+            )
+            .await?;
+        verify_manifest(&manifest, &digest)?;
+        Ok(manifest)
+    }
+}
+
 /// Resolve and download the release preceding `candidate` for `target` from
-/// public GitHub.
+/// public GitHub, or establish that no published release carries `target`.
 ///
 /// Nothing is pinned: the release is selected at run time by
-/// [`select_previous`]. `token` authenticates only the release listing; every
-/// asset is read anonymously over HTTPS from its immutable version path, and
-/// no bytes are returned until the archive and any paired shell-support
-/// envelope match that release's own `SHA256SUMS` and every file matches
-/// GitHub's asset digest.
+/// [`select_previous`] over the release listing, following every listing page
+/// before concluding that no predecessor exists. `token` authenticates only
+/// the release listing; every asset is read anonymously over HTTPS from its
+/// immutable version path, and no bytes are returned until the archive and any
+/// paired shell-support envelope match that release's own `SHA256SUMS` and
+/// every file matches GitHub's asset digest.
 pub async fn previous_release(
     candidate: &str,
     target: &str,
     token: Option<&str>,
-) -> Result<PreviousRelease> {
+) -> Result<Predecessor> {
     let candidate = candidate.parse::<release::Version>()?;
     let target = crate::targets::find(target)?.triple;
     let github = PublicGitHub::new(token)?;
-    // The unpaginated listing holds GitHub's 30 most recently created
-    // releases, which always include the latest ones.
-    let releases: Vec<PublishedRelease> = github.json("releases").await?;
-    let version = select_previous(&releases, candidate)?.to_string();
+    let (selection, releases) = resolve(&mut GitHubReleases(&github), candidate, target).await?;
+    let (version, manifest, skipped) = match selection {
+        Selection::Release {
+            version,
+            manifest,
+            skipped,
+        } => (version.to_string(), manifest, skipped),
+        Selection::None { inspected } => {
+            return Ok(no_predecessor(
+                target,
+                candidate,
+                &inspected,
+                releases.len(),
+            ));
+        }
+        Selection::Incomplete => bail!("release listing ended before selection completed"),
+    };
     let listed = releases
         .iter()
         .find(|release| release.tag_name == format!("v{version}"))
         .context("selected previous release is absent from its listing")?;
     let (archive_name, support_name) = target_assets(&version, target)?;
-    let manifest_digest = listed_digest(listed, &version, "SHA256SUMS")?;
+    // Selection received this manifest authenticated from its source; check it
+    // against the listing again before trusting it for the archive.
+    verify_manifest(&manifest, &listed_digest(listed, &version, "SHA256SUMS")?)?;
     let archive_digest = listed_digest(listed, &version, &archive_name)?;
     let download_base = format!("https://github.com/{REPOSITORY}/releases/download/v{version}");
-    let manifest = github
-        .get(&format!("{download_base}/SHA256SUMS"), 64 * 1024)
-        .await?;
-    verify_manifest(&manifest, &manifest_digest)?;
     let archive = github
         .get(
             &format!("{download_base}/{archive_name}"),
@@ -255,24 +466,123 @@ pub async fn previous_release(
     } else {
         None
     };
-    Ok(PreviousRelease {
+    Ok(Predecessor::Release(PreviousRelease {
         version,
         target,
         manifest,
         archive,
         support,
-    })
+        skipped: skipped.iter().map(ToString::to_string).collect(),
+    }))
 }
 
-/// Select the greatest published stable release other than the candidate.
-/// This is GitHub's latest release, or the one before it when the candidate
-/// itself is already published (a recovered Release run). Fail closed when a
-/// stable release tag is not canonical `vX.Y.Z` or is newer than the candidate.
+fn no_predecessor(
+    target: &'static str,
+    candidate: release::Version,
+    inspected: &[release::Version],
+    releases: usize,
+) -> Predecessor {
+    Predecessor::None {
+        target,
+        candidate: candidate.to_string(),
+        inspected: inspected.iter().map(ToString::to_string).collect(),
+        horizon: format!("across {releases} releases, all pages"),
+    }
+}
+
+/// The outcome of target-scoped selection over the listing read so far.
+#[derive(Debug, PartialEq)]
+enum Selection {
+    /// The greatest older stable release whose listing and manifest both name
+    /// the target's archive, with its authenticated manifest and the newer
+    /// releases skipped because both sources agree they lack it.
+    Release {
+        version: release::Version,
+        manifest: Vec<u8>,
+        skipped: Vec<release::Version>,
+    },
+    /// The listing is complete and no stable older release carries the target.
+    None { inspected: Vec<release::Version> },
+    /// Nothing read so far carries the target and more listing pages exist.
+    Incomplete,
+}
+
+/// Read the release listing page by page until selection finds the target's
+/// predecessor or every page is exhausted, fetching each inspected release's
+/// authenticated manifest once. An unreadable or over-long page chain fails
+/// rather than letting a partial listing establish that no predecessor exists.
+async fn resolve(
+    source: &mut impl ReleaseSource,
+    candidate: release::Version,
+    target: &str,
+) -> Result<(Selection, Vec<PublishedRelease>)> {
+    let (mut releases, mut more) = source.page(1).await?;
+    let mut pages = 1;
+    let mut manifests: HashMap<String, Vec<u8>> = HashMap::new();
+    loop {
+        let mut missing = None;
+        let selection = select_previous(
+            &releases,
+            !more,
+            candidate,
+            target,
+            &mut |listed: &PublishedRelease| {
+                if let Some(manifest) = manifests.get(&listed.tag_name) {
+                    return Ok(manifest.clone());
+                }
+                missing = Some(listed.tag_name.clone());
+                bail!("SHA256SUMS for {} is not fetched yet", listed.tag_name)
+            },
+        );
+        if let Some(tag) = missing {
+            let listed = releases
+                .iter()
+                .find(|listed| listed.tag_name == tag)
+                .context("inspected release is absent from its listing")?;
+            let manifest = source.manifest(listed).await?;
+            manifests.insert(tag, manifest);
+            continue;
+        }
+        match selection? {
+            Selection::Incomplete => {
+                ensure!(
+                    pages < MAX_LISTING_PAGES,
+                    "incomplete release listing: more than {MAX_LISTING_PAGES} pages, so no predecessor for {target} cannot be established"
+                );
+                pages += 1;
+                let (page, next) = source.page(pages).await.with_context(|| {
+                    format!(
+                        "incomplete release listing: page {pages} could not be read, so no predecessor for {target} cannot be established"
+                    )
+                })?;
+                ensure!(
+                    !page.is_empty(),
+                    "incomplete release listing: page {pages} is empty although GitHub named it"
+                );
+                releases.extend(page);
+                more = next;
+            }
+            selection => return Ok((selection, releases)),
+        }
+    }
+}
+
+/// Target-scoped selection of the greatest older stable release carrying
+/// `target`, over the listing read so far and an injected provider of
+/// authenticated manifests. The candidate itself is skipped, which covers a
+/// recovered Release run. Fail closed when a stable release tag is not
+/// canonical `vX.Y.Z`, is newer than the candidate, or appears twice, and when
+/// a release's listing and `SHA256SUMS` disagree about the target's archive.
+/// No stable older release at all remains an error once the listing is
+/// complete: a project's first release differs from a target's first release.
 fn select_previous(
     releases: &[PublishedRelease],
+    complete: bool,
     candidate: release::Version,
-) -> Result<release::Version> {
-    let mut previous = None;
+    target: &str,
+    manifest: &mut dyn FnMut(&PublishedRelease) -> Result<Vec<u8>>,
+) -> Result<Selection> {
+    let mut older = Vec::new();
     for listed in releases
         .iter()
         .filter(|listed| !listed.draft && !listed.prerelease)
@@ -295,9 +605,47 @@ fn select_previous(
             version < candidate,
             "published release v{version} is newer than candidate v{candidate}"
         );
-        previous = previous.max(Some(version));
+        older.push((version, listed));
     }
-    previous.with_context(|| format!("no published stable release precedes v{candidate}"))
+    older.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
+    ensure!(
+        older.windows(2).all(|pair| pair[0].0 != pair[1].0),
+        "the release listing names a published stable release more than once"
+    );
+    if older.is_empty() {
+        ensure!(
+            !complete,
+            "no published stable release precedes v{candidate}"
+        );
+        return Ok(Selection::Incomplete);
+    }
+    let mut inspected = Vec::new();
+    for (version, listed) in older {
+        let name = archive::archive_name(&version.to_string(), target)?;
+        let manifest = manifest(listed)?;
+        if listed.assets.iter().any(|asset| asset.name == name) {
+            archive::expected_digest(&manifest, &name).with_context(|| {
+                format!(
+                    "previous release v{version} lists {name} inconsistently: its SHA256SUMS does not name it exactly once"
+                )
+            })?;
+            return Ok(Selection::Release {
+                version,
+                manifest,
+                skipped: inspected,
+            });
+        }
+        ensure!(
+            !publishes_asset(listed, &manifest, &name),
+            "previous release v{version} omits {name} inconsistently: its SHA256SUMS names it"
+        );
+        inspected.push(version);
+    }
+    Ok(if complete {
+        Selection::None { inspected }
+    } else {
+        Selection::Incomplete
+    })
 }
 
 fn listed_digest(listed: &PublishedRelease, version: &str, name: &str) -> Result<String> {
@@ -370,6 +718,10 @@ mod tests {
     use super::*;
 
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
+    /// A catalog target that no fixture release publishes, standing in for a
+    /// newly added target such as `aarch64-pc-windows-msvc`, which joins the
+    /// catalog only together with its release legs.
+    const NEW_TARGET: &str = "aarch64-unknown-linux-gnu";
 
     fn listed(tag: &str, draft: bool, prerelease: bool) -> PublishedRelease {
         PublishedRelease {
@@ -380,8 +732,100 @@ mod tests {
         }
     }
 
+    fn named_asset(version: &str, name: &str) -> ReleaseAsset {
+        ReleaseAsset {
+            name: name.into(),
+            browser_download_url: format!(
+                "https://github.com/{REPOSITORY}/releases/download/v{version}/{name}"
+            ),
+            digest: Some(format!("sha256:{}", "a".repeat(64))),
+        }
+    }
+
+    /// A stable release whose listing names the core archive of each target.
+    fn carrying(tag: &str, targets: &[&str]) -> PublishedRelease {
+        let version = tag.strip_prefix('v').unwrap();
+        let mut release = listed(tag, false, false);
+        release.assets = std::iter::once("SHA256SUMS".to_owned())
+            .chain(
+                targets
+                    .iter()
+                    .map(|target| archive::archive_name(version, target).unwrap()),
+            )
+            .map(|name| named_asset(version, &name))
+            .collect();
+        release
+    }
+
+    /// A `SHA256SUMS` naming exactly the archives the listing names.
+    fn agreeing_manifest(listed: &PublishedRelease) -> Result<Vec<u8>> {
+        Ok(listed
+            .assets
+            .iter()
+            .filter(|asset| asset.name != "SHA256SUMS")
+            .map(|asset| format!("{}  {}\n", "a".repeat(64), asset.name))
+            .collect::<String>()
+            .into_bytes())
+    }
+
     fn version(value: &str) -> release::Version {
         value.parse().unwrap()
+    }
+
+    fn versions(values: &[&str]) -> Vec<release::Version> {
+        values.iter().map(|value| version(value)).collect()
+    }
+
+    /// Selection over a complete listing whose manifests agree with it.
+    fn select(releases: &[PublishedRelease], candidate: &str, target: &str) -> Result<Selection> {
+        select_previous(
+            releases,
+            true,
+            version(candidate),
+            target,
+            &mut agreeing_manifest,
+        )
+    }
+
+    fn selected(selection: Selection) -> (release::Version, Vec<release::Version>) {
+        match selection {
+            Selection::Release {
+                version, skipped, ..
+            } => (version, skipped),
+            other => panic!("expected a predecessor, got {other:?}"),
+        }
+    }
+
+    /// An in-memory paginated listing; pages past `readable` fail to load.
+    struct Memory {
+        pages: Vec<Vec<PublishedRelease>>,
+        readable: usize,
+        page_reads: Vec<usize>,
+        manifest_reads: Vec<String>,
+    }
+
+    impl Memory {
+        fn new(pages: Vec<Vec<PublishedRelease>>) -> Self {
+            Self {
+                readable: pages.len(),
+                pages,
+                page_reads: Vec::new(),
+                manifest_reads: Vec::new(),
+            }
+        }
+    }
+
+    impl ReleaseSource for Memory {
+        async fn page(&mut self, number: usize) -> Result<(Vec<PublishedRelease>, bool)> {
+            self.page_reads.push(number);
+            ensure!(number <= self.readable, "page {number} is unavailable");
+            Ok((self.pages[number - 1].clone(), number < self.pages.len()))
+        }
+
+        async fn manifest(&mut self, listed: &PublishedRelease) -> Result<Vec<u8>> {
+            self.manifest_reads.push(listed.tag_name.clone());
+            agreeing_manifest(listed)
+        }
     }
 
     #[test]
@@ -389,22 +833,22 @@ mod tests {
         let releases = [
             listed("v0.10.0", true, false),
             listed("v0.9.1-rc.1", false, true),
-            listed("v0.8.0", false, false),
-            listed("v0.9.0", false, false),
-            listed("v0.4.2", false, false),
+            carrying("v0.8.0", &[WINDOWS_TARGET]),
+            carrying("v0.9.0", &[WINDOWS_TARGET]),
+            carrying("v0.4.2", &[WINDOWS_TARGET]),
         ];
         assert_eq!(
-            select_previous(&releases, version("0.10.0")).unwrap(),
+            selected(select(&releases, "0.10.0", WINDOWS_TARGET).unwrap()).0,
             version("0.9.0")
         );
 
         // A recovered run whose candidate is already public uses the one before.
         let recovered = [
-            listed("v0.10.0", false, false),
-            listed("v0.9.0", false, false),
+            carrying("v0.10.0", &[WINDOWS_TARGET]),
+            carrying("v0.9.0", &[WINDOWS_TARGET]),
         ];
         assert_eq!(
-            select_previous(&recovered, version("0.10.0")).unwrap(),
+            selected(select(&recovered, "0.10.0", WINDOWS_TARGET).unwrap()).0,
             version("0.9.0")
         );
 
@@ -416,9 +860,16 @@ mod tests {
             (vec![listed("v0.09.0", false, false)], "0.10.0"),
             (vec![listed("vv0.9.0", false, false)], "0.10.0"),
             (vec![listed("nightly", false, false)], "0.10.0"),
+            (
+                vec![
+                    carrying("v0.9.0", &[WINDOWS_TARGET]),
+                    carrying("v0.9.0", &[WINDOWS_TARGET]),
+                ],
+                "0.10.0",
+            ),
         ] {
             assert!(
-                select_previous(&releases, version(candidate)).is_err(),
+                select(&releases, candidate, WINDOWS_TARGET).is_err(),
                 "accepted {:?}",
                 releases.iter().map(|r| &r.tag_name).collect::<Vec<_>>()
             );
@@ -551,16 +1002,315 @@ mod tests {
         // CI packages main's tree under the next patch version, so the
         // published release matching the workspace version is the previous one.
         let releases = [
-            listed("v0.9.0", false, false),
-            listed("v0.8.0", false, false),
+            carrying("v0.9.0", &[WINDOWS_TARGET]),
+            carrying("v0.8.0", &[WINDOWS_TARGET]),
         ];
         assert_eq!(
-            select_previous(&releases, version("0.9.1")).unwrap(),
+            selected(select(&releases, "0.9.1", WINDOWS_TARGET).unwrap()).0,
             version("0.9.0")
         );
         // A branch older than the latest publication fails closed; rebase it.
-        let ahead = [listed("v0.10.0", false, false)];
-        assert!(select_previous(&ahead, version("0.9.1")).is_err());
+        let ahead = [carrying("v0.10.0", &[WINDOWS_TARGET])];
+        assert!(select(&ahead, "0.9.1", WINDOWS_TARGET).is_err());
+    }
+
+    #[test]
+    fn predecessor_is_the_greatest_older_release_carrying_the_target() {
+        let releases = [
+            carrying("v0.9.0", &[WINDOWS_TARGET]),
+            carrying("v0.10.0", &[WINDOWS_TARGET]),
+        ];
+        let mut fetched = Vec::new();
+        let selection = select_previous(
+            &releases,
+            true,
+            version("0.10.1"),
+            WINDOWS_TARGET,
+            &mut |listed: &PublishedRelease| {
+                fetched.push(listed.tag_name.clone());
+                agreeing_manifest(listed)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            selection,
+            Selection::Release {
+                version: version("0.10.0"),
+                manifest: agreeing_manifest(&releases[1]).unwrap(),
+                skipped: Vec::new(),
+            }
+        );
+        // Only the selected release's manifest is read; it is authenticated by
+        // the provider and handed on with the selection.
+        assert_eq!(fetched, ["v0.10.0"]);
+    }
+
+    #[test]
+    fn predecessor_skips_releases_without_the_target_when_a_later_one_exists() {
+        let releases = [
+            carrying("v0.10.0", &[WINDOWS_TARGET]),
+            carrying("v0.9.0", &[WINDOWS_TARGET, NEW_TARGET]),
+            carrying("v0.8.0", &[WINDOWS_TARGET, NEW_TARGET]),
+        ];
+        assert_eq!(
+            selected(select(&releases, "0.11.0", NEW_TARGET).unwrap()),
+            (version("0.9.0"), versions(&["0.10.0"]))
+        );
+    }
+
+    #[test]
+    fn no_predecessor_when_no_stable_release_carries_the_target() {
+        let mut draft = carrying("v0.10.5", &[NEW_TARGET]);
+        draft.draft = true;
+        let mut prerelease = listed("v0.10.2-rc.1", false, true);
+        prerelease.assets = vec![named_asset(
+            "0.10.2-rc.1",
+            &format!("kuru-0.10.2-rc.1-{NEW_TARGET}.tar.gz"),
+        )];
+        let releases = [
+            draft,
+            prerelease,
+            carrying("v0.9.0", &[WINDOWS_TARGET]),
+            carrying("v0.10.0", &[WINDOWS_TARGET]),
+        ];
+        let mut fetched = Vec::new();
+        let selection = select_previous(
+            &releases,
+            true,
+            version("0.11.0"),
+            NEW_TARGET,
+            &mut |listed: &PublishedRelease| {
+                fetched.push(listed.tag_name.clone());
+                agreeing_manifest(listed)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            selection,
+            Selection::None {
+                inspected: versions(&["0.10.0", "0.9.0"])
+            }
+        );
+        // Draft and prerelease entries are never inspected.
+        assert_eq!(fetched, ["v0.10.0", "v0.9.0"]);
+
+        // A project's first release is not a target's first release: with no
+        // stable older release at all, the existing error stands.
+        let error = select(&releases[..2], "0.11.0", NEW_TARGET)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "no published stable release precedes v0.11.0");
+    }
+
+    #[test]
+    fn no_predecessor_requires_the_manifest_to_agree() {
+        let new_archive = archive::archive_name("0.10.0", NEW_TARGET).unwrap();
+        // The listing omits the target's archive but SHA256SUMS names it.
+        let omitted = [carrying("v0.10.0", &[WINDOWS_TARGET])];
+        let error = select_previous(
+            &omitted,
+            true,
+            version("0.11.0"),
+            NEW_TARGET,
+            &mut |listed: &PublishedRelease| {
+                let mut manifest = agreeing_manifest(listed)?;
+                manifest.extend(format!("{}  {new_archive}\n", "b".repeat(64)).bytes());
+                Ok(manifest)
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omits") && error.contains("inconsistently"),
+            "{error}"
+        );
+
+        // The listing names the target's archive but SHA256SUMS does not.
+        let listed_only = [carrying("v0.10.0", &[WINDOWS_TARGET, NEW_TARGET])];
+        let error = select_previous(
+            &listed_only,
+            true,
+            version("0.11.0"),
+            NEW_TARGET,
+            &mut |_: &PublishedRelease| {
+                Ok(format!(
+                    "{}  {}\n",
+                    "a".repeat(64),
+                    archive::archive_name("0.10.0", WINDOWS_TARGET).unwrap()
+                )
+                .into_bytes())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("lists") && error.contains("inconsistently"),
+            "{error}"
+        );
+
+        // A manifest that fails authentication stops selection.
+        let error = select_previous(
+            &omitted,
+            true,
+            version("0.11.0"),
+            NEW_TARGET,
+            &mut |_: &PublishedRelease| {
+                bail!("previous release SHA256SUMS differs from its GitHub asset digest")
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("differs from its GitHub asset digest"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_predecessor_follows_every_listing_page() {
+        let first = vec![
+            carrying("v0.10.0", &[WINDOWS_TARGET]),
+            carrying("v0.9.0", &[WINDOWS_TARGET]),
+        ];
+        let second = vec![carrying("v0.8.0", &[WINDOWS_TARGET, NEW_TARGET])];
+
+        // Only the second page carries the target: it is read and selected,
+        // and each inspected manifest is fetched once.
+        let mut source = Memory::new(vec![first.clone(), second.clone()]);
+        let (selection, releases) = resolve(&mut source, version("0.11.0"), NEW_TARGET)
+            .await
+            .unwrap();
+        assert_eq!(
+            selected(selection),
+            (version("0.8.0"), versions(&["0.10.0", "0.9.0"]))
+        );
+        assert_eq!(releases.len(), 3);
+        assert_eq!(source.page_reads, [1, 2]);
+        assert_eq!(source.manifest_reads, ["v0.10.0", "v0.9.0", "v0.8.0"]);
+
+        // A predecessor on the first page needs no further page.
+        let mut source = Memory::new(vec![first.clone(), second.clone()]);
+        let (selection, _) = resolve(&mut source, version("0.11.0"), WINDOWS_TARGET)
+            .await
+            .unwrap();
+        assert_eq!(selected(selection).0, version("0.10.0"));
+        assert_eq!(source.page_reads, [1]);
+
+        // An incomplete page chain cannot establish that no predecessor exists.
+        let mut source = Memory::new(vec![first.clone(), second.clone()]);
+        source.readable = 1;
+        let error = resolve(&mut source, version("0.11.0"), NEW_TARGET)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("incomplete release listing: page 2 could not be read"),
+            "{error:#}"
+        );
+
+        // A named page that turns out empty breaks the chain too.
+        let mut source = Memory::new(vec![first.clone(), Vec::new()]);
+        let error = resolve(&mut source, version("0.11.0"), NEW_TARGET)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("page 2 is empty"), "{error}");
+
+        // The complete chain without the target is the no-predecessor branch.
+        let mut source = Memory::new(vec![first, vec![carrying("v0.8.0", &[WINDOWS_TARGET])]]);
+        let (selection, releases) = resolve(&mut source, version("0.11.0"), NEW_TARGET)
+            .await
+            .unwrap();
+        assert_eq!(
+            selection,
+            Selection::None {
+                inspected: versions(&["0.10.0", "0.9.0", "0.8.0"])
+            }
+        );
+        assert_eq!(releases.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn no_predecessor_prints_the_exact_evidence_line() {
+        let mut draft = listed("v0.11.0", true, false);
+        draft.assets = vec![named_asset("0.11.0", "SHA256SUMS")];
+        let mut source = Memory::new(vec![
+            vec![draft, carrying("v0.10.0", &[WINDOWS_TARGET])],
+            vec![carrying("v0.9.0", &[WINDOWS_TARGET])],
+        ]);
+        let (selection, releases) = resolve(&mut source, version("0.11.0"), NEW_TARGET)
+            .await
+            .unwrap();
+        let Selection::None { inspected } = selection else {
+            panic!("expected no predecessor, got {selection:?}");
+        };
+        let predecessor = no_predecessor(NEW_TARGET, version("0.11.0"), &inspected, releases.len());
+        assert_eq!(predecessor.target(), NEW_TARGET);
+        assert_eq!(
+            predecessor.evidence().unwrap(),
+            "no predecessor for aarch64-unknown-linux-gnu: inspected v0.10.0, v0.9.0 across 3 releases, all pages"
+        );
+
+        let arm64 = Predecessor::None {
+            target: "aarch64-pc-windows-msvc",
+            candidate: "0.10.0".into(),
+            inspected: vec!["0.9.0".into(), "0.8.0".into()],
+            horizon: "across 16 releases, all pages".into(),
+        };
+        assert_eq!(
+            arm64.evidence().unwrap(),
+            "no predecessor for aarch64-pc-windows-msvc: inspected v0.9.0, v0.8.0 across 16 releases, all pages"
+        );
+
+        let release = Predecessor::Release(PreviousRelease {
+            version: "0.9.0".into(),
+            target: WINDOWS_TARGET,
+            manifest: Vec::new(),
+            archive: Vec::new(),
+            support: None,
+            skipped: Vec::new(),
+        });
+        assert_eq!(release.target(), WINDOWS_TARGET);
+        assert!(release.evidence().is_none());
+    }
+
+    #[test]
+    fn listing_pages_follow_only_the_exact_next_page() {
+        let link = |page: &str, host: &str| {
+            format!(
+                "<https://{host}/repositories/1/releases?page={page}>; rel=\"next\", <https://{host}/repositories/1/releases?page=5>; rel=\"last\""
+            )
+        };
+        assert!(!next_page(None, 1).unwrap());
+        assert!(next_page(Some(&link("2", METADATA_HOST)), 1).unwrap());
+        assert!(
+            !next_page(
+                Some("<https://api.github.com/repositories/1/releases?page=1>; rel=\"prev\""),
+                2
+            )
+            .unwrap()
+        );
+        for (header, current) in [
+            (link("3", METADATA_HOST), 1),
+            (link("2", "example.invalid"), 1),
+            (link("2&page=3", METADATA_HOST), 1),
+            (
+                "https://api.github.com/releases?page=2; rel=\"next\"".to_owned(),
+                1,
+            ),
+            ("unrecognized".to_owned(), 1),
+            (String::new(), 1),
+            (
+                "<https://api.github.com/repositories/1/releases?page=1>; rel=prev".to_owned(),
+                2,
+            ),
+            (
+                format!("{}, {}", link("2", METADATA_HOST), link("2", METADATA_HOST)),
+                1,
+            ),
+            (link("2", METADATA_HOST).replace("https://", "http://"), 1),
+        ] {
+            assert!(next_page(Some(&header), current).is_err(), "{header}");
+        }
     }
 
     #[test]
@@ -605,6 +1355,17 @@ mod tests {
         let header = &request.headers()[AUTHORIZATION];
         assert_eq!(header, "Bearer ghs_fake");
         assert!(header.is_sensitive());
+        // Listing pages are built here, never taken from a Link header, and
+        // carry the metadata token like the first listing request.
+        let page = authenticated
+            .checked_request(listing_page_url(2).unwrap())
+            .build()
+            .unwrap();
+        assert_eq!(
+            page.url().as_str(),
+            "https://api.github.com/repos/replygirl/kuru/releases?page=2"
+        );
+        assert_eq!(page.headers()[AUTHORIZATION], "Bearer ghs_fake");
         for url in [
             download.as_str(),
             "https://objects.githubusercontent.com/github-production-release-asset/1",

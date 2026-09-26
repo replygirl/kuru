@@ -9,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 use kuru_delivery::{
     archive,
     command::{self, Command},
-    published::PreviousRelease,
+    published::Predecessor,
     shell_support, targets,
 };
 use std::{ffi::OsString, fs, path::Path, time::Duration};
@@ -74,16 +74,45 @@ fn write_executable(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Install the authenticated previous release as a real installation would,
 /// run its own `kuru update` against the candidate directory, and require the
 /// exact candidate executable and shell support afterwards.
+///
+/// When no published release carries the target, print the resolver's
+/// `no predecessor for <target>: ...` evidence line and run no updater: that
+/// line is the acceptance evidence for a target's first release.
 pub async fn previous_updater_accepts_candidate(
-    previous: &PreviousRelease,
+    predecessor: &Predecessor,
     candidate: &Candidate<'_>,
 ) -> Result<()> {
-    let target = targets::find(previous.target)?;
+    let target = targets::find(predecessor.target())?;
     ensure!(
         target.triple == archive::host_target()?,
         "previous-updater acceptance must run the native {} release on its own host",
         target.triple
     );
+    let previous = match predecessor {
+        Predecessor::Release(previous) => previous,
+        Predecessor::None { .. } => {
+            println!(
+                "{}",
+                predecessor
+                    .evidence()
+                    .context("no-predecessor decision has no evidence line")?
+            );
+            return Ok(());
+        }
+    };
+    if !previous.skipped.is_empty() {
+        println!(
+            "previous release for {} skipped {} (no {} archive in listing or SHA256SUMS)",
+            target.triple,
+            previous
+                .skipped
+                .iter()
+                .map(|version| format!("v{version}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            target.triple
+        );
+    }
     let old_version = previous.version.as_str();
     let requested = candidate.requested_version;
     let root = tempfile::tempdir()?;
