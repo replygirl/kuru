@@ -250,8 +250,8 @@ directory for both preparation and compilation. Valid files are reverified and
 reused; corrupt or unsafe entries fail without replacement. This build cache is
 separate from the installed application's extracted `memory.cache_dir`.
 
-Every cached native CI job (coverage, installation and the Linux arm64 native
-build) selects a bundle directory under `${{ runner.temp }}` for all its
+Every cached native CI job (coverage, installation and the Intel macOS and Linux arm64
+native builds) selects a bundle directory under `${{ runner.temp }}` for all its
 preparation and build steps. The Windows coverage shards share one Cargo cache
 key that only one shard saves; their instrumented target directories live in
 `${{ runner.temp }}` and are never cached. Private bundle directories must be created by the
