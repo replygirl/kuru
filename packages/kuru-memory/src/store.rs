@@ -37,6 +37,9 @@ mod recovery_tests;
 #[path = "store/migration_lifecycle_tests.rs"]
 mod migration_lifecycle_tests;
 #[cfg(test)]
+#[path = "store/open_pool_budget_tests.rs"]
+mod open_pool_budget_tests;
+#[cfg(test)]
 #[path = "store/operational_gc_tests.rs"]
 mod operational_gc_tests;
 
@@ -104,6 +107,8 @@ pub struct OpenOptions {
     candidate_recovery_pause: Option<Arc<CandidateRecoveryPause>>,
     #[cfg(test)]
     candidate_cleanup_failure: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    migrated_stage_pool_delay: Option<(Duration, Arc<AtomicBool>)>,
 }
 impl OpenOptions {
     pub fn new(data_dir: PathBuf, project_scope: String) -> Self {
@@ -119,6 +124,8 @@ impl OpenOptions {
             candidate_recovery_pause: None,
             #[cfg(test)]
             candidate_cleanup_failure: None,
+            #[cfg(test)]
+            migrated_stage_pool_delay: None,
         }
     }
 }
@@ -1783,6 +1790,10 @@ impl MemoryStore {
                 )
                 .await
                 .context("reopen migrated staged memory server")?;
+                #[cfg(test)]
+                if let Some((delay, entered)) = options.migrated_stage_pool_delay.clone() {
+                    server.delay_next_pool_authentication(delay, entered);
+                }
                 let pool = server
                     .pool("main")
                     .await
@@ -1928,6 +1939,9 @@ impl MemoryStore {
             let lock: File = store.shared.server.take_reap_guard();
             drop(lock);
         }
+        // Open-sequence pools, including recovery and the usage ledger above,
+        // shared this server's startup deadline. Later pools are ordinary.
+        store.shared.server.finish_opening();
         progress.report(MemoryOpenStage::Ready);
         Ok(store)
     }

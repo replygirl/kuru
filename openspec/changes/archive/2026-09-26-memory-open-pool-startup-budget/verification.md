@@ -1,0 +1,16 @@
+## 1. Open-sequence pools share the startup budget [critical]
+
+- [x] 1.1 @regression (agent) run `store::open_pool_budget_tests::migrated_stage_pool_uses_remaining_startup_budget_and_post_open_pools_stay_ordinary` with the migrated staged reopen's main-pool authentication delayed beyond the ordinary window but inside the startup budget, before and after the fix -> observed on macOS aarch64 host 2026-09-26 via `mise run //packages/kuru-memory:test -- --lib -- open_pool_budget_tests`: with `pool_attempt_window` temporarily forced to the pre-fix flat ordinary window the test FAILED in 4.80s with `open migrated staged main pool` / `authenticate memory branch pool` / `connect to authenticated project memory; connection phase: initial authentication callback entered` / `pool timed out while waiting for an open connection` (the #91 CI chain); with the fix it PASSED (open succeeded, delayed callback entered).
+- [x] 1.2 @integration (agent) same test, delay of the whole startup budget (`startup_timeout_secs` + supervisor-transport allowance) -> observed PASS: open fails with typed `sqlx::Error::PoolTimedOut` and the delayed callback was entered.
+- [x] 1.3 @integration (agent) same test, after the store reports `Ready`, delay a fresh branch pool beyond the ordinary window -> observed PASS: typed `sqlx::Error::PoolTimedOut` (post-open pools keep the ordinary window).
+
+## 2. Identity rejections are not waited out
+
+- [x] 2.1 @integration (agent) run `server::startup_budget_tests::opening_pool_identity_rejection_is_terminal` against a real server in its opening phase whose SQL instance row no longer matches -> observed: with opening-phase fail-fast temporarily disabled the test FAILED after the extended window (32.20s) with `... last callback rejection during SQL project/instance comparison: memory SQL project/instance identity mismatch: pool timed out while waiting for an open connection`; with the fix it PASSED with typed `sqlx::Error::Protocol`, not `PoolTimedOut`.
+
+## 3. Existing behavior and originally failing tests
+
+- [x] 3.1 @integration (agent) run the kuru-memory package test task -> observed: full unfiltered `mise run //packages/kuru-memory:test` exit 0; lib 269 passed (480.94s), integration targets 6 + 5 + 12 + 1 passed, 0 failed.
+- [x] 3.2 @integration (agent) run kuru-runtime `hook_platform_tests::pre_turn_rewrite_reaches_the_provider_without_its_durable_hook_provenance` and `mode_baseline_tests::all_four_modes_allow_one_hop_speaking_consultation_with_a_relationship` -> observed: `mise run //packages/kuru-runtime:test -- --lib -- <both>` 2 passed, 0 failed (16.29s). This host does not reproduce the Windows runner load, so this shows no regression, not the Windows fix.
+- [~] 3.3 @runtime (agent) native Windows CI coverage (memory-runtime) shard at the fixed head -> defer: requires a push, which this change does not perform. The Windows-only supervisor pipe accept change is also neither compiled nor exercised on this macOS host; native Windows CI is its check.
+- [x] 3.4 @integration (agent) `cargo fmt --all --check`, kuru-memory lint (clippy all targets/features `-D warnings`), strict cospec validation -> observed: fmt exit 0; `mise run //packages/kuru-memory:lint` clean; cospec strict validation 0 errors, 0 warnings.

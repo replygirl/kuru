@@ -84,3 +84,62 @@ async fn initial_authentication_uses_remaining_startup_budget_and_reaps_on_expir
     reopened.close().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn opening_pool_identity_rejection_is_terminal() -> Result<()> {
+    let root = crate::test_support::tempdir()?;
+    let config = kuru_core::MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+    let binary = {
+        let _gate = crate::spawn_gate::spawning().await;
+        crate::provision::provision(&config, &crate::store::test_cache()).await?
+    };
+    let server = {
+        let _gate = crate::spawn_gate::spawning().await;
+        Server::open(ServerOptions {
+            binary,
+            directory: root.path().join("identity"),
+            project_scope: "project/opening-identity".into(),
+            supervisor: crate::store::test_supervisor()?,
+            timeout: Duration::from_secs(config.startup_timeout_secs),
+            read_only: false,
+            retained: None,
+            lifecycle_root: cfg!(windows).then(|| root.path().join("leases")),
+        })
+        .await?
+    };
+    assert!(
+        server.opening_deadline().is_some(),
+        "an owned start did not enter its opening phase"
+    );
+
+    // The SQL identity row no longer matches this server's private identity,
+    // which a retry against the same endpoint cannot change.
+    let main = server.pool("main").await?;
+    timeout(
+        crate::store::QUERY_TIMEOUT,
+        sqlx::query("UPDATE kuru_instance SET instance_id = ? WHERE singleton = 1")
+            .bind(Uuid::new_v4().to_string())
+            .execute(main.as_ref()),
+    )
+    .await
+    .context("identity row update deadline exceeded")??;
+    main.close().await;
+    drop(main);
+
+    let error = server
+        .pool("main")
+        .await
+        .expect_err("a mismatched SQL identity cannot authenticate a pool");
+    let rejection = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<sqlx::Error>());
+    assert!(
+        matches!(rejection, Some(sqlx::Error::Protocol(_))),
+        "opening identity rejection was waited out or misclassified: {error:#}"
+    );
+    server.close().await?;
+    Ok(())
+}

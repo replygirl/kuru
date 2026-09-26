@@ -705,7 +705,16 @@ async fn selected_port_takeover_retries_actual_dolt_without_touching_holder() ->
     }
     let identity = load_identity(&directory, "project/selected-port-collision")?
         .context("ready Dolt did not publish its identity")?;
-    let pool = connect_pool(&identity, &endpoint, &directory, "main", false, 1).await?;
+    let pool = connect_pool_with_timeout(
+        &identity,
+        &endpoint,
+        &directory,
+        "main",
+        false,
+        1,
+        PoolAttemptOptions::ordinary(),
+    )
+    .await?;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kuru_instance")
         .fetch_one(&pool)
         .await?;

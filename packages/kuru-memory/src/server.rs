@@ -47,11 +47,16 @@ use tokio::sync::oneshot;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, OwnedMutexGuard},
+    sync::{Mutex, Notify, OwnedMutexGuard},
     time::{Instant, sleep, timeout, timeout_at},
 };
 use uuid::Uuid;
 
+/// Ordinary per-attempt window for authenticating a pool and for its identity
+/// query once memory is open. An opening server never uses less than this.
+pub(crate) const ORDINARY_POOL_WINDOW: Duration = Duration::from_secs(2);
+const DATA_DIRECTORY_MISMATCH: &str = "memory server data directory mismatch";
+const IDENTITY_MISMATCH: &str = "memory SQL project/instance identity mismatch";
 const RECORD_LIMIT: usize = 64 * 1024;
 const LOG_LIMIT: usize = 32 * 1024;
 const CLOSE_GRACE: Duration = Duration::from_secs(8);
@@ -105,8 +110,14 @@ struct ServerInner {
     read_only: bool,
     pools: Mutex<BTreeMap<String, Weak<MySqlPool>>>,
     pool_admission: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
+    /// The deadline that bounded this owned start's readiness and first
+    /// authenticated probe. Pools the store opening requests from this server
+    /// continue that one startup operation until the store reports ready.
+    opening_deadline: StdMutex<Option<Instant>>,
     #[cfg(test)]
     candidate_wait_observer: Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
+    next_pool_probe_delay: StdMutex<Option<(Duration, Arc<AtomicBool>)>>,
     owner: Mutex<Option<Owner>>,
     reap_guard: Arc<StdMutex<Option<File>>>,
     closed: AtomicBool,
@@ -405,6 +416,7 @@ impl Server {
                     options.read_only,
                     None,
                     reap_guard,
+                    None,
                 ));
             }
         } else {
@@ -422,6 +434,8 @@ impl Server {
         // Readiness, the first authenticated connection, and its identity
         // check are one startup operation. The two seconds are the existing
         // supervisor-transport allowance, not a fresh budget after Ready.
+        // Pools the store opening requests from this server before it reports
+        // ready continue the same operation; see `Server::pool_attempt`.
         let startup_deadline = Instant::now() + options.timeout + SUPERVISOR_TRANSPORT_ALLOWANCE;
         #[cfg(unix)]
         let (mut owner, response) = {
@@ -511,7 +525,10 @@ impl Server {
                 .await
                 .context("start memory lifetime supervisor")?;
             drop(_test_spawn_guard);
-            let accept = listener.accept(&child, Duration::from_secs(5));
+            let accept = listener.accept(
+                &child,
+                startup_deadline.saturating_duration_since(Instant::now()),
+            );
             let mut owner = Owner {
                 child: Some(child),
                 lifetime: None,
@@ -584,6 +601,7 @@ impl Server {
                     1,
                     PoolAttemptOptions {
                         acquire_timeout: remaining,
+                        identity_rejection_is_terminal: true,
                         _test_probe_delay: _initial_probe_delay,
                     },
                 ),
@@ -627,6 +645,7 @@ impl Server {
             options.read_only,
             owner,
             reap_guard,
+            Some(startup_deadline),
         ))
     }
 
@@ -637,6 +656,7 @@ impl Server {
         read_only: bool,
         owner: Option<Owner>,
         reap_guard: Arc<StdMutex<Option<File>>>,
+        opening_deadline: Option<Instant>,
     ) -> Self {
         Self(Arc::new(ServerInner {
             directory,
@@ -645,8 +665,11 @@ impl Server {
             read_only,
             pools: Mutex::new(BTreeMap::new()),
             pool_admission: Mutex::new(BTreeMap::new()),
+            opening_deadline: StdMutex::new(opening_deadline),
             #[cfg(test)]
             candidate_wait_observer: Mutex::new(None),
+            #[cfg(test)]
+            next_pool_probe_delay: StdMutex::new(None),
             owner: Mutex::new(owner),
             reap_guard,
             closed: AtomicBool::new(false),
@@ -664,22 +687,89 @@ impl Server {
             return Ok(pool);
         }
         pools.retain(|_, pool| pool.strong_count() != 0);
-        let pool = connect_pool(
+        let pool = connect_pool_with_timeout(
             &self.0.identity,
             &self.0.endpoint,
             &self.0.directory,
             branch,
             self.0.read_only,
             4,
+            self.pool_attempt(),
         )
         .await
         .context("authenticate memory branch pool")?;
-        verify_identity(&pool, &self.0.directory, &self.0.identity)
-            .await
-            .context("verify memory branch pool identity")?;
+        verify_identity_until(
+            &pool,
+            &self.0.directory,
+            &self.0.identity,
+            Instant::now() + self.pool_attempt_window(),
+        )
+        .await
+        .context("verify memory branch pool identity")?;
         let pool = Arc::new(pool);
         pools.insert(branch.to_owned(), Arc::downgrade(&pool));
         Ok(pool)
+    }
+
+    /// End the opening phase once the store that started this server is
+    /// ready. Later pools use exactly the ordinary per-attempt window.
+    pub(crate) fn finish_opening(&self) {
+        *self
+            .0
+            .opening_deadline
+            .lock()
+            .expect("opening deadline lock") = None;
+    }
+
+    fn opening_deadline(&self) -> Option<Instant> {
+        *self
+            .0
+            .opening_deadline
+            .lock()
+            .expect("opening deadline lock")
+    }
+
+    /// While opening, the remaining startup deadline that bounded this
+    /// server's own probe, never less than the ordinary window: a slow but
+    /// healthy start must not leave the next open-sequence pool with less
+    /// than an ordinary attempt. Once open, exactly the ordinary window.
+    fn pool_attempt_window(&self) -> Duration {
+        self.opening_deadline()
+            .map_or(ORDINARY_POOL_WINDOW, |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .max(ORDINARY_POOL_WINDOW)
+            })
+    }
+
+    fn pool_attempt(&self) -> PoolAttemptOptions {
+        let opening = self.opening_deadline().is_some();
+        PoolAttemptOptions {
+            acquire_timeout: self.pool_attempt_window(),
+            // A longer opening window must not wait out an identity
+            // rejection; the same endpoint cannot answer differently.
+            identity_rejection_is_terminal: opening,
+            #[cfg(test)]
+            _test_probe_delay: self
+                .0
+                .next_pool_probe_delay
+                .lock()
+                .expect("pool probe delay lock")
+                .take(),
+            #[cfg(not(test))]
+            _test_probe_delay: None,
+        }
+    }
+
+    /// Delay the next pool's authentication callback after a real Dolt
+    /// connection, as `open_with_initial_probe_delay` does for the probe.
+    #[cfg(test)]
+    pub(crate) fn delay_next_pool_authentication(&self, delay: Duration, entered: Arc<AtomicBool>) {
+        *self
+            .0
+            .next_pool_probe_delay
+            .lock()
+            .expect("pool probe delay lock") = Some((delay, entered));
     }
 
     /// Prevent a new pool for one branch while its checked status transition
@@ -1110,16 +1200,10 @@ impl ConnectionObservation {
             return;
         };
         let cause = match error {
-            sqlx::Error::Protocol(message)
-                if message == "memory server data directory mismatch" =>
-            {
-                "memory server data directory mismatch"
+            sqlx::Error::Protocol(message) if message == DATA_DIRECTORY_MISMATCH => {
+                DATA_DIRECTORY_MISMATCH
             }
-            sqlx::Error::Protocol(message)
-                if message == "memory SQL project/instance identity mismatch" =>
-            {
-                "memory SQL project/instance identity mismatch"
-            }
+            sqlx::Error::Protocol(message) if message == IDENTITY_MISMATCH => IDENTITY_MISMATCH,
             sqlx::Error::Protocol(_) if progress.phase == "checked data directory comparison" => {
                 "checked filesystem validation failed"
             }
@@ -1155,37 +1239,61 @@ impl ConnectionObservation {
     }
 }
 
-async fn connect_pool(
-    identity: &Identity,
-    endpoint: &Endpoint,
-    directory: &Path,
-    branch: &str,
-    read_only: bool,
-    max: u32,
-) -> Result<MySqlPool> {
-    connect_pool_with_timeout(
-        identity,
-        endpoint,
-        directory,
-        branch,
-        read_only,
-        max,
-        PoolAttemptOptions::ordinary(),
-    )
-    .await
-}
-
 struct PoolAttemptOptions {
     acquire_timeout: Duration,
+    /// SQLx retries every `after_connect` error until `acquire_timeout`.
+    /// When set, an authored identity rejection ends acquisition instead.
+    identity_rejection_is_terminal: bool,
     _test_probe_delay: Option<(Duration, Arc<AtomicBool>)>,
 }
 
 impl PoolAttemptOptions {
     fn ordinary() -> Self {
         Self {
-            acquire_timeout: Duration::from_secs(2),
+            acquire_timeout: ORDINARY_POOL_WINDOW,
+            identity_rejection_is_terminal: false,
             _test_probe_delay: None,
         }
+    }
+}
+
+/// An authored identity rejection from the authentication callback. It
+/// cannot change on retry against the same endpoint.
+fn identity_rejection(error: &sqlx::Error) -> Option<&'static str> {
+    match error {
+        sqlx::Error::Protocol(message) if message == DATA_DIRECTORY_MISMATCH => {
+            Some(DATA_DIRECTORY_MISMATCH)
+        }
+        sqlx::Error::Protocol(message) if message == IDENTITY_MISMATCH => Some(IDENTITY_MISMATCH),
+        _ => None,
+    }
+}
+
+/// The first identity rejection seen by one pool attempt's callbacks.
+#[derive(Clone, Default)]
+struct IdentityRejection(Arc<(StdMutex<Option<&'static str>>, Notify)>);
+
+impl IdentityRejection {
+    fn record(&self, error: &sqlx::Error) {
+        let Some(cause) = identity_rejection(error) else {
+            return;
+        };
+        if let Ok(mut first) = self.0.0.lock() {
+            first.get_or_insert(cause);
+        }
+        self.0.1.notify_one();
+    }
+
+    async fn rejected(&self) -> sqlx::Error {
+        self.0.1.notified().await;
+        let cause = self
+            .0
+            .0
+            .lock()
+            .ok()
+            .and_then(|first| *first)
+            .unwrap_or(IDENTITY_MISMATCH);
+        sqlx::Error::Protocol(cause.into())
     }
 }
 
@@ -1244,7 +1352,9 @@ async fn connect_pool_attempt(
     let expected_directory = directory.join("data");
     let observation = ConnectionObservation::new();
     let callback_observation = observation.clone();
-    let result = MySqlPoolOptions::new()
+    let rejection = IdentityRejection::default();
+    let callback_rejection = rejection.clone();
+    let connecting = MySqlPoolOptions::new()
         .max_connections(max)
         .min_connections(0)
         .acquire_timeout(attempt.acquire_timeout)
@@ -1254,6 +1364,7 @@ async fn connect_pool_attempt(
             let project_scope = project_scope.clone();
             let expected_directory = expected_directory.clone();
             let observation = callback_observation.clone();
+            let rejection = callback_rejection.clone();
             #[cfg(test)]
             let test_probe_delay = attempt._test_probe_delay.clone();
             Box::pin(async move {
@@ -1272,9 +1383,7 @@ async fn connect_pool_attempt(
                     if !same_directory(Path::new(&datadir), &expected_directory)
                         .map_err(|error| sqlx::Error::Protocol(error.to_string()))?
                     {
-                        return Err(sqlx::Error::Protocol(
-                            "memory server data directory mismatch".into(),
-                        ));
+                        return Err(sqlx::Error::Protocol(DATA_DIRECTORY_MISMATCH.into()));
                     }
                     observation.phase("SQL project/instance query");
                     let row = sqlx::query(
@@ -1286,9 +1395,7 @@ async fn connect_pool_attempt(
                     if row.try_get::<String, _>("instance_id")? != instance
                         || row.try_get::<String, _>("project_scope")? != project_scope
                     {
-                        return Err(sqlx::Error::Protocol(
-                            "memory SQL project/instance identity mismatch".into(),
-                        ));
+                        return Err(sqlx::Error::Protocol(IDENTITY_MISMATCH.into()));
                     }
                     observation.phase("authenticated identity callback complete");
                     Ok(())
@@ -1296,12 +1403,20 @@ async fn connect_pool_attempt(
                 .await;
                 if let Err(error) = &result {
                     observation.rejected(error);
+                    rejection.record(error);
                 }
                 result
             })
         })
-        .connect_with(options)
-        .await;
+        .connect_with(options);
+    let result = if attempt.identity_rejection_is_terminal {
+        tokio::select! {
+            result = connecting => result,
+            error = rejection.rejected() => Err(error),
+        }
+    } else {
+        connecting.await
+    };
     Ok((result, observation))
 }
 
@@ -1310,7 +1425,7 @@ async fn verify_identity(pool: &MySqlPool, directory: &Path, identity: &Identity
         pool,
         directory,
         identity,
-        Instant::now() + Duration::from_secs(2),
+        Instant::now() + ORDINARY_POOL_WINDOW,
     )
     .await
 }
