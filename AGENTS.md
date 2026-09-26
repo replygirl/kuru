@@ -135,9 +135,10 @@ autoloading through mise or Rust. Keep this policy at the owned launch sites;
 do not strip deliberate module settings from generic configured commands or MCPs.
 Before its user command, the built-in ToolHost stock shell initializes its
 shipped `Microsoft.PowerShell.Management` and `Microsoft.PowerShell.Utility`
-modules from `$PSHOME`; ordinary module autoloading remains available. This
-ToolHost-specific bootstrap does not apply to generic configured commands or
-MCPs.
+modules from `$PSHOME`; ordinary module autoloading remains available. The
+Windows installer bootstrap imports the same exact manifests before its first
+non-Core command, since cold first-use discovery can stall a fresh profile.
+These owned bootstraps do not apply to generic configured commands or MCPs.
 
 Portability and bundled runtime dependencies are product requirements. Installing
 Kuru must be sufficient to run it: ship required native runtime engines and their

@@ -52,6 +52,8 @@ const BOOTSTRAP_PHASES: &[&str] = &[
 #[cfg(windows)]
 const BOOTSTRAP_DIRECT_CHECKPOINTS: &[&str] = &[
     "Kuru bootstrap direct checkpoint: script entered",
+    "Kuru bootstrap direct checkpoint: management module ready",
+    "Kuru bootstrap direct checkpoint: utility module ready",
     "Kuru bootstrap direct checkpoint: native bridge starting",
     "Kuru bootstrap direct checkpoint: native bridge ready",
 ];

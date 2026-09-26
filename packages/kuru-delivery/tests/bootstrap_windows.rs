@@ -373,6 +373,31 @@ async fn default_install_destination_uses_local_app_data_programs_and_recover_ne
 }
 
 #[tokio::test]
+async fn bootstrap_supplies_its_stock_commands_without_module_auto_discovery() {
+    // The fixture's fresh LOCALAPPDATA gives PowerShell a cold module-analysis
+    // cache, as on a new profile. With autoloading disabled, any bootstrap
+    // command reached through auto-discovery is refused instead of scanning the
+    // module path; only the script's exact PSHOME imports can supply them.
+    let fixture = Fixture::new();
+    let result = fixture
+        .run(&mut fixture.script(&format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+$PSModuleAutoLoadingPreference = 'None'
+& $env:KURU_BOOTSTRAP_SCRIPT -Version '{VERSION}'
+foreach ($name in @('Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility')) {{
+    $expected = [IO.Path]::Combine($PSHOME, 'Modules', $name, "$name.psd1")
+    $loaded = @(Microsoft.PowerShell.Core\Get-Module -Name $name)
+    if ($loaded.Count -ne 1 -or -not [String]::Equals($loaded[0].Path, $expected, [StringComparison]::OrdinalIgnoreCase)) {{ throw "bootstrap did not load the exact PSHOME $name manifest" }}
+}}
+"#
+        )))
+        .await;
+    success(&result);
+    fixture.installed(&fixture.install);
+}
+
+#[tokio::test]
 async fn marked_windows_core_requires_verified_paired_support_before_publication() {
     let fixture = Fixture::new();
     let core = fixture.release.join(archive_name(VERSION, TARGET).unwrap());
@@ -748,7 +773,7 @@ async fn aliases_hardlinks_private_acl_and_busy_install_lease_fail_closed() {
     let weak = Fixture::new();
     let result = weak.run(&mut weak.script(r#"
 $ErrorActionPreference = 'Stop'
-$path = Join-Path $env:KURU_INSTALL_DIR '.kuru-update'
+$path = [IO.Path]::Combine($env:KURU_INSTALL_DIR, '.kuru-update')
 [IO.Directory]::CreateDirectory($path) | Out-Null
 $acl = [Security.AccessControl.DirectorySecurity]::new()
 $acl.SetAccessRuleProtection($true, $false)

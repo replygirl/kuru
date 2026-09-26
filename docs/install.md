@@ -83,9 +83,11 @@ irm https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery
 
 The default destination is `$env:LOCALAPPDATA\Programs\kuru\bin`. Add that directory to
 your user `PATH`, then run `kuru --version` and `kuru --provider demo`. The script
-uses stock Windows PowerShell and .NET Framework. Its small native API bridge
-checks file identities, private staging and durable publication; no separate
-compiler installation is needed.
+uses stock Windows PowerShell and .NET Framework. It loads PowerShell's own
+Management and Utility modules directly from `$PSHOME` instead of searching
+every installed module on first use. Its small native API bridge checks file
+identities, private staging and durable publication; no separate compiler
+installation is needed.
 
 To choose an exact version or use a local release directory:
 
