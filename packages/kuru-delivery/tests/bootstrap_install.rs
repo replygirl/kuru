@@ -558,10 +558,10 @@ async fn explicit_github_and_custom_mirror_versions_use_literal_release_director
 #[tokio::test]
 async fn host_detection_selects_each_supported_archive_and_rejects_unknown_hosts() {
     for (os, arch, target) in [
-        ("Darwin", "arm64", TARGETS[0]),
-        ("Darwin", "x86_64", TARGETS[1]),
-        ("Linux", "aarch64", TARGETS[2]),
-        ("Linux", "x86_64", TARGETS[3]),
+        ("Darwin", "arm64", "aarch64-apple-darwin"),
+        ("Linux", "aarch64", "aarch64-unknown-linux-gnu"),
+        ("Linux", "arm64", "aarch64-unknown-linux-gnu"),
+        ("Linux", "x86_64", "x86_64-unknown-linux-gnu"),
     ] {
         let fixture = Fixture::new(target, "0.2.0");
         let mut command = fixture.command();
@@ -579,6 +579,24 @@ async fn host_detection_selects_each_supported_archive_and_rejects_unknown_hosts
         .env("FIXTURE_OS", "FreeBSD");
     failure(&fixture.run(command).await, "unsupported platform");
     fixture.unchanged();
+}
+
+#[tokio::test]
+async fn intel_macs_are_refused_with_the_last_supporting_release() {
+    const REFUSAL: &str = "Intel Macs (x86_64-apple-darwin) are no longer supported; v0.9.0 was the last release supporting them";
+    let fixture = Fixture::new(TARGETS[0], "0.2.0");
+    let mut detected = fixture.command();
+    detected
+        .args(["--version", "0.2.0"])
+        .env("FIXTURE_OS", "Darwin")
+        .env("FIXTURE_ARCH", "x86_64");
+    failure(&fixture.run(detected).await, REFUSAL);
+    fixture.unchanged();
+    let mut explicit = fixture.command();
+    explicit.args(["--version", "0.2.0", "--target", "x86_64-apple-darwin"]);
+    failure(&fixture.run(explicit).await, REFUSAL);
+    fixture.unchanged();
+    assert!(!fixture.path("requests").exists());
 }
 
 async fn timeout_control(exited_root: bool) {

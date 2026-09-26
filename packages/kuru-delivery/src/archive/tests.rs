@@ -482,7 +482,15 @@ fn packaging_requires_a_regular_executable_and_known_target() {
     {
         let directory = fixture.destination.join("not-an-executable");
         fs::create_dir(&directory).unwrap();
-        assert!(package(&directory, TARGETS[4], "0.1.0", &fixture.releases).is_err());
+        assert!(
+            package(
+                &directory,
+                "x86_64-pc-windows-msvc",
+                "0.1.0",
+                &fixture.releases
+            )
+            .is_err()
+        );
     }
     make_executable(&File::open(&path).unwrap()).unwrap();
     assert!(package(&path, "unknown", "0.1.0", &fixture.releases).is_err());

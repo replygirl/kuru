@@ -12,6 +12,13 @@ use std::{
 pub const MAX_COMPRESSED: u64 = 64 * 1024 * 1024;
 pub const MAX_EXPANDED: u64 = 128 * 1024 * 1024;
 const MAX_MANIFEST: u64 = 64 * 1024;
+/// Release targets with a pinned Dolt archive, paired with its upstream stem.
+const SUPPORTED_TARGETS: [(&str, &str); 4] = [
+    ("aarch64-apple-darwin", "dolt-darwin-arm64"),
+    ("aarch64-unknown-linux-gnu", "dolt-linux-arm64"),
+    ("x86_64-unknown-linux-gnu", "dolt-linux-amd64"),
+    ("x86_64-pc-windows-msvc", "dolt-windows-amd64"),
+];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,20 +81,19 @@ impl Manifest {
             "invalid Dolt upstream commit"
         );
         ensure!(
-            manifest.assets.len() == 5,
-            "Dolt manifest must cover the five supported targets"
+            manifest.assets.len() == SUPPORTED_TARGETS.len(),
+            "Dolt manifest must cover exactly the supported targets"
         );
         let mut targets = HashSet::new();
         for asset in &manifest.assets {
             ensure!(targets.insert(&asset.target), "duplicate Dolt target");
-            let stem = match asset.target.as_str() {
-                "aarch64-apple-darwin" => "dolt-darwin-arm64",
-                "x86_64-apple-darwin" => "dolt-darwin-amd64",
-                "aarch64-unknown-linux-gnu" => "dolt-linux-arm64",
-                "x86_64-unknown-linux-gnu" => "dolt-linux-amd64",
-                "x86_64-pc-windows-msvc" => "dolt-windows-amd64",
-                _ => anyhow::bail!("unsupported Dolt bundle target {}", asset.target),
-            };
+            let stem = SUPPORTED_TARGETS
+                .iter()
+                .find(|(target, _)| *target == asset.target)
+                .map(|(_, stem)| *stem)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("unsupported Dolt bundle target {}", asset.target)
+                })?;
             ensure!(
                 asset.stem == stem,
                 "Dolt archive stem does not match target"
@@ -169,9 +175,10 @@ impl Manifest {
             )
         };
         Ok(format!(
-            "pub const DOLT_VERSION: &str = {:?};\npub(crate) const BUNDLED_ASSET: Asset<'static> = {};\n#[cfg(test)]\npub(crate) const ASSETS: [Asset<'static>; 5] = [{}];\n",
+            "pub const DOLT_VERSION: &str = {:?};\npub(crate) const BUNDLED_ASSET: Asset<'static> = {};\n#[cfg(test)]\npub(crate) const ASSETS: [Asset<'static>; {}] = [{}];\n",
             self.version,
             render(selected),
+            self.assets.len(),
             self.assets.iter().map(render).collect::<Vec<_>>().join(",")
         ))
     }

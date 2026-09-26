@@ -438,12 +438,12 @@ differently-named sibling task.
 ## Dependency and release updates
 
 Change workspace dependency pins centrally and regenerate Cargo.lock. Change
-tool pins with the matching five-platform lock refresh:
+tool pins with the matching four-platform lock refresh:
 
 ```sh
-mise lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64,windows-x64
-mise -C apps/kuru-docs lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64,windows-x64
-mise -C packages/kuru-delivery lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64,windows-x64
+mise lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64
+mise -C apps/kuru-docs lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64
+mise -C packages/kuru-delivery lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64
 ```
 
 Mise records available provenance for every platform, but normally verifies

@@ -95,7 +95,8 @@ if [[ -z $kuru_target ]]; then
   esac
 fi
 case "$kuru_target" in
-  aarch64-apple-darwin|x86_64-apple-darwin|aarch64-unknown-linux-gnu|x86_64-unknown-linux-gnu) ;;
+  aarch64-apple-darwin|aarch64-unknown-linux-gnu|x86_64-unknown-linux-gnu) ;;
+  x86_64-apple-darwin) fail 'Intel Macs (x86_64-apple-darwin) are no longer supported; v0.9.0 was the last release supporting them' ;;
   *) fail 'unsupported platform; build from source with Rust' ;;
 esac
 
