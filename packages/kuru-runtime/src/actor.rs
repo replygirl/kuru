@@ -888,6 +888,11 @@ fn ordinary_request(
     private: &[Message],
     required: &[Message],
 ) -> Result<(CompletionRequest, Vec<ContextSourceSize>)> {
+    // Pre-turn rewrite provenance stays in private history only; every
+    // provider projection omits it, so the model sees only the rewritten input.
+    let private = provider_visible(private);
+    let required = provider_visible(required);
+    let (private, required) = (private.as_slice(), required.as_slice());
     let mut instructions = work.instructions.clone();
     instructions.push_str(&serde_json::to_string(
         &public
@@ -933,6 +938,16 @@ fn ordinary_request(
     ))
 }
 
+/// Messages a provider request may carry: everything except durable pre-turn
+/// rewrite provenance records.
+fn provider_visible(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .filter(|message| !crate::engine::is_pre_turn_rewrite_record(message))
+        .cloned()
+        .collect()
+}
+
 async fn run_context_compaction(
     provider: &dyn Provider,
     work: &Work,
@@ -948,12 +963,15 @@ async fn run_context_compaction(
         work.effort.as_deref(),
         budget,
     )?;
-    let rows = source
+    // Compaction is a provider projection too: rewrite provenance records are
+    // omitted, and the covered range ends at the last projected row.
+    let (sequences, rows): (Vec<_>, Vec<_>) = source
         .snapshot
         .rows
         .iter()
-        .map(|row| row.message.clone())
-        .collect::<Vec<_>>();
+        .filter(|row| !crate::engine::is_pre_turn_rewrite_record(&row.message))
+        .map(|row| (row.sequence, row.message.clone()))
+        .unzip();
     let fit = work
         .cancellation
         .wait(largest_fitting_context_prefix(provider, &base, &rows))
@@ -961,7 +979,7 @@ async fn run_context_compaction(
     if fit.selected_messages == 0 {
         return Ok(None);
     }
-    let through_sequence = source.snapshot.rows[fit.selected_messages - 1].sequence;
+    let through_sequence = sequences[fit.selected_messages - 1];
     let invocation_id = source.invocation_id(&work.invocation.operation_id, through_sequence)?;
     revalidate_compaction_source(&work.memory, source, &work.cancellation).await?;
     let invocation = InvocationStart {
@@ -975,6 +993,7 @@ async fn run_context_compaction(
         price_at_invocation: work.invocation.price_at_invocation.clone(),
     };
     invocation.validate()?;
+    let omitted_private_rows = rows.len().saturating_sub(fit.selected_messages) as u64;
     let mut request = base;
     request
         .messages
@@ -1000,11 +1019,7 @@ async fn run_context_compaction(
         context_generation: work.context_generation,
         omitted_public_rows: 0,
         omitted_summary_rows: 0,
-        omitted_private_rows: source
-            .snapshot
-            .rows
-            .len()
-            .saturating_sub(fit.selected_messages) as u64,
+        omitted_private_rows,
         omitted_note_rows: 0,
         runtime_sources,
         settled_reasoning_summaries: vec![],

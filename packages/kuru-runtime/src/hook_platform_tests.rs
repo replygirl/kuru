@@ -122,7 +122,7 @@ fn hook_seen(events: &[Event], hook_event: &str, outcome: &str, call_id: Option<
 }
 
 #[tokio::test]
-async fn pre_turn_rewrite_reaches_the_provider_with_durable_hook_provenance() {
+async fn pre_turn_rewrite_reaches_the_provider_without_its_durable_hook_provenance() {
     warm_hook_launch().await;
     let project = tempfile::tempdir().unwrap();
     let provider = Arc::new(Recording::default());
@@ -148,13 +148,40 @@ async fn pre_turn_rewrite_reaches_the_provider_with_durable_hook_provenance() {
         .await
         .unwrap();
     assert!(hook_seen(&output.events, "pre_turn", "rewritten", None));
+    // A later turn and an explicit compaction project the private history that
+    // now holds the durable record; neither may carry it to the provider.
+    harness
+        .run_for("platform follow-up", Some(&target))
+        .await
+        .unwrap();
+    let compacted_from = provider.requests.lock().unwrap().len();
+    harness
+        .compact_controlled(Some(&target), &CancellationToken::new())
+        .await
+        .unwrap();
     let requests = provider.requests.lock().unwrap().clone();
-    assert!(!requests.is_empty());
-    assert!(requests.iter().all(|request| {
-        !request
+    assert!(
+        requests.len() > compacted_from,
+        "compaction made no provider request"
+    );
+    assert!(requests.iter().any(|request| {
+        request
             .messages
             .iter()
-            .any(|message| message.text_projection().contains("platform original"))
+            .any(|message| message == &Message::text("user", "platform rewrite"))
+    }));
+    // The provider sees only the rewritten request: neither the original text
+    // nor the private provenance record (nor any hook record: no post hooks
+    // are configured) reaches any projection.
+    assert!(requests.iter().all(|request| {
+        !request.messages.iter().any(|message| {
+            message.role == "kuru-hook"
+                || crate::engine::is_pre_turn_rewrite_record(message)
+                || message.text_projection().contains("platform original")
+                || message
+                    .text_projection()
+                    .contains("rewritten by a pre_turn hook")
+        })
     }));
     let private = harness.memory_for(&target).await.unwrap();
     let rewritten = private
@@ -166,6 +193,7 @@ async fn pre_turn_rewrite_reaches_the_provider_with_durable_hook_provenance() {
         .map(|previous| &private[previous])
         .expect("rewritten input lacks its preceding hook record");
     assert_eq!(provenance.role, "kuru-hook");
+    assert!(crate::engine::is_pre_turn_rewrite_record(provenance));
     assert_eq!(
         harness.history().await.unwrap().first(),
         Some(&Message::text("user", "platform original"))

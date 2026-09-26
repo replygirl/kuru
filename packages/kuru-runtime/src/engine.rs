@@ -59,6 +59,24 @@ const MAX_TURN_TRANSITIONS: usize = 64;
 pub const INTERRUPTION_ROLE: &str = "kuru-interruption";
 /// Stable user-facing content of a durable interruption marker.
 pub const INTERRUPTION_TEXT: &str = "Turn interrupted; no completed answer was committed.";
+/// Private-history role of Kuru's lifecycle-hook records (annotations and
+/// pre-turn rewrite provenance).
+pub(crate) const HOOK_RECORD_ROLE: &str = "kuru-hook";
+
+/// Whether `message` is a durable pre-turn rewrite provenance record. It is
+/// kept in private history but never projected into a provider request: the
+/// model sees only the rewritten input. Post-hook annotations share the role
+/// and remain eligible for context.
+pub(crate) fn is_pre_turn_rewrite_record(message: &Message) -> bool {
+    message.role == HOOK_RECORD_ROLE
+        && message
+            .plain_text()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .is_some_and(|record| {
+                record["event"] == HookEvent::PreTurn.label()
+                    && record["outcome"] == HookOutcomeKind::Rewritten.label()
+            })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Focus {
@@ -1831,7 +1849,7 @@ impl Harness {
         let namespace = self.checked_namespace(actor).ok();
         for annotation in &run.annotations {
             let message = Message::text(
-                "kuru-hook",
+                HOOK_RECORD_ROLE,
                 json!({
                     "session_id": self.session.id,
                     "operation_id": self.operation_id,
@@ -3664,10 +3682,11 @@ impl Harness {
         // A rewritten input is hook-authored text. Wherever it is retained in
         // an actor's durable history, this record precedes it so it is never
         // indistinguishable from the user's own words; the original stays in
-        // the public transcript and the rewrite shapes only this turn's view.
+        // the public transcript. The record is private: provider projections
+        // omit it, so the model sees only the rewritten request.
         let rewrite_provenance = public_input_override.as_ref().map(|_| {
             Message::text(
-                "kuru-hook",
+                HOOK_RECORD_ROLE,
                 json!({
                     "session_id": self.session.id,
                     "operation_id": self.operation_id,

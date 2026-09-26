@@ -379,6 +379,13 @@ async fn inspection_skips_hooks_while_runtime_rewrite_preserves_the_durable_inpu
                 .iter()
                 .any(|message| message.text_projection().contains("rewritten input"))
     }));
+    // The durable provenance record never reaches a provider projection.
+    assert!(requests.iter().all(|request| {
+        !request
+            .messages
+            .iter()
+            .any(crate::engine::is_pre_turn_rewrite_record)
+    }));
     let deliberate = requests
         .iter()
         .find(|request| request.instructions.contains("Phase: deliberate"))

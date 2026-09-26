@@ -835,7 +835,7 @@ async fn dream_proposed_external_calls_never_prompt_or_dispatch() {
         report
             .rejected
             .iter()
-            .all(|reason| reason.contains("only dream_suggest is available")),
+            .all(|reason| reason.contains("tool is not offered in this phase")),
         "{report:?}"
     );
     assert!(!marker.exists(), "dream file call took effect");

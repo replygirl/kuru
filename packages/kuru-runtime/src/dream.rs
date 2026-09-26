@@ -125,11 +125,10 @@ impl Harness {
                             report.summaries += 1;
                         }
                         for (index, original) in reply.calls().into_iter().enumerate() {
-                            // The authored proposal cap and the offered dream tool are
-                            // checked before any hook sees the call.
-                            let admission = if index >= plan.max_proposals_per_part
-                                || !dream_tools.iter().any(|tool| tool.name == original.name)
-                            {
+                            // The authored proposal cap is checked before any hook sees
+                            // the call; the shared pre-tool admission then settles a call
+                            // outside the offered dream tool before any hook runs.
+                            let admission = if index >= plan.max_proposals_per_part {
                                 ToolHookAdmission::Dispatch(original)
                             } else {
                                 self.run_pre_tool_hooks(
@@ -157,7 +156,8 @@ impl Harness {
                             } else if let Some(result) = pre_settled {
                                 result.and_then(|_| Err(anyhow::anyhow!("pre-tool hook did not settle a dream proposal")))
                             } else if call.name != "dream_suggest" {
-                                Err(anyhow::anyhow!("only dream_suggest is available"))
+                                // Unreachable: admission settles unoffered calls above.
+                                Err(anyhow::anyhow!("tool is not offered in this phase"))
                             } else {
                                 serde_json::from_value::<DreamProposal>(call.arguments.clone())
                                     .map_err(Into::into)

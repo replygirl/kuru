@@ -30,10 +30,12 @@ const MAX_ANNOTATION_BYTES: usize = 16 * 1024;
 pub const MAX_PRE_TURN_INPUT_BYTES: usize = 131_072;
 const MAX_TOOL_NAME_BYTES: usize = 256;
 /// One owned cleanup deadline: terminate, reap, group absence and pipe drains.
+/// After the root exits, reaping and the output drain share one such deadline.
 const CLEANUP: Duration = Duration::from_secs(5);
-/// A worker observes caller loss at its next poll and then finishes one
-/// `CLEANUP` deadline; the equal margin covers that observation and thread
-/// scheduling. Exceeding it is reported as unconfirmed cleanup.
+/// A worker observes caller loss at its next poll and then finishes within one
+/// `CLEANUP` deadline (before or after root exit); the equal margin covers that
+/// observation and thread scheduling. Exceeding it is reported as unconfirmed
+/// cleanup.
 const QUIESCE: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(10);
 /// Only an owned hook launch adds this marker to its finite child environment.
@@ -901,23 +903,42 @@ async fn run_owned(
         }
     }
     drop(input);
-    let status = wait_for_exit(&mut owner, deadline, reply).await?;
+    let (status, tail) = wait_for_exit(&mut owner, deadline, reply).await?;
     // The owned tree is gone, but a descendant that left it can still hold a
-    // pipe. Drain only within the remaining deadline and never parse a
-    // partial response.
-    let drain = deadline.min(Instant::now() + CLEANUP);
+    // pipe. Drain only within the remaining deadline and the post-exit cleanup
+    // bound already shared with reaping, stop at caller loss, and never parse
+    // a partial response.
+    let drain = deadline.min(tail);
     let drained = tokio::time::timeout_at(drain.into(), async {
-        let output = (&mut stdout)
-            .await
-            .context("lifecycle hook stdout task stopped")??;
-        (&mut stderr)
-            .await
-            .context("lifecycle hook stderr task stopped")??;
-        Ok::<_, anyhow::Error>(output)
+        let pipes = async {
+            let output = (&mut stdout)
+                .await
+                .context("lifecycle hook stdout task stopped")??;
+            (&mut stderr)
+                .await
+                .context("lifecycle hook stderr task stopped")??;
+            Ok::<_, anyhow::Error>(output)
+        };
+        tokio::pin!(pipes);
+        loop {
+            tokio::select! {
+                output = &mut pipes => break Some(output),
+                _ = tokio::time::sleep(POLL) => {
+                    if reply.is_closed() {
+                        break None;
+                    }
+                }
+            }
+        }
     })
     .await;
     let output = match drained {
-        Ok(output) => output?,
+        Ok(Some(output)) => output?,
+        Ok(None) => {
+            stdout.abort();
+            stderr.abort();
+            bail!("lifecycle hook caller cancelled");
+        }
         Err(_) => {
             stdout.abort();
             stderr.abort();
@@ -1081,12 +1102,14 @@ async fn cleanup(owner: &mut HookOwner, deadline: Instant) -> Result<()> {
         .map_err(|error| error.context(CleanupUnconfirmed))
 }
 
+/// Wait for the root to exit, then reap it. Returns its success and the single
+/// post-exit cleanup deadline that the caller's output drain must share.
 #[cfg(unix)]
 async fn wait_for_exit(
     owner: &mut HookOwner,
     deadline: Instant,
     reply: &oneshot::Sender<Result<HookResponse>>,
-) -> Result<bool> {
+) -> Result<(bool, Instant)> {
     loop {
         if reply.is_closed() {
             cleanup(owner, Instant::now() + CLEANUP).await?;
@@ -1106,8 +1129,10 @@ async fn wait_for_exit(
         }
         tokio::time::sleep(POLL).await;
     }
-    reap_after_exit(owner, Instant::now() + CLEANUP)
+    let tail = Instant::now() + CLEANUP;
+    reap_after_exit(owner, tail)
         .await
+        .map(|status| (status, tail))
         .map_err(|error| error.context(CleanupUnconfirmed))
 }
 
@@ -1139,19 +1164,21 @@ async fn reap_after_exit(owner: &mut HookOwner, limit: Instant) -> Result<bool> 
     Ok(status)
 }
 
+/// Wait for the root to exit. Returns its success and the single post-exit
+/// cleanup deadline that the caller's output drain must share.
 #[cfg(windows)]
 async fn wait_for_exit(
     owner: &mut HookOwner,
     deadline: Instant,
     reply: &oneshot::Sender<Result<HookResponse>>,
-) -> Result<bool> {
+) -> Result<(bool, Instant)> {
     loop {
         if reply.is_closed() {
             cleanup(owner, Instant::now() + CLEANUP).await?;
             bail!("lifecycle hook caller cancelled");
         }
         if let Some(status) = owner.try_wait()? {
-            return Ok(status.success());
+            return Ok((status.success(), Instant::now() + CLEANUP));
         }
         if Instant::now() >= deadline {
             cleanup(owner, Instant::now() + CLEANUP).await?;
@@ -1811,6 +1838,54 @@ mod tests {
         assert_eq!(run.observations.len(), 1);
         assert_eq!(run.observations[0].outcome, HookOutcomeKind::Failed);
         host.quiesce().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_after_root_exit_stops_the_held_output_drain() {
+        let root = tempfile::tempdir().unwrap();
+        // The descendant escapes the owned group, keeps stdout open, and
+        // publishes `orphaned` only after the hook root has exited, so the
+        // caller is cancelled in the post-exit tail rather than before exit.
+        let hook = command(
+            "cat >/dev/null; /usr/bin/perl -MPOSIX -e 'POSIX::setsid() or die; my $p = getppid(); open(my $f, \">\", \"escaped.tmp\") or die; print $f $$; close $f; rename(\"escaped.tmp\", \"escaped\"); for (1..6000) { last if getppid() != $p; select(undef, undef, undef, 0.01) } open($f, \">\", \"orphaned.tmp\") or die; close $f; rename(\"orphaned.tmp\", \"orphaned\"); for (1..6000) { last if -e \"release\"; select(undef, undef, undef, 0.01) }' & while [ ! -e escaped ]; do sleep 0.01; done",
+        );
+        let budget_wait = Duration::from_millis(hook.timeout_ms);
+        let host = Arc::new(host(root.path(), HookEvent::PreTurn, hook));
+        let task = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.run_pre(
+                    &host.budget(),
+                    HookEvent::PreTurn,
+                    "invocation",
+                    "actor",
+                    Some("turn"),
+                    None,
+                    serde_json::json!({"input":"hello"}),
+                )
+                .await
+            }
+        });
+        let orphaned = wait_for_file(&root.path().join("orphaned"), budget_wait).await;
+        task.abort();
+        assert!(orphaned, "hook root did not exit before its timeout");
+        assert!(task.await.unwrap_err().is_cancelled());
+        // The worker settles within its shared post-exit bound while the
+        // escaped descendant still holds the output open.
+        host.quiesce().await.unwrap();
+        assert_eq!(host.in_flight_hooks(), 0);
+        let escaped: i32 = std::fs::read_to_string(root.path().join("escaped"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let held = nix::sys::signal::kill(nix::unistd::Pid::from_raw(escaped), None).is_ok();
+        std::fs::write(root.path().join("release"), b"").unwrap();
+        assert!(
+            held,
+            "descendant released the output before cancellation settled"
+        );
     }
 
     fn manual_clock() -> (Clock, Arc<Mutex<Instant>>) {
