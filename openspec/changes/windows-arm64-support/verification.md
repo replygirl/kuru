@@ -1,6 +1,6 @@
 ## 1. Native memory on Windows on Arm [critical]
 
-- [ ] 1.1 @runtime (agent) `windows-coverage` `memory` and `runtime` shards (five-shard matrix from #107) on `windows-11-arm` with the PR6a engine imported through `bundle:prepare --archive --offline` -> both shards green, receipts record host triple `aarch64-pc-windows-msvc`, run id recorded here
+- [ ] 1.1 @runtime (agent) `coverage:shard` `memory` and `runtime` shards (post-PR4b uniform five-shard job) on `windows-11-arm` with the PR6a engine imported through `bundle:prepare --archive --offline` -> both shards green, receipts record host triple `aarch64-pc-windows-msvc`, run id recorded here
 - [ ] 1.2 @e2e (agent) `//apps/kuru-tui:test:embedded-runtime` on `windows-11-arm` with a cold offline engine cache -> install, first conversation, resume and update pass without any download
 
 ## 2. Owned process cleanup on Windows on Arm [critical]
@@ -14,22 +14,22 @@
 
 ## 4. Installation on Windows on Arm [critical]
 
-- [ ] 4.1 @e2e (agent) `windows-install` on `windows-11-arm`: `mise run install`, `bundle:verify-native-build`, `verify:windows-imports` -> source install completes, missing and corrupt-mirror builds fail at the memory build-script boundary, the shipping `kuru.exe` and embedded `dolt.exe` are PE ARM64 with OS-only imports
+- [ ] 4.1 @e2e (agent) PR5's per-OS install/update job on `windows-11-arm`: `mise run install`, `bundle:verify-native-build`, `verify:windows-imports` -> source install completes, missing and corrupt-mirror builds fail at the memory build-script boundary, the shipping `kuru.exe` and embedded `dolt.exe` are PE ARM64 with OS-only imports
 - [ ] 4.2 @integration (agent) bootstrap tests in the `delivery-archive` shard on both Windows runners -> the bootstrap selects the runner's native target while `PROCESSOR_ARCHITECTURE=AMD64` is injected into a native shell (proving the environment is ignored), rejects a mismatched explicit `-Target`, and requires the per-target PE machine; if step zero finds an x64 PowerShell host, a case launched from that emulated process also selects `aarch64-pc-windows-msvc`, otherwise the absence is recorded here
 - [ ] 4.3 @unit (agent) `targets.rs` test after the catalog entry -> `for_platform("windows","aarch64")` yields `kuru.exe`/`zip`; `x86_64-pc-windows-gnu` still rejected
 - [ ] 4.4 @integration (agent) bootstrap recovery case on both Windows runners -> an interrupted update whose receipt names an x64 helper (`x86_64-pc-windows-msvc-<sha>.exe`, PE machine `0x8664`) is recovered, and a helper whose name and PE machine disagree is rejected
 
 ## 5. Update on Windows on Arm [critical]
 
-- [ ] 5.1 @e2e (agent) `verify-staged-windows` `{windows-11-arm, aarch64-pc-windows-msvc}` on the first maintainer-authorized Release run after merge (release-time gate; recorded as an explicit post-merge deferral at archive, task 3.8) -> staged ZIP installs through loopback mise, offline demo persists and resumes, engine and licenses match the manifest, and the log carries either a predecessor-updater success or `no predecessor for aarch64-pc-windows-msvc: inspected ...`
+- [ ] 5.1 @e2e (agent) `verify-staged` leg `{windows-11-arm, aarch64-pc-windows-msvc}` (mise-route, mirroring `windows-latest`) on the first maintainer-authorized Release run after merge (release-time gate; recorded as an explicit post-merge deferral at archive, task 3.8) -> staged ZIP installs through loopback mise, offline demo persists and resumes, engine and licenses match the manifest, and the log carries either a predecessor-updater success or `no predecessor for aarch64-pc-windows-msvc: inspected ...`
 - [ ] 5.2 @unit (agent) `published.rs` selection tests with an in-memory manifest provider -> `predecessor_is_the_greatest_older_release_carrying_the_target`, `predecessor_skips_releases_without_the_target_when_a_later_one_exists`, `no_predecessor_when_no_stable_release_carries_the_target`, `no_predecessor_requires_the_manifest_to_agree`, `no_predecessor_follows_every_listing_page` pass on every host without network access; fetched `SHA256SUMS` are authenticated against their listed digests
-- [ ] 5.3 @integration (agent) `test:previous-release-update` on x64 Windows, macOS arm64 and Linux with a read `GITHUB_TOKEN` -> the actual previous release's updater installs the candidate; the `Release` branch of the new enum behaves as before
-- [ ] 5.4 @e2e (agent) `windows-install` `test:embedded-runtime` on `windows-11-arm` -> `packaged_install_and_update_preserve_complete_offline_memory` passes natively; this is the pre-merge update evidence for the support claim
+- [ ] 5.3 @integration (agent) `test:previous-release-update` in PR5's per-OS install/update job in ordinary CI on `windows-latest`, `macos-latest` and `ubuntu-latest` with `GITHUB_TOKEN` from CI -> the actual previous release's updater installs the candidate; the `Release` branch of the new enum behaves as before; on the `windows-11-arm` leg, until a release carries `aarch64-pc-windows-msvc`, the log carries `no predecessor for aarch64-pc-windows-msvc: inspected ...`
+- [ ] 5.4 @e2e (agent) per-OS install/update job `test:embedded-runtime` on `windows-11-arm` -> `packaged_install_and_update_preserve_complete_offline_memory` passes natively; this is the pre-merge update evidence for the support claim
 
 ## 6. x64 stays green through every generalization [critical]
 
-- [ ] 6.1 @regression (agent) full x64 `windows-2025` CI (native-platform, five coverage shards, report, install) on every phase-2 commit -> green with no catalog or workflow change; fixtures derive `AMD64` from the native machine
-- [ ] 6.2 @unit (agent) `release_workflow.rs` gate cases, in the phase-3 workflow commit (task 3.4) because the test reads the live `native-tests.yml` gate script -> `windows-2025` accept/reject cases unchanged, `windows-11-arm` accept and each reject case added, unknown Windows label rejected
+- [ ] 6.1 @regression (agent) full x64 Windows CI (`windows-2025` before PR5, `windows-latest` after; native-platform, five coverage shards, collect, install/update) on every phase-2 commit -> green with no catalog or workflow change; fixtures derive `AMD64` from the native machine
+- [ ] 6.2 @unit (agent) `release_workflow.rs` gate cases, in the phase-3 workflow commit (task 3.4) because the test reads the live `native-tests.yml` gate script as PR5 rewrites it around shard, collect and install -> `windows-latest` accept/reject cases unchanged, `windows-11-arm` accept and each reject case added, unknown Windows label rejected
 - [ ] 6.3 @integration (agent) `//packages/kuru-delivery:test`, `//packages/kuru-memory:test`, `//apps/kuru-tui:test` on macOS arm64 and x64 Windows after phase 2 -> all pass; `cargo check --target aarch64-pc-windows-msvc` for `kuru-platform` passes via the new cross-check task
 - [ ] 6.4 @integration (agent) staged mise fixture asset ids after the #106 rebase -> ids derive from `CATALOG` position, `SHA256SUMS` has an id past the catalog, all ids are unique, and the `api_fallback` scenario passes on x64 Windows
 

@@ -48,8 +48,16 @@ three merge and then moves them into the sections above, where
   Questions and needs lead confirmation before phase 2 starts. D8's workflow
   wiring goes to the PR6a owner for review before task 3.4 (lead decision 4:
   "this session reviews its workflow wiring").
-- PR5 (workflow ownership): another session owns every file under
-  `.github/workflows` until it sends its PR5 merge notice. Phase-3 tasks that
-  edit workflows, and the `release_workflow.rs` gate cases that read the live
-  workflow text, wait for that notice. PR4a/PR4b/PR5 precede PR6a in the
-  maintainer's sequence.
+- PR5 and PR4b (workflow ownership), both hard gates for stage 3: another
+  session owns every file under `.github/workflows` until it sends the merge
+  notices for PR5 and PR4b. PR5 removes `release.yml`'s `source-tests` and
+  `verify-tests`, adds the pre-bump Ubuntu `tests` job, makes `verify-staged`
+  a three-OS matrix, moves the Windows label to `windows-latest`, adds the
+  per-OS install/update job running `test:previous-release-update`, and
+  rewrites `native-gate` around shard, collect and install. PR4b replaces the
+  Unix monolithic coverage job with the uniform five-shard `coverage:shard` job
+  and one collect job per OS on every OS. D8's arm64 mirror and aggregator
+  edits are based on the post-PR4b file, so phase-3 tasks that edit workflows,
+  and the `release_workflow.rs` gate cases that read the live workflow text,
+  wait for both notices. PR4a/PR4b/PR5 precede PR6a in the maintainer's
+  sequence.

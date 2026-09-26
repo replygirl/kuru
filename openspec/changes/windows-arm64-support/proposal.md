@@ -41,10 +41,11 @@ code path.
 - Parametrize the staged and published Windows verifiers, their receipts and
   artifact names by target.
 - Mirror every x64 Windows CI and Release job on `windows-11-arm` (platform
-  primitives, coverage shards and report, install and offline runtime, release
-  build leg, staged acceptance, post-publication verification) with fail-closed
-  aggregation. Workflow edits are deferred until the workflow owner's PR5 merge
-  notice; this change designs them and updates `release_workflow.rs` with them.
+  primitives, coverage shards and collect, install/update and offline runtime,
+  release build leg, staged acceptance, post-publication verification) with
+  fail-closed aggregation, against the post-PR5 and post-PR4b workflow shapes.
+  Workflow edits are deferred until the workflow owner's PR5 and PR4b merge
+  notices; this change designs them and updates `release_workflow.rs` with them.
 - Add `windows-arm64` platform entries to the tool lockfiles, using the x64 cospec
   asset under emulation first and a named, receipt-recorded
   `cospec_contract` exclusion only if mise cannot select or run it.
@@ -96,7 +97,7 @@ None.
   `tests/windows_commands.rs` fixture. No new unsafe API.
 - `packages/kuru-connectors/src/tools.rs` fixture sites: reviewed, see design.
 - `.github/workflows/ci.yml`, `native-tests.yml`, `release.yml`: designed here;
-  edited only after the PR5 merge notice (phase 3).
+  edited only after the PR5 and PR4b merge notices (phase 3).
 - Root `mise.toml` (cospec `windows-arm64` `asset_pattern`), `mise.lock`,
   `apps/kuru-docs/mise.lock`, `packages/kuru-delivery/mise.lock`:
   `windows-arm64` platform entries. `docs/development.md` lock-refresh commands.

@@ -52,7 +52,26 @@ Current state, `main` at `501ab92d` unless noted:
   `native-gate` on the literal `windows-2025`; artifact names carry no OS.
   `release_workflow.rs` asserts the literal workflow text. Release-time
   `native-tests` calls pass no `os`, so release validation runs Ubuntu only.
-  No CI job runs #108's `test:previous-release-update` yet.
+  At `501ab92d` no CI job runs #108's `test:previous-release-update`; the
+  workflow owner's confirmed PR5 shape (next bullet) adds it to ordinary CI on
+  every OS, including Windows.
+- Confirmed post-PR5 and post-PR4b workflow shapes (workflow owner, 2026-09-26;
+  exact text lands with the PR5 and PR4b merge notices). `release.yml`: the
+  pre-bump `native-tests` call (`source-tests`) and the post-bump coverage rerun
+  (`verify-tests`) are removed; a pre-bump `tests` job runs the ordinary
+  `mise run test` on `ubuntu-latest`; post-bump `verify` (`quality.yml`) stays;
+  `verify-staged` is a three-OS matrix (`windows-latest` keeps the mise-route
+  `verify:staged-windows`; `ubuntu-latest` and `macos-latest` run an interim leg:
+  `SHA256SUMS` verify, extract, `test:embedded-runtime` on the extracted binary,
+  `test:previous-release-update` against it); `deploy-docs` and `publish` need
+  `verify-staged`; `verify-published-windows` is unchanged. `native-tests.yml`:
+  the Windows label is `windows-latest` (not `windows-2025`); PR4b removes the
+  Unix monolithic coverage job, so every OS runs the five shards through a Rust
+  `coverage:shard` task and one uniform collect job per OS; PR5 adds
+  `test:previous-release-update` to a per-OS install/update job on all three
+  OSes for `pull_request`, `merge_group` and main push (`GITHUB_TOKEN` from CI,
+  network on, `KURU_UPDATE_CANDIDATE_BINARY` per #108's documented paths); and
+  `native-gate` is rewritten around shard, collect and the per-OS install job.
 - Tooling on `windows-11-arm` (design note §7; runner image README
   `actions/runner-images` `images/windows/Windows11-Arm64-Readme.md` at
   `d50c3090b1`, 2026-09-25, which supersedes the `actions/partner-runner-images`
@@ -377,13 +396,15 @@ Rules, in order:
   `no predecessor for <target>: inspected v0.9.0, v0.8.0 ... across N releases, all pages`
   and returns `Ok` without running any updater. On `Release` it runs unchanged.
 - `mise_acceptance.rs::run_staged` and `tests/previous_release_update.rs` pass
-  the host target and print the same line, so the `verify-staged-windows` job log
+  the host target and print the same line, so the Windows `verify-staged` leg's log
+  (`verify-staged-windows` before PR5), PR5's per-OS install/update job log
   and the CI acceptance log carry the evidence. No new receipt file: the staged
   check has none today and the published verifier does not run the previous
   updater. Whether a future staged receipt carries the decision as a field is a
   designer default (log line only) awaiting lead confirmation (Open Question 2).
 - The rule cannot be a workflow `if:` (`release_workflow.rs` forbids it in
-  `verify-staged-windows`), which is why it lives here.
+  `verify-staged-windows`; the post-PR5 `verify-staged` assertions are pending
+  the PR5 notice), which is why it lives here.
 
 Unit tests (pure, fixture listings and in-memory manifest provider, no network):
 
@@ -502,6 +523,16 @@ The PR6a owner reviews this wiring before task 3.4 edits any workflow (lead
 decision 4). Every new `uses:` step, including the `actions/download-artifact`
 import step, is pinned by commit SHA.
 
+The mirror is designed against the workflow owner's confirmed post-PR5 and
+post-PR4b shapes (Current state), not the `501ab92d` files: the x64 twin runs on
+`windows-latest` and the arm64 leg on `windows-11-arm`; `native-tests.yml` is the
+uniform five-shard `coverage:shard` job plus one collect job per OS and PR5's
+per-OS install/update job; `release.yml` has `verify-staged` as a three-OS
+matrix. The job ids, step names, gate script and `release_workflow.rs`
+expectations quoted below describe that shape and are **pending the PR5 and
+PR4b merge notices**; task 3.4 rebases onto the merged files and takes their
+exact text from them, without changing the wiring decisions here.
+
 Step zero, a throwaway job on `windows-11-arm` in the first phase-3 commit,
 removed before merge: print `[Environment]::Is64BitProcess`,
 `$env:PROCESSOR_ARCHITECTURE`, `PROCESSOR_ARCHITEW6432` and the `IsWow64Process2`
@@ -516,22 +547,22 @@ ARM64 before the bootstrap is trusted on that assumption.
 
 | x64 job | arm64 twin | Parameters | Aggregation |
 |---|---|---|---|
-| `ci.yml native-platform` | matrix leg `{os: windows-11-arm, target: aarch64-pc-windows-msvc}` of the same job, name `Native platform primitives (${{ matrix.target }})` | `runs-on: ${{ matrix.os }}`, `CARGO_BUILD_TARGET: ${{ matrix.target }}`, rust-cache `shared-key: native-platform-${{ matrix.target }}`, artifact `coverage-native-platform-${{ matrix.target }}` (the current name would collide) | none; `ci-gate` sees the job result |
-| `ci.yml native-tests` matrix | add `windows-11-arm` to `os` | — | `native-gate` below |
-| `native-tests.yml coverage` (Unix) | not run on arm64 | `if: !startsWith(inputs.os, 'windows')` | gate |
-| `windows-coverage` | same job | `runs-on: ${{ inputs.os }}`, `if: startsWith(inputs.os, 'windows')`; artifacts `<prefix>-coverage-<inputs.os>-<shard>-attempt-<n>` and `...-diagnostics-...`; rust-cache key `native-coverage-${{ inputs.os }}`; the PR6a import step (`download-artifact bundle-input-aarch64-pc-windows-msvc` then `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline` into the job's private `KURU_DOLT_BUNDLE_DIR`) conditioned on the os before `coverage:windows:shard`; `install_args` per D7; matrix stays byte-equal to `coverage::SHARDS` (five after #107); `KURU_COVERAGE_JOB_MINUTES` stays equal to the timeout | gate |
-| `windows-coverage-report` | same job | `runs-on: ${{ inputs.os }}`; download patterns `<prefix>-coverage-<inputs.os>-<shard>-attempt-*` so the two Windows OS calls never cross-contaminate; upload `<prefix>-coverage-${{ inputs.os }}-attempt-<n>`; the collector requires every receipt to share one host triple | gate |
-| `windows-install` | same job | `runs-on: ${{ inputs.os }}`; rust-cache key per os; the same PR6a import step; tasks generalized per D3 | gate |
-| `native-gate` | same job | replace the `windows-2025` literal with an explicit allowlist: `windows-2025` and `windows-11-arm` take the Windows branch, `ubuntu-*`/`macos-*` the Unix branch, any other label fails with the label in the message; `release_workflow.rs::`native_workflow_gate_rejects_incomplete_windows_results` gains the arm64 accept case, each arm64 reject case and an unknown-label reject case in the same commit, because the test extracts the gate script from the live `native-tests.yml` (`release_workflow.rs:305-314`) and today's script branches only on `windows-2025` (`native-tests.yml:447`); its Unix case tracks #106's labels | itself |
-| previous-release-update CI job | does not exist on main (#108 documents it, nothing runs it) | flagged to the workflow owner; when it is added, one leg per supported native OS including `windows-11-arm`, `KURU_UPDATE_CANDIDATE_BINARY` with `.exe`, `GITHUB_TOKEN: github.token` on the listing step only | must join `native-gate` or `ci-gate` needs |
-| `release.yml build` Windows leg | add `{os: windows-11-arm, target: aarch64-pc-windows-msvc}` | already keyed on `matrix.target`/`runner.os`; `needs` gains PR6a's release-scoped `dolt-windows-arm64` job built from `needs.bump.outputs.sha`, and the asserted literal `needs: [plan, bump, verify, verify-tests]` in `release_workflow.rs` changes with it; the artifact download and offline import steps carry `if: matrix.target == 'aarch64-pc-windows-msvc'` (`build` is the one job allowed step conditions) | `assemble-candidate` validates against the catalog, so D1 lands in the same commit |
-| `verify-staged-windows` | matrix `{windows-2025, x86_64-pc-windows-msvc}`, `{windows-11-arm, aarch64-pc-windows-msvc}` under the same job id | `runs-on: ${{ matrix.os }}`; `KURU_STAGED_WINDOWS_ARCHIVE: .../kuru-<version>-${{ matrix.target }}.zip`; no `if:` anywhere (asserted); the predecessor rule runs inside the task (D5) | same job id keeps `deploy-docs`/`publish` `needs` unchanged; `release_workflow.rs:101-126` move to the matrix form |
-| `verify-published-windows` | matrix over the same two legs | `runs-on`, `KURU_PUBLISHED_TARGET`, receipt `published-windows-<target>-receipt.json`, artifact `published-windows-<target>-<version>-<attempt>`; stays the file's final step (asserted) | none; post-publication |
+| `ci.yml native-platform` | matrix leg `{os: windows-11-arm, target: aarch64-pc-windows-msvc}` of the same job beside the x64 `windows-latest` leg, name `Native platform primitives (${{ matrix.target }})` | `runs-on: ${{ matrix.os }}`, `CARGO_BUILD_TARGET: ${{ matrix.target }}`, rust-cache `shared-key: native-platform-${{ matrix.target }}`, artifact `coverage-native-platform-${{ matrix.target }}` (the current name would collide) | none; `ci-gate` sees the job result |
+| `ci.yml native-tests` matrix | add `windows-11-arm` beside `windows-latest` in `os` | — | `native-gate` below |
+| post-PR4b shard job (`coverage:shard`, five shards, uniform on every OS) | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; artifacts os-qualified as `<prefix>-coverage-<inputs.os>-<shard>-attempt-<n>` and `...-diagnostics-...` (whatever os qualification PR4b's uniform names already carry is kept, not duplicated); rust-cache key per os; the PR6a import step (`download-artifact bundle-input-aarch64-pc-windows-msvc` then `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline` into the job's private `KURU_DOLT_BUNDLE_DIR`) conditioned on the os before `coverage:shard`; `install_args` per D7; matrix stays byte-equal to `coverage::SHARDS` (five); `KURU_COVERAGE_JOB_MINUTES` stays equal to the timeout | `native-gate` |
+| post-PR4b per-OS collect job | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; download patterns `<prefix>-coverage-<inputs.os>-<shard>-attempt-*` so the two Windows OS calls never cross-contaminate; os-qualified upload; the collector requires every receipt to share one host triple | `native-gate` |
+| PR5 per-OS install/update job (today's `windows-install` plus `test:previous-release-update`) | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; rust-cache key per os; the same PR6a import step; tasks generalized per D3; `test:previous-release-update` with `KURU_UPDATE_CANDIDATE_BINARY` at #108's documented `.exe` path, `GITHUB_TOKEN` from CI and network on exactly as PR5 sets them for `windows-latest`; until a release carries `aarch64-pc-windows-msvc` the leg passes on D5's `no predecessor for aarch64-pc-windows-msvc: ...` branch | `native-gate` |
+| `native-gate` (rewritten by PR5 around shard, collect and install) | same job | the rewritten gate recognizes `windows-11-arm` alongside `windows-latest` for its shard, collect and install checks, keeps the Unix labels on the uniform path, and fails any other Windows label with the label in the message (fail-closed allowlist); `release_workflow.rs`'s gate test (today `native_workflow_gate_rejects_incomplete_windows_results`, which extracts the gate script from the live `native-tests.yml`) gains the `windows-11-arm` accept case, each arm64 reject case and an unknown-label reject case in the same commit, with the `windows-latest` cases unchanged; exact script and test names pending the PR5 notice | itself |
+| `release.yml build` Windows leg | add `{os: windows-11-arm, target: aarch64-pc-windows-msvc}` | already keyed on `matrix.target`/`runner.os`; `needs` gains PR6a's release-scoped `dolt-windows-arm64` job built from `needs.bump.outputs.sha`, and the asserted `needs` literal in `release_workflow.rs` (post-PR5, without `verify-tests`) changes with it; the artifact download and offline import steps carry `if: matrix.target == 'aarch64-pc-windows-msvc'` (`build` is the one job allowed step conditions) | `assemble-candidate` validates against the catalog, so D1 lands in the same commit |
+| `verify-staged` (PR5 three-OS matrix) | fourth leg `{windows-11-arm, aarch64-pc-windows-msvc}` mirroring the `windows-latest` mise-route leg (`verify:staged-windows`), not the interim Unix leg | `runs-on: ${{ matrix.os }}`; `KURU_STAGED_WINDOWS_ARCHIVE: .../kuru-<version>-${{ matrix.target }}.zip`; the predecessor rule runs inside the task (D5); the Windows leg's step-condition rules follow whatever PR5 asserts for the matrix | `deploy-docs` and `publish` need `verify-staged`, so a failing arm64 leg blocks both; `release_workflow.rs` expectations move with the matrix |
+| `verify-published-windows` (unchanged by PR5) | arm64 twin: matrix over `{windows-latest, x86_64-pc-windows-msvc}` and `{windows-11-arm, aarch64-pc-windows-msvc}` | `runs-on`, `KURU_PUBLISHED_TARGET`, receipt `published-windows-<target>-receipt.json`, artifact `published-windows-<target>-<version>-<attempt>`; stays the file's final step (asserted) | none; post-publication |
 
-Caveats carried into the tasks: release-time `native-tests` calls pass no `os`
-and therefore run no Windows coverage for either architecture; arm64 coverage at
-release time exists only through staged and published acceptance, and the docs
-say so. Public-repo Arm runners have 4 vCPU; the 90-minute shard
+Caveats carried into the tasks: after PR5, `release.yml` makes no
+`native-tests` call; its only pre-bump test job is `tests` (`mise run test` on
+`ubuntu-latest`), so release time runs no Windows coverage for either
+architecture. Release-time Windows evidence stays staged and published
+acceptance (the former Open Question 6, settled by PR5's shape), while Unix
+gains the interim staged leg; the docs say so. Public-repo Arm runners have 4 vCPU; the 90-minute shard
 budget is measured on the first run before any change, and a fifth-or-more
 shard needs a `SHARDS` code change first. `windows-11-arm` is GA for public
 repositories and the repository is public; minutes are billed at the Arm rate
@@ -541,11 +572,12 @@ only for private repositories.
 
 The support claim rests on the five native checks AGENTS.md names, all of which
 run in ordinary CI on the branch before merge: memory, process cleanup, terminal,
-installation and update (D11). Update is covered natively by `windows-install`,
-whose `test:embedded-runtime` runs
+installation and update (D11). Update is covered natively by the per-OS
+install/update job (today's `windows-install`), whose PR5
+`test:previous-release-update` runs in ordinary CI and whose `test:embedded-runtime` runs
 `embedded_runtime.rs::packaged_install_and_update_preserve_complete_offline_memory`.
-Staged acceptance (`verify-staged-windows`) and post-publication verification
-(`verify-published-windows`) exist only in `release.yml`, which runs from main
+Staged acceptance (the Windows legs of `verify-staged`) and post-publication
+verification (`verify-published-windows`) exist only in `release.yml`, which runs from main
 after merge; they are release-time gates, not pre-merge evidence. Staged
 acceptance already blocks `deploy-docs` and public promotion in the same run, so
 a failing arm64 leg keeps the release, and the docs that claim support, from
@@ -562,8 +594,9 @@ publishing.
   "in verification" or do not mention it.
 - `docs/release.md`: both Windows legs in the build list, the staged and
   published matrix, the target-parametrized receipt name, the predecessor
-  sentence from D5, the note that release-time coverage is Ubuntu only, and that
-  staged acceptance gates docs deployment and promotion per target.
+  sentence from D5, the note that release-time Windows evidence is staged and
+  published acceptance only (release-time tests are Ubuntu `mise run test`),
+  and that staged acceptance gates docs deployment and promotion per target.
 - `docs/development.md` (A37, A38): the `windows-arm64` lock platform and the
   cospec `asset_pattern` pin in the refresh commands, an arm64 offline import
   example using PR6a's built archive, the `bundle:test-fixtures` note (A18),
@@ -589,7 +622,7 @@ publishing.
   so `assemble-candidate`, `expected_assets` and every x64 job are unchanged in
   behavior; x64 CI proves the generalizations on x64. A29/A30 wait
   for PR6a's manifest data.
-- Phase 3 (after the PR5 merge notice and PR6a's archive, which is a hard gate
+- Phase 3 (after the PR5 and PR4b merge notices and PR6a's archive, which is a hard gate
   here even though `cospec apply` sees it as soft): step zero, then the PR6a
   owner's review of D8, then D1 catalog entry + D8 workflow edits +
   `release_workflow.rs` text expectations and gate cases in one commit, then the
@@ -607,18 +640,24 @@ publishing.
 
 | Native check (AGENTS.md) | Evidence on `windows-11-arm` |
 |---|---|
-| memory | `windows-coverage` shards `memory` and `runtime` (five-shard matrix) pass with the PR6a engine imported offline; `test:embedded-runtime` cold offline conversation |
+| memory | `coverage:shard` shards `memory` and `runtime` (post-PR4b five-shard matrix) pass with the PR6a engine imported offline; `test:embedded-runtime` cold offline conversation |
 | process cleanup | `native-platform` arm64 leg (90% platform coverage) and the `connectors-core-platform` shard's owned-process and supervisor tests |
 | terminal | the `application` shard's ConPTY tests |
-| installation | `windows-install`: `mise run install` (source), `bundle:verify-native-build`, `verify:windows-imports`, plus the bootstrap tests in the `delivery-archive` shard |
-| update | `windows-install`'s `test:embedded-runtime` (`packaged_install_and_update_preserve_complete_offline_memory`) on the branch; the previous-release-update job once the workflow owner adds it |
-| staged acceptance (release-time, after merge) | `verify-staged-windows` `{windows-11-arm, aarch64-pc-windows-msvc}` green on the first maintainer-authorized Release run, with the predecessor decision in its log; gates `deploy-docs` and promotion |
+| installation | the per-OS install/update job: `mise run install` (source), `bundle:verify-native-build`, `verify:windows-imports`, plus the bootstrap tests in the `delivery-archive` shard |
+| update | the per-OS install/update job's `test:embedded-runtime` (`packaged_install_and_update_preserve_complete_offline_memory`) and PR5's `test:previous-release-update` in ordinary CI on the branch (the `no predecessor` branch until a release carries the target) |
+| staged acceptance (release-time, after merge) | `verify-staged` `{windows-11-arm, aarch64-pc-windows-msvc}` green on the first maintainer-authorized Release run, with the predecessor decision in its log; gates `deploy-docs` and promotion |
 | post-publication (release-time, after merge) | `verify-published-windows` arm64 receipt retained on that run |
 
 ## Operational surface
 
 Every arm64 delivery path runs on the same hosts and with the same secrets as the
-x64 one. `windows-11-arm` GitHub-hosted runners (image `20260920.174.1` with
+x64 one, whose label is `windows-latest` after PR5 (`windows-2025` before it).
+The arm64 jobs mirror the post-PR4b shard and per-OS collect jobs, PR5's per-OS
+install/update job (which runs `test:previous-release-update` on Windows in
+ordinary CI), the `release.yml` build leg, the `windows-11-arm` leg of the
+three-OS `verify-staged` matrix and the arm64 twin of the unchanged
+`verify-published-windows`; exact job text is pending the PR5 and PR4b merge
+notices. `windows-11-arm` GitHub-hosted runners (image `20260920.174.1` with
 Visual Studio 2022 or, after the actions/runner-images#14602 migration completes
 by 2026-09-30, `20260920.164.1` with Visual Studio 2026; 4 vCPU in public
 repositories; zstd 1.5.7 installed) run the native jobs; `ubuntu-24.04` runs PR6a's
@@ -626,8 +665,9 @@ engine build and hands the archive over as a workflow artifact that each arm64
 job imports offline into its own runner-created private `KURU_DOLT_BUNDLE_DIR`.
 No job binds a network listener beyond the existing loopback mise fixture in
 staged acceptance; no new secret is introduced, and the only token used is
-`github.token` for mise-action tool downloads and, on the previous-release
-listing step only, `GITHUB_TOKEN` for the GitHub REST metadata request. Asset
+`github.token` for mise-action tool downloads and, for
+`test:previous-release-update` (PR5's install/update job and the staged
+legs), `GITHUB_TOKEN` from CI for the GitHub REST metadata request. Asset
 downloads stay anonymous over HTTPS. Binary versions and architectures: Rust
 1.98.1 `aarch64-pc-windows-msvc`, mise 2026.9.4 native arm64, cargo-llvm-cov
 0.9.1 built from source (instrumented collection subject to rust-lang/rust#150123), cocogitto 7.0.0 and cospec 0.7.1 x64 assets under
@@ -728,12 +768,18 @@ tools; `dumpbin` is a build-time acceptance dependency only.
    Arm (D2).
 5. Designer default, needs lead confirmation: Windows 11 is the Arm floor
    (.NET Framework 4.8.1 native Arm64); Windows 10 on Arm is out of scope.
-6. Designer default, needs lead confirmation: release-time Windows coverage
-   stays staged/published-only for both architectures (D8 caveats).
+6. Resolved 2026-09-26 by the workflow owner's confirmed PR5 shape (was:
+   designer default, needs lead confirmation, that release-time Windows
+   coverage stays staged/published-only for both architectures). PR5 removes
+   the release-time `native-tests` call and the `verify-tests` coverage rerun,
+   runs pre-bump `mise run test` on `ubuntu-latest` only, and keeps Windows
+   release-time evidence to the `verify-staged` Windows legs and
+   `verify-published-windows`; Unix gains the interim staged leg. The default
+   stands for both architectures (D8 caveats) and no lead answer is needed.
 7. Needs lead decision if step zero reproduces rust-lang/rust#150123 on the
    pinned Rust 1.98.1; blocks phase 3 in that case. D8, D11 and verification
    rows 1.1 and 2.1 assume instrumented coverage works on arm64. Options: (a)
-   keep the arm64 `windows-coverage` shards, report and the `native-platform`
+   keep the arm64 `coverage:shard` shards, collect and the `native-platform`
    arm64 leg instrumented and hold the support claim until a pinned toolchain
    carries the upstream fix; or (b) run the same arm64 test selection
    uninstrumented as separately named behavioral evidence for the memory,
