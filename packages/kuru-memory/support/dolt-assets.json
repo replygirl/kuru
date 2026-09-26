@@ -106,7 +106,7 @@
         "toolchain": {
           "go": {
             "version": "go1.26.2",
-            "url": "https://go.dev/dl/go1.26.2.linux-amd64.tar.gz",
+            "url": "https://dl.google.com/go/go1.26.2.linux-amd64.tar.gz",
             "sha256": "990e6b4bbba816dc3ee129eaeaf4b42f17c2800b88a2166c265ac1a200262282"
           },
           "llvm_mingw": {

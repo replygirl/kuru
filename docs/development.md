@@ -226,7 +226,9 @@ first offline launch. The archive is a build input; memory provisioning never
 downloads it at runtime.
 
 `packages/kuru-memory/support/dolt-assets.json` owns the exact version, target,
-upstream URL, sizes and digests. The memory package's `bundle:prepare` task invokes
+provenance, sizes and digests. Each asset declares `"provenance": "upstream"`,
+with Dolt's release URL, or `"provenance": "built"`, for a target that upstream
+never publishes (see [source-built engine inputs](#source-built-engine-inputs)). The memory package's `bundle:prepare` task invokes
 the independent Rust delivery helper to download and verify that input. Ordinary
 mise build, run, test and check tasks prepare their inputs through dependencies.
 To prepare explicitly:
@@ -327,6 +329,65 @@ requires the specific build-script rejection, then restores a valid offline
 build. Run it after source installation with `KURU_EMBEDDED_TEST_BINARY` pointing
 to the installed copy outside Cargo's output directory. It verifies that the
 installed executable and original prepared archive retain their hashes.
+
+### Source-built engine inputs
+
+Upstream Dolt publishes no archive for some targets, currently
+`aarch64-pc-windows-msvc`, and cannot build them without cgo. A `built` manifest
+asset therefore pins everything its archive is made from: the Dolt Go module
+version and its `go.sum` `h1:` hash, the ICU source tarball's size and SHA-256,
+the Go and llvm-mingw toolchain versions, the recipe name and the single build
+host. Preparing, compiling or provisioning any other target never fetches,
+builds or reads a built asset's inputs. Runtime provisioning never builds or
+downloads an engine.
+
+The build host is **linux-x64 only**. llvm-mingw's target runtimes embed paths
+from the package that compiled them, so the same recipe on another host produces
+different bytes. Go and llvm-mingw are pinned as task-scoped tools in
+`packages/kuru-memory/mise.toml` and locked, for linux-x64 only, by
+`packages/kuru-memory/mise.lock`. On linux-x64:
+
+```sh
+mise run //packages/kuru-memory:setup:build-tools
+mise run //packages/kuru-memory:bundle:build -- \
+  --target aarch64-pc-windows-msvc --print-pins \
+  --work-dir /absolute/fresh/work --output /absolute/private/out
+```
+
+The delivery helper's `bundle build` rebuilds its child environment from `PATH`
+and `HOME` only, so inherited compiler, `CGO_*` and `GOFLAGS` settings cannot
+change the bytes. It fetches the Dolt module through the Go module proxy and
+checksum database and requires the pinned `h1:` hash. It streams ICU through the
+same bounded, digest-verified client as `bundle:prepare`, builds static ICU with
+stub data, and cross-compiles Dolt with cgo. It then checks that the PE machine
+is ARM64 and that only operating-system DLLs are imported. It writes
+`<stem>.zip` and `pins.json` to the output directory. The work directory must
+not exist; each run starts from empty module and build caches.
+
+The archive holds `LICENSES` (Dolt's Go dependency notices, byte-identical to
+the upstream archives) and one file per declared third-party notice beside it:
+ICU, the LLVM runtimes and the mingw-w64 runtime. Each notice is read from the
+pinned ICU tarball or the locked toolchain and pinned by size and SHA-256. Built
+assets must declare notices; upstream assets must not.
+
+Built pins land in two rounds. Until the linux-x64 job has run, the built asset's
+archive and executable digests, and any notice digest that has not been observed,
+are the literal `"unpinned"` with `null` sizes. Such an asset can be built with
+`--print-pins` but can never be prepared or embedded; `bundle:prepare` and Cargo
+fail with the build instruction. The `Bundle build` workflow
+(`.github/workflows/bundle-build.yml`) builds twice on `ubuntu-latest` in fresh
+private directories and fails unless the two archives are byte-identical. It
+prints and uploads the archive, its SHA-256 and the observed pins. Commit those
+pins; from then on every build verifies against them and any drift fails with
+both digests. A pinned built archive is never downloaded: import the CI artifact
+or a local linux-x64 build with `bundle:prepare -- --target
+aarch64-pc-windows-msvc --archive <file>`.
+
+`KURU_BUNDLE_BUILD_HOST_OVERRIDE=1` lets `bundle build` run on another host for
+local iteration on the recipe. Its output is **not authoritative**: it requires
+`--print-pins`, never verifies or replaces committed pins, and is labelled as an
+override. Put the matching Go and llvm-mingw `bin` directories on `PATH` yourself;
+the mise task pins only the linux-x64 toolchain package.
 
 ## Change workflow
 
@@ -467,6 +528,16 @@ Review the resulting `provenance_verified` metadata alongside URLs and checksums
 This also keeps CI installation from creating uncommitted verification metadata.
 See mise's [lockfile provenance contract](https://mise.jdx.dev/dev-tools/mise-lock.html#provenance-and-security)
 and [task tool configuration](https://mise.jdx.dev/tasks/task-configuration.html#tools).
+
+The memory package's source-build toolchains are locked for their only build
+host: `mise -C packages/kuru-memory lock --platform linux-x64`. Their tarball URLs
+and digests are mirrored in the built manifest asset, and a delivery test
+requires the two to agree.
+
+A built asset's `archive_sha256` also depends on the exact `zip` and `flate2`
+crate pins that write the archive. A Cargo.lock refresh that moves either crate
+must re-pin that archive digest from the linux-x64 `Bundle build` job; its
+executable and notice digests are unaffected. The job fails loudly on a stale pin.
 
 Commit the updated lockfile in the same change. CI detects lock drift. Update
 user documentation when flags, configuration, role behavior or contracts change.

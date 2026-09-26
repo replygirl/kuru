@@ -21,7 +21,7 @@ const RECIPES: [&str; 1] = ["dolt-cgo-llvm-mingw-icu-stub/1"];
 const BUILD_HOST: &str = "linux-x64";
 const DOLT_MODULE: &str = "github.com/dolthub/dolt/go";
 const ICU_RELEASES: &str = "https://github.com/unicode-org/icu/releases/download/";
-const GO_DOWNLOADS: &str = "https://go.dev/dl/";
+const GO_DOWNLOADS: &str = "https://dl.google.com/go/";
 const LLVM_MINGW_RELEASES: &str = "https://github.com/mstorsjo/llvm-mingw/releases/download/";
 
 #[derive(Debug, Deserialize)]
