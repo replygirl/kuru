@@ -91,7 +91,7 @@ jobs:
           experimental: true
           version: 2026.9.4
           # Cospec is exercised by delivery's real standalone contract tests.
-          install_args: rust cargo:cargo-llvm-cov github:aligned-team/cospec
+          install_args: rust aqua:taiki-e/cargo-llvm-cov github:aligned-team/cospec
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Install coverage components
@@ -110,8 +110,9 @@ jobs:
           # One key per OS for every shard: they build the same helper and
           # fetch the same registry. Only one shard saves it; the rest restore.
           # Instrumented shard targets live in runner.temp and are never cached.
+          # Also restrict that save to main so PR runs never thrash the cache.
           shared-key: native-coverage-${{ inputs.os }}
-          save-if: ${{ matrix.shard == 'connectors-core-platform' }}
+          save-if: ${{ matrix.shard == 'connectors-core-platform' && github.ref == 'refs/heads/main' }}
       - name: Run one checked coverage shard
         if: runner.os != 'Linux'
         shell: bash
@@ -293,7 +294,7 @@ jobs:
           experimental: true
           version: 2026.9.4
           # Cospec is exercised by delivery's real standalone contract tests.
-          install_args: rust cargo:cargo-llvm-cov github:aligned-team/cospec
+          install_args: rust aqua:taiki-e/cargo-llvm-cov github:aligned-team/cospec
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Install coverage components
@@ -405,6 +406,8 @@ jobs:
         with:
           cache-bin: false
           shared-key: native-install-${{ inputs.os }}
+          # Restrict saves to main so PR runs never thrash the shared cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Fetch locked Cargo inputs before offline verification
         run: cargo fetch --locked
       - name: Prepare the package-owned bundle

@@ -75,6 +75,8 @@ jobs:
         with:
           cache-bin: false
           shared-key: native-build-${{ matrix.target }}
+          # Restrict saves to main so PR runs never thrash the shared cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build and package native executable
         env:
           RELEASE_TARGET: ${{ matrix.target }}
@@ -111,7 +113,7 @@ jobs:
         with:
           experimental: true
           version: 2026.9.4
-          install_args: rust cargo:cargo-llvm-cov
+          install_args: rust aqua:taiki-e/cargo-llvm-cov
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Set up platform Rust components

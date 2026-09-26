@@ -385,7 +385,9 @@ fn native_workflow_shards_every_os_and_keeps_the_aggregate_fail_closed() {
     assert!(!workflow.contains("shared-key: native-coverage\n"));
     assert_eq!(
         shards
-            .matches("save-if: ${{ matrix.shard == 'connectors-core-platform' }}\n")
+            .matches(
+                "save-if: ${{ matrix.shard == 'connectors-core-platform' && github.ref == 'refs/heads/main' }}\n"
+            )
             .count(),
         1
     );
