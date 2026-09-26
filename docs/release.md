@@ -3,8 +3,9 @@
 Kuru releases use one manually dispatched workflow with a version bump as its
 only input. The workflow validates the source, creates a signed version commit
 when necessary, builds all five native archives, generates Communiqué notes,
-assembles and tests the complete candidate, deploys documentation from that exact
-commit, and publishes the release only after those gates succeed. A separate
+assembles the complete candidate, accepts it on Linux, macOS and Windows, deploys
+documentation from that exact commit, and publishes the release only after those
+gates succeed. A separate
 post-publication Windows job then verifies the immutable public download.
 Pushes and tags do not start release publication or deploy documentation.
 
@@ -89,18 +90,20 @@ runtime is involved.
 
 ## Validation and publication order
 
-1. Run the reusable quality jobs and native coverage workflow concurrently on
-   the selected main revision. Format, lint, typecheck, tooling, docs and cospec
-   have independent jobs; coverage executes the behavioral suite once. Both
-   workflows must pass before planning and checking publication prerequisites.
+1. Run the reusable quality jobs and one ordinary native test pass (`tests`,
+   `mise run test` on Ubuntu with its own Secret Service session) concurrently
+   on the selected main revision. Format, lint, typecheck, tooling, docs and
+   cospec have independent jobs. Both must pass before planning and checking
+   publication prerequisites. The 90% coverage gate and per-OS installation and
+   update checks are enforced on `main` by CI, not repeated by the release run.
    This original dispatch SHA remains the base when all jobs are rerun.
 2. Stamp the workspace and local lockfile entries, then create the signed API
    commit with an expected-head comparison. If an earlier attempt created that
    commit, recover it by verifying its parent, release message and complete Git
    tree against the expected stamp. An unchanged version reuses the checked
    commit when it remains in main's history. Later main changes are excluded.
-3. Run the same independent validation jobs on that exact version commit. Both
-   quality and coverage must pass before building native archives
+3. Run the quality jobs on that exact version commit; they must pass before
+   building native archives
    on Linux x86_64/arm64, macOS x86_64/arm64 and Windows x86_64 MSVC, verifying
    each binary's version and bundled offline engine. The Windows build uses a
    static CRT and validates its PE imports against the allowed system DLLs.
@@ -113,20 +116,26 @@ runtime is involved.
    generates `SHA256SUMS`, validates the bounded notes, and retains `dist/` plus
    `RELEASE_NOTES.md` for the remaining jobs. Invalid or incomplete inputs stop
    here without creating a tag, draft, or public release.
-6. On native Windows, run the ordinary mise installation route against simulated
-   GitHub metadata that serves the exact staged Windows ZIP. In parallel,
-   `build-docs` checks out the selected commit and builds and validates the site.
-   The Windows check verifies candidate checksums and bytes, installation,
-   activation, bundled Dolt, an offline conversation and durable reopen. It
-   then repeats
+6. Accept the staged candidate natively on Windows x86_64, Linux x86_64 and
+   macOS arm64 (the `verify-staged` matrix). In parallel, `build-docs` checks
+   out the selected commit and builds and validates the site. On Windows, run
+   the ordinary mise installation route against simulated GitHub metadata that
+   serves the exact staged Windows ZIP. The Windows check verifies candidate
+   checksums and bytes, installation, activation, bundled Dolt, an offline
+   conversation and durable reopen. It then repeats
    [previous-release update acceptance](#previous-release-update-acceptance)
-   against the exact staged candidate, requested at its real version, as a
+   against the exact staged candidate, requested at its real version. On Linux
+   and macOS, the leg verifies the target archive against `SHA256SUMS`,
+   extracts it, runs the packaged cold offline runtime check with the extracted
+   `kuru`, and runs the same previous-release update acceptance against that
+   exact executable through
+   `//packages/kuru-delivery:test:previous-release-update`. Each leg is a
    release-time sanity re-run of the check ordinary CI runs on its native-test
    platforms. The loopback mise fixture and the local release base given to the
-   previous updater are not public downloads of the new release. A failure in
-   either path blocks `publish`.
-7. Run `deploy-docs` only after both staged Windows acceptance and `build-docs`
-   succeed. Pages deployment and GitHub release promotion are separate service
+   previous updater are not public downloads of the new release. A failure on
+   any platform or in either path blocks `publish`.
+7. Run `deploy-docs` only after staged acceptance on every platform and
+   `build-docs` succeed. Pages deployment and GitHub release promotion are separate service
    operations; this ordering does not claim they update atomically.
 8. Run `publish` after the acceptance gates. It consumes the same candidate, rechecks
    the five archives and existing `SHA256SUMS`, creates or reuses the immutable
@@ -163,10 +172,11 @@ the commit guard permits only Cargo.toml and Cargo.lock changes. An unexpected
 file is reported by name and must be fixed in source rather than reset or included
 in the version commit.
 
-## Verify the staged Windows candidate
+## Verify the staged candidate
 
-Before publication, the Release workflow downloads its complete candidate on
-`windows-2025` and invokes `//apps/kuru-tui:verify:staged-windows` with the exact
+Before publication, the Release workflow's `verify-staged` matrix downloads its
+complete candidate on `windows-latest`, `ubuntu-latest` and `macos-latest`. The
+Windows leg invokes `//apps/kuru-tui:verify:staged-windows` with the exact
 staged Windows ZIP. The task resolves the pinned native mise executable before
 clearing its child environment, then routes the ordinary
 `github:replygirl/kuru@VERSION` backend through isolated loopback release metadata
@@ -186,9 +196,9 @@ from the public GitHub release.
 The task then runs
 [previous-release update acceptance](#previous-release-update-acceptance)
 against the staged ZIP and its sidecar. Only its release resolver contacts
-public GitHub, as described there; the workflow step currently passes no
-`GITHUB_TOKEN`, so that listing request is anonymous and an exhausted anonymous
-rate limit on the runner fails the check and blocks `publish`.
+public GitHub, as described there; the workflow step passes its read-only
+`GITHUB_TOKEN` for that listing request only, so a shared runner's anonymous
+rate limit does not fail the check.
 
 ## Previous-release update acceptance
 
@@ -237,13 +247,28 @@ support snapshot, leave the previous tree unchanged and, on Linux and macOS,
 publish the candidate's stable man page. The upgraded binary regenerates the
 five support files, which must match the candidate's. Nothing is pinned, so each
 change is checked against the release users actually have. The Release workflow
-repeats the check on Windows against the exact staged candidate before
-publication.
+repeats the check against the exact staged candidate on every staged platform
+before publication.
 
-`deploy-docs` depends on this native check and the independent docs build. The
-`publish` job depends on successful deployment, so a
-candidate, Windows, docs-build or docs-deployment failure leaves no public Kuru
-release. If Pages deploys and final publication then fails, rerun the failed
+The Linux x86_64 and macOS arm64 legs are an interim acceptance. Each checks its
+`kuru-VERSION-TARGET.tar.gz` against the candidate's `SHA256SUMS`, extracts it,
+and runs `//apps/kuru-tui:test:embedded-runtime` with `KURU_EMBEDDED_TEST_BINARY`
+set to the extracted `kuru`, which packages, installs, updates and reopens that
+exact executable with cold offline memory. It then runs
+`//packages/kuru-delivery:test:previous-release-update` with
+`KURU_UPDATE_CANDIDATE_BINARY` set to the same executable and the workflow's
+read-only `GITHUB_TOKEN` for the release listing: the previous published
+release's own updater must install those exact bytes. These legs do not yet
+prove the mise installation route that the Windows leg proves, and the updater
+check repackages the staged executable rather than serving the staged archive
+itself. An app-owned Unix `//apps/kuru-tui:verify:staged` task is the follow-on
+that closes this gap. Other archive targets have no staged leg; their native
+release builds verify the packaged offline runtime.
+
+`deploy-docs` depends on every leg of this native check and the independent docs
+build. The `publish` job depends on successful deployment, so a candidate, any
+platform's acceptance, docs-build or docs-deployment failure leaves no public
+Kuru release. If Pages deploys and final publication then fails, rerun the failed
 publication work in the same Release run; the workflow does not claim that Pages
 and GitHub Releases commit atomically.
 

@@ -11,7 +11,7 @@ on:
         type: string
         default: ubuntu-24.04
       install:
-        description: Also verify source installation and the shipping offline runtime
+        description: Also verify source installation, the shipping offline runtime and the previous release's update
         type: boolean
         default: false
       artifact-prefix:
@@ -33,7 +33,7 @@ env:
 
 jobs:
   coverage:
-    if: inputs.os != 'windows-2025'
+    if: inputs.os != 'windows-latest'
     name: Coverage and native behavior
     runs-on: ${{ inputs.os }}
     timeout-minutes: 90
@@ -49,7 +49,7 @@ jobs:
         # Cargo's restored target/ cache must not supply these directory grants.
         run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Reserve space for bundled runtime coverage
-        if: inputs.os == 'ubuntu-24.04'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           # This Rust/Node job does not use the hosted image's mobile or Swift SDKs.
@@ -75,7 +75,7 @@ jobs:
       - name: Install package-owned test tools
         run: mise run //packages/kuru-delivery:setup:test-tools
       - name: Install Ubuntu native secret-store fixture tools
-        if: inputs.os == 'ubuntu-24.04'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           sudo apt-get update
@@ -85,16 +85,14 @@ jobs:
           cache-bin: false
           shared-key: native-coverage
       - name: Run macOS instrumented native tests and require 90% coverage
-        if: inputs.os != 'ubuntu-24.04'
+        if: runner.os != 'Linux'
+        run: mise run coverage
+      - name: Run Ubuntu instrumented native tests with the OS secret store
+        if: runner.os == 'Linux'
+        shell: bash
         env:
           # Coverage maps remain available without test-profile debug info. Keep
           # the genuine packaged Kuru input below its production archive bound.
-          CARGO_PROFILE_TEST_DEBUG: ${{ inputs.os == 'ubuntu-24.04' && '0' || 'line-tables-only' }}
-        run: mise run coverage
-      - name: Run Ubuntu instrumented native tests with the OS secret store
-        if: inputs.os == 'ubuntu-24.04'
-        shell: bash
-        env:
           CARGO_PROFILE_TEST_DEBUG: "0"
         run: |
           # The Linux keyring backend requires the real Secret Service default
@@ -180,23 +178,9 @@ jobs:
           name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-attempt-${{ github.run_attempt }}
           path: target/coverage.lcov
           if-no-files-found: error
-      - name: Source install smoke
-        if: inputs.install
-        env:
-          KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
-          CARGO_NET_OFFLINE: "true"
-          KURU_DOLT_BUNDLE_OFFLINE: "true"
-        run: |
-          mise run install
-          "$KURU_INSTALL_DIR/kuru" --version
-      - name: Verify installed offline runtime
-        if: inputs.install
-        env:
-          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru
-        run: mise run //apps/kuru-tui:test:embedded-runtime
 
   windows-coverage:
-    if: inputs.os == 'windows-2025'
+    if: inputs.os == 'windows-latest'
     # Receipts name their exact run attempt, and each uploaded artifact holds
     # one attempt-<n> directory. Rerunning failed jobs reruns only the failed
     # shards and the report, which requires every shard job to have succeeded,
@@ -206,7 +190,7 @@ jobs:
     # KURU_COVERAGE_JOB_MINUTES, so a stalled test executable fails with
     # evidence, not a cancel; compilation is not under that deadline.
     name: Windows coverage (${{ matrix.shard }})
-    runs-on: windows-2025
+    runs-on: windows-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -283,10 +267,10 @@ jobs:
           if-no-files-found: warn
 
   windows-coverage-report:
-    if: inputs.os == 'windows-2025' && always()
+    if: inputs.os == 'windows-latest' && always()
     needs: windows-coverage
     name: Windows coverage report
-    runs-on: windows-2025
+    runs-on: windows-latest
     # Downloads include every uploaded attempt of each shard in this run, each
     # bounded by the receipt profile limits. If repeated reruns push the report
     # past this limit, dispatch a fresh run instead of rerunning this one.
@@ -370,14 +354,16 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
-          name: ${{ inputs.artifact-prefix }}-coverage-windows-2025-attempt-${{ github.run_attempt }}
+          name: ${{ inputs.artifact-prefix }}-coverage-windows-latest-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kuru-coverage-report-${{ github.run_attempt }}/coverage.lcov
           if-no-files-found: error
 
-  windows-install:
-    if: inputs.os == 'windows-2025' && inputs.install
-    name: Windows installation and offline runtime
-    runs-on: windows-2025
+  install:
+    if: inputs.install
+    # One installation and update job per OS. The release-profile build that
+    # the install task produces is also the previous-release updater candidate.
+    name: Installation, offline runtime and update
+    runs-on: ${{ inputs.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -387,7 +373,22 @@ jobs:
           persist-credentials: false
       - name: Select private bundle build inputs
         shell: pwsh
+        # Leave the leaf absent so the preparer creates this runner's private ACLs.
+        # Cargo's restored target/ cache must not supply these directory grants.
         run: Add-Content -LiteralPath $env:GITHUB_ENV "KURU_DOLT_BUNDLE_DIR=$env:RUNNER_TEMP/kuru-bundles-install-${{ github.run_attempt }}"
+      - name: Reserve space for release and test builds
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # This Rust job does not use the hosted image's mobile or Swift SDKs.
+          df -h /
+          for sdk in /usr/local/lib/android /usr/share/swift; do
+            if [ -d "$sdk" ]; then
+              sudo du -sh "$sdk"
+              sudo rm -rf -- "$sdk"
+            fi
+          done
+          df -h /
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
@@ -398,22 +399,27 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
-          shared-key: native-install-windows
+          shared-key: native-install-${{ inputs.os }}
       - name: Fetch locked Cargo inputs before offline verification
-        shell: pwsh
+        run: cargo fetch --locked
+      - name: Prepare the package-owned bundle
+        run: mise run //packages/kuru-memory:bundle:prepare
+      - name: Prepare the package-owned bundle fixtures
+        if: runner.os == 'Windows'
+        run: mise run //packages/kuru-memory:bundle:test-fixtures
+      - name: Install package-owned test tools
+        run: mise run //packages/kuru-delivery:setup:test-tools
+      - name: Source install smoke
+        if: runner.os != 'Windows'
+        env:
+          KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
+          CARGO_NET_OFFLINE: "true"
+          KURU_DOLT_BUNDLE_OFFLINE: "true"
         run: |
-          & cargo fetch --locked
-          if ($LASTEXITCODE -ne 0) { throw 'Locked Cargo fetch failed' }
-      - name: Prepare package-owned bundle and test tools
-        shell: pwsh
-        run: |
-          mise run //packages/kuru-memory:bundle:prepare
-          if ($LASTEXITCODE -ne 0) { throw 'Bundle preparation failed' }
-          mise run //packages/kuru-memory:bundle:test-fixtures
-          if ($LASTEXITCODE -ne 0) { throw 'Bundle fixture preparation failed' }
-          mise run //packages/kuru-delivery:setup:test-tools
-          if ($LASTEXITCODE -ne 0) { throw 'Package-owned test-tool setup failed' }
+          mise run install
+          "$KURU_INSTALL_DIR/kuru" --version
       - name: Native Windows source install smoke
+        if: runner.os == 'Windows'
         shell: pwsh
         env:
           KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
@@ -425,23 +431,35 @@ jobs:
           & "$env:KURU_INSTALL_DIR/kuru.exe" --version
           if ($LASTEXITCODE -ne 0) { throw 'Installed Kuru failed' }
       - name: Verify native offline Cargo input failures
+        if: runner.os == 'Windows'
         env:
           KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru.exe
         run: mise run //packages/kuru-memory:bundle:verify-native-build
       - name: Verify installed offline runtime
         env:
-          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru.exe
+          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
         run: mise run //apps/kuru-tui:test:embedded-runtime
       - name: Inspect native shipping DLL imports
+        if: runner.os == 'Windows'
         env:
           KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru.exe
         run: mise run //apps/kuru-tui:verify:windows-imports
+      # The previous published release's own updater installs this tree's
+      # release build. This step is online: the task lists releases on
+      # api.github.com (the token authenticates only that request) and
+      # downloads the previous release's assets anonymously.
+      - name: Accept an update from the previous published release
+        env:
+          # build:release passes --target on Windows, so its output is target-qualified.
+          KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.os == 'Windows' && format('{0}\target\x86_64-pc-windows-msvc\release\kuru.exe', github.workspace) || format('{0}/target/release/kuru', github.workspace) }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: mise run //packages/kuru-delivery:test:previous-release-update
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
 
   native-gate:
     if: always()
-    needs: [coverage, windows-coverage, windows-coverage-report, windows-install]
+    needs: [coverage, windows-coverage, windows-coverage-report, install]
     name: Require native coverage and installation checks
     runs-on: ubuntu-24.04
     steps:
@@ -452,21 +470,20 @@ jobs:
           KURU_NATIVE_COVERAGE: ${{ needs.coverage.result }}
           KURU_NATIVE_WINDOWS_SHARDS: ${{ needs.windows-coverage.result }}
           KURU_NATIVE_WINDOWS_REPORT: ${{ needs.windows-coverage-report.result }}
-          KURU_NATIVE_WINDOWS_INSTALL: ${{ needs.windows-install.result }}
+          KURU_NATIVE_INSTALL_RESULT: ${{ needs.install.result }}
         run: |
           set -e
-          if [ "$KURU_NATIVE_OS" = windows-2025 ]; then
+          if [ "$KURU_NATIVE_OS" = windows-latest ]; then
             test "$KURU_NATIVE_COVERAGE" = skipped
             test "$KURU_NATIVE_WINDOWS_SHARDS" = success
             test "$KURU_NATIVE_WINDOWS_REPORT" = success
-            if [ "$KURU_NATIVE_INSTALL" = true ]; then
-              test "$KURU_NATIVE_WINDOWS_INSTALL" = success
-            else
-              test "$KURU_NATIVE_WINDOWS_INSTALL" = skipped
-            fi
           else
             test "$KURU_NATIVE_COVERAGE" = success
             test "$KURU_NATIVE_WINDOWS_SHARDS" = skipped
             test "$KURU_NATIVE_WINDOWS_REPORT" = skipped
-            test "$KURU_NATIVE_WINDOWS_INSTALL" = skipped
+          fi
+          if [ "$KURU_NATIVE_INSTALL" = true ]; then
+            test "$KURU_NATIVE_INSTALL_RESULT" = success
+          else
+            test "$KURU_NATIVE_INSTALL_RESULT" = skipped
           fi
