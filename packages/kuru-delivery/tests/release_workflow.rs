@@ -98,7 +98,7 @@ fn required_release_checks_precede_the_only_publication_job() {
         assert!(tests.contains(required), "release tests lost {required}");
     }
     assert!(!tests.contains("continue-on-error:"));
-    // The OS secret-store session is the same text CI runs around coverage.
+    // The OS secret-store session is the same text CI runs around each coverage shard.
     let native = fs::read_to_string(root.join(".github/workflows/native-tests.yml")).unwrap();
     let session = |text: &str, command: &str| {
         let start = text
@@ -113,7 +113,7 @@ fn required_release_checks_precede_the_only_publication_job() {
     };
     assert_eq!(
         session(&tests, "mise run test"),
-        session(&native, "mise run coverage")
+        session(&native, "mise run //packages/kuru-delivery:coverage:shard")
     );
 
     let assembly = job("assemble-candidate");
@@ -286,30 +286,67 @@ fn optional_published_windows_diagnostic_keeps_its_native_launcher() {
     assert!(!task.contains("kuru-tui"));
 }
 
-#[test]
-fn native_workflow_shards_only_windows_and_keeps_the_aggregate_fail_closed() {
+fn native_workflow() -> String {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let workflow = fs::read_to_string(root.join(".github/workflows/native-tests.yml")).unwrap();
+    fs::read_to_string(root.join(".github/workflows/native-tests.yml")).unwrap()
+}
+
+fn workflow_job<'a>(workflow: &'a str, name: &str, next: &str) -> &'a str {
+    workflow
+        .split(&format!("\n  {name}:\n"))
+        .nth(1)
+        .unwrap_or_else(|| panic!("missing native job {name}"))
+        .split(&format!("\n  {next}:\n"))
+        .next()
+        .unwrap()
+}
+
+fn workflow_steps(job: &str) -> Vec<String> {
+    let steps = format!("\n{}", job.split("    steps:\n").nth(1).unwrap());
+    steps
+        .split("\n      - ")
+        .skip(1)
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn native_workflow_shards_every_os_and_keeps_the_aggregate_fail_closed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workflow = native_workflow();
+    // Every OS runs the same checked shards and one collect; the unsharded
+    // coverage job and the Windows-only topology are gone.
+    for retired in [
+        "\n  coverage:\n",
+        "windows-coverage",
+        "coverage:windows:",
+        "mise run coverage",
+        "inputs.os != 'windows-latest'",
+        "inputs.os == 'windows-latest'",
+        "KURU_NATIVE_OS",
+        "KURU_NATIVE_WINDOWS_",
+    ] {
+        assert!(!workflow.contains(retired), "retained {retired}");
+    }
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let native_tests = ci
+        .split("\n  native-tests:\n")
+        .nth(1)
+        .unwrap()
+        .split("\n  native-build:\n")
+        .next()
+        .unwrap();
+    assert!(native_tests.contains("os: [ubuntu-latest, macos-latest, windows-latest]"));
+    assert!(native_tests.contains("install: true"));
     for required in [
-        "if: inputs.os != 'windows-latest'",
-        "windows-coverage:",
-        "windows-coverage-report:",
         "native-gate:",
-        "needs: windows-coverage",
-        "needs: [coverage, windows-coverage, windows-coverage-report, install]",
-        "test \"$KURU_NATIVE_WINDOWS_SHARDS\" = success",
-        "test \"$KURU_NATIVE_WINDOWS_REPORT\" = success",
+        "needs: shard\n",
+        "needs: [shard, collect, install]",
+        "test \"$KURU_NATIVE_SHARDS\" = success",
+        "test \"$KURU_NATIVE_REPORT\" = success",
         "test \"$KURU_NATIVE_INSTALL_RESULT\" = success",
         "test \"$KURU_NATIVE_INSTALL_RESULT\" = skipped",
-        "test \"$KURU_NATIVE_COVERAGE\" = skipped",
-        "test \"$KURU_NATIVE_COVERAGE\" = success",
-        "test \"$KURU_NATIVE_WINDOWS_SHARDS\" = skipped",
-        "test \"$KURU_NATIVE_WINDOWS_REPORT\" = skipped",
-        "delivery-archive",
-        "kuru-delivery,kuru-archive",
-        "application",
-        "packages: kuru",
-        "connectors-core-platform",
+        "KURU_COVERAGE_OS: ${{ inputs.os }}",
         "KURU_COVERAGE_TARGET",
         "KURU_COVERAGE_SOURCE",
         "KURU_COVERAGE_ATTEMPT",
@@ -319,49 +356,50 @@ fn native_workflow_shards_only_windows_and_keeps_the_aggregate_fail_closed() {
         "KURU_COVERAGE_INPUTS",
         "KURU_COVERAGE_REPORT",
         "KURU_COVERAGE_DIAGNOSTICS",
-        "KURU_COVERAGE_JOB_STARTED=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())",
-        "coverage:windows:shard",
-        "coverage:windows:collect",
-        "cargo fetch --locked",
-        "KURU_DOLT_BUNDLE_OFFLINE: \"true\"",
+        "run: mise run //packages/kuru-delivery:coverage:shard",
+        "            mise run //packages/kuru-delivery:coverage:shard\n          KURU_NATIVE_STORE",
+        "mise run //packages/kuru-delivery:coverage:collect",
         "if-no-files-found: error",
     ] {
         assert!(workflow.contains(required), "missing {required}");
     }
-    // Every shard restores one shared key; exactly one shard saves it.
+    let shards = workflow_job(&workflow, "shard", "collect");
+    let report = workflow_job(&workflow, "collect", "install");
+    for job in [shards, report] {
+        assert!(job.contains("    runs-on: ${{ inputs.os }}\n"));
+        assert!(!job.contains("inputs.install"));
+        for moved in ["mise run install", "test:embedded-runtime"] {
+            assert!(!job.contains(moved), "coverage still runs {moved}");
+        }
+    }
+    // Every shard and the report share one key per OS; exactly one shard saves.
     assert_eq!(
         workflow
-            .matches("shared-key: native-coverage-windows\n")
+            .matches("shared-key: native-coverage-${{ inputs.os }}\n")
             .count(),
-        1
+        2
     );
-    assert!(!workflow.contains("shared-key: native-coverage-windows-"));
+    assert!(!workflow.contains("shared-key: native-coverage\n"));
     assert_eq!(
-        workflow
+        shards
             .matches("save-if: ${{ matrix.shard == 'connectors-core-platform' }}\n")
             .count(),
         1
     );
-    assert_eq!(
-        workflow.matches("actions/download-artifact@").count(),
-        SHARDS.len()
-    );
+    assert!(report.contains("save-if: false\n"));
     assert_eq!(
         workflow
             .matches("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c")
             .count(),
         SHARDS.len()
     );
+    assert_eq!(
+        workflow.matches("actions/download-artifact@").count(),
+        SHARDS.len()
+    );
     // Only a successful shard publishes receipt evidence under the name the
     // report accepts; failures publish diagnostics under a name it rejects.
     assert_eq!(workflow.matches("if: ${{ !cancelled() }}").count(), 1);
-    let shards = workflow
-        .split("\n  windows-coverage:\n")
-        .nth(1)
-        .unwrap()
-        .split("\n  windows-coverage-report:\n")
-        .next()
-        .unwrap();
     assert!(!shards.contains("if: ${{ !cancelled() }}"));
     // The matrix rows are exactly the shards the receipt and collect code
     // enforce, in the same order, so the two cannot drift.
@@ -384,67 +422,91 @@ fn native_workflow_shards_only_windows_and_keeps_the_aggregate_fail_closed() {
     assert_eq!(matrix, expected_matrix);
     assert_eq!(shards.matches("if: ${{ failure() }}").count(), 1);
     assert!(shards.contains(
-        "name: ${{ inputs.artifact-prefix }}-coverage-windows-${{ matrix.shard }}-diagnostics-attempt-${{ github.run_attempt }}"
+        "name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-${{ matrix.shard }}-diagnostics-attempt-${{ github.run_attempt }}"
     ));
     assert!(shards.contains(
-        "name: ${{ inputs.artifact-prefix }}-coverage-windows-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
+        "name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
+    ));
+    assert!(report.contains(
+        "name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-attempt-${{ github.run_attempt }}"
     ));
     // The job start is recorded before any other step, and the inner deadline
     // derives from the same limit the host enforces.
-    assert!(
-        shards
-            .split("    steps:\n")
+    let steps = workflow_steps(shards);
+    assert!(steps[0].starts_with("name: Record the job start for the inner test deadline\n"));
+    assert!(steps[0].contains("KURU_COVERAGE_JOB_STARTED=%s"));
+    let timeout: Vec<_> = shards
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("timeout-minutes: "))
+        .collect();
+    assert_eq!(timeout.len(), 1);
+    let deadlines: Vec<_> = shards
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("KURU_COVERAGE_JOB_MINUTES: \""))
+        .map(|value| value.strip_suffix('"').unwrap())
+        .collect();
+    assert_eq!(deadlines, [timeout[0], timeout[0]]);
+    // The Linux secret-store leg and the other runners run the same shard
+    // under an identical environment, selected by runner.os.
+    let shard_step = |name: &str| {
+        steps
+            .iter()
+            .find(|step| step.starts_with(&format!("name: {name}\n")))
+            .unwrap_or_else(|| panic!("missing shard step {name}"))
+    };
+    let env = |step: &str| {
+        step.split("        env:\n")
             .nth(1)
             .unwrap()
-            .starts_with("      - name: Record the job start for the inner test deadline\n")
-    );
-    let limit = |prefix: &str, suffix: &str| {
-        let lines: Vec<_> = shards
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix(prefix))
-            .map(|value| value.strip_suffix(suffix).unwrap().to_owned())
-            .collect();
-        assert_eq!(lines.len(), 1, "expected one {prefix}");
-        lines[0].parse::<u64>().unwrap()
+            .split("        run:")
+            .next()
+            .unwrap()
+            .to_owned()
     };
-    assert_eq!(
-        limit("timeout-minutes: ", ""),
-        limit("KURU_COVERAGE_JOB_MINUTES: \"", "\"")
-    );
+    let other = shard_step("Run one checked coverage shard");
+    let linux = shard_step("Run one checked coverage shard with the OS secret store");
+    assert!(other.contains("if: runner.os != 'Linux'"));
+    assert!(linux.contains("if: runner.os == 'Linux'"));
+    assert_eq!(env(other), env(linux));
+    // The rebuilt report inventory repeats the shard's debug-info profile.
+    let profile =
+        "CARGO_PROFILE_TEST_DEBUG: ${{ runner.os == 'Linux' && '0' || 'line-tables-only' }}\n";
+    assert!(env(other).contains(profile));
+    assert!(report.contains(profile));
     // The report takes each shard's latest attempt from a pattern download.
-    let report = workflow
-        .split("\n  windows-coverage-report:\n")
-        .nth(1)
-        .unwrap()
-        .split("\n  install:\n")
-        .next()
-        .unwrap();
     for (shard, _) in SHARDS {
         assert!(report.contains(&format!(
-            "          pattern: ${{{{ inputs.artifact-prefix }}}}-coverage-windows-{shard}-attempt-*\n          merge-multiple: false\n          path: ${{{{ runner.temp }}}}/kuru-coverage-inputs/{shard}\n"
+            "          pattern: ${{{{ inputs.artifact-prefix }}}}-coverage-${{{{ inputs.os }}}}-{shard}-attempt-*\n          merge-multiple: false\n          path: ${{{{ runner.temp }}}}/kuru-coverage-inputs/{shard}\n"
         )));
     }
-    assert!(!report.contains("-attempt-${{ github.run_attempt }}\n          path: ${{ runner.temp }}/kuru-coverage-inputs"));
-    // An older successful attempt must not stand in for a shard whose latest
-    // attempt failed: the report refuses before any other step unless every
-    // shard job succeeded.
-    let steps = report.split("    steps:\n").nth(1).unwrap();
-    assert!(steps.starts_with(
-        "      # Failed shards upload no receipt, so an older successful attempt would\n      # otherwise stand in for a shard whose latest attempt failed.\n      - name: Require every coverage shard job to have succeeded\n        shell: pwsh\n        env:\n          KURU_COVERAGE_SHARDS_RESULT: ${{ needs.windows-coverage.result }}\n        run: |\n          if ($env:KURU_COVERAGE_SHARDS_RESULT -ne 'success') {\n"
+    assert!(!report.contains(
+        "-attempt-${{ github.run_attempt }}\n          path: ${{ runner.temp }}/kuru-coverage-inputs"
     ));
+    // An older successful attempt must not stand in for a shard whose latest
+    // attempt failed: the report runs even after failures, then refuses before
+    // any other step unless every shard job succeeded.
+    assert!(report.starts_with("    if: always()\n    needs: shard\n"));
+    assert!(report.split("    steps:\n").nth(1).unwrap().starts_with(
+        "      # Failed shards upload no receipt, so an older successful attempt would\n      # otherwise stand in for a shard whose latest attempt failed.\n      - name: Require every coverage shard job to have succeeded\n        shell: bash\n        env:\n          KURU_COVERAGE_SHARDS_RESULT: ${{ needs.shard.result }}\n        run: |\n          if [ \"$KURU_COVERAGE_SHARDS_RESULT\" != success ]; then\n"
+    ));
+    // Every step-level OS selection uses the runner, never the caller's label.
+    for line in workflow.lines() {
+        if line.starts_with("        if:") {
+            assert!(!line.contains("inputs.os"), "step condition {line}");
+        }
+    }
 }
 
 #[test]
 fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os() {
+    let workflow = native_workflow();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let workflows = root.join(".github/workflows");
-    let workflow = fs::read_to_string(workflows.join("native-tests.yml")).unwrap();
     for name in ["ci.yml", "native-tests.yml", "release.yml"] {
         let text = fs::read_to_string(workflows.join(name)).unwrap();
         assert!(!text.contains("windows-2025"), "{name} pins windows-2025");
     }
     let ci = fs::read_to_string(workflows.join("ci.yml")).unwrap();
-
     let native_tests = ci
         .split("\n  native-tests:\n")
         .nth(1)
@@ -453,7 +515,6 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
         .next()
         .unwrap();
     assert!(native_tests.contains("install: true"));
-    assert!(native_tests.contains("windows-latest]"));
     assert!(
         !native_tests.contains("\n    if:"),
         "native tests must run on every CI event"
@@ -465,32 +526,10 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
     ] {
         assert!(ci.contains(event), "CI lost {event}");
     }
-
-    // One install job serves every OS; installation no longer rides on the
-    // Unix coverage job and no Windows-only install job remains.
+    // One install job serves every OS; no Windows-only install job remains.
     assert!(!workflow.contains("windows-install"));
     assert_eq!(workflow.matches("\n  install:\n").count(), 1);
-    let coverage = workflow
-        .split("\n  coverage:\n")
-        .nth(1)
-        .unwrap()
-        .split("\n  windows-coverage:\n")
-        .next()
-        .unwrap();
-    for moved in [
-        "mise run install",
-        "test:embedded-runtime",
-        "inputs.install",
-    ] {
-        assert!(!coverage.contains(moved), "coverage still runs {moved}");
-    }
-    let install = workflow
-        .split("\n  install:\n")
-        .nth(1)
-        .unwrap()
-        .split("\n  native-gate:\n")
-        .next()
-        .unwrap();
+    let install = workflow_job(&workflow, "install", "native-gate");
     let header = install.split("    steps:\n").next().unwrap();
     assert!(header.starts_with("    if: inputs.install\n"));
     for required in ["runs-on: ${{ inputs.os }}", "timeout-minutes: 45"] {
@@ -499,8 +538,7 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
     assert!(install.contains("shared-key: native-install-${{ inputs.os }}"));
     // Step order is part of the contract: offline installation first, the
     // installed runtime next, and only then the online updater acceptance.
-    let steps = format!("\n{}", install.split("    steps:\n").nth(1).unwrap());
-    let steps: Vec<_> = steps.split("\n      - ").skip(1).collect();
+    let steps = workflow_steps(install);
     let step = |name: &str| {
         steps
             .iter()
@@ -508,6 +546,7 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
             .unwrap_or_else(|| panic!("missing install step {name}"))
     };
     let order = [
+        "Reserve space for release and test builds",
         "Fetch locked Cargo inputs before offline verification",
         "Prepare the package-owned bundle",
         "Prepare the package-owned bundle fixtures",
@@ -523,6 +562,10 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
     let positions: Vec<_> = order.iter().map(|name| step(name)).collect();
     assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
     for (name, condition) in [
+        (
+            "Reserve space for release and test builds",
+            Some("if: runner.os == 'Linux'"),
+        ),
         (
             "Prepare the package-owned bundle fixtures",
             Some("if: runner.os == 'Windows'"),
@@ -543,7 +586,7 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
         ),
         ("Accept an update from the previous published release", None),
     ] {
-        let body = steps[step(name)];
+        let body = &steps[step(name)];
         match condition {
             Some(condition) => assert!(body.contains(condition), "{name} lost {condition}"),
             None => assert!(!body.contains("if:"), "{name} must run on every OS"),
@@ -553,11 +596,12 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
             "{name} must select by runner.os"
         );
     }
+    assert!(steps[step("Native Windows source install smoke")].contains("shell: pwsh"));
     for name in [
         "Source install smoke",
         "Native Windows source install smoke",
     ] {
-        let body = steps[step(name)];
+        let body = &steps[step(name)];
         assert!(body.contains("KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin"));
         assert!(body.contains("CARGO_NET_OFFLINE: \"true\""));
         assert!(body.contains("KURU_DOLT_BUNDLE_OFFLINE: \"true\""));
@@ -568,7 +612,7 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
     ));
     // The updater step is online, receives the token only for release
     // listing, and names the release build the install task produced.
-    let updater = steps[step("Accept an update from the previous published release")];
+    let updater = &steps[step("Accept an update from the previous published release")];
     for required in [
         "KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.os == 'Windows' && format('{0}\\target\\x86_64-pc-windows-msvc\\release\\kuru.exe', github.workspace) || format('{0}/target/release/kuru', github.workspace) }}",
         "GITHUB_TOKEN: ${{ github.token }}",
@@ -579,19 +623,13 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
     assert!(!updater.contains("CARGO_NET_OFFLINE"));
     assert!(!updater.contains("KURU_DOLT_BUNDLE_OFFLINE"));
     assert!(workflow.contains("permissions:\n  contents: read\n"));
-    // Every step-level OS selection uses the runner, never the caller's label.
-    for line in workflow.lines() {
-        if line.starts_with("        if:") {
-            assert!(!line.contains("inputs.os"), "step condition {line}");
-        }
-    }
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn native_workflow_gate_rejects_incomplete_results() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let workflow = fs::read_to_string(root.join(".github/workflows/native-tests.yml")).unwrap();
+    let workflow = native_workflow();
     let gate = workflow
         .split("\n  native-gate:\n")
         .nth(1)
@@ -599,26 +637,19 @@ async fn native_workflow_gate_rejects_incomplete_results() {
         .split("        run: |\n")
         .nth(1)
         .unwrap();
+    // The same gate applies to every OS: it never branches on the caller's label.
+    assert!(!gate.contains("inputs.os"));
     async fn run(
         root: &Path,
         gate: &str,
-        (os, install, coverage, shards, report, install_result): (
-            &str,
-            &str,
-            &str,
-            &str,
-            &str,
-            &str,
-        ),
+        (install, shards, report, install_result): (&str, &str, &str, &str),
     ) -> bool {
         let mut command = command::rooted(root, "bash");
         command
             .args(["-c", gate])
-            .env("KURU_NATIVE_OS", os)
             .env("KURU_NATIVE_INSTALL", install)
-            .env("KURU_NATIVE_COVERAGE", coverage)
-            .env("KURU_NATIVE_WINDOWS_SHARDS", shards)
-            .env("KURU_NATIVE_WINDOWS_REPORT", report)
+            .env("KURU_NATIVE_SHARDS", shards)
+            .env("KURU_NATIVE_REPORT", report)
             .env("KURU_NATIVE_INSTALL_RESULT", install_result);
         command::bounded_output(&mut command, Duration::from_secs(5), 4096)
             .await
@@ -628,41 +659,8 @@ async fn native_workflow_gate_rejects_incomplete_results() {
     }
 
     for accepted in [
-        (
-            "windows-latest",
-            "true",
-            "skipped",
-            "success",
-            "success",
-            "success",
-        ),
-        (
-            "windows-latest",
-            "false",
-            "skipped",
-            "success",
-            "success",
-            "skipped",
-        ),
-        (
-            "ubuntu-24.04",
-            "true",
-            "success",
-            "skipped",
-            "skipped",
-            "success",
-        ),
-        (
-            "macos-14", "true", "success", "skipped", "skipped", "success",
-        ),
-        (
-            "ubuntu-24.04",
-            "false",
-            "success",
-            "skipped",
-            "skipped",
-            "skipped",
-        ),
+        ("true", "success", "success", "success"),
+        ("false", "success", "success", "skipped"),
     ] {
         assert!(
             run(&root, gate, accepted).await,
@@ -681,41 +679,24 @@ async fn native_workflow_gate_rejects_incomplete_results() {
         ("cancelled install", "success", "success", "cancelled"),
     ] {
         assert!(
-            !run(
-                &root,
-                gate,
-                ("windows-latest", "true", "skipped", shards, report, install),
-            )
-            .await,
-            "native gate accepted Windows {label}"
+            !run(&root, gate, ("true", shards, report, install)).await,
+            "native gate accepted {label}"
         );
     }
-    for os in ["ubuntu-24.04", "macos-14"] {
-        for (label, coverage, install) in [
-            ("missing coverage", "skipped", "success"),
-            ("failed coverage", "failure", "success"),
-            ("missing install", "success", "skipped"),
-            ("failed install", "success", "failure"),
-            ("cancelled install", "success", "cancelled"),
-        ] {
-            assert!(
-                !run(
-                    &root,
-                    gate,
-                    (os, "true", coverage, "skipped", "skipped", install),
-                )
-                .await,
-                "native gate accepted {os} {label}"
-            );
-        }
+    for (label, shards, report, install) in [
+        ("failed shard", "failure", "success", "skipped"),
+        ("missing report", "success", "skipped", "skipped"),
+        ("unrequested install", "success", "success", "success"),
+        (
+            "failed unrequested install",
+            "success",
+            "success",
+            "failure",
+        ),
+    ] {
         assert!(
-            !run(
-                &root,
-                gate,
-                (os, "false", "success", "skipped", "skipped", "success"),
-            )
-            .await,
-            "native gate accepted an unrequested {os} install"
+            !run(&root, gate, ("false", shards, report, install)).await,
+            "native gate accepted {label} without installation"
         );
     }
 }
