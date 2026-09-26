@@ -1,6 +1,6 @@
 ## Why
 
-Kuru ships native executables for five targets, but Windows on Arm users have no
+Kuru ships native executables for four targets once #106 removes Intel macOS, but Windows on Arm users have no
 native release: an x64 `kuru.exe` runs only under emulation, and the x64 bootstrap
 refuses an Arm host outright. Upstream Dolt publishes no windows/arm64 asset, so the
 engine must be built from source; the companion change `dolt-source-build-inputs`
@@ -50,8 +50,12 @@ code path.
   `cospec_contract` exclusion only if mise cannot select or run it.
 - Update `docs/install.md`, `docs/release.md`, `docs/development.md` and the
   native-windows and repository-delivery specs. The support row and any
-  "supported" wording land only in the final commit after every native
-  `windows-11-arm` job is green.
+  "supported" wording land only in the final commit after the five native
+  checks (memory, process cleanup, terminal, installation, update) are green on
+  `windows-11-arm`; staged and published arm64 acceptance are release-time
+  gates observed on the first maintainer-authorized Release after merge.
+- Require the ICU, LLVM runtime and mingw-w64 notices PR6a lists for built
+  engine assets in the staged and published Windows verifiers.
 
 ## Capabilities
 
@@ -77,7 +81,8 @@ None.
   artifact names carry the target), `src/mise_isolation.rs` (native-machine
   `PROCESSOR_ARCHITECTURE`), `src/coverage.rs` (host-keyed named test exclusion
   recorded in receipts, contingency only), `support/install.ps1`,
-  `tests/release_workflow.rs`, `tests/support/mise_acceptance.rs`,
+  `tests/release_workflow.rs`, `tests/support/mise_acceptance.rs` (target-scoped
+  predecessor, catalog-derived asset ids, built-asset notices),
   `tests/support/previous_updater.rs`, `tests/bootstrap_windows.rs`,
   `tests/windows_update.rs`, `tests/windows_archive.rs`.
 - `apps/kuru-tui`: `mise.toml` (native host default, arm64 crt-static),
@@ -85,18 +90,20 @@ None.
   `tests/embedded_runtime.rs`.
 - `packages/kuru-memory`: `mise.toml` (arm64 crt-static clear/set),
   `support/verify-bundle-build.ps1`, `tests/bundle_build.rs`,
-  `src/provision/native_tests.rs` (sixth target). The manifest, both parsers and
+  `src/provision/native_tests.rs` (arm64 target). The manifest, both parsers and
   `bundle build` stay owned by `dolt-source-build-inputs`.
 - `packages/kuru-platform`: `mise.toml` arm64 cross-check tasks,
   `tests/windows_commands.rs` fixture. No new unsafe API.
 - `packages/kuru-connectors/src/tools.rs` fixture sites: reviewed, see design.
 - `.github/workflows/ci.yml`, `native-tests.yml`, `release.yml`: designed here;
   edited only after the PR5 merge notice (phase 3).
-- `mise.lock`, `apps/kuru-docs/mise.lock`, `packages/kuru-delivery/mise.lock`:
+- Root `mise.toml` (cospec `windows-arm64` `asset_pattern`), `mise.lock`,
+  `apps/kuru-docs/mise.lock`, `packages/kuru-delivery/mise.lock`:
   `windows-arm64` platform entries. `docs/development.md` lock-refresh commands.
 - Docs: `docs/install.md`, `docs/release.md`, `docs/development.md`.
 - No migration. The first arm64 release has no predecessor by design; existing
-  x64 installations on Arm hardware keep updating x64 (migration is out of scope).
+  x64 installations on Arm hardware keep updating x64, and bootstrap recovery
+  accepts their x64 helper (migration is out of scope).
 - Not BREAKING: no existing target, archive name, receipt field or workflow
   input is removed.
 

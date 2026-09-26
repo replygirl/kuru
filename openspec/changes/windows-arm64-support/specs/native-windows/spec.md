@@ -9,12 +9,17 @@ memory, dreams, undo, tools, authentication and connectors MUST retain their
 existing behavior on both targets without requiring WSL, a Unix shell, a
 compiler, an MSVC redistributable installation or a separately managed database.
 Shipping builds MUST link the appropriate static CRT for their target without
-changing host build-script/proc-macro settings. Installation and update MUST
-select the target from the host's native machine architecture, never from the
-architecture of an emulated shell or parent process, and MUST fail closed on any
-other machine. A Windows target SHALL be documented as supported only after
-native memory, process cleanup, terminal, installation and update checks have
-passed on that architecture.
+changing host build-script/proc-macro settings. Fresh bootstrap installation
+MUST select the target from the host's native machine architecture, never from
+the architecture reported by an emulated shell's or parent process's
+environment, and MUST fail closed on any other machine. Update MUST keep the
+target of the installed executable, so an x64 executable running under
+emulation on Arm64 continues to update to x64; moving such an installation to
+Arm64 is outside this requirement. Recovery of an interrupted update MUST accept
+the recorded helper's own Windows target even when it differs from the native
+machine. A Windows target SHALL be documented as supported only after native
+memory, process cleanup, terminal, installation and update checks have passed
+on that architecture.
 
 #### Scenario: Fresh native installation
 - **WHEN** a user launches the installed executable in an isolated Windows user environment on either supported architecture
@@ -24,9 +29,13 @@ passed on that architecture.
 - **WHEN** native CI inspects the shipped Kuru and embedded Dolt PE imports for a Windows target
 - **THEN** only operating-system DLL dependencies are present and no separately installed MSVC redistributable is required.
 
-#### Scenario: Bootstrap under an emulated shell
-- **WHEN** the PowerShell bootstrap runs on an Arm64 machine inside an x64-emulated PowerShell whose environment reports `AMD64`
-- **THEN** it detects the Arm64 native machine, selects the `aarch64-pc-windows-msvc` archive and requires an ARM64 PE32+ executable, or fails closed when asked for a target that does not match the native machine.
+#### Scenario: Bootstrap ignores an x64 architecture environment
+- **WHEN** the PowerShell bootstrap runs on an Arm64 machine with `PROCESSOR_ARCHITECTURE` reporting `AMD64`
+- **THEN** it determines the native machine through the operating system rather than the environment, selects the `aarch64-pc-windows-msvc` archive and requires an ARM64 PE32+ executable, or fails closed when asked for a target that does not match the native machine.
+
+#### Scenario: Emulated x64 installation updates
+- **WHEN** an installed x64 `kuru.exe` running under emulation on an Arm64 machine updates, or the bootstrap recovers its interrupted update
+- **THEN** the update installs the x64 target and recovery accepts the recorded x64 helper, without replacing the executable with one of a different machine type.
 
 ### Requirement: Required native Windows verification
 

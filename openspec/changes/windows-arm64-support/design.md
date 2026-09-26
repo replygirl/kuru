@@ -2,7 +2,9 @@
 
 Current state, `main` at `501ab92d` unless noted:
 
-- `packages/kuru-delivery/src/targets.rs` holds the five-entry `CATALOG`; every
+- `packages/kuru-delivery/src/targets.rs` holds the five-entry `CATALOG` on
+  `501ab92d`; #106 (`0ed39198`) reduces it to `[Target; 4]` by removing
+  `x86_64-apple-darwin` and adds asserts that `macos`/`x86_64` is rejected. Every
   delivery path selects by `targets::host()` (`archive::host_target`), which maps
   `std::env::consts::{OS, ARCH}`, so an executable always selects the target it
   was compiled for. `release::archive_assets` (`release.rs:669`) requires one core
@@ -29,6 +31,13 @@ Current state, `main` at `501ab92d` unless noted:
   `windows_commands.rs:184`, `embedded_runtime.rs:1129,1198,1250`) or a fixed
   target constant (`mise_acceptance.rs:35`, `windows_archive.rs:15`,
   `bootstrap_windows.rs:30`, `published_windows.rs:20`).
+- The staged mise fixture (`tests/support/mise_acceptance.rs:95-99`) numbers
+  asset API ids as `assets/{index+1}` in `CATALOG` order and hard-codes
+  `assets/5` for the x64 ZIP and `assets/6` for `SHA256SUMS` (`:99,153,170,843,
+  854,864`). On the five-entry catalog an appended arm64 entry would take
+  `assets/6` and collide with `SHA256SUMS`; after #106 x64 is `assets/4` and the
+  hard-coded `assets/5` x64 assertions no longer name the x64 ZIP, so #106 as
+  it stands probably breaks the `api_fallback` scenario (not run).
 - On `origin/test/previous-release-update-ci` (#108) the previous-release
   resolver is `published::previous_release(candidate, target, token)`:
   `select_previous` picks the greatest older stable `vX.Y.Z` release ignoring the
@@ -56,14 +65,49 @@ Current state, `main` at `501ab92d` unless noted:
   unbundled builds; platform mechanics live in `kuru-platform`; `linux-x64` is the
   only engine build host (lead decision 4); PR6a owns the manifest, both parsers,
   `bundle build`, the Linux determinism job and the arm64 asset data; another
-  session owns `.github/workflows` until its PR5 merge notice; #106 defers the
-  Intel macOS catalog removal to a follow-on.
+  session owns `.github/workflows` until its PR5 merge notice; #106 removes
+  the Intel macOS target from the catalog, `install.sh`, `dolt-assets.json` and
+  `bundle_build.rs`, leaving only the `mise.lock` `macos-x64` entries.
 
-Lead decisions applied verbatim: (1) cospec x64 asset under emulation first, else
-named exclusion with the reason recorded; (2) generic target-scoped "no
-predecessor" rule, unit-tested both ways; (3) built-asset notices belong to
-PR6a; (4) PR6a/PR6b split, linux-x64 only build host; (5) PR4a, PR5, PR4b
-before PR6a.
+Lead decisions, quoted exactly from the design note's final section, with where
+each is applied:
+
+1. "**cospec on arm64**: first try the x64 cospec asset under Windows 11 Arm x64
+   emulation (as cocogitto and shellcheck already run); pin the asset pattern per
+   platform for the arm64 entry via mise's github backend. Only if mise genuinely
+   cannot select or run it: drop cospec from the arm64 job installs and exclude
+   `cospec_contract.rs` by name in the recorded test list, with the reason
+   written down. Do not depend on an upstream arm64 cospec build (raised
+   separately with the maintainer)." Applied in D7 (per-platform
+   `asset_pattern` in root `mise.toml`, lock entry, contingency) and tasks
+   2.9, 3.2, 3.3.
+2. "**Previous-release updater check**: no release-keyed exemption. Make the rule
+   generic and target-scoped in the previous-release resolver: when NO published
+   release carries an asset for this target, record "no predecessor for
+   <target>" as visible evidence and pass; if any predecessor exists for the
+   target it must be exercised. Unit-test both branches." Applied in D5 and
+   tasks 2.6, 2.7.
+3. "**Notices**: ship ICU, LLVM runtime and mingw-w64 notices alongside Dolt's
+   LICENSES for the built asset; the manifest/verifier requires them for built
+   assets, not for upstream ones." Shipping them and the manifest requirement
+   are PR6a's; requiring them in the staged and published verifiers this change
+   owns is D6 and task 3.6.
+4. "**Ownership/split**: PR6a (manifest schema v2, bundle build command and
+   tasks, kuru-memory mise pins and lock, Linux build-twice determinism job,
+   arm64 manifest entry as data) is owned by this session and must be
+   self-contained and merged before PR6b starts. PR6b (target, windows-11-arm
+   jobs, installer/updater/release/docs, the ~30 x64 assumptions) goes to
+   another assistant with this note as the brief; this session reviews its
+   workflow wiring. Linux-to-Linux determinism must be verified in CI before the
+   arm64 entry is trusted; linux-x64 stays the only build host and the docs say
+   so." Applied in D8 (PR6a owner reviews the wiring before task 3.4), D9
+   (build-host sentence) and D10. This change departs from "merged before PR6b
+   starts": phase 2 runs before PR6a merges, following the computed brief, and
+   PR6a is a hard gate only for phase 3 and archive (blocking-changes Phase
+   Gates). Open Question 3 asks the lead to confirm.
+5. "**Sequence**: PR4a, PR5, PR4b before PR6a unless PR6a is already cheap to
+   finish; CI speed and parity are the priority." Applied in D10 and the
+   blocking-changes Phase Gates (PR5 notice gates phase 3).
 
 ## Goals / Non-Goals
 
@@ -81,11 +125,14 @@ before PR6a.
 
 **Non-Goals:**
 
-- Building or hosting the arm64 Dolt engine (PR6a), manifest schema v2, ICU/LLVM
-  /mingw-w64 notices, or an upstream arm64 cospec build.
+- Building or hosting the arm64 Dolt engine (PR6a), manifest schema v2, shipping
+  the ICU/LLVM/mingw-w64 notices or declaring them in the manifest (PR6a), or an
+  upstream arm64 cospec build. Requiring those notices in the staged and
+  published verifiers is in scope (D6).
 - Migrating an emulated x64 installation on Arm hardware to arm64 (Open
   Questions).
-- Removing `x86_64-apple-darwin` from the catalog (#106's follow-on).
+- Removing `x86_64-apple-darwin` from the catalog (done by #106) or its
+  remaining `mise.lock` `macos-x64` entries.
 - Adding an arm64-only coverage shard, changing `KURU_COVERAGE_JOB_MINUTES`, or
   tuning runner time budgets before a measured first run.
 - Windows 10 on Arm.
@@ -96,10 +143,10 @@ before PR6a.
 
 Add `Target { triple: "aarch64-pc-windows-msvc", os: "windows", arch: "aarch64",
 executable: "kuru.exe", format: ArchiveFormat::Zip }` to `CATALOG` after the x64
-Windows entry, and flip the test at `targets.rs:115` to assert
-`for_platform("windows", "aarch64")` selects it with `kuru.exe`/`zip`. Do not
-assert a final array length anywhere new; the Intel removal follow-on changes it
-independently.
+Windows entry, changing #106's `CATALOG: [Target; 4]` to `[Target; 5]`, and
+flip the test at `targets.rs:115` to assert `for_platform("windows", "aarch64")`
+selects it with `kuru.exe`/`zip`, keeping #106's asserts that `macos`/`x86_64`
+is rejected.
 
 `host()` keeps mapping `std::env::consts::ARCH`. That constant is the compiled
 target, which is the true native architecture for a native executable and is the
@@ -132,19 +179,35 @@ no `GetProcAddress` probing. Replace the `:626` gate with:
   the native machine throws "target does not match the native machine"; a 32-bit
   process still fails the `Is64BitProcess` check. Rejected: allowing an explicit
   x64 install on Arm, which would silently ship the emulated executable users
-  are trying to leave. This is a lead decision (default: reject).
+  are trying to leave. This is a designer default awaiting lead confirmation
+  (Open Question 4).
 - `Pe()` takes the expected machine (`0x8664` or `0xAA64`) instead of the
   constant; the error text names the expected architecture.
-- The manifest pattern, support name, helper cache name
-  (`"$Target-$sha.exe"`), receipt helper check and the `PublishSupport` call
-  all use `$Target`.
+- The manifest pattern, support name, new helper cache name and the
+  `PublishSupport` call use `$Target`.
+- Recovery keeps the helper's own target, separate from the target being
+  installed. `update.rs:837` names the recorded helper
+  `{host_target()}-{sha}.exe` from the installed binary's compiled target, so an
+  emulated x64 `kuru.exe` on Arm (which D1 keeps on x64) records an x64 helper.
+  The receipt helper check (`install.ps1:644`) therefore derives the expected
+  helper target from the recorded helper image's PE machine (`0x8664` or
+  `0xAA64`), accepts either Windows catalog target, and requires the name to be
+  `"<that target>-$sha.exe"`; it never compares it with the native `$Target`.
+  Rejected: checking `"$Target-$sha.exe"`, which would leave an interrupted
+  emulated-x64 update unrecoverable and unreinstallable on Arm.
 - `tests/fixtures/install-v0.4.2.ps1` stays x64-only: it is the frozen historical
   bootstrap the update fixtures replay.
 - Bootstrap tests (`bootstrap_windows.rs`) gain a case that runs the bootstrap
   with `PROCESSOR_ARCHITECTURE=AMD64` injected on every host and asserts the
   selected target equals the test executable's native target, proving the
-  environment is ignored; on an arm64 runner the same test proves the emulated
-  view is not trusted.
+  environment variable is ignored, and a recovery case with an x64-named helper
+  receipt and x64 helper image that must recover on either runner. Injecting the
+  variable into a native shell does not run `IsWow64Process2` from an emulated
+  process. Step zero looks for an x64 launch path on `windows-11-arm` (x64
+  `pwsh` or an equivalent x64 PowerShell host); if one exists, task 3.7 adds a
+  real emulated-process bootstrap case, and otherwise the emulated-shell claim
+  stays limited to what the tests prove: native detection through
+  `IsWow64Process2` with the environment ignored.
 
 Rust-side detection needs no change: the updater and `install-local` select by
 the compiled target (Decision 1).
@@ -182,8 +245,9 @@ the compiled target (Decision 1).
   cross-check tasks (`rustup target add aarch64-pc-windows-msvc`).
 - Fixtures: add `pub fn native_processor_architecture() -> &'static str` beside
   the production injection in `packages/kuru-delivery/src/mise_isolation.rs`,
-  mapping `consts::ARCH` `x86_64` → `AMD64` and `aarch64` → `ARM64` (compile
-  error on anything else), and use it at `mise_isolation.rs:64`,
+  mapping `x86_64` → `AMD64` and `aarch64` → `ARM64` through
+  `#[cfg(target_arch = ...)]` arms with a `compile_error!` arm for anything
+  else, and use it at `mise_isolation.rs:64`,
   `bootstrap_windows.rs:90`, `windows_update.rs:326,1039`,
   `embedded_runtime.rs:1129,1198,1250`. `kuru-platform/tests/windows_commands.rs:184`
   cannot depend on `kuru-delivery`, so it uses the same two-line `consts::ARCH`
@@ -228,36 +292,48 @@ Every row of the verified §8 catalogue and every confirmed gap:
 | A26 | `mise_acceptance.rs:35` | `host_target()` (D3) |
 | A27 | `windows_archive.rs:15` | `host_target()` (D3) |
 | A28 | `bootstrap_windows.rs:30` | `host_target()` (D3) |
-| A29 | `kuru-memory/tests/bundle_build.rs:26-32` | add the sixth target once PR6a's data exists (phase 2, after PR6a merges, or phase 3) |
-| A30 | `provision/native_tests.rs:225` | add the sixth target, same timing as A29 |
+| A29 | `kuru-memory/tests/bundle_build.rs:26-32` | add the arm64 target (the fifth after #106) once PR6a's data exists (phase 3, task 3.1) |
+| A30 | `provision/native_tests.rs:225` | add the arm64 target, same timing as A29 |
 | A31 | `published_windows.rs:20,365,380` | `WINDOWS_TARGET` becomes an `Options.target` validated against `host_target()` (D6) |
 | A32 | `mise_acceptance.rs:917-921` | target-scoped predecessor rule (D5) |
 | A33 | `openspec/specs/native-windows/spec.md:15,200` | delta in this change |
 | A34 | `openspec/specs/repository-delivery/spec.md:127` | delta in this change |
 | A35 | `docs/install.md:135-150,154` | phase 3, final commit (D9) |
 | A36 | `docs/release.md:151,180` | phase 3 (D9) |
+| A37 | `docs/development.md:217-320` (bundled-engine build inputs, offline import) | arm64 offline import example using PR6a's built archive and the `bundle:test-fixtures` note (A18); phase 3 (D9) |
+| A38 | `docs/development.md:439-453` (lock refresh commands) | add `windows-arm64` to the `mise lock --platform` lists and describe the cospec `asset_pattern` pin (D7, task 2.9) |
+| A39 | `tests/support/mise_acceptance.rs:95-99,153,170,843,854,864` | derive each asset API id from `CATALOG.iter().position()`, give `SHA256SUMS` an id past the catalog, make the request assertions use those ids and assert the ids are unique (task 2.10, phase 2) |
 | G1 | `embedded_runtime.rs:1129,1198,1250` | same helper as A21 (D3) |
 | G2 | `windows_cli.rs:34-35,82,163,195-196` | out of scope: passes the real machine environment through and asserts it is non-empty; correct on any host |
 | G3 | `tools.rs:116-117,5966-5967` | `:116-117` is the passthrough allowlist, benign; `:5966-5967` is the same synthetic fixture class as A25, same disposition |
 | G4 | tool locks with `windows-x64` entries | add `windows-arm64` entries (D7) |
-| G5 | #106 leaves the Intel catalog entry | out of scope for this change; rebase plan in D10 |
+| G5 | #106 removes the Intel catalog entry (`0ed39198`) | rebase onto #106 (D10); phase-3 catalog edit is `[Target; 4]` → `[Target; 5]` keeping #106's asserts; #106's untouched `mise.lock` `macos-x64` entries are out of scope |
 | G6 | resolver moved to `published.rs` (#108) | this change targets `published.rs` (D5) |
 | — | `openspec/specs/embedded-runtime/spec.md:26-38` | out of scope: PR6a's built-source provenance delta |
 
 ### 5. Previous-release rule in `published.rs`
 
-Replace the target-blind `select_previous` with a pure, target-scoped selection:
+Split the target-blind `select_previous` into pure, target-scoped selection over
+an injected manifest provider plus the async fetch that feeds it:
 
 ```text
 pub enum Predecessor {
     Release(PreviousRelease),
-    None { target: &'static str, candidate: String, inspected: Vec<String> },
+    None { target: &'static str, candidate: String, inspected: Vec<String>, horizon: String },
 }
-fn select_previous(releases: &[PublishedRelease], candidate: Version, core_name: &dyn Fn(&str) -> Result<String>)
-    -> Result<Selection>   // Selection::Release(version) | Selection::None { inspected }
+fn select_previous(
+    releases: &[PublishedRelease], candidate: Version, target: &str,
+    manifest: &mut dyn FnMut(&PublishedRelease) -> Result<Vec<u8>>,
+) -> Result<Selection>   // Selection::Release(version) | Selection::None { inspected }
 ```
 
-Rules, in order, over the unpaginated listing (GitHub's 30 most recent):
+`previous_release` passes a provider that fetches the release's `SHA256SUMS`
+from its immutable version path (64 KiB bound) and authenticates it against its
+listed digest with #108's `listed_digest(..., "SHA256SUMS")` plus
+`verify_manifest` before returning the bytes. Unit tests pass an in-memory
+provider, so no test needs the network.
+
+Rules, in order:
 
 1. Keep the existing fail-closed checks: every stable release tag must be
    canonical `vX.Y.Z`; a stable release newer than the candidate is an error; the
@@ -266,46 +342,60 @@ Rules, in order, over the unpaginated listing (GitHub's 30 most recent):
    whose asset listing names `archive::archive_name(version, target)` is the
    predecessor; `previous_release` then downloads and authenticates it exactly as
    today and it must be exercised.
-3. A release whose listing lacks the name is not yet "no predecessor": fetch its
-   `SHA256SUMS` (64 KiB bound, immutable version path) and require that it does
-   not name the archive either. Listing and manifest disagreeing in either
-   direction is an error ("previous release vX lists/omits <name> inconsistently").
-   Rejected: trusting the listing alone, which would let a release with a missing
-   asset-listing entry pass as "no predecessor".
+3. A release whose listing lacks the name is not yet "no predecessor": obtain its
+   authenticated `SHA256SUMS` from the provider and require, through #108's
+   `publishes_asset(listed, manifest, name)`, that listing and manifest agree
+   the archive is absent. Disagreement in either direction is an error
+   ("previous release vX lists/omits <name> inconsistently"). Rejected:
+   trusting the listing alone, and adding a second agreement helper.
 4. If no stable older release carries the archive, return
    `Predecessor::None { inspected }` with every inspected version. If there is no
    stable older release at all, keep today's error: the first release of the
    project is a different situation from the first release for a target.
+5. Horizon: the release listing request is unpaginated and GitHub returns at
+   most 30 releases per page. The `None` branch follows the `Link: rel="next"`
+   pages (each bounded by the existing 4 MiB metadata limit) until exhausted, so
+   "no predecessor" covers every published release, as lead decision 2 requires
+   ("NO published release"). If pagination cannot be completed, the `None`
+   branch fails rather than passing on a partial listing. The evidence line names
+   the horizon (`across N releases, all pages`).
 
 `previous_release` returns `Result<Predecessor>`. Callers:
 
 - `tests/support/previous_updater.rs::previous_updater_accepts_candidate` takes
   `&Predecessor`; on `None` it prints exactly
-  `no predecessor for <target>: inspected v0.9.0, v0.8.0 ...` and returns `Ok`
-  without running any updater. On `Release` it runs unchanged.
+  `no predecessor for <target>: inspected v0.9.0, v0.8.0 ... across N releases, all pages`
+  and returns `Ok` without running any updater. On `Release` it runs unchanged.
 - `mise_acceptance.rs::run_staged` and `tests/previous_release_update.rs` pass
   the host target and print the same line, so the `verify-staged-windows` job log
   and the CI acceptance log carry the evidence. No new receipt file: the staged
   check has none today and the published verifier does not run the previous
-  updater. Adding a `previous_release` field to a future staged receipt is a lead
-  decision (default: log line only).
+  updater. Whether a future staged receipt carries the decision as a field is a
+  designer default (log line only) awaiting lead confirmation (Open Question 2).
 - The rule cannot be a workflow `if:` (`release_workflow.rs` forbids it in
   `verify-staged-windows`), which is why it lives here.
 
-Unit tests (pure, fixture listings, no network):
+Unit tests (pure, fixture listings and in-memory manifest provider, no network):
 
 - `predecessor_is_the_greatest_older_release_carrying_the_target` — Windows x64
   candidate with v0.10.0 (asset present), v0.9.0 (present): selects v0.10.0.
 - `predecessor_skips_releases_without_the_target_when_a_later_one_exists` —
-  v0.10.0 lacks arm64, v0.9.0 has it: selects v0.9.0 and reports v0.10.0 inspected.
+  v0.10.0 lacks arm64 (listing and manifest agree), v0.9.0 has it: selects
+  v0.9.0 and reports v0.10.0 inspected.
 - `no_predecessor_when_no_stable_release_carries_the_target` — arm64 candidate
   over a listing of x64-only releases: `Selection::None` naming every inspected
   version; draft and prerelease entries are not inspected.
-- `no_predecessor_requires_the_manifest_to_agree` — the manifest cross-check
-  fails when `SHA256SUMS` names the archive the listing omitted, and when the
-  listing names it but the manifest does not (existing `listed_digest` path).
+- `no_predecessor_requires_the_manifest_to_agree` — the provider's manifest
+  names the archive the listing omitted, and the listing names it but the
+  manifest does not: both fail.
+- `no_predecessor_follows_every_listing_page` — a two-page listing where only
+  the second page carries the target selects it; an incomplete page chain fails.
 - Existing tests keep passing: newer-than-candidate error, malformed tags, the
-  project-wide "no stable release precedes" error, synthetic next-patch selection.
+  project-wide "no stable release precedes" error, synthetic next-patch selection,
+  and #108's manifest authentication tests.
+
+All 16 published releases (v0.1.0 through v0.9.0) carry `SHA256SUMS`, so the
+cross-check is always possible.
 
 `docs/release.md` gains the sentence: the check inspects every published stable
 release for the target's archive; on a target's first release it records
@@ -321,7 +411,18 @@ line is the acceptance evidence to look for in the job log.
   `runner_arch`. The task/script take `KURU_PUBLISHED_TARGET` (default host
   target) and the receipt path
   `published-windows-<target>-receipt.json`; the artifact name becomes
-  `published-windows-<target>-<version>-<attempt>`.
+  `published-windows-<target>-<version>-<attempt>`. In phase 2 the verifier
+  keeps writing to the path in `KURU_PUBLISHED_WINDOWS_RECEIPT` that
+  `release.yml verify-published-windows` sets; the target-qualified receipt
+  and artifact names are workflow values that land in phase 3 (task 3.4).
+- Built-asset notices (lead decision 3): once PR6a's v2 schema exists, the
+  staged (`mise_acceptance.rs:653`) and published
+  (`published_windows.rs:1098-1111`) verifiers read the target's manifest
+  source kind; for a built asset they require every ICU, LLVM runtime and
+  mingw-w64 notice the manifest lists, each digest-equal, alongside the
+  `LICENSES` check they already make, and the arm64 published receipt records
+  the verified notice names and digests. Upstream assets keep today's
+  `LICENSES`-only check (task 3.6).
 - `apps/kuru-tui:verify:staged-windows` keeps its single test; `mise_acceptance`
   derives `TARGET` from the host (D3) and the workflow passes
   `KURU_STAGED_WINDOWS_ARCHIVE` with `${{ matrix.target }}` (D8).
@@ -330,21 +431,31 @@ line is the acceptance evidence to look for in the job log.
 
 | Tool | On arm64 | Action |
 |---|---|---|
-| rust 1.98.1, cargo-llvm-cov, llvm-tools-preview | native | none |
+| rust 1.98.1, llvm-tools-preview | native | none |
+| cargo-llvm-cov 0.9.1 | built from source for arm64 through the `cargo:` backend | none; step zero runs an instrumented smoke test |
 | mise 2026.9.4, mise-action v4.3.0 | native | none |
 | mr-boxington 1.17.0 | native asset; CI sets `KURU_MBX=0` | lock entry for maintainers |
 | hk 1.58.1 | native; CI sets `MISE_NO_HOOKS=1` | lock entry |
 | taplo, actionlint, node/npm, communique | native | lock entries |
 | cocogitto 7.0.0 | x64 asset, `windows_arm_emulation: true` in the registry | lock entry to the x64 asset; smoke-test in step zero |
 | shellcheck 0.11.0 | x64 only; not installed on Windows jobs | lock entry to the x64 asset for `MISE_LOCKED=1` completeness |
-| cospec 0.7.1 | no arm64 asset (B2) | lead decision 1: `windows-arm64` lock entry pointing at `cospec-0.7.1-windows-x64.zip` via the github backend's per-platform asset selection; step zero runs `cospec --version` under emulation and records it |
+| cospec 0.7.1 | no arm64 asset (B2); release assets are `linux-{x64,arm64}[-musl]`, `macos-{x64,arm64}`, `windows-x64.zip`, `SHA256SUMS` | lead decision 1: root `mise.toml` moves the tool to table form with `[tools."github:aligned-team/cospec".platforms] windows-arm64 = { asset_pattern = "cospec-*-windows-x64.zip" }`, and the lock entry is generated from it; step zero runs `cospec --version` under emulation and records it |
 
 Lockfiles: root `mise.lock` (hk, shellcheck, actionlint, taplo, cospec,
 mr-boxington), `packages/kuru-delivery/mise.lock` (cocogitto, communique) and
 `apps/kuru-docs/mise.lock` gain `windows-arm64` platform entries, refreshed
 through the `mise lock --platform ...,windows-arm64` commands documented in
-`docs/development.md`. Implementation check: confirm `windows-arm64` is the key
-mise 2026.9.4 writes for that platform before relying on it.
+`docs/development.md`. A hand-written lock entry would be regenerated away by the
+next `mise lock`, so the cospec selection lives in `mise.toml` and the lock only
+records what mise resolved from it. The `platforms.<platform>.asset_pattern`
+syntax is taken from the live mise github-backend documentation
+(mise.jdx.dev/dev-tools/backends/github.html, read 2026-09-26; local mise is
+2026.9.13); task 2.9 re-confirms it and the `windows-arm64` key against the
+pinned mise 2026.9.4 before relying on them. `aqua:cocogitto/cocogitto` needs no
+option: the aqua backend has no `asset_pattern`, and the aqua registry entry's
+`windows_arm_emulation: true` makes aqua select the x64 asset on
+`windows-arm64`; task 2.9 records the resolved asset from the generated lock as
+that check.
 
 Contingency, only if step zero shows mise cannot select or run the x64 cospec
 asset on arm64: drop `github:aligned-team/cospec` from the arm64 jobs'
@@ -368,13 +479,20 @@ package must stay in `SHARDS`, which is test-bound to the workflow matrix) and
 
 ### 8. CI job mirror for `windows-11-arm` (design only; edits in phase 3)
 
+The PR6a owner reviews this wiring before task 3.4 edits any workflow (lead
+decision 4). Every new `uses:` step, including the `actions/download-artifact`
+import step, is pinned by commit SHA.
+
 Step zero, a throwaway job on `windows-11-arm` in the first phase-3 commit,
 removed before merge: print `[Environment]::Is64BitProcess`,
 `$env:PROCESSOR_ARCHITECTURE`, `PROCESSOR_ARCHITEW6432` and the `IsWow64Process2`
 native machine under `powershell.exe` 5.1 and `pwsh`; `$PSVersionTable`;
 `vswhere` results for `VC.Tools.ARM64` and `VC.Tools.x86.x64` with the located
 `dumpbin.exe` paths; `rustc --print host-tuple` after mise; `cospec --version`
-and `cog --version` under emulation. It confirms stock PowerShell 5.1 is native
+and `cog --version` under emulation; whether an x64 PowerShell host (for
+example x64 `pwsh`) can be launched, for the emulated-process bootstrap case in D2; and a
+`cargo llvm-cov` instrumented smoke test, since every memory, cleanup and
+terminal check runs under instrumentation. It confirms stock PowerShell 5.1 is native
 ARM64 before the bootstrap is trusted on that assumption.
 
 | x64 job | arm64 twin | Parameters | Aggregation |
@@ -385,7 +503,7 @@ ARM64 before the bootstrap is trusted on that assumption.
 | `windows-coverage` | same job | `runs-on: ${{ inputs.os }}`, `if: startsWith(inputs.os, 'windows')`; artifacts `<prefix>-coverage-<inputs.os>-<shard>-attempt-<n>` and `...-diagnostics-...`; rust-cache key `native-coverage-${{ inputs.os }}`; the PR6a import step (`download-artifact bundle-input-aarch64-pc-windows-msvc` then `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline` into the job's private `KURU_DOLT_BUNDLE_DIR`) conditioned on the os before `coverage:windows:shard`; `install_args` per D7; matrix stays byte-equal to `coverage::SHARDS` (five after #107); `KURU_COVERAGE_JOB_MINUTES` stays equal to the timeout | gate |
 | `windows-coverage-report` | same job | `runs-on: ${{ inputs.os }}`; download patterns `<prefix>-coverage-<inputs.os>-<shard>-attempt-*` so the two Windows OS calls never cross-contaminate; upload `<prefix>-coverage-${{ inputs.os }}-attempt-<n>`; the collector requires every receipt to share one host triple | gate |
 | `windows-install` | same job | `runs-on: ${{ inputs.os }}`; rust-cache key per os; the same PR6a import step; tasks generalized per D3 | gate |
-| `native-gate` | same job | replace the `windows-2025` literal with an explicit allowlist: `windows-2025` and `windows-11-arm` take the Windows branch, `ubuntu-*`/`macos-*` the Unix branch, any other label fails with the label in the message; `release_workflow.rs::native_workflow_gate_rejects_incomplete_windows_results` gains the arm64 accept case, each arm64 reject case and an unknown-label reject case; its Unix case tracks #106's labels | itself |
+| `native-gate` | same job | replace the `windows-2025` literal with an explicit allowlist: `windows-2025` and `windows-11-arm` take the Windows branch, `ubuntu-*`/`macos-*` the Unix branch, any other label fails with the label in the message; `release_workflow.rs::`native_workflow_gate_rejects_incomplete_windows_results` gains the arm64 accept case, each arm64 reject case and an unknown-label reject case in the same commit, because the test extracts the gate script from the live `native-tests.yml` (`release_workflow.rs:305-314`) and today's script branches only on `windows-2025` (`native-tests.yml:447`); its Unix case tracks #106's labels | itself |
 | previous-release-update CI job | does not exist on main (#108 documents it, nothing runs it) | flagged to the workflow owner; when it is added, one leg per supported native OS including `windows-11-arm`, `KURU_UPDATE_CANDIDATE_BINARY` with `.exe`, `GITHUB_TOKEN: github.token` on the listing step only | must join `native-gate` or `ci-gate` needs |
 | `release.yml build` Windows leg | add `{os: windows-11-arm, target: aarch64-pc-windows-msvc}` | already keyed on `matrix.target`/`runner.os`; `needs` gains PR6a's release-scoped `dolt-windows-arm64` job built from `needs.bump.outputs.sha`, and the asserted literal `needs: [plan, bump, verify, verify-tests]` in `release_workflow.rs` changes with it; the artifact download and offline import steps carry `if: matrix.target == 'aarch64-pc-windows-msvc'` (`build` is the one job allowed step conditions) | `assemble-candidate` validates against the catalog, so D1 lands in the same commit |
 | `verify-staged-windows` | matrix `{windows-2025, x86_64-pc-windows-msvc}`, `{windows-11-arm, aarch64-pc-windows-msvc}` under the same job id | `runs-on: ${{ matrix.os }}`; `KURU_STAGED_WINDOWS_ARCHIVE: .../kuru-<version>-${{ matrix.target }}.zip`; no `if:` anywhere (asserted); the predecessor rule runs inside the task (D5) | same job id keeps `deploy-docs`/`publish` `needs` unchanged; `release_workflow.rs:101-126` move to the matrix form |
@@ -402,40 +520,69 @@ only for private repositories.
 
 ### 9. Documentation and the support-claim rule
 
+The support claim rests on the five native checks AGENTS.md names, all of which
+run in ordinary CI on the branch before merge: memory, process cleanup, terminal,
+installation and update (D11). Update is covered natively by `windows-install`,
+whose `test:embedded-runtime` runs
+`embedded_runtime.rs::packaged_install_and_update_preserve_complete_offline_memory`.
+Staged acceptance (`verify-staged-windows`) and post-publication verification
+(`verify-published-windows`) exist only in `release.yml`, which runs from main
+after merge; they are release-time gates, not pre-merge evidence. Staged
+acceptance already blocks `deploy-docs` and public promotion in the same run, so
+a failing arm64 leg keeps the release, and the docs that claim support, from
+publishing.
+
 - `docs/install.md`: the supported-platforms row `Windows 11 or newer | ARM64 |
   aarch64-pc-windows-msvc`, the bootstrap text (native machine detection, both
-  targets, explicit `-Target` must match), and the archive-naming sentence. The
-  row and every sentence that says Kuru "supports" or "ships" Windows on Arm land
-  only in the final phase-3 commit, after the `windows-11-arm` platform,
-  coverage shards and report, install and offline runtime, and staged acceptance
-  jobs are green natively. Until then the docs describe the target as
+  targets, explicit `-Target` must match; an emulated x64 installation keeps
+  updating x64), and the archive-naming sentence. The row and every sentence
+  that says Kuru "supports" or "ships" Windows on Arm land only in the final
+  phase-3 commit, after the `windows-11-arm` platform, coverage shards and
+  report, and install and offline runtime (including install-and-update) jobs
+  are green natively on the branch. Until then the docs describe the target as
   "in verification" or do not mention it.
 - `docs/release.md`: both Windows legs in the build list, the staged and
   published matrix, the target-parametrized receipt name, the predecessor
-  sentence from D5, and the note that release-time coverage is Ubuntu only.
-- `docs/development.md`: the `windows-arm64` lock platform in the refresh
-  commands, an arm64 offline import example using PR6a's built archive, the
-  `bundle:test-fixtures` note (A18), and the `dumpbin` host-tools sentence.
-- Notices for built assets are PR6a's; this change links to that section rather
-  than duplicating it.
+  sentence from D5, the note that release-time coverage is Ubuntu only, and that
+  staged acceptance gates docs deployment and promotion per target.
+- `docs/development.md` (A37, A38): the `windows-arm64` lock platform and the
+  cospec `asset_pattern` pin in the refresh commands, an arm64 offline import
+  example using PR6a's built archive, the `bundle:test-fixtures` note (A18),
+  the `dumpbin` host-tools sentence, and (lead decision 4) that `linux-x64` is
+  the only engine build host.
+- Notices for built assets are shipped and documented by PR6a; this change
+  links to that section and documents only that the Windows verifiers require
+  them (D6).
+- Verification rows 5.1 (staged arm64 leg) and 7.1 (published arm64 receipt)
+  need a maintainer-authorized Release run after merge. At archive they are
+  recorded as explicit post-merge deferrals naming the first release that will
+  carry the arm64 target, and are observed and recorded on that run.
 
 ### 10. Sequencing and the x64-stays-green guarantee
 
 - Phase 1 (this change): design, specs, this ledger. No product code.
 - Phase 2 (on `feat/windows-arm64`, x64 and Unix only): D2 (installer), D3
-  (tasks, scripts, fixtures), D5 (resolver; requires #108 merged), D6
-  (verifiers), D7 lock entries, and the `release_workflow.rs` gate test cases
-  that do not depend on workflow text changes. None of these touch the catalog
-  or workflows, so `assemble-candidate`, `expected_assets` and every x64 job are
-  unchanged in behavior; x64 CI proves the generalizations on x64. A29/A30 wait
+  (tasks, scripts, fixtures), A39 (staged fixture asset ids), D5 (resolver;
+  requires #108 merged), D6 (verifiers, without the built-asset notices), and D7
+  lock entries. The `release_workflow.rs` gate cases are not in phase 2: the
+  test reads the gate script from the live workflow, so they move with the
+  workflow edit into task 3.4. None of these touch the catalog or workflows,
+  so `assemble-candidate`, `expected_assets` and every x64 job are unchanged in
+  behavior; x64 CI proves the generalizations on x64. A29/A30 wait
   for PR6a's manifest data.
-- Phase 3 (after the PR5 merge notice and PR6a's archive): step zero, then D1
-  catalog entry + D8 workflow edits + `release_workflow.rs` text expectations in
-  one commit, then D9 docs in the final commit after the native jobs are green.
+- Phase 3 (after the PR5 merge notice and PR6a's archive, which is a hard gate
+  here even though `cospec apply` sees it as soft): step zero, then the PR6a
+  owner's review of D8, then D1 catalog entry + D8 workflow edits +
+  `release_workflow.rs` text expectations and gate cases in one commit, then the
+  built-asset notice checks (D6), then D9 docs in the final commit after the
+  five native checks are green on the branch. Staged and published arm64
+  acceptance follow on the first maintainer-authorized Release run after merge.
 - Rebase: `feat/windows-arm64` is created from `origin/main` at `501ab92d`;
-  before phase 2 it rebases onto main once #106 and #108 merge, and again onto
-  the Intel catalog follow-on if it lands first (the catalog edit is a
-  two-line conflict at most). PR6a's merge triggers the phase-3 rebase.
+  before phase 2 it rebases onto main once #106 (which removes Intel macOS and
+  leaves `CATALOG: [Target; 4]`), #107 and #108 merge. PR6a's merge triggers the
+  phase-3 rebase.
+- "Phase 1/2/3" names stages inside this change (design and ledger; x64
+  generalizations; arm64 enablement), not roadmap phases.
 
 ### 11. Acceptance mapped to the five native checks
 
@@ -445,9 +592,9 @@ only for private repositories.
 | process cleanup | `native-platform` arm64 leg (90% platform coverage) and the `connectors-core-platform` shard's owned-process and supervisor tests |
 | terminal | the `application` shard's ConPTY tests |
 | installation | `windows-install`: `mise run install` (source), `bundle:verify-native-build`, `verify:windows-imports`, plus the bootstrap tests in the `delivery-archive` shard |
-| update | `test:embedded-runtime` install-and-update; `verify-staged-windows` arm64 leg with the predecessor rule; the previous-release-update job once the workflow owner adds it |
-| staged acceptance | `verify-staged-windows` `{windows-11-arm, aarch64-pc-windows-msvc}` green on a real Release run |
-| post-publication | `verify-published-windows` arm64 receipt retained on the run |
+| update | `windows-install`'s `test:embedded-runtime` (`packaged_install_and_update_preserve_complete_offline_memory`) on the branch; the previous-release-update job once the workflow owner adds it |
+| staged acceptance (release-time, after merge) | `verify-staged-windows` `{windows-11-arm, aarch64-pc-windows-msvc}` green on the first maintainer-authorized Release run, with the predecessor decision in its log; gates `deploy-docs` and promotion |
+| post-publication (release-time, after merge) | `verify-published-windows` arm64 receipt retained on that run |
 
 ## Operational surface
 
@@ -471,10 +618,11 @@ tools; `dumpbin` is a build-time acceptance dependency only.
 
 ## Integration contract
 
-- GitHub Releases: the predecessor rule reads the unpaginated release listing
-  (`/repos/replygirl/kuru/releases`, 30 most recent) and, for a release whose
-  listing lacks the target's archive, its `SHA256SUMS` from the immutable
-  `releases/download/v<version>/` path. Asset names are owned by
+- GitHub Releases: the predecessor rule reads the release listing
+  (`/repos/replygirl/kuru/releases`, 30 per page, following `Link: rel="next"`
+  on the `None` branch) and, for a release whose listing lacks the target's
+  archive, its `SHA256SUMS` from the immutable `releases/download/v<version>/`
+  path, authenticated against the listed digest. Asset names are owned by
   `archive::archive_name`/`shell_support::archive_name` from the catalog; no new
   naming scheme. Listing and manifest must agree or the release is rejected.
 - Windows API: `IsWow64Process2` (kernel32, Windows 10 1511+) through the
@@ -483,12 +631,15 @@ tools; `dumpbin` is a build-time acceptance dependency only.
 - MSVC tools: `vswhere` component ids `Microsoft.VisualStudio.Component.VC.Tools.x86.x64`
   and `Microsoft.VisualStudio.Component.VC.Tools.ARM64`; `dumpbin.exe` under
   `bin/Hostx64/x64` or `bin/Hostarm64/arm64`. The check reads imports only.
-- mise: the github and aqua backends' per-platform lock entries keyed
-  `windows-arm64` (key confirmed at the first `mise lock`); cospec and cocogitto
-  entries point at their x64 assets. `MISE_LOCKED=1` stays on.
-- PR6a: the sixth manifest asset is selected by Cargo `TARGET` exactly as the
-  five upstream ones; this change reads `target`, `stem`, `format`,
-  `executable_name` and nothing from `source.built.*`. The workflow artifact is
+- mise: root `mise.toml` pins cospec's `windows-arm64` `asset_pattern` to the
+  x64 ZIP; the github and aqua backends' lock entries keyed `windows-arm64` (key
+  confirmed at the first `mise lock`) are generated from configuration; cocogitto
+  resolves its x64 asset through the aqua registry's `windows_arm_emulation`.
+  `MISE_LOCKED=1` stays on.
+- PR6a: the arm64 manifest asset is selected by Cargo `TARGET` exactly as the
+  upstream ones; this change reads `target`, `stem`, `format`,
+  `executable_name` and, for the verifier notice check only, the built-asset
+  notice list PR6a's v2 schema defines under `source.built.*`. The workflow artifact is
   named `bundle-input-aarch64-pc-windows-msvc` and imported with
   `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline`.
 - Coverage receipts: shard receipts may carry `excluded_artifacts`
@@ -516,10 +667,14 @@ tools; `dumpbin` is a build-time acceptance dependency only.
   allowlist that fails on unknown labels, with test cases for each branch.
 - [4 vCPU and gzip caches push a shard past 90 minutes] → measure the first
   run; add a shard through `SHARDS` if needed rather than raising the budget.
-- [`SHA256SUMS` cross-check adds up to 30 small downloads on a first release] →
-  bounded to 64 KiB each on immutable paths; only on the no-predecessor path.
-- [The Intel catalog follow-on and this change conflict in `targets.rs`] →
-  neither asserts a length; rebase resolves a two-line conflict.
+- [`SHA256SUMS` cross-check adds one small download per published release on a
+  first release] → bounded to 64 KiB each on immutable paths, authenticated
+  against listed digests; only on the no-predecessor path.
+- [#106 changes `targets.rs` and the catalog length] → phase 2 rebases onto
+  #106; the phase-3 edit goes from `[Target; 4]` to `[Target; 5]` and keeps its
+  asserts.
+- [The staged fixture's positional asset ids collide or go stale when the
+  catalog changes] → A39 derives them from the catalog and asserts uniqueness.
 - [`windows-arm64` is not the lock platform key mise writes] → verified at the
   first `mise lock` run; the docs command is updated to whatever mise emits.
 
@@ -527,7 +682,19 @@ tools; `dumpbin` is a build-time acceptance dependency only.
 
 1. Migration of an x64 `kuru.exe` running emulated on Arm hardware to the arm64
    target (design note Q3). Deferrable: it changes no spec, task or approach here;
-   `kuru update` keeps its compiled target until a separate change decides.
-2. Whether a later staged-acceptance receipt should carry the predecessor
-   decision as a field rather than a log line (D5). Deferrable: the log line is
-   the evidence surface this change commits to.
+   `kuru update` keeps the installed executable's target until a separate change
+   decides.
+2. Designer default, needs lead confirmation: the predecessor decision is
+   evidenced by a log line only, not a field in a future staged-acceptance
+   receipt (D5).
+3. Needs lead confirmation: lead decision 4 says PR6a is "merged before PR6b
+   starts"; this change runs phase 2 before PR6a merges and treats PR6a as soft
+   for `cospec apply` but hard for phase 3 and archive (blocking-changes Phase
+   Gates). Blocks the start of phase 2.
+4. Designer default, needs lead confirmation: an explicit `-Target` that differs
+   from the native machine is rejected, including an explicit x64 install on
+   Arm (D2).
+5. Designer default, needs lead confirmation: Windows 11 is the Arm floor
+   (.NET Framework 4.8.1 native Arm64); Windows 10 on Arm is out of scope.
+6. Designer default, needs lead confirmation: release-time Windows coverage
+   stays staged/published-only for both architectures (D8 caveats).
