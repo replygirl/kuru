@@ -1,7 +1,10 @@
 #![cfg(all(windows, feature = "tooling"))]
 
 use anyhow::{Context, Result, ensure};
-use kuru_delivery::{archive::digest, command::BlockingCommand as Command};
+use kuru_delivery::{
+    archive::{digest, host_target},
+    command::BlockingCommand as Command,
+};
 use kuru_platform::{
     fs::{Directory, NameRetention, Privacy, regular_file_info, require_private},
     windows::{
@@ -323,7 +326,10 @@ fn recover(fixture: &Fixture) -> Result<()> {
             "SystemRoot",
             system.parent().context("Windows system root")?,
         )
-        .env("PROCESSOR_ARCHITECTURE", "AMD64")
+        .env(
+            "PROCESSOR_ARCHITECTURE",
+            kuru_delivery::mise_isolation::native_processor_architecture(),
+        )
         .env("USERPROFILE", &environment)
         .env("APPDATA", &environment)
         .env("LOCALAPPDATA", &environment)
@@ -1036,7 +1042,12 @@ async fn loaded_image_acknowledges_exact_new_bytes_while_old_process_is_still_al
 async fn corrupt_existing_trusted_helper_is_never_executed_and_preserves_current_image() {
     let fixture = Fixture::new();
     let cache = Directory::ensure_private(&fixture.cache).unwrap();
-    let name = format!("x86_64-pc-windows-msvc-{}.exe", digest(&fixture.original));
+    // The updater names its trusted helper by the executable's compiled target.
+    let name = format!(
+        "{}-{}.exe",
+        host_target().unwrap(),
+        digest(&fixture.original)
+    );
     let mut wrong = cache.create_new(OsStr::new(&name)).unwrap();
     std::io::Write::write_all(&mut wrong, b"not the trusted current image").unwrap();
     drop(wrong);

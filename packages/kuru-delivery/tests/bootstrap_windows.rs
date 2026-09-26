@@ -98,7 +98,10 @@ impl Fixture {
         let system = system_directory().unwrap();
         let mut result = vec![
             ("SystemRoot".into(), system.parent().unwrap().into()),
-            ("PROCESSOR_ARCHITECTURE".into(), "AMD64".into()),
+            (
+                "PROCESSOR_ARCHITECTURE".into(),
+                kuru_delivery::mise_isolation::native_processor_architecture().into(),
+            ),
             ("PATH".into(), "".into()),
             (
                 "USERPROFILE".into(),

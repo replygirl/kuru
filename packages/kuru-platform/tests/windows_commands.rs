@@ -181,7 +181,17 @@ async fn configured_stock_powershell_starts_like_direct_spawn_with_the_same_isol
     let marker = cwd.join("script-reached");
     let mut env: Vec<(OsString, OsString)> = vec![
         ("SystemRoot".into(), system.parent().unwrap().into()),
-        ("PROCESSOR_ARCHITECTURE".into(), "AMD64".into()),
+        (
+            "PROCESSOR_ARCHITECTURE".into(),
+            // The test executable is native: its compiled architecture is the
+            // runner's machine. kuru-platform cannot depend on kuru-delivery.
+            match std::env::consts::ARCH {
+                "x86_64" => "AMD64",
+                "aarch64" => "ARM64",
+                other => panic!("unsupported Windows test architecture {other}"),
+            }
+            .into(),
+        ),
         ("PATH".into(), "".into()),
         ("USERPROFILE".into(), cwd.clone().into()),
         ("LOCALAPPDATA".into(), cwd.clone().into()),

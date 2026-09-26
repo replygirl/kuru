@@ -23,7 +23,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Output,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 
@@ -34,7 +34,16 @@ mod previous_updater;
 
 const DEADLINE: Duration = Duration::from_secs(180);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const TARGET: &str = "x86_64-pc-windows-msvc";
+// The acceptance executable is native, so its compiled catalog target is the
+// runner's Windows target and the staged archive it installs.
+static TARGET: LazyLock<&'static str> = LazyLock::new(|| {
+    let target = archive::host_target().expect("staged acceptance requires a catalog host target");
+    assert!(
+        targets::find(target).is_ok_and(|entry| entry.os == "windows"),
+        "staged acceptance requires a Windows catalog target, found {target}"
+    );
+    target
+});
 fn checked_file_within(path: &Path, root: &Path) -> Result<bool> {
     let ancestor = Directory::open(root, Privacy::Inherited, NameRetention::Movable)?;
     let parent = Directory::open(
@@ -91,7 +100,7 @@ impl Drop for Server {
 }
 
 fn asset_name() -> String {
-    archive::archive_name(VERSION, TARGET).unwrap()
+    archive::archive_name(VERSION, *TARGET).unwrap()
 }
 // Simulated numbering follows the target catalog's own order (matching a real
 // GitHub release's asset enumeration), plus one trailing slot for SHA256SUMS.
@@ -100,7 +109,7 @@ fn asset_name() -> String {
 fn windows_asset_id() -> usize {
     targets::CATALOG
         .iter()
-        .position(|target| target.triple == TARGET)
+        .position(|target| target.triple == *TARGET)
         .expect("Windows target present in the release catalog")
         + 1
 }
@@ -108,9 +117,9 @@ fn sha256sums_asset_id() -> usize {
     targets::CATALOG.len() + 1
 }
 fn release(data: &ServerData) -> Value {
-    let mut assets:Vec<_>=targets::CATALOG.iter().enumerate().filter(|(_,target)| !data.scenario.missing || target.triple!=TARGET).map(|(index,target)| {
+    let mut assets:Vec<_>=targets::CATALOG.iter().enumerate().filter(|(_,target)| !data.scenario.missing || target.triple!=*TARGET).map(|(index,target)| {
         let name=archive::archive_name(VERSION,target.triple).unwrap();
-        json!({"name":name,"browser_download_url":format!("https://github.com/replygirl/kuru/releases/download/v{VERSION}/{name}"),"url":format!("https://api.github.com/repos/replygirl/kuru/releases/assets/{}",index+1),"digest":if data.scenario.api_digest && target.triple==TARGET {Some(format!("sha256:{}",data.digest))} else {None}})
+        json!({"name":name,"browser_download_url":format!("https://github.com/replygirl/kuru/releases/download/v{VERSION}/{name}"),"url":format!("https://api.github.com/repos/replygirl/kuru/releases/assets/{}",index+1),"digest":if data.scenario.api_digest && target.triple==*TARGET {Some(format!("sha256:{}",data.digest))} else {None}})
     }).collect();
     assets.push(json!({"name":"SHA256SUMS","browser_download_url":format!("https://github.com/replygirl/kuru/releases/download/v{VERSION}/SHA256SUMS"),"url":format!("https://api.github.com/repos/replygirl/kuru/releases/assets/{}",sha256sums_asset_id())}));
     json!({"tag_name":format!("v{VERSION}"),"draft":false,"prerelease":false,"created_at":"2020-01-01T00:00:00Z","published_at":"2020-01-01T00:00:00Z","assets":assets})
@@ -666,12 +675,12 @@ impl Installation {
             .as_array()
             .context("engine catalog")?
             .iter()
-            .find(|asset| asset["target"] == TARGET)
+            .find(|asset| asset["target"] == *TARGET)
             .context("Windows engine")?;
         let engine = self
             .engine_cache
             .join(manifest["version"].as_str().context("engine version")?)
-            .join(TARGET);
+            .join(*TARGET);
         for (name, size, hash) in [
             ("dolt.exe", "executable_bytes", "executable_sha256"),
             ("LICENSES", "license_bytes", "license_sha256"),
@@ -912,7 +921,7 @@ pub async fn run(binary: &Path) -> Result<()> {
         "mise acceptance requires an absolute actual Kuru binary"
     );
     let root = tempfile::tempdir()?;
-    let archive = archive::package(binary, TARGET, VERSION, root.path())?;
+    let archive = archive::package(binary, *TARGET, VERSION, root.path())?;
     let bytes = fs::read(archive)?;
     let expected = archive::digest(&fs::read(binary)?);
     run_archive(bytes, expected, None).await
@@ -938,7 +947,7 @@ pub async fn run_staged(archive_path: &Path) -> Result<()> {
         archive::digest(&bytes) == expected_archive,
         "staged Windows archive differs from SHA256SUMS"
     );
-    let (executable, support) = archive::verified_release(directory, VERSION, TARGET).await?;
+    let (executable, support) = archive::verified_release(directory, VERSION, *TARGET).await?;
     ensure!(
         support.is_some(),
         "staged new release is missing its paired shell support"
@@ -952,7 +961,7 @@ pub async fn run_staged(archive_path: &Path) -> Result<()> {
     // release-time sanity re-run, and it is a floor rather than the whole
     // compatibility policy.
     let token = published::checked_token(std::env::var_os("GITHUB_TOKEN"))?;
-    let predecessor = published::previous_release(VERSION, TARGET, token.as_deref()).await?;
+    let predecessor = published::previous_release(VERSION, *TARGET, token.as_deref()).await?;
     previous_updater::previous_updater_accepts_candidate(
         &predecessor,
         &previous_updater::Candidate {
