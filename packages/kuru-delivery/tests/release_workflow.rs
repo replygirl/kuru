@@ -397,7 +397,7 @@ async fn native_workflow_gate_rejects_incomplete_windows_results() {
             &root,
             gate,
             (
-                "ubuntu-24.04",
+                "ubuntu-latest",
                 "true",
                 "success",
                 "skipped",

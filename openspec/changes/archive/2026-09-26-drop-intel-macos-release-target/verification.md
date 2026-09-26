@@ -1,0 +1,14 @@
+## 1. Shell bootstrap refuses Intel Macs before any download [critical]
+
+- [x] 1.1 @integration (agent) run `mise run //packages/kuru-delivery:test`, which executes the real `install.sh` through the faked-`uname` bootstrap harness against a local release server -> `intel_macs_are_refused_with_the_last_supporting_release` passes for both a `Darwin`/`x86_64` host and `--target x86_64-apple-darwin`, with the exact v0.9.0 message, a non-zero exit, no recorded request and an unchanged destination. Observed on macOS arm64: `mise run //packages/kuru-delivery:test` exited 0 with 185 passed, 0 failed, including `intel_macs_are_refused_with_the_last_supporting_release`.
+- [x] 1.2 @integration (agent) confirm the v0.9.0 tag's bootstrap still accepts the Intel target -> `git show v0.9.0:packages/kuru-delivery/support/install.sh` maps `Darwin:x86_64` to `x86_64-apple-darwin` and lists it among accepted targets. Observed: the v0.9.0 tag's `install.sh` maps `Darwin:x86_64) kuru_target=x86_64-apple-darwin` and lists `x86_64-apple-darwin` in its accepted-target case.
+- [x] 1.3 @e2e (agent) run the real current `install.sh` in a subprocess with `--target x86_64-apple-darwin` and a closed local release base -> exits 1 and prints the exact refusal message without contacting the base. Observed on macOS arm64: `bash packages/kuru-delivery/support/install.sh --target x86_64-apple-darwin --version 0.9.0 --release-base https://127.0.0.1:1/v0.9.0 --install-dir <empty temp>/bin` printed `kuru: Intel Macs (x86_64-apple-darwin) are no longer supported; v0.9.0 was the last release supporting them`, exited 1 and left the temp directory empty.
+
+## 2. Release inventory follows the catalog [critical]
+
+- [x] 2.1 @integration (agent) run the delivery suite's release assembly and workflow tests -> assembly expects `TARGETS.len() * 2` archives with no Intel macOS entry and the Windows acceptance fixture resolves the Windows asset by its catalog position. Observed: the same delivery run passed the `release` and `release_workflow` tests (including the native-gate test now driven with `ubuntu-latest`); the Windows-only `mise_acceptance` body type-checks under `mise run typecheck` and runs in the PR's Windows CI.
+- [~] 2.2 @runtime (human) next Release dispatch on main assembles one core and one paired support archive per catalog target and selects a breaking bump from the `feat(release)!:` commit -> defer: Release is an authorized manual dispatch after merge
+
+## 3. Specs and documentation agree with the product
+
+- [x] 3.1 @integration (agent) run `mise run format:code ::: lint:rust ::: typecheck ::: lint:tooling ::: cospec:validate ::: cospec:managed:check ::: docs:check` -> every step exits 0 with the spec deltas and the new docs paragraphs. Observed on macOS arm64: the chain exited 0, including `Public docs artifacts, local links and anchors passed (/kuru/).`

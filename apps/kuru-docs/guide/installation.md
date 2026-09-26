@@ -86,6 +86,12 @@ The bootstrap freezes latest to an explicit version, verifies the ZIP checksum a
 
 Linux archives are built on Ubuntu 24.04 and need a compatible glibc. Linux support uses GNU targets; musl targets are not supported. The shell bootstrap's `--target` overrides host detection for supported tar targets. PowerShell selects Windows x86-64 and accepts `-Target x86_64-pc-windows-msvc` explicitly.
 
+Intel Macs (`x86_64-apple-darwin`) are not supported after v0.9.0, and the current shell bootstrap refuses them before downloading anything. To install v0.9.0 on an Intel Mac, use that tag's own bootstrap with an explicit version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/replygirl/kuru/v0.9.0/packages/kuru-delivery/support/install.sh | bash -s -- --version 0.9.0
+```
+
 ## Release archives and mirrors
 
 Release archives use `kuru-VERSION-TARGET.tar.gz` for macOS/Linux and `kuru-VERSION-x86_64-pc-windows-msvc.zip` for Windows, alongside `SHA256SUMS`. Archives contain the executable, `LICENSE` and `README.md`. To use a mirror, pass its HTTPS version directory and an explicit version:

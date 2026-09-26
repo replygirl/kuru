@@ -147,6 +147,14 @@ engine. The shell bootstrap detects its macOS/Linux host; `--target` selects
 another supported tar target. PowerShell uses the Windows x86-64 ZIP and accepts
 `-Target x86_64-pc-windows-msvc` explicitly.
 
+Intel Macs (`x86_64-apple-darwin`) are not supported after v0.9.0, and the
+current shell bootstrap refuses them before downloading anything. To install
+v0.9.0 on an Intel Mac, use that tag's own bootstrap with an explicit version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/replygirl/kuru/v0.9.0/packages/kuru-delivery/support/install.sh | bash -s -- --version 0.9.0
+```
+
 ## Release archives
 
 Release archives use `kuru-VERSION-TARGET.tar.gz` for macOS/Linux and
