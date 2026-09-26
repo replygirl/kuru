@@ -352,6 +352,37 @@ intentional overrides such as the temporary release index. Keep new repository
 subprocesses on that path and exercise foreign hook environments through child
 processes with temporary repositories. See [Git's hook documentation](https://git-scm.com/docs/githooks).
 
+## Memory service protocol
+
+Each typed memory service operation (`ServiceCall`, `ViewOperation` and
+`LedgerOperation` in `packages/kuru-memory/src/service/rpc.rs`) has one entry in
+its exhaustive `contract()` match. The entry states whether a lost reply may
+hide a write, which durable receipt proves the outcome, and the reply budget.
+A new variant does not compile until it has an entry. A write must also carry a
+receipt; idle retirement is the only exception. Add the variant's sample and
+classification row to `service/rpc/contract_tests.rs`.
+
+`service/rpc/protocol-surface.txt` pins the wire surface to `PROTOCOL_MAJOR`
+and `PROTOCOL_MINOR` in `service.rs`. It records one sampled shape per variant
+for requests and for the nested wire enums they carry: content blocks, turn
+transitions, transcript positions, usage proofs, price terms and export cursor
+phases. Every optional field in a sample is populated. Response and
+unit-valued enums are pinned only by their variant names, and a
+free-form JSON value shows only its sampled shape. The handshake hello is not
+pinned. Shared `kuru-core` types that
+travel on the wire are included. When the pin fails, bump `PROTOCOL_MINOR`.
+Older owners then refuse the newer client at the handshake, which is clearer
+than a decode failure. Regenerate the fixture with
+`KURU_BLESS_PROTOCOL_PIN=1 mise run //packages/kuru-memory:test -- protocol_surface`
+and review its diff. Regeneration writes the fixture only when none exists or
+when the protocol version is strictly greater than the recorded one.
+
+Residual risks: the fixture is a golden file, so a hand edit, or deleting it and
+regenerating, can still record a change at an unchanged version. Review must
+reject any fixture diff that comes without a `PROTOCOL_MINOR` bump. Branches
+that bump concurrently conflict on the fixture and the constant; the later one
+rebases, takes the next minor and regenerates.
+
 ## Coding assistants
 
 [AGENTS.md](../AGENTS.md) is the canonical repository instruction source.
