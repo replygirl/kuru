@@ -80,6 +80,18 @@ license. The connector package carries the crate and asset MIT attributions in
 
 mr-boxington's exact pin and signed lock entries cover every supported platform.
 
+mise stays at `2026.9.4`, behind its current release, 2026.9.14 (2026-09-25).
+Homebrew's `mise` formula was 2026.9.13 on the check date, so a higher root
+`min_version` would reject that installation. The lockfile procedure also relies
+on 2026.9.4 writing `provenance_verified`; see
+[dependency and release updates](development.md#dependency-and-release-updates).
+Raise mise in its own change, updating these together: the root `mise.toml`
+`min_version`; every `jdx/mise-action` `version:` input in the CI, quality,
+native-tests and release workflows; the workflow mise-version check and fixture
+in `packages/kuru-delivery/src/published_windows.rs`; the delivery tests
+`tests/release_workflow.rs` and `tests/support/mise_acceptance.rs`; and the
+minimum mise version stated in development and installation docs.
+
 Cospec is `0.8.2`, confirmed by its [GitHub release](https://github.com/aligned-team/cospec/releases/tag/v0.8.2). Its standalone executable embeds its supported OpenSpec version, 1.13.1 for this release. No project OpenSpec, Bun or Python dependency is required. The task-scoped compatibility preload remains necessary; see [development](development.md).
 
 `cargo-audit` is scoped to delivery's advisory quality tasks. It scans only the
