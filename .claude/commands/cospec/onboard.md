@@ -1,13 +1,13 @@
 ---
 name: "COSPEC: Onboard"
-description: Walk a first-time user through one real cospec change end to end, narrating each step.
+description: Walk a first-time user through one real cospec change end to end, narrating each step. Also use when the user says "cospec onboard" or "openspec onboard".
 category: Workflow
 tags:
   - cospec
   - workflow
 metadata:
   author: cospec
-  generatedBy: cospec@0.7.1
+  generatedBy: cospec@0.8.2
   contentHash: sha256:c0acf01721c99e0b50950041c4080c330b709e81b07ef095b69784b1bedc7960
 ---
 

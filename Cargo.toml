@@ -37,7 +37,7 @@ sha2 = "=0.11.0"
 getrandom = "=0.4.3"
 tokio = { version = "=1.53.1", features = ["full"] }
 tracing = "=0.1.44"
-tiktoken-rs = "=0.12.0"
+tiktoken-rs = "=0.12.1"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = [
   "registry",
   "std",
@@ -54,7 +54,7 @@ ratatui = { version = "=0.30.2", default-features = false, features = [
   "layout-cache",
 ] }
 crossterm = "=0.29.0"
-clap = { version = "=4.6.6", features = ["derive", "env"] }
+clap = { version = "=4.6.7", features = ["derive", "env"] }
 usage-lib = { version = "=6.11.1", features = ["clap"] }
 # usage-cli has no optional features (verified against its published Cargo.toml):
 # every dependency it declares — including rmcp's "server" transport, tera, tokio
@@ -67,11 +67,11 @@ usage-argv = { version = "=6.11.1", features = ["complete"] }
 tempfile = "=3.27.0"
 url = "=2.5.8"
 unicode-width = "=0.2.2"
-jsonschema = { version = "=0.56.0", default-features = false }
+jsonschema = { version = "=0.58.0", default-features = false }
 cap-std = "=4.0.3"
 cap-fs-ext = "=4.0.3"
 nix = { version = "=0.31.3", features = ["signal", "process", "term", "poll", "fs", "user"] }
-rustix = { version = "=1.1.4", features = ["termios"] }
+rustix = { version = "=1.1.5", features = ["termios"] }
 vt100 = "=0.16.2"
 tar = "=0.4.46"
 flate2 = "=1.1.10"

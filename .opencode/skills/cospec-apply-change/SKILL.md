@@ -1,11 +1,11 @@
 ---
 name: cospec-apply-change
-description: Run the apply gate for a change and implement its tasks, obeying the gate's exit code.
+description: Run the apply gate for a change and implement its tasks, obeying the gate's exit code. Also use when the user says "cospec apply" or "openspec apply".
 license: MIT
 compatibility: Requires the cospec CLI (@aligned-team/cospec).
 metadata:
   author: cospec
-  generatedBy: cospec@0.7.1
+  generatedBy: cospec@0.8.2
   contentHash: sha256:0a592f8e240b1a1b70b0b40785fb1bb04f25702de3e264af0fff88b45b824635
 ---
 
