@@ -90,25 +90,130 @@ async fn pwsh_set_content_preserves_long_cargo_json_lines() {
     assert_eq!(parsed, value);
 }
 
-/// Offsets and names of `Verb-Noun` command tokens in PowerShell source.
-fn command_tokens(source: &str) -> Vec<(usize, &str)> {
+/// Standard aliases shipped by `Microsoft.PowerShell.Utility` and
+/// `Microsoft.PowerShell.Management` (PowerShell's documented default alias
+/// list for those two modules). Each resolves through module auto-discovery
+/// exactly like its full cmdlet name, so a bare alias reached before the
+/// matching `Import-Module` would stall a cold profile the same way a
+/// capitalized `Verb-Noun` cmdlet would. Matched case-insensitively.
+const MODULE_ALIASES: &[&str] = &[
+    // Microsoft.PowerShell.Utility
+    "echo", "write", "select", "sort", "where", "group", "measure", "compare", "diff", "iex", "fl",
+    "ft", "fw", "fc", "oh", "gm", "gu", "gv", "sv", "nv", "rv", "clv",
+    // Microsoft.PowerShell.Management
+    "gc", "cat", "type", "gci", "ls", "dir", "gp", "sp", "gps", "ps", "kill", "rm", "del", "erase",
+    "rd", "ri", "rmdir", "cp", "copy", "cpi", "mv", "move", "mi", "ni", "pwd", "cd", "chdir", "sl",
+    "gl", "clc", "cli", "clp", "gcb", "scb", "cvpa", "gdr", "ndr", "rdr", "gtz", "stz",
+];
+
+/// Blanks comment prose and quoted string literals, so English words like
+/// `module auto-discovery` or a literal ZIP filename like `shell-support`
+/// cannot themselves look like a command now that matching is
+/// case-insensitive: only real code positions remain. A double-quoted
+/// `$(...)` subexpression is kept as code, since PowerShell actually
+/// evaluates it. Preserves length, so earlier byte offsets stay valid.
+fn mask_non_code(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut masked = String::with_capacity(source.len());
+    let mut quote: Option<char> = None;
+    let mut expr_depth: u32 = 0;
+    let mut in_comment = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let character = chars[index];
+        if in_comment {
+            if character == '\n' {
+                in_comment = false;
+                masked.push(character);
+            } else {
+                masked.push(' ');
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(q) = quote {
+            if q == '"' && expr_depth == 0 && character == '$' && chars.get(index + 1) == Some(&'(')
+            {
+                masked.push_str("$(");
+                expr_depth = 1;
+                index += 2;
+                continue;
+            }
+            if expr_depth > 0 {
+                match character {
+                    '(' => expr_depth += 1,
+                    ')' => expr_depth -= 1,
+                    _ => {}
+                }
+                masked.push(character);
+                index += 1;
+                continue;
+            }
+            if character == q {
+                quote = None;
+                masked.push(character);
+            } else if character == '\n' {
+                masked.push(character);
+            } else {
+                masked.push(' ');
+            }
+            index += 1;
+            continue;
+        }
+        if character == '\'' || character == '"' {
+            quote = Some(character);
+            masked.push(character);
+            index += 1;
+            continue;
+        }
+        if character == '#' {
+            in_comment = true;
+            masked.push(' ');
+            index += 1;
+            continue;
+        }
+        masked.push(character);
+        index += 1;
+    }
+    masked
+}
+
+/// Offsets and lowercased names of discovered command tokens in PowerShell
+/// source: `Verb-Noun` cmdlets in any letter case, plus standard
+/// Utility/Management module aliases. Excludes variable references (`$name`)
+/// and property/method access (`.name`), which share the same word shape but
+/// never trigger auto-discovery.
+fn command_tokens(source: &str) -> Vec<(usize, String)> {
+    let bytes = source.as_bytes();
     let mut tokens = Vec::new();
     let mut start = None;
     for (index, character) in source.char_indices().chain([(source.len(), ' ')]) {
-        if character.is_ascii_alphanumeric() || character == '-' {
+        // `_` joins identifier segments (e.g. `$env:KURU_INSTALL_DIR`) into one
+        // token so a `SHOUT_CASE` piece can't coincidentally read as a bare
+        // alias like `dir`.
+        if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
             start.get_or_insert(index);
             continue;
         }
         let Some(begin) = start.take() else { continue };
         let word = &source[begin..index];
-        let command = word.split_once('-').is_some_and(|(verb, noun)| {
-            [verb, noun].iter().all(|part| {
-                part.starts_with(|c: char| c.is_ascii_uppercase())
-                    && part.chars().all(|c| c.is_ascii_alphabetic())
-            })
+        // `$name` (variable), `.name` (property/method) and `[name]` (type
+        // literal, e.g. `-as [type]`) share this word shape but are never
+        // reached through command auto-discovery.
+        if matches!(
+            begin.checked_sub(1).map(|i| bytes[i] as char),
+            Some('$') | Some('.') | Some('[')
+        ) {
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        let is_verb_noun = word.split_once('-').is_some_and(|(verb, noun)| {
+            [verb, noun]
+                .iter()
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphabetic()))
         });
-        if command {
-            tokens.push((begin, word));
+        if is_verb_noun || MODULE_ALIASES.contains(&lower.as_str()) {
+            tokens.push((begin, lower));
         }
     }
     tokens
@@ -120,9 +225,12 @@ fn stock_installer_imports_pshome_modules_before_any_discovered_command() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("support/install.ps1"),
     )
     .unwrap();
-    // The native bridge's C# here-string is not PowerShell command text.
+    // The native bridge's C# here-string is not PowerShell command text. Drop
+    // the whole `\n'@\n` closer too: left in place, its bare `'` would read
+    // as an unterminated quote to the string-literal scan below and desync
+    // quote tracking for the rest of the script.
     let bridge = source.find("Add-Type -TypeDefinition @'\n").unwrap() + "Add-Type".len();
-    let bridge_end = bridge + source[bridge..].find("\n'@\n").unwrap();
+    let bridge_end = bridge + source[bridge..].find("\n'@\n").unwrap() + "\n'@\n".len();
     let script = format!("{}{}", &source[..bridge], &source[bridge_end..]);
 
     let imports_end = ["Management", "Utility"]
@@ -139,29 +247,30 @@ fn stock_installer_imports_pshome_modules_before_any_discovered_command() {
         .max()
         .unwrap();
 
-    let functions: Vec<&str> = script
+    let functions: Vec<String> = script
         .lines()
         .filter_map(|line| line.trim_start().strip_prefix("function "))
         .filter_map(|rest| rest.split(|c: char| c == '(' || c.is_whitespace()).next())
+        .map(str::to_ascii_lowercase)
         .collect();
     // Loaded with the engine; never reached through module auto-discovery.
-    let core = ["Import-Module", "Set-StrictMode"];
+    let core = ["import-module", "set-strictmode"];
     let imported = [
-        "Join-Path",
-        "Add-Type",
-        "ConvertFrom-Json",
-        "ConvertTo-Json",
-        "Write-Output",
-        "Write-Verbose",
-        "Write-Warning",
+        "join-path",
+        "add-type",
+        "convertfrom-json",
+        "convertto-json",
+        "write-output",
+        "write-verbose",
+        "write-warning",
     ];
     let mut discovered = 0;
-    for (offset, command) in command_tokens(&script) {
-        if functions.contains(&command) || core.contains(&command) {
+    for (offset, command) in command_tokens(&mask_non_code(&script)) {
+        if functions.iter().any(|f| f == &command) || core.contains(&command.as_str()) {
             continue;
         }
         assert!(
-            imported.contains(&command),
+            imported.contains(&command.as_str()),
             "install.ps1 uses {command}; import its exact stock PSHOME module before first use"
         );
         assert!(
