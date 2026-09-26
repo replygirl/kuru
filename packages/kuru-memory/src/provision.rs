@@ -399,6 +399,17 @@ async fn verified_cache_observed(
     let executable_sha256 = asset.executable_sha256.to_owned();
     let license_bytes = asset.license_bytes;
     let license_sha256 = asset.license_sha256.to_owned();
+    let notices: Vec<_> = asset
+        .notices
+        .iter()
+        .map(|notice| {
+            (
+                notice.name.to_owned(),
+                notice.bytes,
+                notice.sha256.to_owned(),
+            )
+        })
+        .collect();
     let checked = tokio::task::spawn_blocking(move || {
         CheckedCache::open_and_verify(
             &directory_path,
@@ -407,6 +418,7 @@ async fn verified_cache_observed(
             &executable_sha256,
             license_bytes,
             &license_sha256,
+            &notices,
         )
     })
     .await??;
@@ -420,6 +432,7 @@ struct CheckedCache {
     executable_name: std::ffi::OsString,
     executable: File,
     licenses: File,
+    notices: Vec<(std::ffi::OsString, File)>,
 }
 
 impl CheckedCache {
@@ -430,6 +443,7 @@ impl CheckedCache {
         executable_sha256: &str,
         license_bytes: u64,
         license_sha256: &str,
+        notices: &[(String, u64, String)],
     ) -> Result<Self> {
         let directory = files::directory(path)?;
         let executable_name = std::ffi::OsString::from(executable_name);
@@ -449,11 +463,21 @@ impl CheckedCache {
             false,
             &path.join("LICENSES"),
         )?;
+        let notices = notices
+            .iter()
+            .map(|(name, bytes, sha256)| {
+                let name = std::ffi::OsString::from(name);
+                let mut file = directory.read(&name)?;
+                verify_payload_file(&mut file, *bytes, sha256, false, &path.join(&name))?;
+                Ok((name, file))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let checked = Self {
             directory,
             executable_name,
             executable,
             licenses,
+            notices,
         };
         checked.revalidate()?;
         Ok(checked)
@@ -465,6 +489,9 @@ impl CheckedCache {
             .verify(&self.executable_name, &self.executable)?;
         self.directory
             .verify(std::ffi::OsStr::new("LICENSES"), &self.licenses)?;
+        for (name, file) in &self.notices {
+            self.directory.verify(name, file)?;
+        }
         Ok(())
     }
 
@@ -982,7 +1009,14 @@ fn extract_zip(bytes: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()>
     let bin_directory = format!("{}/bin/", asset.stem);
     let executable = format!("{}/bin/{}", asset.stem, asset.executable_name);
     let licenses = format!("{}/LICENSES", asset.stem);
-    let expected = [
+    // Built archives carry their declared third-party notices beside LICENSES;
+    // upstream archives declare none and keep exactly four members.
+    let notices: Vec<_> = asset
+        .notices
+        .iter()
+        .map(|notice| (format!("{}/{}", asset.stem, notice.name), notice))
+        .collect();
+    let mut expected = vec![
         MemberSpec {
             name: &directory,
             kind: MemberKind::Directory,
@@ -1012,6 +1046,13 @@ fn extract_zip(bytes: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()>
             unix_mode: Some(0o100644),
         },
     ];
+    expected.extend(notices.iter().map(|(member, notice)| MemberSpec {
+        name: member,
+        kind: MemberKind::File,
+        max_bytes: notice.bytes,
+        exact_bytes: Some(notice.bytes),
+        unix_mode: Some(0o100644),
+    }));
     let mut archive = Archive::open(
         bytes,
         &expected,
@@ -1023,22 +1064,33 @@ fn extract_zip(bytes: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()>
     )?;
     private_directory(destination)?;
     let parent = files::directory(destination)?;
-    for (member, output, size, digest, executable) in [
+    let payloads = [
         (
-            &executable,
+            executable.as_str(),
             asset.executable_name,
             asset.executable_bytes,
             asset.executable_sha256,
             true,
         ),
         (
-            &licenses,
+            licenses.as_str(),
             "LICENSES",
             asset.license_bytes,
             asset.license_sha256,
             false,
         ),
-    ] {
+    ]
+    .into_iter()
+    .chain(notices.iter().map(|(member, notice)| {
+        (
+            member.as_str(),
+            notice.name,
+            notice.bytes,
+            notice.sha256,
+            false,
+        )
+    }));
+    for (member, output, size, digest, executable) in payloads {
         let mut file = parent.create_new(std::ffi::OsStr::new(output))?;
         ensure!(
             archive.copy(member, &mut file)? == size,
