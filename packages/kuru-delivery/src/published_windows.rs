@@ -331,6 +331,149 @@ fn validate_asset_digests(
     Ok(())
 }
 
+/// The published stable release immediately preceding a release candidate,
+/// with its checksum manifest and Windows ZIP already authenticated. Kuru's
+/// upgrade contract covers only this release: its own updater is what real
+/// installations run against the candidate.
+pub struct PreviousWindowsRelease {
+    pub version: String,
+    pub manifest: Vec<u8>,
+    pub archive: Vec<u8>,
+}
+
+/// Resolve and download the release preceding `candidate` from public GitHub.
+///
+/// Nothing is pinned: the release is selected at run time by
+/// [`select_previous`]. Both assets are read over HTTPS from their immutable
+/// version paths, and no bytes are returned until the ZIP matches that
+/// release's own `SHA256SUMS` and both match GitHub's asset digests.
+pub async fn previous_windows_release(candidate: &str) -> Result<PreviousWindowsRelease> {
+    let candidate = candidate.parse::<release::Version>()?;
+    let github = PublicGitHub::new()?;
+    // The unpaginated listing holds GitHub's 30 most recently created
+    // releases, which always include the latest ones.
+    let releases: Vec<PublishedRelease> = github.json("releases").await?;
+    let version = select_previous(&releases, candidate)?.to_string();
+    let listed = releases
+        .iter()
+        .find(|release| release.tag_name == format!("v{version}"))
+        .context("selected previous release is absent from its listing")?;
+    let archive_name = archive::archive_name(&version, WINDOWS_TARGET)?;
+    let manifest_digest = listed_digest(listed, &version, "SHA256SUMS")?;
+    let archive_digest = listed_digest(listed, &version, &archive_name)?;
+    let download_base = format!("https://github.com/{REPOSITORY}/releases/download/v{version}");
+    let manifest = github
+        .get(&format!("{download_base}/SHA256SUMS"), 64 * 1024)
+        .await?;
+    let archive = github
+        .get(
+            &format!("{download_base}/{archive_name}"),
+            archive::MAX_ARCHIVE_BYTES,
+        )
+        .await?;
+    verify_previous(
+        &manifest,
+        &archive,
+        &archive_name,
+        &manifest_digest,
+        &archive_digest,
+    )?;
+    Ok(PreviousWindowsRelease {
+        version,
+        manifest,
+        archive,
+    })
+}
+
+/// Select the greatest published stable release other than the candidate.
+/// This is GitHub's latest release, or the one before it when the candidate
+/// itself is already published (a recovered Release run). Fail closed when a
+/// stable release tag is not canonical `vX.Y.Z` or is newer than the candidate.
+fn select_previous(
+    releases: &[PublishedRelease],
+    candidate: release::Version,
+) -> Result<release::Version> {
+    let mut previous = None;
+    for listed in releases
+        .iter()
+        .filter(|listed| !listed.draft && !listed.prerelease)
+    {
+        let version = listed
+            .tag_name
+            .parse::<release::Version>()
+            .ok()
+            .filter(|version| listed.tag_name == format!("v{version}"))
+            .with_context(|| {
+                format!(
+                    "published stable release tag {:?} is not vX.Y.Z",
+                    listed.tag_name
+                )
+            })?;
+        if version == candidate {
+            continue;
+        }
+        ensure!(
+            version < candidate,
+            "published release v{version} is newer than candidate v{candidate}"
+        );
+        previous = previous.max(Some(version));
+    }
+    previous.with_context(|| format!("no published stable release precedes v{candidate}"))
+}
+
+fn listed_digest(listed: &PublishedRelease, version: &str, name: &str) -> Result<String> {
+    let mut matches = listed.assets.iter().filter(|asset| asset.name == name);
+    let asset = matches
+        .next()
+        .with_context(|| format!("previous release v{version} lacks {name}"))?;
+    ensure!(
+        matches.next().is_none(),
+        "previous release v{version} lists {name} more than once"
+    );
+    ensure!(
+        asset.browser_download_url
+            == format!("https://github.com/{REPOSITORY}/releases/download/v{version}/{name}"),
+        "previous release asset URL differs from its immutable version path"
+    );
+    let digest = asset
+        .digest
+        .as_deref()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .with_context(|| {
+            format!("previous release v{version} lacks a SHA-256 digest for {name}")
+        })?;
+    Ok(digest.to_owned())
+}
+
+fn verify_previous(
+    manifest: &[u8],
+    archive_bytes: &[u8],
+    archive_name: &str,
+    manifest_digest: &str,
+    archive_digest: &str,
+) -> Result<()> {
+    ensure!(
+        archive::digest(manifest) == manifest_digest,
+        "previous release SHA256SUMS differs from its GitHub asset digest"
+    );
+    let expected = archive::expected_digest(manifest, archive_name)?;
+    ensure!(
+        archive::digest(archive_bytes) == expected,
+        "previous release Windows archive differs from its SHA256SUMS"
+    );
+    ensure!(
+        expected == archive_digest,
+        "previous release SHA256SUMS and GitHub disagree on the Windows archive"
+    );
+    Ok(())
+}
+
 fn read_bounded(path: &Path, limit: usize, description: &str) -> Result<Vec<u8>> {
     let parent = Directory::open(
         path.parent().context("checked file has no parent")?,
@@ -1087,6 +1230,141 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn listed(tag: &str, draft: bool, prerelease: bool) -> PublishedRelease {
+        PublishedRelease {
+            tag_name: tag.into(),
+            draft,
+            prerelease,
+            assets: Vec::new(),
+        }
+    }
+
+    fn version(value: &str) -> release::Version {
+        value.parse().unwrap()
+    }
+
+    #[test]
+    fn previous_release_is_the_greatest_older_stable_release() {
+        let releases = [
+            listed("v0.10.0", true, false),
+            listed("v0.9.1-rc.1", false, true),
+            listed("v0.8.0", false, false),
+            listed("v0.9.0", false, false),
+            listed("v0.4.2", false, false),
+        ];
+        assert_eq!(
+            select_previous(&releases, version("0.10.0")).unwrap(),
+            version("0.9.0")
+        );
+
+        // A recovered run whose candidate is already public uses the one before.
+        let recovered = [
+            listed("v0.10.0", false, false),
+            listed("v0.9.0", false, false),
+        ];
+        assert_eq!(
+            select_previous(&recovered, version("0.10.0")).unwrap(),
+            version("0.9.0")
+        );
+
+        for (releases, candidate) in [
+            (vec![listed("v0.10.0", false, false)], "0.10.0"),
+            (vec![], "0.10.0"),
+            (vec![listed("v0.11.0", false, false)], "0.10.0"),
+            (vec![listed("0.9.0", false, false)], "0.10.0"),
+            (vec![listed("v0.09.0", false, false)], "0.10.0"),
+            (vec![listed("vv0.9.0", false, false)], "0.10.0"),
+            (vec![listed("nightly", false, false)], "0.10.0"),
+        ] {
+            assert!(
+                select_previous(&releases, version(candidate)).is_err(),
+                "accepted {:?}",
+                releases.iter().map(|r| &r.tag_name).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn previous_release_assets_are_authenticated_before_use() {
+        let name = archive::archive_name("0.9.0", WINDOWS_TARGET).unwrap();
+        let archive_bytes = b"windows zip".to_vec();
+        let archive_digest = archive::digest(&archive_bytes);
+        let manifest = format!("{archive_digest}  {name}\n").into_bytes();
+        let manifest_digest = archive::digest(&manifest);
+        let asset = |name: &str, digest: Option<String>| ReleaseAsset {
+            name: name.into(),
+            browser_download_url: format!(
+                "https://github.com/{REPOSITORY}/releases/download/v0.9.0/{name}"
+            ),
+            digest,
+        };
+        let mut release = listed("v0.9.0", false, false);
+        release.assets = vec![
+            asset("SHA256SUMS", Some(format!("sha256:{manifest_digest}"))),
+            asset(&name, Some(format!("sha256:{archive_digest}"))),
+        ];
+        assert_eq!(
+            listed_digest(&release, "0.9.0", "SHA256SUMS").unwrap(),
+            manifest_digest
+        );
+        assert_eq!(
+            listed_digest(&release, "0.9.0", &name).unwrap(),
+            archive_digest
+        );
+        verify_previous(
+            &manifest,
+            &archive_bytes,
+            &name,
+            &manifest_digest,
+            &archive_digest,
+        )
+        .unwrap();
+
+        let other = "f".repeat(64);
+        assert!(
+            verify_previous(
+                &manifest,
+                b"altered",
+                &name,
+                &manifest_digest,
+                &archive_digest
+            )
+            .is_err()
+        );
+        assert!(
+            verify_previous(&manifest, &archive_bytes, &name, &other, &archive_digest).is_err()
+        );
+        assert!(
+            verify_previous(&manifest, &archive_bytes, &name, &manifest_digest, &other).is_err()
+        );
+        let foreign = format!("{archive_digest}  kuru-0.9.0-other.zip\n").into_bytes();
+        assert!(
+            verify_previous(
+                &foreign,
+                &archive_bytes,
+                &name,
+                &archive::digest(&foreign),
+                &archive_digest
+            )
+            .is_err()
+        );
+
+        release.assets[1].digest = None;
+        assert!(listed_digest(&release, "0.9.0", &name).is_err());
+        release.assets[1].digest = Some(format!("sha1:{archive_digest}"));
+        assert!(listed_digest(&release, "0.9.0", &name).is_err());
+        release.assets[1].digest = Some(format!("sha256:{archive_digest}"));
+        release.assets[1].browser_download_url = "https://example.invalid/kuru.zip".into();
+        assert!(listed_digest(&release, "0.9.0", &name).is_err());
+        release.assets[1] = asset(&name, Some(format!("sha256:{archive_digest}")));
+        release
+            .assets
+            .push(asset(&name, Some(format!("sha256:{archive_digest}"))));
+        assert!(listed_digest(&release, "0.9.0", &name).is_err());
+        release.assets.truncate(1);
+        assert!(listed_digest(&release, "0.9.0", &name).is_err());
     }
 
     #[test]

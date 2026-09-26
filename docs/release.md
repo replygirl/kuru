@@ -117,17 +117,23 @@ runtime is involved.
    GitHub metadata that serves the exact staged Windows ZIP. In parallel,
    `build-docs` checks out the selected commit and builds and validates the site.
    The Windows check verifies candidate checksums and bytes, installation,
-   activation, bundled Dolt, an offline conversation and durable reopen. It
-   also authenticates the published v0.4.2 and v0.9.0 Windows executables
-   against pinned release digests, runs each old executable's own updater
-   against the same staged candidate, checks the exact replacement bytes, and
-   regenerates the five support files explicitly from the upgraded binary.
-   Both pinned clients predate the five-file shell-support archive, so neither
-   proves continuity of an already-installed support tree across an upgrade;
-   that case needs a published release that ships shell support before it can
-   be pinned. The loopback mise fixture and local old-updater release bases
-   are not public downloads of the new release. A failure in either path
-   blocks `publish`.
+   activation, bundled Dolt, an offline conversation and durable reopen.
+   Upgrade compatibility is required only from the immediately previous
+   published release. The check resolves it at run time from the public GitHub
+   releases list: the greatest stable `vX.Y.Z` release other than the
+   candidate, failing if none is older or one is newer. It downloads that
+   release's own `SHA256SUMS` and Windows ZIP over HTTPS, verifies the ZIP
+   against that manifest and both files against GitHub's asset digests before
+   running anything, then runs that release's own updater against the staged
+   candidate. It checks the exact replacement bytes and version, requires an
+   executable-only previous updater to leave no managed support and a
+   support-aware one to install the candidate's exact versioned support
+   snapshot, and regenerates the five support files explicitly from the
+   upgraded binary against the staged sidecar. Nothing is pinned, so each
+   release is checked against the one users actually have. The loopback mise
+   fixture and the local release base given to the previous updater are not
+   public downloads of the new release. A failure in either path blocks
+   `publish`.
 7. Run `deploy-docs` only after both staged Windows acceptance and `build-docs`
    succeed. Pages deployment and GitHub release promotion are separate service
    operations; this ordering does not claim they update atomically.
