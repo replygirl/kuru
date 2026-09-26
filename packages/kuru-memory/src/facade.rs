@@ -2817,6 +2817,30 @@ mod tests {
         }
     }
 
+    /// Outer hang backstop for a facade fixture, derived from the product
+    /// budgets it exercises so that a real stall reports its own product error
+    /// before this bound expires.
+    ///
+    /// The fixture's first Dolt start may wait behind another fixture's cold
+    /// install of the shared test runtime cache; the provisioner bounds that
+    /// wait by `LOCK_TIMEOUT`. Each real service lifecycle (a
+    /// `ServiceOwner::open` or a local `MemoryStore::open` that starts Dolt;
+    /// managed attaches and checked rebinds start none) then gets the startup
+    /// budget for its store open, `QUERY_TIMEOUT` for the fixture's operations,
+    /// and the startup budget again for `acquire_maintenance_permit`, whose
+    /// election and retirement deadline covers the owner's Dolt reap. Every
+    /// fixture's options keep the `OpenOptions::new` budgets;
+    /// `test_support::open_options` changes only cache, offline mode and
+    /// supervisor.
+    fn fixture_deadline(lifecycles: u32) -> Duration {
+        let config = OpenOptions::new(PathBuf::new(), String::new()).config;
+        let startup = Duration::from_secs(config.startup_timeout_secs);
+        let lifecycle = startup
+            .saturating_mul(2)
+            .saturating_add(store::QUERY_TIMEOUT);
+        crate::provision::LOCK_TIMEOUT.saturating_add(lifecycle.saturating_mul(lifecycles))
+    }
+
     async fn cancel_before_session_acceptance<F>(remote: &RemoteView, operation: F) -> Result<()>
     where
         F: std::future::Future<Output = Result<store::SessionLifecycleOutcome>>,
@@ -2836,7 +2860,9 @@ mod tests {
 
     #[tokio::test]
     async fn managed_public_transcript_pages_preserve_main_and_candidate_views() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: a local seed open, then one service owner.
+        let deadline = fixture_deadline(2);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -2969,14 +2995,18 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("managed public transcript fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("managed public transcript fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn managed_session_lifecycle_is_reversible_receipted_and_candidate_isolated() -> Result<()>
     {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: one service owner.
+        let deadline = fixture_deadline(1);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -3417,14 +3447,18 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("managed lifecycle fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("managed lifecycle fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn managed_fork_lost_reply_recovers_one_atomic_child_and_candidate_stays_isolated()
     -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: one service owner.
+        let deadline = fixture_deadline(1);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -3641,13 +3675,15 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("managed fork fixture exceeded 90 seconds")??;
+        .with_context(|| format!("managed fork fixture exceeded its {deadline:?} deadline"))??;
         Ok(())
     }
 
     #[tokio::test]
     async fn managed_mode_checkpoint_lost_reply_reconciles_catalog_and_state_once() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(60), async {
+        // Real service lifecycles: one service owner.
+        let deadline = fixture_deadline(1);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -3818,14 +3854,16 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("managed mode fixture exceeded 60 seconds")??;
+        .with_context(|| format!("managed mode fixture exceeded its {deadline:?} deadline"))??;
         Ok(())
     }
 
     #[tokio::test]
     async fn managed_public_turn_lost_reply_reconciles_without_duplicate_settlement() -> Result<()>
     {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: one service owner.
+        let deadline = fixture_deadline(1);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -4239,13 +4277,17 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("managed public-turn fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("managed public-turn fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn managed_legacy_continuation_lost_reply_reconciles_without_a_user_row() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: a local seed open, then one service owner.
+        let deadline = fixture_deadline(2);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -4424,14 +4466,18 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("managed legacy continuation fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("managed legacy continuation fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn cancelling_after_accepted_unit_frame_fences_clones_until_indexed_proof() -> Result<()>
     {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: one service owner.
+        let deadline = fixture_deadline(1);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -4523,13 +4569,17 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("accepted cancelled write fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("accepted cancelled write fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn remote_reasoning_summary_lost_reply_reconciles_one_atomic_receipt() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: one service owner.
+        let deadline = fixture_deadline(1);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -4657,13 +4707,19 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("remote reasoning summary lost-reply fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!(
+                "remote reasoning summary lost-reply fixture exceeded its {deadline:?} deadline"
+            )
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn remote_session_checkpoint_lost_reply_preserves_pinned_provenance() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: one service owner.
+        let deadline = fixture_deadline(1);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -5011,13 +5067,18 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("remote session checkpoint fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("remote session checkpoint fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn selected_abandon_lost_reply_proves_staged_but_not_empty_ref() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(150), async {
+        // Real service lifecycles: each of two iterations opens a local store,
+        // then an owner and its successor.
+        let deadline = fixture_deadline(6);
+        tokio::time::timeout(deadline, async {
             for staged in [false, true] {
                 let root = crate::test_support::tempdir()?;
                 let project = root.path().join("project");
@@ -5212,13 +5273,17 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("selected abandonment fixture exceeded 150 seconds")??;
+        .with_context(|| {
+            format!("selected abandonment fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn lost_candidate_unit_reply_reattaches_before_read_write_and_promotion() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: one owner, then an owner and its restarted successor.
+        let deadline = fixture_deadline(3);
+        tokio::time::timeout(deadline, async {
             for restart_owner in [false, true] {
                 let root = crate::test_support::tempdir()?;
                 let project = root.path().join("project");
@@ -5425,14 +5490,18 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("candidate unit recovery fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("candidate unit recovery fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn candidate_promotion_recovery_uses_exact_target_and_releases_clone_fence() -> Result<()>
     {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: one service owner.
+        let deadline = fixture_deadline(1);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -5537,14 +5606,18 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("candidate promotion facade fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("candidate promotion facade fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn preserved_candidate_conflict_reattaches_before_releasing_mutation_fence() -> Result<()>
     {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: one service owner.
+        let deadline = fixture_deadline(1);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -5635,13 +5708,17 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("candidate conflict reattachment fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("candidate conflict reattachment fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn usage_reply_recovery_fences_clones_until_natural_key_is_proven() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: one service owner.
+        let deadline = fixture_deadline(1);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -5696,14 +5773,18 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("usage facade recovery fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("usage facade recovery fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn candidate_begin_recovery_keeps_clones_fenced_until_exact_ref_reattaches() -> Result<()>
     {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: one owner, then an owner and its restarted successor.
+        let deadline = fixture_deadline(3);
+        tokio::time::timeout(deadline, async {
             for restart_owner in [false, true] {
                 let root = crate::test_support::tempdir()?;
                 let project = root.path().join("project");
@@ -5860,14 +5941,18 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("candidate facade recovery fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("candidate facade recovery fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn managed_dream_lease_serializes_dreams_without_blocking_ordinary_memory() -> Result<()>
     {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: one service owner.
+        let deadline = fixture_deadline(1);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -5964,13 +6049,18 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("managed dream-lease fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("managed dream-lease fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn managed_facade_preserves_views_ledger_export_and_independent_clients() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        // Real service lifecycles: one service owner. The competing local open
+        // is refused by the owner's store lease under its own inner bound.
+        let deadline = fixture_deadline(1);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -6155,7 +6245,7 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("managed facade fixture exceeded 90 seconds")??;
+        .with_context(|| format!("managed facade fixture exceeded its {deadline:?} deadline"))??;
         Ok(())
     }
 }
