@@ -48,7 +48,9 @@ pub struct Options {
 struct EngineManifest {
     schema_version: u32,
     version: String,
-    assets: Vec<EngineAsset>,
+    /// Decoded individually: an unpinned built entry for another target has
+    /// null sizes and must not affect Windows x64 verification.
+    assets: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,6 +204,31 @@ fn validate_asset_digests(
         );
     }
     Ok(())
+}
+
+fn windows_engine_asset(manifest: &EngineManifest) -> Result<EngineAsset> {
+    ensure!(
+        manifest.schema_version == 2,
+        "unsupported Dolt asset manifest schema"
+    );
+    let engine_assets = manifest
+        .assets
+        .iter()
+        .filter(|asset| {
+            asset.get("target").and_then(|target| target.as_str()) == Some(WINDOWS_TARGET)
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        engine_assets.len() == 1,
+        "Dolt manifest must contain exactly one Windows asset"
+    );
+    let asset =
+        EngineAsset::deserialize(engine_assets[0]).context("decode the Windows Dolt asset")?;
+    ensure!(
+        asset.target == WINDOWS_TARGET,
+        "decoded Dolt asset does not match the Windows target"
+    );
+    Ok(asset)
 }
 
 fn read_bounded(path: &Path, limit: usize, description: &str) -> Result<Vec<u8>> {
@@ -620,20 +647,7 @@ pub async fn run(options: Options) -> Result<()> {
         METADATA_LIMIT,
         "Dolt asset manifest",
     )?)?;
-    ensure!(
-        manifest.schema_version == 1,
-        "unsupported Dolt asset manifest schema"
-    );
-    let engine_assets = manifest
-        .assets
-        .iter()
-        .filter(|asset| asset.target == WINDOWS_TARGET)
-        .collect::<Vec<_>>();
-    ensure!(
-        engine_assets.len() == 1,
-        "Dolt manifest must contain exactly one Windows asset"
-    );
-    let engine_asset = engine_assets[0];
+    let engine_asset = &windows_engine_asset(&manifest)?;
 
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().to_owned();
@@ -1303,5 +1317,32 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[test]
+    fn committed_schema_two_manifest_selects_only_the_windows_x64_engine() {
+        let manifest: EngineManifest =
+            serde_json::from_str(include_str!("../../kuru-memory/support/dolt-assets.json"))
+                .unwrap();
+        let asset = windows_engine_asset(&manifest).unwrap();
+        assert_eq!(asset.target, WINDOWS_TARGET);
+        assert_eq!(asset.executable_bytes, 129_126_400);
+        assert!(
+            manifest
+                .assets
+                .iter()
+                .any(|asset| asset["archive_sha256"] == "unpinned"),
+            "an unpinned built entry for another target is tolerated"
+        );
+        let mut legacy: EngineManifest =
+            serde_json::from_str(include_str!("../../kuru-memory/support/dolt-assets.json"))
+                .unwrap();
+        legacy.schema_version = 1;
+        assert!(windows_engine_asset(&legacy).is_err());
+        legacy.schema_version = 2;
+        legacy
+            .assets
+            .retain(|asset| asset["target"] != WINDOWS_TARGET);
+        assert!(windows_engine_asset(&legacy).is_err());
     }
 }

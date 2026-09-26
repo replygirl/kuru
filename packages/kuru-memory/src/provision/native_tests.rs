@@ -320,6 +320,7 @@ fn with_asset<T>(bytes: &[u8], action: impl FnOnce(Asset<'_>) -> T) -> T {
         executable_sha256: &hex_digest(&Sha256::digest(EXE)),
         license_bytes: NOTICES.len() as u64,
         license_sha256: &hex_digest(&Sha256::digest(NOTICES)),
+        notices: &[],
     })
 }
 
@@ -1088,4 +1089,203 @@ async fn real_embedded_windows_engine_installs_offline_and_corrupt_cache_fails_b
         fs::metadata(&binary).unwrap().len(),
         BUNDLED_ASSET.executable_bytes
     );
+}
+
+const ICU_NOTICE: &[u8] = b"fixture ICU license notice";
+const LLVM_NOTICE: &[u8] = b"fixture LLVM runtime license notice";
+
+/// A source-built archive in the manifest layout: the four upstream members,
+/// then each declared third-party notice beside `LICENSES`.
+fn built_zip(notices: &[(&str, &[u8])]) -> Vec<u8> {
+    let names: Vec<_> = notices
+        .iter()
+        .map(|(name, _)| format!("fixture/{name}"))
+        .collect();
+    let mut members = vec![
+        WriteMember {
+            name: "fixture/",
+            kind: MemberKind::Directory,
+            bytes: &[],
+            executable: false,
+        },
+        WriteMember {
+            name: "fixture/bin/",
+            kind: MemberKind::Directory,
+            bytes: &[],
+            executable: false,
+        },
+        WriteMember {
+            name: "fixture/bin/dolt.exe",
+            kind: MemberKind::File,
+            bytes: EXE,
+            executable: true,
+        },
+        WriteMember {
+            name: "fixture/LICENSES",
+            kind: MemberKind::File,
+            bytes: NOTICES,
+            executable: false,
+        },
+    ];
+    members.extend(
+        names
+            .iter()
+            .zip(notices)
+            .map(|(name, (_, bytes))| WriteMember {
+                name,
+                kind: MemberKind::File,
+                bytes,
+                executable: false,
+            }),
+    );
+    write(
+        &members,
+        Limits {
+            max_compressed_bytes: 4096,
+            max_expanded_bytes: 4096,
+            allow_ntfs_timestamps: false,
+        },
+    )
+    .unwrap()
+}
+
+fn with_built_asset<T>(
+    bytes: &[u8],
+    notices: &[crate::catalog::Notice<'_>],
+    action: impl FnOnce(Asset<'_>) -> T,
+) -> T {
+    let declared: u64 = notices.iter().map(|notice| notice.bytes).sum();
+    action(Asset {
+        target: "fixture-built-target",
+        stem: "fixture",
+        format: "zip",
+        executable_name: "dolt.exe",
+        compressed_bytes: bytes.len() as u64,
+        archive_sha256: &hex_digest(&Sha256::digest(bytes)),
+        expanded_bytes: (EXE.len() + NOTICES.len()) as u64 + declared,
+        executable_bytes: EXE.len() as u64,
+        executable_sha256: &hex_digest(&Sha256::digest(EXE)),
+        license_bytes: NOTICES.len() as u64,
+        license_sha256: &hex_digest(&Sha256::digest(NOTICES)),
+        notices,
+    })
+}
+
+#[test]
+fn built_zip_extraction_accepts_exactly_the_declared_notices() {
+    let icu_digest = hex_digest(&Sha256::digest(ICU_NOTICE));
+    let llvm_digest = hex_digest(&Sha256::digest(LLVM_NOTICE));
+    let declared = [
+        crate::catalog::Notice {
+            name: "LICENSE-ICU",
+            bytes: ICU_NOTICE.len() as u64,
+            sha256: &icu_digest,
+        },
+        crate::catalog::Notice {
+            name: "LICENSE-LLVM",
+            bytes: LLVM_NOTICE.len() as u64,
+            sha256: &llvm_digest,
+        },
+    ];
+    let root = crate::test_support::tempdir().unwrap();
+    let archive = built_zip(&[("LICENSE-ICU", ICU_NOTICE), ("LICENSE-LLVM", LLVM_NOTICE)]);
+    let candidate = root.path().join("candidate");
+    with_built_asset(&archive, &declared, |asset| {
+        extract(&archive, &candidate, asset)
+    })
+    .unwrap();
+    assert_eq!(fs::read_dir(&candidate).unwrap().count(), 4);
+    assert_eq!(fs::read(candidate.join("dolt.exe")).unwrap(), EXE);
+    assert_eq!(fs::read(candidate.join("LICENSES")).unwrap(), NOTICES);
+    assert_eq!(fs::read(candidate.join("LICENSE-ICU")).unwrap(), ICU_NOTICE);
+    assert_eq!(
+        fs::read(candidate.join("LICENSE-LLVM")).unwrap(),
+        LLVM_NOTICE
+    );
+    for name in ["LICENSE-ICU", "LICENSE-LLVM"] {
+        let (_parent, file) = files::read(&candidate.join(name), Privacy::OwnerOnly).unwrap();
+        kuru_platform::fs::require_private(&file).unwrap();
+    }
+    let owned: Vec<_> = declared
+        .iter()
+        .map(|notice| {
+            (
+                notice.name.to_owned(),
+                notice.bytes,
+                notice.sha256.to_owned(),
+            )
+        })
+        .collect();
+    let checked = with_built_asset(&archive, &declared, |asset| {
+        CheckedCache::open_and_verify(
+            &candidate,
+            asset.executable_name,
+            asset.executable_bytes,
+            asset.executable_sha256,
+            asset.license_bytes,
+            asset.license_sha256,
+            &owned,
+        )
+    })
+    .unwrap();
+    checked.revalidate().unwrap();
+    assert_eq!(checked.notices.len(), 2);
+    drop(checked);
+    // A cached notice that changed after extraction fails verification.
+    fs::remove_file(candidate.join("LICENSE-LLVM")).unwrap();
+    files::write(
+        &candidate.join("LICENSE-LLVM"),
+        b"tampered notice bytes!!!!!!!!!!!!!",
+    )
+    .unwrap();
+    let error = format!(
+        "{:#}",
+        CheckedCache::open_and_verify(
+            &candidate,
+            "dolt.exe",
+            EXE.len() as u64,
+            &hex_digest(&Sha256::digest(EXE)),
+            NOTICES.len() as u64,
+            &hex_digest(&Sha256::digest(NOTICES)),
+            &owned,
+        )
+        .err()
+        .expect("a tampered notice is rejected")
+    );
+    assert!(error.contains("LICENSE-LLVM"), "{error}");
+
+    // Missing, extra and resized notices are all rejected before publication.
+    for (members, notices) in [
+        (vec![("LICENSE-ICU", ICU_NOTICE)], &declared[..]),
+        (
+            vec![("LICENSE-ICU", ICU_NOTICE), ("LICENSE-LLVM", LLVM_NOTICE)],
+            &declared[..1],
+        ),
+        (
+            vec![
+                ("LICENSE-ICU", ICU_NOTICE),
+                ("LICENSE-LLVM", b"resized LLVM notice".as_slice()),
+            ],
+            &declared[..],
+        ),
+        (
+            vec![("LICENSE-ICU", ICU_NOTICE), ("LICENSE-LLVM", LLVM_NOTICE)],
+            &[][..],
+        ),
+    ] {
+        let archive = built_zip(&members);
+        let candidate = root.path().join(format!("rejected-{}", members.len()));
+        let result = with_built_asset(&archive, notices, |asset| {
+            extract(&archive, &candidate, asset)
+        });
+        assert!(
+            result.is_err(),
+            "{members:?} with {} declared",
+            notices.len()
+        );
+        assert!(
+            !candidate.join("dolt.exe").exists(),
+            "no payload is published from a rejected inventory"
+        );
+    }
 }
