@@ -51,6 +51,7 @@ rustix = { workspace = true, optional = true, features = ["fs", "process"] }
 
 [dev-dependencies]
 axum.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { workspace = true, features = ["process"] }
