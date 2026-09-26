@@ -22,6 +22,11 @@ checksum = "sha256:429303b6d68c6461aa221ab4de82b26d0bbcdee7127947ea9c7c411ab9bc5
 url = "https://github.com/cocogitto/cocogitto/releases/download/7.0.0/cocogitto-7.0.0-aarch64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/cocogitto/cocogitto/releases/assets/366659431"
 
+[tools."aqua:cocogitto/cocogitto"."platforms.windows-arm64"]
+checksum = "sha256:074f68f05d270da5c0d69d3e234ec362bec4c6e3189c21d1c948d038603655d7"
+url = "https://github.com/cocogitto/cocogitto/releases/download/7.0.0/cocogitto-7.0.0-x86_64-pc-windows-msvc.tar.gz"
+url_api = "https://api.github.com/repos/cocogitto/cocogitto/releases/assets/366659399"
+
 [tools."aqua:cocogitto/cocogitto"."platforms.windows-x64"]
 checksum = "sha256:074f68f05d270da5c0d69d3e234ec362bec4c6e3189c21d1c948d038603655d7"
 url = "https://github.com/cocogitto/cocogitto/releases/download/7.0.0/cocogitto-7.0.0-x86_64-pc-windows-msvc.tar.gz"
@@ -90,6 +95,12 @@ url = "https://github.com/jdx/communique/releases/download/v1.4.2/communique-aar
 url_api = "https://api.github.com/repos/jdx/communique/releases/assets/584383064"
 provenance = "github-attestations"
 provenance_verified = true
+
+[tools."github:jdx/communique"."platforms.windows-arm64"]
+checksum = "sha256:6d8d811fcc38db95472ca35ab36a1d589b565469f8f847e824f59fb5a0bf60f0"
+url = "https://github.com/jdx/communique/releases/download/v1.4.2/communique-aarch64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/jdx/communique/releases/assets/584384165"
+provenance = "github-attestations"
 
 [tools."github:jdx/communique"."platforms.windows-x64"]
 checksum = "sha256:0d7b9a528a60584513460154b50a43d2eaa0b0218089ef5720c020367ea6c958"

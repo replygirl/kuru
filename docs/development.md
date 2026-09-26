@@ -684,13 +684,24 @@ differently-named sibling task.
 ## Dependency and release updates
 
 Change workspace dependency pins centrally and regenerate Cargo.lock. Change
-tool pins with the matching four-platform lock refresh:
+tool pins with the matching five-platform lock refresh:
 
 ```sh
-mise lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64
-mise -C apps/kuru-docs lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64
-mise -C packages/kuru-delivery lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64
+mise lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64,windows-arm64
+mise -C apps/kuru-docs lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64,windows-arm64
+mise -C packages/kuru-delivery lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64,windows-arm64
 ```
+
+Root `mise.toml` pins the standalone `github:aligned-team/cospec` tool in
+table form with `[tools."github:aligned-team/cospec".platforms.windows-arm64]
+asset_pattern = "cospec-*-windows-x64.zip"`: cospec publishes no
+`windows-arm64` release asset, so this pins the lock's `windows-arm64` entry to
+the existing `windows-x64` asset (`asset_pattern` replaces mise's asset
+autodetection for that platform). Every other tool listed here resolves its
+own `windows-arm64` entry without a pin: `aqua:cocogitto/cocogitto` falls back
+to its `windows-x64` asset through the aqua registry's own
+`windows_arm_emulation` flag, and the rest publish native `windows-arm64`
+(`aarch64-pc-windows-msvc`/`aarch64-pc-windows-msvc.zip`) assets.
 
 Mise records available provenance for every platform, but normally verifies
 only the current platform's artifact. Before committing an updated Communiqué
@@ -702,6 +713,7 @@ MISE_OS=linux MISE_ARCH=x86_64 mise -C packages/kuru-delivery lock github:jdx/co
 MISE_OS=linux MISE_ARCH=aarch64 mise -C packages/kuru-delivery lock github:jdx/communique --platform linux-arm64
 MISE_OS=macos MISE_ARCH=aarch64 mise -C packages/kuru-delivery lock github:jdx/communique --platform macos-arm64
 MISE_OS=windows MISE_ARCH=x86_64 mise -C packages/kuru-delivery lock github:jdx/communique --platform windows-x64
+MISE_OS=windows MISE_ARCH=aarch64 mise -C packages/kuru-delivery lock github:jdx/communique --platform windows-arm64
 ```
 
 Review the resulting `provenance_verified` metadata alongside URLs and checksums.
