@@ -1127,6 +1127,8 @@ mod tests {
         }
     }
 
+    // Mirrors the Windows on Arm entry the phase-3 catalog change adds; use
+    // targets::find("aarch64-pc-windows-msvc") once that entry exists.
     const WINDOWS_ARM64: targets::Target = targets::Target {
         triple: "aarch64-pc-windows-msvc",
         os: "windows",
