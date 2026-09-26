@@ -135,9 +135,9 @@ let CI and hooks keep documentation work in the app's single `docs:check` task
 graph, whose formatter, linter and build share one dependency installation.
 Task dependencies can overlap;
 Cargo still protects shared build artifacts with its own locks. A full coverage
-run already executes the behavioral tests, so neither CI nor hk first runs a
-duplicate ordinary suite. Keep only one coverage writer active per target
-directory, and preserve the instrumented child fixtures.
+run already executes the behavioral tests, so CI does not first run a duplicate
+ordinary suite; hk runs neither before a push. Keep only one coverage writer
+active per target directory, and preserve the instrumented child fixtures.
 
 Coverage prepares the verified engine archives and uses the supervisor from its
 single instrumented workspace build. Its fixtures initialize the engine cache
@@ -329,7 +329,7 @@ mise run cospec -- instructions proposal --change example-change
 # Author the indicated artifacts and acceptance ledger.
 mise run cospec -- validate example-change --strict
 mise run cospec -- apply example-change
-# Implement, test, and record actual evidence.
+# Implement, test, and record actual evidence with the full local gate.
 mise run format:code ::: lint:rust ::: typecheck ::: coverage ::: lint:tooling ::: cospec:validate ::: cospec:managed:check ::: docs:check
 mise run cospec -- archive example-change
 ```
@@ -341,9 +341,12 @@ schemas and harness instructions are updated by cospec, not edited manually.
 After archival, replace any generated purpose placeholders in new durable specs
 with their capability purpose and rerun `mise run cospec:validate`.
 
-hk validates format/tooling/specs before commits, separate concurrent quality
-steps before pushes, and conventional commit titles. Hooks are installed by mise's postinstall and
-`mise run setup`. Fix failed checks instead of bypassing hooks.
+hk validates format/tooling/specs before commits, separate concurrent static
+format, lint, typecheck, tooling, cospec, cospec-managed and docs steps before
+pushes, and conventional commit titles. Behavioral tests and coverage with its
+90% line gate run in CI, not in hooks; run them locally when a change needs
+them. Hooks are installed by mise's postinstall and `mise run setup`. Fix failed
+checks instead of bypassing hooks.
 
 Git hooks export repository-selection variables, so a subprocess working directory
 alone does not isolate another checkout. Delivery's rooted command constructor

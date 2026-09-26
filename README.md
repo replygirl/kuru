@@ -162,9 +162,9 @@ and [development](docs/development.md) for boundaries and extension points.
 | `openspec` | cospec change workflow and capability specifications |
 | `scripts` | Small installation and commit-hook shell entrypoints |
 
-CI and hk run format, Clippy, typecheck, tooling, cospec, docs and behavioral
-coverage as independent checks. `mise run coverage` runs the test suite with a
-90% workspace line-coverage gate; `mise run check` is an optional local aggregate.
+CI and hk run format, Clippy, typecheck, tooling, cospec and docs as independent
+checks; CI also runs behavioral coverage. `mise run coverage` runs the test suite
+with a 90% workspace line-coverage gate; `mise run check` is an optional local aggregate.
 Each app/package owns its mise tasks; root commands are aliases and
 aggregations. Releases use a manual workflow with conventional-commit versioning
 and Communiqué notes; nothing is published by local setup.

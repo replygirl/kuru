@@ -37,9 +37,6 @@ hooks {
       ["typecheck"] {
         check = "mise run typecheck"
       }
-      ["coverage"] {
-        check = "mise run coverage"
-      }
       ["tooling"] {
         check = "mise run lint:tooling"
       }
