@@ -26,6 +26,10 @@ name = "kuru-delivery-fixture"
 path = "tests/fixtures/delivery.rs"
 required-features = ["tooling"]
 
+[[test]]
+name = "previous_release_update"
+required-features = ["tooling"]
+
 [dependencies]
 anyhow.workspace = true
 kuru-platform = { workspace = true, features = ["test-support"] }

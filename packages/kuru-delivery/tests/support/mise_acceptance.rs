@@ -13,7 +13,7 @@ use axum::{
 use kuru_delivery::{
     archive,
     command::{self, Command},
-    published_windows, shell_support, targets,
+    published, targets,
 };
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use kuru_platform::windows::process::configured_command;
@@ -29,6 +29,8 @@ use std::{
 
 #[path = "../../src/mise_isolation.rs"]
 mod mise_isolation;
+#[path = "previous_updater.rs"]
+mod previous_updater;
 
 const DEADLINE: Duration = Duration::from_secs(180);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -914,164 +916,21 @@ pub async fn run_staged(archive_path: &Path) -> Result<()> {
         "staged new release is missing its paired shell support"
     );
     run_archive(bytes, archive::digest(&executable), support.as_ref()).await?;
-    // Upgrade compatibility is required only from the immediately previous
-    // published release, resolved now rather than pinned.
-    let previous = published_windows::previous_windows_release(VERSION).await?;
-    previous_updater_accepts_staged_release(
+    // The immediately previous published release, resolved now rather than
+    // pinned, must update to the candidate. Ordinary CI runs the same check on
+    // every supported platform; this is the release-time sanity re-run, and it
+    // is a floor rather than the whole compatibility policy.
+    let token = published::checked_token(std::env::var_os("GITHUB_TOKEN"))?;
+    let previous = published::previous_release(VERSION, TARGET, token.as_deref()).await?;
+    previous_updater::previous_updater_accepts_candidate(
         &previous,
-        directory,
-        &executable,
-        support.as_ref().unwrap(),
+        &previous_updater::Candidate {
+            directory,
+            requested_version: VERSION,
+            reported_version: VERSION,
+            executable: &executable,
+            support: support.as_ref().unwrap(),
+        },
     )
     .await
-}
-
-async fn previous_updater_accepts_staged_release(
-    previous: &published_windows::PreviousWindowsRelease,
-    staged_directory: &str,
-    staged_executable: &[u8],
-    staged_support: &shell_support::Files,
-) -> Result<()> {
-    let old_version = previous.version.as_str();
-    let root = tempfile::tempdir()?;
-    let old_release_dir = root.path().join("verified-old-release");
-    fs::create_dir(&old_release_dir)?;
-    // Already authenticated against its own SHA256SUMS and GitHub's digests;
-    // the installer path verifies these local copies again before extraction.
-    fs::write(old_release_dir.join("SHA256SUMS"), &previous.manifest)?;
-    fs::write(
-        old_release_dir.join(archive::archive_name(old_version, TARGET)?),
-        &previous.archive,
-    )?;
-    if let Some(envelope) = &previous.support {
-        fs::write(
-            old_release_dir.join(shell_support::archive_name(old_version, TARGET)?),
-            envelope,
-        )?;
-    }
-    let old_directory = old_release_dir
-        .to_str()
-        .context("isolated old release directory is not Unicode")?;
-    let (old_executable, old_support) =
-        archive::verified_release(old_directory, old_version, TARGET).await?;
-
-    let installation = root.path().join("old-installed-bin");
-    let project = root.path().join("project");
-    fs::create_dir(&installation)?;
-    fs::create_dir(&project)?;
-    let installed = installation.join("kuru.exe");
-    fs::write(&installed, &old_executable)?;
-    // Model a real previous installation: a support-aware release installs
-    // its own versioned support tree beside the executable, as the installers
-    // do, and that tree must survive the update unchanged.
-    let old_support_tree = installation
-        .join("share")
-        .join("kuru")
-        .join(old_version)
-        .join(TARGET);
-    if let Some(files) = &old_support {
-        shell_support::install_versioned(files, &installation, old_version, TARGET)?;
-        ensure!(
-            shell_support::read_generated(&old_support_tree)? == *files,
-            "previous v{old_version} support tree was not installed exactly"
-        );
-    }
-    let environment = mise_isolation::prepare(root.path(), &project)?;
-    let command = || {
-        let mut command = Command::new(&installed);
-        command.env_clear().current_dir(&project);
-        for (name, value) in &environment {
-            command.env(name, value);
-        }
-        command
-    };
-    let mut version_probe = command();
-    version_probe.arg("--version");
-    let output = command::output(&mut version_probe, DEADLINE).await?;
-    ensure!(
-        output.status.success()
-            && output.stdout.as_slice() == format!("kuru {old_version}\n").as_bytes(),
-        "verified old executable did not identify as v{old_version}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let mut update = command();
-    update
-        .args(["update", "--version", VERSION, "--release-base"])
-        .arg(staged_directory);
-    let output = command::output(&mut update, DEADLINE).await?;
-    ensure!(
-        output.status.success(),
-        "actual v{old_version} updater rejected the staged release: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    ensure!(
-        fs::read(&installed)? == staged_executable,
-        "old updater did not install the exact verified staged executable"
-    );
-    // A marked previous core shipped with the support-aware updater, which
-    // stages the candidate's versioned snapshot before replacing itself.
-    let managed = installation.join("share");
-    if let Some(files) = &old_support {
-        ensure!(
-            shell_support::read_generated(&managed.join("kuru").join(VERSION).join(TARGET))?
-                == *staged_support,
-            "support-aware v{old_version} updater did not install the exact staged support"
-        );
-        ensure!(
-            shell_support::read_generated(&old_support_tree)? == *files,
-            "v{old_version} update changed the previously installed support tree"
-        );
-    } else {
-        ensure!(
-            !managed.exists(),
-            "executable-only v{old_version} updater unexpectedly claimed managed shell support"
-        );
-    }
-    let mut new_version = command();
-    new_version.arg("--version");
-    let output = command::output(&mut new_version, DEADLINE).await?;
-    ensure!(
-        output.status.success()
-            && String::from_utf8_lossy(&output.stdout).trim() == format!("kuru {VERSION}"),
-        "upgraded executable did not report the staged version"
-    );
-
-    // Not a repair of anything broken: this proves the upgraded binary's own
-    // regeneration matches the staged sidecar byte-for-byte, independent of
-    // whatever the old updater itself did or did not install as support.
-    let regenerated = root.path().join("regenerated-support-sidecar");
-    for (name, args) in [
-        ("completions/kuru.bash", &["completions", "bash"][..]),
-        ("completions/_kuru", &["completions", "zsh"][..]),
-        ("completions/kuru.fish", &["completions", "fish"][..]),
-        ("completions/kuru.ps1", &["completions", "powershell"][..]),
-        ("man/kuru.1", &["man"][..]),
-    ] {
-        let mut generator = command();
-        generator.args(args);
-        let output = command::output(&mut generator, DEADLINE).await?;
-        ensure!(
-            output.status.success() && staged_support.get(name) == Some(output.stdout.as_slice()),
-            "upgraded executable did not regenerate exact staged support {name}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let destination = regenerated.join(name);
-        fs::create_dir_all(
-            destination
-                .parent()
-                .context("regenerated support member has no parent")?,
-        )?;
-        fs::write(&destination, &output.stdout)?;
-        ensure!(
-            fs::read(&destination)? == output.stdout,
-            "regeneration matching the staged sidecar changed on disk for {name}"
-        );
-    }
-    ensure!(
-        !root.path().join("xdg-data/kuru").exists() && !root.path().join("appdata/kuru").exists(),
-        "old update or support sidecar regeneration created application private data"
-    );
-    root.close()
-        .context("retire isolated old-updater acceptance root")
 }

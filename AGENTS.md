@@ -188,12 +188,14 @@ Run the relevant granular checks before committing. hk runs independent static
 format, lint, typecheck, tooling, cospec, cospec-managed and docs steps
 concurrently before a push; coverage and its 90% line gate are enforced in CI,
 not in hooks. CI gives static categories separate Ubuntu jobs and runs native
-behavior, installation and updates on their supported platforms. Keep these
-scheduling units explicit instead of invoking `check` from hooks or workflows.
-The optional local `mise run check` aggregate uses the same task dependencies.
-Coverage already runs the behavioral suite; do not require an ordinary test pass
-before repeating it under instrumentation. Preserve the 90% workspace line
-coverage gate.
+behavior, installation and updates on their supported platforms. Updating from
+any installed release must remain possible and succeed; as a floor under that
+policy, previous-release update acceptance runs natively in CI on every
+supported platform. Keep these scheduling units explicit instead of invoking
+`check` from hooks or workflows. The optional local `mise run check` aggregate
+uses the same task dependencies. Coverage already runs the behavioral suite; do
+not require an ordinary test pass before repeating it under instrumentation.
+Preserve the 90% workspace line coverage gate.
 Documentation builds and link/content checks are required; keep private
 verification records and local evidence outside the published app directory.
 Do not exclude application modules or
@@ -276,8 +278,9 @@ there; no credentials belong in source or generated artifacts.
 
 Build and publish docs only through the `build-docs` and `deploy-docs` jobs inside
 that Release workflow and from the exact selected release commit. The staged
-Windows candidate acceptance and documentation deployment must succeed before
-the publication job can promote the public release. A separate post-publication
+Windows candidate acceptance, which re-runs previous-release update acceptance
+as a sanity check, and documentation deployment must succeed before the
+publication job can promote the public release. A separate post-publication
 Windows job verifies the immutable public download against the exact released
 commit and retains its acceptance receipt. Its failure is reported on the run;
 it never changes or unpublishes the release. For recovery, rerun the failed

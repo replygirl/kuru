@@ -15,6 +15,8 @@ pub mod mise_isolation;
 #[cfg(feature = "tooling")]
 pub mod notes;
 #[cfg(feature = "tooling")]
+pub mod published;
+#[cfg(feature = "tooling")]
 pub mod published_windows;
 #[cfg(feature = "tooling")]
 pub mod release;

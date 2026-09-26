@@ -1,13 +1,17 @@
 //! Native post-publication acceptance for the exact Windows release.
 
-use crate::{archive, command, mise_isolation, release, targets};
-use anyhow::{Context, Result, bail, ensure};
+use crate::{
+    archive, command, mise_isolation,
+    published::{METADATA_LIMIT, PublicGitHub, PublishedRelease, REPOSITORY},
+    release, targets,
+};
+use anyhow::{Context, Result, ensure};
 use kuru_platform::fs::{Directory, NameRetention, Privacy, regular_file_info};
-use reqwest::{Client, Url, redirect::Policy};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
     io::{Read, Write},
@@ -16,11 +20,9 @@ use std::{
     time::Duration,
 };
 
-const REPOSITORY: &str = "replygirl/kuru";
 const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
 const COMMAND_DEADLINE: Duration = Duration::from_secs(180);
 const OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
-const METADATA_LIMIT: usize = 4 * 1024 * 1024;
 const RECEIPT_LIMIT: usize = 64 * 1024;
 const MISE_CONFIG: &str = r#"[settings]
 use_versions_host=false
@@ -40,40 +42,6 @@ pub struct Options {
     pub manifest: PathBuf,
     pub evidence: PathBuf,
     pub run_url: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReleaseAsset {
-    name: String,
-    browser_download_url: String,
-    digest: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PublishedRelease {
-    tag_name: String,
-    draft: bool,
-    prerelease: bool,
-    assets: Vec<ReleaseAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Object {
-    #[serde(rename = "type")]
-    kind: String,
-    sha: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct TagReference {
-    #[serde(rename = "ref")]
-    name: String,
-    object: Object,
-}
-
-#[derive(Debug, Deserialize)]
-struct TagObject {
-    object: Object,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,101 +113,6 @@ struct Receipt {
     second_revision: String,
     engine: EngineEvidence,
     cleanup_confirmed: bool,
-}
-
-struct PublicGitHub {
-    client: Client,
-}
-
-impl PublicGitHub {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            client: Client::builder()
-                .https_only(true)
-                .no_proxy()
-                .redirect(Policy::limited(5))
-                .timeout(Duration::from_secs(60))
-                .user_agent("kuru-published-windows-verifier")
-                .build()?,
-        })
-    }
-
-    async fn get(&self, url: &str, limit: usize) -> Result<Vec<u8>> {
-        let url = Url::parse(url)?;
-        ensure!(
-            url.scheme() == "https"
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none(),
-            "published release URL must be credential-free HTTPS"
-        );
-        let mut response = self
-            .client
-            .get(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?
-            .error_for_status()?;
-        ensure!(
-            response
-                .content_length()
-                .is_none_or(|size| size <= limit as u64),
-            "published response exceeds size limit"
-        );
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            ensure!(
-                bytes.len().saturating_add(chunk.len()) <= limit,
-                "published response exceeds size limit"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
-    }
-
-    async fn json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
-        let bytes = self
-            .get(
-                &format!("https://api.github.com/repos/{REPOSITORY}/{path}"),
-                METADATA_LIMIT,
-            )
-            .await?;
-        serde_json::from_slice(&bytes).context("invalid GitHub release metadata")
-    }
-
-    async fn release(&self, version: &str) -> Result<PublishedRelease> {
-        self.json(&format!("releases/tags/v{version}")).await
-    }
-
-    async fn tag_commit(&self, version: &str) -> Result<String> {
-        let reference: TagReference = self.json(&format!("git/ref/tags/v{version}")).await?;
-        ensure!(
-            reference.name == format!("refs/tags/v{version}"),
-            "GitHub returned a different tag"
-        );
-        let mut object = reference.object;
-        let mut seen = HashSet::new();
-        for _ in 0..4 {
-            release::checked_sha(&object.sha)?;
-            ensure!(
-                seen.insert(object.sha.clone()),
-                "release tag contains a cycle"
-            );
-            match object.kind.as_str() {
-                "commit" => return Ok(object.sha),
-                "tag" => {
-                    object = self
-                        .json::<TagObject>(&format!("git/tags/{}", object.sha))
-                        .await?
-                        .object;
-                }
-                _ => bail!("release tag does not resolve to a commit"),
-            }
-        }
-        bail!("release tag indirection exceeds limit")
-    }
 }
 
 fn expected_assets(version: &str) -> Result<BTreeSet<String>> {
@@ -328,176 +201,6 @@ fn validate_asset_digests(
             "GitHub asset digest differs from downloaded publication"
         );
     }
-    Ok(())
-}
-
-/// The published stable release immediately preceding a release candidate,
-/// with its checksum manifest and Windows ZIP already authenticated. Kuru's
-/// upgrade contract covers only this release: its own updater is what real
-/// installations run against the candidate.
-pub struct PreviousWindowsRelease {
-    pub version: String,
-    pub manifest: Vec<u8>,
-    pub archive: Vec<u8>,
-    /// The paired Windows shell-support envelope, present exactly when the
-    /// previous release publishes one.
-    pub support: Option<Vec<u8>>,
-}
-
-/// Resolve and download the release preceding `candidate` from public GitHub.
-///
-/// Nothing is pinned: the release is selected at run time by
-/// [`select_previous`]. Every asset is read over HTTPS from its immutable
-/// version path, and no bytes are returned until the ZIP and any paired
-/// shell-support envelope match that release's own `SHA256SUMS` and every
-/// file matches GitHub's asset digest.
-pub async fn previous_windows_release(candidate: &str) -> Result<PreviousWindowsRelease> {
-    let candidate = candidate.parse::<release::Version>()?;
-    let github = PublicGitHub::new()?;
-    // The unpaginated listing holds GitHub's 30 most recently created
-    // releases, which always include the latest ones.
-    let releases: Vec<PublishedRelease> = github.json("releases").await?;
-    let version = select_previous(&releases, candidate)?.to_string();
-    let listed = releases
-        .iter()
-        .find(|release| release.tag_name == format!("v{version}"))
-        .context("selected previous release is absent from its listing")?;
-    let archive_name = archive::archive_name(&version, WINDOWS_TARGET)?;
-    let manifest_digest = listed_digest(listed, &version, "SHA256SUMS")?;
-    let archive_digest = listed_digest(listed, &version, &archive_name)?;
-    let download_base = format!("https://github.com/{REPOSITORY}/releases/download/v{version}");
-    let manifest = github
-        .get(&format!("{download_base}/SHA256SUMS"), 64 * 1024)
-        .await?;
-    verify_manifest(&manifest, &manifest_digest)?;
-    let archive = github
-        .get(
-            &format!("{download_base}/{archive_name}"),
-            archive::MAX_ARCHIVE_BYTES,
-        )
-        .await?;
-    verify_listed_asset(&manifest, &archive, &archive_name, &archive_digest)?;
-    let support_name = crate::shell_support::archive_name(&version, WINDOWS_TARGET)?;
-    let support = if publishes_asset(listed, &manifest, &support_name) {
-        // Either source naming the envelope requires both to agree on it.
-        let support_digest = listed_digest(listed, &version, &support_name)?;
-        let support = github
-            .get(
-                &format!("{download_base}/{support_name}"),
-                crate::shell_support::MAX_ENVELOPE_BYTES,
-            )
-            .await?;
-        verify_listed_asset(&manifest, &support, &support_name, &support_digest)?;
-        Some(support)
-    } else {
-        None
-    };
-    Ok(PreviousWindowsRelease {
-        version,
-        manifest,
-        archive,
-        support,
-    })
-}
-
-/// Select the greatest published stable release other than the candidate.
-/// This is GitHub's latest release, or the one before it when the candidate
-/// itself is already published (a recovered Release run). Fail closed when a
-/// stable release tag is not canonical `vX.Y.Z` or is newer than the candidate.
-fn select_previous(
-    releases: &[PublishedRelease],
-    candidate: release::Version,
-) -> Result<release::Version> {
-    let mut previous = None;
-    for listed in releases
-        .iter()
-        .filter(|listed| !listed.draft && !listed.prerelease)
-    {
-        let version = listed
-            .tag_name
-            .parse::<release::Version>()
-            .ok()
-            .filter(|version| listed.tag_name == format!("v{version}"))
-            .with_context(|| {
-                format!(
-                    "published stable release tag {:?} is not vX.Y.Z",
-                    listed.tag_name
-                )
-            })?;
-        if version == candidate {
-            continue;
-        }
-        ensure!(
-            version < candidate,
-            "published release v{version} is newer than candidate v{candidate}"
-        );
-        previous = previous.max(Some(version));
-    }
-    previous.with_context(|| format!("no published stable release precedes v{candidate}"))
-}
-
-fn listed_digest(listed: &PublishedRelease, version: &str, name: &str) -> Result<String> {
-    let mut matches = listed.assets.iter().filter(|asset| asset.name == name);
-    let asset = matches
-        .next()
-        .with_context(|| format!("previous release v{version} lacks {name}"))?;
-    ensure!(
-        matches.next().is_none(),
-        "previous release v{version} lists {name} more than once"
-    );
-    ensure!(
-        asset.browser_download_url
-            == format!("https://github.com/{REPOSITORY}/releases/download/v{version}/{name}"),
-        "previous release asset URL differs from its immutable version path"
-    );
-    let digest = asset
-        .digest
-        .as_deref()
-        .and_then(|digest| digest.strip_prefix("sha256:"))
-        .filter(|hash| {
-            hash.len() == 64
-                && hash
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-        .with_context(|| {
-            format!("previous release v{version} lacks a SHA-256 digest for {name}")
-        })?;
-    Ok(digest.to_owned())
-}
-
-fn publishes_asset(listed: &PublishedRelease, manifest: &[u8], name: &str) -> bool {
-    listed.assets.iter().any(|asset| asset.name == name)
-        || String::from_utf8_lossy(manifest).lines().any(|line| {
-            line.split_once(' ')
-                .and_then(|(_, listed)| listed.strip_prefix(' ').or(listed.strip_prefix('*')))
-                == Some(name)
-        })
-}
-
-fn verify_manifest(manifest: &[u8], manifest_digest: &str) -> Result<()> {
-    ensure!(
-        archive::digest(manifest) == manifest_digest,
-        "previous release SHA256SUMS differs from its GitHub asset digest"
-    );
-    Ok(())
-}
-
-fn verify_listed_asset(
-    manifest: &[u8],
-    bytes: &[u8],
-    name: &str,
-    listed_digest: &str,
-) -> Result<()> {
-    let expected = archive::expected_digest(manifest, name)?;
-    ensure!(
-        archive::digest(bytes) == expected,
-        "previous release {name} differs from its SHA256SUMS"
-    );
-    ensure!(
-        expected == listed_digest,
-        "previous release SHA256SUMS and GitHub disagree on {name}"
-    );
     Ok(())
 }
 
@@ -861,7 +564,8 @@ pub async fn run(options: Options) -> Result<()> {
     let manifest_path = absolute(&options.manifest)?;
     let evidence_path = absolute(&options.evidence)?;
 
-    let github = PublicGitHub::new()?;
+    // The post-publication verifier reads anonymously.
+    let github = PublicGitHub::new(None)?;
     let published = github.release(&version).await?;
     validate_release(&published, &version)?;
     ensure!(
@@ -1167,6 +871,7 @@ pub async fn run(options: Options) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::published::ReleaseAsset;
     use serde_json::json;
 
     fn published(
@@ -1257,162 +962,6 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    fn listed(tag: &str, draft: bool, prerelease: bool) -> PublishedRelease {
-        PublishedRelease {
-            tag_name: tag.into(),
-            draft,
-            prerelease,
-            assets: Vec::new(),
-        }
-    }
-
-    fn version(value: &str) -> release::Version {
-        value.parse().unwrap()
-    }
-
-    #[test]
-    fn previous_release_is_the_greatest_older_stable_release() {
-        let releases = [
-            listed("v0.10.0", true, false),
-            listed("v0.9.1-rc.1", false, true),
-            listed("v0.8.0", false, false),
-            listed("v0.9.0", false, false),
-            listed("v0.4.2", false, false),
-        ];
-        assert_eq!(
-            select_previous(&releases, version("0.10.0")).unwrap(),
-            version("0.9.0")
-        );
-
-        // A recovered run whose candidate is already public uses the one before.
-        let recovered = [
-            listed("v0.10.0", false, false),
-            listed("v0.9.0", false, false),
-        ];
-        assert_eq!(
-            select_previous(&recovered, version("0.10.0")).unwrap(),
-            version("0.9.0")
-        );
-
-        for (releases, candidate) in [
-            (vec![listed("v0.10.0", false, false)], "0.10.0"),
-            (vec![], "0.10.0"),
-            (vec![listed("v0.11.0", false, false)], "0.10.0"),
-            (vec![listed("0.9.0", false, false)], "0.10.0"),
-            (vec![listed("v0.09.0", false, false)], "0.10.0"),
-            (vec![listed("vv0.9.0", false, false)], "0.10.0"),
-            (vec![listed("nightly", false, false)], "0.10.0"),
-        ] {
-            assert!(
-                select_previous(&releases, version(candidate)).is_err(),
-                "accepted {:?}",
-                releases.iter().map(|r| &r.tag_name).collect::<Vec<_>>()
-            );
-        }
-    }
-
-    #[test]
-    fn previous_release_assets_are_authenticated_before_use() {
-        let name = archive::archive_name("0.9.0", WINDOWS_TARGET).unwrap();
-        let archive_bytes = b"windows zip".to_vec();
-        let archive_digest = archive::digest(&archive_bytes);
-        let manifest = format!("{archive_digest}  {name}\n").into_bytes();
-        let manifest_digest = archive::digest(&manifest);
-        let asset = |name: &str, digest: Option<String>| ReleaseAsset {
-            name: name.into(),
-            browser_download_url: format!(
-                "https://github.com/{REPOSITORY}/releases/download/v0.9.0/{name}"
-            ),
-            digest,
-        };
-        let mut release = listed("v0.9.0", false, false);
-        release.assets = vec![
-            asset("SHA256SUMS", Some(format!("sha256:{manifest_digest}"))),
-            asset(&name, Some(format!("sha256:{archive_digest}"))),
-        ];
-        assert_eq!(
-            listed_digest(&release, "0.9.0", "SHA256SUMS").unwrap(),
-            manifest_digest
-        );
-        assert_eq!(
-            listed_digest(&release, "0.9.0", &name).unwrap(),
-            archive_digest
-        );
-        verify_manifest(&manifest, &manifest_digest).unwrap();
-        verify_listed_asset(&manifest, &archive_bytes, &name, &archive_digest).unwrap();
-
-        let other = "f".repeat(64);
-        assert!(verify_manifest(&manifest, &other).is_err());
-        assert!(verify_listed_asset(&manifest, b"altered", &name, &archive_digest).is_err());
-        assert!(verify_listed_asset(&manifest, &archive_bytes, &name, &other).is_err());
-        let foreign = format!("{archive_digest}  kuru-0.9.0-other.zip\n").into_bytes();
-        assert!(verify_listed_asset(&foreign, &archive_bytes, &name, &archive_digest).is_err());
-
-        release.assets[1].digest = None;
-        assert!(listed_digest(&release, "0.9.0", &name).is_err());
-        release.assets[1].digest = Some(format!("sha1:{archive_digest}"));
-        assert!(listed_digest(&release, "0.9.0", &name).is_err());
-        release.assets[1].digest = Some(format!("sha256:{archive_digest}"));
-        release.assets[1].browser_download_url = "https://example.invalid/kuru.zip".into();
-        assert!(listed_digest(&release, "0.9.0", &name).is_err());
-        release.assets[1] = asset(&name, Some(format!("sha256:{archive_digest}")));
-        release
-            .assets
-            .push(asset(&name, Some(format!("sha256:{archive_digest}"))));
-        assert!(listed_digest(&release, "0.9.0", &name).is_err());
-        release.assets.truncate(1);
-        assert!(listed_digest(&release, "0.9.0", &name).is_err());
-    }
-
-    #[test]
-    fn previous_support_envelope_is_detected_and_authenticated() {
-        let core = archive::archive_name("1.0.0", WINDOWS_TARGET).unwrap();
-        let support = crate::shell_support::archive_name("1.0.0", WINDOWS_TARGET).unwrap();
-        let envelope = b"support envelope".to_vec();
-        let envelope_digest = archive::digest(&envelope);
-        let unmarked = format!("{}  {core}\n", "a".repeat(64)).into_bytes();
-        let marked =
-            format!("{}  {core}\n{envelope_digest}  {support}\n", "a".repeat(64)).into_bytes();
-        let asset = |name: &str| ReleaseAsset {
-            name: name.into(),
-            browser_download_url: format!(
-                "https://github.com/{REPOSITORY}/releases/download/v1.0.0/{name}"
-            ),
-            digest: Some(format!("sha256:{envelope_digest}")),
-        };
-        let mut release = listed("v1.0.0", false, false);
-        release.assets = vec![asset(&core)];
-
-        // An executable-only release names no envelope in either source.
-        assert!(!publishes_asset(&release, &unmarked, &support));
-        // Naming it in either source requires it; a listing without it (or a
-        // manifest without it) then fails authentication instead of skipping.
-        assert!(publishes_asset(&release, &marked, &support));
-        assert!(listed_digest(&release, "1.0.0", &support).is_err());
-        release.assets.push(asset(&support));
-        assert!(publishes_asset(&release, &unmarked, &support));
-        assert!(verify_listed_asset(&unmarked, &envelope, &support, &envelope_digest).is_err());
-        let binary_marked =
-            format!("{}  {core}\n{envelope_digest} *{support}\n", "a".repeat(64)).into_bytes();
-        assert!(publishes_asset(
-            &listed("v1.0.0", false, false),
-            &binary_marked,
-            &support
-        ));
-
-        let digest = listed_digest(&release, "1.0.0", &support).unwrap();
-        verify_listed_asset(&marked, &envelope, &support, &digest).unwrap();
-        assert!(verify_listed_asset(&marked, b"altered envelope", &support, &digest).is_err());
-        assert!(verify_listed_asset(&marked, &envelope, &support, &"f".repeat(64)).is_err());
-        let substituted = format!(
-            "{}  {core}\n{}  {support}\n",
-            "a".repeat(64),
-            "b".repeat(64)
-        )
-        .into_bytes();
-        assert!(verify_listed_asset(&substituted, &envelope, &support, &digest).is_err());
     }
 
     #[test]
