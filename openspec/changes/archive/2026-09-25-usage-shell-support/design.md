@@ -19,6 +19,7 @@ The shipped `completions` and `man` commands already run before configuration or
 - Usage's script protocol and candidate formatting may change across releases → exact compatible pins and focused four-shell protocol tests, including spaces, apostrophes, Unicode and descriptions.
 - The hidden completion route could appear in public help or perform startup work → keep it hidden in Clap and assert pure early dispatch from a foreign directory.
 - A generated script could require an uninstalled Usage executable or Bash shell package → default to Usage's native Kuru-hosted script with no such prerequisite, and document/test the optional external mode separately.
+- `usage-cli`, the only path to the default self-hosted answer engine, has no optional Cargo features as published (verified against its Cargo.toml: `rmcp`'s "server" transport, `tera`, `tokio` and `env_logger` are all unconditional) → no narrower dependency set is selectable; measured release-binary impact is a real, modest ~3.16 MiB (≈4.9%) versus the pre-Usage baseline, well inside the 128 MiB shipping cap. A same-process process-launching audit above `native_completion_answer_output` in `apps/kuru-tui/src/cli.rs` confirms none of that crate's own process-spawning code (`usage::sh::sh`, its `exec`/`shell` subcommands, the unix-only `exec` crate) is reachable from the Clap-derived spec this decision uses.
 
 ## Operational surface
 
