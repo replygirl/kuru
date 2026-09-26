@@ -225,21 +225,33 @@ uses Usage's generic completion script. Its Bash variant also requires the
 installed Kuru executable and needs no such package. Its generic Bash variant
 caches the embedded command spec as a file under
 `${XDG_CACHE_HOME:-~/.cache}/usage/`, pruning cache entries for this version
-family older than 30 days; nothing else on disk is read or written by either
-Bash variant.
+family older than 30 days. That cache write is the default script's only
+disk access beyond the completion request itself; the external mode's
+separately installed `usage` executable does its own reads (its own config,
+cache and completion logic) that Kuru neither controls nor observes.
 
 A path-valued option or argument (an install directory, a config file, and
 similar) completes by listing entries in your current working directory —
 read-only, and only the directory you are already in — rather than any
 project or Kuru-managed path.
 
-**Not independently verified**: escaping and spacing for filenames answered
-under Bash 3.2 (still the system `/bin/bash` on unpatched macOS). The default
-script calls `compopt -o filenames` to get correct trailing-slash and
-no-escaping behavior for path completions, redirecting its error to `/dev/null`
-because `compopt` does not exist before Bash 4.0; `COMPREPLY` still populates
-without it, but whether filenames containing spaces or special characters
-render identically on that shell has not been checked.
+**Known limitation**: a path candidate with a space in its name does not
+complete correctly in the default Bash script. `compopt -o filenames` — which
+tells Bash to quote a completion as a filename — is never invoked for Kuru's
+own path-valued options, on any Bash version: the pinned completion engine
+answers a typed path argument by listing the directory itself and returning
+each entry as a plain candidate string, the same protocol path used for an
+ordinary non-path value, rather than telling the script to switch into
+file-completion mode. Confirmed directly on the system `/bin/bash` 3.2
+shipped on unpatched macOS, sourcing the generated script by hand:
+`COMPREPLY=([0]="my dir/" [1]="plaindir/")` for a directory named `my dir`
+next to an ordinary one — Bash then inserts the unescaped text verbatim,
+splitting the completed line at the space. The generated script's logic here
+does not vary by Bash version, so the same result is expected (not
+independently run here) on Bash 4+. Not fixable in Kuru's own code without
+reimplementing the pinned engine's argument-position-aware candidate
+classification; tracked as a limitation of the pinned dependency rather than
+patched locally.
 
 For ordinary Unix `man kuru`, include the selected install root's manual
 directory in `MANPATH`, for example
