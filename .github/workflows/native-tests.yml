@@ -112,22 +112,6 @@ jobs:
           # Instrumented shard targets live in runner.temp and are never cached.
           shared-key: native-coverage-${{ inputs.os }}
           save-if: ${{ matrix.shard == 'connectors-core-platform' }}
-      # TEMPORARY (stall drill, revert before merge): print this runner's exact
-      # `show-env --pwsh` output, with the orchestrator's environment, so the
-      # Linux and Windows fixtures can be captured from real runners.
-      - name: Print cargo-llvm-cov show-env for fixture capture
-        if: matrix.shard == 'connectors-core-platform'
-        shell: bash
-        env:
-          KURU_SHOW_ENV_TARGET: ${{ runner.temp }}/kuru-coverage-show-env-${{ github.run_attempt }}
-        run: |
-          mise exec cargo:cargo-llvm-cov@0.9.1 -- cargo-llvm-cov llvm-cov --version
-          echo '=== KURU_SHOW_ENV_BEGIN ==='
-          CARGO_TARGET_DIR="$KURU_SHOW_ENV_TARGET" \
-            CARGO_LLVM_COV_TARGET_DIR="$KURU_SHOW_ENV_TARGET" \
-            LLVM_PROFILE_FILE="$KURU_SHOW_ENV_TARGET/kuru-%p-%m.profraw" \
-            mise exec cargo:cargo-llvm-cov@0.9.1 -- cargo-llvm-cov llvm-cov show-env --pwsh
-          echo '=== KURU_SHOW_ENV_END ==='
       - name: Run one checked coverage shard
         if: runner.os != 'Linux'
         shell: bash
