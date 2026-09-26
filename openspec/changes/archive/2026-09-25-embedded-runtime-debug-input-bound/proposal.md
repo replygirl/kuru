@@ -1,6 +1,6 @@
 ## Why
 
-The instrumented macOS Kuru executable is 171,024,280 bytes, above the embedded-runtime fixture's selected-input limit of 168,820,736 bytes. The fixture rejects it before making its private copy, so the required offline install and self-update acceptance never runs even though the same executable strips to 118,213,992 bytes, below the unchanged 128 MiB shipping limit.
+The instrumented macOS Kuru executable is 171,024,280 bytes, above the embedded-runtime fixture's selected-input limit of 167,772,160 bytes. The fixture rejects it before making its private copy, so the required offline install and self-update acceptance never runs even though the same executable strips to 118,213,992 bytes, below the unchanged 128 MiB shipping limit.
 
 ## What Changes
 
