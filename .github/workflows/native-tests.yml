@@ -11,7 +11,7 @@ on:
         type: string
         default: ubuntu-latest
       install:
-        description: Also verify source installation and the shipping offline runtime
+        description: Also verify source installation, the shipping offline runtime and the previous release's update
         type: boolean
         default: false
       artifact-prefix:
@@ -365,7 +365,9 @@ jobs:
 
   install:
     if: inputs.install
-    name: Installation, offline runtime and update (${{ inputs.os }})
+    # One installation and update job per OS. The release-profile build that
+    # the install task produces is also the previous-release updater candidate.
+    name: Installation, offline runtime and update
     runs-on: ${{ inputs.os }}
     timeout-minutes: 45
     steps:
@@ -375,8 +377,23 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Select private bundle build inputs
+        shell: pwsh
+        # Leave the leaf absent so the preparer creates this runner's private ACLs.
+        # Cargo's restored target/ cache must not supply these directory grants.
+        run: Add-Content -LiteralPath $env:GITHUB_ENV "KURU_DOLT_BUNDLE_DIR=$env:RUNNER_TEMP/kuru-bundles-install-${{ github.run_attempt }}"
+      - name: Reserve space for release and test builds
+        if: runner.os == 'Linux'
         shell: bash
-        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles-install-${{ github.run_attempt }}\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+        run: |
+          # This Rust job does not use the hosted image's mobile or Swift SDKs.
+          df -h /
+          for sdk in /usr/local/lib/android /usr/share/swift; do
+            if [ -d "$sdk" ]; then
+              sudo du -sh "$sdk"
+              sudo rm -rf -- "$sdk"
+            fi
+          done
+          df -h /
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
@@ -389,24 +406,35 @@ jobs:
           cache-bin: false
           shared-key: native-install-${{ inputs.os }}
       - name: Fetch locked Cargo inputs before offline verification
-        shell: bash
         run: cargo fetch --locked
-      - name: Prepare package-owned bundle and test tools
-        shell: bash
-        run: |
-          mise run //packages/kuru-memory:bundle:prepare
-          mise run //packages/kuru-memory:bundle:test-fixtures
-          mise run //packages/kuru-delivery:setup:test-tools
+      - name: Prepare the package-owned bundle
+        run: mise run //packages/kuru-memory:bundle:prepare
+      - name: Prepare the package-owned bundle fixtures
+        if: runner.os == 'Windows'
+        run: mise run //packages/kuru-memory:bundle:test-fixtures
+      - name: Install package-owned test tools
+        run: mise run //packages/kuru-delivery:setup:test-tools
       - name: Source install smoke
-        shell: bash
+        if: runner.os != 'Windows'
         env:
           KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
-          KURU_INSTALLED_BINARY: ${{ runner.temp }}/kuru-bin/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
           CARGO_NET_OFFLINE: "true"
           KURU_DOLT_BUNDLE_OFFLINE: "true"
         run: |
           mise run install
-          "$KURU_INSTALLED_BINARY" --version
+          "$KURU_INSTALL_DIR/kuru" --version
+      - name: Native Windows source install smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
+          CARGO_NET_OFFLINE: "true"
+          KURU_DOLT_BUNDLE_OFFLINE: "true"
+        run: |
+          mise run install
+          if ($LASTEXITCODE -ne 0) { throw 'Source installation failed' }
+          & "$env:KURU_INSTALL_DIR/kuru.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'Installed Kuru failed' }
       - name: Verify native offline Cargo input failures
         if: runner.os == 'Windows'
         env:
@@ -421,9 +449,14 @@ jobs:
         env:
           KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru.exe
         run: mise run //apps/kuru-tui:verify:windows-imports
+      # The previous published release's own updater installs this tree's
+      # release build. This step is online: the task lists releases on
+      # api.github.com (the token authenticates only that request) and
+      # downloads the previous release's assets anonymously.
       - name: Accept an update from the previous published release
         env:
-          KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.temp }}/kuru-bin/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
+          # build:release passes --target on Windows, so its output is target-qualified.
+          KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.os == 'Windows' && format('{0}\target\x86_64-pc-windows-msvc\release\kuru.exe', github.workspace) || format('{0}/target/release/kuru', github.workspace) }}
           GITHUB_TOKEN: ${{ github.token }}
         run: mise run //packages/kuru-delivery:test:previous-release-update
       - name: Require unchanged dependency locks
