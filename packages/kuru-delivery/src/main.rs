@@ -85,6 +85,9 @@ enum Command {
         evidence: PathBuf,
         #[arg(long, env = "RELEASE_RUN_URL")]
         run_url: String,
+        /// Windows target to verify; must be this runner's native host target.
+        #[arg(long, env = "KURU_PUBLISHED_TARGET")]
+        target: Option<String>,
     },
     /// Check public artifacts, base paths, links, anchors and sitemap.
     Docs {
@@ -382,6 +385,7 @@ async fn main() -> Result<()> {
             manifest,
             evidence,
             run_url,
+            target,
         } => {
             published_windows::run(published_windows::Options {
                 version,
@@ -390,6 +394,7 @@ async fn main() -> Result<()> {
                 manifest,
                 evidence,
                 run_url,
+                target,
             })
             .await?;
         }

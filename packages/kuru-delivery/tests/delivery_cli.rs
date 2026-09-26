@@ -435,6 +435,7 @@ fn published_windows_cli_is_explicit_and_native_only() {
         "--manifest",
         "--evidence",
         "--run-url",
+        "--target",
     ] {
         assert!(help.contains(option), "missing {option}: {help}");
     }

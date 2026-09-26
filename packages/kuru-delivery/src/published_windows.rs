@@ -20,10 +20,12 @@ use std::{
     time::Duration,
 };
 
-const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
 const COMMAND_DEADLINE: Duration = Duration::from_secs(180);
 const OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const RECEIPT_LIMIT: usize = 64 * 1024;
+const RECEIPT_SCHEMA: u32 = 2;
+/// PE optional headers follow a bounded DOS stub; a larger offset is malformed.
+const PE_HEADER_LIMIT: usize = 64 * 1024;
 const MISE_CONFIG: &str = r#"[settings]
 use_versions_host=false
 use_versions_host_track=false
@@ -42,14 +44,17 @@ pub struct Options {
     pub manifest: PathBuf,
     pub evidence: PathBuf,
     pub run_url: String,
+    /// Windows catalog target to verify; defaults to the runner's host target
+    /// and must equal it, since the installed image is executed natively.
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct EngineManifest {
     schema_version: u32,
     version: String,
-    /// Decoded individually: an unpinned built entry for another target has
-    /// null sizes and must not affect Windows x64 verification.
+    /// Decoded individually: only the entry for the verified Windows target is
+    /// decoded, so another target's entry cannot affect its verification.
     assets: Vec<serde_json::Value>,
 }
 
@@ -98,6 +103,8 @@ struct Receipt {
     schema_version: u32,
     runner_os: &'static str,
     runner_arch: &'static str,
+    target: &'static str,
+    pe_machine: &'static str,
     repository: &'static str,
     release_url: String,
     run_url: String,
@@ -115,6 +122,90 @@ struct Receipt {
     second_revision: String,
     engine: EngineEvidence,
     cleanup_confirmed: bool,
+}
+
+#[derive(Deserialize)]
+struct ReceiptIdentity {
+    schema_version: u32,
+    target: String,
+    pe_machine: String,
+}
+
+/// Select the Windows catalog target this runner verifies. The installed image
+/// is executed, so only the runner's own native target can be accepted.
+fn checked_target(requested: Option<&str>, host: &str) -> Result<&'static targets::Target> {
+    let target = targets::find(requested.unwrap_or(host))?;
+    ensure!(
+        target.os == "windows",
+        "{} is not a Windows release target",
+        target.triple
+    );
+    ensure!(
+        target.triple == host,
+        "published target {} differs from this runner's native target {host}",
+        target.triple
+    );
+    Ok(target)
+}
+
+/// The COFF machine value and name every image for `target` must carry.
+fn expected_machine(target: &targets::Target) -> Result<(u16, &'static str)> {
+    match (target.os, target.arch) {
+        ("windows", "x86_64") => Ok((0x8664, "AMD64")),
+        ("windows", "aarch64") => Ok((0xaa64, "ARM64")),
+        _ => anyhow::bail!("{} has no Windows PE machine", target.triple),
+    }
+}
+
+/// Read the COFF machine of a PE image through its bounded DOS header offset.
+fn pe_machine(image: &[u8]) -> Result<u16> {
+    let field = |offset: usize, width: usize| {
+        image
+            .get(offset..offset + width)
+            .context("PE image is truncated")
+    };
+    ensure!(field(0, 2)? == b"MZ", "image is not a PE executable");
+    let header = u32::from_le_bytes(field(0x3c, 4)?.try_into()?) as usize;
+    ensure!(
+        header <= PE_HEADER_LIMIT,
+        "PE header offset exceeds its bound"
+    );
+    ensure!(field(header, 4)? == b"PE\0\0", "image has no PE signature");
+    Ok(u16::from_le_bytes(field(header + 4, 2)?.try_into()?))
+}
+
+fn require_machine(
+    image: &[u8],
+    target: &targets::Target,
+    description: &str,
+) -> Result<&'static str> {
+    let (expected, name) = expected_machine(target)?;
+    let actual = pe_machine(image).with_context(|| format!("read {description} PE machine"))?;
+    ensure!(
+        actual == expected,
+        "{description} PE machine 0x{actual:04x} differs from {} ({name} 0x{expected:04x})",
+        target.triple
+    );
+    Ok(name)
+}
+
+/// Reject a receipt that does not name a Windows target and its PE machine.
+fn validate_receipt(bytes: &[u8]) -> Result<()> {
+    let identity: ReceiptIdentity =
+        serde_json::from_slice(bytes).context("receipt must record target and PE machine")?;
+    ensure!(
+        identity.schema_version == RECEIPT_SCHEMA,
+        "unsupported published receipt schema"
+    );
+    let target = targets::find(&identity.target)?;
+    let (_, expected) = expected_machine(target)?;
+    ensure!(
+        identity.pe_machine == expected,
+        "receipt PE machine {} differs from {} ({expected})",
+        identity.pe_machine,
+        target.triple
+    );
+    Ok(())
 }
 
 fn expected_assets(version: &str) -> Result<BTreeSet<String>> {
@@ -206,7 +297,7 @@ fn validate_asset_digests(
     Ok(())
 }
 
-fn windows_engine_asset(manifest: &EngineManifest) -> Result<EngineAsset> {
+fn windows_engine_asset(manifest: &EngineManifest, windows_target: &str) -> Result<EngineAsset> {
     ensure!(
         manifest.schema_version == 2,
         "unsupported Dolt asset manifest schema"
@@ -215,18 +306,18 @@ fn windows_engine_asset(manifest: &EngineManifest) -> Result<EngineAsset> {
         .assets
         .iter()
         .filter(|asset| {
-            asset.get("target").and_then(|target| target.as_str()) == Some(WINDOWS_TARGET)
+            asset.get("target").and_then(|target| target.as_str()) == Some(windows_target)
         })
         .collect::<Vec<_>>();
     ensure!(
         engine_assets.len() == 1,
-        "Dolt manifest must contain exactly one Windows asset"
+        "Dolt manifest must contain exactly one {windows_target} asset"
     );
-    let asset =
-        EngineAsset::deserialize(engine_assets[0]).context("decode the Windows Dolt asset")?;
+    let asset = EngineAsset::deserialize(engine_assets[0])
+        .with_context(|| format!("decode the {windows_target} Dolt asset"))?;
     ensure!(
-        asset.target == WINDOWS_TARGET,
-        "decoded Dolt asset does not match the Windows target"
+        asset.target == windows_target,
+        "decoded Dolt asset does not match {windows_target}"
     );
     Ok(asset)
 }
@@ -580,6 +671,8 @@ pub async fn run(options: Options) -> Result<()> {
         cfg!(windows),
         "verify-published-windows requires native Windows"
     );
+    let target = checked_target(options.target.as_deref(), archive::host_target()?)?;
+    let windows_target = target.triple;
     let version = options.version.parse::<release::Version>()?.to_string();
     let expected_sha = release::checked_sha(&options.expected_sha)?.to_owned();
     let run_url = checked_run_url(&options.run_url)?.to_owned();
@@ -607,7 +700,7 @@ pub async fn run(options: Options) -> Result<()> {
     let checksums = parse_checksums(&checksum_bytes, &version)?;
     let checksum_manifest_sha256 = archive::digest(&checksum_bytes);
     validate_asset_digests(&published, &checksums, &checksum_manifest_sha256)?;
-    let archive_name = archive::archive_name(&version, WINDOWS_TARGET)?;
+    let archive_name = archive::archive_name(&version, windows_target)?;
     let archive_bytes = github
         .get(
             &format!("{download_base}/{archive_name}"),
@@ -619,16 +712,13 @@ pub async fn run(options: Options) -> Result<()> {
         checksums.get(&archive_name) == Some(&archive_sha256),
         "published Windows archive differs from SHA256SUMS"
     );
-    let (executable, marked) = archive::extract_core(
-        &archive_bytes,
-        targets::find(WINDOWS_TARGET)?,
-        archive::MAX_ARCHIVE_BYTES,
-    )?;
+    let (executable, marked) =
+        archive::extract_core(&archive_bytes, target, archive::MAX_ARCHIVE_BYTES)?;
     ensure!(
         marked,
         "published core is missing its required shell support marker"
     );
-    let support_name = crate::shell_support::archive_name(&version, WINDOWS_TARGET)?;
+    let support_name = crate::shell_support::archive_name(&version, windows_target)?;
     let support_bytes = github
         .get(
             &format!("{download_base}/{support_name}"),
@@ -639,7 +729,7 @@ pub async fn run(options: Options) -> Result<()> {
         checksums.get(&support_name) == Some(&archive::digest(&support_bytes)),
         "published Windows shell support differs from SHA256SUMS"
     );
-    let support = crate::shell_support::decode(&support_bytes, targets::find(WINDOWS_TARGET)?)?;
+    let support = crate::shell_support::decode(&support_bytes, target)?;
     let executable_sha256 = archive::digest(&executable);
 
     let manifest: EngineManifest = serde_json::from_slice(&read_bounded(
@@ -647,7 +737,7 @@ pub async fn run(options: Options) -> Result<()> {
         METADATA_LIMIT,
         "Dolt asset manifest",
     )?)?;
-    let engine_asset = &windows_engine_asset(&manifest)?;
+    let engine_asset = &windows_engine_asset(&manifest, windows_target)?;
 
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().to_owned();
@@ -686,6 +776,7 @@ pub async fn run(options: Options) -> Result<()> {
             installed_sha256 == executable_sha256,
             "mise-installed executable differs from the independently verified archive"
         );
+        let installed_machine = require_machine(&installed, target, "mise-installed executable")?;
         let reported = install
             .success("installed-version", &["exec", "--", "kuru", "--version"])
             .await?;
@@ -807,7 +898,7 @@ pub async fn run(options: Options) -> Result<()> {
         let engine_root = install
             .engine_cache
             .join(&manifest.version)
-            .join(WINDOWS_TARGET);
+            .join(windows_target);
         let engine_bytes = read_bounded(
             &engine_root.join("dolt.exe"),
             archive::MAX_ARCHIVE_BYTES,
@@ -831,9 +922,11 @@ pub async fn run(options: Options) -> Result<()> {
 
         let commands = std::mem::take(&mut install.commands);
         let receipt = Receipt {
-            schema_version: 1,
+            schema_version: RECEIPT_SCHEMA,
             runner_os: std::env::consts::OS,
             runner_arch: std::env::consts::ARCH,
+            target: windows_target,
+            pe_machine: installed_machine,
             repository: REPOSITORY,
             release_url,
             run_url,
@@ -871,6 +964,7 @@ pub async fn run(options: Options) -> Result<()> {
         bytes.len() <= RECEIPT_LIMIT,
         "published verification receipt exceeds size limit"
     );
+    validate_receipt(&bytes)?;
     let mut evidence = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -989,9 +1083,11 @@ mod tests {
         assert!(checked_run_url("https://github.com/replygirl/kuru/actions/runs/42").is_ok());
         assert!(checked_run_url("https://example.invalid/run").is_err());
         let receipt = Receipt {
-            schema_version: 1,
+            schema_version: RECEIPT_SCHEMA,
             runner_os: "windows",
             runner_arch: "x86_64",
+            target: "x86_64-pc-windows-msvc",
+            pe_machine: "AMD64",
             repository: REPOSITORY,
             release_url: "https://github.com/replygirl/kuru/releases/tag/v1.2.3".into(),
             run_url: "https://github.com/replygirl/kuru/actions/runs/42".into(),
@@ -1025,9 +1121,133 @@ mod tests {
         };
         let text = serde_json::to_string(&receipt).unwrap();
         assert!(text.len() < RECEIPT_LIMIT);
+        validate_receipt(text.as_bytes()).unwrap();
         for forbidden in ["stdout", "stderr", "token", "oauth", "proxy"] {
             assert!(!text.contains(forbidden));
         }
+    }
+
+    const WINDOWS_ARM64: targets::Target = targets::Target {
+        triple: "aarch64-pc-windows-msvc",
+        os: "windows",
+        arch: "aarch64",
+        executable: "kuru.exe",
+        format: targets::ArchiveFormat::Zip,
+    };
+
+    fn pe_image(machine: u16) -> Vec<u8> {
+        let mut image = vec![0; 0x100];
+        image[..2].copy_from_slice(b"MZ");
+        image[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        image[0x80..0x84].copy_from_slice(b"PE\0\0");
+        image[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
+        image
+    }
+
+    fn receipt_identity(target: &str, machine: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema_version": RECEIPT_SCHEMA,
+            "runner_os": "windows",
+            "target": target,
+            "pe_machine": machine,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn published_target_defaults_to_the_host_and_rejects_other_machines() {
+        let x64 = "x86_64-pc-windows-msvc";
+        assert_eq!(checked_target(None, x64).unwrap().triple, x64);
+        assert_eq!(checked_target(Some(x64), x64).unwrap().triple, x64);
+        // An explicit Windows target that is not the runner's native target is
+        // rejected, even though it is a valid catalog entry.
+        let mismatch = checked_target(Some(x64), "aarch64-apple-darwin")
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.contains("differs from this runner's native target"));
+        assert!(
+            checked_target(None, "aarch64-apple-darwin")
+                .unwrap_err()
+                .to_string()
+                .contains("not a Windows release target")
+        );
+        assert!(checked_target(Some("x86_64-pc-windows-gnu"), x64).is_err());
+    }
+
+    #[test]
+    fn installed_image_pe_machine_must_match_the_target() {
+        let x64 = targets::find("x86_64-pc-windows-msvc").unwrap();
+        assert_eq!(expected_machine(x64).unwrap(), (0x8664, "AMD64"));
+        assert_eq!(expected_machine(&WINDOWS_ARM64).unwrap(), (0xaa64, "ARM64"));
+        assert!(expected_machine(targets::find("aarch64-apple-darwin").unwrap()).is_err());
+        assert_eq!(
+            require_machine(&pe_image(0x8664), x64, "fixture").unwrap(),
+            "AMD64"
+        );
+        assert_eq!(
+            require_machine(&pe_image(0xaa64), &WINDOWS_ARM64, "fixture").unwrap(),
+            "ARM64"
+        );
+        let wrong = require_machine(&pe_image(0xaa64), x64, "fixture")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            wrong.contains("0xaa64 differs from x86_64-pc-windows-msvc"),
+            "{wrong}"
+        );
+        assert!(require_machine(&pe_image(0x8664), &WINDOWS_ARM64, "fixture").is_err());
+    }
+
+    #[test]
+    fn pe_machine_reader_is_bounded_and_rejects_malformed_headers() {
+        assert_eq!(pe_machine(&pe_image(0x8664)).unwrap(), 0x8664);
+        assert!(pe_machine(b"MZ").is_err());
+        let mut not_dos = pe_image(0x8664);
+        not_dos[0] = b'X';
+        assert!(pe_machine(&not_dos).is_err());
+        let mut no_signature = pe_image(0x8664);
+        no_signature[0x80] = b'X';
+        assert!(pe_machine(&no_signature).is_err());
+        let mut beyond = pe_image(0x8664);
+        beyond[0x3c..0x40].copy_from_slice(&((PE_HEADER_LIMIT + 1) as u32).to_le_bytes());
+        assert!(
+            pe_machine(&beyond)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds its bound")
+        );
+        let mut truncated = pe_image(0x8664);
+        truncated.truncate(0x85);
+        assert!(pe_machine(&truncated).is_err());
+        let mut overflow = pe_image(0x8664);
+        overflow[0x3c..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(pe_machine(&overflow).is_err());
+    }
+
+    #[test]
+    fn receipt_schema_requires_target_matching_its_pe_machine() {
+        validate_receipt(&receipt_identity("x86_64-pc-windows-msvc", "AMD64")).unwrap();
+        let missing = serde_json::to_vec(&json!({
+            "schema_version": RECEIPT_SCHEMA,
+            "pe_machine": "AMD64",
+        }))
+        .unwrap();
+        assert!(validate_receipt(&missing).is_err());
+        let mismatched = validate_receipt(&receipt_identity("x86_64-pc-windows-msvc", "ARM64"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            mismatched.contains("differs from x86_64-pc-windows-msvc"),
+            "{mismatched}"
+        );
+        assert!(validate_receipt(&receipt_identity("aarch64-apple-darwin", "ARM64")).is_err());
+        let old = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "target": "x86_64-pc-windows-msvc",
+            "pe_machine": "AMD64",
+        }))
+        .unwrap();
+        assert!(validate_receipt(&old).is_err());
     }
 
     #[test]
@@ -1320,13 +1540,34 @@ mod tests {
     }
 
     #[test]
-    fn committed_schema_two_manifest_selects_only_the_windows_x64_engine() {
+    fn committed_schema_two_manifest_selects_only_the_requested_windows_engine() {
+        let x64 = "x86_64-pc-windows-msvc";
+        let arm64 = "aarch64-pc-windows-msvc";
         let manifest: EngineManifest =
             serde_json::from_str(include_str!("../../kuru-memory/support/dolt-assets.json"))
                 .unwrap();
-        let asset = windows_engine_asset(&manifest).unwrap();
-        assert_eq!(asset.target, WINDOWS_TARGET);
-        assert_eq!(asset.executable_bytes, 129_280_000);
+        let committed = |target: &str| {
+            manifest
+                .assets
+                .iter()
+                .find(|asset| asset["target"] == target)
+                .unwrap_or_else(|| panic!("committed manifest has no {target} entry"))
+                .clone()
+        };
+        for target in [x64, arm64] {
+            let entry = committed(target);
+            let asset = windows_engine_asset(&manifest, target).unwrap();
+            assert_eq!(asset.target, target);
+            assert_eq!(asset.executable_bytes, entry["executable_bytes"]);
+            assert_eq!(asset.executable_sha256, entry["executable_sha256"]);
+            assert_eq!(asset.license_bytes, entry["license_bytes"]);
+            assert_eq!(asset.license_sha256, entry["license_sha256"]);
+        }
+        assert_ne!(
+            windows_engine_asset(&manifest, x64).unwrap().executable_sha256,
+            windows_engine_asset(&manifest, arm64).unwrap().executable_sha256,
+            "each target selects its own engine"
+        );
         assert!(
             manifest
                 .assets
@@ -1338,11 +1579,11 @@ mod tests {
             serde_json::from_str(include_str!("../../kuru-memory/support/dolt-assets.json"))
                 .unwrap();
         legacy.schema_version = 1;
-        assert!(windows_engine_asset(&legacy).is_err());
+        assert!(windows_engine_asset(&legacy, x64).is_err());
         legacy.schema_version = 2;
-        legacy
-            .assets
-            .retain(|asset| asset["target"] != WINDOWS_TARGET);
-        assert!(windows_engine_asset(&legacy).is_err());
+        legacy.assets.retain(|asset| asset["target"] != x64);
+        let missing = windows_engine_asset(&legacy, x64).unwrap_err().to_string();
+        assert!(missing.contains(x64), "{missing}");
+        assert!(windows_engine_asset(&legacy, arm64).is_ok());
     }
 }
