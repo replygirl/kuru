@@ -87,9 +87,11 @@ Current state, `main` at `501ab92d` unless noted:
   1.29.1, PowerShell 7.6.6 and zstd 1.5.7, so `rust-cache` no longer falls back
   to gzip; public-repo Arm runners have 4 vCPU. Instrumented coverage on
   `aarch64-pc-windows-msvc` has an open upstream defect, rust-lang/rust#150123
-  (D7, Open Question 7). Whether stock Windows PowerShell 5.1 is native ARM64 on
-  the image is not itemized. Windows 11 is the Arm floor
-  because .NET Framework 4.8.1's native Arm64 support is Windows 11+.
+  (D7; Open Question 7, decided by lead ruling 1 on 2026-09-26). Whether stock
+  Windows PowerShell 5.1 is native ARM64 on the image is not itemized. Windows 11
+  is the Arm floor because .NET Framework 4.8.1's native Arm64 support is
+  Windows 11+ (confirmed by lead ruling 4 on 2026-09-26; x64 keeps Windows 10
+  1809).
 - Constraints: AGENTS.md forbids compile-only support claims, host fallbacks and
   unbundled builds; platform mechanics live in `kuru-platform`; `linux-x64` is the
   only engine build host (lead decision 4); PR6a owns the manifest, both parsers,
@@ -183,7 +185,9 @@ correct answer for self-update: an x64 `kuru.exe` running emulated on Arm keeps
 updating x64. Rejected: querying `IsWow64Process2` from Rust so an emulated x64
 binary could pick arm64. That would make the updater replace an executable with
 one of a different machine type mid-flight and is the migration question, not
-target selection.
+target selection. Confirmed by lead ruling 3 (kuru-implement-phase2-sep26a, 2026-09-26): an x64 `kuru.exe` under
+emulation keeps self-updating to x64, and migration to arm64 is a separate
+follow-on change (Open Question 1).
 
 Because `release::archive_assets` and `expected_assets` iterate the catalog, the
 entry, the test flip, the `release.yml` legs and the `release_workflow.rs`
@@ -205,11 +209,14 @@ no `GetProcAddress` probing. Replace the `:626` gate with:
 - `PROCESSOR_ARCHITECTURE` and `PROCESSOR_ARCHITEW6432` are no longer consulted;
   both report the emulated view under WOW64/ARM64EC, which is the pitfall.
 - `-Target` defaults to the native target. An explicit `-Target` that differs from
-  the native machine throws "target does not match the native machine"; a 32-bit
+  the native machine throws before any download with a message naming both the
+  requested and the native target ("target <requested> does not match the
+  native machine target <native>"); a 32-bit
   process still fails the `Is64BitProcess` check. Rejected: allowing an explicit
   x64 install on Arm, which would silently ship the emulated executable users
-  are trying to leave. This is a designer default awaiting lead confirmation
-  (Open Question 4).
+  are trying to leave. Confirmed by lead ruling 2 (kuru-implement-phase2-sep26a, 2026-09-26): "Reject an explicit
+  -Target that mismatches the native machine, with a message that names the
+  native target." (Open Question 4)
 - `Pe()` takes the expected machine (`0x8664` or `0xAA64`) instead of the
   constant; the error text names the expected architecture.
 - The manifest pattern, support name, new helper cache name and the
@@ -297,7 +304,7 @@ Every row of the verified §8 catalogue and every confirmed gap:
 | A2 | `targets.rs:115` | flip the assertion (D1, phase 3) |
 | A3 | `update.rs:761,837,1224` | no code change; selects by catalog (D1) |
 | A4 | `archive.rs:65-66,256,275` | no code change; selects by catalog (D1) |
-| A5 | `consts::ARCH` behavior | out of scope: migration is Open Question 1; emulated x64 keeps x64 |
+| A5 | `consts::ARCH` behavior | out of scope: migration is a follow-on change (Open Question 1, lead ruling 3); emulated x64 keeps x64 |
 | A6 | `install.ps1:626` | `IsWow64Process2` native machine (D2) |
 | A7 | 32-bit process | still rejected by `Is64BitProcess`; documented (D2) |
 | A8 | `install.ps1:627-628` | default native target; explicit mismatch rejected (D2) |
@@ -400,8 +407,10 @@ Rules, in order:
   (`verify-staged-windows` before PR5), PR5's per-OS install/update job log
   and the CI acceptance log carry the evidence. No new receipt file: the staged
   check has none today and the published verifier does not run the previous
-  updater. Whether a future staged receipt carries the decision as a field is a
-  designer default (log line only) awaiting lead confirmation (Open Question 2).
+  updater. The evidence surface is confirmed by lead ruling 6 (kuru-implement-phase2-sep26a, 2026-09-26)
+  (Open Question 2): a job-log line plus the two unit-tested branches
+  (`Release` and `None`), with no receipt field; "no stable older release at
+  all" stays a distinct error (rule 4).
 - The rule cannot be a workflow `if:` (`release_workflow.rs` forbids it in
   `verify-staged-windows`; the post-PR5 `verify-staged` assertions are pending
   the PR5 notice), which is why it lives here.
@@ -463,7 +472,7 @@ line is the acceptance evidence to look for in the job log.
 | Tool | On arm64 | Action |
 |---|---|---|
 | rust 1.98.1, llvm-tools-preview | native | none |
-| cargo-llvm-cov 0.9.1 | built from source for arm64 through the `cargo:` backend; installation works, but instrumented collection has an open upstream defect: rust-lang/rust#150123 (open, label `O-aarch64-pc-windows-msvc`, filed 2025-12-18 against nightly 1.94.0 `f794a0873`, last updated 2025-12-19, no comments) reports `llvm-profdata merge` failing with "malformed instrumentation profile data: symbol name is empty"; not yet checked on the pinned 1.98.1 | step zero runs an instrumented smoke test including the issue's `llvm-profdata merge -sparse` step and records its stderr; a reproduction invokes Open Question 7 before any arm64 coverage job is wired |
+| cargo-llvm-cov 0.9.1 | built from source for arm64 through the `cargo:` backend; installation works, but instrumented collection has an open upstream defect: rust-lang/rust#150123 (open, label `O-aarch64-pc-windows-msvc`, filed 2025-12-18 against nightly 1.94.0 `f794a0873`, last updated 2025-12-19, no comments) reports `llvm-profdata merge` failing with "malformed instrumentation profile data: symbol name is empty"; not yet checked on the pinned 1.98.1 | step zero runs an instrumented smoke test including the issue's `llvm-profdata merge -sparse` step and records its stderr as the pinned toolchain's state; per lead ruling 1 (Open Question 7, decided 2026-09-26) arm64 runs the same shard suites uninstrumented as separately named behavioral evidence, never counted toward the 90% gate, and instrumented arm64 shards are held until a pinned toolchain carries the upstream fix |
 | mise 2026.9.4, mise-action v4.3.0 | native | none |
 | mr-boxington 1.17.0 | native asset; CI sets `KURU_MBX=0` | lock entry for maintainers |
 | hk 1.58.1 | native; CI sets `MISE_NO_HOOKS=1` | lock entry |
@@ -517,6 +526,14 @@ removing the test from the shard's package list (not a named exclusion, and the
 package must stay in `SHARDS`, which is test-bound to the workflow matrix) and
 `#[cfg_attr(target_arch = "aarch64", ignore)]` (a silent skip with no receipt).
 
+Lead ruling 5 (kuru-implement-phase2-sep26a, 2026-09-26) accepts this mechanism on one condition: the
+exclusion applies only while the arm64 job actually has no runnable cospec after
+the emulated x64 asset (the `asset_pattern` pin above, lead decision 1) has been
+tried first. If cospec runs there, nothing is excluded and `EXCLUDED_ARTIFACTS`
+carries no arm64 entry. Every arm64 shard receipt records which case applied:
+the `cospec_contract` exclusion with its reason, or that cospec ran under
+emulation and nothing was excluded.
+
 ### 8. CI job mirror for `windows-11-arm` (design only; edits in phase 3)
 
 The PR6a owner reviews this wiring before task 3.4 edits any workflow (lead
@@ -541,8 +558,9 @@ native machine under `powershell.exe` 5.1 and `pwsh`; `$PSVersionTable`;
 `dumpbin.exe` paths; `rustc --print host-tuple` after mise; `cospec --version`
 and `cog --version` under emulation; whether an x64 PowerShell host (for
 example x64 `pwsh`) can be launched, for the emulated-process bootstrap case in D2; and a
-`cargo llvm-cov` instrumented smoke test, since every memory, cleanup and
-terminal check runs under instrumentation. It confirms stock PowerShell 5.1 is native
+`cargo llvm-cov` instrumented smoke test recording whether the pinned toolchain
+carries the rust-lang/rust#150123 fix (per lead ruling 1 the arm64 suites run
+uninstrumented until one does). It confirms stock PowerShell 5.1 is native
 ARM64 before the bootstrap is trusted on that assumption.
 
 | x64 job | arm64 twin | Parameters | Aggregation |
@@ -567,6 +585,14 @@ budget is measured on the first run before any change, and a fifth-or-more
 shard needs a `SHARDS` code change first. `windows-11-arm` is GA for public
 repositories and the repository is public; minutes are billed at the Arm rate
 only for private repositories.
+
+Per lead ruling 1 (Open Question 7), until a pinned toolchain carries the
+rust-lang/rust#150123 fix, the arm64 legs of `native-platform` and the shard
+job run the same test suites uninstrumented; the instrumented arm64 shards and
+the arm64 `native-platform` coverage upload are held. Those runs are named
+separately in their receipts as arm64 behavioral evidence and never contribute
+to or satisfy the 90% gate, which the instrumented x64 and Unix runs keep
+enforcing.
 
 ### 9. Documentation and the support-claim rule
 
@@ -640,9 +666,9 @@ publishing.
 
 | Native check (AGENTS.md) | Evidence on `windows-11-arm` |
 |---|---|
-| memory | `coverage:shard` shards `memory` and `runtime` (post-PR4b five-shard matrix) pass with the PR6a engine imported offline; `test:embedded-runtime` cold offline conversation |
-| process cleanup | `native-platform` arm64 leg (90% platform coverage) and the `connectors-core-platform` shard's owned-process and supervisor tests |
-| terminal | the `application` shard's ConPTY tests |
+| memory | `coverage:shard` shards `memory` and `runtime` (post-PR4b five-shard matrix, uninstrumented per lead ruling 1) pass with the PR6a engine imported offline; `test:embedded-runtime` cold offline conversation |
+| process cleanup | `native-platform` arm64 leg (uninstrumented per lead ruling 1; the 90% platform gate stays with the instrumented x64 and Unix runs) and the `connectors-core-platform` shard's owned-process and supervisor tests |
+| terminal | the `application` shard's ConPTY tests (uninstrumented per lead ruling 1) |
 | installation | the per-OS install/update job: `mise run install` (source), `bundle:verify-native-build`, `verify:windows-imports`, plus the bootstrap tests in the `delivery-archive` shard |
 | update | the per-OS install/update job's `test:embedded-runtime` (`packaged_install_and_update_preserve_complete_offline_memory`) and PR5's `test:previous-release-update` in ordinary CI on the branch (the `no predecessor` branch until a release carries the target) |
 | staged acceptance (release-time, after merge) | `verify-staged` `{windows-11-arm, aarch64-pc-windows-msvc}` green on the first maintainer-authorized Release run, with the predecessor decision in its log; gates `deploy-docs` and promotion |
@@ -705,7 +731,11 @@ tools; `dumpbin` is a build-time acceptance dependency only.
   `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline`.
 - Coverage receipts: shard receipts may carry `excluded_artifacts`
   (`[{artifact, reason}]`) only when the contingency in D7 is active; the
-  collector reconciles it against the inventory and the report shows it.
+  collector reconciles it against the inventory and the report shows it. Per
+  lead ruling 5, every arm64 shard receipt records which D7 case applied
+  (exclusion with reason, or cospec ran and nothing was excluded). Per lead
+  ruling 1, arm64 shard receipts identify uninstrumented behavioral runs that
+  never count toward the 90% gate.
 
 ## Risks / Trade-offs
 
@@ -715,9 +745,12 @@ tools; `dumpbin` is a build-time acceptance dependency only.
   the .NET 4.8.1 reason.
 - [The x64 cospec asset fails under emulation] → the named, receipt-recorded
   exclusion mechanism in D7 is designed now so the fallback is a small diff, not
-  a redesign; the reason is written in the receipt and the docs.
+  a redesign; the reason is written in the receipt and the docs. Per lead
+  ruling 5 it applies only while cospec cannot run after the emulated x64 asset
+  is tried first.
 - [Emulated x64 installations on Arm keep updating x64] → deliberate (D1),
-  documented in `install.md`; migration is Open Question 1.
+  documented in `install.md`; migration is a follow-on change (Open Question
+  1, lead ruling 3).
 - [Adding the catalog entry before the workflows breaks release assembly] →
   D10 makes the entry and the workflow legs one commit; phase 2 never touches
   the catalog.
@@ -735,10 +768,12 @@ tools; `dumpbin` is a build-time acceptance dependency only.
   install root; step zero records the image version and Visual Studio edition,
   and the README is re-read when phase 3 starts.
 - [rust-lang/rust#150123 breaks instrumented coverage on
-  `aarch64-pc-windows-msvc`] → step zero reproduces the issue's
-  `llvm-profdata merge` step on the pinned toolchain before any arm64 coverage
-  job is wired; a reproduction is resolved by Open Question 7, never by
-  substituting an uninstrumented run inside the coverage gate.
+  `aarch64-pc-windows-msvc`] → decided by lead ruling 1 (Open Question 7):
+  arm64 runs the same shard suites uninstrumented as separately named
+  behavioral evidence outside the 90% gate, and instrumented arm64 shards are
+  held until a pinned toolchain carries the fix; step zero records the issue's
+  `llvm-profdata merge` step on the pinned toolchain; an uninstrumented run
+  never reports or satisfies coverage.
 - [`SHA256SUMS` cross-check adds one small download per published release on a
   first release] → bounded to 64 KiB each on immutable paths, authenticated
   against listed digests; only on the no-predecessor path.
@@ -752,22 +787,34 @@ tools; `dumpbin` is a build-time acceptance dependency only.
 
 ## Open Questions
 
-1. Migration of an x64 `kuru.exe` running emulated on Arm hardware to the arm64
-   target (design note Q3). Deferrable: it changes no spec, task or approach here;
-   `kuru update` keeps the installed executable's target until a separate change
-   decides.
-2. Designer default, needs lead confirmation: the predecessor decision is
-   evidenced by a log line only, not a field in a future staged-acceptance
-   receipt (D5).
+1. Resolved 2026-09-26 by lead ruling 3 (kuru-implement-phase2-sep26a): "Yes: an x64
+   kuru.exe under emulation keeps self-updating to x64; migration is a separate
+   change (add it to tmp/roadmap/dx-followons.md)." Migration of an x64
+   `kuru.exe` running emulated on Arm hardware to the arm64 target (design note
+   Q3) is a separate follow-on change, recorded in the shared follow-ons list;
+   `kuru update` keeps the installed executable's target (D1).
+2. Resolved 2026-09-26 by lead ruling 6 (kuru-implement-phase2-sep26a): "Yes, a job-log line
+   plus the two unit-tested branches; "no stable older release at all" stays a
+   distinct error." (Was: designer default, needs lead confirmation, that the
+   predecessor decision is evidenced by a log line only, not a field in a
+   future staged-acceptance receipt.) Applied in D5.
 3. Needs lead confirmation: lead decision 4 says PR6a is "merged before PR6b
    starts"; this change runs phase 2 before PR6a merges and treats PR6a as soft
    for `cospec apply` but hard for phase 3 and archive (blocking-changes Phase
-   Gates). Blocks the start of phase 2.
-4. Designer default, needs lead confirmation: an explicit `-Target` that differs
-   from the native machine is rejected, including an explicit x64 install on
-   Arm (D2).
-5. Designer default, needs lead confirmation: Windows 11 is the Arm floor
-   (.NET Framework 4.8.1 native Arm64); Windows 10 on Arm is out of scope.
+   Gates). Blocks the start of phase 2. Not addressed by the 2026-09-26
+   rulings; lead ruling 7 (a verification draft PR later rebased onto PR6a's
+   branch) presupposes phase 2 work before PR6a exists, but this question
+   stays open until the lead answers it.
+4. Resolved 2026-09-26 by lead ruling 2 (kuru-implement-phase2-sep26a): "Reject an explicit
+   -Target that mismatches the native machine, with a message that names the
+   native target." (Was: designer default, needs lead confirmation, that an
+   explicit `-Target` differing from the native machine is rejected, including
+   an explicit x64 install on Arm.) Applied in D2 and the native-windows spec
+   delta.
+5. Resolved 2026-09-26 by lead ruling 4 (kuru-implement-phase2-sep26a): "Yes: Windows 11 floor
+   for Arm only; x64 keeps Windows 10 1809." (Was: designer default, needs lead
+   confirmation, that Windows 11 is the Arm floor because of .NET Framework
+   4.8.1 native Arm64; Windows 10 on Arm is out of scope.)
 6. Resolved 2026-09-26 by the workflow owner's confirmed PR5 shape (was:
    designer default, needs lead confirmation, that release-time Windows
    coverage stays staged/published-only for both architectures). PR5 removes
@@ -776,17 +823,19 @@ tools; `dumpbin` is a build-time acceptance dependency only.
    release-time evidence to the `verify-staged` Windows legs and
    `verify-published-windows`; Unix gains the interim staged leg. The default
    stands for both architectures (D8 caveats) and no lead answer is needed.
-7. Needs lead decision if step zero reproduces rust-lang/rust#150123 on the
-   pinned Rust 1.98.1; blocks phase 3 in that case. D8, D11 and verification
-   rows 1.1 and 2.1 assume instrumented coverage works on arm64. Options: (a)
-   keep the arm64 `coverage:shard` shards, collect and the `native-platform`
-   arm64 leg instrumented and hold the support claim until a pinned toolchain
-   carries the upstream fix; or (b) run the same arm64 test selection
-   uninstrumented as separately named behavioral evidence for the memory,
-   cleanup and terminal checks, explicitly outside the 90% gate that x64 and
-   Ubuntu keep enforcing. Recommended fallback: (b), recorded as a named
-   host-keyed decision in the receipts like the D7 contingency; AGENTS.md's
-   "never substitute an uninstrumented executable to make a coverage run pass"
-   means (b) must never report or satisfy coverage, only behavior. If step zero
-   does not reproduce the defect, the question closes with the recorded
-   evidence.
+7. Decided 2026-09-26 by lead ruling 1 (kuru-implement-phase2-sep26a): "[b] accepted:
+   uninstrumented arm64 runs of the SAME shard suites (not a subset) are the
+   behavioral evidence for memory, cleanup, terminal, install and update; they
+   are named separately in the receipts and never counted toward the 90%
+   gate. Hold instrumented arm64 shards until a pinned toolchain has the
+   llvm-profdata fix; record the upstream issue number in docs and the
+   follow-ons file." The arm64 legs run the same shard suites as x64 and Unix,
+   uninstrumented, as separately named behavioral evidence (D8 caveats, D11);
+   they never report or satisfy coverage, so AGENTS.md's rule against
+   substituting an uninstrumented executable in a coverage run holds, and x64
+   and Ubuntu keep enforcing the 90% gate. Instrumented arm64 shards (and the
+   arm64 `native-platform` coverage upload, which uses the same
+   `llvm-profdata` path) are held until a pinned toolchain carries the fix for
+   rust-lang/rust#150123; step zero records the pinned toolchain's state. The
+   upstream issue number appears in the docs task (3.9) and in the shared
+   follow-ons list (`tmp/roadmap/dx-followons.md`).

@@ -33,6 +33,10 @@ on that architecture.
 - **WHEN** the PowerShell bootstrap runs on an Arm64 machine with `PROCESSOR_ARCHITECTURE` reporting `AMD64`
 - **THEN** it determines the native machine through the operating system rather than the environment, selects the `aarch64-pc-windows-msvc` archive and requires an ARM64 PE32+ executable, or fails closed when asked for a target that does not match the native machine.
 
+#### Scenario: Explicit target mismatch
+- **WHEN** the PowerShell bootstrap is given an explicit `-Target` that differs from the target of the host's native machine, including an x64 target on an Arm64 machine
+- **THEN** it fails closed before any download with a message that names the native machine's target, and installs nothing.
+
 #### Scenario: Emulated x64 installation updates
 - **WHEN** an installed x64 `kuru.exe` running under emulation on an Arm64 machine updates, or the bootstrap recovers its interrupted update
 - **THEN** the update installs the x64 target and recovery accepts the recorded x64 helper, without replacing the executable with one of a different machine type.
