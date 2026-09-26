@@ -21,8 +21,8 @@ npm = "npm:npm"
 # Cargo runs through mr-boxington's shared build cache unless KURU_MBX=0 (CI and
 # source installation) or on Intel macOS, which has no mbx release build.
 rust = { version = "1.98.1", mr_boxington = "{{ get_env(name='KURU_MBX', default='1') != '0' and not (os() == 'macos' and arch() == 'x64') }}" }
-mr-boxington = { version = "1.17.0", os = ["linux", "macos/arm64", "windows"] }
-"github:aligned-team/cospec" = "0.7.1"
+mr-boxington = { version = "1.18.0", os = ["linux", "macos/arm64", "windows"] }
+"github:aligned-team/cospec" = "0.8.2"
 "aqua:jdx/hk" = "1.58.1"
 "aqua:tamasfe/taplo" = "0.10.0"
 "aqua:koalaman/shellcheck" = "0.11.0"

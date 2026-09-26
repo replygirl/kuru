@@ -11,8 +11,8 @@ Each is licensed under either the MIT License or the Unlicense, at the user's
 option. The source distributions retain both license texts; Kuru preserves that
 choice and includes this notice with its connector source distribution.
 
-Kuru's offline input sizing embeds `tiktoken-rs` 0.12.0 from
-[zurawiki/tiktoken-rs](https://github.com/zurawiki/tiktoken-rs/tree/v0.12.0)
+Kuru's offline input sizing embeds `tiktoken-rs` 0.12.1 from
+[zurawiki/tiktoken-rs](https://github.com/zurawiki/tiktoken-rs/tree/v0.12.1)
 under the MIT License. Its embedded `o200k_base.tiktoken` asset matches the
 [OpenAI tiktoken](https://github.com/openai/tiktoken) public asset SHA-256
 `446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d`

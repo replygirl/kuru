@@ -41,7 +41,7 @@ The build job has `contents: read` and `pages: read`; only the deploy job receiv
 `pages: write` and `id-token: write`. There is no standalone Pages workflow.
 
 Release notes run on Ubuntu with the delivery package's task-scoped Cocogitto
-7.0.0 and Communiqué 1.3.5 pins. The latter has no Intel macOS release binary;
+7.0.0 and Communiqué 1.4.2 pins. The latter has no Intel macOS release binary;
 native archive build jobs use only the Rust packaging task, so all five Kuru
 targets remain buildable. Full maintainer tests and notes generation run on
 Linux, Apple Silicon macOS or Windows x86_64. App installation does not require these tools.
@@ -220,17 +220,19 @@ the check. The package task also remains available for manual diagnostics.
 ## Notes model and configuration
 
 `communique.toml` uses top-level `context` and `system_extra` plus `[defaults]`.
-The pinned tool is Communiqué 1.3.5. It uses `claude-sonnet-5` through
+The pinned tool is Communiqué 1.4.2. It uses `claude-sonnet-5` through
 Anthropic's official OpenAI-compatible endpoint. `provider = "openai"` selects
 the wire format; requests go directly to `https://api.anthropic.com/v1`, and the
 model and credentials remain Anthropic's. Only the notes step maps the existing
 `ANTHROPIC_API_KEY_COMMUNIQUE` secret to the adapter's `OPENAI_API_KEY` environment
 variable. No additional secret is needed.
 
-Communiqué's native Anthropic parser cannot yet deserialize Claude 5 thinking
-blocks. The compatibility response omits those blocks while retaining tool calls.
-Return to the native adapter when upstream supports the response shape and the
-integration checks pass. This compatibility route cannot configure an
+Communiqué 1.3.5's native Anthropic parser could not deserialize Claude 5
+thinking blocks; the compatibility response omits those blocks while retaining
+tool calls. Communiqué 1.4.0 added native replay of signed thinking blocks, and
+a delivery fixture shows the pinned native adapter now accepts a thinking
+response. Kuru keeps the compatibility route until multi-turn tool replay with
+signed thinking blocks is verified against the live API with the pinned model. This compatibility route cannot configure an
 `anthropic-workspace-id` header; use a key scoped to the intended workspace.
 
 Generation includes current product documentation from the exact selected commit.
@@ -251,8 +253,8 @@ the selected source, including defaults, provider identities and configuration
 persistence. A successful notes job is not evidence that every claim is accurate.
 
 Upstream contracts: [Cocogitto versioning](https://docs.cocogitto.io/guide/bump.html),
-[Communiqué configuration](https://github.com/jdx/communique/blob/v1.3.5/src/config.rs),
-[Communiqué OpenAI adapter](https://github.com/jdx/communique/blob/v1.3.5/src/providers/openai.rs),
+[Communiqué configuration](https://github.com/jdx/communique/blob/v1.4.2/src/config.rs),
+[Communiqué OpenAI adapter](https://github.com/jdx/communique/blob/v1.4.2/src/providers/openai.rs),
 [Anthropic API compatibility](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk),
 [Claude Sonnet 5 response changes](https://platform.claude.com/docs/en/models/sonnet-5/whats-new-sonnet-5).
 

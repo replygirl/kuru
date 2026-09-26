@@ -1,11 +1,11 @@
 ---
 name: cospec-new-change
-description: Scaffold a new change and show its typed artifact plan, then stop before authoring anything.
+description: Scaffold a new change and show its typed artifact plan, then stop before authoring anything. Also use when the user says "cospec new" or "openspec new".
 license: MIT
 compatibility: Requires the cospec CLI (@aligned-team/cospec).
 metadata:
   author: cospec
-  generatedBy: cospec@0.7.1
+  generatedBy: cospec@0.8.2
   contentHash: sha256:4039323d6aff19fdf3f07ef9ceab694b7ae8081e302f9cf857462d969bd4d31b
 ---
 

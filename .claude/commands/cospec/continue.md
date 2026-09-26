@@ -1,13 +1,13 @@
 ---
 name: "COSPEC: Continue"
-description: Resume a partially-built change and finish its remaining artifacts.
+description: Resume a partially-built change and finish its remaining artifacts. Also use when the user says "cospec continue" or "openspec continue".
 category: Workflow
 tags:
   - cospec
   - workflow
 metadata:
   author: cospec
-  generatedBy: cospec@0.7.1
+  generatedBy: cospec@0.8.2
   contentHash: sha256:2b7c61ad71a36a9dbe6e864a51a0c5e0ca2f115240ccb1abb1a38279e04869d4
 ---
 
