@@ -1,0 +1,6 @@
+## 1. Static pre-push hook
+
+- [x] 1.1 Remove the `coverage` step from the `hk.pkl` pre-push hook and verify with `hk validate` and a manual `hk run pre-push` that only static steps run
+- [x] 1.2 Update `AGENTS.md`, `docs/development.md` and `README.md` so pre-push is static and coverage with its 90% gate is enforced in CI, not in hooks, and verify with `format:code`, `lint:tooling`, `cospec:validate`, `cospec:managed:check` and `docs:check`
+
+Evidence (macOS arm64, 2026-09-26; artifacts authored, `validate --strict` passed and `apply --json` exited 0 with gate `clear` before any edit): `hk validate` exit 0; manual `hk run pre-push` ran only format, lint, typecheck, tooling, cospec, cospec-managed and docs, all passing in 178 s with no coverage output; after the final text edits the static chain above exited 0 and `git diff --check` was clean. Unrun: `mise run coverage` and `mise run test` were deliberately not run locally, since this change moves them to CI only; CI on the PR provides the behavioral suite and the 90% line gate. Concurrent mise postinstall `hk install --mise` runs printed `git config --unset-all` race warnings during the hook run without failing any step; that is existing behavior outside this change.

@@ -1,0 +1,8 @@
+## 1. Pre-push runs only static checks [critical]
+
+- [x] 1.1 @integration (agent) run `hk validate` in the worktree and read the `pre-push` steps in `hk.pkl` -> the configuration parses and the pre-push step set is exactly `format`, `lint`, `typecheck`, `tooling`, `cospec`, `cospec-managed` and `docs`, with no `coverage` step; `pre-commit` and `commit-msg` are unchanged. Observed: hk 1.58.1 `hk validate` reported `hk.pkl is valid` (exit 0); the pre-push block lists exactly those seven steps and the diff touches only the removed `coverage` step.
+- [x] 1.2 @e2e (agent) run `hk run pre-push` in the worktree, which is what the installed Git-config hook (`mise x -- hk run pre-push --from-hook`) executes from the worktree root -> hk reports only the static steps, all pass, and no instrumented coverage build starts. Observed on macOS arm64: hk printed `✔` for format, cospec-managed, cospec, tooling, docs, lint and typecheck, exit 0, 178 s wall clock; the log has no `coverage` or `llvm-cov` line. The actual `git push` hook run is additionally observed at push time and reported in the PR.
+
+## 2. Guidance matches the hooks
+
+- [x] 2.1 @integration (agent) run `mise run lint:tooling` and `mise run docs:check`, and grep `AGENTS.md`, `README.md` and `docs/development.md` for hook/coverage statements -> checks exit 0 and no current guidance claims hk runs coverage; historical records in `docs/verification.md` stay unchanged. Observed: after the final text edits `mise run format:code ::: lint:tooling ::: cospec:validate ::: cospec:managed:check ::: docs:check` exited 0 and `git diff --check` was clean; a repository grep for `pre-push` and hk leaves only the dated `docs/verification.md` records, which describe past runs at named commits.
