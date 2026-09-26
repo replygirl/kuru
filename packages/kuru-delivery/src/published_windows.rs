@@ -1331,8 +1331,8 @@ mod tests {
             manifest
                 .assets
                 .iter()
-                .any(|asset| asset["archive_sha256"] == "unpinned"),
-            "an unpinned built entry for another target is tolerated"
+                .any(|asset| asset["provenance"] == "built"),
+            "a built entry for another target is tolerated"
         );
         let mut legacy: EngineManifest =
             serde_json::from_str(include_str!("../../kuru-memory/support/dolt-assets.json"))

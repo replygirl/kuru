@@ -315,6 +315,27 @@ fn parse_error(value: &Value) -> String {
         .unwrap_or_else(|error| format!("{error:#}"))
 }
 
+/// The committed manifest with the built archive returned to its unpinned
+/// round-one state (notice pins kept), as the two-round pinning flow begins.
+fn unpinned_built(valid: &Value) -> Value {
+    let mut unpinned = valid.clone();
+    let asset = &mut unpinned["assets"][BUILT];
+    for (field, sentinel) in [
+        ("compressed_bytes", Value::Null),
+        ("archive_sha256", json!("unpinned")),
+        ("expanded_bytes", Value::Null),
+        ("executable_bytes", Value::Null),
+        ("executable_sha256", json!("unpinned")),
+    ] {
+        asset[field] = sentinel;
+    }
+    for index in [1, 2] {
+        asset["notices"][index]["bytes"] = Value::Null;
+        asset["notices"][index]["sha256"] = json!("unpinned");
+    }
+    unpinned
+}
+
 /// Pin the built entry with synthetic values that satisfy the zip size rule.
 fn pinned_built(valid: &Value) -> Value {
     let mut pinned = valid.clone();
@@ -338,7 +359,7 @@ fn pinned_built(valid: &Value) -> Value {
 }
 
 #[test]
-fn committed_manifest_is_schema_two_with_one_unpinned_built_entry() {
+fn committed_manifest_is_schema_two_with_one_pinned_built_entry() {
     let manifest = Manifest::parse(MANIFEST).unwrap();
     assert_eq!(manifest.schema_version, 2);
     let built: Vec<_> = manifest
@@ -363,6 +384,16 @@ fn committed_manifest_is_schema_two_with_one_unpinned_built_entry() {
     );
     assert_eq!(asset.notices()[0].from, NoticeSource::Icu);
     assert_eq!(asset.notices()[1].from, NoticeSource::LlvmMingw);
+    // The pins observed by the reproducible linux-x64 CI build.
+    let pins = asset.pins().unwrap();
+    assert_eq!(pins.compressed_bytes, 40_719_091);
+    assert_eq!(
+        pins.archive_sha256,
+        "d179856838fd8d1d2105c29c4948cc7eb3c8b78ca7e387be4cdfc854ea3bb73c"
+    );
+    assert!(asset.notices().iter().all(|notice| notice.bytes.is_some()));
+    let generated = manifest.catalog("aarch64-pc-windows-msvc").unwrap();
+    assert!(generated.contains("pub(crate) const ASSETS: [Asset<'static>; 5]"));
     for upstream in manifest
         .assets
         .iter()
@@ -377,7 +408,9 @@ fn committed_manifest_is_schema_two_with_one_unpinned_built_entry() {
 fn unpinned_built_asset_is_refused_as_an_input_without_affecting_other_targets() {
     let temporary = tempfile::tempdir().unwrap();
     let directory = temporary.path().canonicalize().unwrap();
-    let manifest = Manifest::parse(MANIFEST).unwrap();
+    let valid: Value = serde_json::from_slice(MANIFEST).unwrap();
+    let unpinned = serde_json::to_vec(&unpinned_built(&valid)).unwrap();
+    let manifest = Manifest::parse(&unpinned).unwrap();
     let asset = manifest.select("aarch64-pc-windows-msvc").unwrap();
     let instruction = "not yet pinned: run `mise run //packages/kuru-memory:bundle:build -- --target aarch64-pc-windows-msvc --print-pins` on linux-x64 and commit the pins";
     for error in [
@@ -436,7 +469,8 @@ fn pinned_built_asset_is_catalogued_with_its_notices() {
 
 #[test]
 fn schema_two_provenance_build_and_notice_rules_fail_closed() {
-    let valid: Value = serde_json::from_slice(MANIFEST).unwrap();
+    let committed: Value = serde_json::from_slice(MANIFEST).unwrap();
+    let valid = unpinned_built(&committed);
     let upstream_url = valid["assets"][3]["url"].clone();
     let build = valid["assets"][BUILT]["build"].clone();
     let notices = valid["assets"][BUILT]["notices"].clone();

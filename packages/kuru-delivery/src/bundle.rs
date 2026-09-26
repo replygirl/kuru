@@ -1246,17 +1246,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_targets_fetch_only_their_own_archive_beside_an_unpinned_built_entry() {
+    async fn upstream_targets_fetch_only_their_own_archive_beside_the_built_entry() {
         let committed = include_bytes!("../../kuru-memory/support/dolt-assets.json");
         let parsed = parse_manifest(committed).unwrap();
         let built = parsed.select("aarch64-pc-windows-msvc").unwrap();
         assert_eq!(built.provenance, Provenance::Built);
-        assert!(!built.archive_pinned());
+        assert!(built.archive_pinned());
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("dolt-assets.json");
         fs::write(&path, committed).unwrap();
+        // The committed pinned entry resolves as a built input with no URL.
+        let asset = manifest(&path, "aarch64-pc-windows-msvc").unwrap();
+        assert!(asset.built && asset.url.is_empty());
+        // Its unpinned round-one form is refused before any work.
+        let mut unpinned: serde_json::Value = serde_json::from_slice(committed).unwrap();
+        let entry = &mut unpinned["assets"][5];
+        assert_eq!(entry["target"], "aarch64-pc-windows-msvc");
+        for (field, sentinel) in [
+            ("compressed_bytes", serde_json::Value::Null),
+            ("archive_sha256", serde_json::json!(UNPINNED)),
+            ("expanded_bytes", serde_json::Value::Null),
+            ("executable_bytes", serde_json::Value::Null),
+            ("executable_sha256", serde_json::json!(UNPINNED)),
+        ] {
+            entry[field] = sentinel;
+        }
+        let unpinned_path = root.path().join("unpinned-assets.json");
+        fs::write(&unpinned_path, serde_json::to_vec(&unpinned).unwrap()).unwrap();
         assert!(
-            manifest(&path, "aarch64-pc-windows-msvc")
+            manifest(&unpinned_path, "aarch64-pc-windows-msvc")
                 .unwrap_err()
                 .to_string()
                 .contains("not yet pinned")

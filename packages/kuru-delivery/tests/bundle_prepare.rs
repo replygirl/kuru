@@ -451,7 +451,8 @@ async fn host_sentinel_selects_only_the_declared_host_archive() {
 const BUILT: &str = "aarch64-pc-windows-msvc";
 
 /// The committed built entry, re-pinned to fixture bytes whose license and
-/// notice sizes satisfy the built zip rule against this fixture's upstreams.
+/// notice sizes satisfy the built zip rule against this fixture's upstreams,
+/// or returned to its unpinned round-one archive state.
 fn built_asset(bytes: &[u8], pinned: bool) -> Value {
     let committed: Value =
         serde_json::from_str(include_str!("../../kuru-memory/support/dolt-assets.json")).unwrap();
@@ -476,6 +477,16 @@ fn built_asset(bytes: &[u8], pinned: bool) -> Value {
         asset["executable_bytes"] = json!(60);
         asset["executable_sha256"] = json!("b".repeat(64));
         asset["expanded_bytes"] = json!(60 + 20 + 30);
+    } else {
+        for (field, sentinel) in [
+            ("compressed_bytes", Value::Null),
+            ("archive_sha256", json!("unpinned")),
+            ("expanded_bytes", Value::Null),
+            ("executable_bytes", Value::Null),
+            ("executable_sha256", json!("unpinned")),
+        ] {
+            asset[field] = sentinel;
+        }
     }
     asset
 }

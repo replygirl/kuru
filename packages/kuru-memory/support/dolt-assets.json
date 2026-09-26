@@ -103,11 +103,11 @@
           }
         }
       },
-      "compressed_bytes": null,
-      "archive_sha256": "unpinned",
-      "expanded_bytes": null,
-      "executable_bytes": null,
-      "executable_sha256": "unpinned",
+      "compressed_bytes": 40719091,
+      "archive_sha256": "d179856838fd8d1d2105c29c4948cc7eb3c8b78ca7e387be4cdfc854ea3bb73c",
+      "expanded_bytes": 119410801,
+      "executable_bytes": 118142976,
+      "executable_sha256": "09e39a490f2ed33450ba5f5929cbdcd009ba01a958f94eef8453fe66642bef6b",
       "license_bytes": 1212811,
       "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386",
       "notices": [
@@ -122,15 +122,15 @@
           "name": "LICENSE-LLVM",
           "from": "llvm_mingw",
           "path": "LICENSE.TXT",
-          "bytes": null,
-          "sha256": "unpinned"
+          "bytes": 15141,
+          "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
         },
         {
           "name": "LICENSE-MINGW-W64-RUNTIME",
           "from": "llvm_mingw",
           "path": "aarch64-w64-mingw32/share/mingw32/COPYING.MinGW-w64-runtime.txt",
-          "bytes": null,
-          "sha256": "unpinned"
+          "bytes": 12155,
+          "sha256": "1db8da07b436c68833c0673ffee3d9fcb2526047f3820b81661865dfedc79a1f"
         }
       ]
     }

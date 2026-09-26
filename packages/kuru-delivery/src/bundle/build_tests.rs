@@ -110,7 +110,8 @@ fn digest(bytes: &[u8]) -> String {
     crate::archive::digest(bytes)
 }
 
-/// The committed manifest, re-pinned to fixture license, ICU and notice bytes.
+/// The committed manifest, re-pinned to fixture license, ICU and notice bytes,
+/// with the built archive returned to its unpinned round-one state.
 fn manifest(icu: &[u8]) -> Value {
     let mut manifest: Value = serde_json::from_str(include_str!(
         "../../../kuru-memory/support/dolt-assets.json"
@@ -130,6 +131,15 @@ fn manifest(icu: &[u8]) -> Value {
     {
         built["notices"][index]["bytes"] = json!(bytes.len());
         built["notices"][index]["sha256"] = json!(digest(bytes));
+    }
+    for (field, sentinel) in [
+        ("compressed_bytes", Value::Null),
+        ("archive_sha256", json!("unpinned")),
+        ("expanded_bytes", Value::Null),
+        ("executable_bytes", Value::Null),
+        ("executable_sha256", json!("unpinned")),
+    ] {
+        built[field] = sentinel;
     }
     manifest
 }
