@@ -39,7 +39,26 @@ fn invocation_start() -> kuru_core::InvocationStart {
         actor_id: "actor".into(),
         route: "responses".into(),
         model: "model".into(),
-        price_at_invocation: None,
+        price_at_invocation: Some(kuru_core::PriceSchedule {
+            basis: kuru_core::PriceBasis::ApiStandard {
+                api_model: "model".into(),
+            },
+            source: kuru_core::SourceCitation {
+                url: "https://example.invalid/pricing".into(),
+                checked_on: "2026-09-25".into(),
+            },
+            input_per_million_usd: "1".into(),
+            cached_input_per_million_usd: Some("0.1".into()),
+            output_per_million_usd: "2".into(),
+            long_context_tier: Some(kuru_core::LongContextTier {
+                input_tokens_over: 1,
+                input_multiplier: "2".into(),
+                cached_input_multiplier: "2".into(),
+                output_multiplier: "2".into(),
+            }),
+            cache_write: Some(kuru_core::CacheWriteTerms::PerMillionUsd { value: "1".into() }),
+            promotional_available_at_least_through: Some("2026-12-31".into()),
+        }),
     }
 }
 
@@ -565,10 +584,13 @@ fn attachment_resources_include_the_dream_lease_but_handles_do_not() -> Result<(
 // Protocol pin
 // ---------------------------------------------------------------------------
 
-const PROTOCOL_SURFACE: &str = include_str!("protocol-surface.txt");
 const PROTOCOL_SURFACE_PATH: &str = "packages/kuru-memory/src/service/rpc/protocol-surface.txt";
 const BLESS_PROTOCOL_PIN: &str = "KURU_BLESS_PROTOCOL_PIN";
 const UNKNOWN_VARIANT: &str = "__kuru_protocol_pin_unknown_variant__";
+
+fn protocol_surface_file() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/service/rpc/protocol-surface.txt")
+}
 
 /// The derive's own variant list, read from serde's unknown-variant refusal,
 /// so a variant without a sample cannot go unnoticed.
@@ -599,6 +621,7 @@ fn unknown_adjacent(tag: &str) -> Value {
     json!({ tag: UNKNOWN_VARIANT, "value": null })
 }
 
+/// Unit and externally tagged enums both identify the variant first.
 fn unknown_unit() -> Value {
     Value::String(UNKNOWN_VARIANT.into())
 }
@@ -663,8 +686,24 @@ fn wire_enums() -> Result<Vec<(&'static str, Vec<String>)>> {
             serde_variants::<InvocationOutcome>("InvocationOutcome", unknown_unit())?,
         ),
         (
+            "price_basis",
+            serde_variants::<kuru_core::PriceBasis>("PriceBasis", unknown_unit())?,
+        ),
+        (
+            "cache_write_terms",
+            serde_variants::<kuru_core::CacheWriteTerms>("CacheWriteTerms", unknown_unit())?,
+        ),
+        (
             "usage_proof",
             serde_variants::<UsageProof>("UsageProof", unknown_tag("kind"))?,
+        ),
+        (
+            // Private to store/export.rs; probed through its cursor carrier.
+            "export_phase",
+            serde_variants::<ExportCursor>(
+                "ExportCursor.phase",
+                json!({"snapshot": HANDLE, "phase": { UNKNOWN_VARIANT: null }}),
+            )?,
         ),
         (
             "service_response",
@@ -714,6 +753,137 @@ fn wire_enums() -> Result<Vec<(&'static str, Vec<String>)>> {
     ])
 }
 
+/// One sample per `ContentBlock` variant: messages are the busiest payload.
+fn content_block_samples() -> Vec<kuru_core::ContentBlock> {
+    use kuru_core::ContentBlock;
+    vec![
+        ContentBlock::Text {
+            text: "hello".into(),
+        },
+        ContentBlock::ToolUse {
+            id: "call".into(),
+            name: "tool".into(),
+            arguments: json!({"path": "file"}),
+        },
+        ContentBlock::ToolResult {
+            call_id: "call".into(),
+            output: json!({"ok": true}),
+            is_error: false,
+        },
+        ContentBlock::ReasoningSummary {
+            text: "summary".into(),
+        },
+        ContentBlock::Image {
+            media_type: "image/png".into(),
+            data_base64: "AA==".into(),
+        },
+        ContentBlock::CacheBoundary {
+            kind: "prefix".into(),
+        },
+    ]
+}
+
+fn session_turn_checkpoint_samples() -> Vec<crate::SessionTurnCheckpoint> {
+    use crate::SessionTurnCheckpoint;
+    vec![
+        SessionTurnCheckpoint::Admit {
+            expected_generation: 0,
+            turn_id: "turn".into(),
+            label: Some("label".into()),
+            expected_transcript_rows: Some(0),
+        },
+        SessionTurnCheckpoint::MarkRetryableInterruption {
+            expected_generation: 0,
+            turn_id: "turn".into(),
+            speaker_id: "speaker".into(),
+        },
+        SessionTurnCheckpoint::Resume {
+            expected_generation: 0,
+            turn_id: "turn".into(),
+            legacy: Some(crate::store::LegacySessionTurnResume {
+                legacy_prefix: crate::store::LegacyTranscriptPrefix {
+                    namespace: "transcript".into(),
+                    source_session_id: "session".into(),
+                    source_revision: "revision".into(),
+                    first_sequence: 1,
+                    through_sequence: 2,
+                    row_count: 2,
+                    record_format: crate::store::LEGACY_PREFIX_RECORD_FORMAT.into(),
+                },
+                journal_key: "journal".into(),
+                expected_journal: json!({"turn": "turn"}),
+            }),
+        },
+        SessionTurnCheckpoint::Settle {
+            expected_generation: 0,
+            turn_id: "turn".into(),
+            settlement: crate::store::PublicTurnSettlement::Completed,
+            speaker_id: "speaker".into(),
+        },
+    ]
+}
+
+fn public_transcript_position_samples() -> Vec<crate::store::PublicTranscriptPosition> {
+    use crate::store::PublicTranscriptPosition;
+    vec![
+        PublicTranscriptPosition::Turn {
+            node_id: "node".into(),
+        },
+        PublicTranscriptPosition::Legacy { sequence: 1 },
+    ]
+}
+
+/// The real proofs of every mutating ledger sample, plus none for reads.
+fn usage_proof_samples() -> Result<Vec<UsageProof>> {
+    let mut proofs = Vec::new();
+    for operation in ledger_operation_samples() {
+        proofs.extend(operation.proof()?);
+    }
+    Ok(proofs)
+}
+
+fn price_basis_samples() -> Vec<kuru_core::PriceBasis> {
+    vec![
+        kuru_core::PriceBasis::ApiStandard {
+            api_model: "model".into(),
+        },
+        kuru_core::PriceBasis::ApiEquivalent {
+            api_model: "model".into(),
+        },
+    ]
+}
+
+fn cache_write_terms_samples() -> Vec<kuru_core::CacheWriteTerms> {
+    vec![
+        kuru_core::CacheWriteTerms::PerMillionUsd { value: "1".into() },
+        kuru_core::CacheWriteTerms::InputMultiplier { value: "1".into() },
+    ]
+}
+
+/// Every export cursor phase, populated. `Phase` is private, so each sample is
+/// the cursor's wire JSON and must decode before it is pinned.
+fn export_phase_samples() -> Result<Vec<Value>> {
+    let bytes = json!([1, 2]);
+    [
+        json!({"Messages": 1}),
+        json!({"State": bytes}),
+        json!({"ContextSummaries": "summary"}),
+        json!({"ContextCursors": [bytes, bytes, bytes]}),
+        json!({"SessionCatalog": bytes}),
+        json!({"PublicTurns": "turn"}),
+    ]
+    .into_iter()
+    .map(|phase| {
+        let cursor: ExportCursor =
+            serde_json::from_value(json!({"snapshot": HANDLE, "phase": phase}))?;
+        serde_json::to_value(cursor)?
+            .get("phase")
+            .cloned()
+            .context("export cursor lost its phase")
+    })
+    .collect()
+}
+
 /// JSON structure with leaf values replaced by their types and object keys
 /// sorted. Arrays list each distinct element shape once.
 fn shape(value: &Value) -> String {
@@ -743,29 +913,54 @@ fn shape(value: &Value) -> String {
     }
 }
 
-/// `<tag> <shape without the tag>` for one internally tagged sample.
-fn tagged_shape(value: &impl Serialize, key: &str) -> Result<(String, String)> {
-    let mut encoded = serde_json::to_value(value)?;
-    let fields = encoded
-        .as_object_mut()
-        .context("tagged sample is not an object")?;
-    let tag = fields
-        .remove(key)
-        .and_then(|tag| tag.as_str().map(str::to_owned))
-        .with_context(|| format!("sample has no `{key}` tag"))?;
-    Ok((tag, shape(&encoded)))
+/// `(tag, shape without the tag)` for internally tagged samples.
+fn internal(samples: &[impl Serialize], key: &str) -> Result<Vec<(String, String)>> {
+    samples
+        .iter()
+        .map(|sample| {
+            let mut encoded = serde_json::to_value(sample)?;
+            let fields = encoded
+                .as_object_mut()
+                .context("tagged sample is not an object")?;
+            let tag = fields
+                .remove(key)
+                .and_then(|tag| tag.as_str().map(str::to_owned))
+                .with_context(|| format!("sample has no `{key}` tag"))?;
+            Ok((tag, shape(&encoded)))
+        })
+        .collect()
+}
+
+/// `(tag, content shape)` for externally tagged samples: `{tag: content}`.
+fn external(samples: Vec<Value>) -> Result<Vec<(String, String)>> {
+    samples
+        .into_iter()
+        .map(|sample| {
+            let fields = sample
+                .as_object()
+                .filter(|fields| fields.len() == 1)
+                .with_context(|| format!("externally tagged sample is not one-keyed: {sample}"))?;
+            let (tag, content) = fields.iter().next().context("empty sample")?;
+            Ok((tag.clone(), shape(content)))
+        })
+        .collect()
+}
+
+fn values_of(samples: &[impl Serialize]) -> Result<Vec<Value>> {
+    samples
+        .iter()
+        .map(|sample| Ok(serde_json::to_value(sample)?))
+        .collect()
 }
 
 fn sampled(
     name: &str,
-    key: &str,
-    samples: &[impl Serialize],
+    shapes: Vec<(String, String)>,
     variants: &[String],
     lines: &mut Vec<String>,
 ) -> Result<()> {
     let mut tags = Vec::new();
-    for sample in samples {
-        let (tag, shape) = tagged_shape(sample, key)?;
+    for (tag, shape) in shapes {
         lines.push(format!("sample {name}.{tag} {shape}"));
         tags.push(tag);
     }
@@ -791,34 +986,43 @@ fn wire_surface() -> Result<String> {
     let mut lines = vec![
         "# Memory service wire surface, generated by service::rpc::contract_tests.".to_owned(),
         "# Do not edit by hand; see docs/development.md, \"Memory service protocol\".".to_owned(),
-        format!("protocol {}.{}", PROTOCOL_MAJOR, PROTOCOL_MINOR),
+        format!("protocol {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}"),
         String::new(),
     ];
     for (name, variants) in &enums {
         lines.push(format!("enum {name}: {}", variants.join(", ")));
     }
     lines.push(String::new());
-    sampled(
-        "service_call",
-        "kind",
-        &service_call_samples()?,
-        variants("service_call")?,
-        &mut lines,
-    )?;
-    sampled(
-        "view_operation",
-        "operation",
-        &view_operation_samples()?,
-        variants("view_operation")?,
-        &mut lines,
-    )?;
-    sampled(
-        "ledger_operation",
-        "operation",
-        &ledger_operation_samples(),
-        variants("ledger_operation")?,
-        &mut lines,
-    )?;
+    let sets = [
+        ("service_call", internal(&service_call_samples()?, "kind")?),
+        (
+            "view_operation",
+            internal(&view_operation_samples()?, "operation")?,
+        ),
+        (
+            "ledger_operation",
+            internal(&ledger_operation_samples(), "operation")?,
+        ),
+        ("content_block", internal(&content_block_samples(), "type")?),
+        (
+            "session_turn_checkpoint",
+            internal(&session_turn_checkpoint_samples(), "transition")?,
+        ),
+        (
+            "public_transcript_position",
+            internal(&public_transcript_position_samples(), "kind")?,
+        ),
+        ("usage_proof", internal(&usage_proof_samples()?, "kind")?),
+        ("price_basis", external(values_of(&price_basis_samples())?)?),
+        (
+            "cache_write_terms",
+            external(values_of(&cache_write_terms_samples())?)?,
+        ),
+        ("export_phase", external(export_phase_samples()?)?),
+    ];
+    for (name, shapes) in sets {
+        sampled(name, shapes, variants(name)?, &mut lines)?;
+    }
     let request = ServiceRequest::with_id(GENERATION, HANDLE, ServiceCall::Revision);
     lines.push(format!(
         "envelope request {}",
@@ -842,52 +1046,91 @@ fn wire_surface() -> Result<String> {
     Ok(lines.join("\n"))
 }
 
-fn recorded_protocol(surface: &str) -> Option<&str> {
-    surface
+fn recorded_protocol(surface: &str) -> Option<(u16, u16)> {
+    let version = surface
         .lines()
-        .find_map(|line| line.strip_prefix("protocol "))
+        .find_map(|line| line.strip_prefix("protocol "))?;
+    let (major, minor) = version.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// Regeneration records a surface only for a fixture that does not exist yet
+/// or under a protocol version strictly greater than the recorded one.
+fn may_record_surface(recorded: Option<&str>, current: (u16, u16)) -> bool {
+    match recorded {
+        None => true,
+        Some(recorded) => recorded_protocol(recorded).is_some_and(|recorded| current > recorded),
+    }
+}
+
+#[test]
+fn regeneration_requires_an_absent_fixture_or_a_strictly_greater_version() {
+    let at = |version: &str| format!("# header\nprotocol {version}\n");
+    assert!(may_record_surface(None, (1, 7)));
+    assert!(may_record_surface(Some(&at("1.7")), (1, 8)));
+    assert!(may_record_surface(Some(&at("1.7")), (2, 0)));
+    assert!(!may_record_surface(Some(&at("1.7")), (1, 7)));
+    assert!(!may_record_surface(Some(&at("1.8")), (1, 7)));
+    assert!(!may_record_surface(Some(&at("2.0")), (1, 9)));
+    assert!(!may_record_surface(Some("no version line\n"), (1, 7)));
 }
 
 #[test]
 fn protocol_surface_matches_the_pinned_protocol_version() -> Result<()> {
+    let path = protocol_surface_file();
+    let recorded = match std::fs::read_to_string(&path) {
+        Ok(recorded) => Some(recorded),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
     let current = wire_surface()?;
-    if current == PROTOCOL_SURFACE {
+    if recorded.as_deref() == Some(current.as_str()) {
         return Ok(());
     }
-    let version = format!("{}.{}", PROTOCOL_MAJOR, PROTOCOL_MINOR);
-    let recorded = recorded_protocol(PROTOCOL_SURFACE).unwrap_or("none");
-    let bumped = recorded != version;
+    let version = (PROTOCOL_MAJOR, PROTOCOL_MINOR);
+    let may_record = may_record_surface(recorded.as_deref(), version);
     if std::env::var_os(BLESS_PROTOCOL_PIN).is_some_and(|value| value == "1") {
         ensure!(
-            bumped,
-            "refusing to record a changed memory service wire surface under unchanged protocol \
-             {version}. Bump PROTOCOL_MINOR in packages/kuru-memory/src/service.rs first."
+            may_record,
+            "refusing to record a changed memory service wire surface: protocol \
+             {PROTOCOL_MAJOR}.{PROTOCOL_MINOR} is not greater than the recorded version. Bump \
+             PROTOCOL_MINOR in packages/kuru-memory/src/service.rs first."
         );
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/service/rpc/protocol-surface.txt");
         std::fs::write(&path, &current).with_context(|| format!("write {}", path.display()))?;
         return Ok(());
     }
-    let removed = PROTOCOL_SURFACE
+    let recorded_text = recorded.as_deref().unwrap_or("");
+    let removed = recorded_text
         .lines()
         .filter(|line| !current.lines().any(|current| current == *line))
         .map(|line| format!("  - {line}"));
     let added = current
         .lines()
-        .filter(|line| !PROTOCOL_SURFACE.lines().any(|recorded| recorded == *line))
+        .filter(|line| !recorded_text.lines().any(|recorded| recorded == *line))
         .map(|line| format!("  + {line}"));
     let changes: Vec<String> = removed.chain(added).collect();
-    let action = if bumped {
-        format!(
-            "PROTOCOL_MINOR is already {version} (fixture records {recorded}); regenerate the \
-             fixture"
-        )
-    } else {
-        format!(
-            "The wire changed under unchanged protocol {version}. Bump PROTOCOL_MINOR in \
-             packages/kuru-memory/src/service.rs so older owners refuse the newer client at the \
-             handshake instead of failing to decode its request, then regenerate the fixture"
-        )
+    let action = match recorded.as_deref().map(recorded_protocol) {
+        None => "No fixture is recorded yet; record it".to_owned(),
+        Some(None) => "The fixture has no valid protocol line; restore it from version control, \
+                       then regenerate it"
+            .to_owned(),
+        Some(Some(recorded)) if version > recorded => format!(
+            "PROTOCOL_MINOR is already {PROTOCOL_MAJOR}.{PROTOCOL_MINOR} (fixture records {}.{}); \
+             regenerate the fixture",
+            recorded.0, recorded.1
+        ),
+        Some(Some(recorded)) if version < recorded => format!(
+            "The fixture records protocol {}.{}, newer than {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}; a \
+             protocol version never decreases. Rebase onto the newer protocol, take the next \
+             minor, then regenerate the fixture",
+            recorded.0, recorded.1
+        ),
+        Some(Some(_)) => format!(
+            "The wire changed under unchanged protocol {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}. Bump \
+             PROTOCOL_MINOR in packages/kuru-memory/src/service.rs so older owners refuse the \
+             newer client at the handshake instead of failing to decode its request, then \
+             regenerate the fixture"
+        ),
     };
     bail!(
         "memory service wire surface differs from {PROTOCOL_SURFACE_PATH}:\n{}\n\n{action} with\n  \

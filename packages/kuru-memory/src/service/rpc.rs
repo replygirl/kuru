@@ -1261,7 +1261,34 @@ fn unit_receipt_view(call: &ServiceCall, state: &AttachmentState) -> Result<Stri
             .view()
             .pinned_view()
             .to_owned(),
-        _ => "main".to_owned(),
+        // Every other call is named so a new one must choose its view here.
+        ServiceCall::View {
+            candidate: None, ..
+        }
+        | ServiceCall::RetireIfIdle
+        | ServiceCall::TryAcquireDreamLease
+        | ServiceCall::AppendMessage { .. }
+        | ServiceCall::HistoryWindow { .. }
+        | ServiceCall::Notes { .. }
+        | ServiceCall::PutMany { .. }
+        | ServiceCall::PutReasoningSummaries { .. }
+        | ServiceCall::Get { .. }
+        | ServiceCall::Reconcile
+        | ServiceCall::Revision
+        | ServiceCall::Outcome { .. }
+        | ServiceCall::BeginCandidate { .. }
+        | ServiceCall::CandidateOutcome { .. }
+        | ServiceCall::PromoteCandidate { .. }
+        | ServiceCall::AbandonCandidate { .. }
+        | ServiceCall::CandidateTransitionOutcome { .. }
+        | ServiceCall::SelectedAbandonOutcome { .. }
+        | ServiceCall::CandidateInventory { .. }
+        | ServiceCall::CandidateRefStatus { .. }
+        | ServiceCall::AbandonCandidateRef { .. }
+        | ServiceCall::Ledger { .. }
+        | ServiceCall::LedgerOutcome { .. }
+        | ServiceCall::BeginExport
+        | ServiceCall::ExportPage { .. } => "main".to_owned(),
     })
 }
 
@@ -1571,13 +1598,14 @@ pub(super) async fn exchange_attached_with_id_paused<S: AsyncRead + AsyncWrite +
         matches!(&call, ServiceCall::PromoteCandidate { .. }),
         Ordering::Release,
     );
+    let reply_deadline = call.contract().reply.deadline();
     let request = ServiceRequest::with_id(&authority.service_generation, id, call);
     write_frame(stream, &request, OPERATION_FRAME_LIMIT, OPERATION_TIMEOUT).await?;
     pause.sent.notify_one();
-    tokio::time::timeout(OPERATION_TIMEOUT, pause.release.notified())
+    tokio::time::timeout(reply_deadline, pause.release.notified())
         .await
         .context("test client reply pause exceeded operation deadline")?;
-    let reply: ServiceReply = read_frame(stream, OPERATION_FRAME_LIMIT, OPERATION_TIMEOUT).await?;
+    let reply: ServiceReply = read_frame(stream, OPERATION_FRAME_LIMIT, reply_deadline).await?;
     ensure!(reply.id == request.id, "memory service reply ID changed");
     ensure!(
         reply.generation == authority.service_generation,

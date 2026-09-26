@@ -14,7 +14,10 @@ enum public_turn_settlement: completed, interrupted, pending
 enum public_transcript_position: legacy, turn
 enum usage_phase: compact, consult, deliberate, dream, speak
 enum invocation_outcome: cancelled, failed, succeeded
+enum price_basis: api-equivalent, api-standard
+enum cache_write_terms: input-multiplier, per-million-usd
 enum usage_proof: admit, new_session, observe, settle
+enum export_phase: ContextCursors, ContextSummaries, Messages, PublicTurns, SessionCatalog, State
 enum service_response: rejected, success
 enum service_value: candidate_inventory, candidate_outcome, candidate_ref_status, candidate_started, candidate_transition_outcome, context_summary_cursor, context_summary_window, dream_lease, export_page, export_started, history_window, messages, notes, outcome, public_transcript_page, reconciled, retirement, revision, revisions, session_catalog_page, session_catalog_record, session_history_window_after, session_lifecycle_outcome, session_source_snapshot, session_usage, status, stored_value, unit
 enum service_fault: candidate_conflict, candidate_ref_rejected, context_summary_stale, generation_changed, reasoning_summary_conflict, receipt_conflict, session_lifecycle_rejected, session_turn_rejected, storage_failed
@@ -81,10 +84,36 @@ sample view_operation.revision {}
 sample view_operation.revisions {limit:number}
 sample view_operation.status {}
 sample ledger_operation.mark_new_session {session_id:string}
-sample ledger_operation.admit {start:{actor_id:string,invocation_id:string,model:string,operation_id:string,phase:string,price_at_invocation:null,route:string,session_id:string}}
+sample ledger_operation.admit {start:{actor_id:string,invocation_id:string,model:string,operation_id:string,phase:string,price_at_invocation:{basis:{api-standard:{api_model:string}},cache_write:{per-million-usd:{value:string}},cached_input_per_million_usd:string,input_per_million_usd:string,long_context_tier:{cached_input_multiplier:string,input_multiplier:string,input_tokens_over:number,output_multiplier:string},output_per_million_usd:string,promotional_available_at_least_through:string,source:{checked_on:string,url:string}},route:string,session_id:string}}
 sample ledger_operation.observe {invocation_id:string,observation:{sequence:number,terminal:bool,usage:{cached_input_tokens:number,input_tokens:number,output_tokens:number,reasoning_output_tokens:number}}}
 sample ledger_operation.settle {invocation_id:string,outcome:string}
 sample ledger_operation.session {session_id:string}
+sample content_block.text {text:string}
+sample content_block.tool_use {arguments:{path:string},id:string,name:string}
+sample content_block.tool_result {call_id:string,is_error:bool,output:{ok:bool}}
+sample content_block.reasoning_summary {text:string}
+sample content_block.image {data_base64:string,media_type:string}
+sample content_block.cache_boundary {kind:string}
+sample session_turn_checkpoint.admit {expected_generation:number,expected_transcript_rows:number,label:string,turn_id:string}
+sample session_turn_checkpoint.mark_retryable_interruption {expected_generation:number,speaker_id:string,turn_id:string}
+sample session_turn_checkpoint.resume {expected_generation:number,legacy:{expected_journal:{turn:string},journal_key:string,legacy_prefix:{first_sequence:number,namespace:string,record_format:string,row_count:number,source_revision:string,source_session_id:string,through_sequence:number}},turn_id:string}
+sample session_turn_checkpoint.settle {expected_generation:number,settlement:string,speaker_id:string,turn_id:string}
+sample public_transcript_position.turn {node_id:string}
+sample public_transcript_position.legacy {sequence:number}
+sample usage_proof.new_session {session_id:string}
+sample usage_proof.admit {digest:string,invocation_id:string}
+sample usage_proof.observe {digest:string,invocation_id:string,sequence:number}
+sample usage_proof.settle {digest:string,invocation_id:string}
+sample price_basis.api-standard {api_model:string}
+sample price_basis.api-equivalent {api_model:string}
+sample cache_write_terms.per-million-usd {value:string}
+sample cache_write_terms.input-multiplier {value:string}
+sample export_phase.Messages number
+sample export_phase.State [number]
+sample export_phase.ContextSummaries string
+sample export_phase.ContextCursors [[number]]
+sample export_phase.SessionCatalog [number]
+sample export_phase.PublicTurns string
 envelope request {call:{kind:string},generation:string,id:string}
 envelope reply {generation:string,id:string,response:{status:string,value:{kind:string}}}
 envelope rejected {status:string,value:string}
