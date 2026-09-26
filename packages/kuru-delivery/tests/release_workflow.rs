@@ -8,7 +8,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use kuru_delivery::release::{self, GitHub, Version};
-use kuru_delivery::{archive::digest, command, shell_support};
+use kuru_delivery::{archive::digest, command, coverage::SHARDS, shell_support};
 use kuru_platform::fs::make_executable;
 use serde_json::{Value, json};
 use std::{
@@ -197,10 +197,7 @@ fn native_workflow_shards_only_windows_and_keeps_the_aggregate_fail_closed() {
         "kuru-delivery,kuru-archive",
         "application",
         "packages: kuru",
-        "memory-runtime",
-        "kuru-memory,kuru-runtime",
         "connectors-core-platform",
-        "kuru-connectors,kuru-core,kuru-platform",
         "KURU_COVERAGE_TARGET",
         "KURU_COVERAGE_SOURCE",
         "KURU_COVERAGE_ATTEMPT",
@@ -219,18 +216,29 @@ fn native_workflow_shards_only_windows_and_keeps_the_aggregate_fail_closed() {
     ] {
         assert!(workflow.contains(required), "missing {required}");
     }
+    // Every shard restores one shared key; exactly one shard saves it.
     assert_eq!(
         workflow
-            .matches("shared-key: native-coverage-windows-")
+            .matches("shared-key: native-coverage-windows\n")
             .count(),
         1
     );
-    assert_eq!(workflow.matches("actions/download-artifact@").count(), 4);
+    assert!(!workflow.contains("shared-key: native-coverage-windows-"));
+    assert_eq!(
+        workflow
+            .matches("save-if: ${{ matrix.shard == 'connectors-core-platform' }}\n")
+            .count(),
+        1
+    );
+    assert_eq!(
+        workflow.matches("actions/download-artifact@").count(),
+        SHARDS.len()
+    );
     assert_eq!(
         workflow
             .matches("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c")
             .count(),
-        4
+        SHARDS.len()
     );
     // Only a successful shard publishes receipt evidence under the name the
     // report accepts; failures publish diagnostics under a name it rejects.
@@ -243,6 +251,25 @@ fn native_workflow_shards_only_windows_and_keeps_the_aggregate_fail_closed() {
         .next()
         .unwrap();
     assert!(!shards.contains("if: ${{ !cancelled() }}"));
+    // The matrix rows are exactly the shards the receipt and collect code
+    // enforce, in the same order, so the two cannot drift.
+    let expected_matrix: String = SHARDS
+        .iter()
+        .map(|(shard, packages)| {
+            format!(
+                "          - shard: {shard}\n            packages: {}\n",
+                packages.join(",")
+            )
+        })
+        .collect();
+    let matrix = shards
+        .split("      matrix:\n        include:\n")
+        .nth(1)
+        .unwrap()
+        .split("    steps:\n")
+        .next()
+        .unwrap();
+    assert_eq!(matrix, expected_matrix);
     assert_eq!(shards.matches("if: ${{ failure() }}").count(), 1);
     assert!(shards.contains(
         "name: ${{ inputs.artifact-prefix }}-coverage-windows-${{ matrix.shard }}-diagnostics-attempt-${{ github.run_attempt }}"
@@ -280,12 +307,7 @@ fn native_workflow_shards_only_windows_and_keeps_the_aggregate_fail_closed() {
         .split("\n  windows-install:\n")
         .next()
         .unwrap();
-    for shard in [
-        "delivery-archive",
-        "application",
-        "memory-runtime",
-        "connectors-core-platform",
-    ] {
+    for (shard, _) in SHARDS {
         assert!(report.contains(&format!(
             "          pattern: ${{{{ inputs.artifact-prefix }}}}-coverage-windows-{shard}-attempt-*\n          merge-multiple: false\n          path: ${{{{ runner.temp }}}}/kuru-coverage-inputs/{shard}\n"
         )));

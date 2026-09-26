@@ -46,7 +46,9 @@ require Communiqué or maintainer setup.
 CI runs format, lint, typecheck, repository/workflow tooling, cospec validation,
 managed-file checks and documentation as separate Ubuntu jobs. Native coverage
 runs as one workspace suite on Linux x86_64 and macOS arm64. Windows x86_64 runs
-four package shards in parallel, validates their exact source, toolchain,
+five package shards in parallel (`delivery-archive`, `application`, `memory`,
+`runtime` and `connectors-core-platform`, matching `SHARDS` in
+`packages/kuru-delivery/src/coverage.rs`), validates their exact source, toolchain,
 artifact inventory, Cargo-native runner ledger and raw-profile receipts, and
 then enforces one 90% workspace report. Each shard compiles the same full
 workspace/all-target/all-feature graph; its task-private runner executes only
@@ -72,7 +74,8 @@ installation and installed offline-runtime checks run beside the coverage shards
 after independently preparing their locked inputs. Linux Clippy does not analyze
 platform-specific conditional code; the native suites compile and test those
 branches. Intel macOS and Linux arm64 additionally build and package the native
-executable, exercise real memory and verify the packaged offline runtime.
+executable, exercise real memory and verify the packaged offline runtime; that
+job restores and saves its own per-target Cargo dependency cache.
 Windows primitives retain a separate native coverage job for early feedback. The
 required `ci-gate` accepts only success from every branch of this graph.
 
@@ -247,8 +250,11 @@ directory for both preparation and compilation. Valid files are reverified and
 reused; corrupt or unsafe entries fail without replacement. This build cache is
 separate from the installed application's extracted `memory.cache_dir`.
 
-The cached native CI job selects `${{ runner.temp }}/kuru-bundles` for all its
-preparation and build steps. Private bundle directories must be created by the
+Every cached native CI job (coverage, installation and the Intel macOS and Linux arm64
+native builds) selects a bundle directory under `${{ runner.temp }}` for all its
+preparation and build steps. The Windows coverage shards share one Cargo cache
+key that only one shard saves; their instrumented target directories live in
+`${{ runner.temp }}` and are never cached. Private bundle directories must be created by the
 current runner; restoring them inside a Cargo target archive can change their
 permissions. Keep them outside shared build-output caches and retain the private
 directory checks when configuring native test runners.
