@@ -183,8 +183,7 @@ corruption; trust comes from the release source you choose.
 
 The current direct installer places verified support snapshots at
 `INSTALL_DIR/share/kuru/VERSION/TARGET/`. Unix installs also maintain the regular
-file `INSTALL_DIR/share/man/man1/kuru.1`. For the default Unix install, load
-completions from the fixed installed executable in your chosen shell:
+file `INSTALL_DIR/share/man/man1/kuru.1`.
 
 Kuru uses the Usage completion engine and derives its completion scripts and
 manual from the same Clap command tree that parses commands. The default scripts
@@ -195,6 +194,9 @@ before loading a script, including when you chose a custom `--install-dir` or
 `-InstallDir`, so the script's `kuru` command resolves to that same executable.
 For example, on Unix use `export PATH="INSTALL_DIR:$PATH"`; in PowerShell use
 `$env:PATH = "INSTALL_DIR;$env:PATH"` for the current session.
+
+For the default Unix install, load completions from the fixed installed
+executable in your chosen shell:
 
 ```bash
 eval "$("$HOME/.local/bin/kuru" completions bash)"
