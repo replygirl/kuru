@@ -49,47 +49,6 @@ fn valid_envelopes_without_errors_cannot_satisfy_a_rejection_message() {
     }
 }
 
-#[cfg(windows)]
-#[tokio::test]
-async fn pwsh_set_content_preserves_long_cargo_json_lines() {
-    use std::{fs, time::Duration};
-
-    let temp = tempfile::tempdir().unwrap();
-    let destination = temp.path().join("cargo.json");
-    let value = serde_json::json!({
-        "reason": "compiler-artifact",
-        "target": {"name": "fixture", "src_path": "x".repeat(4096)},
-        "filenames": ["y".repeat(4096)]
-    });
-    let line = serde_json::to_string(&value).unwrap().replace('\'', "''");
-    let script = format!(
-        "@('{line}') | Set-Content -LiteralPath '{}' -Encoding utf8NoBOM; if (-not $?) {{ exit 1 }}",
-        destination.display()
-    );
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut command = kuru_delivery::command::rooted(&root, "pwsh");
-    command.args([
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        &script,
-    ]);
-    let command_output =
-        kuru_delivery::command::bounded_output(&mut command, Duration::from_secs(10), 32 * 1024)
-            .await
-            .unwrap();
-    assert!(
-        command_output.status.success(),
-        "pwsh failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&command_output.stdout),
-        String::from_utf8_lossy(&command_output.stderr)
-    );
-    let bytes = fs::read(destination).unwrap();
-    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(parsed, value);
-}
-
 /// Standard aliases shipped by `Microsoft.PowerShell.Utility` and
 /// `Microsoft.PowerShell.Management` (PowerShell's documented default alias
 /// list for those two modules). Each resolves through module auto-discovery
@@ -282,71 +241,126 @@ fn stock_installer_imports_pshome_modules_before_any_discovered_command() {
     assert!(discovered > 0, "command inventory found no stock commands");
 }
 
-#[test]
-fn windows_coverage_tasks_launch_pwsh_without_cmd_metacharacters() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let task = std::fs::read_to_string(root.join("packages/kuru-delivery/mise.toml")).unwrap();
-    let script =
-        std::fs::read_to_string(root.join("packages/kuru-delivery/support/windows-coverage.ps1"))
-            .unwrap();
-
-    let prefix = "pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File packages/kuru-delivery/support/windows-coverage.ps1 -Mode ";
-    assert!(task.contains(&format!("run_windows = \"{prefix}Shard\"")));
-    assert!(task.contains(&format!("run_windows = \"{prefix}Collect\"")));
+/// The exact `run` string of one package coverage task.
+fn coverage_task_run(name: &str) -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest: toml::Value =
+        toml::from_str(&std::fs::read_to_string(root.join("mise.toml")).unwrap()).unwrap();
+    let task = &manifest["tasks"][name];
     assert!(
-        !task.contains("run_windows = \"& packages/kuru-delivery/support/windows-coverage.ps1")
+        task.get("run_windows").is_none(),
+        "{name} must run the same orchestrator on every OS"
     );
-    for binding in [
-        "$env:KURU_COVERAGE_TARGET",
-        "$env:KURU_COVERAGE_SOURCE",
-        "$env:KURU_COVERAGE_ATTEMPT",
-        "$env:KURU_COVERAGE_SHARD",
-        "$env:KURU_COVERAGE_PACKAGES",
-        "$env:KURU_COVERAGE_OUTPUT",
-        "$env:KURU_COVERAGE_INPUTS",
-        "$env:KURU_COVERAGE_REPORT",
-        "$env:KURU_COVERAGE_DIAGNOSTICS",
-        "$env:KURU_COVERAGE_JOB_STARTED",
-        "$env:KURU_COVERAGE_JOB_MINUTES",
-    ] {
-        assert!(script.contains(binding), "missing script binding {binding}");
-    }
-    for argument in [
-        "--diagnostics $diagnosticsDir --job-started $JobStarted --job-minutes $JobMinutes",
-        "--max-attempt $RunAttempt",
-    ] {
-        assert!(
-            script.contains(argument),
-            "missing script argument {argument}"
-        );
-    }
-    assert!(!script.contains("--run-attempt $RunAttempt --llvm-cov $llvmCov\n"));
+    assert_eq!(
+        task["dir"].as_str(),
+        Some("{{config_root}}/../.."),
+        "{name}"
+    );
+    assert_eq!(
+        task["env"]["KURU_TEST_SUPERVISOR_PREPARED"].as_bool(),
+        Some(false),
+        "{name} must use the instrumented supervisor"
+    );
+    assert_eq!(
+        task["depends"].as_array().unwrap(),
+        &[
+            toml::Value::from("//packages/kuru-memory:bundle:prepare"),
+            toml::Value::from("//packages/kuru-memory:bundle:test-fixtures"),
+        ],
+        "{name} prepares only verified bundle inputs"
+    );
+    task["run"].as_str().unwrap().to_owned()
+}
 
-    // One try covers every step after the shard's diagnostics directory exists,
-    // so verifier, toolchain and inventory failures also leave diagnostics.
-    let diagnostics = script
-        .find("$diagnosticsDir = (Resolve-Path -LiteralPath $Diagnostics).Path")
-        .unwrap();
-    let guarded = script.find("\ntry {\n").unwrap();
-    assert!(diagnostics < guarded);
-    for step in [
-        "Set-Location $root",
-        "& cargo build -p kuru-delivery",
-        "coverage verify-source",
-        "coverage inventory",
-        "coverage runner-config",
-        "& cargo @runArgs",
-        "coverage receipt",
-    ] {
+#[test]
+fn coverage_tasks_run_the_rust_orchestrator_without_shell_metacharacters() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (task, mode) in [("coverage:shard", "shard"), ("coverage:collect", "collect")] {
+        let run = coverage_task_run(task);
+        assert_eq!(
+            run,
+            format!(
+                "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- coverage {mode}"
+            )
+        );
+        // The same inline command runs under sh and Windows cmd.exe unchanged.
         assert!(
-            script.find(step).unwrap() > guarded,
-            "{step} precedes the diagnostics try"
+            !run.chars()
+                .any(|character| "&|<>^%\"'`$();\\!*?[]{}~#\n".contains(character)),
+            "{task} run string has shell metacharacters: {run}"
         );
     }
-    let handler = &script[script.rfind("\n} catch {\n").unwrap()..];
-    assert!(handler.contains("'failure.txt'"));
-    assert!(handler.contains("if ($null -ne $state)"));
-    assert!(handler.trim_end().ends_with("throw\n}"));
+    assert!(
+        !root.join("support/windows-coverage.ps1").exists(),
+        "the PowerShell shard runner is retired"
+    );
+    let manifest = std::fs::read_to_string(root.join("mise.toml")).unwrap();
+    assert!(!manifest.contains("coverage:windows:"), "{manifest}");
+    assert!(manifest.contains("[tasks.\"coverage:workspace\"]"));
+}
+
+/// Launch the orchestrator's delivery binary exactly as a coverage task does,
+/// with every coverage input removed, and return its combined diagnostics.
+async fn orchestrator_without_inputs(mode: &str, through_cmd: bool) -> (bool, String) {
+    use std::time::Duration;
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let run = coverage_task_run(&format!("coverage:{mode}"));
+    // Cargo's own `run` prefix builds this same binary; a test cannot invoke
+    // Cargo under the outer test build lock, so it launches the built binary
+    // with the task's exact arguments after `--`.
+    let (_, arguments) = run.split_once(" -- ").unwrap();
+    let binary = env!("CARGO_BIN_EXE_kuru-delivery");
+    let mut child = if through_cmd {
+        let mut child = kuru_delivery::command::rooted(&root, "cmd.exe");
+        child.args(["/d", "/s", "/c", &format!("{binary} {arguments}")]);
+        child
+    } else {
+        let mut child = kuru_delivery::command::rooted(&root, binary);
+        child.args(arguments.split(' '));
+        child
+    };
+    for (variable, _) in std::env::vars_os() {
+        if variable.to_string_lossy().starts_with("KURU_COVERAGE_") {
+            child.env_remove(&variable);
+        }
+    }
+    let output =
+        kuru_delivery::command::bounded_output(&mut child, Duration::from_secs(30), 16 * 1024)
+            .await
+            .unwrap();
+    (
+        output.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+}
+
+#[tokio::test]
+async fn coverage_orchestrator_refuses_missing_inputs_before_any_effect() {
+    let (success, diagnostic) = orchestrator_without_inputs("shard", false).await;
+    assert!(!success);
+    assert!(
+        diagnostic.contains(
+            "coverage shard requires KURU_COVERAGE_TARGET, KURU_COVERAGE_SOURCE, \
+             KURU_COVERAGE_ATTEMPT, KURU_COVERAGE_OS, KURU_COVERAGE_SHARD, \
+             KURU_COVERAGE_PACKAGES, KURU_COVERAGE_OUTPUT, KURU_COVERAGE_DIAGNOSTICS, \
+             KURU_COVERAGE_JOB_STARTED, KURU_COVERAGE_JOB_MINUTES"
+        ),
+        "shard did not reach input validation: {diagnostic}"
+    );
+    let (success, diagnostic) = orchestrator_without_inputs("collect", false).await;
+    assert!(!success);
+    assert!(
+        diagnostic.contains(
+            "coverage collect requires KURU_COVERAGE_TARGET, KURU_COVERAGE_SOURCE, \
+             KURU_COVERAGE_ATTEMPT, KURU_COVERAGE_OS, KURU_COVERAGE_INPUTS, KURU_COVERAGE_REPORT"
+        ),
+        "collect did not reach input validation: {diagnostic}"
+    );
 }
 
 #[cfg(windows)]
@@ -389,52 +403,15 @@ async fn cmd_mise_launches_published_windows_task_wrapper_before_cargo() {
 
 #[cfg(windows)]
 #[tokio::test]
-async fn cmd_launches_the_exact_shard_task_and_reaches_script_validation() {
-    use std::time::Duration;
-
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let task = std::fs::read_to_string(root.join("packages/kuru-delivery/mise.toml")).unwrap();
-    let shard = task
-        .split("[tasks.\"coverage:windows:shard\"]")
-        .nth(1)
-        .unwrap()
-        .split("[tasks.\"coverage:windows:shard\".env]")
-        .next()
-        .unwrap();
-    let command = shard
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("run_windows = \"")
-                .and_then(|line| line.strip_suffix('"'))
-        })
-        .unwrap();
-    let mut child = kuru_delivery::command::rooted(&root, "cmd.exe");
-    child.args(["/d", "/s", "/c", command]);
-    for variable in [
-        "KURU_COVERAGE_TARGET",
-        "KURU_COVERAGE_SOURCE",
-        "KURU_COVERAGE_ATTEMPT",
-        "KURU_COVERAGE_SHARD",
-        "KURU_COVERAGE_PACKAGES",
-        "KURU_COVERAGE_OUTPUT",
-        "KURU_COVERAGE_INPUTS",
-        "KURU_COVERAGE_REPORT",
-    ] {
-        child.env_remove(variable);
+async fn cmd_launches_the_exact_coverage_tasks_and_reaches_input_validation() {
+    for mode in ["shard", "collect"] {
+        let (success, diagnostic) = orchestrator_without_inputs(mode, true).await;
+        assert!(!success);
+        assert!(
+            diagnostic.contains(&format!("coverage {mode} requires KURU_COVERAGE_TARGET")),
+            "{mode} did not reach orchestrator validation through cmd: {diagnostic}"
+        );
+        assert!(!diagnostic.contains("was unexpected at this time"));
+        assert!(!diagnostic.contains("is not recognized as an internal or external command"));
     }
-    let output =
-        kuru_delivery::command::bounded_output(&mut child, Duration::from_secs(10), 16 * 1024)
-            .await
-            .unwrap();
-    assert!(!output.status.success());
-    let diagnostic = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        diagnostic.contains("Coverage target, expected source and run attempt are required"),
-        "task did not reach the script validation: {diagnostic}"
-    );
-    assert!(!diagnostic.contains("was unexpected at this time"));
 }
