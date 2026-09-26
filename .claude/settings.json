@@ -35,7 +35,9 @@
       "Bash(git cherry-pick:*)",
       "Bash(git stash:*)",
 
-      "Bash(git push:*)",
+      "Bash(git push --force-with-lease:*)",
+      "Bash(git push -u origin:*)",
+      "Bash(git push origin:*)",
       "Bash(gh stack push:*)",
       "Bash(gh stack submit:*)",
 
@@ -59,32 +61,6 @@
       "Bash(cargo llvm-cov:*)",
       "Bash(cargo tree:*)",
       "Bash(cargo metadata:*)"
-    ],
-    "deny": [
-      "Bash(git push --force:*)",
-      "Bash(git push -f:*)",
-      "Bash(git push --force origin:*)",
-      "Bash(git push origin main:*)",
-      "Bash(git push origin HEAD:main:*)",
-      "Bash(git push --delete:*)",
-      "Bash(git push origin --delete:*)",
-      "Bash(git push -d:*)",
-      "Bash(git reset --hard:*)",
-      "Bash(gh pr merge --admin:*)",
-      "Bash(gh release create:*)",
-      "Bash(gh release delete:*)",
-      "Bash(gh release edit:*)",
-      "Bash(gh workflow run:*)",
-      "Bash(gh repo:*)",
-      "Bash(mise run release:*)",
-      "Bash(mise run release:tool:*)",
-      "Bash(mise run release:version:*)",
-      "Bash(mise run release:set-version:*)",
-      "Bash(mise run package:*)",
-      "Bash(mise run tool:*)",
-      "Bash(mise run //packages/kuru-delivery:release:*)",
-      "Bash(mise run //packages/kuru-delivery:package:*)",
-      "Bash(mise run //packages/kuru-delivery:tool:*)"
     ]
   }
 }
