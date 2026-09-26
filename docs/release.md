@@ -278,8 +278,11 @@ same selected release commit. It invokes the delivery package's existing
 `verify:published-windows` task with the exact version, expected commit and run
 URL. It resolves the public tag and asset inventory, verifies checksums, installs
 through the unmodified public mise route, and exercises a cold offline
-conversation and durable reopen with the bundled engine. Its cleanup-confirmed
-receipt is retained as the `published-windows-<version>-<attempt>` Actions artifact.
+conversation and durable reopen with the bundled engine. It verifies the runner's
+own Windows target: the optional `KURU_PUBLISHED_TARGET` must equal the native
+host target, and the installed executable's PE machine must match it. Its
+cleanup-confirmed receipt records that target and PE machine and is retained as
+the `published-windows-<version>-<attempt>` Actions artifact.
 
 This job has read-only repository permissions and no publication credentials.
 A failed download or runtime check makes the release run fail visibly, while the
