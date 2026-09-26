@@ -146,82 +146,125 @@ pub enum ServiceCall {
     },
 }
 
+/// Whether a lost reply may conceal an accepted effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Mutation {
+    Read,
+    Write,
+}
+
+/// The durable proof a request leaves for its lost-reply outcome query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Receipt {
+    /// Nothing durable to prove. Only `RetireIfIdle` pairs this with a write:
+    /// its only effect is retiring an idle owner; no stored data changes.
+    None,
+    /// A logical unit receipt stored with the write, named by this method.
+    Unit(&'static str),
+    /// The deterministic candidate branch for the request ID.
+    CandidateCreation,
+    /// The exact candidate ref transition, keyed by its pinned branch.
+    CandidateTransition,
+    /// The exact inspected branch/base/head chosen for abandonment.
+    SelectedAbandon,
+    /// The usage ledger's natural-key proof.
+    UsageProof,
+}
+
+/// How long an attached client waits for one reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplyBudget {
+    Operation,
+}
+
+impl ReplyBudget {
+    pub(crate) const fn deadline(self) -> std::time::Duration {
+        match self {
+            Self::Operation => OPERATION_TIMEOUT,
+        }
+    }
+}
+
+/// Every operation's handling, decided in one exhaustive place so that a new
+/// operation cannot default to "read-only, no receipt".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OperationContract {
+    pub mutation: Mutation,
+    pub receipt: Receipt,
+    pub reply: ReplyBudget,
+}
+
+impl OperationContract {
+    const READ: Self = Self {
+        mutation: Mutation::Read,
+        receipt: Receipt::None,
+        reply: ReplyBudget::Operation,
+    };
+
+    const fn write(receipt: Receipt) -> Self {
+        Self {
+            mutation: Mutation::Write,
+            receipt,
+            reply: ReplyBudget::Operation,
+        }
+    }
+}
+
 impl ServiceCall {
+    /// Keep every arm explicit: no wildcard may classify a new variant.
+    pub(crate) fn contract(&self) -> OperationContract {
+        use OperationContract as C;
+        match self {
+            Self::RetireIfIdle => C::write(Receipt::None),
+            // Attachment-local lease state; nothing durable changes.
+            Self::TryAcquireDreamLease => C::READ,
+            Self::AppendMessage { .. } => C::write(Receipt::Unit("append_message")),
+            Self::HistoryWindow { .. } => C::READ,
+            Self::Notes { .. } => C::READ,
+            Self::PutMany { .. } => C::write(Receipt::Unit("put_many")),
+            Self::PutReasoningSummaries { .. } => {
+                C::write(Receipt::Unit("put_reasoning_summaries"))
+            }
+            Self::Get { .. } => C::READ,
+            Self::Reconcile => C::READ,
+            Self::Revision => C::READ,
+            Self::Outcome { .. } => C::READ,
+            Self::View { operation, .. } => operation.contract(),
+            Self::BeginCandidate { .. } => C::write(Receipt::CandidateCreation),
+            Self::CandidateOutcome { .. } => C::READ,
+            Self::PromoteCandidate { .. } => C::write(Receipt::CandidateTransition),
+            Self::AbandonCandidate { .. } => C::write(Receipt::CandidateTransition),
+            Self::CandidateTransitionOutcome { .. } => C::READ,
+            Self::SelectedAbandonOutcome { .. } => C::READ,
+            Self::CandidateInventory { .. } => C::READ,
+            Self::CandidateRefStatus { .. } => C::READ,
+            Self::AbandonCandidateRef { .. } => C::write(Receipt::SelectedAbandon),
+            Self::Ledger { operation } => operation.contract(),
+            Self::LedgerOutcome { .. } => C::READ,
+            Self::BeginExport => C::READ,
+            Self::ExportPage { .. } => C::READ,
+        }
+    }
+
     /// A lost reply to one of these calls may conceal an accepted effect.
     /// Callers must not issue another mutation through a sibling attachment.
     pub(crate) fn may_mutate(&self) -> bool {
-        match self {
-            Self::RetireIfIdle
-            | Self::AppendMessage { .. }
-            | Self::PutMany { .. }
-            | Self::PutReasoningSummaries { .. }
-            | Self::BeginCandidate { .. }
-            | Self::PromoteCandidate { .. }
-            | Self::AbandonCandidate { .. } => true,
-            Self::AbandonCandidateRef { .. } => true,
-            Self::View { operation, .. } => matches!(
-                &**operation,
-                ViewOperation::Append { .. }
-                    | ViewOperation::AppendMessage { .. }
-                    | ViewOperation::AppendSessionMessage { .. }
-                    | ViewOperation::Checkpoint { .. }
-                    | ViewOperation::CheckpointSession { .. }
-                    | ViewOperation::CheckpointContextSummary { .. }
-                    | ViewOperation::CreateSession { .. }
-                    | ViewOperation::RenameSession { .. }
-                    | ViewOperation::RemoveSession { .. }
-                    | ViewOperation::RestoreSession { .. }
-                    | ViewOperation::ForkSession { .. }
-                    | ViewOperation::ForgetNote { .. }
-                    | ViewOperation::PutMany { .. }
-                    | ViewOperation::Clear { .. }
-            ),
-            Self::Ledger { operation } => !matches!(&**operation, LedgerOperation::Session { .. }),
-            Self::HistoryWindow { .. }
-            | Self::TryAcquireDreamLease
-            | Self::Notes { .. }
-            | Self::Get { .. }
-            | Self::Reconcile
-            | Self::Revision
-            | Self::Outcome { .. }
-            | Self::CandidateOutcome { .. }
-            | Self::CandidateTransitionOutcome { .. }
-            | Self::SelectedAbandonOutcome { .. }
-            | Self::CandidateInventory { .. }
-            | Self::CandidateRefStatus { .. }
-            | Self::LedgerOutcome { .. }
-            | Self::BeginExport
-            | Self::ExportPage { .. } => false,
+        match self.contract().mutation {
+            Mutation::Write => true,
+            Mutation::Read => false,
         }
     }
 
     /// Only receipt-bearing unit writes use this path. Candidate transitions
     /// and usage records need their existing typed ref/natural-key outcomes.
     fn unit_receipt_method(&self) -> Option<&'static str> {
-        match self {
-            Self::AppendMessage { .. } => Some("append_message"),
-            Self::PutMany { .. } => Some("put_many"),
-            Self::PutReasoningSummaries { .. } => Some("put_reasoning_summaries"),
-            Self::View { operation, .. } => match &**operation {
-                ViewOperation::Append { .. } => Some("view.append"),
-                ViewOperation::AppendMessage { .. } => Some("view.append_message"),
-                ViewOperation::AppendSessionMessage { .. } => Some("view.append_session_message"),
-                ViewOperation::Checkpoint { .. } => Some("view.checkpoint"),
-                ViewOperation::CheckpointSession { .. } => Some("view.checkpoint_session"),
-                ViewOperation::CheckpointContextSummary { .. } => {
-                    Some("view.checkpoint_context_summary")
-                }
-                ViewOperation::CreateSession { .. } => Some("view.create_session"),
-                ViewOperation::RenameSession { .. } => Some("view.rename_session"),
-                ViewOperation::RemoveSession { .. } => Some("view.remove_session"),
-                ViewOperation::RestoreSession { .. } => Some("view.restore_session"),
-                ViewOperation::ForkSession { .. } => Some("view.fork_session"),
-                ViewOperation::ForgetNote { .. } => Some("view.forget_note"),
-                ViewOperation::PutMany { .. } => Some("view.put_many"),
-                ViewOperation::Clear { .. } => Some("view.clear"),
-                _ => None,
-            },
-            _ => None,
+        match self.contract().receipt {
+            Receipt::Unit(method) => Some(method),
+            Receipt::None
+            | Receipt::CandidateCreation
+            | Receipt::CandidateTransition
+            | Receipt::SelectedAbandon
+            | Receipt::UsageProof => None,
         }
     }
 
@@ -395,6 +438,49 @@ pub enum ViewOperation {
     Status,
 }
 
+impl ViewOperation {
+    /// Keep every arm explicit: no wildcard may classify a new variant.
+    pub(crate) fn contract(&self) -> OperationContract {
+        use OperationContract as C;
+        match self {
+            Self::Append { .. } => C::write(Receipt::Unit("view.append")),
+            Self::AppendMessage { .. } => C::write(Receipt::Unit("view.append_message")),
+            Self::AppendSessionMessage { .. } => {
+                C::write(Receipt::Unit("view.append_session_message"))
+            }
+            Self::Checkpoint { .. } => C::write(Receipt::Unit("view.checkpoint")),
+            Self::CheckpointSession { .. } => C::write(Receipt::Unit("view.checkpoint_session")),
+            Self::History { .. } => C::READ,
+            Self::HistoryWindow { .. } => C::READ,
+            Self::SessionHistoryWindow { .. } => C::READ,
+            Self::SessionHistoryWindowAfter { .. } => C::READ,
+            Self::SessionCatalogPage { .. } => C::READ,
+            Self::SessionCatalogRecord { .. } => C::READ,
+            Self::CreateSession { .. } => C::write(Receipt::Unit("view.create_session")),
+            Self::RenameSession { .. } => C::write(Receipt::Unit("view.rename_session")),
+            Self::RemoveSession { .. } => C::write(Receipt::Unit("view.remove_session")),
+            Self::RestoreSession { .. } => C::write(Receipt::Unit("view.restore_session")),
+            Self::ForkSession { .. } => C::write(Receipt::Unit("view.fork_session")),
+            Self::PublicTranscriptPage { .. } => C::READ,
+            Self::SessionSourceSnapshot { .. } => C::READ,
+            Self::CheckpointContextSummary { .. } => {
+                C::write(Receipt::Unit("view.checkpoint_context_summary"))
+            }
+            Self::ContextSummaryCursor { .. } => C::READ,
+            Self::ContextSummaryWindow { .. } => C::READ,
+            Self::Notes { .. } => C::READ,
+            Self::ForgetNote { .. } => C::write(Receipt::Unit("view.forget_note")),
+            Self::PutMany { .. } => C::write(Receipt::Unit("view.put_many")),
+            Self::Get { .. } => C::READ,
+            Self::Clear { .. } => C::write(Receipt::Unit("view.clear")),
+            Self::Reconcile => C::READ,
+            Self::Revision => C::READ,
+            Self::Revisions { .. } => C::READ,
+            Self::Status => C::READ,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LedgerOperation {
@@ -418,6 +504,18 @@ pub enum LedgerOperation {
 }
 
 impl LedgerOperation {
+    /// Keep every arm explicit: no wildcard may classify a new variant.
+    pub(crate) fn contract(&self) -> OperationContract {
+        use OperationContract as C;
+        match self {
+            Self::MarkNewSession { .. } => C::write(Receipt::UsageProof),
+            Self::Admit { .. } => C::write(Receipt::UsageProof),
+            Self::Observe { .. } => C::write(Receipt::UsageProof),
+            Self::Settle { .. } => C::write(Receipt::UsageProof),
+            Self::Session { .. } => C::READ,
+        }
+    }
+
     pub(crate) fn proof(&self) -> Result<Option<UsageProof>> {
         Ok(match self {
             Self::MarkNewSession { session_id } => Some(UsageProof::new_session(session_id)),
@@ -579,6 +677,19 @@ struct AttachmentState {
     candidates: HashMap<Uuid, Candidate>,
     exports: HashMap<Uuid, ActiveExportSnapshot>,
     dream_lease: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl AttachmentState {
+    /// Connection-local candidate or export handles.
+    fn holds_handles(&self) -> bool {
+        !self.candidates.is_empty() || !self.exports.is_empty()
+    }
+
+    /// Every attachment-held resource. An attachment holding any of them
+    /// never accepts idle retirement.
+    fn holds_resources(&self) -> bool {
+        self.holds_handles() || self.dream_lease.is_some()
+    }
 }
 
 const COMPLETED_RECEIPT_WINDOW: usize = 4096;
@@ -1092,51 +1203,54 @@ fn receipt_progress_key(
     state: &AttachmentState,
     store: &MemoryStore,
 ) -> Result<Option<ReceiptKey>> {
-    if matches!(call, ServiceCall::BeginCandidate { .. }) {
-        return Ok(Some(ReceiptKey {
-            view: store.candidate_branch_for_id(id),
-            id,
-        }));
-    }
-    if let ServiceCall::Ledger { operation } = call
-        && operation.proof()?.is_some()
-    {
-        return Ok(Some(ReceiptKey {
-            view: "kuru_usage_v1".to_owned(),
-            id,
-        }));
-    }
-    if let ServiceCall::PromoteCandidate { handle, branch, .. }
-    | ServiceCall::AbandonCandidate { handle, branch, .. } = call
-    {
-        let candidate = state
-            .candidates
-            .get(handle)
-            .context("candidate does not belong to this attachment")?;
-        ensure!(
-            candidate.view().pinned_view() == branch,
-            "candidate transition names the wrong pinned view"
-        );
-        return Ok(Some(ReceiptKey {
-            view: branch.clone(),
-            id,
-        }));
-    }
-    if let ServiceCall::AbandonCandidateRef {
-        branch,
-        base,
-        target,
-    } = call
-    {
-        return Ok(Some(ReceiptKey {
-            view: selected_abandon_progress_view(branch, base, target),
-            id,
-        }));
-    }
-    if call.unit_receipt_method().is_none() {
-        return Ok(None);
-    }
-    let view = match call {
+    let view = match call.contract().receipt {
+        Receipt::None => return Ok(None),
+        Receipt::Unit(_) => unit_receipt_view(call, state)?,
+        Receipt::CandidateCreation => store.candidate_branch_for_id(id),
+        Receipt::UsageProof => {
+            let ServiceCall::Ledger { operation } = call else {
+                bail!("usage-proof contract names a non-ledger call");
+            };
+            if operation.proof()?.is_none() {
+                return Ok(None);
+            }
+            "kuru_usage_v1".to_owned()
+        }
+        Receipt::CandidateTransition => {
+            let (ServiceCall::PromoteCandidate { handle, branch, .. }
+            | ServiceCall::AbandonCandidate { handle, branch, .. }) = call
+            else {
+                bail!("candidate-transition contract names a non-transition call");
+            };
+            let candidate = state
+                .candidates
+                .get(handle)
+                .context("candidate does not belong to this attachment")?;
+            ensure!(
+                candidate.view().pinned_view() == branch,
+                "candidate transition names the wrong pinned view"
+            );
+            branch.clone()
+        }
+        Receipt::SelectedAbandon => {
+            let ServiceCall::AbandonCandidateRef {
+                branch,
+                base,
+                target,
+            } = call
+            else {
+                bail!("selected-abandon contract names a different call");
+            };
+            selected_abandon_progress_view(branch, base, target)
+        }
+    };
+    Ok(Some(ReceiptKey { view, id }))
+}
+
+/// The stable view a unit receipt is pinned to: a candidate's branch, never
+/// its attachment-local handle, or the main view.
+fn unit_receipt_view(call: &ServiceCall, state: &AttachmentState) -> Result<String> {
+    Ok(match call {
         ServiceCall::View {
             candidate: Some(handle),
             ..
@@ -1148,8 +1262,7 @@ fn receipt_progress_key(
             .pinned_view()
             .to_owned(),
         _ => "main".to_owned(),
-    };
-    Ok(Some(ReceiptKey { view, id }))
+    })
 }
 
 fn selected_abandon_progress_view(branch: &str, base: &str, target: &str) -> String {
@@ -1423,9 +1536,10 @@ pub(super) async fn exchange_attached_with_id<S: AsyncRead + AsyncWrite + Unpin>
     id: Uuid,
     call: ServiceCall,
 ) -> Result<ServiceResponse> {
+    let reply_deadline = call.contract().reply.deadline();
     let request = ServiceRequest::with_id(&authority.service_generation, id, call);
     write_frame(stream, &request, OPERATION_FRAME_LIMIT, OPERATION_TIMEOUT).await?;
-    let reply: ServiceReply = read_frame(stream, OPERATION_FRAME_LIMIT, OPERATION_TIMEOUT).await?;
+    let reply: ServiceReply = read_frame(stream, OPERATION_FRAME_LIMIT, reply_deadline).await?;
     ensure!(reply.id == request.id, "memory service reply ID changed");
     ensure!(
         reply.generation == authority.service_generation,
@@ -1512,31 +1626,21 @@ async fn dispatch(
     request_id: Uuid,
     call: ServiceCall,
 ) -> Result<ServiceValue> {
-    let unit_receipt_view = match &call {
-        ServiceCall::View {
-            candidate: Some(handle),
-            ..
-        } if call.unit_receipt_method().is_some() => state
-            .candidates
-            .get(handle)
-            .context("candidate does not belong to this attachment")?
-            .view()
-            .pinned_view()
-            .to_owned(),
-        _ => "main".to_owned(),
+    let unit_receipt_view = if call.unit_receipt_method().is_some() {
+        unit_receipt_view(&call, state)?
+    } else {
+        "main".to_owned()
     };
     let unit_receipt = call.unit_receipt_bytes(&unit_receipt_view)?;
     let value = match call {
         ServiceCall::RetireIfIdle => ServiceValue::Retirement {
-            accepted: state.candidates.is_empty()
-                && state.exports.is_empty()
-                && state.dream_lease.is_none()
+            accepted: !state.holds_resources()
                 && retirement.is_some_and(Retirement::request_if_idle),
         },
         ServiceCall::TryAcquireDreamLease => {
             if state.dream_lease.is_none() {
                 ensure!(
-                    state.candidates.is_empty() && state.exports.is_empty(),
+                    !state.holds_resources(),
                     "dream lease acquisition requires a dedicated main-view attachment"
                 );
                 state.dream_lease = store.try_acquire_dream_lease();
@@ -1604,7 +1708,8 @@ async fn dispatch(
             base,
             target,
         } => {
-            if !state.candidates.is_empty() || !state.exports.is_empty() {
+            // Handles only: a dream-lease holder is not refused here today.
+            if state.holds_handles() {
                 return Err(CandidateRefRejected(CandidateRefRefusal::Active).into());
             }
             let _reservation = retirement
