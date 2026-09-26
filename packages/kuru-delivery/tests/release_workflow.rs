@@ -568,7 +568,8 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
     ));
     // The updater step is online, receives the token only for release
     // listing, and names the installed shipping executable, never Cargo's
-    // target directory, which a later Windows step rebuilds with all features.
+    // target directory, which the Windows build-input check between
+    // installation and this step has already rebuilt with all features.
     let updater = steps[step("Accept an update from the previous published release")];
     for required in [
         "KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.temp }}/kuru-bin/kuru${{ runner.os == 'Windows' && '.exe' || '' }}",
