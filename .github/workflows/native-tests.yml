@@ -450,9 +450,9 @@ jobs:
       # downloads the previous release's assets anonymously.
       - name: Accept an update from the previous published release
         env:
-          # The installed copy is the verified shipping build; on Windows
-          # bundle:verify-native-build later relinks Cargo's release output
-          # with all features, so the target directory is not the candidate.
+          # The installed copy is the verified shipping build. On Windows the
+          # earlier bundle:verify-native-build step has already relinked Cargo's
+          # release output with all features, so that is not the candidate.
           KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.temp }}/kuru-bin/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
           GITHUB_TOKEN: ${{ github.token }}
         run: mise run //packages/kuru-delivery:test:previous-release-update
