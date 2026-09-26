@@ -1,7 +1,7 @@
 ## Why
 
-Upstream Dolt publishes engine archives for five targets but has never shipped
-windows/arm64, and Dolt v2.3.3 cannot be built for it without cgo (go-mysql-server's
+Kuru bundles upstream Dolt engine archives for four release targets, but upstream
+Dolt has never shipped windows/arm64, and Dolt v2.3.3 cannot be built for it without cgo (go-mysql-server's
 ICU regex and gozstd need a C/C++ toolchain). Windows on Arm support (the follow-on
 change) therefore needs Kuru's bundled build-input pipeline to produce a pinned,
 reproducible engine archive from pinned sources instead of downloading one, while
@@ -56,7 +56,7 @@ None.
 
 ## Impact
 
-- `packages/kuru-memory/support/dolt-assets.json` (schema v2, sixth asset),
+- `packages/kuru-memory/support/dolt-assets.json` (schema v2, fifth asset),
   `packages/kuru-memory/support/bundle.rs`, `packages/kuru-memory/build.rs`,
   `packages/kuru-memory/src/catalog.rs`, `packages/kuru-memory/src/provision.rs`
   (notice-aware zip extraction), related tests.
@@ -70,7 +70,7 @@ None.
 - `docs/development.md`.
 - The built asset's `archive_sha256` is coupled to the exact `zip`/`flate2` crate pins;
   a lockfile refresh that moves them must re-pin it.
-- Not breaking: the five upstream targets' archives, digests, preparation, embedding
+- Not breaking: the four upstream targets' archives, digests, preparation, embedding
   and extraction are unchanged.
 
 ## Surfaces

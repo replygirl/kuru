@@ -121,7 +121,7 @@ fn manifest(icu: &[u8]) -> Value {
         asset["license_bytes"] = json!(LICENSES.len());
         asset["license_sha256"] = json!(digest(LICENSES));
     }
-    let built = &mut manifest["assets"][5];
+    let built = &mut manifest["assets"][4];
     assert_eq!(built["target"], TARGET);
     built["build"]["sources"]["icu"]["bytes"] = json!(icu.len());
     built["build"]["sources"]["icu"]["sha256"] = json!(digest(icu));
@@ -145,7 +145,7 @@ fn manifest(icu: &[u8]) -> Value {
 }
 
 fn pin(manifest: &mut Value, pins: &ObservedPins) {
-    let built = &mut manifest["assets"][5];
+    let built = &mut manifest["assets"][4];
     built["compressed_bytes"] = json!(pins.compressed_bytes);
     built["archive_sha256"] = json!(pins.archive_sha256);
     built["expanded_bytes"] = json!(pins.expanded_bytes);
@@ -603,7 +603,7 @@ async fn committed_pins_are_verified_and_any_drift_fails_with_both_digests() {
     );
     // A pinned notice that changes is also drift.
     fixture.edit(|manifest| {
-        manifest["assets"][5]["notices"][1]["sha256"] = json!("0".repeat(64));
+        manifest["assets"][4]["notices"][1]["sha256"] = json!("0".repeat(64));
     });
     let message = error(
         fixture

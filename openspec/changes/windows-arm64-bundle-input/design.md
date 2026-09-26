@@ -6,8 +6,9 @@ required; static ICU 78.3 with stub data keeps `dolt.exe` about 118 MB under the
 build host is pinned). Current constraints:
 
 - Two independent `deny_unknown_fields` parsers read `dolt-assets.json`:
-  `packages/kuru-memory/support/bundle.rs` (build.rs, catalog, tests; exactly 5 assets,
-  fixed target→stem map, dolthub URL rule, zip `exe + license == expanded`) and
+  `packages/kuru-memory/support/bundle.rs` (build.rs, catalog, tests; exactly one
+  asset per entry of a target→stem table, which #106 reduced to the four release
+  targets without `x86_64-apple-darwin`; dolthub URL rule, zip `exe + license == expanded`) and
   `packages/kuru-delivery/src/bundle.rs` (1–32 assets, HTTPS URL rule).
 - `provision.rs::extract_zip` requires exactly four members; `kuru-archive` ZIP rules
   (Unix creator, no descriptors, no ZIP64, no comments) are satisfied by
@@ -17,7 +18,7 @@ build host is pinned). Current constraints:
 
 ## Goals / Non-Goals
 
-**Goals:** a built provenance that cannot perturb the five upstream targets; a
+**Goals:** a built provenance that cannot perturb the four upstream targets; a
 fail-closed representation of "not yet pinned"; a reproducible build whose pins are
 established and enforced only by linux-x64 CI.
 
@@ -29,8 +30,11 @@ hosting or publishing built archives; a Dolt version bump; PGO parity with upstr
 1. **Explicit `provenance` field, upstream entries otherwise unchanged.** Each asset
    gains `"provenance": "upstream" | "built"` directly after `executable_name`; all
    existing upstream keys, values and order (including flat `url`) stay. Missing or
-   unknown provenance is rejected. Rejected: nesting `url` under `source: {kind, url}`
-   (rewrites upstream entries); defaulting absent to upstream (not fail-closed).
+   unknown provenance is rejected. The kuru-memory target→stem table gains
+   `aarch64-pc-windows-msvc` → `dolt-windows-arm64`, so its exact asset count is the
+   table length: five (four upstream plus the built entry, at index 4). Rejected:
+   nesting `url` under `source: {kind, url}` (rewrites upstream entries); defaulting
+   absent to upstream (not fail-closed).
 2. **Built entries.** `url` is forbidden; `build` is required:
    `recipe` (allowlist `dolt-cgo-llvm-mingw-icu-stub/1`), `host` (`linux-x64`),
    `goos`, `goarch`, `tags` (`["icu_static","timetzdata"]`),

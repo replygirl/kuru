@@ -1,6 +1,6 @@
 ## 1. Manifest schema v2
 
-- [x] 1.1 (T1) Implement schema v2 with explicit `provenance`, the `build` object, `"unpinned"` sentinels and the validators in design.md in both `packages/kuru-memory/support/bundle.rs` and `packages/kuru-delivery/src/bundle.rs`; add the inert `aarch64-pc-windows-msvc` built entry and raise the kuru-memory asset count to 6; branch preparation on provenance so other targets never read built inputs and unpinned built assets are refused; verify with verification rows 1.1–1.5
+- [x] 1.1 (T1) Implement schema v2 with explicit `provenance`, the `build` object, `"unpinned"` sentinels and the validators in design.md in both `packages/kuru-memory/support/bundle.rs` and `packages/kuru-delivery/src/bundle.rs`; add the inert `aarch64-pc-windows-msvc` built entry and raise the kuru-memory asset count to 5 (the four upstream release targets plus the built entry); branch preparation on provenance so other targets never read built inputs and unpinned built assets are refused; verify with verification rows 1.1–1.5
 - [x] 1.2 (T2) Add notices handling: parser rules, built zip size rule, runtime `Asset` notices list (empty for upstream) and notice-aware `provision.rs::extract_zip`; verify with verification rows 2.1–2.2
 
 ## 2. Source build

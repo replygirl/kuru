@@ -1260,7 +1260,7 @@ mod tests {
         assert!(asset.built && asset.url.is_empty());
         // Its unpinned round-one form is refused before any work.
         let mut unpinned: serde_json::Value = serde_json::from_slice(committed).unwrap();
-        let entry = &mut unpinned["assets"][5];
+        let entry = &mut unpinned["assets"][4];
         assert_eq!(entry["target"], "aarch64-pc-windows-msvc");
         for (field, sentinel) in [
             ("compressed_bytes", serde_json::Value::Null),
@@ -1320,7 +1320,7 @@ mod tests {
             .filter(|asset| asset.provenance == Provenance::Upstream)
             .map(|asset| asset.target.clone())
             .collect();
-        assert_eq!(upstream.len(), 5);
+        assert_eq!(upstream.len(), 4);
         for target in &upstream {
             let mut asset = manifest(&path, target).unwrap();
             assert!(!asset.built);
@@ -1348,7 +1348,7 @@ mod tests {
         server.abort();
         let _ = server.await;
         let requests = requests.lock().unwrap().clone();
-        assert_eq!(requests.len(), 5, "{requests:?}");
+        assert_eq!(requests.len(), upstream.len(), "{requests:?}");
         for (request, target) in requests.iter().zip(&upstream) {
             let stem = parsed.select(target).unwrap().stem.clone();
             assert!(
