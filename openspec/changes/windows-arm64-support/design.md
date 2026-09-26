@@ -798,13 +798,13 @@ tools; `dumpbin` is a build-time acceptance dependency only.
    distinct error." (Was: designer default, needs lead confirmation, that the
    predecessor decision is evidenced by a log line only, not a field in a
    future staged-acceptance receipt.) Applied in D5.
-3. Needs lead confirmation: lead decision 4 says PR6a is "merged before PR6b
+3. Open, 2026-09-26 note: lead decision 4 says PR6a is "merged before PR6b
    starts"; this change runs phase 2 before PR6a merges and treats PR6a as soft
    for `cospec apply` but hard for phase 3 and archive (blocking-changes Phase
-   Gates). Blocks the start of phase 2. Not addressed by the 2026-09-26
-   rulings; lead ruling 7 (a verification draft PR later rebased onto PR6a's
-   branch) presupposes phase 2 work before PR6a exists, but this question
-   stays open until the lead answers it.
+   Gates). Lead ruling 7 (a verification draft PR later rebased onto PR6a's
+   branch) presupposes phase 2 work before PR6a exists. This question stays open
+   pending the lead's answer to whether PR6a's merge must precede phase 2 or
+   phase 3.
 4. Resolved 2026-09-26 by lead ruling 2 (kuru-implement-phase2-sep26a): "Reject an explicit
    -Target that mismatches the native machine, with a message that names the
    native target." (Was: designer default, needs lead confirmation, that an
