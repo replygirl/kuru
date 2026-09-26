@@ -357,7 +357,8 @@ cleanup remains pending. Rerunning the normal PowerShell installer reconciles
 the private receipt, including an interrupted update where `kuru.exe` is absent.
 It refuses an unknown replacement at that path. A verified helper cache entry is
 retained for recovery and occupies approximately one executable per updated
-current-version digest.
+current-version digest, under `$XDG_CACHE_HOME\kuru\update-helpers` when that
+variable is set, otherwise `%LOCALAPPDATA%\kuru\update-helpers`.
 
 For a source installation, select the desired revision and install it again, or
 run `kuru update --source /path/to/kuru`.
