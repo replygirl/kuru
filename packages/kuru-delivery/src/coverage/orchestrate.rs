@@ -607,6 +607,7 @@ async fn run_shard<H: Host>(
         canonical_attempt(&common.attempt).is_some(),
         "coverage run attempt must be a positive integer without leading zeros"
     );
+    artifact_os_label(&common.os)?;
     let known = workspace_packages();
     for package in &inputs.packages {
         ensure!(
@@ -1731,12 +1732,15 @@ mod tests {
         let error = helper.run(Mode::Shard).await.unwrap_err().to_string();
         assert!(error.contains("coverage helper"), "{error}");
 
-        let mut os = Scenario::new(Mode::Collect);
-        os.vars
-            .insert(format!("{INPUT_PREFIX}OS"), "Ubuntu".to_owned());
-        let error = os.run(Mode::Collect).await.unwrap_err().to_string();
-        assert!(error.contains("[a-z0-9-]+"), "{error}");
-        assert!(os.fake.steps.is_empty());
+        for mode in [Mode::Shard, Mode::Collect] {
+            let mut os = Scenario::new(mode);
+            os.vars
+                .insert(format!("{INPUT_PREFIX}OS"), "Ubuntu".to_owned());
+            let error = os.run(mode).await.unwrap_err().to_string();
+            assert!(error.contains("[a-z0-9-]+"), "{mode:?}: {error}");
+            assert!(os.fake.steps.is_empty(), "{mode:?}");
+            assert!(!os.job("target").exists(), "{mode:?}");
+        }
     }
 
     #[tokio::test]

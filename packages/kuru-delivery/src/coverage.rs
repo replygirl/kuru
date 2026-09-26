@@ -843,7 +843,7 @@ trait TestProcess {
     /// Diagnostic resource sample taken before termination.
     fn sample(&self) -> Option<String>;
     /// Terminate the retained tree, never a numeric identity.
-    fn terminate(&mut self) -> std::io::Result<()>;
+    async fn terminate(&mut self) -> std::io::Result<()>;
     /// The tree's residual presence, available only once its root is reaped.
     fn presence_after_reap(&self) -> Option<String> {
         None
@@ -994,7 +994,7 @@ where
         };
         let (sample, termination, cleanup, presence_after_reap) = if waited.is_err() {
             let sample = process.sample();
-            let termination = format!("{:?}", process.terminate());
+            let termination = format!("{:?}", process.terminate().await);
             let cleanup = format!("{:?}", process.wait(cleanup_bound).await);
             // Recorded only after the cleanup wait has had its chance to reap.
             (sample, termination, cleanup, process.presence_after_reap())
@@ -1185,7 +1185,7 @@ pub async fn dispatch_test(options: &DispatchOptions<'_>) -> Result<Option<ExitS
                     },
                 )
             }
-            fn terminate(&mut self) -> std::io::Result<()> {
+            async fn terminate(&mut self) -> std::io::Result<()> {
                 self.0.terminate()
             }
         }
@@ -1427,7 +1427,7 @@ where
     let output = match child.take_stdout() {
         Ok(output) => output,
         Err(error) => {
-            let termination = child.terminate();
+            let termination = child.terminate().await;
             let cleanup = child.wait(cleanup_bound).await;
             bail!(
                 "Cargo test process has no stdout pipe: {error}; termination={termination:?}; cleanup={cleanup:?}"
@@ -1454,8 +1454,9 @@ impl TestProcess for GroupProcess {
             let state = self.owner.root_state();
             self.observed = format!("{state:?}");
             match state {
-                RootState::Exited => return self.settle().await,
-                RootState::Reaped(status) => return Ok(status),
+                // A reaped root still settles: a cancelled wait may have been
+                // dropped between the reap and the absence confirmation.
+                RootState::Exited | RootState::Reaped(_) => return self.settle().await,
                 RootState::Running | RootState::Interrupted => {}
                 RootState::Disarmed(reason) => return Err(disarmed(reason)),
             }
@@ -1474,17 +1475,24 @@ impl TestProcess for GroupProcess {
         Some(format!("root_state={}", self.observed))
     }
 
-    fn terminate(&mut self) -> std::io::Result<()> {
+    async fn terminate(&mut self) -> std::io::Result<()> {
         use kuru_platform::unix::Termination;
 
-        match self.owner.terminate_before_reap() {
-            // The transition may already have been consumed by a settling exit.
-            Termination::Signalled(_) | Termination::InvalidPhase => Ok(()),
-            Termination::Interrupted => Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "owned test process group observation was interrupted",
-            )),
-            Termination::Disarmed(reason) => Err(disarmed(reason)),
+        let limit = tokio::time::Instant::now() + self.settle_bound;
+        loop {
+            match self.owner.terminate_before_reap() {
+                // The transition may already have been consumed by a settling exit.
+                Termination::Signalled(_) | Termination::InvalidPhase => return Ok(()),
+                Termination::Interrupted => {}
+                Termination::Disarmed(reason) => return Err(disarmed(reason)),
+            }
+            if tokio::time::Instant::now() >= limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "owned test process group observation was interrupted",
+                ));
+            }
+            tokio::time::sleep(GROUP_POLL).await;
         }
     }
 
@@ -3200,7 +3208,7 @@ mod tests {
         fn sample(&self) -> Option<String> {
             Some("kernel_time=0ns".to_owned())
         }
-        fn terminate(&mut self) -> std::io::Result<()> {
+        async fn terminate(&mut self) -> std::io::Result<()> {
             self.terminated = self.terminate_result;
             if self.terminate_result {
                 Ok(())
@@ -3486,7 +3494,7 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(process.sample().as_deref(), Some("root_state=Running"));
         assert_eq!(process.presence_after_reap(), None);
-        process.terminate().unwrap();
+        process.terminate().await.unwrap();
         // Before the reap the group is still unobserved.
         assert_eq!(process.presence_after_reap(), None);
         let status = process.wait(GROUP_BOUND).await.unwrap();
@@ -3497,7 +3505,7 @@ mod tests {
         );
         assert_eq!(process.presence_after_reap().as_deref(), Some("Absent"));
         // The consumed transition and cached reap are stable.
-        process.terminate().unwrap();
+        process.terminate().await.unwrap();
         assert_eq!(process.wait(GROUP_BOUND).await.unwrap(), status);
         assert!(process.sample().unwrap().starts_with("root_state=Reaped("));
 
