@@ -140,7 +140,7 @@ fn required_release_checks_precede_the_only_publication_job() {
     }
 
     let verifier = job("verify-staged");
-    // Staged acceptance runs on each supported operating system before promotion.
+    // Staged acceptance runs on every supported platform before promotion.
     let matrix = verifier
         .split("        include:\n")
         .nth(1)

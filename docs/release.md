@@ -264,9 +264,7 @@ release's own updater must install those exact bytes. These legs do not yet
 prove the mise installation route that the Windows leg proves, and the updater
 check repackages the staged executable rather than serving the staged archive
 itself. An app-owned Unix `//apps/kuru-tui:verify:staged` task is the follow-on
-that closes this gap. Intel macOS (`x86_64-apple-darwin`) has no staged leg:
-it is a known gap, and its native release build alone verifies the packaged
-offline runtime.
+that closes this gap.
 
 `deploy-docs` depends on every leg of this native check and the independent docs
 build. The `publish` job depends on successful deployment, so a candidate, any
