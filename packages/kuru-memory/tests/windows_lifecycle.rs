@@ -1,7 +1,6 @@
 #![cfg(windows)]
 use anyhow::{Context, Result, ensure};
 use kuru_memory::{
-    provision,
     server::{Server, ServerOptions},
     test_support,
 };
@@ -278,7 +277,7 @@ async fn marker_rows(
 async fn marker_interruption(after_marker: bool, kill_creator: bool) -> Result<()> {
     use sha2::{Digest, Sha256};
     let mut owner = Fixture::new()?;
-    let binary = provision::provision(&Default::default(), &test_support::cache_dir()).await?;
+    let binary = test_support::warm_runtime_cache().await?;
     let options = test_support::windows::ready_marker_options(
         owner.path(),
         binary.clone(),
@@ -511,7 +510,7 @@ async fn marker_observer_eof_awaits_cleanup_without_stranding_the_release_channe
 #[tokio::test]
 async fn marker_startup_failure_reports_its_actual_cause_and_releases_the_writer() -> Result<()> {
     let mut owner = Fixture::new()?;
-    let binary = provision::provision(&Default::default(), &test_support::cache_dir()).await?;
+    let binary = test_support::warm_runtime_cache().await?;
     let options = test_support::windows::ready_marker_options(
         owner.path(),
         binary.clone(),
@@ -582,7 +581,7 @@ async fn marker_startup_failure_reports_its_actual_cause_and_releases_the_writer
 
 async fn loss(whole_job: bool, mode: &str) -> Result<()> {
     let mut owner = Fixture::new()?;
-    let binary = provision::provision(&Default::default(), &test_support::cache_dir()).await?;
+    let binary = test_support::warm_runtime_cache().await?;
     let lifetime = if whole_job {
         Lifetime::OwnedJob
     } else {
@@ -768,7 +767,7 @@ async fn creator_loss_after_partial_readiness_consumption_reaps_the_initialized_
 #[tokio::test]
 async fn normal_headless_dolt_close_reaps_the_supervisor_and_reopens_accepted_sql() -> Result<()> {
     let mut owner = Fixture::new()?;
-    let binary = provision::provision(&Default::default(), &test_support::cache_dir()).await?;
+    let binary = test_support::warm_runtime_cache().await?;
     fixture(
         &mut owner,
         &binary,

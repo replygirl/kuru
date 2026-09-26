@@ -1,6 +1,5 @@
 use anyhow::Result;
 use kuru_memory::{
-    provision,
     server::{Server, ServerOptions},
     test_support,
 };
@@ -18,7 +17,7 @@ async fn prepared_snapshot_runs_real_supervisor_after_cargo_alias_disappears_and
     fs::copy(env!("CARGO_BIN_EXE_kuru-memory"), &source)?;
     let supervisor = test_support::snapshot_supervisor(&source, root.path())?;
     fs::remove_file(&source)?;
-    let binary = provision::provision(&Default::default(), &test_support::cache_dir()).await?;
+    let binary = test_support::warm_runtime_cache().await?;
     let options = ServerOptions {
         binary,
         directory: root.path().join("actual store"),

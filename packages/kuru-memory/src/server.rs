@@ -56,6 +56,19 @@ const RECORD_LIMIT: usize = 64 * 1024;
 const LOG_LIMIT: usize = 32 * 1024;
 const CLOSE_GRACE: Duration = Duration::from_secs(8);
 const KILL_GRACE: Duration = Duration::from_secs(3);
+/// Supervisor-transport allowance beyond a Dolt-side budget: added to the
+/// configured startup timeout for readiness and the first authenticated
+/// connection, and to the Dolt stop graces for the supervisor's exit report.
+pub(crate) const SUPERVISOR_TRANSPORT_ALLOWANCE: Duration = Duration::from_secs(2);
+/// Bound for the supervisor to stop Dolt gracefully, kill it, and report its
+/// own exit after its lifetime closes. `finish_owner` enforces it.
+const SUPERVISOR_REAP_ALLOWANCE: Duration = CLOSE_GRACE
+    .saturating_add(KILL_GRACE)
+    .saturating_add(SUPERVISOR_TRANSPORT_ALLOWANCE);
+/// A dropped owner's background observer warns only once the supervisor has
+/// outlived the reap allowance by this margin; it tracks that allowance
+/// rather than defining a separate budget.
+const DROPPED_REAP_WARNING_MARGIN: Duration = Duration::from_secs(1);
 
 /// Worst-case owned close, as bounded by `close_pools_and_owner`: the first
 /// graceful pool drain, the Windows lifetime close, the supervisor reap
@@ -64,7 +77,7 @@ const KILL_GRACE: Duration = Duration::from_secs(3);
 pub(crate) fn close_budget() -> Duration {
     CLOSE_GRACE
         .saturating_add(KILL_GRACE)
-        .saturating_add(CLOSE_GRACE + KILL_GRACE + Duration::from_secs(2))
+        .saturating_add(SUPERVISOR_REAP_ALLOWANCE)
         .saturating_add(CLOSE_GRACE)
 }
 
@@ -141,7 +154,7 @@ impl Drop for Owner {
             observe_supervisor(
                 child,
                 retained,
-                CLOSE_GRACE + KILL_GRACE + Duration::from_secs(3),
+                SUPERVISOR_REAP_ALLOWANCE + DROPPED_REAP_WARNING_MARGIN,
                 SupervisorChild::try_wait,
             )
         });
@@ -409,7 +422,7 @@ impl Server {
         // Readiness, the first authenticated connection, and its identity
         // check are one startup operation. The two seconds are the existing
         // supervisor-transport allowance, not a fresh budget after Ready.
-        let startup_deadline = Instant::now() + options.timeout + Duration::from_secs(2);
+        let startup_deadline = Instant::now() + options.timeout + SUPERVISOR_TRANSPORT_ALLOWANCE;
         #[cfg(unix)]
         let (mut owner, response) = {
             let mut command = Command::new(options.supervisor);
@@ -786,7 +799,7 @@ async fn finish_owner(owner: &mut Owner) -> Result<()> {
         lifetime.close(KILL_GRACE).await?;
     }
     drop(owner.lifetime.take());
-    let deadline = Instant::now() + CLOSE_GRACE + KILL_GRACE + Duration::from_secs(2);
+    let deadline = Instant::now() + SUPERVISOR_REAP_ALLOWANCE;
     let status = loop {
         if let Some(status) = owner
             .child

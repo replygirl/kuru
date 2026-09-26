@@ -9573,9 +9573,10 @@ mod tests {
 
     #[tokio::test]
     async fn service_disconnect_and_owner_restart_preserve_unresolved_candidate() -> Result<()> {
-        // Real lifecycles: owner, local open, successor owner and final local
-        // reopen.
-        let deadline = crate::test_support::fixture_deadline(4);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: a fresh owner, then a reopened local store, successor owner and final
+        // local store.
+        let deadline = crate::test_support::fixture_deadline(1, 3);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -11814,8 +11815,9 @@ mod tests {
 
     #[tokio::test]
     async fn committed_promotion_retries_cleanup_before_caching_success() -> Result<()> {
-        // Real lifecycles: one local store.
-        let deadline = crate::test_support::fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh local store.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let mut options = crate::test_support::open_options(
@@ -11875,8 +11877,9 @@ mod tests {
 
     #[tokio::test]
     async fn candidate_transition_observation_uses_exact_refs_and_revisions() -> Result<()> {
-        // Real lifecycles: one temporary local store.
-        let deadline = crate::test_support::fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh temporary local store.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let store = MemoryStore::temporary().await?;
             let stale = store.begin_candidate("stale transition").await?;
@@ -11940,8 +11943,9 @@ mod tests {
     #[tokio::test]
     async fn selected_candidate_inventory_pages_past_foreign_prefix_and_abandons_exact_ref()
     -> Result<()> {
-        // Real lifecycles: one temporary local store.
-        let deadline = crate::test_support::fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh temporary local store.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let store = MemoryStore::temporary().await?;
             let candidate = store.begin_candidate("retained exact ref").await?;
@@ -12009,8 +12013,9 @@ mod tests {
 
     #[tokio::test]
     async fn candidate_creation_outcome_only_reads_its_exact_ref_across_restart() -> Result<()> {
-        // Real lifecycles: one local store, then its reopen.
-        let deadline = crate::test_support::fixture_deadline(2);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh local store, then its reopen.
+        let deadline = crate::test_support::fixture_deadline(1, 1);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let options = crate::test_support::open_options(

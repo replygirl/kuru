@@ -2837,8 +2837,9 @@ mod tests {
 
     #[tokio::test]
     async fn managed_public_transcript_pages_preserve_main_and_candidate_views() -> Result<()> {
-        // Real service lifecycles: a local seed open, then one service owner.
-        let deadline = fixture_deadline(2);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: a fresh local seed open, then the owner reopens it.
+        let deadline = fixture_deadline(1, 1);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -2981,8 +2982,9 @@ mod tests {
     #[tokio::test]
     async fn managed_session_lifecycle_is_reversible_receipted_and_candidate_isolated() -> Result<()>
     {
-        // Real service lifecycles: one service owner.
-        let deadline = fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -3433,8 +3435,9 @@ mod tests {
     #[tokio::test]
     async fn managed_fork_lost_reply_recovers_one_atomic_child_and_candidate_stays_isolated()
     -> Result<()> {
-        // Real service lifecycles: one service owner.
-        let deadline = fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -3658,8 +3661,9 @@ mod tests {
 
     #[tokio::test]
     async fn managed_mode_checkpoint_lost_reply_reconciles_catalog_and_state_once() -> Result<()> {
-        // Real service lifecycles: one service owner.
-        let deadline = fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -3838,8 +3842,9 @@ mod tests {
     #[tokio::test]
     async fn managed_public_turn_lost_reply_reconciles_without_duplicate_settlement() -> Result<()>
     {
-        // Real service lifecycles: one service owner.
-        let deadline = fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -4262,8 +4267,9 @@ mod tests {
 
     #[tokio::test]
     async fn managed_legacy_continuation_lost_reply_reconciles_without_a_user_row() -> Result<()> {
-        // Real service lifecycles: a local seed open, then one service owner.
-        let deadline = fixture_deadline(2);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: a fresh local seed open, then the owner reopens it.
+        let deadline = fixture_deadline(1, 1);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -4452,8 +4458,9 @@ mod tests {
     #[tokio::test]
     async fn cancelling_after_accepted_unit_frame_fences_clones_until_indexed_proof() -> Result<()>
     {
-        // Real service lifecycles: one service owner.
-        let deadline = fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -4554,8 +4561,9 @@ mod tests {
 
     #[tokio::test]
     async fn remote_reasoning_summary_lost_reply_reconciles_one_atomic_receipt() -> Result<()> {
-        // Real service lifecycles: one service owner.
-        let deadline = fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -4694,8 +4702,9 @@ mod tests {
 
     #[tokio::test]
     async fn remote_session_checkpoint_lost_reply_preserves_pinned_provenance() -> Result<()> {
-        // Real service lifecycles: one service owner.
-        let deadline = fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -5052,9 +5061,10 @@ mod tests {
 
     #[tokio::test]
     async fn selected_abandon_lost_reply_proves_staged_but_not_empty_ref() -> Result<()> {
-        // Real service lifecycles: each of two iterations opens a local store,
-        // then an owner and its successor.
-        let deadline = fixture_deadline(6);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: each of two iterations opens a fresh local store, then an owner and its
+        // successor reopen it.
+        let deadline = fixture_deadline(2, 4);
         tokio::time::timeout(deadline, async {
             for staged in [false, true] {
                 let root = crate::test_support::tempdir()?;
@@ -5258,8 +5268,9 @@ mod tests {
 
     #[tokio::test]
     async fn lost_candidate_unit_reply_reattaches_before_read_write_and_promotion() -> Result<()> {
-        // Real service lifecycles: one owner, then an owner and its restarted successor.
-        let deadline = fixture_deadline(3);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: two fresh owners, the second followed by its reopened successor.
+        let deadline = fixture_deadline(2, 1);
         tokio::time::timeout(deadline, async {
             for restart_owner in [false, true] {
                 let root = crate::test_support::tempdir()?;
@@ -5476,8 +5487,9 @@ mod tests {
     #[tokio::test]
     async fn candidate_promotion_recovery_uses_exact_target_and_releases_clone_fence() -> Result<()>
     {
-        // Real service lifecycles: one service owner.
-        let deadline = fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -5592,8 +5604,9 @@ mod tests {
     #[tokio::test]
     async fn preserved_candidate_conflict_reattaches_before_releasing_mutation_fence() -> Result<()>
     {
-        // Real service lifecycles: one service owner.
-        let deadline = fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -5693,8 +5706,9 @@ mod tests {
 
     #[tokio::test]
     async fn usage_reply_recovery_fences_clones_until_natural_key_is_proven() -> Result<()> {
-        // Real service lifecycles: one service owner.
-        let deadline = fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -5759,8 +5773,9 @@ mod tests {
     #[tokio::test]
     async fn candidate_begin_recovery_keeps_clones_fenced_until_exact_ref_reattaches() -> Result<()>
     {
-        // Real service lifecycles: one owner, then an owner and its restarted successor.
-        let deadline = fixture_deadline(3);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: two fresh owners, the second followed by its reopened successor.
+        let deadline = fixture_deadline(2, 1);
         tokio::time::timeout(deadline, async {
             for restart_owner in [false, true] {
                 let root = crate::test_support::tempdir()?;
@@ -5927,8 +5942,9 @@ mod tests {
     #[tokio::test]
     async fn managed_dream_lease_serializes_dreams_without_blocking_ordinary_memory() -> Result<()>
     {
-        // Real service lifecycles: one service owner.
-        let deadline = fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
@@ -6034,9 +6050,10 @@ mod tests {
 
     #[tokio::test]
     async fn managed_facade_preserves_views_ledger_export_and_independent_clients() -> Result<()> {
-        // Real service lifecycles: one service owner. The competing local open
-        // is refused by the owner's store lease under its own inner bound.
-        let deadline = fixture_deadline(1);
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner. The competing local open is refused by the
+        // owner's store lease under its own inner bound.
+        let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
