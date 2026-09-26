@@ -1,11 +1,11 @@
 ---
 name: cospec-ff-change
-description: Author every remaining artifact on an already-scaffolded change in one pass, then validate.
+description: Author every remaining artifact on an already-scaffolded change in one pass, then validate. Also use when the user says "cospec ff", "cospec fast-forward", or "openspec ff".
 license: MIT
 compatibility: Requires the cospec CLI (@aligned-team/cospec).
 metadata:
   author: cospec
-  generatedBy: cospec@0.7.1
+  generatedBy: cospec@0.8.2
   contentHash: sha256:297fcf956284a582d82fe043cbdc0091ade5810399cdc4f9b0417a9014a9938f
 ---
 

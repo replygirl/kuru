@@ -238,129 +238,129 @@ backend = "cargo:cargo-llvm-cov"
 specifiers = ["0.9.1"]
 
 [[tools."github:aligned-team/cospec"]]
-version = "0.7.1"
+version = "0.8.2"
 backend = "github:aligned-team/cospec"
-specifiers = ["0.7.1"]
+specifiers = ["0.8.2"]
 
 [tools."github:aligned-team/cospec"."platforms.linux-arm64"]
-checksum = "sha256:613a5267de54ec86dab997a5e0efeed6c9504554fa052cc70becb3531ac697f7"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-linux-arm64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504549"
+checksum = "sha256:1c28a151e9955a27076c6def53dfbdca643399ec8f45933f321e8a7fdf127b3b"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-linux-arm64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199686"
 provenance = "github-attestations"
 provenance_verified = true
 
 [tools."github:aligned-team/cospec"."platforms.linux-arm64-musl"]
-checksum = "sha256:62a49c3ca1308f8ef32dfc21646a1a97ffb00961f58775fafd66420179d9d4e3"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-linux-arm64-musl.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504550"
+checksum = "sha256:67b3262251d0e51044ab172cfd00d284c6935cf3a0cf5bf4d0e489e05bab263e"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-linux-arm64-musl.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199690"
 provenance = "github-attestations"
 
 [tools."github:aligned-team/cospec"."platforms.linux-x64"]
-checksum = "sha256:8cc3f1747147f2e88d3ce89fc773f2e6d505e9382daef1c60bd8404d099ca8d0"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-linux-x64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504548"
+checksum = "sha256:ec14d37a5e18b4603d88427e0f892cf8e0ea0787e45ddc64aac636d9fef3e185"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-linux-x64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199687"
 provenance = "github-attestations"
 provenance_verified = true
 
 [tools."github:aligned-team/cospec"."platforms.linux-x64-baseline"]
-checksum = "sha256:8cc3f1747147f2e88d3ce89fc773f2e6d505e9382daef1c60bd8404d099ca8d0"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-linux-x64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504548"
+checksum = "sha256:ec14d37a5e18b4603d88427e0f892cf8e0ea0787e45ddc64aac636d9fef3e185"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-linux-x64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199687"
 provenance = "github-attestations"
 
 [tools."github:aligned-team/cospec"."platforms.linux-x64-musl"]
-checksum = "sha256:5da54ddeccbe0198deea3ff3cd553ba1b22ba1535afe872aa87668cd31654914"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-linux-x64-musl.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504553"
+checksum = "sha256:9d30b71a35fd9dc1b5bc3b77e422163461f4b9c404948d19da3bb55ada975bb9"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-linux-x64-musl.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199685"
 provenance = "github-attestations"
 
 [tools."github:aligned-team/cospec"."platforms.linux-x64-musl-baseline"]
-checksum = "sha256:5da54ddeccbe0198deea3ff3cd553ba1b22ba1535afe872aa87668cd31654914"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-linux-x64-musl.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504553"
+checksum = "sha256:9d30b71a35fd9dc1b5bc3b77e422163461f4b9c404948d19da3bb55ada975bb9"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-linux-x64-musl.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199685"
 provenance = "github-attestations"
 
 [tools."github:aligned-team/cospec"."platforms.macos-arm64"]
-checksum = "sha256:2c94f407215a25d8c68408226fc0c11a158f984f9808e2a6316f4f8bacdee1af"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-macos-arm64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504552"
+checksum = "sha256:cc1e73d0d5396566cb23c52095ed72378da57090c7532b4871e9d2717d6c907f"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-macos-arm64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199684"
 provenance = "github-attestations"
 provenance_verified = true
 
 [tools."github:aligned-team/cospec"."platforms.macos-x64"]
-checksum = "sha256:563079b5baaaf6d458d6f7dbda97f28e776e1afad6e43b6880607d8ac68e5a1b"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-macos-x64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504590"
+checksum = "sha256:b1ea9191811356198796c73fa1962efb988883fd165ba6ae680331b77c6b8fd5"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-macos-x64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199757"
 provenance = "github-attestations"
 provenance_verified = true
 
 [tools."github:aligned-team/cospec"."platforms.macos-x64-baseline"]
-checksum = "sha256:563079b5baaaf6d458d6f7dbda97f28e776e1afad6e43b6880607d8ac68e5a1b"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-macos-x64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504590"
+checksum = "sha256:b1ea9191811356198796c73fa1962efb988883fd165ba6ae680331b77c6b8fd5"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-macos-x64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199757"
 provenance = "github-attestations"
 
 [tools."github:aligned-team/cospec"."platforms.windows-x64"]
-checksum = "sha256:823a74cc156c5c40efeb87d2a0df6eb1980013ad1bc50fd0c3661f2a2108be02"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-windows-x64.zip"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504596"
+checksum = "sha256:13e900c386f17a4daa2a3d32e36659d6cdf0a1dbb79fec7bb41f49042d6d3c2f"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-windows-x64.zip"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199765"
 provenance = "github-attestations"
 provenance_verified = true
 
 [tools."github:aligned-team/cospec"."platforms.windows-x64-baseline"]
-checksum = "sha256:823a74cc156c5c40efeb87d2a0df6eb1980013ad1bc50fd0c3661f2a2108be02"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-windows-x64.zip"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504596"
+checksum = "sha256:13e900c386f17a4daa2a3d32e36659d6cdf0a1dbb79fec7bb41f49042d6d3c2f"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-windows-x64.zip"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199765"
 provenance = "github-attestations"
 
 [[tools.mr-boxington]]
-version = "1.17.0"
+version = "1.18.0"
 backend = "packslip:github.com/jdx/mr-boxington"
-specifiers = ["1.17.0"]
+specifiers = ["1.18.0"]
 
 [tools.mr-boxington."platforms.linux-arm64"]
-checksum = "sha256:4dbe8a1af312d56b666847593192e50321ac25d3e06487086c237e3546ed252e"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.17.0/mbx-aarch64-unknown-linux-gnu.tar.gz"
+checksum = "sha256:ab0f4af3e98295bc35f448d453cfe15931bb02342d48163b2ede94583f937cdc"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-aarch64-unknown-linux-gnu.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.linux-arm64-musl"]
-checksum = "sha256:47e982e493201bd1c171b20f6e67121c45af0542ae882a79be2f4596a73967ca"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.17.0/mbx-aarch64-unknown-linux-musl.tar.gz"
+checksum = "sha256:3df879fdd6ea854b0c06a19eb345e735617fcda50b05814a1eaf4ea211120672"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-aarch64-unknown-linux-musl.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.linux-x64"]
-checksum = "sha256:7d6ffbae31b2943da86fde419270889d822f56f04ec15ed7bdb637a35f73f407"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.17.0/mbx-x86_64-unknown-linux-gnu.tar.gz"
+checksum = "sha256:92833c87261ea0c65fee52898ea67605b152b516fc0a3d8dee5a276601a8924c"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-x86_64-unknown-linux-gnu.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.linux-x64-baseline"]
-checksum = "sha256:7d6ffbae31b2943da86fde419270889d822f56f04ec15ed7bdb637a35f73f407"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.17.0/mbx-x86_64-unknown-linux-gnu.tar.gz"
+checksum = "sha256:92833c87261ea0c65fee52898ea67605b152b516fc0a3d8dee5a276601a8924c"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-x86_64-unknown-linux-gnu.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.linux-x64-musl"]
-checksum = "sha256:bfa8b9c2104562cbfb845529eb0b12873f866530880286643031757c1d889aa8"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.17.0/mbx-x86_64-unknown-linux-musl.tar.gz"
+checksum = "sha256:ef52bb50f593f749d513d98cb222d72006bfac743d11a5431b4494ed2bb128f3"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-x86_64-unknown-linux-musl.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.linux-x64-musl-baseline"]
-checksum = "sha256:bfa8b9c2104562cbfb845529eb0b12873f866530880286643031757c1d889aa8"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.17.0/mbx-x86_64-unknown-linux-musl.tar.gz"
+checksum = "sha256:ef52bb50f593f749d513d98cb222d72006bfac743d11a5431b4494ed2bb128f3"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-x86_64-unknown-linux-musl.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.macos-arm64"]
-checksum = "sha256:821d3efa1d0f496141e5041f65b90fa8551b9466d0b8cfc37fe92eb99c36fef3"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.17.0/mbx-aarch64-apple-darwin.tar.gz"
+checksum = "sha256:70ab23933b3745205125174120bd930c0116c1ef3ac38786122e5651636b9aea"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-aarch64-apple-darwin.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.windows-x64"]
-checksum = "sha256:1e449e748f8d8f8237799e692f22ae46fefd5a97c468e6e6af13aa8b363efc99"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.17.0/mbx-x86_64-pc-windows-msvc.zip"
+checksum = "sha256:6f3e761a18946b7d17ab54d4021773144ff7b9203b99b2df1ccddbebed6e1828"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-x86_64-pc-windows-msvc.zip"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.windows-x64-baseline"]
-checksum = "sha256:1e449e748f8d8f8237799e692f22ae46fefd5a97c468e6e6af13aa8b363efc99"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.17.0/mbx-x86_64-pc-windows-msvc.zip"
+checksum = "sha256:6f3e761a18946b7d17ab54d4021773144ff7b9203b99b2df1ccddbebed6e1828"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-x86_64-pc-windows-msvc.zip"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [[tools.rust]]

@@ -1,13 +1,13 @@
 ---
 name: "COSPEC: Verify"
-description: Dress-rehearse a change before archiving — validate strictly, walk the verification ledger, and name the hard archive gates.
+description: Dress-rehearse a change before archiving — validate strictly, walk the verification ledger, and name the hard archive gates. Also use when the user says "cospec verify" or "openspec verify".
 category: Workflow
 tags:
   - cospec
   - workflow
 metadata:
   author: cospec
-  generatedBy: cospec@0.7.1
+  generatedBy: cospec@0.8.2
   contentHash: sha256:d77817df123483dd7f40b93919041d8e5b09c2b55bc9681e503ffd5b63b9076a
 ---
 

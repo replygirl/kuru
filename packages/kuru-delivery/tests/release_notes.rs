@@ -186,7 +186,7 @@ impl Api {
                     Reply::Unauthorized => (StatusCode::UNAUTHORIZED, json!({"error": {"message": "sensitive provider payload: fixture-key"}})),
                     Reply::Malformed => (StatusCode::OK, json!({"unexpected": "provider payload"})),
                     Reply::NativeThinking => (StatusCode::OK, json!({
-                        "content": [{"type": "thinking", "thinking": "", "signature": "fixture"}, {"type": "text", "text": "# Notes\nUnsupported response shape."}],
+                        "content": [{"type": "thinking", "thinking": "", "signature": "fixture"}, {"type": "text", "text": "# Notes\nNative thinking response."}],
                         "stop_reason": "end_turn", "usage": {"input_tokens": 10, "output_tokens": 10}
                     })),
                 };
@@ -494,12 +494,13 @@ async fn snapshots_ignore_uncommitted_edits_and_generation_refuses_dirty_tools()
 }
 
 #[tokio::test]
-async fn actual_native_anthropic_adapter_still_rejects_claude_five_thinking() {
+async fn actual_native_anthropic_adapter_accepts_claude_five_thinking() {
     let repo = Fixture::new().await;
     let api = Api::new(Reply::NativeThinking).await;
     let output = repo.path().join("notes.md");
-    // Explicitly exercise the old adapter, with its own fake key. This must
-    // reach the API and fail on the response shape, not missing credentials.
+    // Explicitly exercise the native adapter, with its own fake key. Communiqué
+    // 1.4.0 replays signed thinking blocks; 1.3.5 rejected this response shape.
+    // Release configuration still selects the compatibility route.
     let result = tokio::time::timeout(
         TEST_TIMEOUT,
         release::rooted_command(repo.path(), "communique")
@@ -528,14 +529,13 @@ async fn actual_native_anthropic_adapter_still_rejects_claude_five_thinking() {
     .await
     .expect("native protocol fixture timed out")
     .unwrap();
-    assert!(!result.status.success());
-    let error = String::from_utf8_lossy(&result.stderr);
-    assert!(error.contains("unknown variant `thinking`"), "{error}");
-    println!(
-        "Actual native adapter rejected the thinking response: {}",
-        result.status
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
     );
-    assert!(!output.exists());
+    let notes = fs::read_to_string(&output).unwrap();
+    assert!(notes.contains("Native thinking response."), "{notes}");
     {
         let calls = api.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);

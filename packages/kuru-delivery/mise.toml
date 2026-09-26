@@ -1,7 +1,7 @@
 [vars]
 kuru_cargo_audit_version = "0.22.2"
 kuru_cocogitto_version = "7.0.0"
-kuru_communique_version = "1.3.5"
+kuru_communique_version = "1.4.2"
 
 [tasks.setup]
 description = "Install package task tools without running release commands"
