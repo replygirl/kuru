@@ -16,29 +16,19 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use kuru_memory::{
-    provision,
     server::{Server, ServerOptions},
+    test_support,
 };
 use sqlx::Row;
 use tokio::{
-    sync::{OnceCell, Semaphore},
+    sync::Semaphore,
     time::{Instant, sleep},
 };
 
-static ENGINE: OnceCell<PathBuf> = OnceCell::const_new();
 static SERVERS: Semaphore = Semaphore::const_new(1);
 
 async fn engine() -> Result<PathBuf> {
-    Ok(ENGINE
-        .get_or_try_init(|| async {
-            provision::provision(
-                &Default::default(),
-                &std::env::temp_dir().join("kuru-dolt-test-cache"),
-            )
-            .await
-        })
-        .await?
-        .clone())
+    test_support::warm_runtime_cache().await
 }
 
 fn options(root: &Path, binary: PathBuf) -> ServerOptions {

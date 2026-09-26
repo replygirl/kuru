@@ -24,8 +24,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 #[cfg(unix)]
 use tokio::process::Command;
 
-const LOCK_TIMEOUT: Duration = Duration::from_secs(180);
-const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const LOCK_TIMEOUT: Duration = Duration::from_secs(180);
+pub(crate) const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTPUT_LIMIT: u64 = 4096;
 #[cfg(windows)]
 const ACTIVATION_RETRY_LIMIT: Duration = Duration::from_secs(2);

@@ -80,6 +80,130 @@ pub fn tempdir() -> Result<TempDir> {
     TempDir::new("kuru-fixture-", None)
 }
 
+/// Provision the bundled Dolt runtime into the shared test cache once per test
+/// process and return its executable.
+///
+/// Fixtures call this before starting their own outer deadline, so a cold
+/// install is paid here once instead of inside whichever fixtures happen to
+/// start first. The wait is bounded by the provisioner's cache-lock peer budget
+/// plus its version-probe budget and [`WARM_UP_MARGIN`], so the product's own
+/// lock error wins that race and an installing caller's extraction and probe
+/// are covered; the result, including a failure, is shared by every later
+/// caller in the process.
+pub async fn warm_runtime_cache() -> Result<PathBuf> {
+    static WARMED: tokio::sync::OnceCell<std::result::Result<PathBuf, String>> =
+        tokio::sync::OnceCell::const_new();
+    WARMED
+        .get_or_init(|| async {
+            // Provisioning probes the extracted engine with a child process.
+            #[cfg(test)]
+            let _gate = crate::spawn_gate::spawning().await;
+            let config = OpenOptions::new(PathBuf::new(), String::new()).config;
+            let cache = crate::store::test_cache();
+            let bound = crate::provision::LOCK_TIMEOUT
+                .saturating_add(crate::provision::VERSION_TIMEOUT)
+                .saturating_add(WARM_UP_MARGIN);
+            match tokio::time::timeout(bound, crate::provision::provision(&config, &cache)).await {
+                Ok(Ok(binary)) => Ok(binary),
+                Ok(Err(error)) => Err(format!("warm test Dolt runtime cache: {error:#}")),
+                Err(_) => Err(format!("warm test Dolt runtime cache exceeded {bound:?}")),
+            }
+        })
+        .await
+        .clone()
+        .map_err(Error::msg)
+}
+
+/// Allowance beyond the provisioner's lock and probe budgets for extraction
+/// bookkeeping, so its own deadline errors are observed before the warm-up's.
+pub const WARM_UP_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Allowance for creating a fixture child process and its runtime before the
+/// product's own startup clock begins inside it.
+#[cfg(test)]
+pub(crate) const CHILD_START_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(test)]
+fn default_startup() -> std::time::Duration {
+    let config = OpenOptions::new(PathBuf::new(), String::new()).config;
+    std::time::Duration::from_secs(config.startup_timeout_secs)
+}
+
+/// One owned Dolt server start: the configured startup timeout plus the
+/// supervisor-transport allowance `Server::open` adds to it.
+#[cfg(test)]
+fn server_start_budget() -> std::time::Duration {
+    default_startup().saturating_add(crate::server::SUPERVISOR_TRANSPORT_ALLOWANCE)
+}
+
+/// A fresh store open (`MemoryStore::open_inner` with no active directory):
+/// the startup lock wait, four server starts (initialization, migration,
+/// validation, active) each with one `QUERY_TIMEOUT` session, three owned
+/// server closes, and the staged directory's quiescence wait.
+#[cfg(test)]
+pub(crate) fn fresh_open_budget() -> std::time::Duration {
+    let startup = default_startup();
+    startup
+        .saturating_add(
+            server_start_budget()
+                .saturating_add(crate::store::QUERY_TIMEOUT)
+                .saturating_mul(4),
+        )
+        .saturating_add(crate::server::close_budget().saturating_mul(3))
+        .saturating_add(startup)
+}
+
+/// Outer hang backstop for a fixture with `fresh` real lifecycles that create
+/// their store and `reopened` real lifecycles that reopen an existing one,
+/// under a single-stall model.
+///
+/// A lifecycle is a `ServiceOwner::open`, a spawned service owner, or a local
+/// `MemoryStore::open` that starts Dolt; managed attaches and checked rebinds
+/// start none. Every Dolt server start the fixture really performs gets the
+/// full `server_start_budget()`: four for a fresh open (initialization,
+/// migration, validation, active) and one for a reopen. On top of those, the
+/// fixture gets one single-stall term, the largest bound any other single
+/// product step can reach (an owned server close, a `QUERY_TIMEOUT` statement,
+/// or a startup-budgeted lock, quiescence or maintenance-permit wait), and one
+/// `QUERY_TIMEOUT` for its own operations. A fixture whose owner retires only
+/// through idle expiry adds `SERVICE_IDLE_TIMEOUT` at the call site.
+///
+/// So one stalled step with its own product bound reports that error before
+/// this backstop expires; the backstop does not budget several steps each
+/// running to its limit. Steps without a product bound, such as warm cache
+/// verification, legacy import preparation and activation reads, rely on this
+/// backstop alone. Fixtures call [`warm_runtime_cache`] first, so no cold
+/// runtime install is charged here, and keep the `OpenOptions::new` budgets.
+#[cfg(test)]
+pub(crate) fn fixture_deadline(fresh: u32, reopened: u32) -> std::time::Duration {
+    let starts = fresh.saturating_mul(4).saturating_add(reopened);
+    let single_stall = crate::server::close_budget()
+        .max(crate::store::QUERY_TIMEOUT)
+        .max(default_startup());
+    server_start_budget()
+        .saturating_mul(starts)
+        .saturating_add(single_stall)
+        .saturating_add(crate::store::QUERY_TIMEOUT)
+}
+
+#[cfg(test)]
+mod fixture_deadline_tests {
+    use super::fixture_deadline;
+    use std::time::Duration;
+
+    #[test]
+    fn single_stall_defaults_match_the_reviewed_bounds() {
+        for ((fresh, reopened), seconds) in
+            [((1, 0), 190), ((1, 1), 222), ((2, 1), 350), ((2, 4), 446)]
+        {
+            assert_eq!(
+                fixture_deadline(fresh, reopened),
+                Duration::from_secs(seconds)
+            );
+        }
+    }
+}
+
 pub fn open_options(data_dir: PathBuf, project_scope: String) -> Result<OpenOptions> {
     let mut options = OpenOptions::new(data_dir, project_scope);
     options.config.cache_dir = Some(crate::store::test_cache());
@@ -546,6 +670,29 @@ pub(crate) fn prepared_supervisor() -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn runtime_warm_up_is_shared_and_returns_the_cached_engine() -> Result<()> {
+        let (first, second) = tokio::join!(warm_runtime_cache(), warm_runtime_cache());
+        let (first, second) = (first?, second?);
+        ensure!(
+            first == second,
+            "concurrent warm-ups returned different engines"
+        );
+        ensure!(
+            first.starts_with(crate::store::test_cache().canonicalize()?),
+            "warm-up provisioned outside the shared test cache"
+        );
+        ensure!(
+            first.is_file(),
+            "warm-up did not return an installed engine"
+        );
+        ensure!(
+            warm_runtime_cache().await? == first,
+            "a later warm-up did not reuse the process result"
+        );
+        Ok(())
+    }
 
     #[test]
     fn snapshots_survive_source_removal_and_replacement_and_reject_corrupt_private_bytes() {

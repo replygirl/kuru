@@ -9573,7 +9573,11 @@ mod tests {
 
     #[tokio::test]
     async fn service_disconnect_and_owner_restart_preserve_unresolved_candidate() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: a fresh owner, then a reopened local store, successor owner and final
+        // local store.
+        let deadline = crate::test_support::fixture_deadline(1, 3);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             fs::create_dir(&project)?;
@@ -9641,7 +9645,9 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("candidate disconnect/restart fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("candidate disconnect/restart fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
@@ -11809,7 +11815,10 @@ mod tests {
 
     #[tokio::test]
     async fn committed_promotion_retries_cleanup_before_caching_success() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh local store.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let mut options = crate::test_support::open_options(
                 root.path().to_owned(),
@@ -11860,13 +11869,18 @@ mod tests {
             store.close().await
         })
         .await
-        .context("candidate cleanup retry fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("candidate cleanup retry fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn candidate_transition_observation_uses_exact_refs_and_revisions() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh temporary local store.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
             let store = MemoryStore::temporary().await?;
             let stale = store.begin_candidate("stale transition").await?;
             let stale_view = stale.view();
@@ -11920,14 +11934,19 @@ mod tests {
             store.close().await
         })
         .await
-        .context("candidate transition observation fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("candidate transition observation fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn selected_candidate_inventory_pages_past_foreign_prefix_and_abandons_exact_ref()
     -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh temporary local store.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
             let store = MemoryStore::temporary().await?;
             let candidate = store.begin_candidate("retained exact ref").await?;
             let branch = candidate.view().pinned_view().to_owned();
@@ -11986,13 +12005,18 @@ mod tests {
             store.close().await
         })
         .await
-        .context("selected candidate inventory fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("selected candidate inventory fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
     #[tokio::test]
     async fn candidate_creation_outcome_only_reads_its_exact_ref_across_restart() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh local store, then its reopen.
+        let deadline = crate::test_support::fixture_deadline(1, 1);
+        tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
             let options = crate::test_support::open_options(
                 root.path().to_owned(),
@@ -12053,7 +12077,9 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("exact candidate outcome fixture exceeded 90 seconds")??;
+        .with_context(|| {
+            format!("exact candidate outcome fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
