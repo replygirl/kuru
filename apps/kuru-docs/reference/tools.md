@@ -17,18 +17,23 @@ Stale cached metadata is inspectable but cannot be routed or treated as a grant.
 
 ## Built-in tools
 
-A [`[[permissions]]` rule](./configuration#tool-permissions) can `allow`, `ask`, or `deny` any of these by exact name, and can additionally pattern-match the two file-mutation tools by anchored, project-relative path. Absent a matching rule, reads and listing stay allowed; `file_write`/`file_delete` fall back to `allow_write`, while `shell` and `web_fetch` ask for approval. Add an explicit `deny` rule to refuse a tool outright.
+A [`[[permissions]]` rule](./configuration#tool-permissions) can `allow`, `ask`, or `deny` any of these by exact name, and can additionally pattern-match file mutations — `file_write`, `file_edit` (sharing `file_write`'s selector), and `file_delete` — by anchored, project-relative path. Absent a matching rule, reads and listing stay allowed; `file_write`/`file_edit`/`file_delete` fall back to `allow_write`, while `shell` and `web_fetch` ask for approval. Add an explicit `deny` rule to refuse a tool outright.
 
-| Tool          | Arguments                        | Permission fallback              |
-| ------------- | -------------------------------- | -------------------------------- |
-| `file_read`   | `path`                           | Always allowed (project read)    |
-| `file_list`   | `path`                           | Always allowed (project listing) |
-| `grep`        | `pattern`, optional `path`       | Per-candidate project read       |
-| `glob`        | `pattern`, optional `path`       | Per-candidate project discovery  |
-| `file_write`  | `path`, `content`                | `allow_write` → ask              |
-| `file_delete` | `path`                           | `allow_write` → ask              |
-| `shell`       | `command`, optional `timeout_ms` | `allow_shell` → ask              |
-| `web_fetch`   | `url`                            | Ask                              |
+| Tool          | Arguments                                                       | Permission fallback                       |
+| ------------- | --------------------------------------------------------------- | ----------------------------------------- |
+| `file_read`   | `path`, optional `offset`, `limit`                              | Always allowed (project read)             |
+| `file_list`   | `path`                                                          | Always allowed (project listing)          |
+| `grep`        | `pattern`, optional `path`, `include_hidden`, `include_ignored` | Per-candidate project read                |
+| `glob`        | `pattern`, optional `path`, `include_hidden`, `include_ignored` | Per-candidate project discovery           |
+| `file_write`  | `path`, `content`                                               | `allow_write` → ask                       |
+| `file_edit`   | `path`, `hunks`                                                 | `allow_write` → ask (shares `file_write`) |
+| `file_delete` | `path`                                                          | `allow_write` → ask                       |
+| `shell`       | `command`, optional `timeout_ms`                                | `allow_shell` → ask                       |
+| `web_fetch`   | `url`                                                           | Ask                                       |
+
+`file_read` returns its plain text response when called with only `path`. Supplying `offset` or `limit` selects a page of one-based logical UTF-8 text lines: the JSON page carries `text`, `offset`, `limit`, `line_count`, `next_offset` when more lines remain, and `omitted_lines`; pass `next_offset` back as the next call's `offset` to continue. `offset`/`limit` must be positive integers; offset zero, a limit outside 1–10,000, an out-of-range page, binary content, more than 100,000 lines, or a file over 2 MiB fails without returning partial page metadata.
+
+`grep` and `glob` search only regular UTF-8 project files and exclude hidden and repository-ignored paths by default; set `include_hidden` or `include_ignored` independently to include them. Search never follows links and caps candidate files at 10,000, individual file snapshots at 2 MiB, matched lines at 8 KiB, and returned matches at 2,000. A binary, unreadable, protected, linked, denied, oversized, or over-limit candidate is omitted without exposing its path or content, and the result's `omitted` object counts each applicable category, including oversized matched lines. Each discovered candidate receives its own exact permission evaluation, and the search directory itself is never granted as a whole subtree, so an allow rule cannot override a more specific deny.
 
 For an explicit write:
 

@@ -28,6 +28,7 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 | `/resume SESSION_ID`                         | Resume one exact active session                                               |
 | `/export [PATH]`                             | Export this public session as Markdown                                        |
 | `/status`                                    | Show the current session, project, selections, turns, and known usage locally |
+| `/compact [ID]`                              | Compact retained context for one or all active identities                     |
 | `/parts`                                     | Inspect active parts and relationships                                        |
 | `/mode ifs`                                  | Select `ifs`, `polyvagal`, `freudian`, or `jungian`                           |
 | `/model MODEL_ID`                            | Select a model and its advertised default effort                              |
