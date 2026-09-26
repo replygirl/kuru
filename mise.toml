@@ -7,7 +7,6 @@ lockfile = true
 
 [env]
 HK_MISE = "1"
-HK_PKL_BACKEND = "pklr"
 # Private build inputs under target/ refuse symlinked paths, so mr-boxington
 # shares compiled outputs while each checkout keeps a real target directory.
 MBX_TARGET_VIEWS = "0"
@@ -23,7 +22,7 @@ npm = "npm:npm"
 rust = { version = "1.98.1", mr_boxington = "{{ get_env(name='KURU_MBX', default='1') != '0' and not (os() == 'macos' and arch() == 'x64') }}" }
 mr-boxington = { version = "1.17.0", os = ["linux", "macos/arm64", "windows"] }
 "github:aligned-team/cospec" = "0.7.1"
-"aqua:jdx/hk" = "1.58.1"
+"aqua:jdx/hk" = "2.2.0"
 "aqua:tamasfe/taplo" = "0.10.0"
 "aqua:koalaman/shellcheck" = "0.11.0"
 "aqua:rhysd/actionlint" = "1.7.12"
