@@ -64,7 +64,7 @@ jsonschema = { version = "=0.56.0", default-features = false }
 cap-std = "=4.0.3"
 cap-fs-ext = "=4.0.3"
 nix = { version = "=0.31.3", features = ["signal", "process", "term", "poll", "fs", "user"] }
-rustix = { version = "=1.1.4", features = ["termios"] }
+rustix = { version = "=1.1.5", features = ["termios"] }
 vt100 = "=0.16.2"
 tar = "=0.4.46"
 flate2 = "=1.1.10"
