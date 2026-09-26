@@ -18,20 +18,6 @@
       "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386"
     },
     {
-      "target": "x86_64-apple-darwin",
-      "stem": "dolt-darwin-amd64",
-      "format": "tar.gz",
-      "executable_name": "dolt",
-      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.3/dolt-darwin-amd64.tar.gz",
-      "compressed_bytes": 43603373,
-      "archive_sha256": "e33f4fa00032054e38da78b31314f8e93fa9eb950c587ac5f29ba5c6402b3f2a",
-      "expanded_bytes": 127662080,
-      "executable_bytes": 126442936,
-      "executable_sha256": "cb37ed2489c15d62cd0a054c3c594337ca1b758a3866b63eef845490e58f0776",
-      "license_bytes": 1212811,
-      "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386"
-    },
-    {
       "target": "aarch64-unknown-linux-gnu",
       "stem": "dolt-linux-arm64",
       "format": "tar.gz",

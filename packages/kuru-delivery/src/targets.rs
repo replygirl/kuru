@@ -26,18 +26,11 @@ pub struct Target {
     pub format: ArchiveFormat,
 }
 
-pub const CATALOG: [Target; 5] = [
+pub const CATALOG: [Target; 4] = [
     Target {
         triple: "aarch64-apple-darwin",
         os: "macos",
         arch: "aarch64",
-        executable: "kuru",
-        format: ArchiveFormat::TarGz,
-    },
-    Target {
-        triple: "x86_64-apple-darwin",
-        os: "macos",
-        arch: "x86_64",
         executable: "kuru",
         format: ArchiveFormat::TarGz,
     },
@@ -112,6 +105,8 @@ mod tests {
         assert_eq!(windows.executable, "kuru.exe");
         assert_eq!(windows.format.extension(), "zip");
         assert!(for_platform("windows", "aarch64").is_err());
+        assert!(for_platform("macos", "x86_64").is_err());
+        assert!(find("x86_64-apple-darwin").is_err());
         assert!(find("x86_64-pc-windows-gnu").is_err());
     }
 }

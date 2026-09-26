@@ -181,7 +181,7 @@ async fn verified_zip_wrong_inventory_modes_and_crc_preserve_previous_image() {
 }
 
 #[test]
-fn all_five_assets_share_catalog_naming_and_keep_four_ustar_contracts() {
+fn all_catalog_assets_share_release_naming_and_keep_ustar_contracts() {
     let root = tempfile::tempdir().unwrap();
     // Cargo's top-level binary aliases have multiple links on Linux. Make that
     // source shape explicit on every host rather than relying on Cargo's choice.

@@ -64,7 +64,7 @@ The connector package carries the crate and asset MIT attributions in
 | `aqua:koalaman/shellcheck` | `0.11.0` |
 | `aqua:rhysd/actionlint` | `1.7.12` |
 | `cargo:cargo-llvm-cov` | `0.9.1` |
-| `mr-boxington` (not on Intel macOS) | `1.17.0` |
+| `mr-boxington` | `1.17.0` |
 | `cargo:cargo-audit` (delivery package) | `0.22.2` |
 | Node (docs app only) | `26.8.2` |
 | npm (docs app only) | `12.0.2` |
@@ -76,7 +76,7 @@ The connector package carries the crate and asset MIT attributions in
 | Communiqué (delivery package) | `1.3.5` |
 | mise (root `min_version` and CI) | `2026.9.4` |
 
-mr-boxington's exact pin and signed lock entries cover every locked platform except Intel macOS, which has no upstream binary.
+mr-boxington's exact pin and signed lock entries cover every supported platform.
 
 Cospec is `0.7.1`, confirmed by its [GitHub release](https://github.com/aligned-team/cospec/releases/tag/v0.7.1). Its standalone executable embeds its supported OpenSpec version. No project OpenSpec, Bun or Python dependency is required. The task-scoped compatibility preload remains necessary; see [development](development.md).
 

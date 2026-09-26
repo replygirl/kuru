@@ -41,7 +41,7 @@ The workflow SHALL create signed version commits using an expected main head, va
 
 ### Requirement: Complete recoverable publication
 
-The workflow SHALL verify all five expected native archives and checksum sidecars, generate the complete `SHA256SUMS` manifest and release notes, and assemble them into one attempt-scoped candidate artifact without making a remote release write. It SHALL publish only from the sole final job after native Windows acceptance of that candidate and documentation build and deployment have succeeded. Final publication SHALL revalidate the candidate, preserve complete-draft digest checks, and reuse a complete matching published release without replacing its notes, tag, or assets.
+The workflow SHALL verify one expected native archive and checksum sidecar for every target in the authoritative release catalog, generate the complete `SHA256SUMS` manifest and release notes, and assemble them into one attempt-scoped candidate artifact without making a remote release write. It SHALL publish only from the sole final job after native Windows acceptance of that candidate and documentation build and deployment have succeeded. Final publication SHALL revalidate the candidate, preserve complete-draft digest checks, and reuse a complete matching published release without replacing its notes, tag, or assets.
 
 #### Scenario: Incomplete or corrupted artifacts
 - **WHEN** an expected archive, checksum sidecar, checksum-manifest entry, or notes file is missing, unexpected, malformed, or invalid
@@ -58,6 +58,10 @@ The workflow SHALL verify all five expected native archives and checksum sidecar
 #### Scenario: Publication succeeded before the runner failed
 - **WHEN** retry finds a published release with the exact immutable tag, source marker, and complete valid asset metadata
 - **THEN** the final publication job succeeds without remote writes and no dependent release jobs remain
+
+#### Scenario: Retired target archive in the candidate
+- **WHEN** a candidate contains an archive or checksum sidecar for a target that is not in the release catalog, such as `x86_64-apple-darwin`
+- **THEN** candidate assembly rejects it as an unexpected asset and no public release is created
 
 ### Requirement: Accurate release notes and instructions
 
@@ -89,7 +93,7 @@ The Release workflow SHALL verify the exact staged Windows ZIP from the selected
 
 ### Requirement: Complete immutable shell-support release inventory
 
-Release candidate assembly SHALL require one versioned support envelope paired with each existing native executable archive, with exactly one checksum-manifest entry per sidecar and no unexpected assets. It SHALL verify all five decoded support inventories and each sidecar's generated content against its paired target build before final publication. The staged and published-download verifiers SHALL check the exact immutable support assets selected for the release without weakening the existing executable archive member inventory or native offline-runtime gates.
+Release candidate assembly SHALL require one versioned support envelope paired with each existing native executable archive, with exactly one checksum-manifest entry per sidecar and no unexpected assets. It SHALL verify one core archive and one paired decoded support inventory for every target in the release catalog, and each sidecar's generated content against its paired target build, before final publication. The staged and published-download verifiers SHALL check the exact immutable support assets selected for the release without weakening the existing executable archive member inventory or native offline-runtime gates.
 
 #### Scenario: Incomplete candidate
 - **WHEN** any target's paired support envelope, checksum entry or expected generated file is missing or inconsistent with that target's executable
