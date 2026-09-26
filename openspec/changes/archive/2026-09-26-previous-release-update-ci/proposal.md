@@ -1,6 +1,6 @@
 ## Why
 
-Updating Kuru must always be possible and always succeed; migrations exist for that reason. The acceptance that the immediately previous published release's own updater installs a new candidate is a floor under that policy, yet today it runs only on Windows inside the Release workflow, after a candidate already exists. This change makes the same acceptance a platform-generic, package-owned task that ordinary PR/main CI can run natively on every supported platform, with the release-time Windows run kept as a sanity re-run.
+Updating Kuru must always be possible and always succeed; migrations exist for that reason. The acceptance that the immediately previous published release's own updater installs a new candidate is a floor under that policy, yet today it runs only on Windows inside the Release workflow, after a candidate already exists. This change makes the same acceptance a platform-generic, package-owned task that ordinary PR/main CI can run natively on its native-test platforms (Linux x86-64, macOS Apple Silicon and Windows x86-64), with the release-time Windows run kept as a sanity re-run.
 
 ## What Changes
 
@@ -10,7 +10,7 @@ Updating Kuru must always be possible and always succeed; migrations exist for t
 - `packages/kuru-delivery/tests/support/mise_acceptance.rs`: the staged Windows check calls the shared helper with unchanged behaviour.
 - `packages/kuru-delivery/tests/previous_release_update.rs` (new, ignored, `tooling`): packages `KURU_UPDATE_CANDIDATE_BINARY` and its generated shell support under a synthetic next patch version, resolves the host target's previous published release, and runs the shared helper.
 - `packages/kuru-delivery/mise.toml`: `test:previous-release-update` runs that test single-threaded. Workflow wiring is owned separately and is not part of this change.
-- Docs: `docs/release.md`, `docs/development.md` and `AGENTS.md` describe previous-release acceptance as a floor running natively in CI on every supported platform, with the release job as a sanity re-run.
+- Docs: `docs/release.md`, `docs/development.md` and `AGENTS.md` describe previous-release acceptance as a floor running natively in CI on the native-test platforms, with the release job as a sanity re-run.
 
 The behavior is already specified by the release and update requirements; this change adds tests, a task and documentation. No product behaviour changes.
 

@@ -121,8 +121,8 @@ runtime is involved.
    then repeats
    [previous-release update acceptance](#previous-release-update-acceptance)
    against the exact staged candidate, requested at its real version, as a
-   release-time sanity re-run of the check ordinary CI runs on every supported
-   platform. The loopback mise fixture and the local release base given to the
+   release-time sanity re-run of the check ordinary CI runs on its native-test
+   platforms. The loopback mise fixture and the local release base given to the
    previous updater are not public downloads of the new release. A failure in
    either path blocks `publish`.
 7. Run `deploy-docs` only after both staged Windows acceptance and `build-docs`
@@ -187,7 +187,8 @@ The task then runs
 [previous-release update acceptance](#previous-release-update-acceptance)
 against the staged ZIP and its sidecar. Only its release resolver contacts
 public GitHub, as described there; the workflow step currently passes no
-`GITHUB_TOKEN`, so that listing request is anonymous.
+`GITHUB_TOKEN`, so that listing request is anonymous and an exhausted anonymous
+rate limit on the runner fails the check and blocks `publish`.
 
 ## Previous-release update acceptance
 
@@ -195,7 +196,9 @@ Updating Kuru must always be possible and must succeed; migrations exist so that
 it does. As a floor under that policy, not a replacement for it, the previous
 published release's own updater must install every candidate. Ordinary PR and
 main CI runs `//packages/kuru-delivery:test:previous-release-update` natively on
-every supported platform. The task requires `KURU_UPDATE_CANDIDATE_BINARY`, the
+the platforms where it runs native behavior tests: Linux x86-64, macOS Apple
+Silicon and Windows x86-64. Other published targets are built in CI but not
+exercised by this check. The task requires `KURU_UPDATE_CANDIDATE_BINARY`, the
 absolute path of the release-profile `kuru` built from the tree under test, and
 outbound HTTPS to GitHub. It has no bundle-preparation dependency, because the
 binary already embeds its engine.
@@ -217,8 +220,10 @@ none is older or one is newer. The resolver downloads that release's own
 Windows) and, when the release publishes one, that target's shell-support
 envelope. It verifies each file against that manifest and GitHub's asset digests
 before running anything. An optional `GITHUB_TOKEN` is sent as a bearer token
-only on the single release-listing request to `api.github.com`, which avoids the
-anonymous API rate limit on shared runners. Asset downloads are anonymous, and no
+only on the single release-listing request to `api.github.com`. Without it, that
+request is anonymous and can fail with `HTTP 403 rate limit exceeded` on shared
+runner addresses; pass the workflow's `${{ github.token }}` with `contents: read`
+to avoid it. Asset downloads are anonymous, and no
 Kuru or mise child process receives the token.
 
 The previous executable is installed into fresh isolated user, configuration,

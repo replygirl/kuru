@@ -87,7 +87,7 @@ impl PublicGitHub {
                 .no_proxy()
                 .redirect(Policy::limited(5))
                 .timeout(Duration::from_secs(60))
-                .user_agent("kuru-published-windows-verifier")
+                .user_agent("kuru-published-release-client")
                 .build()?,
             authorization,
         })

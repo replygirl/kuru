@@ -1,4 +1,4 @@
-//! Ordinary CI acceptance on every supported platform: the previous published
+//! Ordinary CI acceptance on each native-test platform: the previous published
 //! release's own updater installs this tree's release build on the native host.
 //!
 //! Run through `mise run //packages/kuru-delivery:test:previous-release-update`

@@ -190,8 +190,10 @@ concurrently before a push; coverage and its 90% line gate are enforced in CI,
 not in hooks. CI gives static categories separate Ubuntu jobs and runs native
 behavior, installation and updates on their supported platforms. Updating from
 any installed release must remain possible and succeed; as a floor under that
-policy, previous-release update acceptance runs natively in CI on every
-supported platform. Keep these scheduling units explicit instead of invoking
+policy, previous-release update acceptance runs natively in CI on the
+native-test platforms; see
+[previous-release acceptance](docs/release.md#previous-release-update-acceptance).
+Keep these scheduling units explicit instead of invoking
 `check` from hooks or workflows. The optional local `mise run check` aggregate
 uses the same task dependencies. Coverage already runs the behavioral suite; do
 not require an ordinary test pass before repeating it under instrumentation.

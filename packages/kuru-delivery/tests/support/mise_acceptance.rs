@@ -918,7 +918,7 @@ pub async fn run_staged(archive_path: &Path) -> Result<()> {
     run_archive(bytes, archive::digest(&executable), support.as_ref()).await?;
     // The immediately previous published release, resolved now rather than
     // pinned, must update to the candidate. Ordinary CI runs the same check on
-    // every supported platform; this is the release-time sanity re-run, and it
+    // its native-test platforms; this is the release-time sanity re-run, and it
     // is a floor rather than the whole compatibility policy.
     let token = published::checked_token(std::env::var_os("GITHUB_TOKEN"))?;
     let previous = published::previous_release(VERSION, TARGET, token.as_deref()).await?;
