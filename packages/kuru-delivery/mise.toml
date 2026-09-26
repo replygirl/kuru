@@ -50,29 +50,27 @@ if ((& $llvmCov llvm-cov --version).Trim() -ne 'cargo-llvm-cov 0.9.1') { throw '
 RUST_TEST_THREADS = "2"
 KURU_TEST_SUPERVISOR_PREPARED = false
 
-[tasks."coverage:windows:shard"]
+[tasks."coverage:shard"]
 depends = ["//packages/kuru-memory:bundle:prepare", "//packages/kuru-memory:bundle:test-fixtures"]
-description = "Run one fail-closed Windows workspace coverage package shard"
+description = "Run one fail-closed workspace coverage package shard from KURU_COVERAGE_* inputs (CI)"
 dir = "{{config_root}}/../.."
 tools."cargo:cargo-llvm-cov" = "0.9.1"
 tools."aqua:cocogitto/cocogitto" = "{{vars.kuru_cocogitto_version}}"
 tools."github:jdx/communique" = "{{vars.kuru_communique_version}}"
-run = "echo 'coverage:windows:shard requires native Windows' >&2; exit 1"
-run_windows = "pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File packages/kuru-delivery/support/windows-coverage.ps1 -Mode Shard"
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- coverage shard"
 
-[tasks."coverage:windows:shard".env]
+[tasks."coverage:shard".env]
 RUST_TEST_THREADS = "2"
 KURU_TEST_SUPERVISOR_PREPARED = false
 
-[tasks."coverage:windows:collect"]
+[tasks."coverage:collect"]
 depends = ["//packages/kuru-memory:bundle:prepare", "//packages/kuru-memory:bundle:test-fixtures"]
-description = "Validate Windows coverage shard receipts and enforce one workspace report"
+description = "Validate this OS's coverage shard receipts and enforce one workspace report (CI)"
 dir = "{{config_root}}/../.."
 tools."cargo:cargo-llvm-cov" = "0.9.1"
-run = "echo 'coverage:windows:collect requires native Windows' >&2; exit 1"
-run_windows = "pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File packages/kuru-delivery/support/windows-coverage.ps1 -Mode Collect"
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- coverage collect"
 
-[tasks."coverage:windows:collect".env]
+[tasks."coverage:collect".env]
 KURU_TEST_SUPERVISOR_PREPARED = false
 
 [tasks."build"]

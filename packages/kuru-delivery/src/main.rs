@@ -251,7 +251,7 @@ enum CoverageCommand {
     },
     /// Verify each shard's latest uploaded (successful) attempt and copy only
     /// accepted profiles for reporting.
-    Collect {
+    CollectProfiles {
         #[arg(long, default_value = ".")]
         root: PathBuf,
         #[arg(long)]
@@ -265,8 +265,22 @@ enum CoverageCommand {
         /// The current workflow run attempt; no shard may claim a later one.
         #[arg(long)]
         max_attempt: String,
+        /// Hosted OS label carried by every accepted artifact name.
+        #[arg(long)]
+        artifact_os: String,
         #[arg(long)]
         llvm_cov: PathBuf,
+    },
+    /// Run one fail-closed coverage shard from its `KURU_COVERAGE_*` inputs.
+    Shard {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
+    /// Validate every shard receipt and enforce one workspace coverage report
+    /// from the `KURU_COVERAGE_*` inputs.
+    Collect {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
     },
 }
 
@@ -447,29 +461,41 @@ async fn main() -> Result<()> {
         }
         Command::Coverage {
             command:
-                CoverageCommand::Collect {
+                CoverageCommand::CollectProfiles {
                     root,
                     inventory,
                     inputs,
                     target_dir,
                     expected_source,
                     max_attempt,
+                    artifact_os,
                     llvm_cov,
                 },
         } => {
-            let selected = coverage::collect_profiles(
-                &root,
-                &inventory,
-                &inputs,
-                &target_dir,
-                &expected_source,
-                &max_attempt,
-                &llvm_cov,
-            )
+            let selected = coverage::collect_profiles(&coverage::CollectOptions {
+                root: &root,
+                inventory: &inventory,
+                inputs: &inputs,
+                target_dir: &target_dir,
+                expected_source: &expected_source,
+                max_attempt: &max_attempt,
+                artifact_os: &artifact_os,
+                llvm_cov: &llvm_cov,
+            })
             .await?;
             for (shard, attempt) in selected {
                 println!("coverage shard {shard}: accepted run attempt {attempt}");
             }
+        }
+        Command::Coverage {
+            command: CoverageCommand::Shard { root },
+        } => {
+            coverage::orchestrate::shard(&root).await?;
+        }
+        Command::Coverage {
+            command: CoverageCommand::Collect { root },
+        } => {
+            coverage::orchestrate::collect(&root).await?;
         }
         Command::Install {
             version,

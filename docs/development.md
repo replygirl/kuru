@@ -45,34 +45,39 @@ require Communiqué or maintainer setup.
 
 CI runs format, lint, typecheck, repository/workflow tooling, cospec validation,
 managed-file checks and documentation as separate Ubuntu jobs. Native coverage
-runs as one workspace suite on Linux x86_64 and macOS arm64. Windows x86_64 runs
-five package shards in parallel (`delivery-archive`, `application`, `memory`,
-`runtime` and `connectors-core-platform`, matching `SHARDS` in
-`packages/kuru-delivery/src/coverage.rs`), validates their exact source, toolchain,
-artifact inventory, Cargo-native runner ledger and raw-profile receipts, and
-then enforces one 90% workspace report. Each shard compiles the same full
-workspace/all-target/all-feature graph; its task-private runner executes only
-the assigned standard test targets while Cargo retains package cwd and runtime
-environment. That runner stops test executables at a deadline derived from the
-job's `timeout-minutes`, less a fixed evidence reserve. Compilation is not under
-that deadline: only the hosted job limit bounds it, without evidence. A test
-executable still running at the deadline is terminated through its owned Job,
-and the shard fails with a `…-<shard>-diagnostics-attempt-<n>` artifact holding
-each executable's output log, a stall report naming the tests libtest reported
-as unfinished, the error in `failure.txt`, and the shard's manifests and runner
-ledger; any other shard failure uploads the same diagnostics. Only a successful
-shard uploads its receipt artifact, whose root holds one `attempt-<n>`
-directory. Rerunning only the failed jobs is enough. The report refuses unless
-every shard job succeeded, then takes each shard's latest uploaded (successful)
-attempt from the same run and validates it exactly; an invalid latest attempt is
-never replaced by an older one. It accepts both download layouts: one artifact
-extracted directly into the shard directory, or several in directories named
-after their artifacts. Each rerun adds one more artifact download per rerun
-shard, bounded by the receipt profile limits, inside the report's 30-minute
-limit; if repeated reruns exhaust it, dispatch a fresh run. On every OS, one
-installation job runs beside coverage after independently preparing its locked
-inputs: it installs the release build offline, verifies the installed offline
-runtime and then runs
+runs the same way on Linux x86_64, macOS arm64 and Windows x86_64: five package
+shards in parallel (`delivery-archive`, `application`, `memory`, `runtime` and
+`connectors-core-platform`, matching `SHARDS` in
+`packages/kuru-delivery/src/coverage.rs`) and one report job per OS that validates
+their exact source, toolchain, artifact inventory, Cargo-native runner ledger and
+raw-profile receipts, and then enforces one 90% workspace report. One Rust
+orchestrator, `kuru-delivery coverage shard` and `coverage collect`, sequences
+both jobs on every OS through the `coverage:shard` and `coverage:collect` tasks.
+Each shard compiles the same full workspace/all-target/all-feature graph; its
+task-private runner executes only the assigned standard test targets while Cargo
+retains package cwd and runtime environment. That runner stops test executables
+at a deadline derived from the job's `timeout-minutes`, less a fixed evidence
+reserve. Compilation is not under that deadline: only the hosted job limit
+bounds it, without evidence. A test executable still running at the deadline is
+terminated through its owned Job on Windows or its owned process group on Unix,
+and the shard fails with a `<prefix>-coverage-<os>-<shard>-diagnostics-attempt-<n>`
+artifact holding each executable's output log, a stall report naming the tests
+libtest reported as unfinished, the error in `failure.txt`, and the shard's
+manifests and runner ledger; any other shard failure uploads the same
+diagnostics. Only a successful shard uploads its
+`<prefix>-coverage-<os>-<shard>-attempt-<n>` receipt artifact, whose root holds
+one `attempt-<n>` directory. Rerunning only the failed jobs is enough. The report
+refuses unless every shard job succeeded, then takes each shard's latest
+uploaded (successful) attempt for its own OS from the same run and validates it
+exactly; an invalid latest attempt is never replaced by an older one. It accepts
+both download layouts: one artifact extracted directly into the shard directory,
+or several in directories named after their artifacts. Each rerun adds one more
+artifact download per rerun shard, bounded by the receipt profile limits, inside
+the report's 30-minute limit; if repeated reruns exhaust it, dispatch a fresh
+run. The report uploads the merged `<prefix>-coverage-<os>-attempt-<n>` LCOV.
+On every OS, one installation job runs beside coverage after independently
+preparing its locked inputs: it installs the release build offline, verifies the
+installed offline runtime and then runs
 `mise run //packages/kuru-delivery:test:previous-release-update`, in which the
 previous published release's own updater installs that release build
 (`target/release/kuru`, or `target/x86_64-pc-windows-msvc/release/kuru.exe` on
@@ -87,12 +92,14 @@ job restores and saves its own per-target Cargo dependency cache.
 Windows primitives retain a separate native coverage job for early feedback. The
 required `ci-gate` accepts only success from every branch of this graph.
 
-Ubuntu's coverage step disables Rust test-profile debug information so its
-instrumented Kuru executable remains a valid input to the same production
-release-archive bound exercised by the packaged-runtime fixture. Coverage maps,
-the full test graph, and the 90% line threshold remain enabled. Panic text is
-retained, but Ubuntu coverage backtraces may omit source file and line details;
-use a focused local run or another native job when those details are needed.
+Ubuntu's shard and report steps both disable Rust test-profile debug information
+so its instrumented Kuru executable remains a valid input to the same production
+release-archive bound exercised by the packaged-runtime fixture. The two steps
+must carry the same value because it is part of the artifact inventory every
+receipt is validated against. Coverage maps, the full test graph, and the 90%
+line threshold remain enabled. Panic text is retained, but Ubuntu coverage
+backtraces may omit source file and line details; use a focused local run or
+another native job when those details are needed.
 
 CI installs only each job's tools before task activation, disables automatic
 installation of unrelated root tools, and uses `MISE_NO_HOOKS=1` because validation jobs do not create Git
@@ -130,6 +137,8 @@ bridge before any downloaded application can be trusted.
 | `mise run coverage` | Run the behavioral suite under LLVM instrumentation, minimum 90% workspace line coverage |
 | `mise run test:install` | Native archive tests and, on macOS/Linux, real Bash bootstrap tests |
 | `mise run //packages/kuru-delivery:test` | Delivery contracts, including native PowerShell bootstrap/update fixtures on Windows |
+| `mise run //packages/kuru-delivery:coverage:shard` | One fail-closed CI coverage shard, configured by `KURU_COVERAGE_*` ([by hand](#running-a-coverage-shard-by-hand)) |
+| `mise run //packages/kuru-delivery:coverage:collect` | Validate every shard receipt for one OS and enforce the single 90% report |
 | `mise run //apps/kuru-tui:test:embedded-runtime` | Package, install, update and reopen actual Kuru with cold offline memory |
 | `mise run //packages/kuru-delivery:test:previous-release-update` | [Previous published release's updater](release.md#previous-release-update-acceptance) installs `KURU_UPDATE_CANDIDATE_BINARY`; optional `GITHUB_TOKEN` |
 | `mise run lint:tooling` | Shell, GitHub Actions and metadata validation |
@@ -180,6 +189,38 @@ runtime paths or add tautological assertions to inflate the score. Favor tests
 that observe peer routing, context isolation, persistence, bounded failure,
 protocol payloads and real CLI output. Live authenticated-provider checks are
 separate from deterministic fixture tests and must be reported accurately.
+
+## Running a coverage shard by hand
+
+`mise run coverage` remains the local workspace gate. To reproduce one CI shard,
+run the orchestrator from a clean checkout of a committed revision (it refuses
+modified tracked files and a source other than `HEAD`) with a throwaway target,
+evidence and diagnostics directory that do not yet exist:
+
+```sh
+scratch=$(mktemp -d)
+KURU_COVERAGE_OS=local \
+KURU_COVERAGE_SOURCE=$(git rev-parse HEAD) \
+KURU_COVERAGE_ATTEMPT=1 \
+KURU_COVERAGE_SHARD=connectors-core-platform \
+KURU_COVERAGE_PACKAGES=kuru-connectors,kuru-core,kuru-platform \
+KURU_COVERAGE_TARGET="$scratch/target" \
+KURU_COVERAGE_OUTPUT="$scratch/evidence" \
+KURU_COVERAGE_DIAGNOSTICS="$scratch/diagnostics" \
+KURU_COVERAGE_JOB_STARTED=$(date +%s) \
+KURU_COVERAGE_JOB_MINUTES=75 \
+  mise run //packages/kuru-delivery:coverage:shard
+```
+
+Use a shard name and package list from `SHARDS`. The instrumented build stays in
+`KURU_COVERAGE_TARGET`, separate from `target/`, so it never disturbs ordinary
+builds or the shared build cache; delete the scratch directory afterwards. On
+failure, `diagnostics/failure.txt` and any stall reports explain the stop. To
+exercise collection, run all five shards, copy each shard's evidence (its
+`attempt-<n>` directory) into `$scratch/inputs/<shard>/`, and run
+`mise run //packages/kuru-delivery:coverage:collect` with the same `OS`, `SOURCE`
+and `ATTEMPT`, a fresh `KURU_COVERAGE_TARGET`, `KURU_COVERAGE_INPUTS="$scratch/inputs"`
+and a not-yet-existing `KURU_COVERAGE_REPORT` path whose parent exists.
 
 ## Shared build cache
 
@@ -259,11 +300,12 @@ directory for both preparation and compilation. Valid files are reverified and
 reused; corrupt or unsafe entries fail without replacement. This build cache is
 separate from the installed application's extracted `memory.cache_dir`.
 
-Every cached native CI job (coverage, installation and the Intel macOS and Linux arm64
-native builds) selects a bundle directory under `${{ runner.temp }}` for all its
-preparation and build steps. The Windows coverage shards share one Cargo cache
-key that only one shard saves; their instrumented target directories live in
-`${{ runner.temp }}` and are never cached. Private bundle directories must be created by the
+Every cached native CI job (coverage shards and reports, installation and the
+Intel macOS and Linux arm64 native builds) selects a bundle directory under
+`${{ runner.temp }}` for all its preparation and build steps. Each OS's coverage
+shards share one Cargo cache key that only one shard saves and the report job
+only restores; their instrumented target directories live in `${{ runner.temp }}`
+and are never cached. Private bundle directories must be created by the
 current runner; restoring them inside a Cargo target archive can change their
 permissions. Keep them outside shared build-output caches and retain the private
 directory checks when configuring native test runners.
