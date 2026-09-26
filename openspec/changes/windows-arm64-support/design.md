@@ -31,13 +31,13 @@ Current state, `main` at `501ab92d` unless noted:
   `windows_commands.rs:184`, `embedded_runtime.rs:1129,1198,1250`) or a fixed
   target constant (`mise_acceptance.rs:35`, `windows_archive.rs:15`,
   `bootstrap_windows.rs:30`, `published_windows.rs:20`).
-- The staged mise fixture (`tests/support/mise_acceptance.rs:95-99`) numbers
-  asset API ids as `assets/{index+1}` in `CATALOG` order and hard-codes
-  `assets/5` for the x64 ZIP and `assets/6` for `SHA256SUMS` (`:99,153,170,843,
-  854,864`). On the five-entry catalog an appended arm64 entry would take
-  `assets/6` and collide with `SHA256SUMS`; after #106 x64 is `assets/4` and the
-  hard-coded `assets/5` x64 assertions no longer name the x64 ZIP, so #106 as
-  it stands probably breaks the `api_fallback` scenario (not run).
+- The staged mise fixture (`tests/support/mise_acceptance.rs`) numbered asset
+  API ids as `assets/{index+1}` in `CATALOG` order and, at `501ab92d`,
+  hard-coded `assets/5` for the x64 ZIP and `assets/6` for `SHA256SUMS`. #106
+  (`8225613d`, this change's stage-2 base) replaced them with
+  `windows_asset_id()` (the target's `CATALOG` position plus one) and
+  `sha256sums_asset_id()` (`CATALOG.len() + 1`), so an appended arm64 entry
+  takes the next catalog slot and `SHA256SUMS` moves past it (A39, task 2.10).
 - On `origin/test/previous-release-update-ci` (#108) the previous-release
   resolver is `published::previous_release(candidate, target, token)`:
   `select_previous` picks the greatest older stable `vX.Y.Z` release ignoring the
@@ -133,9 +133,9 @@ each is applied:
    arm64 entry is trusted; linux-x64 stays the only build host and the docs say
    so." Applied in D8 (PR6a owner reviews the wiring before task 3.4), D9
    (build-host sentence) and D10. This change departs from "merged before PR6b
-   starts": phase 2 runs before PR6a merges, following the computed brief, and
-   PR6a is a hard gate only for phase 3 and archive (blocking-changes Phase
-   Gates). Open Question 3 asks the lead to confirm.
+   starts": phase 2 runs before PR6a merges and PR6a is a hard gate only for
+   phase 3 and archive (blocking-changes Phase Gates). The departure is settled
+   by the lead's stack-order ruling of 2026-09-26 (Open Question 3).
 5. "**Sequence**: PR4a, PR5, PR4b before PR6a unless PR6a is already cheap to
    finish; CI speed and parity are the priority." Applied in D10 and the
    blocking-changes Phase Gates (PR5 notice gates phase 3).
@@ -338,7 +338,7 @@ Every row of the verified §8 catalogue and every confirmed gap:
 | A36 | `docs/release.md:151,180` | phase 3 (D9) |
 | A37 | `docs/development.md:217-320` (bundled-engine build inputs, offline import) | arm64 offline import example using PR6a's built archive and the `bundle:test-fixtures` note (A18); phase 3 (D9) |
 | A38 | `docs/development.md:439-453` (lock refresh commands) | add `windows-arm64` to the `mise lock --platform` lists and describe the cospec `asset_pattern` pin (D7, task 2.9) |
-| A39 | `tests/support/mise_acceptance.rs:95-99,153,170,843,854,864` | derive each asset API id from `CATALOG.iter().position()`, give `SHA256SUMS` an id past the catalog, make the request assertions use those ids and assert the ids are unique (task 2.10, phase 2) |
+| A39 | `tests/support/mise_acceptance.rs` staged-fixture asset ids | done by #106 (`8225613d`): `windows_asset_id()` derives from `CATALOG.iter().position()`, `sha256sums_asset_id()` is `CATALOG.len() + 1`, and the request assertions use both; ids are unique by construction (task 2.10, inherited) |
 | G1 | `embedded_runtime.rs:1129,1198,1250` | same helper as A21 (D3) |
 | G2 | `windows_cli.rs:34-35,82,163,195-196` | out of scope: passes the real machine environment through and asserts it is non-empty; correct on any host |
 | G3 | `tools.rs:116-117,5966-5967` | `:116-117` is the passthrough allowlist, benign; `:5966-5967` is the same synthetic fixture class as A25, same disposition |
@@ -455,14 +455,29 @@ line is the acceptance evidence to look for in the job log.
   keeps writing to the path in `KURU_PUBLISHED_WINDOWS_RECEIPT` that
   `release.yml verify-published-windows` sets; the target-qualified receipt
   and artifact names are workflow values that land in phase 3 (task 3.4).
-- Built-asset notices (lead decision 3): once PR6a's v2 schema exists, the
-  staged (`mise_acceptance.rs:653`) and published
-  (`published_windows.rs:1098-1111`) verifiers read the target's manifest
-  source kind; for a built asset they require every ICU, LLVM runtime and
-  mingw-w64 notice the manifest lists, each digest-equal, alongside the
-  `LICENSES` check they already make, and the arm64 published receipt records
-  the verified notice names and digests. Upstream assets keep today's
-  `LICENSES`-only check (task 3.6).
+- Built-asset notices (lead decision 3): once PR6a's manifest schema v2
+  (`packages/kuru-memory/support/dolt-assets.json`, `"schema_version": 2`)
+  exists, the staged (`mise_acceptance.rs`) and published
+  (`published_windows.rs`) verifiers read the target's asset-level
+  `"provenance"` key, which is exactly `"upstream"` or `"built"` on every asset
+  (missing is a parse error). For `"built"` they read the asset-level
+  `notices` array, non-empty for built assets and forbidden for upstream ones;
+  each entry carries exactly `name`, `from`, `path`, `bytes` and `sha256`.
+  `name` (for example `LICENSE-ICU`, `LICENSE-LLVM`,
+  `LICENSE-MINGW-W64-RUNTIME`) is the archive member `{stem}/<name>`, placed
+  after `{stem}/LICENSES` (`stem` for `aarch64-pc-windows-msvc` is
+  `dolt-windows-arm64`); `from` (`icu` or `llvm_mingw`) and `path` are
+  build-time inputs the verifiers do not interpret. The verifiers require every
+  listed notice to be present in the extracted engine directory with exactly
+  `bytes` bytes and SHA-256 `sha256`, alongside the `LICENSES` check they
+  already make, and the arm64 published receipt records each verified notice's
+  `name`, `bytes` and `sha256`. PR6a allows the literal string `"unpinned"`
+  for `archive_sha256`, `executable_sha256` and notice `sha256`, and `null`
+  for the matching byte counts, on built assets only until its second pinning
+  round; `bundle prepare` and the build script already refuse such an asset,
+  and the verifiers here fail closed on any `"unpinned"` or `null` value rather
+  than skipping the check. Upstream assets keep today's `LICENSES`-only check
+  (task 3.6).
 - `apps/kuru-tui:verify:staged-windows` keeps its single test; `mise_acceptance`
   derives `TARGET` from the host (D3) and the workflow passes
   `KURU_STAGED_WINDOWS_ARCHIVE` with `${{ matrix.target }}` (D8).
@@ -640,8 +655,8 @@ publishing.
 
 - Phase 1 (this change): design, specs, this ledger. No product code.
 - Phase 2 (on `feat/windows-arm64`, x64 and Unix only): D2 (installer), D3
-  (tasks, scripts, fixtures), A39 (staged fixture asset ids), D5 (resolver;
-  requires #108 merged), D6 (verifiers, without the built-asset notices), and D7
+  (tasks, scripts, fixtures), A39 (staged fixture asset ids, inherited from
+  #106), D5 (resolver; #108 merged), D6 (verifiers, without the built-asset notices), and D7
   lock entries. The `release_workflow.rs` gate cases are not in phase 2: the
   test reads the gate script from the live workflow, so they move with the
   workflow edit into task 3.4. None of these touch the catalog or workflows,
@@ -655,10 +670,16 @@ publishing.
   built-asset notice checks (D6), then D9 docs in the final commit after the
   five native checks are green on the branch. Staged and published arm64
   acceptance follow on the first maintainer-authorized Release run after merge.
-- Rebase: `feat/windows-arm64` is created from `origin/main` at `501ab92d`;
-  before phase 2 it rebases onto main once #106 (which removes Intel macOS and
-  leaves `CATALOG: [Target; 4]`), #107 and #108 merge. PR6a's merge triggers the
-  phase-3 rebase.
+- Rebase: `feat/windows-arm64` was created from `origin/main` at `501ab92d`
+  and, for phase 2, rebased onto `origin/main` at `8225613d`, which contains
+  #106 (which removes Intel macOS and leaves `CATALOG: [Target; 4]`) and #108;
+  phase 2 gates on those two only. #107 (`native-coverage-shards`) is also on
+  that base but touches only `coverage.rs`, `release_workflow.rs`, `ci.yml`,
+  `native-tests.yml` and `docs/development.md`, none of which phase 2 edits, so
+  it is a phase-3 gate beside PR5 and PR4b. Per the lead's stack-order ruling
+  (Open Question 3) the branch rebases onto PR6a's branch
+  (`feat/windows-arm64-bundle-input`, #113) before PR6b opens, and PR6a's
+  archive gates phase 3.
 - "Phase 1/2/3" names stages inside this change (design and ledger; x64
   generalizations; arm64 enablement), not roadmap phases.
 
@@ -723,10 +744,17 @@ tools; `dumpbin` is a build-time acceptance dependency only.
   confirmed at the first `mise lock`) are generated from configuration; cocogitto
   resolves its x64 asset through the aqua registry's `windows_arm_emulation`.
   `MISE_LOCKED=1` stays on.
-- PR6a: the arm64 manifest asset is selected by Cargo `TARGET` exactly as the
-  upstream ones; this change reads `target`, `stem`, `format`,
-  `executable_name` and, for the verifier notice check only, the built-asset
-  notice list PR6a's v2 schema defines under `source.built.*`. The workflow artifact is
+- PR6a: the arm64 manifest asset (`"schema_version": 2`, exactly six assets)
+  is selected by Cargo `TARGET` exactly as the upstream ones; PR6a's
+  target-to-stem map gives `aarch64-pc-windows-msvc` → `dolt-windows-arm64`,
+  format `zip` and `dolt.exe`. This change's stage-3 verifiers read the asset
+  keys `target`, `stem`, `format`, `executable_name`, `provenance`
+  (`"upstream"` or `"built"`), `license_bytes`, `license_sha256` and, for a
+  built asset only, the asset-level `notices` array with entry keys `name`,
+  `from`, `path`, `bytes` and `sha256`; a built zip holds `{stem}/`,
+  `{stem}/bin/`, `{stem}/bin/{executable_name}`, `{stem}/LICENSES`, then one
+  `{stem}/<notice.name>` per declared notice. The `"unpinned"` sentinel and
+  `null` byte counts are rejected by the verifiers (D6). The workflow artifact is
   named `bundle-input-aarch64-pc-windows-msvc` and imported with
   `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline`.
 - Coverage receipts: shard receipts may carry `excluded_artifacts`
@@ -781,7 +809,8 @@ tools; `dumpbin` is a build-time acceptance dependency only.
   #106; the phase-3 edit goes from `[Target; 4]` to `[Target; 5]` and keeps its
   asserts.
 - [The staged fixture's positional asset ids collide or go stale when the
-  catalog changes] → A39 derives them from the catalog and asserts uniqueness.
+  catalog changes] → A39 (#106) derives them from the catalog; uniqueness
+  holds by construction (catalog positions, then `SHA256SUMS` past them).
 - [`windows-arm64` is not the lock platform key mise writes] → verified at the
   first `mise lock` run; the docs command is updated to whatever mise emits.
 
@@ -798,13 +827,14 @@ tools; `dumpbin` is a build-time acceptance dependency only.
    distinct error." (Was: designer default, needs lead confirmation, that the
    predecessor decision is evidenced by a log line only, not a field in a
    future staged-acceptance receipt.) Applied in D5.
-3. Open, 2026-09-26 note: lead decision 4 says PR6a is "merged before PR6b
-   starts"; this change runs phase 2 before PR6a merges and treats PR6a as soft
-   for `cospec apply` but hard for phase 3 and archive (blocking-changes Phase
-   Gates). Lead ruling 7 (a verification draft PR later rebased onto PR6a's
-   branch) presupposes phase 2 work before PR6a exists. This question stays open
-   pending the lead's answer to whether PR6a's merge must precede phase 2 or
-   phase 3.
+3. Resolved 2026-09-26 by the lead's stack-order ruling: "until PR6a's branch
+   exists, do your phase 1 and phase 2 work on a local branch off main and
+   rebase onto PR6a when it opens; do not open PR6b before then." (Was: lead
+   decision 4 says PR6a is "merged before PR6b starts", while this change runs
+   phase 2 before PR6a merges.) PR6a's merge does not precede phase 2: phase 2
+   runs on the branch off main, PR6a is soft for `cospec apply` (once its record
+   exists on the base) and a hard gate for phase 3 and archive
+   (blocking-changes Phase Gates), and PR6b opens only on PR6a's branch.
 4. Resolved 2026-09-26 by lead ruling 2 (kuru-implement-phase2-sep26a): "Reject an explicit
    -Target that mismatches the native machine, with a message that names the
    native target." (Was: designer default, needs lead confirmation, that an
