@@ -2001,6 +2001,9 @@ async fn dispatch_ledger(store: &MemoryStore, operation: LedgerOperation) -> Res
 }
 
 #[cfg(test)]
+mod contract_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ContextSummaryCheckpoint, ContextSummaryRecord, ReasoningSummaryRecord};
