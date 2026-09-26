@@ -1,0 +1,139 @@
+name: Bundle build
+
+# Source-built Dolt engine archives (manifest `provenance: built`) are pinned
+# only from this linux-x64 job: two builds in fresh private directories must be
+# byte-identical before their pins can be trusted, and once pinned every build
+# must reproduce the committed bytes exactly.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/bundle-build.yml
+      - Cargo.lock
+      - packages/kuru-archive/src/zip.rs
+      - packages/kuru-delivery/src/bundle.rs
+      - packages/kuru-delivery/src/bundle/**
+      - packages/kuru-delivery/src/main.rs
+      - packages/kuru-memory/mise.lock
+      - packages/kuru-memory/mise.toml
+      - packages/kuru-memory/support/bundle.rs
+      - packages/kuru-memory/support/dolt-assets.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bundle-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MISE_LOCKED: "1"
+  # CI builds stay outside the maintainer mr-boxington cache.
+  KURU_MBX: "0"
+  MISE_NO_HOOKS: "1"
+  MISE_TASK_RUN_AUTO_INSTALL: "false"
+  CARGO_INCREMENTAL: "0"
+  BUILT_TARGET: aarch64-pc-windows-msvc
+  BUILT_ARCHIVE: dolt-windows-arm64.zip
+
+jobs:
+  windows-arm64-engine:
+    name: Reproducible Windows arm64 engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: bundle-build
+      - name: Install the pinned Go and llvm-mingw toolchains
+        run: mise run //packages/kuru-memory:setup:build-tools
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Build twice in fresh private directories
+        run: |
+          set -eu
+          for run in 1 2; do
+            mise run //packages/kuru-memory:bundle:build -- \
+              --target "$BUILT_TARGET" --print-pins \
+              --work-dir "$RUNNER_TEMP/bundle-build-$run/work" \
+              --output "$RUNNER_TEMP/bundle-build-$run/out"
+          done
+      - name: Require byte-identical archives
+        run: |
+          set -eu
+          first="$RUNNER_TEMP/bundle-build-1/out"
+          second="$RUNNER_TEMP/bundle-build-2/out"
+          sha256sum "$first/$BUILT_ARCHIVE" "$second/$BUILT_ARCHIVE"
+          if ! cmp "$first/$BUILT_ARCHIVE" "$second/$BUILT_ARCHIVE"; then
+            echo "::error::The two builds produced different archive bytes"
+            diff "$first/pins.json" "$second/pins.json" || true
+            exit 1
+          fi
+          cmp "$first/pins.json" "$second/pins.json"
+          sha="$(sha256sum "$first/$BUILT_ARCHIVE" | cut -d ' ' -f 1)"
+          size="$(stat -c %s "$first/$BUILT_ARCHIVE")"
+          echo "archive sha256: $sha"
+          echo "archive bytes: $size"
+          artifact="$RUNNER_TEMP/bundle-artifact"
+          mkdir "$artifact"
+          cp "$first/$BUILT_ARCHIVE" "$first/pins.json" "$artifact/"
+          printf '%s  %s\n' "$sha" "$BUILT_ARCHIVE" > "$artifact/SHA256SUMS"
+          {
+            echo "### $BUILT_TARGET engine"
+            echo
+            echo "Two fresh builds were byte-identical."
+            echo
+            echo "- archive sha256: \`$sha\`"
+            echo "- archive bytes: $size"
+            echo
+            echo '```json'
+            cat "$first/pins.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify the committed pin
+        run: |
+          set -eu
+          manifest=packages/kuru-memory/support/dolt-assets.json
+          pinned="$(jq -r --arg target "$BUILT_TARGET" '.assets[] | select(.target == $target) | .archive_sha256' "$manifest")"
+          pinned_size="$(jq -r --arg target "$BUILT_TARGET" '.assets[] | select(.target == $target) | .compressed_bytes' "$manifest")"
+          archive="$RUNNER_TEMP/bundle-artifact/$BUILT_ARCHIVE"
+          observed="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+          observed_size="$(stat -c %s "$archive")"
+          if [ "$pinned" = unpinned ]; then
+            echo "::notice::unpinned: pin verification not yet possible (observed $observed, $observed_size bytes)"
+          elif [ "$pinned" != "$observed" ] || [ "$pinned_size" != "$observed_size" ]; then
+            echo "::error::Built archive differs from the committed pin: pinned $pinned ($pinned_size bytes), observed $observed ($observed_size bytes)"
+            exit 1
+          else
+            echo "Built archive matches the committed pin $pinned ($pinned_size bytes)"
+          fi
+      - name: Require unchanged dependency locks
+        run: git diff --exit-code -- mise.lock packages/kuru-memory/mise.lock Cargo.lock
+      - name: Upload the built archive and its pins
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundle-build-aarch64-pc-windows-msvc
+          path: ${{ runner.temp }}/bundle-artifact
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload both builds for diagnosis
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundle-build-diagnostics
+          path: |
+            ${{ runner.temp }}/bundle-build-1/out
+            ${{ runner.temp }}/bundle-build-2/out
+          if-no-files-found: ignore
+          retention-days: 14
