@@ -14,7 +14,7 @@ use kuru_core::{
     Completion, CompletionRequest, Config, HookCommand, LifecycleHooks, Message, Mode, ModelInfo,
     ToolCall,
 };
-use kuru_memory::MemoryStore;
+use kuru_memory::{MemoryStore, PublicTranscriptEntry};
 use serde_json::json;
 
 use crate::{CancellationToken, Event, Harness, turn_was_cancelled};
@@ -126,10 +126,12 @@ async fn pre_turn_rewrite_reaches_the_provider_without_its_durable_hook_provenan
     warm_hook_launch().await;
     let project = tempfile::tempdir().unwrap();
     let provider = Arc::new(Recording::default());
+    // Only the first input is rewritten, so every later projection of it must
+    // come from the durable rewrite rather than a fresh hook run.
     let hooks = LifecycleHooks {
         pre_turn: vec![fake_hook(
-            r#"cat >/dev/null; printf '%s' '{"decision":"rewrite","value":{"input":"platform rewrite"}}'"#,
-            r#"$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('{"decision":"rewrite","value":{"input":"platform rewrite"}}')"#,
+            r#"input=$(cat); case "$input" in *"platform original"*) printf '%s' '{"decision":"rewrite","value":{"input":"platform rewrite"}}' ;; *) printf '%s' '{"decision":"allow"}' ;; esac"#,
+            r#"$i = [Console]::In.ReadToEnd(); if ($i.Contains('platform original')) { [Console]::Out.Write('{"decision":"rewrite","value":{"input":"platform rewrite"}}') } else { [Console]::Out.Write('{"decision":"allow"}') }"#,
         )],
         ..LifecycleHooks::default()
     };
@@ -143,45 +145,115 @@ async fn pre_turn_rewrite_reaches_the_provider_without_its_durable_hook_provenan
     .await
     .unwrap();
     let target = harness.topology.parts[0].id.clone();
+    let other = harness.topology.parts[1].id.clone();
+    let source = harness.session.id.clone();
     let output = harness
         .run_for("platform original", Some(&target))
         .await
         .unwrap();
     assert!(hook_seen(&output.events, "pre_turn", "rewritten", None));
-    // A later turn and an explicit compaction project the private history that
-    // now holds the durable record; neither may carry it to the provider.
-    harness
-        .run_for("platform follow-up", Some(&target))
+    // The turn-scoped rewrite record carries the rewritten input, never the
+    // original, under the turn's primary public node.
+    let page = harness
+        .memory
+        .public_transcript_page(&source, None, 16)
         .await
         .unwrap();
-    let compacted_from = provider.requests.lock().unwrap().len();
+    let [PublicTranscriptEntry::Turn { record }] = page.records.as_slice() else {
+        panic!("rewritten turn is not the only public turn: {page:?}");
+    };
+    let rewrite = harness
+        .memory
+        .get(&crate::engine::pre_turn_rewrite_key(
+            &harness.scope,
+            &record.node_id,
+        ))
+        .await
+        .unwrap()
+        .expect("rewritten turn lacks its turn-scoped rewrite record");
+    assert_eq!(rewrite["input"], "platform rewrite");
+    assert!(!rewrite.to_string().contains("platform original"));
+    let first_turn = provider.requests.lock().unwrap().len();
+    // A later turn to an actor that never saw the rewritten turn projects the
+    // public transcript; so do compaction, a resumed session and a fork.
+    harness
+        .run_for("platform follow-up", Some(&other))
+        .await
+        .unwrap();
+    let follow_up = provider.requests.lock().unwrap().len();
+    let compacted_from = follow_up;
     harness
         .compact_controlled(Some(&target), &CancellationToken::new())
         .await
         .unwrap();
-    let requests = provider.requests.lock().unwrap().clone();
     assert!(
-        requests.len() > compacted_from,
+        provider.requests.lock().unwrap().len() > compacted_from,
         "compaction made no provider request"
     );
-    assert!(requests.iter().any(|request| {
+    let fresh = harness.new_session().await.unwrap();
+    assert_ne!(fresh, source);
+    harness.resume_session(&source).await.unwrap();
+    let resumed_from = provider.requests.lock().unwrap().len();
+    harness
+        .run_for("platform resumed", Some(&target))
+        .await
+        .unwrap();
+    let resumed = provider.requests.lock().unwrap().len();
+    let head = harness
+        .memory
+        .session_catalog_record(&source)
+        .await
+        .unwrap()
+        .unwrap()
+        .head_node_id
+        .unwrap();
+    let child = harness
+        .fork_session(&source, &head, "platform fork")
+        .await
+        .unwrap();
+    harness
+        .run_for("platform forked", Some(&other))
+        .await
+        .unwrap();
+    let requests = provider.requests.lock().unwrap().clone();
+    assert!(requests[..first_turn].iter().any(|request| {
         request
             .messages
             .iter()
             .any(|message| message == &Message::text("user", "platform rewrite"))
     }));
+    // Every later public-transcript projection — the non-participant's later
+    // turn, the resumed session and the fork — carries the rewritten input in
+    // place of the original.
+    for (label, window) in [
+        ("later turn", &requests[first_turn..follow_up]),
+        ("resumed turn", &requests[resumed_from..resumed]),
+        ("forked turn", &requests[resumed..]),
+    ] {
+        assert!(!window.is_empty(), "{label} made no provider request");
+        assert!(
+            window
+                .iter()
+                .all(|request| request.instructions.contains("platform rewrite")),
+            "{label} did not project the rewritten input"
+        );
+    }
     // The provider sees only the rewritten request: neither the original text
-    // nor the private provenance record (nor any hook record: no post hooks
-    // are configured) reaches any projection.
+    // (in messages or instructions) nor the private provenance record (nor any
+    // hook record: no post hooks are configured) reaches any projection.
     assert!(requests.iter().all(|request| {
-        !request.messages.iter().any(|message| {
-            message.role == "kuru-hook"
-                || crate::engine::is_pre_turn_rewrite_record(message)
-                || message.text_projection().contains("platform original")
-                || message
-                    .text_projection()
-                    .contains("rewritten by a pre_turn hook")
-        })
+        !request.instructions.contains("platform original")
+            && !request
+                .instructions
+                .contains("rewritten by a pre_turn hook")
+            && !request.messages.iter().any(|message| {
+                message.role == "kuru-hook"
+                    || crate::engine::is_pre_turn_rewrite_record(message)
+                    || message.text_projection().contains("platform original")
+                    || message
+                        .text_projection()
+                        .contains("rewritten by a pre_turn hook")
+            })
     }));
     let private = harness.memory_for(&target).await.unwrap();
     let rewritten = private
@@ -194,6 +266,20 @@ async fn pre_turn_rewrite_reaches_the_provider_without_its_durable_hook_provenan
         .expect("rewritten input lacks its preceding hook record");
     assert_eq!(provenance.role, "kuru-hook");
     assert!(crate::engine::is_pre_turn_rewrite_record(provenance));
+    // The user-facing record keeps the original input in the fork's inherited
+    // public transcript and in the source session.
+    assert_eq!(harness.session.id, child);
+    let inherited = harness
+        .memory
+        .public_transcript_page(&child, None, 16)
+        .await
+        .unwrap();
+    assert!(inherited.records.iter().any(|entry| matches!(
+        entry,
+        PublicTranscriptEntry::Turn { record }
+            if record.user_entry == Some(Message::text("user", "platform original"))
+    )));
+    harness.resume_session(&source).await.unwrap();
     assert_eq!(
         harness.history().await.unwrap().first(),
         Some(&Message::text("user", "platform original"))

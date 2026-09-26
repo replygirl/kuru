@@ -2012,12 +2012,15 @@ async fn rewritten_safe_retry_uses_its_own_public_turn_after_marker_or_later_ans
         {
             let requests = provider.requests.lock().unwrap();
             assert!(requests.len() > before);
+            // The retry's public-transcript context holds this turn's
+            // interrupted primary record; it projects the rewritten input.
             assert!(requests[before..].iter().all(|request| {
                 let current = &request.messages
                     [request.messages.len() - request.current_message_count.unwrap()..];
-                !current
-                    .iter()
-                    .any(|message| message.text_projection().contains("original pending input"))
+                !request.instructions.contains("original pending input")
+                    && !current
+                        .iter()
+                        .any(|message| message.text_projection().contains("original pending input"))
             }));
             assert!(requests[before..].iter().any(|request| {
                 let current = &request.messages

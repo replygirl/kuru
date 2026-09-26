@@ -276,6 +276,10 @@ actor, invocation, and call IDs and no `turn_id`. Dreams have no `pre_turn`,
 tool class or bypass its proposal cap and candidate validation.
 
 A `pre_turn` rewrite value is `{ "input": string }` (1–131,072 bytes, not blank).
+The final rewritten input replaces the original in every provider projection of
+that turn, including later turns' public-transcript context, retries, resumed
+sessions and forks. The user-facing transcript keeps the original; see
+[lifecycle hooks](configuration.md#lifecycle-hooks).
 A `pre_tool` rewrite value is `{ "name": string, "arguments": object }`, where
 `name` must repeat the proposed tool name exactly. Only `arguments` may change;
 a different `name` is an invalid response.

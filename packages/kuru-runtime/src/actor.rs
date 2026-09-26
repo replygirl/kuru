@@ -56,6 +56,8 @@ impl std::error::Error for AccountingFailure {}
 
 pub(crate) struct Work {
     pub memory: MemoryStore,
+    /// Project scope of this work's durable state keys.
+    pub scope: String,
     pub ledger: UsageLedger,
     pub invocation: InvocationStart,
     pub turn_id: Option<String>,
@@ -390,6 +392,7 @@ impl Actor {
                     let (mut optional_public, omitted_public_rows) = if public_transcript {
                         read_public_window(
                             &work.memory,
+                            &work.scope,
                             &work.invocation.session_id,
                             16,
                             &work.cancellation,
@@ -723,8 +726,12 @@ async fn read_window(
         .await
 }
 
+/// The provider projection of the public transcript. It keeps the user-facing
+/// record's order and entries, except that a pre-turn-rewritten turn's user
+/// entry is projected as the rewritten input the model actually received.
 async fn read_public_window(
     memory: &MemoryStore,
+    scope: &str,
     session_id: &str,
     limit: usize,
     cancellation: &CancellationToken,
@@ -743,8 +750,10 @@ async fn read_public_window(
     for entry in page.records.into_iter().rev() {
         match entry {
             PublicTranscriptEntry::Turn { record } => {
-                if let Some(user) = record.user_entry {
-                    visible.push(user);
+                if let Some(user) = &record.user_entry {
+                    visible.push(
+                        provider_user_entry(memory, scope, &record, user, cancellation).await?,
+                    );
                 }
                 visible.extend(record.terminal_entries);
             }
@@ -753,6 +762,43 @@ async fn read_public_window(
     }
     visible.retain(|message| message.role != crate::engine::INTERRUPTION_ROLE);
     Ok((visible, omitted))
+}
+
+/// A public turn's user entry as a provider may see it: the durable
+/// turn-scoped rewrite when a pre-turn hook rewrote that turn, otherwise the
+/// unchanged user entry. The rewrite record is keyed by the primary node, so
+/// it serves every actor, later session, resume and fork that projects the
+/// turn.
+async fn provider_user_entry(
+    memory: &MemoryStore,
+    scope: &str,
+    record: &PublicTurnRecord,
+    user: &Message,
+    cancellation: &CancellationToken,
+) -> Result<Message> {
+    let key = crate::engine::pre_turn_rewrite_key(scope, &record.node_id);
+    let rewrite = cancellation
+        .wait(async {
+            memory
+                .get(&key)
+                .await
+                .map_err(MemoryFailure)
+                .map_err(Into::into)
+        })
+        .await?;
+    let Some(rewrite) = rewrite else {
+        return Ok(user.clone());
+    };
+    ensure!(
+        rewrite["format"] == crate::engine::PRE_TURN_REWRITE_FORMAT
+            && rewrite["session_id"] == record.origin_session_id.as_str()
+            && rewrite["turn_id"] == record.turn_id.as_str(),
+        "pre-turn rewrite record does not match its public turn"
+    );
+    let input = rewrite["input"]
+        .as_str()
+        .context("pre-turn rewrite record lacks its rewritten input")?;
+    Ok(Message::text("user", input))
 }
 
 async fn read_private_context(
@@ -837,7 +883,15 @@ async fn read_private_context(
         .total_rows
         .saturating_sub(u64::from(source.prior.is_some()));
     let omitted_shared = eligible_shared.saturating_sub(shared_summaries.len() as u64);
-    let messages = window.rows.into_iter().map(|row| row.message).collect();
+    // Pre-turn rewrite provenance stays in private history only. Remove it
+    // here, once, so context-fit omission only ever drops a projected row;
+    // these records were never budget-omitted and are not counted as such.
+    let messages = window
+        .rows
+        .into_iter()
+        .map(|row| row.message)
+        .filter(|message| !crate::engine::is_pre_turn_rewrite_record(message))
+        .collect();
     revalidate_compaction_source(memory, &source, cancellation).await?;
     let current_shared = cancellation
         .wait(async {
@@ -890,9 +944,10 @@ fn ordinary_request(
 ) -> Result<(CompletionRequest, Vec<ContextSourceSize>)> {
     // Pre-turn rewrite provenance stays in private history only; every
     // provider projection omits it, so the model sees only the rewritten input.
-    let private = provider_visible(private);
+    // Retained private rows were filtered when read; the current input is
+    // filtered here.
     let required = provider_visible(required);
-    let (private, required) = (private.as_slice(), required.as_slice());
+    let required = required.as_slice();
     let mut instructions = work.instructions.clone();
     instructions.push_str(&serde_json::to_string(
         &public

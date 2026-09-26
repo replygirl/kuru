@@ -1847,9 +1847,12 @@ mod tests {
         // The descendant escapes the owned group, keeps stdout open, and
         // publishes `orphaned` only after the hook root has exited, so the
         // caller is cancelled in the post-exit tail rather than before exit.
-        let hook = command(
+        let mut hook = command(
             "cat >/dev/null; /usr/bin/perl -MPOSIX -e 'POSIX::setsid() or die; my $p = getppid(); open(my $f, \">\", \"escaped.tmp\") or die; print $f $$; close $f; rename(\"escaped.tmp\", \"escaped\"); for (1..6000) { last if getppid() != $p; select(undef, undef, undef, 0.01) } open($f, \">\", \"orphaned.tmp\") or die; close $f; rename(\"orphaned.tmp\", \"orphaned\"); for (1..6000) { last if -e \"release\"; select(undef, undef, undef, 0.01) }' & while [ ! -e escaped ]; do sleep 0.01; done",
         );
+        // A hook deadline well beyond the post-exit bound, so only caller loss
+        // (not the deadline) can end the held drain early.
+        hook.timeout_ms = 30_000;
         let budget_wait = Duration::from_millis(hook.timeout_ms);
         let host = Arc::new(host(root.path(), HookEvent::PreTurn, hook));
         let task = tokio::spawn({
@@ -1868,13 +1871,23 @@ mod tests {
             }
         });
         let orphaned = wait_for_file(&root.path().join("orphaned"), budget_wait).await;
-        task.abort();
         assert!(orphaned, "hook root did not exit before its timeout");
+        // Give the worker many polls to observe the root exit and enter the
+        // post-exit output drain before the caller goes away.
+        tokio::time::sleep(POLL * 20).await;
+        let cancelled = Instant::now();
+        task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        // The worker settles within its shared post-exit bound while the
-        // escaped descendant still holds the output open.
+        // The drain stops at its next poll after caller loss while the escaped
+        // descendant still holds the output open; it does not run out the
+        // post-exit `CLEANUP` bound.
         host.quiesce().await.unwrap();
+        let settled = cancelled.elapsed();
         assert_eq!(host.in_flight_hooks(), 0);
+        assert!(
+            settled < CLEANUP / 2,
+            "held output drain outlived caller loss for {settled:?}"
+        );
         let escaped: i32 = std::fs::read_to_string(root.path().join("escaped"))
             .unwrap()
             .trim()

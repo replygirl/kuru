@@ -295,16 +295,28 @@ observe or stop the already-validated selection. It cannot name another speaker
 or cause a second selection. `post_tool` and `post_turn` may observe or annotate
 settled work. A post failure does not change a tool effect, result, receipt,
 usage, answer, or durable conversation, and later post hooks still run.
-A rewritten `pre_turn` input replaces the original in every provider request
-for that turn; the model sees only the rewritten text as the user's request.
-The public transcript keeps the user's original input. Each participating part's
-private history retains the rewritten input, preceded by a separate durable
-`kuru-hook` provenance record (`event: pre_turn`, `outcome: rewritten`, with the
-session, operation, invocation, turn, and rewriting hook indexes), so
-hook-authored text is never stored as indistinguishable user speech. That
-record is private: Kuru omits it from every provider request, including later
-turns and context compaction, while the retained rewritten text remains
-ordinary context for that part's later turns.
+A rewritten `pre_turn` input replaces the original in every provider
+projection of that turn: its own requests and a retry of it, every later turn's
+public-transcript context for every part (including parts that did not take
+part in the rewritten turn), resumed sessions, forks that inherit the turn, and
+context compaction. The model therefore sees only the rewritten text as the
+user's request, and its view of the conversation matches what it received. The
+user-facing public transcript, session history, export and terminal view keep
+the user's original input.
+
+Kuru keeps two private provenance records for a rewrite, and neither is ever
+sent to a provider:
+
+- Each participating part's private history retains the rewritten input,
+  preceded by a durable `kuru-hook` record (`event: pre_turn`,
+  `outcome: rewritten`, with the session, operation, invocation, turn and
+  rewriting hook indexes). Hook-authored text is therefore never stored as
+  indistinguishable user speech. The retained rewritten text remains ordinary
+  context for that part's later turns.
+- Before any provider request, Kuru stores one turn-scoped record with the
+  rewritten input and the same identities, but not the original. Every public
+  transcript projection of that turn uses it in place of the original.
+
 In a dream, a call must still be `dream_suggest` and pass the authored
 proposal cap and dream validation. Dream annotations stay in the candidate
 memory view and disappear if that candidate is abandoned.
@@ -347,11 +359,10 @@ hook that explicitly runs the system's stock Windows PowerShell
 that edition reconstructs its standard module paths. Hooks do not receive the
 built-in shell tool's `$PSHOME` module bootstrap, which is specific to that
 tool. A cold stock PowerShell 5.1 start, such as the first hook after sign-in or
-on a fresh profile, can take longer than the 5,000-millisecond default before
-the command runs; native Windows CI has observed a first stock PowerShell hook
-exceed that default. Set `timeout_ms` on each Windows hook that runs stock
-PowerShell to allow for its cold start (up to the 120,000-millisecond maximum),
-and keep the operation's `max_total_ms` large enough for the hooks it runs.
+on a fresh profile, can exceed the 5,000-millisecond default. Set `timeout_ms`
+on each Windows hook that runs stock PowerShell to allow for its cold start (up
+to the 120,000-millisecond maximum), and keep the operation's `max_total_ms`
+large enough for the hooks it runs.
 See [hook protocol](protocols.md#lifecycle-hook-protocol) for the exact request
 and decision shapes.
 

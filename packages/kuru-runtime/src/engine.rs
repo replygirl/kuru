@@ -35,7 +35,7 @@ use kuru_memory::{
     HistoryWindow, LegacySessionTurnResume, MemoryStatus, MemoryStore, PublicTranscriptEntry,
     PublicTurnSettlement, Revision, SelectedAbandonResolution, SessionCatalogRecord,
     SessionLifecycleOutcome, SessionLifecycleState, SessionModeCheckpoint, SessionTurnCheckpoint,
-    StoredNote,
+    StoredNote, public_turn_node_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -76,6 +76,18 @@ pub(crate) fn is_pre_turn_rewrite_record(message: &Message) -> bool {
                 record["event"] == HookEvent::PreTurn.label()
                     && record["outcome"] == HookOutcomeKind::Rewritten.label()
             })
+}
+
+/// Format of the turn-scoped pre-turn rewrite record.
+pub(crate) const PRE_TURN_REWRITE_FORMAT: u64 = 1;
+
+/// State key of the turn-scoped pre-turn rewrite record for one primary
+/// public turn node. The record holds the final rewritten input (never the
+/// original) so every provider projection of that turn's public user entry —
+/// later turns, retries, resumes and forks, for every actor — carries what the
+/// model actually received. It is private provenance, never projected itself.
+pub(crate) fn pre_turn_rewrite_key(scope: &str, primary_node_id: &str) -> String {
+    format!("{scope}/pre-turn-rewrite/{primary_node_id}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3160,6 +3172,7 @@ impl Harness {
         let instructions = self.instruction_parts(id, phase)?;
         let work = Work {
             memory: memory.clone(),
+            scope: self.scope.clone(),
             ledger: self.memory.usage_ledger()?,
             invocation,
             turn_id: turn_id.map(str::to_owned),
@@ -3673,6 +3686,23 @@ impl Harness {
                     .unwrap_or(false),
                 "active turn transcript changed before provider dispatch"
             );
+            // Before any dispatch, retain the rewritten input for this turn's
+            // public node so every later provider projection of the public
+            // transcript substitutes it for the original user entry.
+            let primary = public_turn_node_id(&self.session.id, turn_id)?;
+            self.memory
+                .put(
+                    &pre_turn_rewrite_key(&self.scope, &primary),
+                    &json!({
+                        "format": PRE_TURN_REWRITE_FORMAT,
+                        "session_id": self.session.id,
+                        "turn_id": turn_id,
+                        "invocation_id": journal.id,
+                        "hook_indexes": rewriting_hooks,
+                        "input": effective_prompt,
+                    }),
+                )
+                .await?;
             Some(override_input)
         } else {
             None
