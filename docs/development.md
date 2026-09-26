@@ -74,9 +74,10 @@ installation job runs beside coverage after independently preparing its locked
 inputs: it installs the release build offline, verifies the installed offline
 runtime and then runs
 `mise run //packages/kuru-delivery:test:previous-release-update`, in which the
-previous published release's own updater installs that release build
-(`target/release/kuru`, or `target/x86_64-pc-windows-msvc/release/kuru.exe` on
-Windows). That step needs outbound HTTPS and receives the workflow's read-only
+previous published release's own updater installs the installed executable
+under the job's temporary `kuru-bin` directory. It never reads Cargo's target
+directory, which the Windows offline build-input check later relinks with all
+features. That step needs outbound HTTPS and receives the workflow's read-only
 `GITHUB_TOKEN`, used only to list releases. It runs on pull requests, merge
 groups and `main` pushes; a branch older than the latest published release fails
 it and must be rebased. Linux Clippy does not analyze

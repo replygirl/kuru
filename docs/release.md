@@ -95,7 +95,9 @@ runtime is involved.
    on the selected main revision. Format, lint, typecheck, tooling, docs and
    cospec have independent jobs. Both must pass before planning and checking
    publication prerequisites. The 90% coverage gate and per-OS installation and
-   update checks are enforced on `main` by CI, not repeated by the release run.
+   update checks are required by CI (`ci-gate` in the merge queue) before a
+   commit reaches `main`; the release run does not repeat them or read that
+   result.
    This original dispatch SHA remains the base when all jobs are rerun.
 2. Stamp the workspace and local lockfile entries, then create the signed API
    commit with an expected-head comparison. If an earlier attempt created that
@@ -116,8 +118,8 @@ runtime is involved.
    generates `SHA256SUMS`, validates the bounded notes, and retains `dist/` plus
    `RELEASE_NOTES.md` for the remaining jobs. Invalid or incomplete inputs stop
    here without creating a tag, draft, or public release.
-6. Accept the staged candidate natively on Windows x86_64, Linux x86_64 and
-   macOS arm64 (the `verify-staged` matrix). In parallel, `build-docs` checks
+6. Accept the staged candidate natively on Windows x86_64, Linux x86_64,
+   Linux arm64 and macOS arm64 (the `verify-staged` matrix). In parallel, `build-docs` checks
    out the selected commit and builds and validates the site. On Windows, run
    the ordinary mise installation route against simulated GitHub metadata that
    serves the exact staged Windows ZIP. The Windows check verifies candidate
@@ -175,7 +177,8 @@ in the version commit.
 ## Verify the staged candidate
 
 Before publication, the Release workflow's `verify-staged` matrix downloads its
-complete candidate on `windows-latest`, `ubuntu-latest` and `macos-latest`. The
+complete candidate on `windows-latest`, `ubuntu-latest`, `ubuntu-24.04-arm`
+and `macos-latest`. The
 Windows leg invokes `//apps/kuru-tui:verify:staged-windows` with the exact
 staged Windows ZIP. The task resolves the pinned native mise executable before
 clearing its child environment, then routes the ordinary
@@ -250,7 +253,7 @@ change is checked against the release users actually have. The Release workflow
 repeats the check against the exact staged candidate on every staged platform
 before publication.
 
-The Linux x86_64 and macOS arm64 legs are an interim acceptance. Each checks its
+The Linux x86_64, Linux arm64 and macOS arm64 legs are an interim acceptance. Each checks its
 `kuru-VERSION-TARGET.tar.gz` against the candidate's `SHA256SUMS`, extracts it,
 and runs `//apps/kuru-tui:test:embedded-runtime` with `KURU_EMBEDDED_TEST_BINARY`
 set to the extracted `kuru`, which packages, installs, updates and reopens that
@@ -262,8 +265,9 @@ release's own updater must install those exact bytes. These legs do not yet
 prove the mise installation route that the Windows leg proves, and the updater
 check repackages the staged executable rather than serving the staged archive
 itself. An app-owned Unix `//apps/kuru-tui:verify:staged` task is the follow-on
-that closes this gap. Other archive targets have no staged leg; their native
-release builds verify the packaged offline runtime.
+that closes this gap. Intel macOS (`x86_64-apple-darwin`) has no staged leg:
+it is a known gap, and its native release build alone verifies the packaged
+offline runtime.
 
 `deploy-docs` depends on every leg of this native check and the independent docs
 build. The `publish` job depends on successful deployment, so a candidate, any

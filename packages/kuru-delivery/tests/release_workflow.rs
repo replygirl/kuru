@@ -137,7 +137,7 @@ fn required_release_checks_precede_the_only_publication_job() {
     }
 
     let verifier = job("verify-staged");
-    // Staged acceptance runs on every supported platform before promotion.
+    // Staged acceptance runs on each supported operating system before promotion.
     let matrix = verifier
         .split("        include:\n")
         .nth(1)
@@ -147,7 +147,7 @@ fn required_release_checks_precede_the_only_publication_job() {
         .unwrap();
     assert_eq!(
         matrix,
-        "          - os: windows-latest\n            target: x86_64-pc-windows-msvc\n          - os: ubuntu-latest\n            target: x86_64-unknown-linux-gnu\n          - os: macos-latest\n            target: aarch64-apple-darwin\n"
+        "          - os: windows-latest\n            target: x86_64-pc-windows-msvc\n          - os: ubuntu-latest\n            target: x86_64-unknown-linux-gnu\n          - os: ubuntu-24.04-arm\n            target: aarch64-unknown-linux-gnu\n          - os: macos-latest\n            target: aarch64-apple-darwin\n"
     );
     for required in [
         "fail-fast: false",
@@ -567,10 +567,11 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
         "KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru${{ runner.os == 'Windows' && '.exe' || '' }}"
     ));
     // The updater step is online, receives the token only for release
-    // listing, and names the release build the install task produced.
+    // listing, and names the installed shipping executable, never Cargo's
+    // target directory, which a later Windows step rebuilds with all features.
     let updater = steps[step("Accept an update from the previous published release")];
     for required in [
-        "KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.os == 'Windows' && format('{0}\\target\\x86_64-pc-windows-msvc\\release\\kuru.exe', github.workspace) || format('{0}/target/release/kuru', github.workspace) }}",
+        "KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.temp }}/kuru-bin/kuru${{ runner.os == 'Windows' && '.exe' || '' }}",
         "GITHUB_TOKEN: ${{ github.token }}",
         "run: mise run //packages/kuru-delivery:test:previous-release-update",
     ] {

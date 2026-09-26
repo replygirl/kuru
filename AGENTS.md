@@ -280,7 +280,7 @@ there; no credentials belong in source or generated artifacts.
 
 Build and publish docs only through the `build-docs` and `deploy-docs` jobs inside
 that Release workflow and from the exact selected release commit. Staged
-candidate acceptance on every supported platform, each leg re-running
+candidate acceptance on each supported operating system, each leg re-running
 previous-release update acceptance as a sanity check, and documentation
 deployment must succeed before the publication job can promote the public
 release. A separate post-publication
