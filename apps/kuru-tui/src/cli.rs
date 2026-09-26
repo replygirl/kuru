@@ -251,6 +251,41 @@ fn shell_support_output(command: &Command) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Process-launching audit (AGENTS.md: "audit new process-launching
+/// dependencies and consumer call sites instead of claiming isolation across
+/// arbitrary spawn mechanisms"), against `usage-cli` 6.11.1 as published:
+///
+/// - `usage::sh::sh` (spawns `sh -c` on Unix, `cmd /c` on Windows) runs behind
+///   `usage_cli::complete_answer` only when a `SpecComplete.run` is
+///   `Some(_)` (`usage-cli/src/cli/complete_word.rs`, `if let Some(run) =
+///   &complete.run`). `usage-lib`'s `From<&clap::Command> for Spec`
+///   conversion (`usage-lib/src/spec/cmd.rs`, the arg/flag loop building
+///   `spec.complete`) only ever sets `name` and `type_` from
+///   `clap::ValueHint`; `run` is left at its `Default` (`None`) for every
+///   entry. `usage_spec()` below is exactly that conversion, so no
+///   `SpecComplete` it produces can ever carry a `run` script — this path is
+///   statically unreachable here, not merely unexercised.
+/// - `std::process::Command` at `usage-cli/src/cli/exec.rs:92` and
+///   `cli/shell.rs:133` belong to `usage-cli`'s own `exec`/`shell`
+///   subcommands (`Cli::Exec`, `Cli::Shell`), reachable only through
+///   `usage_cli::Cli`'s own arg dispatch (`Cli::run`/`Cli::parse_from`).
+///   Kuru never imports `usage_cli::Cli` and never calls `usage_cli::run`;
+///   the only `usage_cli` symbol referenced anywhere in this crate is
+///   `complete_answer` itself (grepped: `usage_cli::` appears exactly once,
+///   at its call site below).
+/// - The Unix-only `exec` crate (`[target.'cfg(unix)'.dependencies]` in
+///   `usage-cli`'s Cargo.toml) has no call site under its `src/` at all as
+///   published — `exec::` never appears in its source, only the crate's own
+///   local `mod exec` (the module above, an unrelated name collision). It
+///   appears to be a vestigial manifest entry upstream; either way nothing
+///   in `usage-cli`'s compiled surface invokes it.
+/// - `env_logger`'s `Builder::init()` call lives only in `usage-cli`'s
+///   `[[bin]] usage` target (`src/main.rs`), which is never built when
+///   `usage-cli` is consumed as a library dependency, as Kuru does.
+///
+/// Net: the only process this call path can start is Kuru's own re-exec of
+/// itself through the shell-installed completion script, never a subprocess
+/// `usage-cli` spawns on Kuru's behalf.
 fn native_completion_answer_output(
     request: &usage_argv::complete::CompletionRequest,
 ) -> Result<Vec<u8>> {
@@ -1005,10 +1040,25 @@ fn data_directory_error(data: &Path, error: std::io::Error) -> anyhow::Error {
     error.into()
 }
 
+/// Writes generated shell-support or completion-answer bytes to stdout, the
+/// same as a well-behaved Unix tool: a reader that closes early (`kuru
+/// completions bash | head`) is not an error condition — Rust's runtime
+/// ignores `SIGPIPE`, so a write past a closed pipe returns a plain
+/// `BrokenPipe` `io::Error` rather than terminating the process, and letting
+/// that propagate as an ordinary `anyhow` error prints a spurious `Error:
+/// Broken pipe (os error 32)` and exits 1 for what is, from the reader's
+/// side, a completely successful invocation.
+fn write_stdout_ignoring_broken_pipe(output: &[u8]) -> Result<()> {
+    match io::stdout().write_all(output) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub async fn run() -> Result<()> {
     if let Some(output) = native_completion_from_argv()? {
-        io::stdout().write_all(&output)?;
-        return Ok(());
+        return write_stdout_ignoring_broken_pipe(&output);
     }
     execute(Cli::parse()).await
 }
@@ -1016,8 +1066,7 @@ pub async fn run() -> Result<()> {
 /// Binary-only entrypoint. Library callers remain subscriber-neutral.
 pub async fn run_with_diagnostics() -> Result<()> {
     if let Some(output) = native_completion_from_argv()? {
-        io::stdout().write_all(&output)?;
-        return Ok(());
+        return write_stdout_ignoring_broken_pipe(&output);
     }
     execute_inner(Cli::parse(), true).await
 }
@@ -1028,8 +1077,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
 
 async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
     if let Some(command @ (Command::Completions { .. } | Command::Man)) = &cli.command {
-        io::stdout().write_all(&shell_support_output(command)?)?;
-        return Ok(());
+        return write_stdout_ignoring_broken_pipe(&shell_support_output(command)?);
     }
     if let Some(Command::Update {
         version,

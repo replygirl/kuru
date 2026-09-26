@@ -56,6 +56,12 @@ ratatui = { version = "=0.30.2", default-features = false, features = [
 crossterm = "=0.29.0"
 clap = { version = "=4.6.6", features = ["derive", "env"] }
 usage-lib = { version = "=6.11.1", features = ["clap"] }
+# usage-cli has no optional features (verified against its published Cargo.toml):
+# every dependency it declares — including rmcp's "server" transport, tera, tokio
+# and env_logger — is unconditional, so there is no narrower feature set to select
+# here. Kuru links only its `complete_answer` function; see the process-launching
+# audit above `native_completion_answer_output` in apps/kuru-tui/src/cli.rs for
+# which of its process-spawning code paths are actually reachable from that call.
 usage-cli = "=6.11.1"
 usage-argv = { version = "=6.11.1", features = ["complete"] }
 tempfile = "=3.27.0"
