@@ -65,6 +65,11 @@ function Invoke-Build([string] $label, [string] $inputMirror, [string] $expected
         if ($message.Contains('Compiling ')) {
             throw "$label was not fresh: the source installation's build differs from this offline command."
         }
+        # Require Cargo's positive status line too, so lost or redirected output
+        # cannot pass the freshness check by merely lacking 'Compiling '.
+        if (-not $message.Contains('Finished ')) {
+            throw "$label printed no Cargo 'Finished ' status; its freshness is unproven."
+        }
         if (-not (Test-Path -LiteralPath $built -PathType Leaf)) { throw "$label found no Cargo output at $built." }
         # Hash only: Cargo's output is a read-only input to this check.
         $builtHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $built).Hash

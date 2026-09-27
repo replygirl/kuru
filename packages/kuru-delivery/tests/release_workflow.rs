@@ -1008,6 +1008,7 @@ fn native_build_input_check_reuses_the_installed_shipping_build() {
     for required in [
         "if ($control) { $env:KURU_DOLT_BUNDLE_DIR = $savedMirror }",
         "$message.Contains('Compiling ')",
+        "if (-not $message.Contains('Finished '))",
         r#"$built = Join-Path $targetDirectory "$target/release/kuru.exe""#,
         "$builtHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $built).Hash",
         "if ($builtHash -cne $installedHash)",
