@@ -710,11 +710,31 @@ its project's own naming (for example `hk-aarch64-pc-windows-msvc.zip`,
 
 A pattern that matches no asset does not make `mise lock` fail: it reports the
 platform as skipped, exits successfully and writes no `windows-arm64` entry for
-cospec, and only a later `MISE_LOCKED=1` installation fails. After refreshing
-the root lock, confirm the entry exists:
+cospec, and only a later `MISE_LOCKED=1` installation fails.
+
+Mise records a per-platform option as a second
+`[[tools."github:aligned-team/cospec"]]` lock element carrying
+`options.asset_pattern`, its own `specifiers` and the `windows-arm64` row (see
+mise's [lockfile format](https://mise.jdx.dev/dev-tools/mise-lock.html), where
+one version can have several entries distinguished by `options`). Unlocked
+installs, including the nested `mise install node npm` behind
+`//apps/kuru-docs:setup:tools` that `format:check`, `docs:*` and the hk hooks
+reach, rewrite each per-project lockfile from the host's resolved toolset.
+They drop that non-host element, and mise's best-effort auto-lock may then
+re-add the `windows-arm64` row without `specifiers` or, when the GitHub API
+refuses the query, not at all. Only `mise lock` restores it. Run every
+command other than an intentional lock refresh with `MISE_LOCKED=1`, which
+stops automatic lockfile updates and fails on a missing entry instead of
+resolving it ([strict lockfile mode](https://mise.jdx.dev/dev-tools/mise-lock.html)).
+The refresh commands above still write with `MISE_LOCKED=1` set. CI
+already exports `MISE_LOCKED=1`. The repository check in `lint:tooling`
+(`mise run //packages/kuru-delivery:check:repo`) fails unless the lock holds, for
+each root tool with a `platforms` table, an element with those options, the
+pinned version in `specifiers` and a `checksum` and `url` for that platform.
+Run it after refreshing the root lock:
 
 ```sh
-grep -F '[tools."github:aligned-team/cospec"."platforms.windows-arm64"]' mise.lock
+MISE_LOCKED=1 mise run //packages/kuru-delivery:check:repo
 ```
 
 Mise records available provenance for every platform, but normally verifies

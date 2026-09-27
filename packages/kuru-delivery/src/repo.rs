@@ -65,6 +65,67 @@ fn inherited_dependencies(manifest: &Value, member: &str, errors: &mut BTreeSet<
     }
 }
 
+/// A root tool's per-platform options (`[tools.<name>.platforms.<platform>]`)
+/// make mise record a separate lock element keyed by those options. Ordinary
+/// unlocked mise runs on another host drop that element or its `specifiers`,
+/// so require the committed lock to still carry it complete.
+fn platform_option_locks(
+    root: &Path,
+    tools: Option<&toml::map::Map<String, Value>>,
+    errors: &mut BTreeSet<String>,
+) -> Result<()> {
+    let mut lock = None;
+    for (name, tool) in tools.into_iter().flatten() {
+        let Some(platforms) = tool.get("platforms").and_then(Value::as_table) else {
+            continue;
+        };
+        let version = tool_version(tool).unwrap_or_default();
+        let lock = match &lock {
+            Some(lock) => lock,
+            None => lock.insert(read_toml(&root.join("mise.lock"))?),
+        };
+        let elements = lock
+            .get("tools")
+            .and_then(|tools| tools.get(name))
+            .and_then(Value::as_array);
+        for (platform, options) in platforms {
+            let Some(options) = options.as_table() else {
+                errors.insert(format!(
+                    "mise tool {name} platform {platform} options must be a table"
+                ));
+                continue;
+            };
+            let complete = elements.into_iter().flatten().any(|element| {
+                let recorded = element.get("options").and_then(Value::as_table);
+                let row = element.get(format!("platforms.{platform}").as_str());
+                element.get("version").and_then(Value::as_str) == Some(version)
+                    && options.iter().all(|(key, value)| {
+                        recorded.and_then(|recorded| recorded.get(key)) == Some(value)
+                    })
+                    && element
+                        .get("specifiers")
+                        .and_then(Value::as_array)
+                        .is_some_and(|specifiers| {
+                            specifiers
+                                .iter()
+                                .any(|value| value.as_str() == Some(version))
+                        })
+                    && ["checksum", "url"].iter().all(|field| {
+                        row.and_then(|row| row.get(field))
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| !value.is_empty())
+                    })
+            });
+            if !complete {
+                errors.insert(format!(
+                    "mise.lock lacks the complete {name}@{version} {platform} option entry (options, specifiers, checksum and url); refresh it with the documented `mise lock --platform ...` and run other mise commands with MISE_LOCKED=1"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn check(root: &Path) -> Result<Vec<String>> {
     let canonical_root = root.canonicalize()?;
     let manifest = read_toml(&root.join("Cargo.toml"))?;
@@ -87,6 +148,7 @@ pub fn check(root: &Path) -> Result<Vec<String>> {
             errors.insert(format!("mise tool {name} must be exactly pinned"));
         }
     }
+    platform_option_locks(root, tools, &mut errors)?;
     if config.get("monorepo_root").and_then(Value::as_bool) != Some(true) {
         errors.insert("mise.toml must declare monorepo_root = true".into());
     }

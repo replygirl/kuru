@@ -558,6 +558,41 @@ option: the aqua backend has no `asset_pattern`, and the aqua registry entry's
 `windows-arm64`; task 2.9 records the resolved asset from the generated lock as
 that check.
 
+Known limitation (upstream mise behavior, observed 2026-09-26 with 2026.9.13 and
+the pinned 2026.9.4). The github backend puts every per-target asset selector
+(`asset_pattern`, `additional_asset_patterns`, `url`) into the lock entry's
+`options` (`src/backend/github.rs` `lockfile_options`), so the arm64 pin is a
+second `[[tools."github:aligned-team/cospec"]]` element; mise's lockfile format
+documents several entries per version distinguished by `options`
+(https://mise.jdx.dev/dev-tools/mise-lock.html). The committed
+`platforms.windows-arm64` table is the form mise's github backend documentation
+prescribes (https://mise.jdx.dev/dev-tools/backends/github.html), and every
+equivalent spelling produces the same options, so no stable alternative
+representation exists. A tool-level templated pattern would add options to the primary element
+and reselect its musl and baseline rows. Opting the root into
+`[monorepo] lockfile = true` would reroute the docs and delivery locks. Both
+break the additive-only lock diff. Unlocked installs run `update_lockfiles`
+(`src/lockfile.rs`), whose `merge_tool_entries` rebuilds the root lock from
+the host's resolved toolset and drops an existing non-empty-options element the
+host did not resolve; `preserve_absent_tool_entries` rescues it only for a
+monorepo-root lockfile, which this repository's per-project locks are not. The
+best-effort `auto_lock_new_versions` then re-adds only the `windows-arm64` row
+through `set_platform_info`, without `specifiers`, when the GitHub attestation
+query succeeds, and nothing when it fails. One path therefore explains both
+earlier reports. The one-line `specifiers` loss follows a successful auto-lock.
+The 14-line element deletion follows an anonymous-rate-limited 403 (`auto-lock:
+failed to resolve github:aligned-team/cospec for windows-arm64 ... 403
+Forbidden`). Exact repro in the branch worktree: `mise run
+//apps/kuru-docs:format:check` (its `setup:tools` runs `mise install node npm`),
+or `mise install node` at the root, then `git diff --stat mise.lock`. A
+following `mise lock` restores the committed lock byte for byte. Mitigation:
+every command other than an intentional lock refresh runs with `MISE_LOCKED=1`,
+which skips both `update_lockfiles` and auto-lock (CI already exports it), as
+`docs/development.md` records. `kuru-delivery repo` (in `lint:tooling`) fails
+unless, for each root tool with a `platforms` table, the lock holds an element
+carrying those options, the pinned version in `specifiers` and that platform's
+`checksum` and `url`.
+
 Contingency, only if step zero shows mise cannot select or run the x64 cospec
 asset on arm64: drop `github:aligned-team/cospec` from the arm64 jobs'
 `install_args` and add a host-keyed exclusion table to
