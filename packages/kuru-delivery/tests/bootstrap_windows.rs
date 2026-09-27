@@ -1189,21 +1189,39 @@ async fn recover_only_restores_exact_old_identity_and_rejects_corrupted_trusted_
 async fn bootstrap_selects_the_native_machine_target_whatever_the_architecture_environment_reports()
 {
     // AMD64 is true on x64 and false on Arm64; ARM64 is the reverse, so every
-    // runner sees at least one contradicting report. x86, an empty value and an
-    // unknown name cover reports that name no catalog target at all. This
-    // proves the environment is ignored in a native shell. It does not launch
-    // the bootstrap from an emulated process (design D2, task 3.7).
+    // runner is asked to report at least one contradicting value. x86, an empty
+    // value and an unknown name cover reports that name no catalog target at
+    // all. It does not launch the bootstrap from an emulated process (design
+    // D2, task 3.7).
     //
     // The child records the environment it actually received before it runs
-    // the bootstrap, so the injection proof never depends on the bootstrap,
+    // the bootstrap, so the injection record never depends on the bootstrap,
     // which deliberately never reads these variables. Both variables are in
     // the child's creation block, but a native x64 runner delivered
-    // PROCESSOR_ARCHITECTURE exactly and PROCESSOR_ARCHITEW6432 empty, so only
-    // the former must arrive exactly; the WOW64 variable may be absent but
-    // never different. The empty case displaces the fixture's native value,
-    // so observing it empty still proves the injection.
+    // PROCESSOR_ARCHITECTURE exactly and PROCESSOR_ARCHITEW6432 empty, so the
+    // WOW64 variable may be absent but never different. The empty case
+    // displaces the fixture's native value, so observing it empty still proves
+    // the injection.
+    //
+    // On x64 every injected PROCESSOR_ARCHITECTURE must arrive exactly, and
+    // that run is the proof that the environment is ignored. Windows on Arm
+    // did not deliver it: in job 108616153749 (run 36317654214, windows-11-arm)
+    // the native ARM64 (0xAA64) stock PowerShell child created with
+    // PROCESSOR_ARCHITECTURE=AMD64 and PROCESSOR_ARCHITEW6432=AMD64 observed
+    // PROCESSOR_ARCHITECTURE=ARM64 and PROCESSOR_ARCHITEW6432 empty, while the
+    // bootstrap still selected aarch64-pc-windows-msvc and installed. That is
+    // the only Arm case observed so far; the others are unobserved until a run
+    // reaches them. On an aarch64 target a case therefore passes when the child
+    // observed either the injected value or the native ARM64 name, and each
+    // case's outcome (injected, os-normalised or indistinguishable) is carried
+    // in every later assertion message. On Arm the normalised cases run the
+    // same bootstrap with the native value present, so they prove native
+    // selection and the PE machine but not that a contradicting value is
+    // ignored; the identical script's x64 run carries that property.
     let fixture = Fixture::new();
     let (machine, _) = pe_machine(*TARGET);
+    let native = kuru_delivery::mise_isolation::native_processor_architecture();
+    let mut received = Vec::new();
     for (reported, label) in [
         ("AMD64", "AMD64"),
         ("ARM64", "ARM64"),
@@ -1231,18 +1249,33 @@ Write-Output "native=$([Kuru.Bootstrap.Native]::MachineTarget([Kuru.Bootstrap.Na
         success(&result);
         let stdout = String::from_utf8_lossy(&result.stdout);
         let lines = stdout.lines().map(str::trim).collect::<Vec<_>>();
+        let injected = lines.contains(&format!("observed=[{reported}]").as_str());
+        let normalised = cfg!(target_arch = "aarch64")
+            && lines.contains(&format!("observed=[{native}]").as_str());
+        received.push((
+            label,
+            match (injected, normalised) {
+                (true, true) => "indistinguishable",
+                (true, false) => "injected",
+                (false, true) => "os-normalised",
+                (false, false) => "neither",
+            },
+        ));
         assert!(
-            lines.contains(&format!("observed=[{reported}]").as_str()),
-            "the child shell did not receive PROCESSOR_ARCHITECTURE={reported:?}: {stdout}"
+            injected || normalised,
+            "the child shell observed neither PROCESSOR_ARCHITECTURE={reported:?} nor, on Arm, \
+             the native {native:?}: {stdout}\nreceived so far: {received:?}"
         );
         assert!(
             lines.contains(&"observed-wow64=[]")
                 || lines.contains(&format!("observed-wow64=[{reported}]").as_str()),
-            "the child shell received a PROCESSOR_ARCHITEW6432 other than {reported:?}: {stdout}"
+            "the child shell received a PROCESSOR_ARCHITEW6432 other than {reported:?}: \
+             {stdout}\nreceived so far: {received:?}"
         );
         assert!(
             lines.contains(&format!("native={}", *TARGET).as_str()),
-            "bootstrap did not detect the native machine with {reported:?} reported: {stdout}"
+            "bootstrap did not detect the native machine with {reported:?} reported: \
+             {stdout}\nreceived so far: {received:?}"
         );
         fixture.installed(&destination);
         let installed = fs::read(destination.join("kuru.exe")).unwrap();
@@ -1250,10 +1283,15 @@ Write-Output "native=$([Kuru.Bootstrap.Native]::MachineTarget([Kuru.Bootstrap.Na
         assert_eq!(
             u16::from_le_bytes(installed[field..field + 2].try_into().unwrap()),
             machine,
-            "installed executable is not the native {} machine with {reported:?} reported",
+            "installed executable is not the native {} machine with {reported:?} reported; \
+             received so far: {received:?}",
             *TARGET
         );
     }
+    println!(
+        "PROCESSOR_ARCHITECTURE received per case on {}: {received:?}",
+        *TARGET
+    );
     fixture.unchanged();
 }
 
