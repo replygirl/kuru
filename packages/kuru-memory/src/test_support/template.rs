@@ -674,7 +674,13 @@ mod tests {
         let store = Store::temporary().await?;
         store.close().await?;
         let fingerprint = fingerprint(&scope())?;
-        let template = default_root()?.join(&fingerprint);
+        // Read under the shared lock, as every copy does.
+        let root = files::ensure_private_directory(&default_root()?)?;
+        let lock_name = format!("{fingerprint}.lock");
+        let lock = root.lock_file(OsStr::new(&lock_name))?;
+        let _held = acquire(&lock, true, &root.path().join(&lock_name)).await?;
+        root.verify(OsStr::new(&lock_name), &lock)?;
+        let template = root.path().join(&fingerprint);
         let manifest = read_manifest(&template, &fingerprint)?;
         assert_eq!(
             top_level(&manifest),
@@ -760,7 +766,30 @@ mod tests {
         assert_eq!(names, [fingerprint.clone(), format!("{fingerprint}.lock")]);
         validate(&template, &fingerprint)?;
 
-        // A copy never follows or adopts a link.
+        // A second hard link to a template file, outside the template.
+        let alias = container.path().join("alias");
+        fs::hard_link(template.join(STORE).join("identity.json"), &alias)?;
+        let error = validate(&template, &fingerprint).expect_err("hard link accepted");
+        assert!(
+            format!("{error:#}").contains("exactly one hardlink"),
+            "unexpected validation error: {error:#}"
+        );
+        let copy = container.path().join("hard-link-copy").join("memory");
+        files::private_dir(&copy)?;
+        let error = copy_template(&template, &fingerprint, &copy.join("store"))
+            .expect_err("hard link copied");
+        assert!(
+            format!("{error:#}").contains("exactly one hardlink"),
+            "unexpected copy error: {error:#}"
+        );
+        assert_eq!(
+            instantiate_in(&root, &data("hard-linked"), &scope()).await?,
+            Outcome::Rebuilt
+        );
+        validate(&template, &fingerprint)?;
+        open_copy(&data("hard-linked")).await?;
+
+        // A copy never follows or adopts a symbolic link.
         #[cfg(unix)]
         {
             let outside = container.path().join("outside");
