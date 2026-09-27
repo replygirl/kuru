@@ -764,6 +764,12 @@ fn windows_on_arm_partitions_are_uninstrumented_behavioral_evidence_with_an_impo
         named_step(&steps, "Install coverage components")
             .contains("if: env.KURU_NATIVE_MODE == 'instrumented'\n")
     );
+    // Only instrumented partitions install cargo-llvm-cov; the Arm task
+    // declares no coverage tool, so its mise setup omits it as well.
+    assert!(shards.contains(
+        "          install_args: ${{ inputs.os == 'windows-11-arm' && 'rust github:aligned-team/cospec' || 'rust aqua:taiki-e/cargo-llvm-cov github:aligned-team/cospec' }}\n"
+    ));
+    assert_eq!(shards.matches("install_args:").count(), 1);
 
     // Each Windows on Arm job imports the pinned engine before anything
     // builds; bundle:prepare checks the committed pin again.

@@ -107,7 +107,8 @@ jobs:
           experimental: true
           version: 2026.9.4
           # Cospec is exercised by delivery's real standalone contract tests.
-          install_args: rust aqua:taiki-e/cargo-llvm-cov github:aligned-team/cospec
+          # Uninstrumented Windows on Arm partitions never use cargo-llvm-cov.
+          install_args: ${{ inputs.os == 'windows-11-arm' && 'rust github:aligned-team/cospec' || 'rust aqua:taiki-e/cargo-llvm-cov github:aligned-team/cospec' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Install coverage components
