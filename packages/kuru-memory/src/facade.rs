@@ -1246,10 +1246,21 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Template-backed isolated test store; see [`store::MemoryStore::temporary`].
     #[cfg(any(test, feature = "test-support"))]
     pub async fn temporary() -> Result<Self> {
         Ok(Self {
             backend: Backend::Local(store::MemoryStore::temporary().await?),
+            reject_next_state_write: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Isolated test store created by a complete cold open; see
+    /// [`store::MemoryStore::temporary_cold`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn temporary_cold() -> Result<Self> {
+        Ok(Self {
+            backend: Backend::Local(store::MemoryStore::temporary_cold().await?),
             reject_next_state_write: Arc::new(AtomicBool::new(false)),
         })
     }

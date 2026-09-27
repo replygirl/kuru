@@ -42,6 +42,9 @@ mod open_pool_budget_tests;
 #[cfg(test)]
 #[path = "store/operational_gc_tests.rs"]
 mod operational_gc_tests;
+#[cfg(test)]
+#[path = "store/template_tests.rs"]
+mod template_tests;
 
 pub(crate) const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTHOR: &str = "Kuru <memory@kuru.local>";
@@ -1946,28 +1949,57 @@ impl MemoryStore {
         Ok(store)
     }
 
-    /// Real isolated Dolt fixture. Missing runtime/helper is an error, never a skip.
+    /// Real isolated Dolt fixture copied from the pre-migrated test template.
+    ///
+    /// The store owns its own private directory, writable open, supervisor
+    /// and Dolt process, exactly as [`Self::temporary_cold`] does. Only the
+    /// schema work is skipped: the directory starts as a private copy of one
+    /// cleanly closed cold open (see [`crate::test_support`]), so every copy
+    /// shares that template's instance identity, credentials, initial revision
+    /// and migration receipts. Tests of server or process lifecycle,
+    /// migration, import or legacy data, and tests that compare identity or
+    /// secrets use [`Self::temporary_cold`]. Missing runtime/helper is an
+    /// error, never a skip.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn temporary() -> Result<Self> {
-        static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-        let permit = PERMITS
-            .get_or_init(|| Arc::new(Semaphore::new(4)))
-            .clone()
-            .acquire_owned()
-            .await?;
-        let directory = tempfile::Builder::new().prefix("kuru-memory-").tempdir()?;
-        let data = directory.path().join("private");
-        let mut options = OpenOptions::new(data, format!("project/{}", "0".repeat(64)));
-        options.config.cache_dir = Some(test_cache());
-        options.config.offline = true;
-        options.supervisor = Some(test_supervisor()?);
+        let directory = Arc::new(temporary_directory()?);
+        // Boxed: template creation nests a complete cold open.
+        Box::pin(crate::test_support::template::instantiate(
+            &directory.path().join("private"),
+            &temporary_scope(),
+        ))
+        .await
+        .context("copy the pre-migrated memory test template")?;
+        let permit = temporary_permit().await?;
+        Self::open_temporary(directory, Some(permit)).await
+    }
+
+    /// Real isolated Dolt fixture created by a complete cold open: a new
+    /// instance identity and credentials, then initialization, every
+    /// migration, staged validation and activation. Missing runtime/helper is
+    /// an error, never a skip.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn temporary_cold() -> Result<Self> {
+        let permit = temporary_permit().await?;
+        let directory = Arc::new(temporary_directory()?);
+        Self::open_temporary(directory, Some(permit)).await
+    }
+
+    /// Open the fixture store under `directory/private`, creating it by a cold
+    /// open when absent. The retained directory outlives the supervisor reap.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn open_temporary(
+        directory: Arc<tempfile::TempDir>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<Self> {
+        let options =
+            crate::test_support::open_options(directory.path().join("private"), temporary_scope())?;
         let mut progress = ProgressReporter::silent();
-        let retained = Arc::new(directory);
         let fixture_options = options.clone();
         let opened = Self::open_inner(
             options,
-            Some(retained.clone()),
-            Some(permit),
+            Some(directory.clone()),
+            permit,
             None,
             &mut progress,
         )
@@ -1975,7 +2007,7 @@ impl MemoryStore {
         let result = opened
             .map_err(|error| crate::test_support::fixture_startup_error(&fixture_options, error));
         // The stage and its server.log must still exist while the error is annotated.
-        drop(retained);
+        drop(directory);
         result
     }
 
@@ -7516,6 +7548,31 @@ async fn acquire_lock(file: File, duration: Duration) -> Result<File> {
     }
 }
 #[cfg(any(test, feature = "test-support"))]
+fn temporary_directory() -> Result<tempfile::TempDir> {
+    Ok(tempfile::Builder::new().prefix("kuru-memory-").tempdir()?)
+}
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn temporary_scope() -> String {
+    format!("project/{}", "0".repeat(64))
+}
+#[cfg(any(test, feature = "test-support"))]
+async fn temporary_permit() -> Result<OwnedSemaphorePermit> {
+    static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Ok(PERMITS
+        .get_or_init(|| Arc::new(Semaphore::new(4)))
+        .clone()
+        .acquire_owned()
+        .await?)
+}
+/// Schema versions whose migrations a test template has already applied.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn template_schema() -> (i32, i32) {
+    (
+        migrations::CURRENT_VERSION,
+        migrations::USAGE_CURRENT_VERSION,
+    )
+}
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_cache() -> PathBuf {
     std::env::var_os("KURU_DOLT_CACHE")
         .map(PathBuf::from)
@@ -10715,7 +10772,7 @@ mod tests {
         assert_eq!(inspection_snapshot(&pool).await?, before);
         history.close().await?;
 
-        let store = MemoryStore::temporary().await?;
+        let store = MemoryStore::temporary_cold().await?;
         let candidate = store.begin_candidate("dirty historical receipt").await?;
         let view = candidate.view();
         sqlx::query("ALTER TABLE kuru_migrations ADD COLUMN inspection_guard INT NULL")
@@ -10781,28 +10838,28 @@ mod tests {
 
     #[tokio::test]
     async fn migration_validation_rejects_extra_schema_or_receipt_authority() -> Result<()> {
-        let store = MemoryStore::temporary().await?;
+        let store = MemoryStore::temporary_cold().await?;
         sqlx::query("INSERT INTO kuru_schema (id, version) VALUES (2, 2)")
             .execute(store.pool.as_ref())
             .await?;
         assert!(migrations::validate_current(&store.pool).await.is_err());
         store.close().await?;
 
-        let store = MemoryStore::temporary().await?;
+        let store = MemoryStore::temporary_cold().await?;
         sqlx::query("ALTER TABLE messages DROP INDEX messages_namespace_session_sequence")
             .execute(store.pool.as_ref())
             .await?;
         assert!(migrations::validate_current(&store.pool).await.is_err());
         store.close().await?;
 
-        let store = MemoryStore::temporary().await?;
+        let store = MemoryStore::temporary_cold().await?;
         sqlx::query("ALTER TABLE context_summary_cursors ADD COLUMN forged BIGINT NULL")
             .execute(store.pool.as_ref())
             .await?;
         assert!(migrations::validate_current(&store.pool).await.is_err());
         store.close().await?;
 
-        let store = MemoryStore::temporary().await?;
+        let store = MemoryStore::temporary_cold().await?;
         sqlx::query(
             "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (?, 'forged', ?, ?)",
         )

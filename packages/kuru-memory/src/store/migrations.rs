@@ -2133,7 +2133,7 @@ mod tests {
 
     #[tokio::test]
     async fn v6_registry_rejects_v7_store_without_mutating_it() -> Result<()> {
-        let store = super::super::MemoryStore::temporary().await?;
+        let store = super::super::MemoryStore::temporary_cold().await?;
         let before = durable_snapshot(&store.pool).await?;
         let error = validate_active_with(RELEASED_V6_REGISTRY, &store.shared.server, &store.pool)
             .await
@@ -2705,7 +2705,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let store = super::super::MemoryStore::temporary().await?;
+            let store = super::super::MemoryStore::temporary_cold().await?;
             let base = store.revision().await?;
             let count = if matches!(
                 invalid,
@@ -2897,7 +2897,7 @@ mod tests {
         ]
         .into_iter()
         {
-            let store = super::super::MemoryStore::temporary().await?;
+            let store = super::super::MemoryStore::temporary_cold().await?;
             let base = store.revision().await?;
             let names = match invalid {
                 InvalidInventory::Malformed => vec!["kuru_migration_bad".to_owned()],
@@ -2947,7 +2947,7 @@ mod tests {
     #[tokio::test]
     async fn test_v8_receipt_order_and_operation_uniqueness_are_enforced() -> Result<()> {
         for repeated_operation in [false, true] {
-            let store = super::super::MemoryStore::temporary().await?;
+            let store = super::super::MemoryStore::temporary_cold().await?;
             upgrade_with(
                 TEST_REGISTRY,
                 &store.shared.server,
@@ -3042,7 +3042,7 @@ mod tests {
 
     #[tokio::test]
     async fn historical_and_out_of_order_attempts_fail_without_mutation() -> Result<()> {
-        let store = super::super::MemoryStore::temporary().await?;
+        let store = super::super::MemoryStore::temporary_cold().await?;
         let operation = Uuid::new_v4();
         let name = attempt_name(2, operation);
         let completed_v2 = reserved_names(&store.pool)
@@ -3153,7 +3153,7 @@ mod tests {
         drop(main);
         server.close().await?;
 
-        let store = super::super::MemoryStore::temporary().await?;
+        let store = super::super::MemoryStore::temporary_cold().await?;
         let completed_name = reserved_names(&store.pool)
             .await?
             .into_iter()
