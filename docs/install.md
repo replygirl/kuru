@@ -1,7 +1,7 @@
 # Installation and updates
 
 Kuru ships native executables for Apple Silicon macOS, Linux on arm64 and x86-64,
-and Windows on x86-64. Binary installation requires no separately installed compiler, Dolt
+and Windows on x86-64 and on Arm (Windows 11). Binary installation requires no separately installed compiler, Dolt
 server or MSVC redistributable. Run it as `kuru` (`kuru.exe` on Windows).
 ChatGPT sign-in and OpenAI model requests are native to Kuru; no Codex CLI,
 Node or npm installation is needed for them.
@@ -89,6 +89,18 @@ every installed module on first use. Its small native API bridge checks file
 identities, private staging and durable publication; no separate compiler
 installation is needed.
 
+The script selects the Windows target from the machine the operating system
+reports, never from `PROCESSOR_ARCHITECTURE` or `PROCESSOR_ARCHITEW6432`, so it
+installs `x86_64-pc-windows-msvc` on x64 Windows and `aarch64-pc-windows-msvc`
+on Windows 11 on Arm. Run it from 64-bit stock Windows PowerShell 5.1. An explicit
+`-Target` must equal that native target: requesting the x64 build on Arm, or
+the Arm build on x64, fails with `Requested target ... does not match the
+native machine target ...` before anything is downloaded. The downloaded
+`kuru.exe` must carry the native PE machine. A release that has no archive for
+the native target fails with `Release vVERSION publishes no TARGET archive;
+nothing was installed.`; releases before Windows on Arm support publish only
+the x64 ZIP.
+
 To choose an exact version or use a local release directory:
 
 ```powershell
@@ -140,12 +152,16 @@ for storage overrides and migration from the removed `codex_command` setting.
 | Linux | ARM64 | `aarch64-unknown-linux-gnu` |
 | Linux | x86-64 | `x86_64-unknown-linux-gnu` |
 | Windows 10 version 1809 or newer | x86-64 | `x86_64-pc-windows-msvc` |
+| Windows 11 or newer | ARM64 | `aarch64-pc-windows-msvc` |
 
 Linux archives are built on Ubuntu 24.04 and require a compatible glibc. The
 supported Linux targets use GNU libc, including source builds with the bundled
 engine. The shell bootstrap detects its macOS/Linux host; `--target` selects
-another supported tar target. PowerShell uses the Windows x86-64 ZIP and accepts
-`-Target x86_64-pc-windows-msvc` explicitly.
+another supported tar target. PowerShell uses the ZIP for the native Windows
+machine and accepts only that target as an explicit `-Target`. Windows on Arm
+requires Windows 11 because the installer's stock .NET Framework 4.8.1 runs
+natively on Arm64 only there; x64 keeps the Windows 10 version 1809 floor.
+Windows 10 on Arm is not supported.
 
 Intel Macs (`x86_64-apple-darwin`) are not supported after v0.9.0, and the
 current shell bootstrap refuses them before downloading anything. On Apple
@@ -160,7 +176,8 @@ curl -fsSL https://raw.githubusercontent.com/replygirl/kuru/v0.9.0/packages/kuru
 ## Release archives
 
 Release archives use `kuru-VERSION-TARGET.tar.gz` for macOS/Linux and
-`kuru-VERSION-x86_64-pc-windows-msvc.zip` for Windows, alongside `SHA256SUMS`.
+`kuru-VERSION-TARGET.zip` for both Windows targets (`x86_64-pc-windows-msvc`
+and `aarch64-pc-windows-msvc`), alongside `SHA256SUMS`.
 Each archive includes the executable,
 `LICENSE` and `README.md`. New marked releases also have a matching
 `kuru-VERSION-TARGET-shell-support.tar.gz` or `.zip` containing Bash, Zsh,
@@ -354,6 +371,8 @@ Replace `VERSION` in both places with the desired release. This command also
 works in PowerShell. The updater requires an
 explicit version and release directory, which can also be a local directory.
 It validates the archive in Rust and defaults to replacing the running executable.
+It keeps the running executable's target, so an x64 `kuru.exe` running under
+emulation on Windows on Arm keeps updating to x64 builds.
 It requires no compiler or interpreter. Kuru does not install background updates.
 
 On Windows, the current trusted executable performs replacement through a

@@ -40,7 +40,7 @@ The delivery package activates Cocogitto and Communiqué only for its tests,
 combined coverage and release tasks. Its `setup` task preinstalls those tools
 with mise's `--include-task-tools` option; lean CI jobs use `setup:test-tools`
 to install only those two exact package-owned pins. Communiqué 1.4.2 provides Linux x86_64
-and arm64, macOS arm64 and Windows x86_64 binaries, which cover every supported
+and arm64, macOS arm64 and Windows x86_64 and arm64 binaries, which cover every supported
 platform for the full maintainer gate.
 
 CI runs format, lint, typecheck, repository/workflow tooling, cospec validation,
@@ -178,6 +178,25 @@ offline build-input check (`bundle:verify-native-build`) has no test inventory
 to partition and stays in the Windows installation job.
 Windows primitives retain a separate native coverage job for early feedback. The
 required `ci-gate` accepts only success from every branch of this graph.
+
+Windows on Arm (`windows-11-arm`) runs the same partitioned workspace suites as
+x64, uninstrumented, as separately named behavioral evidence: `Behavior
+partition` 1..8 run `//packages/kuru-delivery:test:partition` over every
+workspace package, and `Behavior merge` checks receipt agreement, disjointness
+and completeness on Ubuntu without LCOV or a threshold. Their receipts record
+`mode: uninstrumented` with null coverage, and they never count toward the 90%
+gate, which x64, macOS and Ubuntu keep enforcing. Instrumented Windows on Arm
+partitions are held until a pinned Rust toolchain carries the fix for
+[rust-lang/rust#150123](https://github.com/rust-lang/rust/issues/150123), whose
+`llvm-profdata merge` failure on `aarch64-pc-windows-msvc` the pinned 1.98.1
+reproduces; `coverage::PARTITIONS` rejects an instrumented `windows-11-arm` set.
+`native-platform` is a two-leg matrix: the x64 leg keeps
+`//packages/kuru-platform:coverage` and its 90% gate, and the arm64 leg,
+`Native platform behavior (aarch64-pc-windows-msvc)`, runs
+`//packages/kuru-platform:test` with no coverage upload. The arm64 partitions
+and installation job import the source-built engine from the
+`dolt-windows-arm64` job before building (see
+[source-built engine inputs](#source-built-engine-inputs)).
 
 Ubuntu's partition steps disable Rust test-profile debug information so the
 instrumented Kuru executable remains a valid input to the same production
@@ -488,7 +507,22 @@ $env:CARGO_NET_OFFLINE = 'true'
 mise run //apps/kuru-tui:build:release -- --target x86_64-pc-windows-msvc
 ```
 
-The shipping binary is under `target/x86_64-pc-windows-msvc/release/kuru.exe`
+On Windows on Arm, import the source-built archive (a `Bundle build` artifact or
+a linux-x64 build; see [source-built engine inputs](#source-built-engine-inputs))
+the same way and build for the Arm target:
+
+```powershell
+$env:KURU_DOLT_BUNDLE_DIR = 'C:\BuildInputs\kuru'
+mise run //packages/kuru-memory:bundle:prepare -- --target aarch64-pc-windows-msvc --archive C:\Downloads\dolt-windows-arm64.zip --offline
+$env:KURU_DOLT_BUNDLE_OFFLINE = 'true'
+$env:CARGO_NET_OFFLINE = 'true'
+mise run //apps/kuru-tui:build:release -- --target aarch64-pc-windows-msvc
+```
+
+`verify:windows-imports` finds `dumpbin.exe` through `vswhere` under either the
+x64 or the ARM64 MSVC host tools.
+
+The shipping binary is under `target/<target>/release/kuru.exe`
 unless `CARGO_TARGET_DIR` selects another target directory. For its native import
 check, set `KURU_EMBEDDED_TEST_BINARY` to that absolute path and run
 `mise run //apps/kuru-tui:verify:windows-imports`. This maintainer check uses MSVC
@@ -521,7 +555,13 @@ host. Preparing, compiling or provisioning any other target never fetches,
 builds or reads a built asset's inputs. Runtime provisioning never builds or
 downloads an engine.
 
-The build host is **linux-x64 only**. llvm-mingw's target runtimes embed paths
+`//packages/kuru-memory:bundle:test-fixtures`, a dependency of the memory
+tests, always prepares the upstream `x86_64-pc-windows-msvc` ZIP, on every host
+including Windows on Arm: it is a host-independent fixture for the archive
+decoder, not an engine for the host.
+
+The build host is **linux-x64 only**, including for the Windows on Arm engine
+that CI and release jobs import; no Windows or Arm runner builds it. llvm-mingw's target runtimes embed paths
 from the package that compiled them, so the same recipe on another host produces
 different bytes. Go and llvm-mingw are pinned as task-scoped tools in
 `packages/kuru-memory/mise.toml` and locked, for linux-x64 only, by
