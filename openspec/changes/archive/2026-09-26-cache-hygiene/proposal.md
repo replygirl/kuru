@@ -21,7 +21,8 @@ downloading a prebuilt binary.
     `native-coverage-windows` (combined with its existing
     `matrix.shard == 'connectors-core-platform'` condition),
     `native-install-windows`
-  - `.github/workflows/ci.yml`: `native-build-${{ matrix.target }}`
+  - `.github/workflows/ci.yml`: `native-build-${{ matrix.target }}` and
+    `native-platform-windows`
   - `.github/workflows/release.yml` calls the same reusable `quality.yml` and
     `native-tests.yml` workflows, so it inherits this behavior without its own
     edit.

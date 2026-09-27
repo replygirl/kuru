@@ -3,8 +3,9 @@
 - [x] 1.1 Add `save-if: ${{ github.ref == 'refs/heads/main' }}` (combined with
       the existing shard condition for `native-coverage-windows`) to the
       `quality-lint`, `quality-typecheck`, `quality-tooling`, `quality-docs`,
-      `native-coverage`, `native-coverage-windows`, `native-install-windows`
-      and `native-build-${{ matrix.target }}` rust-cache steps, and verify
+      `native-coverage`, `native-coverage-windows`, `native-install-windows`,
+      `native-build-${{ matrix.target }}` and `native-platform-windows`
+      rust-cache steps, and verify
       `actionlint`/`mise run lint:tooling` accepts the workflow YAML.
 - [x] 1.2 Update `packages/kuru-delivery/tests/release_workflow.rs`'s exact
       `save-if` string assertion to match the new combined condition and
