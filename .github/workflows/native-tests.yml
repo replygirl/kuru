@@ -33,31 +33,26 @@ env:
 
 jobs:
   shard:
-    # Receipts name their exact run attempt, and each uploaded artifact holds
-    # one attempt-<n> directory. Rerunning failed jobs reruns only the failed
-    # shards and the report, which requires every shard job to have succeeded,
-    # takes each shard's latest uploaded (successful) attempt and requires
-    # identical source, tree, toolchain and inventory across them. The shard's
-    # inner test deadline sits inside this job limit, derived from
+    # Each partition compiles the full instrumented workspace inventory, lists
+    # every test executable and runs only the tests its deterministic hash
+    # assignment selects, by exact name. Receipts name their exact run attempt,
+    # and each uploaded artifact holds one attempt-<n> directory. Rerunning
+    # failed jobs reruns only the failed partitions and the merge, which
+    # requires every partition job to have succeeded, takes each partition's
+    # latest uploaded (successful) attempt and requires the receipts to agree.
+    # The inner test deadline sits inside this job limit, derived from
     # KURU_COVERAGE_JOB_MINUTES, so a stalled test executable fails with
     # evidence, not a cancel; compilation is not under that deadline.
-    name: Coverage shard (${{ inputs.os }}, ${{ matrix.shard }})
+    name: Coverage partition (${{ inputs.os }}, ${{ matrix.partition }})
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 75
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - shard: delivery-archive
-            packages: kuru-delivery,kuru-archive
-          - shard: application
-            packages: kuru
-          - shard: memory
-            packages: kuru-memory
-          - shard: runtime
-            packages: kuru-runtime
-          - shard: connectors-core-platform
-            packages: kuru-connectors,kuru-core,kuru-platform
+        # Must equal PARTITIONS in packages/kuru-delivery/src/coverage.rs.
+        # macOS uses four so its partitions and the install job fit the
+        # account's five concurrent macOS jobs without queueing.
+        partition: ${{ fromJSON(inputs.os == 'macos-latest' && '[1,2,3,4]' || '[1,2,3,4,5,6,7,8]') }}
     steps:
       - name: Record the job start for the inner test deadline
         shell: bash
@@ -71,7 +66,7 @@ jobs:
         shell: bash
         # Leave the leaf absent so the preparer creates this runner's private ACLs.
         # Cargo's restored target/ cache must not supply these directory grants.
-        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles-${{ matrix.shard }}-${{ github.run_attempt }}\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles-partition-${{ matrix.partition }}-${{ github.run_attempt }}\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Reserve space for bundled runtime coverage
         if: runner.os == 'Linux'
         shell: bash
@@ -104,53 +99,81 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends dbus gnome-keyring libsecret-tools
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - id: helper-cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
-          # One key per OS for every shard: they build the same helper and
-          # fetch the same registry. Only one shard saves it; the rest restore.
-          # Instrumented shard targets live in runner.temp and are never cached.
+          # One key per OS for every partition: they build the same helper and
+          # fetch the same registry. Only one partition saves it; the rest restore.
+          # Instrumented targets live in runner.temp and are never cached here.
           # Also restrict that save to main so PR runs never thrash the cache.
           shared-key: native-coverage-${{ inputs.os }}
-          save-if: ${{ matrix.shard == 'connectors-core-platform' && github.ref == 'refs/heads/main' }}
-      - name: Run one checked coverage shard
+          save-if: ${{ matrix.partition == 1 && github.ref == 'refs/heads/main' }}
+      # The seed holds only allow-listed non-workspace dependency outputs that
+      # the orchestrator exported from a successful main partition. The
+      # partition still builds into a fresh target and imports from the seed
+      # itself; a missing or evicted seed only makes the build slower. Restore
+      # and save must name the same path, which is part of the cache version.
+      - id: seed
+        name: Restore the instrumented dependency seed
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/kuru-coverage-seed
+          key: kuru-coverage-seed-v1-${{ inputs.os }}-instrumented-${{ hashFiles('Cargo.lock', 'mise.toml', 'mise.lock') }}
+          restore-keys: kuru-coverage-seed-v1-${{ inputs.os }}-instrumented-
+      - name: Select the dependency seed export
+        if: github.ref == 'refs/heads/main' && matrix.partition == 1 && steps.seed.outputs.cache-hit != 'true'
+        shell: bash
+        # Absent everywhere else, so only this partition exports after its receipt.
+        run: printf 'KURU_COVERAGE_SEED_EXPORT=%s/kuru-coverage-seed-export\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Run one checked coverage partition
         if: runner.os != 'Linux'
         shell: bash
         env:
           KURU_COVERAGE_OS: ${{ inputs.os }}
-          KURU_COVERAGE_TARGET: ${{ runner.temp }}/kuru-coverage-${{ matrix.shard }}-${{ github.run_attempt }}
+          # One fixed path per job, so seeded build-script and dep-info paths match.
+          KURU_COVERAGE_TARGET: ${{ runner.temp }}/kuru-coverage-target
           KURU_COVERAGE_SOURCE: ${{ inputs.ref }}
           KURU_COVERAGE_ATTEMPT: ${{ github.run_attempt }}
-          KURU_COVERAGE_SHARD: ${{ matrix.shard }}
-          KURU_COVERAGE_PACKAGES: ${{ matrix.packages }}
-          KURU_COVERAGE_OUTPUT: ${{ runner.temp }}/kuru-coverage-evidence-${{ matrix.shard }}-${{ github.run_attempt }}
-          KURU_COVERAGE_DIAGNOSTICS: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.shard }}-${{ github.run_attempt }}
+          KURU_COVERAGE_PARTITION: ${{ matrix.partition }}
+          KURU_COVERAGE_PARTITIONS: ${{ inputs.os == 'macos-latest' && '4' || '8' }}
+          KURU_COVERAGE_OUTPUT: ${{ runner.temp }}/kuru-coverage-evidence-${{ matrix.partition }}-${{ github.run_attempt }}
+          KURU_COVERAGE_DIAGNOSTICS: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.partition }}-${{ github.run_attempt }}
+          KURU_COVERAGE_SEED: ${{ runner.temp }}/kuru-coverage-seed
+          KURU_COVERAGE_HELPER_CACHE: ${{ steps.helper-cache.outputs.cache-hit }}
+          KURU_COVERAGE_SEED_CACHE: ${{ steps.seed.outputs.cache-hit }}
+          KURU_COVERAGE_SEED_MATCHED_KEY: ${{ steps.seed.outputs.cache-matched-key }}
           # Must equal this job's timeout-minutes.
-          KURU_COVERAGE_JOB_MINUTES: "75"
+          KURU_COVERAGE_JOB_MINUTES: "45"
           # Coverage maps remain available without Linux test-profile debug
           # info, keeping the genuine packaged Kuru input below its production
-          # archive bound. The report job must repeat this value exactly: it is
-          # part of the artifact inventory every receipt is validated against.
+          # archive bound. It is part of the profile identity and artifact
+          # inventory on which every partition's receipt must agree.
           CARGO_PROFILE_TEST_DEBUG: ${{ runner.os == 'Linux' && '0' || 'line-tables-only' }}
         run: mise run //packages/kuru-delivery:coverage:shard
-      - name: Run one checked coverage shard with the OS secret store
+      - name: Run one checked coverage partition with the OS secret store
         if: runner.os == 'Linux'
         shell: bash
         env:
           KURU_COVERAGE_OS: ${{ inputs.os }}
-          KURU_COVERAGE_TARGET: ${{ runner.temp }}/kuru-coverage-${{ matrix.shard }}-${{ github.run_attempt }}
+          # One fixed path per job, so seeded build-script and dep-info paths match.
+          KURU_COVERAGE_TARGET: ${{ runner.temp }}/kuru-coverage-target
           KURU_COVERAGE_SOURCE: ${{ inputs.ref }}
           KURU_COVERAGE_ATTEMPT: ${{ github.run_attempt }}
-          KURU_COVERAGE_SHARD: ${{ matrix.shard }}
-          KURU_COVERAGE_PACKAGES: ${{ matrix.packages }}
-          KURU_COVERAGE_OUTPUT: ${{ runner.temp }}/kuru-coverage-evidence-${{ matrix.shard }}-${{ github.run_attempt }}
-          KURU_COVERAGE_DIAGNOSTICS: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.shard }}-${{ github.run_attempt }}
+          KURU_COVERAGE_PARTITION: ${{ matrix.partition }}
+          KURU_COVERAGE_PARTITIONS: ${{ inputs.os == 'macos-latest' && '4' || '8' }}
+          KURU_COVERAGE_OUTPUT: ${{ runner.temp }}/kuru-coverage-evidence-${{ matrix.partition }}-${{ github.run_attempt }}
+          KURU_COVERAGE_DIAGNOSTICS: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.partition }}-${{ github.run_attempt }}
+          KURU_COVERAGE_SEED: ${{ runner.temp }}/kuru-coverage-seed
+          KURU_COVERAGE_HELPER_CACHE: ${{ steps.helper-cache.outputs.cache-hit }}
+          KURU_COVERAGE_SEED_CACHE: ${{ steps.seed.outputs.cache-hit }}
+          KURU_COVERAGE_SEED_MATCHED_KEY: ${{ steps.seed.outputs.cache-matched-key }}
           # Must equal this job's timeout-minutes.
-          KURU_COVERAGE_JOB_MINUTES: "75"
+          KURU_COVERAGE_JOB_MINUTES: "45"
           # Coverage maps remain available without Linux test-profile debug
           # info, keeping the genuine packaged Kuru input below its production
-          # archive bound. The report job must repeat this value exactly: it is
-          # part of the artifact inventory every receipt is validated against.
+          # archive bound. It is part of the profile identity and artifact
+          # inventory on which every partition's receipt must agree.
           CARGO_PROFILE_TEST_DEBUG: ${{ runner.os == 'Linux' && '0' || 'line-tables-only' }}
         run: |
           # The Linux keyring backend requires the real Secret Service default
@@ -231,40 +254,65 @@ jobs:
           KURU_NATIVE_STORE
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
-      # Only a successful shard publishes receipt evidence under the name the
-      # report accepts; a failed shard publishes its diagnostics separately.
+      # Only a successful partition publishes receipt evidence under the name
+      # the merge downloads; a failed partition publishes its diagnostics under
+      # a name that the merge's pattern cannot match.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/kuru-coverage-evidence-${{ matrix.shard }}-${{ github.run_attempt }}
+          name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kuru-coverage-evidence-${{ matrix.partition }}-${{ github.run_attempt }}
           if-no-files-found: error
-      - name: Upload failed shard diagnostics
+      - name: Upload failed partition diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-${{ matrix.shard }}-diagnostics-attempt-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.shard }}-${{ github.run_attempt }}
+          name: ${{ inputs.artifact-prefix }}-coverage-diagnostics-${{ inputs.os }}-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.partition }}-${{ github.run_attempt }}
           if-no-files-found: warn
+      # The export exists only after a successful receipt on main; replace the
+      # consumed seed path with it so save and restore name the same path.
+      - name: Stage the exported dependency seed
+        if: env.KURU_COVERAGE_SEED_EXPORT != ''
+        shell: bash
+        run: |
+          # Import moved entries out of the restored seed; never save that remainder.
+          rm -rf -- "$RUNNER_TEMP/kuru-coverage-seed"
+          if [ -d "$KURU_COVERAGE_SEED_EXPORT" ]; then
+            mv -- "$KURU_COVERAGE_SEED_EXPORT" "$RUNNER_TEMP/kuru-coverage-seed"
+            echo 'KURU_COVERAGE_SEED_READY=true' >> "$GITHUB_ENV"
+          else
+            echo '::notice::No dependency seed export was produced; nothing will be saved'
+          fi
+      - name: Save the instrumented dependency seed
+        if: env.KURU_COVERAGE_SEED_READY == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/kuru-coverage-seed
+          key: ${{ steps.seed.outputs.cache-primary-key }}
 
-  collect:
+  merge:
     if: always()
     needs: shard
-    name: Coverage report (${{ inputs.os }})
-    runs-on: ${{ inputs.os }}
-    # Downloads include every uploaded attempt of each shard in this run, each
-    # bounded by the receipt profile limits. If repeated reruns push the report
-    # past this limit, dispatch a fresh run instead of rerunning this one.
-    timeout-minutes: 30
+    # Every OS merges on Ubuntu: the partitions already exported their LCOV
+    # against their own instrumented executables, so the merge rebuilds
+    # nothing. Its fail-closed check is the agreement of the independently
+    # built partitions: identical source, toolchain, profile and inventory
+    # identity, and per-executable test lists that are disjoint and complete
+    # against every partition's recorded --list output. It then unions the
+    # partition LCOV and enforces this OS's 90% line gate.
+    name: Coverage merge (${{ inputs.os }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      # Failed shards upload no receipt, so an older successful attempt would
-      # otherwise stand in for a shard whose latest attempt failed.
-      - name: Require every coverage shard job to have succeeded
+      # Failed partitions upload no receipt, so an older successful attempt
+      # would otherwise stand in for a partition whose latest attempt failed.
+      - name: Require every coverage partition job to have succeeded
         shell: bash
         env:
           KURU_COVERAGE_SHARDS_RESULT: ${{ needs.shard.result }}
         run: |
           if [ "$KURU_COVERAGE_SHARDS_RESULT" != success ]; then
-            echo "Coverage shards finished as '$KURU_COVERAGE_SHARDS_RESULT'; the report requires success" >&2
+            echo "Coverage partitions finished as '$KURU_COVERAGE_SHARDS_RESULT'; the merge requires success" >&2
             exit 1
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -272,96 +320,52 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Select private bundle build inputs
-        shell: bash
-        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles-report-${{ github.run_attempt }}\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - name: Reserve space for bundled runtime coverage
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          # This Rust/Node job does not use the hosted image's mobile or Swift SDKs.
-          # Keep Cargo outputs, coverage and the runner's own runtime intact.
-          df -h /
-          for sdk in /usr/local/lib/android /usr/share/swift; do
-            if [ -d "$sdk" ]; then
-              sudo du -sh "$sdk"
-              sudo rm -rf -- "$sdk"
-            fi
-          done
-          df -h /
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
           version: 2026.9.4
-          # Cospec is exercised by delivery's real standalone contract tests.
-          install_args: rust aqua:taiki-e/cargo-llvm-cov github:aligned-team/cospec
+          # The merge builds only the delivery helper; it runs no tests and
+          # reads no profiles, so it needs neither llvm-tools nor a bundle.
+          install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
-      - name: Install coverage components
-        run: rustup component add llvm-tools-preview --toolchain 1.98.1
-      # Restore only: the shard key is already warm and saves collect's cold
-      # registry fetch. The instrumented inventory is rebuilt in runner.temp.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
-          shared-key: native-coverage-${{ inputs.os }}
-          save-if: false
-      - name: Download delivery and archive evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-delivery-archive-attempt-*
-          merge-multiple: false
-          path: ${{ runner.temp }}/kuru-coverage-inputs/delivery-archive
-      - name: Download application evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-application-attempt-*
-          merge-multiple: false
-          path: ${{ runner.temp }}/kuru-coverage-inputs/application
-      - name: Download memory evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-memory-attempt-*
-          merge-multiple: false
-          path: ${{ runner.temp }}/kuru-coverage-inputs/memory
-      - name: Download runtime evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-runtime-attempt-*
-          merge-multiple: false
-          path: ${{ runner.temp }}/kuru-coverage-inputs/runtime
-      - name: Download connectors, core and platform evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-connectors-core-platform-attempt-*
-          merge-multiple: false
-          path: ${{ runner.temp }}/kuru-coverage-inputs/connectors-core-platform
+          shared-key: native-coverage-merge
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Pattern downloads include earlier attempts of this run. download-artifact
-      # extracts one matching artifact directly into the shard directory
-      # (<shard>/attempt-<n>) and several into one directory per artifact name
-      # (<shard>/<name>/attempt-<n>); collection accepts both layouts and
-      # validates each shard's latest uploaded attempt.
-      - name: Collect all checked profiles and require 90% coverage
+      # extracts one matching artifact directly into the inputs directory and
+      # several into one directory per artifact name; the merge accepts both
+      # layouts and validates each partition's latest uploaded attempt.
+      - name: Download every partition's evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-partition-*
+          merge-multiple: false
+          path: ${{ runner.temp }}/kuru-coverage-inputs
+      - name: Require agreeing partition receipts and 90% coverage
         shell: bash
         env:
           KURU_COVERAGE_OS: ${{ inputs.os }}
-          KURU_COVERAGE_TARGET: ${{ runner.temp }}/kuru-coverage-report-target-${{ github.run_attempt }}
           KURU_COVERAGE_SOURCE: ${{ inputs.ref }}
           KURU_COVERAGE_ATTEMPT: ${{ github.run_attempt }}
+          KURU_COVERAGE_MODE: instrumented
+          KURU_COVERAGE_PARTITIONS: ${{ inputs.os == 'macos-latest' && '4' || '8' }}
           KURU_COVERAGE_INPUTS: ${{ runner.temp }}/kuru-coverage-inputs
           KURU_COVERAGE_REPORT: ${{ runner.temp }}/kuru-coverage-report-${{ github.run_attempt }}/coverage.lcov
-          # Must equal the shard step: the rebuilt inventory includes it.
-          CARGO_PROFILE_TEST_DEBUG: ${{ runner.os == 'Linux' && '0' || 'line-tables-only' }}
         run: |
           mkdir -p "$(dirname "$KURU_COVERAGE_REPORT")"
-          mise run //packages/kuru-delivery:coverage:collect
+          mise run //packages/kuru-delivery:coverage:merge
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
+      # The merged LCOV and merge-summary.json, whose per-partition table
+      # records cache hits, phase times and profile counts.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
           name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-attempt-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/kuru-coverage-report-${{ github.run_attempt }}/coverage.lcov
+          path: ${{ runner.temp }}/kuru-coverage-report-${{ github.run_attempt }}
           if-no-files-found: error
 
   install:
@@ -469,7 +473,7 @@ jobs:
 
   native-gate:
     if: always()
-    needs: [shard, collect, install]
+    needs: [shard, merge, install]
     name: Require native coverage and installation checks
     runs-on: ubuntu-latest
     steps:
@@ -477,7 +481,7 @@ jobs:
         env:
           KURU_NATIVE_INSTALL: ${{ inputs.install }}
           KURU_NATIVE_SHARDS: ${{ needs.shard.result }}
-          KURU_NATIVE_REPORT: ${{ needs.collect.result }}
+          KURU_NATIVE_REPORT: ${{ needs.merge.result }}
           KURU_NATIVE_INSTALL_RESULT: ${{ needs.install.result }}
         run: |
           set -e

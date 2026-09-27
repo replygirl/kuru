@@ -241,12 +241,12 @@ fn stock_installer_imports_pshome_modules_before_any_discovered_command() {
     assert!(discovered > 0, "command inventory found no stock commands");
 }
 
-/// The exact `run` string of one package coverage task.
-fn coverage_task_run(name: &str) -> String {
+/// One package coverage task's manifest table.
+fn coverage_task(name: &str) -> toml::Value {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest: toml::Value =
         toml::from_str(&std::fs::read_to_string(root.join("mise.toml")).unwrap()).unwrap();
-    let task = &manifest["tasks"][name];
+    let task = manifest["tasks"][name].clone();
     assert!(
         task.get("run_windows").is_none(),
         "{name} must run the same orchestrator on every OS"
@@ -256,31 +256,30 @@ fn coverage_task_run(name: &str) -> String {
         Some("{{config_root}}/../.."),
         "{name}"
     );
-    assert_eq!(
-        task["env"]["KURU_TEST_SUPERVISOR_PREPARED"].as_bool(),
-        Some(false),
-        "{name} must use the instrumented supervisor"
-    );
-    assert_eq!(
-        task["depends"].as_array().unwrap(),
-        &[
-            toml::Value::from("//packages/kuru-memory:bundle:prepare"),
-            toml::Value::from("//packages/kuru-memory:bundle:test-fixtures"),
-        ],
-        "{name} prepares only verified bundle inputs"
-    );
-    task["run"].as_str().unwrap().to_owned()
+    task
 }
+
+/// The exact `run` string of one package coverage task.
+fn coverage_task_run(name: &str) -> String {
+    coverage_task(name)["run"].as_str().unwrap().to_owned()
+}
+
+/// The orchestrator tasks and the subcommand each runs.
+const ORCHESTRATOR_TASKS: [(&str, &str); 3] = [
+    ("coverage:shard", "shard"),
+    ("test:partition", "shard --uninstrumented"),
+    ("coverage:merge", "merge"),
+];
 
 #[test]
 fn coverage_tasks_run_the_rust_orchestrator_without_shell_metacharacters() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    for (task, mode) in [("coverage:shard", "shard"), ("coverage:collect", "collect")] {
+    for (task, command) in ORCHESTRATOR_TASKS {
         let run = coverage_task_run(task);
         assert_eq!(
             run,
             format!(
-                "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- coverage {mode}"
+                "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- coverage {command}"
             )
         );
         // The same inline command runs under sh and Windows cmd.exe unchanged.
@@ -290,22 +289,53 @@ fn coverage_tasks_run_the_rust_orchestrator_without_shell_metacharacters() {
             "{task} run string has shell metacharacters: {run}"
         );
     }
+    let bundle = [
+        toml::Value::from("//packages/kuru-memory:bundle:prepare"),
+        toml::Value::from("//packages/kuru-memory:bundle:test-fixtures"),
+    ];
+    // Instrumented partitions use their own instrumented supervisor.
+    let shard = coverage_task("coverage:shard");
+    assert_eq!(
+        shard["env"]["KURU_TEST_SUPERVISOR_PREPARED"].as_bool(),
+        Some(false),
+        "coverage:shard must use the instrumented supervisor"
+    );
+    assert_eq!(shard["depends"].as_array().unwrap(), &bundle);
+    assert_eq!(
+        shard["tools"]["cargo:cargo-llvm-cov"].as_str(),
+        Some("0.9.1")
+    );
+    // Uninstrumented partitions use the prepared snapshot, as kuru-memory:test.
+    let partition = coverage_task("test:partition");
+    assert_eq!(
+        partition["env"]["KURU_TEST_SUPERVISOR_PREPARED"].as_str(),
+        Some("1")
+    );
+    assert_eq!(partition["env"]["RUST_TEST_THREADS"].as_str(), Some("2"));
+    assert_eq!(partition["depends"].as_array().unwrap(), &bundle);
+    assert!(partition["tools"].get("cargo:cargo-llvm-cov").is_none());
+    // The merge reads uploaded evidence only: no bundle, tool or supervisor.
+    let merge = coverage_task("coverage:merge");
+    for key in ["depends", "tools", "env"] {
+        assert!(merge.get(key).is_none(), "coverage:merge declares {key}");
+    }
     assert!(
         !root.join("support/windows-coverage.ps1").exists(),
         "the PowerShell shard runner is retired"
     );
     let manifest = std::fs::read_to_string(root.join("mise.toml")).unwrap();
     assert!(!manifest.contains("coverage:windows:"), "{manifest}");
+    assert!(!manifest.contains("coverage:collect"), "{manifest}");
     assert!(manifest.contains("[tasks.\"coverage:workspace\"]"));
 }
 
 /// Launch the orchestrator's delivery binary exactly as a coverage task does,
 /// with every coverage input removed, and return its combined diagnostics.
-async fn orchestrator_without_inputs(mode: &str, through_cmd: bool) -> (bool, String) {
+async fn orchestrator_without_inputs(task: &str, through_cmd: bool) -> (bool, String) {
     use std::time::Duration;
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let run = coverage_task_run(&format!("coverage:{mode}"));
+    let run = coverage_task_run(task);
     // Cargo's own `run` prefix builds this same binary; a test cannot invoke
     // Cargo under the outer test build lock, so it launches the built binary
     // with the task's exact arguments after `--`.
@@ -339,28 +369,40 @@ async fn orchestrator_without_inputs(mode: &str, through_cmd: bool) -> (bool, St
     )
 }
 
+/// The input diagnostic each orchestrator task reports with no inputs.
+const MISSING_INPUTS: [(&str, &str); 3] = [
+    (
+        "coverage:shard",
+        "coverage shard requires KURU_COVERAGE_TARGET, KURU_COVERAGE_SOURCE, \
+         KURU_COVERAGE_ATTEMPT, KURU_COVERAGE_OS, KURU_COVERAGE_PARTITION, \
+         KURU_COVERAGE_PARTITIONS, KURU_COVERAGE_OUTPUT, KURU_COVERAGE_DIAGNOSTICS, \
+         KURU_COVERAGE_JOB_STARTED, KURU_COVERAGE_JOB_MINUTES",
+    ),
+    (
+        "test:partition",
+        "coverage shard requires KURU_COVERAGE_TARGET, KURU_COVERAGE_SOURCE, \
+         KURU_COVERAGE_ATTEMPT, KURU_COVERAGE_OS, KURU_COVERAGE_PARTITION, \
+         KURU_COVERAGE_PARTITIONS, KURU_COVERAGE_PACKAGES, KURU_COVERAGE_OUTPUT, \
+         KURU_COVERAGE_DIAGNOSTICS, KURU_COVERAGE_JOB_STARTED, KURU_COVERAGE_JOB_MINUTES",
+    ),
+    (
+        "coverage:merge",
+        "coverage merge requires KURU_COVERAGE_SOURCE, KURU_COVERAGE_ATTEMPT, \
+         KURU_COVERAGE_OS, KURU_COVERAGE_MODE, KURU_COVERAGE_PARTITIONS, \
+         KURU_COVERAGE_INPUTS, KURU_COVERAGE_REPORT",
+    ),
+];
+
 #[tokio::test]
 async fn coverage_orchestrator_refuses_missing_inputs_before_any_effect() {
-    let (success, diagnostic) = orchestrator_without_inputs("shard", false).await;
-    assert!(!success);
-    assert!(
-        diagnostic.contains(
-            "coverage shard requires KURU_COVERAGE_TARGET, KURU_COVERAGE_SOURCE, \
-             KURU_COVERAGE_ATTEMPT, KURU_COVERAGE_OS, KURU_COVERAGE_SHARD, \
-             KURU_COVERAGE_PACKAGES, KURU_COVERAGE_OUTPUT, KURU_COVERAGE_DIAGNOSTICS, \
-             KURU_COVERAGE_JOB_STARTED, KURU_COVERAGE_JOB_MINUTES"
-        ),
-        "shard did not reach input validation: {diagnostic}"
-    );
-    let (success, diagnostic) = orchestrator_without_inputs("collect", false).await;
-    assert!(!success);
-    assert!(
-        diagnostic.contains(
-            "coverage collect requires KURU_COVERAGE_TARGET, KURU_COVERAGE_SOURCE, \
-             KURU_COVERAGE_ATTEMPT, KURU_COVERAGE_OS, KURU_COVERAGE_INPUTS, KURU_COVERAGE_REPORT"
-        ),
-        "collect did not reach input validation: {diagnostic}"
-    );
+    for (task, expected) in MISSING_INPUTS {
+        let (success, diagnostic) = orchestrator_without_inputs(task, false).await;
+        assert!(!success, "{task}");
+        assert!(
+            diagnostic.contains(expected),
+            "{task} did not reach input validation: {diagnostic}"
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -404,12 +446,12 @@ async fn cmd_mise_launches_published_windows_task_wrapper_before_cargo() {
 #[cfg(windows)]
 #[tokio::test]
 async fn cmd_launches_the_exact_coverage_tasks_and_reaches_input_validation() {
-    for mode in ["shard", "collect"] {
-        let (success, diagnostic) = orchestrator_without_inputs(mode, true).await;
+    for (task, expected) in MISSING_INPUTS {
+        let (success, diagnostic) = orchestrator_without_inputs(task, true).await;
         assert!(!success);
         assert!(
-            diagnostic.contains(&format!("coverage {mode} requires KURU_COVERAGE_TARGET")),
-            "{mode} did not reach orchestrator validation through cmd: {diagnostic}"
+            diagnostic.contains(expected),
+            "{task} did not reach orchestrator validation through cmd: {diagnostic}"
         );
         assert!(!diagnostic.contains("was unexpected at this time"));
         assert!(!diagnostic.contains("is not recognized as an internal or external command"));

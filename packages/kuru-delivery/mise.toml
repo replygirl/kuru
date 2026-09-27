@@ -52,7 +52,7 @@ KURU_TEST_SUPERVISOR_PREPARED = false
 
 [tasks."coverage:shard"]
 depends = ["//packages/kuru-memory:bundle:prepare", "//packages/kuru-memory:bundle:test-fixtures"]
-description = "Run one fail-closed workspace coverage package shard from KURU_COVERAGE_* inputs (CI)"
+description = "Run one fail-closed instrumented workspace coverage partition from KURU_COVERAGE_* inputs (CI)"
 dir = "{{config_root}}/../.."
 tools."aqua:taiki-e/cargo-llvm-cov" = "0.9.1"
 tools."aqua:cocogitto/cocogitto" = "{{vars.kuru_cocogitto_version}}"
@@ -63,15 +63,22 @@ run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-deliver
 RUST_TEST_THREADS = "2"
 KURU_TEST_SUPERVISOR_PREPARED = false
 
-[tasks."coverage:collect"]
+[tasks."test:partition"]
 depends = ["//packages/kuru-memory:bundle:prepare", "//packages/kuru-memory:bundle:test-fixtures"]
-description = "Validate this OS's coverage shard receipts and enforce one workspace report (CI)"
+description = "Run one fail-closed uninstrumented test partition of KURU_COVERAGE_PACKAGES from KURU_COVERAGE_* inputs (CI)"
 dir = "{{config_root}}/../.."
-tools."aqua:taiki-e/cargo-llvm-cov" = "0.9.1"
-run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- coverage collect"
+tools."aqua:cocogitto/cocogitto" = "{{vars.kuru_cocogitto_version}}"
+tools."github:jdx/communique" = "{{vars.kuru_communique_version}}"
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- coverage shard --uninstrumented"
 
-[tasks."coverage:collect".env]
-KURU_TEST_SUPERVISOR_PREPARED = false
+[tasks."test:partition".env]
+RUST_TEST_THREADS = "2"
+KURU_TEST_SUPERVISOR_PREPARED = "1"
+
+[tasks."coverage:merge"]
+description = "Require one OS's partition receipts to agree and be complete, then enforce its coverage gate (CI)"
+dir = "{{config_root}}/../.."
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- coverage merge"
 
 [tasks."build"]
 run = "cargo build -p kuru-delivery --all-features --locked"

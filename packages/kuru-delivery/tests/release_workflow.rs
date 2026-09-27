@@ -8,7 +8,12 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use kuru_delivery::release::{self, GitHub, Version};
-use kuru_delivery::{archive::digest, command, coverage::SHARDS, shell_support};
+use kuru_delivery::{
+    archive::digest,
+    command,
+    coverage::{Mode, partition_count},
+    shell_support,
+};
 use kuru_platform::fs::make_executable;
 use serde_json::{Value, json};
 use std::{
@@ -313,17 +318,53 @@ fn workflow_steps(job: &str) -> Vec<String> {
         .collect()
 }
 
+/// The JSON partition list a workflow matrix names for a partition count.
+fn partition_list(count: u32) -> String {
+    let items: Vec<_> = (1..=count).map(|k| k.to_string()).collect();
+    format!("[{}]", items.join(","))
+}
+
+fn table_count(os: &str, mode: Mode) -> u32 {
+    partition_count(os, mode).unwrap_or_else(|| panic!("no {} partitions for {os}", mode.name()))
+}
+
+fn step_env(step: &str) -> String {
+    step.split("        env:\n")
+        .nth(1)
+        .unwrap()
+        .split("        run:")
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+fn named_step<'a>(steps: &'a [String], name: &str) -> &'a str {
+    steps
+        .iter()
+        .find(|step| {
+            step.starts_with(&format!("name: {name}\n"))
+                || step.contains(&format!("\n        name: {name}\n"))
+        })
+        .unwrap_or_else(|| panic!("missing step {name}"))
+}
+
 #[test]
-fn native_workflow_shards_every_os_and_keeps_the_aggregate_fail_closed() {
+fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let workflow = native_workflow();
-    // Every OS runs the same checked shards and one collect; the unsharded
-    // coverage job and the Windows-only topology are gone.
+    // Every OS runs the same checked partitions and one Ubuntu merge; the
+    // package shards, the rebuilding collect job and the unsharded coverage
+    // job are gone.
     for retired in [
         "\n  coverage:\n",
+        "\n  collect:\n",
         "windows-coverage",
         "coverage:windows:",
+        "coverage:collect",
         "mise run coverage",
+        "matrix.shard",
+        "KURU_COVERAGE_SHARD:",
+        "KURU_COVERAGE_PACKAGES",
         "inputs.os != 'windows-latest'",
         "inputs.os == 'windows-latest'",
         "KURU_NATIVE_OS",
@@ -344,156 +385,197 @@ fn native_workflow_shards_every_os_and_keeps_the_aggregate_fail_closed() {
     for required in [
         "native-gate:",
         "needs: shard\n",
-        "needs: [shard, collect, install]",
+        "needs: [shard, merge, install]",
         "test \"$KURU_NATIVE_SHARDS\" = success",
         "test \"$KURU_NATIVE_REPORT\" = success",
         "test \"$KURU_NATIVE_INSTALL_RESULT\" = success",
         "test \"$KURU_NATIVE_INSTALL_RESULT\" = skipped",
+        "KURU_NATIVE_REPORT: ${{ needs.merge.result }}",
         "KURU_COVERAGE_OS: ${{ inputs.os }}",
-        "KURU_COVERAGE_TARGET",
-        "KURU_COVERAGE_SOURCE",
-        "KURU_COVERAGE_ATTEMPT",
-        "KURU_COVERAGE_SHARD",
-        "KURU_COVERAGE_PACKAGES",
+        "KURU_COVERAGE_TARGET: ${{ runner.temp }}/kuru-coverage-target\n",
+        "KURU_COVERAGE_SOURCE: ${{ inputs.ref }}",
+        "KURU_COVERAGE_ATTEMPT: ${{ github.run_attempt }}",
+        "KURU_COVERAGE_PARTITION: ${{ matrix.partition }}",
         "KURU_COVERAGE_OUTPUT",
+        "KURU_COVERAGE_DIAGNOSTICS",
+        "KURU_COVERAGE_SEED: ${{ runner.temp }}/kuru-coverage-seed\n",
+        "KURU_COVERAGE_HELPER_CACHE: ${{ steps.helper-cache.outputs.cache-hit }}",
+        "KURU_COVERAGE_SEED_CACHE: ${{ steps.seed.outputs.cache-hit }}",
+        "KURU_COVERAGE_SEED_MATCHED_KEY: ${{ steps.seed.outputs.cache-matched-key }}",
+        "KURU_COVERAGE_MODE: instrumented",
         "KURU_COVERAGE_INPUTS",
         "KURU_COVERAGE_REPORT",
-        "KURU_COVERAGE_DIAGNOSTICS",
         "run: mise run //packages/kuru-delivery:coverage:shard",
         "            mise run //packages/kuru-delivery:coverage:shard\n          KURU_NATIVE_STORE",
-        "mise run //packages/kuru-delivery:coverage:collect",
+        "mise run //packages/kuru-delivery:coverage:merge",
         "if-no-files-found: error",
     ] {
         assert!(workflow.contains(required), "missing {required}");
     }
-    let shards = workflow_job(&workflow, "shard", "collect");
-    let report = workflow_job(&workflow, "collect", "install");
-    for job in [shards, report] {
-        assert!(job.contains("    runs-on: ${{ inputs.os }}\n"));
+    let shards = workflow_job(&workflow, "shard", "merge");
+    let merge = workflow_job(&workflow, "merge", "install");
+    // Partitions run on their own OS; every OS merges on Ubuntu from the
+    // partitions' exported LCOV, rebuilding and instrumenting nothing.
+    assert!(shards.contains("    runs-on: ${{ inputs.os }}\n"));
+    assert!(merge.contains("    runs-on: ubuntu-latest\n"));
+    assert!(merge.contains("    name: Coverage merge (${{ inputs.os }})\n"));
+    assert!(
+        shards
+            .contains("    name: Coverage partition (${{ inputs.os }}, ${{ matrix.partition }})\n")
+    );
+    for forbidden in [
+        "cargo-llvm-cov",
+        "component add llvm-tools",
+        "bundle:prepare",
+        "coverage:shard",
+        "CARGO_PROFILE_TEST_DEBUG: ${{",
+    ] {
+        assert!(!merge.contains(forbidden), "merge still uses {forbidden}");
+    }
+    assert!(merge.contains("install_args: rust\n"));
+    for job in [shards, merge] {
         assert!(!job.contains("inputs.install"));
         for moved in ["mise run install", "test:embedded-runtime"] {
             assert!(!job.contains(moved), "coverage still runs {moved}");
         }
     }
-    // Every shard and the report share one key per OS; exactly one shard saves.
+    // The matrix and the declared partition count are exactly the table the
+    // receipt and merge code enforce, so the workflow cannot drift from it.
+    let ubuntu = table_count("ubuntu-latest", Mode::Instrumented);
+    let macos = table_count("macos-latest", Mode::Instrumented);
+    let windows = table_count("windows-latest", Mode::Instrumented);
+    assert_eq!(ubuntu, windows, "the non-macOS branch names one count");
+    assert!(shards.contains(&format!(
+        "        partition: ${{{{ fromJSON(inputs.os == 'macos-latest' && '{}' || '{}') }}}}\n",
+        partition_list(macos),
+        partition_list(ubuntu)
+    )));
+    let count = format!(
+        "KURU_COVERAGE_PARTITIONS: ${{{{ inputs.os == 'macos-latest' && '{macos}' || '{ubuntu}' }}}}\n"
+    );
+    assert_eq!(shards.matches(count.as_str()).count(), 2);
+    assert_eq!(merge.matches(count.as_str()).count(), 1);
+    // Every partition and the merge share one helper key per OS; exactly
+    // partition 1 saves it. The merge keeps its own helper cache.
     assert_eq!(
         workflow
             .matches("shared-key: native-coverage-${{ inputs.os }}\n")
             .count(),
-        2
+        1
     );
-    assert!(!workflow.contains("shared-key: native-coverage\n"));
     assert_eq!(
         shards
             .matches(
-                "save-if: ${{ matrix.shard == 'connectors-core-platform' && github.ref == 'refs/heads/main' }}\n"
+                "save-if: ${{ matrix.partition == 1 && github.ref == 'refs/heads/main' }}
+"
             )
             .count(),
         1
     );
-    assert!(report.contains("save-if: false\n"));
+    assert!(merge.contains("shared-key: native-coverage-merge\n"));
+    // The seed restores and saves the same path under one pinned action,
+    // exports only from main partition 1 on a cache miss, and saves only a
+    // staged export, never the consumed remainder of a restored seed.
+    let steps = workflow_steps(shards);
+    let restore = named_step(&steps, "Restore the instrumented dependency seed");
+    for required in [
+        "uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+        "path: ${{ runner.temp }}/kuru-coverage-seed\n",
+        "key: kuru-coverage-seed-v1-${{ inputs.os }}-instrumented-${{ hashFiles('Cargo.lock', 'mise.toml', 'mise.lock') }}",
+        "restore-keys: kuru-coverage-seed-v1-${{ inputs.os }}-instrumented-",
+    ] {
+        assert!(restore.contains(required), "seed restore lost {required}");
+    }
+    assert!(restore.starts_with("id: seed\n"));
+    assert!(named_step(&steps, "Select the dependency seed export").contains(
+        "if: github.ref == 'refs/heads/main' && matrix.partition == 1 && steps.seed.outputs.cache-hit != 'true'"
+    ));
+    let stage = named_step(&steps, "Stage the exported dependency seed");
+    assert!(stage.contains("if: env.KURU_COVERAGE_SEED_EXPORT != ''"));
+    assert!(stage.contains("rm -rf -- \"$RUNNER_TEMP/kuru-coverage-seed\""));
+    let save = named_step(&steps, "Save the instrumented dependency seed");
+    for required in [
+        "if: env.KURU_COVERAGE_SEED_READY == 'true'",
+        "uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+        "path: ${{ runner.temp }}/kuru-coverage-seed\n",
+        "key: ${{ steps.seed.outputs.cache-primary-key }}",
+    ] {
+        assert!(save.contains(required), "seed save lost {required}");
+    }
+    let position = |name: &str| {
+        steps
+            .iter()
+            .position(|step| step.starts_with(&format!("name: {name}\n")))
+            .unwrap_or_else(|| panic!("missing step {name}"))
+    };
+    assert!(
+        position("Run one checked coverage partition with the OS secret store")
+            < position("Stage the exported dependency seed")
+    );
+    // The merge downloads every partition's attempts in one pattern step.
     assert_eq!(
         workflow
             .matches("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c")
             .count(),
-        SHARDS.len()
+        1
     );
-    assert_eq!(
-        workflow.matches("actions/download-artifact@").count(),
-        SHARDS.len()
-    );
-    // Only a successful shard publishes receipt evidence under the name the
-    // report accepts; failures publish diagnostics under a name it rejects.
+    assert_eq!(workflow.matches("actions/download-artifact@").count(), 1);
+    assert!(merge.contains(
+        "          pattern: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-partition-*\n          merge-multiple: false\n          path: ${{ runner.temp }}/kuru-coverage-inputs\n"
+    ));
+    // Only a successful partition publishes receipt evidence under the name
+    // the merge accepts; failures publish diagnostics under a name it rejects.
     assert_eq!(workflow.matches("if: ${{ !cancelled() }}").count(), 1);
     assert!(!shards.contains("if: ${{ !cancelled() }}"));
-    // The matrix rows are exactly the shards the receipt and collect code
-    // enforce, in the same order, so the two cannot drift.
-    let expected_matrix: String = SHARDS
-        .iter()
-        .map(|(shard, packages)| {
-            format!(
-                "          - shard: {shard}\n            packages: {}\n",
-                packages.join(",")
-            )
-        })
-        .collect();
-    let matrix = shards
-        .split("      matrix:\n        include:\n")
-        .nth(1)
-        .unwrap()
-        .split("    steps:\n")
-        .next()
-        .unwrap();
-    assert_eq!(matrix, expected_matrix);
     assert_eq!(shards.matches("if: ${{ failure() }}").count(), 1);
     assert!(shards.contains(
-        "name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-${{ matrix.shard }}-diagnostics-attempt-${{ github.run_attempt }}"
+        "name: ${{ inputs.artifact-prefix }}-coverage-diagnostics-${{ inputs.os }}-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}"
     ));
     assert!(shards.contains(
-        "name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
+        "name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}"
     ));
-    assert!(report.contains(
+    assert!(merge.contains(
         "name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-attempt-${{ github.run_attempt }}"
     ));
     // The job start is recorded before any other step, and the inner deadline
     // derives from the same limit the host enforces.
-    let steps = workflow_steps(shards);
     assert!(steps[0].starts_with("name: Record the job start for the inner test deadline\n"));
     assert!(steps[0].contains("KURU_COVERAGE_JOB_STARTED=%s"));
     let timeout: Vec<_> = shards
         .lines()
         .filter_map(|line| line.trim().strip_prefix("timeout-minutes: "))
         .collect();
-    assert_eq!(timeout.len(), 1);
+    assert_eq!(timeout, ["45"]);
     let deadlines: Vec<_> = shards
         .lines()
         .filter_map(|line| line.trim().strip_prefix("KURU_COVERAGE_JOB_MINUTES: \""))
         .map(|value| value.strip_suffix('"').unwrap())
         .collect();
     assert_eq!(deadlines, [timeout[0], timeout[0]]);
-    // The Linux secret-store leg and the other runners run the same shard
-    // under an identical environment, selected by runner.os.
-    let shard_step = |name: &str| {
-        steps
-            .iter()
-            .find(|step| step.starts_with(&format!("name: {name}\n")))
-            .unwrap_or_else(|| panic!("missing shard step {name}"))
-    };
-    let env = |step: &str| {
-        step.split("        env:\n")
-            .nth(1)
-            .unwrap()
-            .split("        run:")
-            .next()
-            .unwrap()
-            .to_owned()
-    };
-    let other = shard_step("Run one checked coverage shard");
-    let linux = shard_step("Run one checked coverage shard with the OS secret store");
+    // The Linux secret-store leg and the other runners run the same
+    // partition under an identical environment, selected by runner.os.
+    let other = named_step(&steps, "Run one checked coverage partition");
+    let linux = named_step(
+        &steps,
+        "Run one checked coverage partition with the OS secret store",
+    );
     assert!(other.contains("if: runner.os != 'Linux'"));
     assert!(linux.contains("if: runner.os == 'Linux'"));
-    assert_eq!(env(other), env(linux));
-    // The rebuilt report inventory repeats the shard's debug-info profile.
-    let profile =
-        "CARGO_PROFILE_TEST_DEBUG: ${{ runner.os == 'Linux' && '0' || 'line-tables-only' }}\n";
-    assert!(env(other).contains(profile));
-    assert!(report.contains(profile));
-    // The report takes each shard's latest attempt from a pattern download.
-    for (shard, _) in SHARDS {
-        assert!(report.contains(&format!(
-            "          pattern: ${{{{ inputs.artifact-prefix }}}}-coverage-${{{{ inputs.os }}}}-{shard}-attempt-*\n          merge-multiple: false\n          path: ${{{{ runner.temp }}}}/kuru-coverage-inputs/{shard}\n"
-        )));
-    }
-    assert!(!report.contains(
-        "-attempt-${{ github.run_attempt }}\n          path: ${{ runner.temp }}/kuru-coverage-inputs"
+    assert_eq!(step_env(other), step_env(linux));
+    assert!(step_env(other).contains(
+        "CARGO_PROFILE_TEST_DEBUG: ${{ runner.os == 'Linux' && '0' || 'line-tables-only' }}\n"
     ));
-    // An older successful attempt must not stand in for a shard whose latest
-    // attempt failed: the report runs even after failures, then refuses before
-    // any other step unless every shard job succeeded.
-    assert!(report.starts_with("    if: always()\n    needs: shard\n"));
-    assert!(report.split("    steps:\n").nth(1).unwrap().starts_with(
-        "      # Failed shards upload no receipt, so an older successful attempt would\n      # otherwise stand in for a shard whose latest attempt failed.\n      - name: Require every coverage shard job to have succeeded\n        shell: bash\n        env:\n          KURU_COVERAGE_SHARDS_RESULT: ${{ needs.shard.result }}\n        run: |\n          if [ \"$KURU_COVERAGE_SHARDS_RESULT\" != success ]; then\n"
-    ));
+    // An older successful attempt must not stand in for a partition whose
+    // latest attempt failed: the merge runs even after failures, then
+    // refuses before any other step unless every partition job succeeded.
+    assert!(merge.starts_with("    if: always()\n    needs: shard\n"));
+    let merge_steps = workflow_steps(merge);
+    assert!(
+        merge_steps[0]
+            .starts_with("name: Require every coverage partition job to have succeeded\n")
+    );
+    assert!(merge_steps[0].contains("KURU_COVERAGE_SHARDS_RESULT: ${{ needs.shard.result }}"));
+    assert!(merge_steps[0].contains("if [ \"$KURU_COVERAGE_SHARDS_RESULT\" != success ]; then\n"));
     // Every step-level OS selection uses the runner, never the caller's label.
     for line in workflow.lines() {
         if line.starts_with("        if:") {
@@ -629,6 +711,93 @@ fn rust_cache_step_named_before_uses_still_extracts_its_save_if() {
     assert_eq!(blocks.len(), 1);
     let value = save_if_value(blocks[0]).unwrap();
     assert!(save_if_restricts_to_main(value));
+}
+
+#[test]
+fn arm64_memory_suite_runs_as_gated_uninstrumented_partitions() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let job = |name: &str, next: &str| {
+        ci.split(&format!("\n  {name}:\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing CI job {name}"))
+            .split(&format!("\n  {next}:\n"))
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    // The memory suite moved out of the arm64 build job into partitions.
+    let build = job("native-build", "native-memory");
+    assert!(!build.contains("//packages/kuru-memory:test"));
+    assert!(build.contains("test:embedded-runtime"));
+    let partitions = job("native-memory", "native-memory-merge");
+    let merge = job("native-memory-merge", "native-platform");
+    let count = table_count("ubuntu-24.04-arm", Mode::Uninstrumented);
+    assert!(partitions.contains(&format!(
+            "        partition: [{}]\n",
+            (1..=count)
+                .map(|k| k.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    assert!(partitions.contains("    runs-on: ubuntu-24.04-arm\n"));
+    assert!(partitions.contains(
+        "    name: Native memory partition (ubuntu-24.04-arm, ${{ matrix.partition }})\n"
+    ));
+    let declared = format!("KURU_COVERAGE_PARTITIONS: \"{count}\"\n");
+    assert!(partitions.contains(&declared));
+    assert!(merge.contains(&declared));
+    for required in [
+        "install_args: rust\n",
+        "run: mise run //packages/kuru-delivery:setup:test-tools",
+        "KURU_COVERAGE_OS: ubuntu-24.04-arm\n",
+        "KURU_COVERAGE_PACKAGES: kuru-memory\n",
+        "KURU_COVERAGE_TARGET: ${{ runner.temp }}/kuru-coverage-target\n",
+        "KURU_COVERAGE_JOB_MINUTES: \"45\"",
+        "timeout-minutes: 45\n",
+        "key: kuru-coverage-seed-v1-ubuntu-24.04-arm-uninstrumented-",
+        "uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+        "uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+        "run: mise run //packages/kuru-delivery:test:partition",
+        "name: ci-coverage-ubuntu-24.04-arm-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}",
+    ] {
+        assert!(
+            partitions.contains(required),
+            "memory partitions lost {required}"
+        );
+    }
+    // Uninstrumented: no coverage tooling, profiles or instrumented task.
+    for forbidden in [
+        "cargo-llvm-cov",
+        "component add llvm-tools",
+        "coverage:shard",
+        "CARGO_PROFILE_TEST_DEBUG",
+    ] {
+        assert!(
+            !partitions.contains(forbidden),
+            "memory partitions use {forbidden}"
+        );
+    }
+    assert!(merge.starts_with("    if: always()\n    needs: native-memory\n"));
+    for required in [
+        "    runs-on: ubuntu-latest\n",
+        "KURU_COVERAGE_SHARDS_RESULT: ${{ needs.native-memory.result }}",
+        "pattern: ci-coverage-ubuntu-24.04-arm-partition-*\n",
+        "KURU_COVERAGE_MODE: uninstrumented\n",
+        "mise run //packages/kuru-delivery:coverage:merge",
+    ] {
+        assert!(merge.contains(required), "memory merge lost {required}");
+    }
+    assert!(
+        merge
+            .split("    steps:\n")
+            .nth(1)
+            .unwrap()
+            .starts_with("      - name: Require every memory partition job to have succeeded\n")
+    );
+    assert!(ci.contains(
+        "needs: [quality, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
+    ));
 }
 
 #[test]

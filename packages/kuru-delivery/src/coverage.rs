@@ -1,9 +1,19 @@
-//! Fail-closed manifests for sharded native coverage.
+//! Fail-closed manifests for partitioned native test and coverage evidence.
 
+#[cfg(test)]
+mod fixture;
+pub mod lcov;
+pub mod ledger;
+pub mod merge;
 pub mod orchestrate;
+pub mod partition;
+pub mod plan;
+pub mod seed;
 
 use crate::{archive, command};
 use anyhow::{Context, Result, bail, ensure};
+use partition::PartitionScheme;
+use plan::{InvocationRecord, RunnerRecord};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,9 +26,12 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA: u32 = 1;
+/// Schema of every inventory, plan, ledger and receipt. Schema 1 (package
+/// shards with uploaded raw profiles) is refused by name.
+const SCHEMA: u32 = 2;
 const LLVM_COV_VERSION: &str = "cargo-llvm-cov 0.9.1";
-const INSTRUMENTATION: &str = "cargo-test-no-run;workspace;all-targets;all-features;locked;instrument-coverage;exact-libtest-executables";
+const INSTRUMENTATION: &str = "cargo-test-no-run;workspace;all-targets;all-features;locked;instrument-coverage;exact-libtest-executables;partitioned-exact-tests";
+const UNINSTRUMENTED: &str = "cargo-test-no-run;packages;all-targets;all-features;locked;uninstrumented;exact-libtest-executables;partitioned-exact-tests";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
 const JSON_LIMIT: u64 = 16 * 1024 * 1024;
@@ -28,41 +41,136 @@ const PROFILE_TOTAL_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 const PROFILE_COUNT_LIMIT: usize = 4096;
 const RUNNER_LEDGER_LIMIT: u64 = 16 * 1024 * 1024;
 const RUNNER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Time kept between the shard's test deadline and its hosted job limit. It covers
-/// tree termination and cleanup, fast refusal of the remaining Cargo test
-/// executables, evidence copying and the diagnostics upload.
+/// Bound for one executable's `--list` run and its captured output.
+const LIST_TIMEOUT: Duration = Duration::from_secs(120);
+const LIST_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+/// Time kept between the partition's test deadline and its hosted job limit. It
+/// covers tree termination and cleanup, fast refusal of the remaining Cargo
+/// test executables, LCOV export, evidence writing and the diagnostics upload.
 const EVIDENCE_RESERVE: Duration = Duration::from_secs(10 * 60);
 const TEST_LOG_LIMIT: u64 = 32 * 1024 * 1024;
 const RECENT_RESULT_LIMIT: usize = 20;
 const PENDING_LINE_LIMIT: usize = 64 * 1024;
 
-pub const SHARDS: [(&str, &[&str]); 5] = [
-    ("delivery-archive", &["kuru-delivery", "kuru-archive"]),
-    ("application", &["kuru"]),
-    ("memory", &["kuru-memory"]),
-    ("runtime", &["kuru-runtime"]),
-    (
-        "connectors-core-platform",
-        &["kuru-connectors", "kuru-core", "kuru-platform"],
-    ),
+/// Every workspace package. The orchestrator requires `cargo metadata` to name
+/// exactly this set, so the table cannot drift from the workspace.
+pub const WORKSPACE_PACKAGES: [&str; 8] = [
+    "kuru",
+    "kuru-archive",
+    "kuru-connectors",
+    "kuru-core",
+    "kuru-delivery",
+    "kuru-memory",
+    "kuru-platform",
+    "kuru-runtime",
 ];
 
-/// Every workspace package, derived from [`SHARDS`] so the two cannot drift.
+/// Whether a partition set runs under coverage instrumentation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    Instrumented,
+    Uninstrumented,
+}
+
+impl Mode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Instrumented => "instrumented",
+            Self::Uninstrumented => "uninstrumented",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        match text {
+            "instrumented" => Ok(Self::Instrumented),
+            "uninstrumented" => Ok(Self::Uninstrumented),
+            _ => bail!("coverage mode {text:?} must be instrumented or uninstrumented"),
+        }
+    }
+
+    fn contract(self) -> &'static str {
+        match self {
+            Self::Instrumented => INSTRUMENTATION,
+            Self::Uninstrumented => UNINSTRUMENTED,
+        }
+    }
+}
+
+/// Hosted partition sets: OS label, mode and partition count. Workflow
+/// matrices are pinned against this table.
+pub const PARTITIONS: [(&str, Mode, u32); 4] = [
+    ("ubuntu-latest", Mode::Instrumented, 8),
+    ("macos-latest", Mode::Instrumented, 4),
+    ("windows-latest", Mode::Instrumented, 8),
+    ("ubuntu-24.04-arm", Mode::Uninstrumented, 3),
+];
+
+/// The Rust host target every hosted OS label's partitions must report.
+pub const OS_TARGETS: [(&str, &str); 4] = [
+    ("ubuntu-latest", "x86_64-unknown-linux-gnu"),
+    ("macos-latest", "aarch64-apple-darwin"),
+    ("windows-latest", "x86_64-pc-windows-msvc"),
+    ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu"),
+];
+
+/// The OS label that local, by-hand partition runs use. It accepts any
+/// partition count and host target.
+pub const LOCAL_OS: &str = "local";
+
+/// Test executables whose tests are listed but not run on one host target:
+/// `(host target, artifact key, reason)`. An entry must name an executable of
+/// the inventory; every partition records the reason, and the merge requires
+/// the same reason everywhere.
+pub const EXCLUDED_ARTIFACTS: [(&str, &str, &str); 0] = [];
+
+/// Every workspace package, from [`WORKSPACE_PACKAGES`].
 pub fn workspace_packages() -> BTreeSet<&'static str> {
-    SHARDS
+    WORKSPACE_PACKAGES.into_iter().collect()
+}
+
+/// The partition count of a hosted OS label and mode, if the table has one.
+pub fn partition_count(os: &str, mode: Mode) -> Option<u32> {
+    PARTITIONS
         .iter()
-        .flat_map(|(_, packages)| packages.iter().copied())
-        .collect()
+        .find(|(label, table_mode, _)| *label == os && *table_mode == mode)
+        .map(|(_, _, count)| *count)
+}
+
+/// Require a partition set to match the table, or to be a local run.
+pub fn check_partitioning(os: &str, mode: Mode, count: u32) -> Result<()> {
+    artifact_os_label(os)?;
+    if os == LOCAL_OS {
+        return Ok(());
+    }
+    let expected = partition_count(os, mode)
+        .with_context(|| format!("no {} partition set is declared for {os}", mode.name()))?;
+    ensure!(
+        count == expected,
+        "{os} {} partitions number {expected}, not {count}",
+        mode.name()
+    );
+    Ok(())
+}
+
+/// The host target a hosted OS label must report, if it is not local.
+pub fn os_target(os: &str) -> Option<&'static str> {
+    OS_TARGETS
+        .iter()
+        .find(|(label, _)| *label == os)
+        .map(|(_, target)| *target)
 }
 
 /// Validate the hosted OS label that names this OS's coverage artifacts.
 pub fn artifact_os_label(label: &str) -> Result<&str> {
     ensure!(
         !label.is_empty()
-            && label
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
-        "coverage artifact OS label {label:?} must match [a-z0-9-]+"
+            && !label.starts_with(['-', '.'])
+            && !label.ends_with(['-', '.'])
+            && label.bytes().all(|byte| byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'-' | b'.')),
+        "coverage artifact OS label {label:?} must match [a-z0-9][a-z0-9.-]*[a-z0-9]"
     );
     Ok(label)
 }
@@ -146,57 +254,91 @@ pub struct Artifact {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Inventory {
     schema: u32,
     workspace_packages: Vec<String>,
+    /// Packages whose test targets were built: every workspace package when
+    /// instrumented, the named packages when uninstrumented.
+    scope: Vec<String>,
     artifacts: Vec<Artifact>,
 }
 
+/// Size and digest of the raw profiles a partition exported from.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Selection {
-    schema: u32,
-    inventory_sha256: String,
-    packages: Vec<String>,
-    artifacts: Vec<Artifact>,
+#[serde(deny_unknown_fields)]
+pub struct ProfileSummary {
+    pub count: usize,
+    pub bytes: u64,
+    /// Digest of the sorted `name bytes sha256` lines of every profile.
+    pub manifest_sha256: String,
 }
 
+/// The normalized LCOV a partition uploaded.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct RunnerRecord {
-    schema: u32,
-    executable: String,
-    action: String,
-    cwd: String,
-    args: Vec<String>,
-    success: bool,
-    status_code: Option<i32>,
+#[serde(deny_unknown_fields)]
+pub struct LcovReceipt {
+    pub bytes: u64,
+    pub sha256: String,
+    pub files: usize,
+    pub lines_found: u64,
+    pub lines_hit: u64,
 }
 
+/// One partition's evidence. Every field but the partition index, attempt,
+/// plan, ledgers, profiles and LCOV must agree across an OS's partitions.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct ProfileReceipt {
-    name: String,
-    bytes: u64,
-    sha256: String,
+#[serde(deny_unknown_fields)]
+pub struct Receipt {
+    pub schema: u32,
+    pub partition: PartitionScheme,
+    pub run_attempt: String,
+    pub mode: Mode,
+    pub scope: Vec<String>,
+    pub source: String,
+    pub tree: String,
+    pub cargo_lock_sha256: String,
+    pub rustc: String,
+    pub cargo: String,
+    pub target: String,
+    pub cargo_llvm_cov: Option<String>,
+    pub instrumentation: String,
+    pub target_os: String,
+    pub profile_env_sha256: String,
+    pub inventory_sha256: String,
+    pub plan_sha256: String,
+    pub tests_sha256: String,
+    pub runner_ledger_sha256: String,
+    pub job_ledger_sha256: String,
+    pub profiles: ProfileSummary,
+    pub lcov: Option<LcovReceipt>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct Receipt {
-    schema: u32,
-    shard: String,
-    run_attempt: String,
-    packages: Vec<String>,
-    source: String,
-    tree: String,
-    cargo_lock_sha256: String,
-    rustc: String,
-    cargo: String,
-    target: String,
-    cargo_llvm_cov: String,
-    instrumentation: String,
-    target_os: String,
-    inventory_sha256: String,
-    selection_sha256: String,
-    runner_ledger_sha256: String,
-    profiles: Vec<ProfileReceipt>,
+/// Evidence file names inside one uploaded `attempt-<n>` directory.
+const RECEIPT_FILE: &str = "receipt.json";
+const INVENTORY_FILE: &str = "inventory.json";
+const PLAN_FILE: &str = "partition-plan.json";
+const RUNNER_LEDGER_FILE: &str = "runner-ledger.jsonl";
+const JOB_LEDGER_FILE: &str = "job-ledger.json";
+const LCOV_FILE: &str = "coverage.lcov";
+
+/// Parse a schema-bearing JSON document, naming a schema-1 file explicitly.
+fn read_versioned<T: for<'de> Deserialize<'de>>(path: &Path, what: &str) -> Result<T> {
+    let bytes = read_bounded(path, JSON_LIMIT)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    match value.get("schema").and_then(serde_json::Value::as_u64) {
+        Some(1) => bail!(
+            "{what} {} uses coverage schema 1 (package shards); schema {SCHEMA} partitions are required",
+            path.display()
+        ),
+        Some(schema) if schema == u64::from(SCHEMA) => {}
+        other => bail!(
+            "{what} {} has unsupported coverage schema {other:?}",
+            path.display()
+        ),
+    }
+    serde_json::from_value(value).with_context(|| format!("parse {what} {}", path.display()))
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
@@ -316,10 +458,43 @@ fn metadata(path: &Path) -> Result<Metadata> {
     Ok(metadata)
 }
 
+/// Workspace member identity from `cargo metadata --no-deps`.
+pub(crate) struct WorkspaceIdentity {
+    /// Sorted member package names.
+    pub packages: Vec<String>,
+    /// Every member package and target name, which workspace outputs carry.
+    pub names: BTreeSet<String>,
+    /// Member package ids, as Cargo messages name them.
+    pub ids: BTreeSet<String>,
+}
+
+pub(crate) fn workspace_identity(metadata_path: &Path) -> Result<WorkspaceIdentity> {
+    let metadata = metadata(metadata_path)?;
+    let members: BTreeSet<_> = metadata.workspace_members.iter().cloned().collect();
+    let mut packages = Vec::new();
+    let mut names = BTreeSet::new();
+    for package in metadata
+        .packages
+        .iter()
+        .filter(|package| members.contains(&package.id))
+    {
+        packages.push(package.name.clone());
+        names.insert(package.name.clone());
+        names.extend(package.targets.iter().map(|target| target.name.clone()));
+    }
+    packages.sort();
+    Ok(WorkspaceIdentity {
+        packages,
+        names,
+        ids: members,
+    })
+}
+
 fn artifact_inventory(
     metadata: &Metadata,
     messages: &Path,
     target_dir: &Path,
+    scope: &[String],
 ) -> Result<Inventory> {
     let workspace: BTreeMap<_, _> = metadata
         .packages
@@ -407,12 +582,38 @@ fn artifact_inventory(
         !artifacts.is_empty(),
         "Cargo messages contain no workspace artifacts"
     );
+    let mut scope = scope.to_vec();
+    scope.sort();
+    scope.dedup();
+    ensure!(!scope.is_empty(), "coverage inventory scope is empty");
+    for package in &scope {
+        ensure!(
+            workspace_packages.binary_search(package).is_ok(),
+            "coverage inventory scope names unknown package {package}"
+        );
+    }
     let inventory = Inventory {
         schema: SCHEMA,
         workspace_packages,
+        scope,
         artifacts: artifacts.into_iter().collect(),
     };
-    for package in workspace.values() {
+    for artifact in inventory
+        .artifacts
+        .iter()
+        .filter(|artifact| is_runnable(artifact))
+    {
+        ensure!(
+            inventory.scope.binary_search(&artifact.package).is_ok(),
+            "Cargo built a test executable outside the scope: {} {}",
+            artifact.package,
+            artifact.target_name
+        );
+    }
+    for package in workspace
+        .values()
+        .filter(|package| inventory.scope.binary_search(&package.name).is_ok())
+    {
         for target in package.targets.iter().filter(|target| target.test) {
             ensure!(
                 inventory.artifacts.iter().any(|artifact| {
@@ -430,125 +631,39 @@ fn artifact_inventory(
     Ok(inventory)
 }
 
+/// Canonicalize the Cargo artifact inventory of `scope` into `output`.
 pub fn write_inventory(
     metadata_path: &Path,
     messages: &Path,
     target_dir: &Path,
+    scope: &[String],
     output: &Path,
 ) -> Result<()> {
-    let inventory = artifact_inventory(&metadata(metadata_path)?, messages, target_dir)?;
+    let inventory = artifact_inventory(&metadata(metadata_path)?, messages, target_dir, scope)?;
     write_json(output, &inventory)
-}
-
-pub fn write_selection(inventory_path: &Path, packages: &[String], output: &Path) -> Result<()> {
-    let inventory: Inventory = read_json(inventory_path)?;
-    ensure!(inventory.schema == SCHEMA, "unsupported inventory schema");
-    let mut packages = packages.to_vec();
-    packages.sort();
-    packages.dedup();
-    ensure!(!packages.is_empty(), "coverage shard has no packages");
-    for package in &packages {
-        ensure!(
-            inventory.workspace_packages.binary_search(package).is_ok(),
-            "coverage shard names unknown package {package}"
-        );
-    }
-
-    let selected: Vec<_> = inventory
-        .artifacts
-        .iter()
-        .filter(|artifact| packages.binary_search(&artifact.package).is_ok())
-        .cloned()
-        .collect();
-    validate_selection(&inventory, &selected, &packages)?;
-
-    write_json(
-        output,
-        &Selection {
-            schema: SCHEMA,
-            inventory_sha256: digest_json(&inventory)?,
-            packages,
-            artifacts: selected,
-        },
-    )
 }
 
 fn is_runnable(artifact: &Artifact) -> bool {
     artifact.profile_test && artifact.executable.is_some()
 }
 
-fn validate_selection(
-    inventory: &Inventory,
-    selected: &[Artifact],
-    packages: &[String],
-) -> Result<()> {
-    let selected_set: BTreeSet<_> = selected.iter().cloned().collect();
-    ensure!(
-        selected_set.len() == selected.len(),
-        "selected inventory contains duplicate artifacts"
-    );
-    for artifact in &selected_set {
-        ensure!(
-            packages.binary_search(&artifact.package).is_ok(),
-            "selected inventory includes artifact outside its shard: {} {}",
-            artifact.package,
-            artifact.target_name
-        );
-    }
-    for package in packages {
-        let required: BTreeSet<_> = inventory
-            .artifacts
-            .iter()
-            .filter(|artifact| artifact.package == *package)
-            .cloned()
-            .collect();
-        ensure!(
-            !required.is_empty(),
-            "full inventory omits package {package}"
-        );
-        ensure!(
-            required.is_subset(&selected_set),
-            "selected inventory omits an artifact for {package}"
-        );
-        ensure!(
-            required.iter().any(is_runnable),
-            "package {package} has no runnable Cargo test artifact"
-        );
-    }
-    let expected: BTreeSet<_> = inventory
+fn read_inventory(path: &Path) -> Result<Inventory> {
+    read_versioned(path, "coverage inventory")
+}
+
+/// The inventory's test executables, each with supported libtest semantics.
+fn runnable_artifacts(inventory: &Inventory) -> Result<Vec<Artifact>> {
+    let runnable: Vec<_> = inventory
         .artifacts
         .iter()
-        .filter(|artifact| packages.binary_search(&artifact.package).is_ok())
+        .filter(|artifact| is_runnable(artifact))
         .cloned()
         .collect();
     ensure!(
-        selected_set == expected,
-        "selected inventory differs from the full package artifacts"
-    );
-    Ok(())
-}
-
-fn runnable_artifacts(inventory_path: &Path, selection_path: &Path) -> Result<Vec<Artifact>> {
-    let inventory: Inventory = read_json(inventory_path)?;
-    let selection: Selection = read_json(selection_path)?;
-    ensure!(
-        inventory.schema == SCHEMA && selection.schema == SCHEMA,
-        "unsupported coverage schema"
-    );
-    ensure!(
-        selection.inventory_sha256 == digest_json(&inventory)?,
-        "selection names another inventory"
-    );
-    validate_selection(&inventory, &selection.artifacts, &selection.packages)?;
-    let runnable: Vec<_> = inventory
-        .artifacts
-        .into_iter()
-        .filter(is_runnable)
-        .collect();
-    ensure!(
         !runnable.is_empty(),
-        "coverage shard has no test executables"
+        "coverage inventory has no test executables"
     );
+    let mut keys = BTreeSet::new();
     for artifact in &runnable {
         let supported = artifact.target_kind.len() == 1
             && matches!(artifact.target_kind[0].as_str(), "lib" | "bin" | "test");
@@ -559,6 +674,11 @@ fn runnable_artifacts(inventory_path: &Path, selection_path: &Path) -> Result<Ve
             artifact.target_name,
             artifact.target_kind
         );
+        ensure!(
+            keys.insert(partition::artifact_key(artifact)),
+            "test executable identity {} is ambiguous",
+            partition::artifact_key(artifact)
+        );
     }
     Ok(runnable)
 }
@@ -568,7 +688,7 @@ pub struct RunnerConfigOptions<'a> {
     pub host: &'a str,
     pub helper: &'a Path,
     pub inventory: &'a Path,
-    pub selection: &'a Path,
+    pub partition: &'a PartitionScheme,
     pub target_dir: &'a Path,
     pub ledger: &'a Path,
     pub diagnostics: &'a Path,
@@ -608,7 +728,7 @@ pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
         host,
         helper,
         inventory: inventory_path,
-        selection: selection_path,
+        partition,
         target_dir,
         ledger,
         diagnostics,
@@ -619,7 +739,7 @@ pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
     ensure!(root.is_absolute(), "coverage root must be absolute");
     ensure!(helper.is_absolute(), "coverage helper must be absolute");
     ensure!(
-        inventory_path.is_absolute() && selection_path.is_absolute(),
+        inventory_path.is_absolute(),
         "coverage manifests must be absolute"
     );
     ensure!(target_dir.is_absolute(), "coverage target must be absolute");
@@ -628,6 +748,7 @@ pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
         diagnostics.is_absolute() && fs::symlink_metadata(diagnostics)?.file_type().is_dir(),
         "coverage diagnostics must be an absolute directory"
     );
+    partition.validate()?;
     let now = unix_now()?;
     ensure!(
         *job_started <= now,
@@ -636,7 +757,7 @@ pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
     let deadline = shard_deadline(*job_started, *job_minutes)?;
     ensure!(
         deadline > now,
-        "coverage shard deadline {deadline} passed before its tests started"
+        "coverage partition deadline {deadline} passed before its tests started"
     );
     ensure!(
         !host.is_empty()
@@ -645,13 +766,14 @@ pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
         "invalid Cargo host target"
     );
-    runnable_artifacts(inventory_path, selection_path)?;
+    let inventory = read_inventory(inventory_path)?;
+    runnable_artifacts(&inventory)?;
+    plan::check_exclusions(&EXCLUDED_ARTIFACTS, host, &inventory)?;
     let strings = [
         helper,
         root,
         target_dir,
         inventory_path,
-        selection_path,
         ledger,
         diagnostics,
     ]
@@ -659,15 +781,7 @@ pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
         path.to_str()
             .context("Cargo runner configuration path is not UTF-8")
     });
-    let [
-        helper,
-        root,
-        target_dir,
-        inventory,
-        selection,
-        ledger,
-        diagnostics,
-    ] = strings;
+    let [helper, root, target_dir, inventory, ledger, diagnostics] = strings;
     let runner = vec![
         helper?.to_owned(),
         "coverage".to_owned(),
@@ -678,8 +792,12 @@ pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
         target_dir?.to_owned(),
         "--inventory".to_owned(),
         inventory?.to_owned(),
-        "--selection".to_owned(),
-        selection?.to_owned(),
+        "--host".to_owned(),
+        (*host).to_owned(),
+        "--partition".to_owned(),
+        partition.index.to_string(),
+        "--partitions".to_owned(),
+        partition.count.to_string(),
         "--ledger".to_owned(),
         ledger?.to_owned(),
         "--diagnostics".to_owned(),
@@ -736,7 +854,9 @@ fn append_runner_record(ledger: &Path, record: &RunnerRecord) -> Result<()> {
 pub struct DispatchOptions<'a> {
     pub root: &'a Path,
     pub inventory: &'a Path,
-    pub selection: &'a Path,
+    /// The Rust host target, which keys [`EXCLUDED_ARTIFACTS`].
+    pub host: &'a str,
+    pub partition: &'a PartitionScheme,
     pub target_dir: &'a Path,
     pub ledger: &'a Path,
     pub diagnostics: &'a Path,
@@ -758,6 +878,8 @@ struct LibtestProgress {
     long_running: Vec<String>,
     recent: std::collections::VecDeque<String>,
     completed: usize,
+    /// The first `running N tests` announcement: the selection libtest ran.
+    announced: Option<usize>,
 }
 
 impl LibtestProgress {
@@ -777,6 +899,21 @@ impl LibtestProgress {
     }
 
     fn line(&mut self, line: &str) {
+        if self.announced.is_none()
+            && let Some(count) = line
+                .strip_prefix("running ")
+                .and_then(|rest| {
+                    rest.strip_suffix(" tests")
+                        .or_else(|| rest.strip_suffix(" test"))
+                })
+                .filter(|count| {
+                    !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                .and_then(|count| count.parse().ok())
+        {
+            self.announced = Some(count);
+            return;
+        }
         let Some(rest) = line.strip_prefix("test ") else {
             return;
         };
@@ -860,7 +997,8 @@ struct StallEvidence {
 }
 
 enum Supervision {
-    Exited(ExitStatus),
+    /// The tree exited; carries libtest's announced selection size.
+    Exited(ExitStatus, Option<usize>),
     Stalled(Box<StallEvidence>),
     /// The Unix runner itself received a termination request.
     #[cfg(unix)]
@@ -1124,7 +1262,7 @@ where
             if output != "complete" {
                 eprintln!("coverage runner output relay: {output}");
             }
-            Ok(Supervision::Exited(status))
+            Ok(Supervision::Exited(status, progress.announced))
         }
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
             Ok(Supervision::Stalled(Box::new(StallEvidence {
@@ -1155,11 +1293,185 @@ fn diagnostic_name(executable: &str) -> String {
         .collect()
 }
 
+/// One exact selection the runner starts for an executable.
+struct Launch<'a> {
+    executable: &'a Path,
+    artifact: &'a Artifact,
+    args: &'a [String],
+    log: PathBuf,
+    remaining: Duration,
+}
+
+/// The dispatcher's process boundary: listing an executable's tests and
+/// running one supervised selection. Unit tests drive the dispatcher through a
+/// fake; [`SystemLauncher`] starts real processes.
+trait Launcher {
+    /// Run `<executable> --list --format terse` from the current directory with
+    /// the runner's environment and return its standard output.
+    async fn list(&mut self, executable: &Path, timeout: Duration) -> Result<String>;
+    /// Start and supervise one selection until it exits or the deadline.
+    async fn run(&mut self, launch: &Launch<'_>) -> Result<Supervision>;
+}
+
+/// Real test processes: an owned Unix process group or a Windows native Job.
+struct SystemLauncher;
+
+impl Launcher for SystemLauncher {
+    async fn list(&mut self, executable: &Path, timeout: Duration) -> Result<String> {
+        let mut child = command::rooted(&std::env::current_dir()?, executable);
+        child.args(["--list", "--format", "terse"]);
+        let output = command::bounded_output(&mut child, timeout, LIST_OUTPUT_LIMIT)
+            .await
+            .with_context(|| format!("list the tests of {}", executable.display()))?;
+        ensure!(
+            output.status.success(),
+            "{} --list failed with {}: {}",
+            executable.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        String::from_utf8(output.stdout).context("libtest printed a non-UTF-8 test list")
+    }
+
+    async fn run(&mut self, launch: &Launch<'_>) -> Result<Supervision> {
+        let Launch {
+            executable,
+            artifact,
+            args,
+            log,
+            remaining,
+        } = launch;
+        #[cfg(not(windows))]
+        let _ = artifact;
+        #[cfg(windows)]
+        let supervision = {
+            use kuru_platform::windows::process::{
+                Lifetime, NativeChild, NativeSpawnSpec, StandardStream, Stdio, inherited_stdio,
+                sample_process,
+            };
+
+            struct Native(NativeChild);
+            impl TestProcess for Native {
+                async fn wait(&mut self, timeout: Duration) -> std::io::Result<ExitStatus> {
+                    self.0.wait(timeout).await
+                }
+                fn sample(&self) -> Option<String> {
+                    Some(
+                        match self
+                            .0
+                            .duplicate_diagnostic_handle()
+                            .and_then(|handle| sample_process(&handle))
+                        {
+                            Ok(sample) => format!(
+                                "kernel_time={:?}; user_time={:?}; working_set_bytes={}",
+                                sample.kernel_time, sample.user_time, sample.working_set_bytes
+                            ),
+                            Err(error) => format!("sample failed: {error}"),
+                        },
+                    )
+                }
+                async fn terminate(&mut self) -> std::io::Result<()> {
+                    self.0.terminate()
+                }
+            }
+
+            let mut spec = NativeSpawnSpec::new(executable.to_path_buf(), std::env::current_dir()?);
+            // Only the verified memory test artifact exercises an owner that must
+            // outlive its starter. Its test process remains in a kill-on-close Job,
+            // but that Job permits the service's explicit native breakaway. All
+            // other test artifacts retain the ordinary owned Job policy.
+            if needs_independent_service_lifetime(artifact) {
+                spec.lifetime = Lifetime::FixtureBreakawayJob;
+            }
+            spec.args = args.iter().map(OsString::from).collect();
+            spec.environment = std::env::vars_os().collect();
+            spec.stdin = inherited_stdio(StandardStream::Input)?;
+            // The runner relays stdout to the job log and observes libtest progress.
+            spec.stdout = Stdio::Pipe;
+            spec.stderr = inherited_stdio(StandardStream::Error)?;
+            let mut child = spec.spawn().await?;
+            let output = child
+                .take_stdout()
+                .context("Cargo test process has no stdout pipe")?;
+            let mut child = Native(child);
+            supervise(
+                &mut child,
+                output,
+                tokio::io::stdout(),
+                log.clone(),
+                *remaining,
+                RUNNER_CLEANUP_TIMEOUT,
+            )
+            .await?
+        };
+        #[cfg(unix)]
+        let supervision = {
+            // Handlers are installed before the test group exists.
+            let interrupt = runner_signals()?;
+            // The test inherits this runner's complete environment, including the
+            // LLVM_PROFILE_FILE destination, working directory, stdin and stderr.
+            let mut command = std::process::Command::new(executable);
+            command
+                .args(args.iter())
+                .stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit());
+            supervise_group(
+                command,
+                tokio::io::stdout(),
+                log.clone(),
+                *remaining,
+                RUNNER_CLEANUP_TIMEOUT,
+                interrupt,
+            )
+            .await?
+        };
+        Ok(supervision)
+    }
+}
+
+/// Raw profiles directly in the target root.
+fn count_profiles(target: &Path) -> Result<usize> {
+    let mut count = 0;
+    for entry in fs::read_dir(target)? {
+        if entry?.path().extension() == Some(OsStr::new("profraw")) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// The time left before the deadline, or `None` once it has passed.
+fn remaining_until(deadline: u64) -> Result<Option<Duration>> {
+    let now = unix_now()?;
+    Ok((now < deadline).then(|| Duration::from_secs(deadline - now)))
+}
+
+/// Close a record with its end time and profile count and append it.
+fn finish_record(record: &mut RunnerRecord, ledger: &Path, target_dir: &Path) -> Result<()> {
+    record.finished = unix_now()?.max(record.started);
+    record.profraw_after = count_profiles(target_dir)?;
+    append_runner_record(ledger, record)
+}
+
+/// Dispatch one Cargo-selected test executable through the real processes.
 pub async fn dispatch_test(options: &DispatchOptions<'_>) -> Result<Option<ExitStatus>> {
+    let cwd = std::env::current_dir()?;
+    dispatch_with(&mut SystemLauncher, options, &cwd, &EXCLUDED_ARTIFACTS).await
+}
+
+/// Dispatch from Cargo's working directory `current` through `launcher`.
+async fn dispatch_with<L: Launcher>(
+    launcher: &mut L,
+    options: &DispatchOptions<'_>,
+    current: &Path,
+    exclusions: &[(&str, &str, &str)],
+) -> Result<Option<ExitStatus>> {
     let DispatchOptions {
         root,
         inventory: inventory_path,
-        selection: selection_path,
+        host,
+        partition,
         target_dir,
         ledger,
         diagnostics,
@@ -1169,7 +1481,7 @@ pub async fn dispatch_test(options: &DispatchOptions<'_>) -> Result<Option<ExitS
     } = options;
     ensure!(root.is_absolute(), "coverage root must be absolute");
     ensure!(
-        inventory_path.is_absolute() && selection_path.is_absolute(),
+        inventory_path.is_absolute(),
         "coverage manifests must be absolute"
     );
     ensure!(target_dir.is_absolute(), "coverage target must be absolute");
@@ -1178,10 +1490,11 @@ pub async fn dispatch_test(options: &DispatchOptions<'_>) -> Result<Option<ExitS
         diagnostics.is_absolute() && fs::symlink_metadata(diagnostics)?.file_type().is_dir(),
         "coverage diagnostics must be an absolute directory"
     );
+    partition.validate()?;
     let executable_path = if executable.is_absolute() {
         executable.to_path_buf()
     } else {
-        std::env::current_dir()?.join(executable)
+        current.join(executable)
     };
     ensure!(
         fs::symlink_metadata(&executable_path)?
@@ -1190,20 +1503,20 @@ pub async fn dispatch_test(options: &DispatchOptions<'_>) -> Result<Option<ExitS
         "Cargo runner executable is not a regular file"
     );
     let executable = normalized_relative(target_dir, &executable_path, "runner executable")?;
-    let artifacts = runnable_artifacts(inventory_path, selection_path)?;
-    let artifact = artifacts
+    let inventory = read_inventory(inventory_path)?;
+    let artifacts = runnable_artifacts(&inventory)?;
+    let matching: Vec<_> = artifacts
         .iter()
-        .find(|artifact| artifact.executable.as_deref() == Some(executable.as_str()))
-        .with_context(|| format!("Cargo invoked unknown test executable {executable}"))?;
-    ensure!(
-        artifacts
-            .iter()
-            .filter(|candidate| candidate.executable.as_deref() == Some(executable.as_str()))
-            .count()
-            == 1,
-        "Cargo test executable identity is ambiguous"
-    );
-    let cwd = normalized_relative(root, &std::env::current_dir()?, "runner directory")?;
+        .filter(|artifact| artifact.executable.as_deref() == Some(executable.as_str()))
+        .collect();
+    let [artifact] = matching[..] else {
+        ensure!(
+            matching.is_empty(),
+            "Cargo test executable identity is ambiguous"
+        );
+        bail!("Cargo invoked unknown test executable {executable}");
+    };
+    let cwd = normalized_relative(root, current, "runner directory")?;
     ensure!(
         cwd == artifact.package_root,
         "Cargo ran {} {} from {cwd}, expected {}",
@@ -1223,192 +1536,197 @@ pub async fn dispatch_test(options: &DispatchOptions<'_>) -> Result<Option<ExitS
         args.is_empty(),
         "Cargo supplied unexpected libtest arguments"
     );
-    let selection: Selection = read_json(selection_path)?;
-    let selected = selection.packages.binary_search(&artifact.package).is_ok();
-    if !selected {
-        append_runner_record(
-            ledger,
-            &RunnerRecord {
-                schema: SCHEMA,
-                executable,
-                action: "omit".to_owned(),
-                cwd,
-                args,
-                success: true,
-                status_code: Some(0),
-            },
-        )?;
+    let key = partition::artifact_key(artifact);
+    let started = unix_now()?;
+    let profraw_before = count_profiles(target_dir)?;
+    let empty = partition::list_sha256(&[]);
+    let mut record = RunnerRecord {
+        schema: SCHEMA,
+        executable: executable.clone(),
+        artifact: key.clone(),
+        action: plan::DEADLINE.to_owned(),
+        cwd,
+        args,
+        listed: Vec::new(),
+        list_sha256: empty.clone(),
+        assigned: 0,
+        assigned_sha256: empty,
+        reason: None,
+        invocations: Vec::new(),
+        started,
+        finished: started,
+        profraw_before,
+        profraw_after: profraw_before,
+        success: false,
+        status_code: None,
+    };
+    let Some(remaining) = remaining_until(*deadline)? else {
+        finish_record(&mut record, ledger, target_dir)?;
+        bail!("coverage partition deadline {deadline} passed before starting {executable}");
+    };
+
+    // Every partition lists every executable: the lists prove completeness,
+    // and in an instrumented partition the list run leaves each object a profile.
+    let list_started = unix_now()?;
+    let listed = match launcher
+        .list(&executable_path, remaining.min(LIST_TIMEOUT))
+        .await
+        .and_then(|text| partition::parse_libtest_list(&text))
+    {
+        Ok(listed) => listed,
+        Err(error) => {
+            record.action = plan::LIST.to_owned();
+            finish_record(&mut record, ledger, target_dir)?;
+            return Err(error.context(format!("list the tests of {executable}")));
+        }
+    };
+    record.list_sha256 = partition::list_sha256(&listed);
+    record.invocations.push(InvocationRecord {
+        kind: plan::LIST.to_owned(),
+        names: listed.len(),
+        names_sha256: record.list_sha256.clone(),
+        announced: None,
+        started: list_started,
+        finished: unix_now()?,
+        status_code: Some(0),
+    });
+    let excluded = plan::excluded_reason(exclusions, host, &key);
+    let assigned = if excluded.is_some() {
+        Vec::new()
+    } else {
+        partition.assigned(&key, &listed)
+    };
+    record.listed = listed;
+    record.assigned = assigned.len();
+    record.assigned_sha256 = partition::list_sha256(&assigned);
+    if let Some(reason) = excluded {
+        eprintln!("coverage runner: {executable} is excluded on {host}: {reason}");
+        record.reason = Some(reason);
+        record.action = plan::EXCLUDE.to_owned();
+    } else if assigned.is_empty() {
+        record.action = plan::OMIT.to_owned();
+    }
+    if assigned.is_empty() {
+        record.success = true;
+        record.status_code = Some(0);
+        finish_record(&mut record, ledger, target_dir)?;
         return Ok(None);
     }
-    let now = unix_now()?;
-    if now >= *deadline {
-        append_runner_record(
-            ledger,
-            &RunnerRecord {
-                schema: SCHEMA,
-                executable: executable.clone(),
-                action: "deadline".to_owned(),
-                cwd,
-                args,
-                success: false,
-                status_code: None,
-            },
-        )?;
-        bail!("coverage shard deadline {deadline} passed before starting {executable}");
-    }
-    let remaining = Duration::from_secs(deadline - now);
-    let log = diagnostics.join(format!("{}.stdout.log", diagnostic_name(&executable)));
-    #[cfg(windows)]
-    let supervision = {
-        use kuru_platform::windows::process::{
-            Lifetime, NativeChild, NativeSpawnSpec, StandardStream, Stdio, inherited_stdio,
-            sample_process,
-        };
 
-        struct Native(NativeChild);
-        impl TestProcess for Native {
-            async fn wait(&mut self, timeout: Duration) -> std::io::Result<ExitStatus> {
-                self.0.wait(timeout).await
-            }
-            fn sample(&self) -> Option<String> {
-                Some(
-                    match self
-                        .0
-                        .duplicate_diagnostic_handle()
-                        .and_then(|handle| sample_process(&handle))
-                    {
-                        Ok(sample) => format!(
-                            "kernel_time={:?}; user_time={:?}; working_set_bytes={}",
-                            sample.kernel_time, sample.user_time, sample.working_set_bytes
-                        ),
-                        Err(error) => format!("sample failed: {error}"),
-                    },
-                )
-            }
-            async fn terminate(&mut self) -> std::io::Result<()> {
-                self.0.terminate()
-            }
+    record.action = plan::RUN.to_owned();
+    let program = executable_path
+        .to_str()
+        .context("Cargo runner executable path is not UTF-8")?;
+    let chunks = match partition::chunk(
+        program,
+        &["--exact"],
+        &assigned,
+        partition::COMMAND_LINE_BUDGET,
+    ) {
+        Ok(chunks) => chunks,
+        Err(error) => {
+            finish_record(&mut record, ledger, target_dir)?;
+            return Err(error);
         }
-
-        let mut spec = NativeSpawnSpec::new(executable_path, std::env::current_dir()?);
-        // Only the verified memory test artifact exercises an owner that must
-        // outlive its starter. Its test process remains in a kill-on-close Job,
-        // but that Job permits the service's explicit native breakaway. All
-        // other test artifacts retain the ordinary owned Job policy.
-        if needs_independent_service_lifetime(artifact) {
-            spec.lifetime = Lifetime::FixtureBreakawayJob;
-        }
-        spec.args = args.iter().map(OsString::from).collect();
-        spec.environment = std::env::vars_os().collect();
-        spec.stdin = inherited_stdio(StandardStream::Input)?;
-        // The runner relays stdout to the job log and observes libtest progress.
-        spec.stdout = Stdio::Pipe;
-        spec.stderr = inherited_stdio(StandardStream::Error)?;
-        let mut child = spec.spawn().await?;
-        let output = child
-            .take_stdout()
-            .context("Cargo test process has no stdout pipe")?;
-        let mut child = Native(child);
-        supervise(
-            &mut child,
-            output,
-            tokio::io::stdout(),
-            log.clone(),
-            remaining,
-            RUNNER_CLEANUP_TIMEOUT,
-        )
-        .await?
     };
-    #[cfg(unix)]
-    let supervision = {
-        // Handlers are installed before the test group exists.
-        let interrupt = runner_signals()?;
-        // The test inherits this runner's complete environment, including the
-        // LLVM_PROFILE_FILE destination, working directory, stdin and stderr.
-        let mut command = std::process::Command::new(executable_path);
-        command
-            .args(&args)
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
-        supervise_group(
-            command,
-            tokio::io::stdout(),
-            log.clone(),
-            remaining,
-            RUNNER_CLEANUP_TIMEOUT,
-            interrupt,
-        )
-        .await?
-    };
-    let status = match supervision {
-        Supervision::Exited(status) => status,
-        #[cfg(unix)]
-        Supervision::Interrupted(evidence) => {
-            append_runner_record(
-                ledger,
-                &RunnerRecord {
-                    schema: SCHEMA,
-                    executable: executable.clone(),
-                    action: "run".to_owned(),
-                    cwd,
-                    args,
-                    success: false,
-                    status_code: None,
-                },
-            )?;
-            let InterruptEvidence {
-                signal,
-                termination,
-                cleanup,
-                presence_after_reap,
-            } = *evidence;
-            return Err(RunnerInterrupted {
-                signal,
-                detail: format!(
-                    "coverage runner received {} while {executable} was running; termination={termination}; cleanup={cleanup}; presence_after_reap={presence_after_reap:?}",
-                    signal.name()
-                ),
-            }
-            .into());
-        }
-        Supervision::Stalled(evidence) => {
-            append_runner_record(
-                ledger,
-                &RunnerRecord {
-                    schema: SCHEMA,
-                    executable: executable.clone(),
-                    action: "run".to_owned(),
-                    cwd,
-                    args,
-                    success: false,
-                    status_code: None,
-                },
-            )?;
-            let report = stall_report(artifact, &executable, *deadline, evidence, &log)?;
-            let path = diagnostics.join(format!("{}.stall.json", diagnostic_name(&executable)));
-            write_json(&path, &report)?;
+    let chunk_count = chunks.len();
+    let mut last = None;
+    for (index, names) in chunks.into_iter().enumerate() {
+        let Some(remaining) = remaining_until(*deadline)? else {
+            record.action = plan::DEADLINE.to_owned();
+            finish_record(&mut record, ledger, target_dir)?;
             bail!(
-                "coverage shard deadline reached while {executable} was running; unfinished tests: {:?}; latest results: {:?}; evidence: {}",
-                report.unfinished_tests,
-                report.recent_results.last(),
-                path.display()
+                "coverage partition deadline {deadline} passed before chunk {} of {chunk_count} of {executable}",
+                index + 1
+            );
+        };
+        let label = format!("{}.exact-{}", diagnostic_name(&executable), index + 1);
+        let log = diagnostics.join(format!("{label}.stdout.log"));
+        let mut selection = Vec::with_capacity(names.len() + 1);
+        selection.push("--exact".to_owned());
+        selection.extend(names.iter().cloned());
+        let chunk_started = unix_now()?;
+        let supervision = launcher
+            .run(&Launch {
+                executable: &executable_path,
+                artifact,
+                args: &selection,
+                log: log.clone(),
+                remaining,
+            })
+            .await;
+        let supervision = match supervision {
+            Ok(supervision) => supervision,
+            Err(error) => {
+                finish_record(&mut record, ledger, target_dir)?;
+                return Err(error);
+            }
+        };
+        let mut invocation = InvocationRecord {
+            kind: plan::EXACT.to_owned(),
+            names: names.len(),
+            names_sha256: partition::list_sha256(&names),
+            announced: None,
+            started: chunk_started,
+            finished: unix_now()?,
+            status_code: None,
+        };
+        let (status, announced) = match supervision {
+            Supervision::Exited(status, announced) => (status, announced),
+            #[cfg(unix)]
+            Supervision::Interrupted(evidence) => {
+                record.invocations.push(invocation);
+                finish_record(&mut record, ledger, target_dir)?;
+                let InterruptEvidence {
+                    signal,
+                    termination,
+                    cleanup,
+                    presence_after_reap,
+                } = *evidence;
+                return Err(RunnerInterrupted {
+                    signal,
+                    detail: format!(
+                        "coverage runner received {} while {executable} was running; termination={termination}; cleanup={cleanup}; presence_after_reap={presence_after_reap:?}",
+                        signal.name()
+                    ),
+                }
+                .into());
+            }
+            Supervision::Stalled(evidence) => {
+                record.invocations.push(invocation);
+                finish_record(&mut record, ledger, target_dir)?;
+                let report = stall_report(artifact, &executable, *deadline, evidence, &log)?;
+                let path = diagnostics.join(format!("{label}.stall.json"));
+                write_json(&path, &report)?;
+                bail!(
+                    "coverage partition deadline reached while {executable} was running; unfinished tests: {:?}; latest results: {:?}; evidence: {}",
+                    report.unfinished_tests,
+                    report.recent_results.last(),
+                    path.display()
+                );
+            }
+        };
+        invocation.announced = announced;
+        invocation.status_code = status.code();
+        record.invocations.push(invocation);
+        if !status.success() {
+            record.status_code = status.code();
+            finish_record(&mut record, ledger, target_dir)?;
+            return Ok(Some(status));
+        }
+        if announced != Some(names.len()) {
+            finish_record(&mut record, ledger, target_dir)?;
+            bail!(
+                "libtest announced {announced:?} tests for a {}-name selection of {executable}",
+                names.len()
             );
         }
-    };
-    append_runner_record(
-        ledger,
-        &RunnerRecord {
-            schema: SCHEMA,
-            executable,
-            action: "run".to_owned(),
-            cwd,
-            args,
-            success: status.success(),
-            status_code: status.code(),
-        },
-    )?;
-    Ok(Some(status))
+        last = Some(status);
+    }
+    record.success = true;
+    record.status_code = Some(0);
+    finish_record(&mut record, ledger, target_dir)?;
+    Ok(last)
 }
 
 fn stall_report(
@@ -1487,13 +1805,29 @@ impl GroupProcess {
     }
 
     /// Consume the transition, reap the exact root, then confirm absence.
-    async fn settle(&mut self) -> std::io::Result<ExitStatus> {
+    ///
+    /// Settling is bounded by `settle_bound` and never outlives the caller's
+    /// `deadline`: a settle cut short by that deadline reports `TimedOut`, as
+    /// the wait it belongs to would, so the caller's cleanup still applies.
+    async fn settle(&mut self, deadline: tokio::time::Instant) -> std::io::Result<ExitStatus> {
         use kuru_platform::unix::{GroupPresence, Reap, Termination};
 
         let bound = self.settle_bound;
-        let limit = tokio::time::Instant::now() + bound;
+        let own = tokio::time::Instant::now() + bound;
+        let (limit, kind, within) = if deadline < own {
+            (
+                deadline,
+                std::io::ErrorKind::TimedOut,
+                "before the wait deadline",
+            )
+        } else {
+            (own, std::io::ErrorKind::Other, "within the settle bound")
+        };
         let expired = |what: &str| {
-            std::io::Error::other(format!("owned test process group {what} within {bound:?}"))
+            std::io::Error::new(
+                kind,
+                format!("owned test process group {what} {within} ({bound:?})"),
+            )
         };
         loop {
             match self.owner.terminate_before_reap() {
@@ -1610,7 +1944,7 @@ impl TestProcess for GroupProcess {
             match state {
                 // A reaped root still settles: a cancelled wait may have been
                 // dropped between the reap and the absence confirmation.
-                RootState::Exited | RootState::Reaped(_) => return self.settle().await,
+                RootState::Exited | RootState::Reaped(_) => return self.settle(deadline).await,
                 RootState::Running | RootState::Interrupted => {}
                 RootState::Disarmed(reason) => return Err(disarmed(reason)),
             }
@@ -1663,67 +1997,16 @@ fn needs_independent_service_lifetime(artifact: &Artifact) -> bool {
         && artifact.target_kind[0] == "lib"
 }
 
+/// Validate a runner ledger file against its inventory and partition.
 pub fn validate_run_ledger(
     inventory_path: &Path,
-    selection_path: &Path,
+    partition: &PartitionScheme,
+    host: &str,
     ledger: &Path,
-) -> Result<()> {
-    let artifacts = runnable_artifacts(inventory_path, selection_path)?;
-    let selection: Selection = read_json(selection_path)?;
-    ensure!(
-        fs::symlink_metadata(ledger)?.file_type().is_file(),
-        "coverage runner ledger is not a regular file"
-    );
-    ensure!(
-        fs::symlink_metadata(ledger)?.len() <= RUNNER_LEDGER_LIMIT,
-        "coverage runner ledger is too large"
-    );
-    let reader = BufReader::new(File::open(ledger)?);
-    let mut records = BTreeMap::new();
-    for (index, line) in reader.lines().enumerate() {
-        ensure!(
-            index < artifacts.len(),
-            "Cargo runner ledger has extra records"
-        );
-        let record: RunnerRecord = serde_json::from_str(&line?)?;
-        ensure!(record.schema == SCHEMA, "unsupported runner ledger schema");
-        ensure!(
-            record.args.is_empty(),
-            "Cargo supplied unexpected libtest arguments"
-        );
-        ensure!(
-            records.insert(record.executable.clone(), record).is_none(),
-            "Cargo invoked a test executable more than once"
-        );
-    }
-    ensure!(
-        records.len() == artifacts.len(),
-        "Cargo runner ledger omits test executables"
-    );
-    for artifact in artifacts {
-        let executable = artifact.executable.as_deref().unwrap();
-        let record = records
-            .get(executable)
-            .with_context(|| format!("Cargo did not invoke {executable}"))?;
-        let expected = if selection.packages.binary_search(&artifact.package).is_ok() {
-            "run"
-        } else {
-            "omit"
-        };
-        ensure!(
-            record.action == expected,
-            "wrong runner action for {executable}"
-        );
-        ensure!(
-            record.success && record.status_code == Some(0),
-            "Cargo runner did not complete {executable} successfully"
-        );
-        ensure!(
-            record.cwd == artifact.package_root,
-            "wrong Cargo working directory for {executable}"
-        );
-    }
-    Ok(())
+) -> Result<plan::PartitionPlan> {
+    let inventory = read_inventory(inventory_path)?;
+    let records = plan::read_ledger(ledger)?;
+    plan::validate_run_ledger(&inventory, partition, host, &EXCLUDED_ARTIFACTS, &records)
 }
 
 async fn checked_output(root: &Path, program: &OsStr, args: &[&str]) -> Result<String> {
@@ -1742,7 +2025,13 @@ async fn checked_output(root: &Path, program: &OsStr, args: &[&str]) -> Result<S
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
-async fn identity(root: &Path, expected_source: &str, llvm_cov: &Path) -> Result<ReceiptIdentity> {
+/// The exact source and toolchain identity of this runner. `llvm_cov` names
+/// the pinned cargo-llvm-cov executable of an instrumented partition.
+async fn identity(
+    root: &Path,
+    expected_source: &str,
+    llvm_cov: Option<&Path>,
+) -> Result<ReceiptIdentity> {
     let source = checked_output(root, OsStr::new("git"), &["rev-parse", "HEAD"]).await?;
     ensure!(
         source == expected_source,
@@ -1766,12 +2055,18 @@ async fn identity(root: &Path, expected_source: &str, llvm_cov: &Path) -> Result
         .context("rustc identity omits host target")?
         .to_owned();
     let cargo = checked_output(root, OsStr::new("cargo"), &["-vV"]).await?;
-    let cargo_llvm_cov =
-        checked_output(root, llvm_cov.as_os_str(), &["llvm-cov", "--version"]).await?;
-    ensure!(
-        cargo_llvm_cov == LLVM_COV_VERSION,
-        "expected {LLVM_COV_VERSION}, got {cargo_llvm_cov}"
-    );
+    let cargo_llvm_cov = match llvm_cov {
+        Some(llvm_cov) => {
+            let version =
+                checked_output(root, llvm_cov.as_os_str(), &["llvm-cov", "--version"]).await?;
+            ensure!(
+                version == LLVM_COV_VERSION,
+                "expected {LLVM_COV_VERSION}, got {version}"
+            );
+            Some(version)
+        }
+        None => None,
+    };
     let lock = read_bounded(&root.join("Cargo.lock"), JSON_LIMIT)?;
     Ok(ReceiptIdentity {
         source,
@@ -1793,31 +2088,33 @@ struct ReceiptIdentity {
     rustc: String,
     cargo: String,
     target: String,
-    cargo_llvm_cov: String,
+    cargo_llvm_cov: Option<String>,
     target_os: String,
 }
 
-pub async fn verify_source(root: &Path, expected_source: &str, llvm_cov: &Path) -> Result<()> {
+/// Reject a different or modified tracked source before compiling.
+pub async fn verify_source(
+    root: &Path,
+    expected_source: &str,
+    llvm_cov: Option<&Path>,
+) -> Result<()> {
     identity(root, expected_source, llvm_cov).await.map(drop)
 }
 
-fn hash_copy(source: &Path, destination: &Path) -> Result<ProfileReceipt> {
-    let metadata = fs::symlink_metadata(source)?;
+/// Hash one raw profile without following links, within the size bound.
+fn hash_profile(path: &Path) -> Result<(u64, String)> {
+    let metadata = fs::symlink_metadata(path)?;
     ensure!(
         metadata.file_type().is_file(),
         "profile {} is not a regular file",
-        source.display()
+        path.display()
     );
     ensure!(
         metadata.len() <= PROFILE_LIMIT,
         "profile {} is too large",
-        source.display()
+        path.display()
     );
-    let mut input = File::open(source)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
+    let mut input = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
@@ -1832,87 +2129,21 @@ fn hash_copy(source: &Path, destination: &Path) -> Result<ProfileReceipt> {
         ensure!(
             bytes <= PROFILE_LIMIT,
             "profile {} grew too large",
-            source.display()
+            path.display()
         );
         hasher.update(&buffer[..length]);
-        output.write_all(&buffer[..length])?;
     }
-    ensure!(bytes > 0, "profile {} is empty", source.display());
     let sha256 = hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    Ok(ProfileReceipt {
-        name: destination
-            .file_name()
-            .and_then(OsStr::to_str)
-            .context("profile destination lacks a UTF-8 name")?
-            .to_owned(),
-        bytes,
-        sha256,
-    })
+    Ok((bytes, sha256))
 }
 
-fn copy_checked_profile(
-    source: &Path,
-    destination: &Path,
-    expected: &ProfileReceipt,
-) -> Result<()> {
-    let copied = hash_copy(source, destination)?;
-    ensure!(
-        copied.bytes == expected.bytes && copied.sha256 == expected.sha256,
-        "profile {} changed",
-        expected.name
-    );
-    Ok(())
-}
-
-fn verify_profile(source: &Path, expected: &ProfileReceipt) -> Result<()> {
-    let metadata = fs::symlink_metadata(source)?;
-    ensure!(
-        metadata.file_type().is_file(),
-        "profile {} is not a regular file",
-        source.display()
-    );
-    ensure!(
-        metadata.len() == expected.bytes,
-        "profile {} changed",
-        expected.name
-    );
-    let mut input = File::open(source)?;
-    let mut hasher = Sha256::new();
-    let mut bytes = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let length = input.read(&mut buffer)?;
-        if length == 0 {
-            break;
-        }
-        bytes = bytes
-            .checked_add(length as u64)
-            .context("profile size overflow")?;
-        ensure!(
-            bytes <= PROFILE_LIMIT,
-            "profile {} grew too large",
-            source.display()
-        );
-        hasher.update(&buffer[..length]);
-    }
-    let sha256: String = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    ensure!(
-        bytes == expected.bytes && sha256 == expected.sha256,
-        "profile {} changed",
-        expected.name
-    );
-    Ok(())
-}
-
-fn profile_sources(directory: &Path) -> Result<Vec<PathBuf>> {
+/// Bound and summarize the raw profiles in the target root. An instrumented
+/// partition must have written some; an uninstrumented one must have none.
+fn profile_summary(directory: &Path, mode: Mode) -> Result<ProfileSummary> {
     let mut candidates = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -1923,52 +2154,47 @@ fn profile_sources(directory: &Path) -> Result<Vec<PathBuf>> {
     candidates.sort();
     ensure!(
         candidates.len() <= PROFILE_COUNT_LIMIT,
-        "coverage shard produced too many profiles"
+        "coverage partition produced too many profiles"
     );
-    let mut profiles = Vec::new();
+    let mut manifest = String::new();
     let mut total = 0_u64;
-    for path in candidates {
-        let metadata = fs::symlink_metadata(&path)?;
-        ensure!(
-            metadata.file_type().is_file(),
-            "profile {} is not a regular file",
-            path.display()
-        );
-        ensure!(
-            metadata.len() <= PROFILE_LIMIT,
-            "profile {} is too large",
-            path.display()
-        );
+    let mut nonempty = 0;
+    for path in &candidates {
+        let (bytes, sha256) = hash_profile(path)?;
         total = total
-            .checked_add(metadata.len())
+            .checked_add(bytes)
             .context("profile total size overflow")?;
-        if metadata.len() > 0 {
-            profiles.push(path);
+        if bytes > 0 {
+            nonempty += 1;
         }
+        let name = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .context("profile lacks a UTF-8 name")?;
+        manifest.push_str(&format!("{name} {bytes} {sha256}\n"));
     }
     ensure!(
         total <= PROFILE_TOTAL_LIMIT,
-        "coverage shard profiles exceed total size limit"
+        "coverage partition profiles exceed total size limit"
     );
-    ensure!(
-        !profiles.is_empty(),
-        "coverage shard produced no nonempty raw profiles"
-    );
-    Ok(profiles)
-}
-
-fn ensure_no_profiles(directory: &Path) -> Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        ensure!(
-            entry.path().extension() != Some(OsStr::new("profraw")),
-            "aggregate target already contains raw profile {}",
-            entry.path().display()
-        );
+    match mode {
+        Mode::Instrumented => ensure!(
+            nonempty > 0,
+            "coverage partition produced no nonempty raw profiles"
+        ),
+        Mode::Uninstrumented => ensure!(
+            candidates.is_empty(),
+            "an uninstrumented partition produced raw profiles"
+        ),
     }
-    Ok(())
+    Ok(ProfileSummary {
+        count: candidates.len(),
+        bytes: total,
+        manifest_sha256: archive::digest(manifest.as_bytes()),
+    })
 }
 
+/// Remove compile-phase profiles before the partition's tests run.
 pub fn discard_compile_profiles(directory: &Path) -> Result<usize> {
     let entries = fs::read_dir(directory)?
         .map(|entry| entry.map(|entry| entry.path()))
@@ -1989,149 +2215,156 @@ pub fn discard_compile_profiles(directory: &Path) -> Result<usize> {
     Ok(removed)
 }
 
-fn validate_profile_receipts(profiles: &[ProfileReceipt]) -> Result<()> {
-    ensure!(!profiles.is_empty(), "coverage receipt has no raw profiles");
-    ensure!(
-        profiles.len() <= PROFILE_COUNT_LIMIT,
-        "coverage receipt has too many raw profiles"
-    );
-    let mut names = BTreeSet::new();
-    let mut total = 0_u64;
-    for profile in profiles {
-        let path = Path::new(&profile.name);
-        ensure!(
-            path.components().count() == 1
-                && path.extension() == Some(OsStr::new("profraw"))
-                && path.file_stem().is_some_and(|stem| !stem.is_empty()),
-            "invalid raw profile name {}",
-            profile.name
-        );
-        ensure!(
-            names.insert(profile.name.as_str()),
-            "duplicate raw profile name {}",
-            profile.name
-        );
-        ensure!(
-            profile.bytes > 0 && profile.bytes <= PROFILE_LIMIT,
-            "invalid raw profile size for {}",
-            profile.name
-        );
-        total = total
-            .checked_add(profile.bytes)
-            .context("profile receipt total size overflow")?;
-    }
-    ensure!(
-        total <= PROFILE_TOTAL_LIMIT,
-        "coverage receipt profiles exceed total size limit"
-    );
-    Ok(())
-}
-
-fn shard_packages(name: &str) -> Result<Vec<String>> {
-    let (_, packages) = SHARDS
-        .iter()
-        .find(|(shard, _)| *shard == name)
-        .with_context(|| format!("unknown coverage shard {name}"))?;
-    let mut packages: Vec<_> = packages
-        .iter()
-        .map(|package| (*package).to_owned())
-        .collect();
-    packages.sort();
-    Ok(packages)
-}
-
 pub struct ReceiptOptions<'a> {
     pub root: &'a Path,
+    pub mode: Mode,
+    pub partition: &'a PartitionScheme,
     pub inventory: &'a Path,
-    pub selection: &'a Path,
     pub ledger: &'a Path,
+    pub job_ledger: &'a Path,
+    /// The target root holding this partition's raw profiles.
     pub profiles: &'a Path,
-    pub shard: &'a str,
+    /// The normalized LCOV of an instrumented partition.
+    pub lcov: Option<&'a Path>,
     pub run_attempt: &'a str,
     pub expected_source: &'a str,
-    pub llvm_cov: &'a Path,
+    pub llvm_cov: Option<&'a Path>,
+    pub profile_env_sha256: &'a str,
     pub output: &'a Path,
 }
 
+/// Bind the partition's plan, ledgers and coverage to its exact identity and
+/// write the uploaded `attempt-<n>` evidence directory.
 pub async fn write_receipt(options: &ReceiptOptions<'_>) -> Result<()> {
     let ReceiptOptions {
         root,
-        inventory: inventory_path,
-        selection: selection_path,
-        ledger,
-        profiles,
-        shard,
         run_attempt,
         expected_source,
         llvm_cov,
+        ..
+    } = options;
+    canonical_attempt(run_attempt)
+        .context("coverage run attempt must be a positive integer without leading zeros")?;
+    let observed = identity(root, expected_source, *llvm_cov).await?;
+    write_evidence(options, observed)
+}
+
+/// Write the evidence of [`write_receipt`] for an observed identity.
+fn write_evidence(options: &ReceiptOptions<'_>, observed: ReceiptIdentity) -> Result<()> {
+    let ReceiptOptions {
+        mode,
+        partition,
+        inventory: inventory_path,
+        ledger,
+        job_ledger,
+        profiles,
+        lcov,
+        run_attempt,
+        profile_env_sha256,
         output,
+        ..
     } = options;
     let attempt = canonical_attempt(run_attempt)
         .context("coverage run attempt must be a positive integer without leading zeros")?;
-    let inventory: Inventory = read_json(inventory_path)?;
-    let selection: Selection = read_json(selection_path)?;
+    partition.validate()?;
+    let inventory = read_inventory(inventory_path)?;
+    if *mode == Mode::Instrumented {
+        ensure!(
+            inventory.scope == inventory.workspace_packages,
+            "an instrumented partition must build the whole workspace"
+        );
+    }
     ensure!(
-        inventory.schema == SCHEMA && selection.schema == SCHEMA,
-        "unsupported coverage schema"
+        observed.cargo_llvm_cov.is_some() == (*mode == Mode::Instrumented),
+        "coverage tool identity does not match the {} mode",
+        mode.name()
     );
-    let packages = shard_packages(shard)?;
-    ensure!(
-        selection.packages == packages,
-        "selection packages do not match shard {shard}"
-    );
-    let inventory_sha256 = digest_json(&inventory)?;
-    ensure!(
-        selection.inventory_sha256 == inventory_sha256,
-        "selection names another inventory"
-    );
-    validate_selection(&inventory, &selection.artifacts, &packages)?;
-    validate_run_ledger(inventory_path, selection_path, ledger)?;
+    let records = plan::read_ledger(ledger)?;
+    let plan = plan::validate_run_ledger(
+        &inventory,
+        partition,
+        &observed.target,
+        &EXCLUDED_ARTIFACTS,
+        &records,
+    )?;
     let runner_ledger = read_bounded(ledger, RUNNER_LEDGER_LIMIT)?;
-    let observed = identity(root, expected_source, llvm_cov).await?;
+    let job_ledger_bytes = read_bounded(job_ledger, JSON_LIMIT)?;
+    ledger::JobLedger::parse(&job_ledger_bytes).context("job ledger")?;
+    let profile_summary = profile_summary(profiles, *mode)?;
+    let lcov_bytes = match (mode, lcov) {
+        (Mode::Instrumented, Some(path)) => Some(read_bounded(path, lcov::LCOV_LIMIT)?),
+        (Mode::Uninstrumented, None) => None,
+        _ => bail!("an LCOV report is required exactly for an instrumented partition"),
+    };
+    let lcov_receipt = match &lcov_bytes {
+        Some(bytes) => {
+            let parsed = lcov::Lcov::parse(
+                std::str::from_utf8(bytes).context("partition LCOV is not UTF-8")?,
+            )?;
+            parsed.require_relative()?;
+            let totals = parsed.totals();
+            Some(LcovReceipt {
+                bytes: bytes.len() as u64,
+                sha256: archive::digest(bytes),
+                files: totals.files,
+                lines_found: totals.lines_found,
+                lines_hit: totals.lines_hit,
+            })
+        }
+        None => None,
+    };
+    let receipt = Receipt {
+        schema: SCHEMA,
+        partition: (*partition).clone(),
+        run_attempt: (*run_attempt).to_owned(),
+        mode: *mode,
+        scope: inventory.scope.clone(),
+        source: observed.source,
+        tree: observed.tree,
+        cargo_lock_sha256: observed.cargo_lock_sha256,
+        rustc: observed.rustc,
+        cargo: observed.cargo,
+        target: observed.target,
+        cargo_llvm_cov: observed.cargo_llvm_cov,
+        instrumentation: mode.contract().to_owned(),
+        target_os: observed.target_os,
+        profile_env_sha256: (*profile_env_sha256).to_owned(),
+        inventory_sha256: digest_json(&inventory)?,
+        plan_sha256: digest_json(&plan)?,
+        tests_sha256: plan::tests_sha256(&plan)?,
+        runner_ledger_sha256: archive::digest(&runner_ledger),
+        job_ledger_sha256: archive::digest(&job_ledger_bytes),
+        profiles: profile_summary,
+        lcov: lcov_receipt,
+    };
     // The uploaded artifact root holds one `attempt-<n>` directory, so the
     // evidence names its attempt whether download-artifact extracts it into
     // the destination itself or into a directory named after the artifact.
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
     fs::create_dir(output).with_context(|| format!("create {}", output.display()))?;
     let output = &output.join(attempt_directory(attempt));
     fs::create_dir(output).with_context(|| format!("create {}", output.display()))?;
-    let profile_output = output.join("profiles");
-    fs::create_dir(&profile_output)?;
-    let mut copied = Vec::new();
-    for (index, source) in profile_sources(profiles)?.iter().enumerate() {
-        copied.push(hash_copy(
-            source,
-            &profile_output.join(format!("{index:04}.profraw")),
-        )?);
+    write_json(&output.join(INVENTORY_FILE), &inventory)?;
+    write_json(&output.join(PLAN_FILE), &plan)?;
+    write_new(&output.join(RUNNER_LEDGER_FILE), &runner_ledger)?;
+    write_new(&output.join(JOB_LEDGER_FILE), &job_ledger_bytes)?;
+    if let Some(bytes) = &lcov_bytes {
+        write_new(&output.join(LCOV_FILE), bytes)?;
     }
-    write_json(&output.join("inventory.json"), &inventory)?;
-    write_json(&output.join("selection.json"), &selection)?;
-    let mut ledger_output = OpenOptions::new()
+    write_json(&output.join(RECEIPT_FILE), &receipt)
+}
+
+fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(output.join("runner-ledger.jsonl"))?;
-    ledger_output.write_all(&runner_ledger)?;
-    write_json(
-        &output.join("receipt.json"),
-        &Receipt {
-            schema: SCHEMA,
-            shard: (*shard).to_owned(),
-            run_attempt: (*run_attempt).to_owned(),
-            packages,
-            source: observed.source,
-            tree: observed.tree,
-            cargo_lock_sha256: observed.cargo_lock_sha256,
-            rustc: observed.rustc,
-            cargo: observed.cargo,
-            target: observed.target,
-            cargo_llvm_cov: observed.cargo_llvm_cov,
-            instrumentation: INSTRUMENTATION.to_owned(),
-            target_os: observed.target_os,
-            inventory_sha256,
-            selection_sha256: digest_json(&selection)?,
-            runner_ledger_sha256: archive::digest(&runner_ledger),
-            profiles: copied,
-        },
-    )
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn exact_entries(directory: &Path, expected: &[&str]) -> Result<()> {
@@ -2164,355 +2397,6 @@ const ATTEMPT_DIRECTORY: &str = "attempt-";
 
 fn attempt_directory(attempt: u64) -> String {
     format!("{ATTEMPT_DIRECTORY}{attempt}")
-}
-
-/// Sorted names and paths of a directory's entries, which must all be directories.
-fn directory_names(directory: &Path, shard: &str) -> Result<Vec<(String, PathBuf)>> {
-    let mut entries = fs::read_dir(directory)?
-        .map(|entry| {
-            let entry = entry?;
-            let name = entry.file_name().into_string().map_err(|_| {
-                anyhow::anyhow!("coverage shard {shard} artifact has a non-UTF-8 name")
-            })?;
-            ensure!(
-                fs::symlink_metadata(entry.path())?.file_type().is_dir(),
-                "coverage shard {shard} entry {name} is not a directory"
-            );
-            Ok((name, entry.path()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    entries.sort();
-    Ok(entries)
-}
-
-/// Parse the self-describing `attempt-<n>` evidence directory name.
-fn evidence_attempt(shard: &str, name: &str) -> Result<u64> {
-    name.strip_prefix(ATTEMPT_DIRECTORY)
-        .and_then(canonical_attempt)
-        .with_context(|| {
-            format!("coverage shard {shard} evidence {name} is not a canonical attempt directory")
-        })
-}
-
-/// Choose one shard's highest uploaded attempt.
-///
-/// Each uploaded artifact holds exactly one `attempt-<n>` directory. The pinned
-/// download-artifact extracts a pattern download that matches one artifact
-/// directly into the shard directory (`<shard>/attempt-<n>`), and one that
-/// matches several into a directory per artifact name
-/// (`<shard>/<name>/attempt-<n>`, where the name must carry the same attempt).
-/// A mixture of the two layouts is refused. Failed shards upload no receipt
-/// artifact, so this is the latest successful attempt; the workflow refuses
-/// collection unless every shard job succeeded. The selected attempt is then
-/// validated exactly and an invalid one is never replaced by an older attempt.
-fn latest_shard_attempt(
-    inputs: &Path,
-    artifact_os: &str,
-    shard: &str,
-    max_attempt: u64,
-) -> Result<(u64, PathBuf)> {
-    let directory = inputs.join(shard);
-    let metadata = fs::symlink_metadata(&directory)
-        .with_context(|| format!("coverage shard {shard} has no downloaded artifacts"))?;
-    ensure!(
-        metadata.file_type().is_dir(),
-        "coverage shard {shard} input is not a directory"
-    );
-    let entries = directory_names(&directory, shard)?;
-    let flat = entries
-        .iter()
-        .filter(|(name, _)| name.starts_with(ATTEMPT_DIRECTORY))
-        .count();
-    let mut attempts = BTreeMap::new();
-    if flat > 0 {
-        ensure!(
-            flat == entries.len(),
-            "coverage shard {shard} mixes single- and multi-artifact download layouts"
-        );
-        ensure!(
-            entries.len() == 1,
-            "coverage shard {shard} has several attempts outside artifact directories"
-        );
-        let (name, path) = &entries[0];
-        attempts.insert(evidence_attempt(shard, name)?, path.clone());
-    } else {
-        // Only this OS's artifacts belong here; another OS's label is refused.
-        let marker = format!("-coverage-{artifact_os}-{shard}-attempt-");
-        let mut prefix = None;
-        for (name, path) in entries {
-            let (artifact_prefix, attempt) = name
-                .rsplit_once(&marker)
-                .filter(|(artifact_prefix, _)| !artifact_prefix.is_empty())
-                .with_context(|| format!("unexpected coverage shard {shard} artifact {name}"))?;
-            let attempt = canonical_attempt(attempt).with_context(|| {
-                format!("coverage shard {shard} artifact {name} has a non-canonical attempt")
-            })?;
-            ensure!(
-                *prefix.get_or_insert_with(|| artifact_prefix.to_owned()) == artifact_prefix,
-                "coverage shard {shard} artifacts use different prefixes"
-            );
-            let inner = directory_names(&path, shard)?;
-            ensure!(
-                inner.len() == 1,
-                "coverage shard {shard} artifact {name} must hold one attempt directory"
-            );
-            let (inner_name, inner_path) = inner.into_iter().next().expect("one entry");
-            ensure!(
-                evidence_attempt(shard, &inner_name)? == attempt,
-                "coverage shard {shard} artifact {name} holds {inner_name}"
-            );
-            ensure!(
-                attempts.insert(attempt, inner_path).is_none(),
-                "coverage shard {shard} has duplicate attempt {attempt}"
-            );
-        }
-    }
-    if let Some((&attempt, _)) = attempts.last_key_value() {
-        ensure!(
-            attempt <= max_attempt,
-            "coverage shard {shard} attempt {attempt} is newer than run attempt {max_attempt}"
-        );
-    }
-    attempts
-        .pop_last()
-        .with_context(|| format!("coverage shard {shard} has no downloaded artifacts"))
-}
-
-pub struct CollectOptions<'a> {
-    pub root: &'a Path,
-    pub inventory: &'a Path,
-    pub inputs: &'a Path,
-    pub target_dir: &'a Path,
-    pub expected_source: &'a str,
-    /// The current workflow run attempt; no shard may claim a later one.
-    pub max_attempt: &'a str,
-    /// The hosted OS label every accepted artifact name must carry.
-    pub artifact_os: &'a str,
-    pub llvm_cov: &'a Path,
-}
-
-/// Verify each shard's latest uploaded (successful) attempt and copy its
-/// profiles. Returns the accepted attempt for every shard.
-pub async fn collect_profiles(options: &CollectOptions<'_>) -> Result<Vec<(String, u64)>> {
-    let CollectOptions {
-        root,
-        inventory: inventory_path,
-        inputs,
-        target_dir,
-        expected_source,
-        max_attempt,
-        artifact_os,
-        llvm_cov,
-    } = options;
-    let artifact_os = artifact_os_label(artifact_os)?;
-    let max_attempt = canonical_attempt(max_attempt)
-        .context("coverage run attempt must be a positive integer")?;
-    let inventory: Inventory = read_json(inventory_path)?;
-    ensure!(inventory.schema == SCHEMA, "unsupported inventory schema");
-    let inventory_sha256 = digest_json(&inventory)?;
-    let observed = identity(root, expected_source, llvm_cov).await?;
-    collect_profiles_with_identity(
-        &inventory,
-        &inventory_sha256,
-        inputs,
-        target_dir,
-        max_attempt,
-        artifact_os,
-        &observed,
-    )
-}
-
-fn collect_profiles_with_identity(
-    inventory: &Inventory,
-    inventory_sha256: &str,
-    inputs: &Path,
-    target_dir: &Path,
-    max_attempt: u64,
-    artifact_os: &str,
-    observed: &ReceiptIdentity,
-) -> Result<Vec<(String, u64)>> {
-    let artifact_os = artifact_os_label(artifact_os)?;
-    ensure!(
-        fs::symlink_metadata(inputs)?.file_type().is_dir(),
-        "coverage inputs path is not a directory"
-    );
-    ensure!(
-        fs::symlink_metadata(target_dir)?.file_type().is_dir(),
-        "aggregate target is not a directory"
-    );
-    let shard_names: Vec<_> = SHARDS.iter().map(|(name, _)| *name).collect();
-    exact_entries(inputs, &shard_names)?;
-    let mut selected = Vec::new();
-    for shard in shard_names {
-        let (attempt, directory) = latest_shard_attempt(inputs, artifact_os, shard, max_attempt)?;
-        selected.push((shard.to_owned(), attempt, directory));
-    }
-    ensure_no_profiles(target_dir)?;
-
-    let mut seen = BTreeSet::new();
-    let mut assigned = BTreeSet::new();
-    let mut accepted = Vec::new();
-    let mut aggregate_count = 0_usize;
-    let mut aggregate_bytes = 0_u64;
-    for (shard, attempt, directory) in &selected {
-        ensure!(
-            fs::symlink_metadata(directory)?.file_type().is_dir(),
-            "shard artifact is not a directory"
-        );
-        exact_entries(
-            directory,
-            &[
-                "inventory.json",
-                "profiles",
-                "receipt.json",
-                "runner-ledger.jsonl",
-                "selection.json",
-            ],
-        )?;
-        let receipt: Receipt = read_json(&directory.join("receipt.json"))?;
-        ensure!(receipt.schema == SCHEMA, "unsupported receipt schema");
-        ensure!(
-            receipt.shard == *shard,
-            "artifact for shard {shard} carries a receipt for {}",
-            receipt.shard
-        );
-        ensure!(
-            receipt.run_attempt == attempt.to_string(),
-            "shard {shard} receipt attempt differs from its artifact attempt {attempt}"
-        );
-        ensure!(
-            seen.insert(receipt.shard.clone()),
-            "duplicate shard {}",
-            receipt.shard
-        );
-        let packages = shard_packages(&receipt.shard)?;
-        ensure!(
-            receipt.packages == packages,
-            "wrong packages for shard {}",
-            receipt.shard
-        );
-        for package in &receipt.packages {
-            ensure!(
-                assigned.insert(package.clone()),
-                "package {package} is assigned twice"
-            );
-        }
-        ensure!(receipt.source == observed.source, "shard source differs");
-        ensure!(receipt.tree == observed.tree, "shard tree differs");
-        ensure!(
-            receipt.cargo_lock_sha256 == observed.cargo_lock_sha256,
-            "shard Cargo.lock differs"
-        );
-        ensure!(
-            receipt.rustc == observed.rustc,
-            "shard Rust toolchain differs"
-        );
-        ensure!(
-            receipt.cargo == observed.cargo,
-            "shard Cargo toolchain differs"
-        );
-        ensure!(receipt.target == observed.target, "shard target differs");
-        ensure!(
-            receipt.cargo_llvm_cov == observed.cargo_llvm_cov,
-            "shard cargo-llvm-cov differs"
-        );
-        ensure!(
-            receipt.instrumentation == INSTRUMENTATION,
-            "shard instrumentation contract differs"
-        );
-        ensure!(
-            receipt.target_os == observed.target_os,
-            "shard operating system differs"
-        );
-        ensure!(
-            receipt.inventory_sha256 == inventory_sha256,
-            "shard inventory differs"
-        );
-        let uploaded_inventory: Inventory = read_json(&directory.join("inventory.json"))?;
-        ensure!(
-            uploaded_inventory == *inventory,
-            "uploaded shard inventory differs"
-        );
-        let selection: Selection = read_json(&directory.join("selection.json"))?;
-        ensure!(selection.schema == SCHEMA, "unsupported selection schema");
-        ensure!(
-            selection.packages == receipt.packages,
-            "uploaded selection packages differ"
-        );
-        ensure!(
-            digest_json(&selection)? == receipt.selection_sha256,
-            "uploaded selection differs"
-        );
-        ensure!(
-            selection.inventory_sha256 == inventory_sha256,
-            "uploaded selection names another inventory"
-        );
-        validate_selection(inventory, &selection.artifacts, &receipt.packages)?;
-        let runner_ledger =
-            read_bounded(&directory.join("runner-ledger.jsonl"), RUNNER_LEDGER_LIMIT)?;
-        ensure!(
-            archive::digest(&runner_ledger) == receipt.runner_ledger_sha256,
-            "uploaded runner ledger differs"
-        );
-        validate_run_ledger(
-            &directory.join("inventory.json"),
-            &directory.join("selection.json"),
-            &directory.join("runner-ledger.jsonl"),
-        )?;
-
-        let profile_dir = directory.join("profiles");
-        ensure!(
-            fs::symlink_metadata(&profile_dir)?.file_type().is_dir(),
-            "shard profiles path is not a directory"
-        );
-        validate_profile_receipts(&receipt.profiles)?;
-        aggregate_count = aggregate_count
-            .checked_add(receipt.profiles.len())
-            .context("aggregate profile count overflow")?;
-        ensure!(
-            aggregate_count <= PROFILE_COUNT_LIMIT,
-            "aggregate contains too many raw profiles"
-        );
-        aggregate_bytes = receipt
-            .profiles
-            .iter()
-            .try_fold(aggregate_bytes, |total, profile| {
-                total
-                    .checked_add(profile.bytes)
-                    .context("aggregate profile size overflow")
-            })?;
-        ensure!(
-            aggregate_bytes <= PROFILE_TOTAL_LIMIT,
-            "aggregate raw profiles exceed total size limit"
-        );
-        let expected_names: Vec<_> = receipt
-            .profiles
-            .iter()
-            .map(|profile| profile.name.as_str())
-            .collect();
-        exact_entries(&profile_dir, &expected_names)?;
-        for profile in &receipt.profiles {
-            verify_profile(&profile_dir.join(&profile.name), profile)?;
-        }
-        accepted.push((profile_dir, receipt));
-    }
-    let expected_shards: BTreeSet<_> = SHARDS.iter().map(|(name, _)| (*name).to_owned()).collect();
-    ensure!(seen == expected_shards, "coverage shard set differs");
-    let expected_packages: BTreeSet<_> = inventory.workspace_packages.iter().cloned().collect();
-    ensure!(
-        assigned == expected_packages,
-        "coverage package assignment differs from workspace"
-    );
-    for (profile_dir, receipt) in accepted {
-        for profile in &receipt.profiles {
-            let destination = target_dir.join(format!("{}-{}", receipt.shard, profile.name));
-            copy_checked_profile(&profile_dir.join(&profile.name), &destination, profile)?;
-        }
-    }
-    Ok(selected
-        .into_iter()
-        .map(|(shard, attempt, _)| (shard, attempt))
-        .collect())
 }
 
 #[cfg(test)]
@@ -2591,22 +2475,6 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
-    /// The hosted OS label the aggregate fixture's artifacts carry.
-    const FIXTURE_OS: &str = "windows-latest";
-
-    fn receipt_identity() -> ReceiptIdentity {
-        ReceiptIdentity {
-            source: "source".to_owned(),
-            tree: "tree".to_owned(),
-            cargo_lock_sha256: "lock".to_owned(),
-            rustc: "rustc".to_owned(),
-            cargo: "cargo".to_owned(),
-            target: "target".to_owned(),
-            cargo_llvm_cov: LLVM_COV_VERSION.to_owned(),
-            target_os: "windows".to_owned(),
-        }
-    }
-
     fn receipt_artifact(package: &str) -> Artifact {
         Artifact {
             package: package.to_owned(),
@@ -2643,562 +2511,90 @@ mod tests {
         assert!(!needs_independent_service_lifetime(&runtime));
     }
 
-    struct AggregateFixture {
-        _temp: TempDir,
-        inputs: PathBuf,
-        target: PathBuf,
-        inventory: Inventory,
-        inventory_sha256: String,
-        identity: ReceiptIdentity,
-    }
-
-    impl AggregateFixture {
-        fn new() -> Self {
-            let temp = TempDir::new().unwrap();
-            let inputs = temp.path().join("inputs");
-            let target = temp.path().join("target");
-            fs::create_dir(&inputs).unwrap();
-            fs::create_dir(&target).unwrap();
-            let mut workspace_packages: Vec<_> = SHARDS
-                .iter()
-                .flat_map(|(_, packages)| packages.iter().copied())
-                .map(str::to_owned)
-                .collect();
-            workspace_packages.sort();
-            let inventory = Inventory {
-                schema: SCHEMA,
-                artifacts: workspace_packages
-                    .iter()
-                    .map(|package| receipt_artifact(package))
-                    .collect(),
-                workspace_packages,
-            };
-            let inventory_sha256 = digest_json(&inventory).unwrap();
-            let identity = receipt_identity();
-            let fixture = Self {
-                _temp: temp,
-                inputs,
-                target,
-                inventory,
-                inventory_sha256,
-                identity,
-            };
-            for (shard, _) in SHARDS {
-                fixture.upload(shard, 2);
-            }
-            fixture
-        }
-
-        fn artifact(&self, shard: &str, attempt: u64) -> PathBuf {
-            self.inputs.join(shard).join(format!(
-                "ci-coverage-{FIXTURE_OS}-{shard}-attempt-{attempt}"
-            ))
-        }
-
-        /// The shard's evidence for one attempt in whichever layout it has.
-        fn evidence(&self, shard: &str, attempt: u64) -> PathBuf {
-            let flat = self.inputs.join(shard).join(attempt_directory(attempt));
-            if flat.exists() {
-                flat
-            } else {
-                self.artifact(shard, attempt)
-                    .join(attempt_directory(attempt))
-            }
-        }
-
-        /// Lay out a shard's artifacts as the pinned download-artifact does for
-        /// a pattern download: one matching artifact is extracted directly into
-        /// `<inputs>/<shard>/`, several into `<inputs>/<shard>/<artifact name>/`.
-        /// Each artifact's own root holds its `attempt-<n>` directory.
-        fn download_layout(&self, shard: &str) {
-            let directory = self.inputs.join(shard);
-            let names: Vec<_> = fs::read_dir(&directory)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-                .collect();
-            let mut attempts = Vec::new();
-            for name in names {
-                if let Some(attempt) = name.strip_prefix(ATTEMPT_DIRECTORY) {
-                    let attempt: u64 = attempt.parse().unwrap();
-                    let artifact = self.artifact(shard, attempt);
-                    fs::create_dir(&artifact).unwrap();
-                    fs::rename(directory.join(&name), artifact.join(&name)).unwrap();
-                    attempts.push(attempt);
-                } else {
-                    let (_, attempt) = name.rsplit_once("-attempt-").unwrap();
-                    attempts.push(attempt.parse().unwrap());
-                }
-            }
-            if let [attempt] = attempts[..] {
-                let artifact = self.artifact(shard, attempt);
-                let name = attempt_directory(attempt);
-                fs::rename(artifact.join(&name), directory.join(&name)).unwrap();
-                fs::remove_dir(artifact).unwrap();
-            }
-        }
-
-        /// Write one checked shard artifact and lay the shard out as a pattern
-        /// download would; returns the attempt's evidence directory.
-        fn upload(&self, shard: &str, attempt: u64) -> PathBuf {
-            let Self {
-                inventory,
-                inventory_sha256,
-                identity,
-                ..
-            } = self;
-            let directory = self
-                .artifact(shard, attempt)
-                .join(attempt_directory(attempt));
-            {
-                let profiles = directory.join("profiles");
-                fs::create_dir_all(&profiles).unwrap();
-                let packages = shard_packages(shard).unwrap();
-                let selection = Selection {
-                    schema: SCHEMA,
-                    inventory_sha256: inventory_sha256.clone(),
-                    artifacts: inventory
-                        .artifacts
-                        .iter()
-                        .filter(|artifact| packages.binary_search(&artifact.package).is_ok())
-                        .cloned()
-                        .collect(),
-                    packages: packages.clone(),
-                };
-                let bytes = format!("profile-{shard}").into_bytes();
-                let profile = ProfileReceipt {
-                    name: "0000.profraw".to_owned(),
-                    bytes: bytes.len() as u64,
-                    sha256: archive::digest(&bytes),
-                };
-                fs::write(profiles.join(&profile.name), bytes).unwrap();
-                let mut runner_ledger = Vec::new();
-                for artifact in inventory
-                    .artifacts
-                    .iter()
-                    .filter(|artifact| is_runnable(artifact))
-                {
-                    serde_json::to_writer(
-                        &mut runner_ledger,
-                        &RunnerRecord {
-                            schema: SCHEMA,
-                            executable: artifact.executable.clone().unwrap(),
-                            action: if packages.binary_search(&artifact.package).is_ok() {
-                                "run"
-                            } else {
-                                "omit"
-                            }
-                            .to_owned(),
-                            cwd: artifact.package_root.clone(),
-                            args: Vec::new(),
-                            success: true,
-                            status_code: Some(0),
-                        },
-                    )
-                    .unwrap();
-                    runner_ledger.push(b'\n');
-                }
-                fs::write(directory.join("runner-ledger.jsonl"), &runner_ledger).unwrap();
-                write(&directory.join("inventory.json"), &inventory);
-                write(&directory.join("selection.json"), &selection);
-                write(
-                    &directory.join("receipt.json"),
-                    &Receipt {
-                        schema: SCHEMA,
-                        shard: shard.to_owned(),
-                        run_attempt: attempt.to_string(),
-                        packages,
-                        source: identity.source.clone(),
-                        tree: identity.tree.clone(),
-                        cargo_lock_sha256: identity.cargo_lock_sha256.clone(),
-                        rustc: identity.rustc.clone(),
-                        cargo: identity.cargo.clone(),
-                        target: identity.target.clone(),
-                        cargo_llvm_cov: identity.cargo_llvm_cov.clone(),
-                        instrumentation: INSTRUMENTATION.to_owned(),
-                        target_os: identity.target_os.clone(),
-                        inventory_sha256: inventory_sha256.clone(),
-                        selection_sha256: digest_json(&selection).unwrap(),
-                        runner_ledger_sha256: archive::digest(&runner_ledger),
-                        profiles: vec![profile],
-                    },
-                );
-            }
-            self.download_layout(shard);
-            self.evidence(shard, attempt)
-        }
-
-        fn remove(&self, shard: &str) {
-            fs::remove_dir_all(self.inputs.join(shard)).unwrap();
-        }
-
-        fn shard(&self, name: &str) -> PathBuf {
-            self.evidence(name, 2)
-        }
-
-        fn collect(&self) -> Result<Vec<(String, u64)>> {
-            self.collect_through(2)
-        }
-
-        fn collect_through(&self, max_attempt: u64) -> Result<Vec<(String, u64)>> {
-            collect_profiles_with_identity(
-                &self.inventory,
-                &self.inventory_sha256,
-                &self.inputs,
-                &self.target,
-                max_attempt,
-                FIXTURE_OS,
-                &self.identity,
-            )
-        }
-
-        fn profile_count(&self) -> usize {
-            fs::read_dir(&self.target).unwrap().count()
-        }
-    }
-
     #[test]
-    fn aggregate_requires_exact_shards_receipts_and_unchanged_profiles() {
-        let complete = AggregateFixture::new();
-        complete.collect().unwrap();
-        assert_eq!(
-            fs::read_dir(&complete.target).unwrap().count(),
-            SHARDS.len()
-        );
-
-        let missing = AggregateFixture::new();
-        fs::remove_dir_all(missing.shard("application")).unwrap();
-        let error = missing.collect().unwrap_err().to_string();
-        assert!(error.contains("has no downloaded artifacts"), "{error}");
-        assert_eq!(fs::read_dir(&missing.target).unwrap().count(), 0);
-
-        let duplicate = AggregateFixture::new();
-        let receipt_path = duplicate.shard("memory").join("receipt.json");
-        let mut receipt: Receipt = read_json(&receipt_path).unwrap();
-        receipt.shard = "application".to_owned();
-        write(&receipt_path, &receipt);
-        assert!(duplicate.collect().is_err());
-        assert_eq!(fs::read_dir(&duplicate.target).unwrap().count(), 0);
-
-        let wrong_package = AggregateFixture::new();
-        let receipt_path = wrong_package.shard("delivery-archive").join("receipt.json");
-        let mut receipt: Receipt = read_json(&receipt_path).unwrap();
-        receipt.packages.pop();
-        write(&receipt_path, &receipt);
-        assert!(wrong_package.collect().is_err());
-        assert_eq!(fs::read_dir(&wrong_package.target).unwrap().count(), 0);
-
-        let changed_inventory = AggregateFixture::new();
-        let inventory_path = changed_inventory
-            .shard("connectors-core-platform")
-            .join("inventory.json");
-        let mut inventory: Inventory = read_json(&inventory_path).unwrap();
-        inventory.artifacts.pop();
-        write(&inventory_path, &inventory);
-        assert!(changed_inventory.collect().is_err());
-        assert_eq!(fs::read_dir(&changed_inventory.target).unwrap().count(), 0);
-
-        let changed_feature = AggregateFixture::new();
-        let inventory_path = changed_feature
-            .shard("connectors-core-platform")
-            .join("inventory.json");
-        let mut inventory: Inventory = read_json(&inventory_path).unwrap();
-        inventory.artifacts[0].features.push("changed".to_owned());
-        write(&inventory_path, &inventory);
-        assert!(changed_feature.collect().is_err());
-        assert_eq!(fs::read_dir(&changed_feature.target).unwrap().count(), 0);
-
-        let changed_selection = AggregateFixture::new();
-        let directory = changed_selection.shard("delivery-archive");
-        let selection_path = directory.join("selection.json");
-        let mut selection: Selection = read_json(&selection_path).unwrap();
-        selection.artifacts.pop();
-        write(&selection_path, &selection);
-        let receipt_path = directory.join("receipt.json");
-        let mut receipt: Receipt = read_json(&receipt_path).unwrap();
-        receipt.selection_sha256 = digest_json(&selection).unwrap();
-        write(&receipt_path, &receipt);
-        assert!(changed_selection.collect().is_err());
-        assert_eq!(fs::read_dir(&changed_selection.target).unwrap().count(), 0);
-
-        for field in ["source", "tool", "attempt"] {
-            let changed_identity = AggregateFixture::new();
-            let receipt_path = changed_identity.shard("application").join("receipt.json");
-            let mut receipt: Receipt = read_json(&receipt_path).unwrap();
-            match field {
-                "source" => receipt.source.push_str("-changed"),
-                "tool" => receipt.cargo_llvm_cov.push_str("-changed"),
-                "attempt" => receipt.run_attempt = "3".to_owned(),
-                _ => unreachable!(),
-            }
-            write(&receipt_path, &receipt);
-            assert!(
-                changed_identity.collect().is_err(),
-                "accepted changed {field}"
-            );
-            assert_eq!(fs::read_dir(&changed_identity.target).unwrap().count(), 0);
-        }
-
-        for mutation in ["missing", "empty", "changed"] {
-            let changed_profile = AggregateFixture::new();
-            let profile = changed_profile
-                .shard("memory")
-                .join("profiles/0000.profraw");
-            match mutation {
-                "missing" => fs::remove_file(profile).unwrap(),
-                "empty" => fs::write(profile, []).unwrap(),
-                "changed" => fs::write(profile, b"different bytes").unwrap(),
-                _ => unreachable!(),
-            }
-            assert!(
-                changed_profile.collect().is_err(),
-                "accepted {mutation} profile"
-            );
-            assert_eq!(fs::read_dir(&changed_profile.target).unwrap().count(), 0);
-        }
-    }
-
-    #[test]
-    fn aggregate_takes_each_shards_latest_attempt_and_fails_closed() {
-        // A partial rerun uploads only the rerun shard under the new attempt.
-        let rerun = AggregateFixture::new();
-        rerun.upload("application", 3);
-        let selected = rerun.collect_through(3).unwrap();
-        let expected: Vec<_> = SHARDS
+    fn tables_cover_the_workspace_and_hosted_labels() {
+        let unique = workspace_packages();
+        assert_eq!(unique.len(), WORKSPACE_PACKAGES.len(), "a package repeats");
+        assert!(WORKSPACE_PACKAGES.is_sorted());
+        // The root workspace's members are exactly the table's packages.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest: toml::Value =
+            toml::from_str(&fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+        let mut members: Vec<String> = manifest["workspace"]["members"]
+            .as_array()
+            .unwrap()
             .iter()
-            .map(|(shard, _)| {
-                (
-                    (*shard).to_owned(),
-                    if *shard == "application" { 3 } else { 2 },
-                )
+            .map(|member| {
+                let path = root.join(member.as_str().unwrap()).join("Cargo.toml");
+                let package: toml::Value =
+                    toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+                package["package"]["name"].as_str().unwrap().to_owned()
             })
             .collect();
-        assert_eq!(selected, expected);
-        assert_eq!(rerun.profile_count(), SHARDS.len());
+        members.sort();
+        assert_eq!(members, WORKSPACE_PACKAGES);
 
-        // A stale lower attempt is ignored once a later one exists.
-        let stale = AggregateFixture::new();
-        let old = stale.upload("memory", 1);
-        fs::write(old.join("receipt.json"), b"not a receipt").unwrap();
-        assert!(stale.collect().unwrap().contains(&("memory".to_owned(), 2)));
-
-        // An invalid latest attempt never falls back to an older valid one.
-        for mutation in ["profile", "source", "tree", "shard", "attempt"] {
-            let invalid = AggregateFixture::new();
-            let latest = invalid.upload("memory", 3);
-            let receipt_path = latest.join("receipt.json");
-            let mut receipt: Receipt = read_json(&receipt_path).unwrap();
-            match mutation {
-                "profile" => fs::write(latest.join("profiles/0000.profraw"), b"other").unwrap(),
-                "source" => receipt.source = "other-commit".to_owned(),
-                "tree" => receipt.tree = "other-tree".to_owned(),
-                "shard" => receipt.shard = "application".to_owned(),
-                "attempt" => receipt.run_attempt = "2".to_owned(),
-                _ => unreachable!(),
-            }
-            if mutation != "profile" {
-                fs::remove_file(&receipt_path).unwrap();
-                write(&receipt_path, &receipt);
-            }
-            let error = invalid.collect_through(3).unwrap_err().to_string();
-            let reason = match mutation {
-                "profile" => "profile 0000.profraw changed",
-                "source" => "shard source differs",
-                "tree" => "shard tree differs",
-                "shard" => "carries a receipt for application",
-                "attempt" => "receipt attempt differs",
-                _ => unreachable!(),
-            };
-            assert!(error.contains(reason), "{mutation}: {error}");
-            assert_eq!(invalid.profile_count(), 0);
-        }
-
-        // No shard may claim an attempt later than the current run attempt,
-        // in either download layout.
-        let future = AggregateFixture::new();
-        future.upload("application", 3);
-        let error = future.collect_through(2).unwrap_err().to_string();
-        assert!(error.contains("newer than run attempt 2"), "{error}");
-        assert_eq!(future.profile_count(), 0);
-        let flat_future = AggregateFixture::new();
-        let error = flat_future.collect_through(1).unwrap_err().to_string();
-        assert!(error.contains("newer than run attempt 1"), "{error}");
-        assert_eq!(flat_future.profile_count(), 0);
-
-        // Missing shards and unknown shard directories are refused.
-        let missing = AggregateFixture::new();
-        missing.remove("connectors-core-platform");
-        let error = missing.collect().unwrap_err().to_string();
-        assert!(error.contains("unexpected artifact entries"), "{error}");
-        assert_eq!(missing.profile_count(), 0);
-        let empty = AggregateFixture::new();
-        fs::remove_dir_all(empty.shard("connectors-core-platform")).unwrap();
-        let error = empty.collect().unwrap_err().to_string();
-        assert!(error.contains("has no downloaded artifacts"), "{error}");
-        assert_eq!(empty.profile_count(), 0);
-        let unknown = AggregateFixture::new();
-        fs::create_dir(unknown.inputs.join("unknown")).unwrap();
-        let error = unknown.collect().unwrap_err().to_string();
-        assert!(error.contains("unexpected artifact entries"), "{error}");
-        assert!(error.contains("unknown"), "{error}");
-        assert_eq!(unknown.profile_count(), 0);
-
-        // Non-canonical or foreign artifact names beside real artifacts.
-        for (name, reason) in [
-            (
-                "ci-coverage-windows-latest-application-attempt-03",
-                "non-canonical attempt",
-            ),
-            (
-                "ci-coverage-windows-latest-application-attempt-0",
-                "non-canonical attempt",
-            ),
-            (
-                "ci-coverage-windows-latest-application-attempt-x",
-                "non-canonical attempt",
-            ),
-            (
-                "ci-coverage-windows-latest-application-diagnostics-attempt-1",
-                "unexpected coverage shard",
-            ),
-            (
-                "other-coverage-windows-latest-application-attempt-1",
-                "different prefixes",
-            ),
-            (
-                "-coverage-windows-latest-application-attempt-1",
-                "unexpected coverage shard",
-            ),
-            // Another OS's receipt for the same shard is never accepted here.
-            (
-                "ci-coverage-ubuntu-latest-application-attempt-1",
-                "unexpected coverage shard",
-            ),
-            (
-                "ci-coverage-windows-application-attempt-1",
-                "unexpected coverage shard",
-            ),
-        ] {
-            let foreign = AggregateFixture::new();
-            foreign.upload("application", 3);
-            fs::create_dir(foreign.inputs.join("application").join(name)).unwrap();
-            let error = foreign.collect_through(3).unwrap_err().to_string();
-            assert!(error.contains(reason), "{name}: {error}");
-            assert_eq!(foreign.profile_count(), 0);
-        }
-
-        // Layout refusals: a nested artifact must hold exactly its own attempt,
-        // a flat download holds one canonical attempt, and layouts never mix.
-        let mismatched = AggregateFixture::new();
-        let latest = mismatched.upload("application", 3);
-        fs::rename(&latest, latest.with_file_name("attempt-4")).unwrap();
-        let error = mismatched.collect_through(4).unwrap_err().to_string();
-        assert!(
-            error.contains("attempt-3 holds attempt-4"),
-            "mismatched: {error}"
-        );
-        let extra = AggregateFixture::new();
-        let latest = extra.upload("application", 3);
-        fs::create_dir(latest.with_file_name("attempt-1")).unwrap();
-        let error = extra.collect_through(3).unwrap_err().to_string();
-        assert!(error.contains("must hold one attempt directory"), "{error}");
-        let mixed = AggregateFixture::new();
-        fs::create_dir(mixed.artifact("application", 1)).unwrap();
-        let error = mixed.collect().unwrap_err().to_string();
-        assert!(
-            error.contains("mixes single- and multi-artifact"),
-            "{error}"
-        );
-        let several_flat = AggregateFixture::new();
-        fs::create_dir(several_flat.inputs.join("application/attempt-1")).unwrap();
-        let error = several_flat.collect().unwrap_err().to_string();
-        assert!(
-            error.contains("several attempts outside artifact directories"),
-            "{error}"
-        );
-        let padded = AggregateFixture::new();
-        let flat = padded.shard("application");
-        fs::rename(&flat, flat.with_file_name("attempt-02")).unwrap();
-        let error = padded.collect().unwrap_err().to_string();
-        assert!(
-            error.contains("not a canonical attempt directory"),
-            "{error}"
-        );
-        let loose = AggregateFixture::new();
-        fs::write(loose.inputs.join("application/attempt-1"), b"").unwrap();
-        let error = loose.collect().unwrap_err().to_string();
-        assert!(error.contains("attempt-1 is not a directory"), "{error}");
-        for fixture in [&mismatched, &extra, &mixed, &several_flat, &padded, &loose] {
-            assert_eq!(fixture.profile_count(), 0);
-        }
-    }
-
-    #[test]
-    fn aggregate_accepts_the_single_artifact_download_layout() {
-        // Every ordinary first attempt downloads one artifact per shard, which
-        // download-artifact extracts without an artifact-name directory.
-        let first = AggregateFixture::new();
-        for (shard, _) in SHARDS {
-            let entries: Vec<_> = fs::read_dir(first.inputs.join(shard))
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-                .collect();
-            assert_eq!(entries, ["attempt-2"]);
-        }
-        let selected = first.collect().unwrap();
-        assert!(selected.iter().all(|(_, attempt)| *attempt == 2));
-        assert_eq!(first.profile_count(), SHARDS.len());
-
-        // Several attempts of one shard use the per-artifact layout while the
-        // other shards stay flat.
-        let rerun = AggregateFixture::new();
-        rerun.upload("memory", 3);
-        assert!(rerun.artifact("memory", 2).join("attempt-2").is_dir());
-        assert!(rerun.artifact("memory", 3).join("attempt-3").is_dir());
-        assert!(rerun.inputs.join("application/attempt-2").is_dir());
-        assert!(
-            rerun
-                .collect_through(3)
-                .unwrap()
-                .contains(&("memory".to_owned(), 3))
-        );
-    }
-
-    #[test]
-    fn shards_cover_each_workspace_package_exactly_once() {
-        let listed: Vec<_> = SHARDS
-            .iter()
-            .flat_map(|(_, packages)| packages.iter().copied())
-            .collect();
-        let unique = workspace_packages();
-        assert_eq!(listed.len(), unique.len(), "a package is in two shards");
+        let labels: BTreeSet<_> = PARTITIONS.iter().map(|(label, _, _)| *label).collect();
         assert_eq!(
-            unique.into_iter().collect::<Vec<_>>(),
-            [
-                "kuru",
-                "kuru-archive",
-                "kuru-connectors",
-                "kuru-core",
-                "kuru-delivery",
-                "kuru-memory",
-                "kuru-platform",
-                "kuru-runtime",
-            ]
+            labels.len(),
+            PARTITIONS.len(),
+            "one partition set per label"
         );
-        let names: BTreeSet<_> = SHARDS.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names.len(), SHARDS.len(), "shard names are unique");
-        for (name, packages) in SHARDS {
-            assert!(!packages.is_empty(), "{name} has no packages");
-            assert!(artifact_os_label(name).is_ok(), "{name} is not a label");
+        for (label, mode, count) in PARTITIONS {
+            assert_eq!(artifact_os_label(label).unwrap(), label);
+            assert!(os_target(label).is_some(), "{label} has no host target");
+            assert!(PartitionScheme::new(count, count).is_ok(), "{label}");
+            assert_eq!(partition_count(label, mode), Some(count));
+            check_partitioning(label, mode, count).unwrap();
+            let error = check_partitioning(label, mode, count + 1)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("number {count}")), "{error}");
         }
+        assert_eq!(
+            OS_TARGETS.map(|(label, _)| label).to_vec(),
+            PARTITIONS.map(|(label, _, _)| label).to_vec()
+        );
+        // macOS fits the five-job cap beside its install job; Windows and
+        // Ubuntu stay inside the account's concurrency.
+        assert_eq!(partition_count("macos-latest", Mode::Instrumented), Some(4));
+        assert_eq!(
+            partition_count("windows-latest", Mode::Instrumented),
+            Some(8)
+        );
+        assert!((8..=12).contains(&partition_count("ubuntu-latest", Mode::Instrumented).unwrap()));
+        assert_eq!(
+            partition_count("ubuntu-24.04-arm", Mode::Uninstrumented),
+            Some(3)
+        );
+        assert_eq!(partition_count("ubuntu-latest", Mode::Uninstrumented), None);
+        check_partitioning(LOCAL_OS, Mode::Uninstrumented, 5).unwrap();
+        let error = check_partitioning("windows-2025", Mode::Instrumented, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no instrumented partition set"), "{error}");
+        assert_eq!(os_target(LOCAL_OS), None);
+        assert!(EXCLUDED_ARTIFACTS.is_empty());
+        for mode in [Mode::Instrumented, Mode::Uninstrumented] {
+            assert_eq!(Mode::parse(mode.name()).unwrap(), mode);
+        }
+        assert!(Mode::parse("partial").is_err());
+        assert_ne!(
+            Mode::Instrumented.contract(),
+            Mode::Uninstrumented.contract()
+        );
     }
 
     #[test]
-    fn artifact_os_labels_are_lowercase_runner_names() {
+    fn artifact_os_labels_are_runner_names() {
         for label in [
             "ubuntu-latest",
             "macos-latest",
             "windows-2025",
             "windows-latest",
+            "ubuntu-24.04-arm",
+            "windows-11-arm",
+            LOCAL_OS,
         ] {
             assert_eq!(artifact_os_label(label).unwrap(), label);
         }
@@ -3209,61 +2605,68 @@ mod tests {
             "macos latest",
             "../x",
             "a/b",
+            ".hidden",
+            "trailing.",
+            "-flag",
+            "dash-",
         ] {
             let error = artifact_os_label(label).unwrap_err().to_string();
-            assert!(error.contains("[a-z0-9-]+"), "{label}: {error}");
+            assert!(error.contains("[a-z0-9]"), "{label}: {error}");
         }
-        let fixture = AggregateFixture::new();
-        let error = collect_profiles_with_identity(
-            &fixture.inventory,
-            &fixture.inventory_sha256,
-            &fixture.inputs,
-            &fixture.target,
-            2,
-            "Windows",
-            &fixture.identity,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("[a-z0-9-]+"), "{error}");
-        assert_eq!(fixture.profile_count(), 0);
+    }
 
-        // Artifacts for another OS label never satisfy this OS's collection.
-        let rerun = AggregateFixture::new();
-        rerun.upload("memory", 3);
-        let error = collect_profiles_with_identity(
-            &rerun.inventory,
-            &rerun.inventory_sha256,
-            &rerun.inputs,
-            &rerun.target,
-            3,
-            "ubuntu-latest",
-            &rerun.identity,
+    #[test]
+    fn schema_one_files_are_refused_by_name() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("inventory.json");
+        fs::write(
+            &path,
+            br#"{"schema":1,"workspace_packages":[],"artifacts":[]}"#,
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap();
+        let error = read_inventory(&path).unwrap_err().to_string();
         assert!(
-            error.contains("unexpected coverage shard memory"),
+            error.contains("coverage schema 1 (package shards)"),
             "{error}"
         );
-        assert_eq!(rerun.profile_count(), 0);
+        fs::write(&path, br#"{"schema":3}"#).unwrap();
+        let error = read_inventory(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported coverage schema Some(3)"),
+            "{error}"
+        );
+        fs::write(&path, br#"{"schema":2,"unknown":true}"#).unwrap();
+        assert!(read_inventory(&path).is_err());
+        let ledger = temp.path().join("ledger.jsonl");
+        fs::write(&ledger, b"{\"schema\":1}\n").unwrap();
+        let error = plan::read_ledger(&ledger).unwrap_err().to_string();
+        assert!(error.contains("schema 1 (package shards)"), "{error}");
+        fs::write(&ledger, b"{}\n").unwrap();
+        let error = plan::read_ledger(&ledger).unwrap_err().to_string();
+        assert!(error.contains("unsupported schema None"), "{error}");
+        fs::write(&ledger, b"nonsense\n").unwrap();
+        assert!(plan::read_ledger(&ledger).is_err());
     }
 
     #[tokio::test]
     async fn receipts_require_a_canonical_run_attempt() {
         let temp = TempDir::new().unwrap();
         let path = temp.path();
+        let partition = PartitionScheme::new(1, 1).unwrap();
         for attempt in ["", "0", "03", "x"] {
             let error = write_receipt(&ReceiptOptions {
                 root: path,
+                mode: Mode::Instrumented,
+                partition: &partition,
                 inventory: path,
-                selection: path,
                 ledger: path,
+                job_ledger: path,
                 profiles: path,
-                shard: "application",
+                lcov: None,
                 run_attempt: attempt,
                 expected_source: "HEAD",
-                llvm_cov: path,
+                llvm_cov: None,
+                profile_env_sha256: "env",
                 output: &path.join("output"),
             })
             .await
@@ -3487,7 +2890,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(supervision, Supervision::Exited(status) if status.success()));
+        assert!(matches!(supervision, Supervision::Exited(status, _) if status.success()));
         assert!(!process.terminated);
         let mut copied = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut relayed, &mut copied)
@@ -3623,7 +3026,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let Supervision::Exited(status) = supervision else {
+        let Supervision::Exited(status, _) = supervision else {
             panic!("an exiting root was reported as stalled");
         };
         assert_eq!(status.code(), Some(3), "{status:?}");
@@ -3860,16 +3263,19 @@ mod tests {
     }
 
     #[test]
-    fn selected_manifest_is_the_exact_full_inventory_subset() {
+    fn inventories_are_scoped_to_their_packages() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("root");
         let target = temp.path().join("target");
         workspace(&root, &target);
         let metadata_path = temp.path().join("metadata.json");
         write(&metadata_path, &metadata_value(&root));
-        let full_messages = temp.path().join("full.json");
+        let identity = workspace_identity(&metadata_path).unwrap();
+        assert_eq!(identity.packages, ["alpha", "common"]);
+        assert!(identity.names.contains("alpha") && identity.ids.contains("common-id"));
+        let full = temp.path().join("full.json");
         cargo_messages(
-            &full_messages,
+            &full,
             &[
                 artifact(&root, &target, "alpha", "alpha", "normal", false),
                 artifact(&root, &target, "alpha", "alpha", "test", true),
@@ -3877,264 +3283,915 @@ mod tests {
                 artifact(&root, &target, "common", "common", "test", true),
             ],
         );
-        let inventory_path = temp.path().join("inventory.json");
-        write_inventory(&metadata_path, &full_messages, &target, &inventory_path).unwrap();
-        let selection_path = temp.path().join("selection.json");
-        write_selection(&inventory_path, &["alpha".to_owned()], &selection_path).unwrap();
-        let selection: Selection = read_json(&selection_path).unwrap();
-        assert_eq!(selection.artifacts.len(), 2);
-        assert!(
-            selection
-                .artifacts
-                .iter()
-                .all(|artifact| artifact.package == "alpha")
-        );
-        assert!(selection.artifacts.iter().any(is_runnable));
-    }
-
-    #[test]
-    fn selected_manifest_rejects_runnable_artifact_outside_shard() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("root");
-        let target = temp.path().join("target");
-        workspace(&root, &target);
-        let metadata_path = temp.path().join("metadata.json");
-        write(&metadata_path, &metadata_value(&root));
-        let messages = temp.path().join("messages.json");
+        let scoped = temp.path().join("scoped.json");
         cargo_messages(
-            &messages,
+            &scoped,
             &[
-                artifact(&root, &target, "alpha", "alpha", "normal", false),
                 artifact(&root, &target, "alpha", "alpha", "test", true),
+                // A workspace dependency's library is recorded, not run.
                 artifact(&root, &target, "common", "common", "normal", false),
-                artifact(&root, &target, "common", "common", "test", true),
             ],
         );
-        let inventory_path = temp.path().join("inventory.json");
-        write_inventory(&metadata_path, &messages, &target, &inventory_path).unwrap();
-        let selection_path = temp.path().join("selection.json");
-        write_selection(&inventory_path, &["alpha".to_owned()], &selection_path).unwrap();
-        let mut selection: Selection = read_json(&selection_path).unwrap();
-        let inventory: Inventory = read_json(&inventory_path).unwrap();
-        selection.artifacts.push(
-            inventory
-                .artifacts
-                .into_iter()
-                .find(|artifact| artifact.package == "common" && is_runnable(artifact))
-                .unwrap(),
-        );
-        fs::write(&selection_path, serde_json::to_vec(&selection).unwrap()).unwrap();
-        let error = runnable_artifacts(&inventory_path, &selection_path).unwrap_err();
-        assert!(error.to_string().contains("artifact outside its shard"));
+        let output = |name: &str| temp.path().join(name);
+        let all = ["alpha".to_owned(), "common".to_owned()];
+        write_inventory(&metadata_path, &full, &target, &all, &output("all.json")).unwrap();
+        let inventory = read_inventory(&output("all.json")).unwrap();
+        assert_eq!(inventory.scope, all);
+        assert_eq!(runnable_artifacts(&inventory).unwrap().len(), 2);
+        write_inventory(
+            &metadata_path,
+            &scoped,
+            &target,
+            &["alpha".to_owned(), "alpha".to_owned()],
+            &output("alpha.json"),
+        )
+        .unwrap();
+        let inventory = read_inventory(&output("alpha.json")).unwrap();
+        assert_eq!(inventory.scope, ["alpha"]);
+        assert_eq!(inventory.workspace_packages, all);
+        assert_eq!(runnable_artifacts(&inventory).unwrap().len(), 1);
+        for (messages, scope, reason) in [
+            (&full, vec!["alpha".to_owned()], "outside the scope"),
+            (&scoped, all.to_vec(), "omits runnable target common"),
+            (&scoped, vec![], "scope is empty"),
+            (&scoped, vec!["zeta".to_owned()], "unknown package zeta"),
+        ] {
+            let error = write_inventory(
+                &metadata_path,
+                messages,
+                &target,
+                &scope,
+                &output("refused.json"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(reason), "{scope:?}: {error}");
+        }
+        let mut duplicate = inventory.clone();
+        duplicate.artifacts.push({
+            let mut copy = duplicate.artifacts[0].clone();
+            copy.executable = Some("debug/deps/other".to_owned());
+            copy
+        });
+        let error = runnable_artifacts(&duplicate).unwrap_err().to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+        let mut empty = inventory;
+        empty.artifacts.clear();
+        assert!(runnable_artifacts(&empty).is_err());
     }
 
     #[test]
-    fn cargo_runner_config_and_ledger_bind_the_full_test_inventory() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("root");
-        let target = temp.path().join("target");
-        workspace(&root, &target);
-        let inventory = Inventory {
-            schema: SCHEMA,
-            workspace_packages: vec!["alpha".to_owned(), "common".to_owned()],
-            artifacts: vec![receipt_artifact("alpha"), receipt_artifact("common")],
-        };
-        let inventory_path = temp.path().join("inventory.json");
-        write(&inventory_path, &inventory);
-        let selection_path = temp.path().join("selection.json");
-        write_selection(&inventory_path, &["alpha".to_owned()], &selection_path).unwrap();
-        let helper = temp.path().join("delivery helper.exe");
+    fn runner_config_binds_partition_host_and_inventory() {
+        let workspace = fixture::Workspace::new(Mode::Instrumented);
+        let temp = workspace.temp.path();
+        let helper = temp.join("delivery helper.exe");
         fs::write(&helper, []).unwrap();
-        let ledger = temp.path().join("ledger.jsonl");
-        let diagnostics = temp.path().join("diagnostics");
+        let diagnostics = temp.join("diagnostics");
         fs::create_dir(&diagnostics).unwrap();
-        let config = temp.path().join("runner.toml");
-        let job_started = unix_now().unwrap() - 60;
-        let options = |job_started, job_minutes, output| RunnerConfigOptions {
-            root: &root,
-            host: "x86_64-pc-windows-msvc",
-            helper: &helper,
-            inventory: &inventory_path,
-            selection: &selection_path,
-            target_dir: &target,
+        let partition = PartitionScheme::new(3, 8).unwrap();
+        let root = temp.join("root");
+        let ledger = temp.join("ledger.jsonl");
+        let write = |output: &Path, host: &str, job_started: u64| {
+            write_runner_config(&RunnerConfigOptions {
+                root: &root,
+                host,
+                helper: &helper,
+                inventory: &workspace.inventory,
+                partition: &partition,
+                target_dir: &workspace.target,
+                ledger: &ledger,
+                diagnostics: &diagnostics,
+                job_started,
+                job_minutes: 45,
+                output,
+            })
+        };
+        let config = temp.join("runner.toml");
+        let now = unix_now().unwrap();
+        write(&config, fixture::HOST, now).unwrap();
+        let value: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        let runner: Vec<_> = value["target"][fixture::HOST]["runner"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect();
+        let flag = |name: &str| {
+            let position = runner.iter().position(|arg| arg == name).unwrap();
+            runner[position + 1].clone()
+        };
+        assert_eq!(runner[0], helper.to_str().unwrap());
+        assert_eq!(runner[1..3], ["coverage", "dispatch"]);
+        assert_eq!(flag("--partition"), "3");
+        assert_eq!(flag("--partitions"), "8");
+        assert_eq!(flag("--host"), fixture::HOST);
+        assert_eq!(
+            flag("--deadline"),
+            shard_deadline(now, 45).unwrap().to_string()
+        );
+        assert_eq!(runner.last().unwrap(), "--");
+        // The configuration is never replaced.
+        assert!(write(&config, fixture::HOST, now).is_err());
+        for (host, started, reason) in [
+            ("x86_64 linux", now, "invalid Cargo host target"),
+            (fixture::HOST, now + 3600, "in the future"),
+            (
+                fixture::HOST,
+                now - 45 * 60,
+                "passed before its tests started",
+            ),
+        ] {
+            let error = write(&temp.join("other.toml"), host, started)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(reason), "{reason}: {error}");
+        }
+    }
+
+    fn names_of(runs: &[Vec<String>]) -> Vec<String> {
+        runs.iter()
+            .flat_map(|run| {
+                assert_eq!(run[0], "--exact");
+                run[1..].iter().cloned()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn dispatch_lists_every_executable_and_runs_only_assigned_chunks() {
+        let workspace = fixture::Workspace::new(Mode::Instrumented);
+        let temp = workspace.temp.path();
+        let partition = PartitionScheme::new(2, 3).unwrap();
+        let ledger = temp.join("ledger.jsonl");
+        let diagnostics = temp.join("diagnostics");
+        let mut launcher = workspace.launcher();
+        launcher.profiles = Some(workspace.target.clone());
+        workspace
+            .dispatch_all(&mut launcher, &partition, &ledger, &diagnostics, &[])
+            .await
+            .unwrap();
+        let records = plan::read_ledger(&ledger).unwrap();
+        assert_eq!(records.len(), workspace.runnable().len());
+        let proven =
+            plan::validate_run_ledger(&workspace.value, &partition, fixture::HOST, &[], &records)
+                .unwrap();
+        assert_eq!(
+            validate_run_ledger(&workspace.inventory, &partition, fixture::HOST, &ledger).unwrap(),
+            proven
+        );
+        let assigned: Vec<String> = proven
+            .executables
+            .iter()
+            .flat_map(|tests| tests.assigned.iter().cloned())
+            .collect();
+        // Selections are made in inventory order; compare as sets.
+        let mut ran = names_of(&launcher.runs);
+        ran.sort();
+        let mut expected = assigned.clone();
+        expected.sort();
+        assert_eq!(ran, expected);
+        assert!(!assigned.is_empty());
+        for record in &records {
+            let (list, chunks) = record.invocations.split_first().unwrap();
+            assert_eq!(list.kind, plan::LIST);
+            assert_eq!(list.names, record.listed.len());
+            assert!(record.started <= record.finished);
+            // One list profile plus one per chunk, in this fixture's target.
+            assert_eq!(
+                record.profraw_after - record.profraw_before,
+                1 + chunks.len()
+            );
+            if record.assigned == 0 {
+                assert_eq!(record.action, plan::OMIT);
+                assert!(chunks.is_empty());
+            } else {
+                assert_eq!(record.action, plan::RUN);
+                assert_eq!(chunks.len(), 1);
+                assert_eq!(chunks[0].announced, Some(record.assigned));
+                let log = diagnostics.join(format!(
+                    "{}.exact-1.stdout.log",
+                    diagnostic_name(&record.executable)
+                ));
+                assert!(log.is_file(), "{}", log.display());
+            }
+        }
+        // The empty executable is listed and omitted in every partition.
+        assert!(records.iter().any(|record| record.listed.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn every_listed_test_runs_exactly_once_across_partitions() {
+        for count in 1..=4 {
+            let workspace = fixture::Workspace::new(Mode::Uninstrumented);
+            let temp = workspace.temp.path();
+            let mut owners = BTreeMap::new();
+            let mut listed = BTreeSet::new();
+            for index in 1..=count {
+                let partition = PartitionScheme::new(index, count).unwrap();
+                let ledger = temp.join(format!("ledger-{index}.jsonl"));
+                let mut launcher = workspace.launcher();
+                workspace
+                    .dispatch_all(&mut launcher, &partition, &ledger, &temp.join("d"), &[])
+                    .await
+                    .unwrap();
+                let records = plan::read_ledger(&ledger).unwrap();
+                let plan = plan::validate_run_ledger(
+                    &workspace.value,
+                    &partition,
+                    fixture::HOST,
+                    &[],
+                    &records,
+                )
+                .unwrap();
+                for tests in &plan.executables {
+                    for name in &tests.listed {
+                        listed.insert((tests.artifact.clone(), name.clone()));
+                    }
+                    for name in &tests.assigned {
+                        assert!(
+                            owners
+                                .insert((tests.artifact.clone(), name.clone()), index)
+                                .is_none(),
+                            "{name} ran twice"
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                owners.keys().cloned().collect::<BTreeSet<_>>(),
+                listed,
+                "{count}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn large_assignments_are_split_into_bounded_chunks() {
+        let workspace = fixture::Workspace::new(Mode::Uninstrumented);
+        let mut launcher = workspace.launcher();
+        let first = workspace
+            .target
+            .join(workspace.runnable()[0].executable.as_deref().unwrap());
+        let names: String = (0..2500)
+            .map(|index| format!("module::with::a::long::path::case_{index:05}: test\n"))
+            .collect();
+        launcher.lists.insert(first, names);
+        let partition = PartitionScheme::new(1, 1).unwrap();
+        let ledger = workspace.temp.path().join("ledger.jsonl");
+        workspace
+            .dispatch_all(
+                &mut launcher,
+                &partition,
+                &ledger,
+                &workspace.temp.path().join("d"),
+                &[],
+            )
+            .await
+            .unwrap();
+        let records = plan::read_ledger(&ledger).unwrap();
+        let large = records
+            .iter()
+            .find(|record| record.listed.len() == 2500)
+            .unwrap();
+        assert!(large.invocations.len() > 3, "{}", large.invocations.len());
+        plan::validate_run_ledger(&workspace.value, &partition, fixture::HOST, &[], &records)
+            .unwrap();
+        for run in &launcher.runs {
+            let args: Vec<_> = run.iter().map(String::as_str).collect();
+            assert!(
+                partition::windows_command_line_units(
+                    workspace.target.join("debug/deps/x").to_str().unwrap(),
+                    &args
+                ) <= partition::COMMAND_LINE_BUDGET
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_failures_are_recorded_and_fail_closed() {
+        type Setup = fn(&mut fixture::ScriptedLauncher);
+        let cases: [(Setup, &str, &str); 5] = [
+            (
+                |launcher| launcher.announce_offset = 1,
+                "libtest announced",
+                plan::RUN,
+            ),
+            (
+                |launcher| launcher.stall = true,
+                "deadline reached while",
+                plan::RUN,
+            ),
+            (
+                |launcher| launcher.list_error = true,
+                "scripted list failure",
+                plan::LIST,
+            ),
+            (
+                |launcher| launcher.run_error = true,
+                "scripted run failure",
+                plan::RUN,
+            ),
+            (
+                |launcher| {
+                    for list in launcher.lists.values_mut() {
+                        list.push_str("bench: bench\n");
+                    }
+                },
+                "benchmark",
+                plan::LIST,
+            ),
+        ];
+        for (setup, reason, action) in cases {
+            let workspace = fixture::Workspace::new(Mode::Uninstrumented);
+            let temp = workspace.temp.path();
+            let mut launcher = workspace.launcher();
+            setup(&mut launcher);
+            let partition = PartitionScheme::new(1, 1).unwrap();
+            let ledger = temp.join("ledger.jsonl");
+            let diagnostics = temp.join("diagnostics");
+            let error = format!(
+                "{:#}",
+                workspace
+                    .dispatch_all(&mut launcher, &partition, &ledger, &diagnostics, &[])
+                    .await
+                    .unwrap_err()
+            );
+            assert!(error.contains(reason), "{reason}: {error}");
+            let records = plan::read_ledger(&ledger).unwrap();
+            let last = records.last().unwrap();
+            assert!(!last.success, "{reason}");
+            assert_eq!(last.action, action, "{reason}");
+            let error = plan::validate_run_ledger(
+                &workspace.value,
+                &partition,
+                fixture::HOST,
+                &[],
+                &records,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(!error.is_empty());
+            if reason.starts_with("deadline") {
+                let stall = fs::read_dir(&diagnostics)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                    .find(|name| name.ends_with(".exact-1.stall.json"))
+                    .unwrap();
+                let report: StallReport = read_json(&diagnostics.join(stall)).unwrap();
+                assert_eq!(report.unfinished_tests, ["tests::stuck"]);
+            }
+        }
+
+        // A failing selection is returned to Cargo and recorded as failed.
+        let workspace = fixture::Workspace::new(Mode::Uninstrumented);
+        let temp = workspace.temp.path();
+        let mut launcher = workspace.launcher();
+        launcher.status = 101;
+        let partition = PartitionScheme::new(1, 1).unwrap();
+        let artifact = workspace.runnable()[0];
+        let executable = workspace
+            .target
+            .join(artifact.executable.as_deref().unwrap());
+        let ledger = temp.join("ledger.jsonl");
+        let diagnostics = temp.join("diagnostics");
+        fs::create_dir(&diagnostics).unwrap();
+        let current = workspace.root.join(&artifact.package_root);
+        let options = |deadline: u64, args: &'static [OsString]| DispatchOptions {
+            root: &workspace.root,
+            inventory: &workspace.inventory,
+            host: fixture::HOST,
+            partition: &partition,
+            target_dir: &workspace.target,
             ledger: &ledger,
             diagnostics: &diagnostics,
-            job_started,
-            job_minutes,
-            output,
+            deadline,
+            executable: &executable,
+            args,
         };
-        // A job whose remaining budget is already inside the evidence reserve,
-        // or whose start is in the future, cannot configure a runner.
-        let expired = temp.path().join("expired.toml");
-        assert!(write_runner_config(&options(job_started - 90 * 60, 90, &expired)).is_err());
-        let future = temp.path().join("future.toml");
-        assert!(write_runner_config(&options(job_started + 3600, 90, &future)).is_err());
-        assert!(!expired.exists() && !future.exists());
-        write_runner_config(&options(job_started, 90, &config)).unwrap();
-        let config: toml::Value = toml::from_str(&fs::read_to_string(config).unwrap()).unwrap();
-        let runner = config["target"]["x86_64-pc-windows-msvc"]["runner"]
-            .as_array()
-            .unwrap();
-        assert_eq!(runner[0].as_str(), helper.to_str());
-        assert_eq!(runner.last().unwrap().as_str(), Some("--"));
-        let argument = |flag: &str| {
-            let index = runner
-                .iter()
-                .position(|value| value.as_str() == Some(flag))
-                .unwrap();
-            runner[index + 1].as_str().unwrap().to_owned()
-        };
-        assert_eq!(argument("--diagnostics"), diagnostics.to_str().unwrap());
-        assert_eq!(
-            argument("--deadline"),
-            (job_started + 90 * 60 - EVIDENCE_RESERVE.as_secs()).to_string()
-        );
-
-        let records = [
-            RunnerRecord {
-                schema: SCHEMA,
-                executable: "debug/deps/alpha.exe".to_owned(),
-                action: "run".to_owned(),
-                cwd: "packages/alpha".to_owned(),
-                args: Vec::new(),
-                success: true,
-                status_code: Some(0),
-            },
-            RunnerRecord {
-                schema: SCHEMA,
-                executable: "debug/deps/common.exe".to_owned(),
-                action: "omit".to_owned(),
-                cwd: "packages/common".to_owned(),
-                args: Vec::new(),
-                success: true,
-                status_code: Some(0),
-            },
-        ];
-        let mut bytes = Vec::new();
-        for record in &records {
-            serde_json::to_writer(&mut bytes, record).unwrap();
-            bytes.push(b'\n');
-        }
-        fs::write(&ledger, &bytes).unwrap();
-        validate_run_ledger(&inventory_path, &selection_path, &ledger).unwrap();
-
-        bytes.extend_from_slice(&bytes.clone());
-        fs::write(&ledger, bytes).unwrap();
-        assert!(validate_run_ledger(&inventory_path, &selection_path, &ledger).is_err());
-    }
-
-    #[test]
-    fn profile_receipts_must_be_nonempty_unique_normal_files() {
-        assert!(validate_profile_receipts(&[]).is_err());
-        let receipt = ProfileReceipt {
-            name: "0000.profraw".to_owned(),
-            bytes: 1,
-            sha256: "a".repeat(64),
-        };
-        assert!(validate_profile_receipts(std::slice::from_ref(&receipt)).is_ok());
-        assert!(validate_profile_receipts(&[receipt.clone(), receipt]).is_err());
-        assert!(
-            validate_profile_receipts(&[ProfileReceipt {
-                name: "../escape.profraw".to_owned(),
-                bytes: 1,
-                sha256: "a".repeat(64),
-            }])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn empty_profiles_are_omitted_only_after_candidate_bounds_and_type_checks() {
-        let mixed = TempDir::new().unwrap();
-        fs::write(mixed.path().join("empty.profraw"), []).unwrap();
-        fs::write(mixed.path().join("valid.profraw"), b"valid profile").unwrap();
-        let sources = profile_sources(mixed.path()).unwrap();
-        assert_eq!(sources, [mixed.path().join("valid.profraw")]);
-        let copied = mixed.path().join("copied.profraw");
-        let receipt = hash_copy(&sources[0], &copied).unwrap();
-        assert_eq!(receipt.bytes, 13);
-        assert_eq!(fs::read(copied).unwrap(), b"valid profile");
-
-        let empty = TempDir::new().unwrap();
-        fs::write(empty.path().join("empty.profraw"), []).unwrap();
-        assert!(
-            profile_sources(empty.path())
-                .unwrap_err()
-                .to_string()
-                .contains("no nonempty raw profiles")
-        );
-
-        let excess = TempDir::new().unwrap();
-        for index in 0..=PROFILE_COUNT_LIMIT {
-            fs::write(excess.path().join(format!("{index:04}.profraw")), []).unwrap();
-        }
-        assert!(
-            profile_sources(excess.path())
-                .unwrap_err()
-                .to_string()
-                .contains("too many profiles")
-        );
-
-        let oversized = TempDir::new().unwrap();
-        File::create(oversized.path().join("oversized.profraw"))
+        let later = unix_now().unwrap() + 3600;
+        let status = dispatch_with(&mut launcher, &options(later, &[]), &current, &[])
+            .await
             .unwrap()
-            .set_len(PROFILE_LIMIT + 1)
             .unwrap();
-        assert!(
-            profile_sources(oversized.path())
-                .unwrap_err()
-                .to_string()
-                .contains("is too large")
-        );
+        assert_eq!(status.code(), Some(101));
+        let records = plan::read_ledger(&ledger).unwrap();
+        assert_eq!(records[0].status_code, Some(101));
+        assert!(!records[0].success);
 
-        let nonregular = TempDir::new().unwrap();
-        fs::create_dir(nonregular.path().join("directory.profraw")).unwrap();
-        assert!(
-            profile_sources(nonregular.path())
-                .unwrap_err()
-                .to_string()
-                .contains("is not a regular file")
-        );
-
-        let malformed = TempDir::new().unwrap();
-        let malformed_profile = malformed.path().join("malformed.profraw");
-        fs::write(&malformed_profile, b"not-a-profile").unwrap();
+        // A passed deadline is recorded before anything starts.
+        let error = dispatch_with(&mut launcher, &options(1, &[]), &current, &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("passed before starting"), "{error}");
         assert_eq!(
-            profile_sources(malformed.path()).unwrap(),
-            [malformed_profile]
+            plan::read_ledger(&ledger).unwrap().last().unwrap().action,
+            plan::DEADLINE
         );
+        // Cargo-supplied libtest arguments, a foreign directory and an
+        // unknown executable are refused without a record.
+        static ARGS: [OsString; 0] = [];
+        let before = plan::read_ledger(&ledger).unwrap().len();
+        let extra = [OsString::from("--nocapture")];
+        let mut with_args = options(later, &ARGS);
+        with_args.args = &extra;
+        let error = dispatch_with(&mut launcher, &with_args, &current, &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unexpected libtest arguments"), "{error}");
+        let error = dispatch_with(
+            &mut launcher,
+            &options(later, &ARGS),
+            &workspace.root.join("elsewhere"),
+            &[],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Cargo ran"), "{error}");
+        let stranger = workspace.target.join("debug/deps/stranger");
+        fs::write(&stranger, b"").unwrap();
+        let mut unknown = options(later, &ARGS);
+        unknown.executable = &stranger;
+        let error = dispatch_with(&mut launcher, &unknown, &current, &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown test executable"), "{error}");
+        assert_eq!(plan::read_ledger(&ledger).unwrap().len(), before);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn profile_symlinks_are_rejected_before_empty_filtering() {
-        use std::os::unix::fs::symlink;
-
-        let temp = TempDir::new().unwrap();
-        let target = temp.path().join("empty");
-        fs::write(&target, []).unwrap();
-        symlink(&target, temp.path().join("linked.profraw")).unwrap();
-        assert!(
-            profile_sources(temp.path())
+    #[tokio::test]
+    async fn excluded_executables_are_listed_with_their_reason_but_never_run() {
+        let workspace = fixture::Workspace::new(Mode::Uninstrumented);
+        let temp = workspace.temp.path();
+        let artifact = workspace.runnable()[0];
+        let key = partition::artifact_key(artifact);
+        let reason = "fixture exclusion";
+        let exclusions = [(fixture::HOST, key.as_str(), reason)];
+        let partition = PartitionScheme::new(1, 1).unwrap();
+        let ledger = temp.join("ledger.jsonl");
+        let mut launcher = workspace.launcher();
+        workspace
+            .dispatch_all(
+                &mut launcher,
+                &partition,
+                &ledger,
+                &temp.join("d"),
+                &exclusions,
+            )
+            .await
+            .unwrap();
+        let records = plan::read_ledger(&ledger).unwrap();
+        let excluded = records
+            .iter()
+            .find(|record| record.artifact == key)
+            .unwrap();
+        assert_eq!(excluded.action, plan::EXCLUDE);
+        assert_eq!(excluded.reason.as_deref(), Some(reason));
+        assert!(!excluded.listed.is_empty());
+        assert_eq!(excluded.invocations.len(), 1);
+        let plan = plan::validate_run_ledger(
+            &workspace.value,
+            &partition,
+            fixture::HOST,
+            &exclusions,
+            &records,
+        )
+        .unwrap();
+        let tests = plan
+            .executables
+            .iter()
+            .find(|tests| tests.artifact == key)
+            .unwrap();
+        assert_eq!(tests.excluded.as_deref(), Some(reason));
+        assert!(tests.assigned.is_empty());
+        // Another host's entry does not apply; the record then disagrees.
+        let other = [("aarch64-apple-darwin", key.as_str(), reason)];
+        let error = plan::validate_run_ledger(
+            &workspace.value,
+            &partition,
+            fixture::HOST,
+            &other,
+            &records,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exclusion reason"), "{error}");
+        // Stale, reasonless and repeated entries fail.
+        for (table, message) in [
+            (
+                vec![(fixture::HOST, "gone/lib/gone", reason)],
+                "names no test executable",
+            ),
+            (vec![(fixture::HOST, key.as_str(), " ")], "has no reason"),
+            (
+                vec![
+                    (fixture::HOST, key.as_str(), reason),
+                    (fixture::HOST, key.as_str(), reason),
+                ],
+                "repeated",
+            ),
+        ] {
+            let error = plan::check_exclusions(&table, fixture::HOST, &workspace.value)
                 .unwrap_err()
-                .to_string()
-                .contains("is not a regular file")
+                .to_string();
+            assert!(error.contains(message), "{message}: {error}");
+        }
+        plan::check_exclusions(
+            &[("aarch64-apple-darwin", "gone/lib/gone", reason)],
+            fixture::HOST,
+            &workspace.value,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_ledgers_refuse_every_inconsistency() {
+        let workspace = fixture::Workspace::new(Mode::Uninstrumented);
+        let temp = workspace.temp.path();
+        let partition = PartitionScheme::new(1, 2).unwrap();
+        let ledger = temp.join("ledger.jsonl");
+        let mut launcher = workspace.launcher();
+        workspace
+            .dispatch_all(&mut launcher, &partition, &ledger, &temp.join("d"), &[])
+            .await
+            .unwrap();
+        let records = plan::read_ledger(&ledger).unwrap();
+        let validate = |records: &[RunnerRecord]| {
+            plan::validate_run_ledger(&workspace.value, &partition, fixture::HOST, &[], records)
+                .map(drop)
+                .map_err(|error| error.to_string())
+        };
+        validate(&records).unwrap();
+        let running = records
+            .iter()
+            .position(|record| record.action == plan::RUN)
+            .unwrap();
+        type Tamper = fn(&mut Vec<RunnerRecord>, usize);
+        let cases: [(Tamper, &str); 16] = [
+            (
+                |records, _| records.push(records[0].clone()),
+                "extra records",
+            ),
+            (|records, _| drop(records.pop()), "omits test executables"),
+            (
+                |records, _| {
+                    let copy = records[0].clone();
+                    records[1] = copy;
+                },
+                "more than once",
+            ),
+            (|records, _| records[0].schema = 3, "schema"),
+            (
+                |records, _| records[0].args.push("--x".to_owned()),
+                "libtest arguments",
+            ),
+            (
+                |records, at| records[at].artifact = "x/lib/x".to_owned(),
+                "is recorded as",
+            ),
+            (
+                |records, at| records[at].cwd = "elsewhere".to_owned(),
+                "working directory",
+            ),
+            (|records, at| records[at].listed.reverse(), "unsorted"),
+            (
+                |records, at| records[at].listed.push("zz\u{7}".to_owned()),
+                "invalid test name",
+            ),
+            (
+                |records, at| records[at].list_sha256 = "0".repeat(64),
+                "list digest",
+            ),
+            (
+                |records, at| records[at].assigned += 1,
+                "assigned tests differ",
+            ),
+            (
+                |records, at| records[at].action = plan::OMIT.to_owned(),
+                "wrong runner action",
+            ),
+            (
+                |records, at| records[at].invocations[1].announced = Some(99),
+                "announced",
+            ),
+            (
+                |records, at| records[at].invocations[1].names += 1,
+                "exceed its assignment",
+            ),
+            (
+                |records, at| drop(records[at].invocations.pop()),
+                "ran 0 of",
+            ),
+            (
+                |records, at| records[at].invocations[0].kind = plan::EXACT.to_owned(),
+                "expected list",
+            ),
+        ];
+        for (tamper, reason) in cases {
+            let mut changed = records.clone();
+            tamper(&mut changed, running);
+            let error = validate(&changed).unwrap_err();
+            assert!(error.contains(reason), "{reason}: {error}");
+        }
+        let mut backwards = records.clone();
+        backwards[running].finished = 0;
+        backwards[running].started = 5;
+        assert!(
+            validate(&backwards)
+                .unwrap_err()
+                .contains("finished before")
         );
+        let mut failed = records;
+        failed[running].invocations[1].status_code = Some(1);
+        assert!(validate(&failed).unwrap_err().contains("did not succeed"));
     }
 
     #[test]
-    fn changed_profile_bytes_are_rejected() {
+    fn profile_summaries_bound_and_digest_profiles() {
         let temp = TempDir::new().unwrap();
-        let source = temp.path().join("0000.profraw");
-        fs::write(&source, b"changed profile").unwrap();
-        let expected = ProfileReceipt {
-            name: "0000.profraw".to_owned(),
-            bytes: 15,
-            sha256: "0".repeat(64),
+        let directory = temp.path();
+        let error = profile_summary(directory, Mode::Instrumented)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no nonempty raw profiles"), "{error}");
+        assert_eq!(
+            profile_summary(directory, Mode::Uninstrumented)
+                .unwrap()
+                .count,
+            0
+        );
+        fs::write(directory.join("b.profraw"), b"bb").unwrap();
+        fs::write(directory.join("a.profraw"), b"").unwrap();
+        fs::write(directory.join("other.txt"), b"x").unwrap();
+        let summary = profile_summary(directory, Mode::Instrumented).unwrap();
+        assert_eq!((summary.count, summary.bytes), (2, 2));
+        let manifest = format!(
+            "a.profraw 0 {}\nb.profraw 2 {}\n",
+            archive::digest(b""),
+            archive::digest(b"bb")
+        );
+        assert_eq!(
+            summary.manifest_sha256,
+            archive::digest(manifest.as_bytes())
+        );
+        let error = profile_summary(directory, Mode::Uninstrumented)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("produced raw profiles"), "{error}");
+        assert_eq!(count_profiles(directory).unwrap(), 2);
+        assert_eq!(discard_compile_profiles(directory).unwrap(), 2);
+        assert_eq!(count_profiles(directory).unwrap(), 0);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(directory.join("other.txt"), directory.join("l.profraw"))
+                .unwrap();
+            let error = profile_summary(directory, Mode::Instrumented)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not a regular file"), "{error}");
+            assert!(discard_compile_profiles(directory).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn evidence_binds_every_file_and_is_written_once() {
+        for mode in [Mode::Instrumented, Mode::Uninstrumented] {
+            let workspace = fixture::Workspace::new(mode);
+            let partition = PartitionScheme::new(1, 2).unwrap();
+            let output = workspace.temp.path().join("evidence");
+            workspace
+                .evidence(mode, &partition, 2, &output)
+                .await
+                .unwrap();
+            let attempt = output.join("attempt-2");
+            let mut expected = vec![
+                INVENTORY_FILE,
+                JOB_LEDGER_FILE,
+                PLAN_FILE,
+                RECEIPT_FILE,
+                RUNNER_LEDGER_FILE,
+            ];
+            if mode == Mode::Instrumented {
+                expected.push(LCOV_FILE);
+            }
+            exact_entries(&attempt, &expected).unwrap();
+            let receipt: Receipt = read_versioned(&attempt.join(RECEIPT_FILE), "receipt").unwrap();
+            assert_eq!(receipt.partition, partition);
+            assert_eq!(receipt.run_attempt, "2");
+            assert_eq!(receipt.mode, mode);
+            assert_eq!(receipt.instrumentation, mode.contract());
+            assert_eq!(receipt.lcov.is_some(), mode == Mode::Instrumented);
+            assert_eq!(receipt.profiles.count > 0, mode == Mode::Instrumented);
+            let plan: plan::PartitionPlan =
+                read_versioned(&attempt.join(PLAN_FILE), "plan").unwrap();
+            assert_eq!(receipt.plan_sha256, digest_json(&plan).unwrap());
+            assert_eq!(receipt.tests_sha256, plan::tests_sha256(&plan).unwrap());
+            assert_eq!(
+                receipt.runner_ledger_sha256,
+                archive::digest(&fs::read(attempt.join(RUNNER_LEDGER_FILE)).unwrap())
+            );
+            // The same output is never written twice.
+            let error = workspace
+                .evidence(mode, &partition, 2, &output)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("create"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn evidence_refuses_mismatched_modes_and_tools() {
+        let workspace = fixture::Workspace::new(Mode::Uninstrumented);
+        let temp = workspace.temp.path();
+        let partition = PartitionScheme::new(1, 1).unwrap();
+        let ledger = temp.join("ledger.jsonl");
+        let mut launcher = workspace.launcher();
+        workspace
+            .dispatch_all(&mut launcher, &partition, &ledger, &temp.join("d"), &[])
+            .await
+            .unwrap();
+        let job = temp.join("job.json");
+        fs::write(&job, b"{}").unwrap();
+        let options = |mode, lcov: Option<&'static Path>| ReceiptOptions {
+            root: temp,
+            mode,
+            partition: &partition,
+            inventory: &workspace.inventory,
+            ledger: &ledger,
+            job_ledger: &job,
+            profiles: temp,
+            lcov,
+            run_attempt: "1",
+            expected_source: fixture::SOURCE,
+            llvm_cov: None,
+            profile_env_sha256: "env",
+            output: Box::leak(temp.join("out").into_boxed_path()),
         };
-        let error = copy_checked_profile(&source, &temp.path().join("copy.profraw"), &expected)
+        let error = write_evidence(
+            &options(Mode::Uninstrumented, None),
+            fixture::identity(Mode::Instrumented),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("tool identity"), "{error}");
+        let error = write_evidence(
+            &options(Mode::Instrumented, None),
+            fixture::identity(Mode::Instrumented),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("whole workspace"), "{error}");
+        let error = write_evidence(
+            &options(Mode::Uninstrumented, None),
+            fixture::identity(Mode::Uninstrumented),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("job ledger"), "{error}");
+    }
+
+    #[test]
+    fn libtest_announcements_record_the_first_selection_size() {
+        for (text, expected) in [
+            ("\nrunning 2 tests\ntest a ... ok\n", Some(2)),
+            ("running 1 test\n", Some(1)),
+            ("running 0 tests\n", Some(0)),
+            ("running 3 tests\nrunning 9 tests\n", Some(3)),
+            ("running many tests\n", None),
+            ("running  tests\n", None),
+            ("", None),
+        ] {
+            let mut progress = LibtestProgress::default();
+            progress.observe(text.as_bytes());
+            assert_eq!(progress.announced, expected, "{text:?}");
+        }
+    }
+
+    /// No-op probes that the live libtest test lists and selects exactly.
+    #[test]
+    fn libtest_probe_alpha() {}
+
+    #[test]
+    fn libtest_probe_beta() {}
+
+    const PROBES: [&str; 2] = [
+        "coverage::tests::libtest_probe_alpha",
+        "coverage::tests::libtest_probe_beta",
+    ];
+
+    /// Run this test executable with an exact selection, supervised as the
+    /// runner supervises a chunk, without installing runner signal handlers.
+    async fn run_self(args: &[String], log: PathBuf) -> Supervision {
+        let executable = std::env::current_exe().unwrap();
+        #[cfg(unix)]
+        {
+            let mut command = std::process::Command::new(&executable);
+            command
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit());
+            supervise_group(
+                command,
+                tokio::io::sink(),
+                log,
+                Duration::from_secs(120),
+                RUNNER_CLEANUP_TIMEOUT,
+                std::future::pending(),
+            )
+            .await
+            .unwrap()
+        }
+        #[cfg(windows)]
+        {
+            let artifact = fixture::artifact("kuru-delivery", "lib", "kuru_delivery");
+            SystemLauncher
+                .run(&Launch {
+                    executable: &executable,
+                    artifact: &artifact,
+                    args,
+                    log,
+                    remaining: Duration::from_secs(120),
+                })
+                .await
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn live_libtest_lists_and_runs_exact_selections() {
+        let temp = TempDir::new().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let listed = partition::parse_libtest_list(
+            &SystemLauncher
+                .list(&executable, LIST_TIMEOUT)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        for probe in PROBES {
+            assert!(listed.binary_search(&probe.to_owned()).is_ok(), "{probe}");
+        }
+        let mut args = vec!["--exact".to_owned()];
+        args.extend(PROBES.map(str::to_owned));
+        let supervision = run_self(&args, temp.path().join("exact.log")).await;
+        let Supervision::Exited(status, announced) = supervision else {
+            panic!("the exact probe selection did not exit");
+        };
+        assert!(status.success(), "{status:?}");
+        assert_eq!(announced, Some(2));
+
+        // A selection sized to the command-line budget still starts: absent
+        // names are ordinary filters that select nothing.
+        let program = executable.to_str().unwrap();
+        let mut filler = 0;
+        loop {
+            let name = format!("coverage::tests::absent_filler_test_name_{filler:06}");
+            let mut next: Vec<&str> = args.iter().map(String::as_str).collect();
+            next.push(&name);
+            if partition::windows_command_line_units(program, &next)
+                > partition::COMMAND_LINE_BUDGET
+            {
+                break;
+            }
+            args.push(name);
+            filler += 1;
+        }
+        assert!(filler > 100);
+        let supervision = run_self(&args, temp.path().join("budget.log")).await;
+        let Supervision::Exited(status, announced) = supervision else {
+            panic!("the budget-sized selection did not exit");
+        };
+        assert!(status.success(), "{status:?}");
+        assert_eq!(announced, Some(2));
+        let error = SystemLauncher
+            .list(&temp.path().join("missing"), LIST_TIMEOUT)
+            .await
             .unwrap_err();
-        assert!(error.to_string().contains("profile 0000.profraw changed"));
+        assert!(format!("{error:#}").contains("list the tests"), "{error:#}");
+    }
+
+    /// The group settle never outlives its wait's deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_group_settle_is_bounded_by_the_wait_deadline() {
+        let mut command = group_command("sleep 30 & exit 0");
+        command.stdout(std::process::Stdio::null());
+        let mut child = GroupProcess::spawn(command, Duration::from_secs(60)).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        match child.wait(Duration::ZERO).await {
+            Ok(status) => assert!(status.success()),
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let status = child.wait(GROUP_BOUND).await.unwrap();
+        assert!(status.success());
+        assert_eq!(child.presence_after_reap().as_deref(), Some("Absent"));
     }
 
     #[tokio::test]
@@ -4171,9 +4228,27 @@ mod tests {
         );
         let head = String::from_utf8(git(root, &["rev-parse", "HEAD"]).await.stdout).unwrap();
         fs::write(root.join("source.rs"), "const VALUE: u8 = 2;\n").unwrap();
-        let error = identity(root, head.trim(), Path::new("missing-llvm-cov"))
+        let error = identity(root, head.trim(), Some(Path::new("missing-llvm-cov")))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("modified tracked files"));
+        let error = identity(root, "0000", None).await.unwrap_err();
+        assert!(error.to_string().contains("expected 0000"), "{error}");
+        assert!(
+            git(root, &["checkout", "--", "source.rs"])
+                .await
+                .status
+                .success()
+        );
+        let observed = identity(root, head.trim(), None).await.unwrap();
+        assert_eq!(observed.source, head.trim());
+        assert_eq!(observed.cargo_llvm_cov, None);
+        assert!(
+            observed
+                .rustc
+                .contains(&format!("host: {}", observed.target))
+        );
+        assert_eq!(observed.target_os, std::env::consts::OS);
+        verify_source(root, head.trim(), None).await.unwrap();
     }
 }

@@ -69,8 +69,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
       # The save-time cleanup keeps only build, .fingerprint and deps in each
-      # profile directory, so the private kuru-test-supervisors snapshot that
-      # kuru-memory:test creates under target/<profile> is never archived.
+      # profile directory, so no private kuru-test-supervisors snapshot under
+      # target/<profile> is ever archived.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
@@ -86,12 +86,195 @@ jobs:
           version=${version#kuru }
           mise run package -- --binary "target/$RELEASE_TARGET/release/kuru" --target "$RELEASE_TARGET" --version "$version"
           git diff --exit-code --name-only HEAD
-      - name: Verify native Dolt memory
-        run: mise run //packages/kuru-memory:test
       - name: Verify packaged offline runtime
         env:
           KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru
         run: mise run //apps/kuru-tui:test:embedded-runtime
+
+  native-memory:
+    # The arm64 host runs the complete real-memory suite through the same
+    # checked partitions as coverage, uninstrumented: every partition builds
+    # the kuru-memory test inventory into a fresh target, lists each test
+    # executable and runs only its assigned tests by exact name.
+    name: Native memory partition (ubuntu-24.04-arm, ${{ matrix.partition }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Must equal PARTITIONS in packages/kuru-delivery/src/coverage.rs.
+        partition: [1, 2, 3]
+    env:
+      MISE_LOCKED: "1"
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      MISE_NO_HOOKS: "1"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Record the job start for the inner test deadline
+        shell: bash
+        run: printf 'KURU_COVERAGE_JOB_STARTED=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select private bundle build inputs
+        shell: bash
+        # Leave the leaf absent so the preparer creates this runner's private ACLs.
+        # Cargo's restored target/ cache must not supply these directory grants.
+        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles-partition-${{ matrix.partition }}-${{ github.run_attempt }}\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - id: helper-cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          # The partition targets live in runner.temp and are never cached here.
+          shared-key: native-memory-aarch64-unknown-linux-gnu
+          save-if: ${{ matrix.partition == 1 && github.ref == 'refs/heads/main' }}
+      # test:partition declares these pinned fixture tools and task auto-install
+      # is disabled, so install them explicitly as the coverage partitions do.
+      - name: Install package-owned test tools
+        run: mise run //packages/kuru-delivery:setup:test-tools
+      # Allow-listed non-workspace dependency outputs exported by a successful
+      # main partition. A missing or evicted seed only makes the build slower.
+      - id: seed
+        name: Restore the uninstrumented dependency seed
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/kuru-coverage-seed
+          key: kuru-coverage-seed-v1-ubuntu-24.04-arm-uninstrumented-${{ hashFiles('Cargo.lock', 'mise.toml', 'mise.lock') }}
+          restore-keys: kuru-coverage-seed-v1-ubuntu-24.04-arm-uninstrumented-
+      - name: Select the dependency seed export
+        if: github.ref == 'refs/heads/main' && matrix.partition == 1 && steps.seed.outputs.cache-hit != 'true'
+        shell: bash
+        # Absent everywhere else, so only this partition exports after its receipt.
+        run: printf 'KURU_COVERAGE_SEED_EXPORT=%s/kuru-coverage-seed-export\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Run one checked memory partition
+        shell: bash
+        env:
+          KURU_COVERAGE_OS: ubuntu-24.04-arm
+          KURU_COVERAGE_PACKAGES: kuru-memory
+          # One fixed path per job, so seeded build-script and dep-info paths match.
+          KURU_COVERAGE_TARGET: ${{ runner.temp }}/kuru-coverage-target
+          KURU_COVERAGE_SOURCE: ${{ github.sha }}
+          KURU_COVERAGE_ATTEMPT: ${{ github.run_attempt }}
+          KURU_COVERAGE_PARTITION: ${{ matrix.partition }}
+          KURU_COVERAGE_PARTITIONS: "3"
+          KURU_COVERAGE_OUTPUT: ${{ runner.temp }}/kuru-coverage-evidence-${{ matrix.partition }}-${{ github.run_attempt }}
+          KURU_COVERAGE_DIAGNOSTICS: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.partition }}-${{ github.run_attempt }}
+          KURU_COVERAGE_SEED: ${{ runner.temp }}/kuru-coverage-seed
+          KURU_COVERAGE_HELPER_CACHE: ${{ steps.helper-cache.outputs.cache-hit }}
+          KURU_COVERAGE_SEED_CACHE: ${{ steps.seed.outputs.cache-hit }}
+          KURU_COVERAGE_SEED_MATCHED_KEY: ${{ steps.seed.outputs.cache-matched-key }}
+          # Must equal this job's timeout-minutes.
+          KURU_COVERAGE_JOB_MINUTES: "45"
+        run: mise run //packages/kuru-delivery:test:partition
+      - name: Require unchanged dependency locks
+        run: git diff --exit-code -- mise.lock Cargo.lock
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-coverage-ubuntu-24.04-arm-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kuru-coverage-evidence-${{ matrix.partition }}-${{ github.run_attempt }}
+          if-no-files-found: error
+      - name: Upload failed partition diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-coverage-diagnostics-ubuntu-24.04-arm-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.partition }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+      - name: Stage the exported dependency seed
+        if: env.KURU_COVERAGE_SEED_EXPORT != ''
+        shell: bash
+        run: |
+          # Import moved entries out of the restored seed; never save that remainder.
+          rm -rf -- "$RUNNER_TEMP/kuru-coverage-seed"
+          if [ -d "$KURU_COVERAGE_SEED_EXPORT" ]; then
+            mv -- "$KURU_COVERAGE_SEED_EXPORT" "$RUNNER_TEMP/kuru-coverage-seed"
+            echo 'KURU_COVERAGE_SEED_READY=true' >> "$GITHUB_ENV"
+          else
+            echo '::notice::No dependency seed export was produced; nothing will be saved'
+          fi
+      - name: Save the uninstrumented dependency seed
+        if: env.KURU_COVERAGE_SEED_READY == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/kuru-coverage-seed
+          key: ${{ steps.seed.outputs.cache-primary-key }}
+
+  native-memory-merge:
+    if: always()
+    needs: native-memory
+    # Receipt agreement without instrumentation: identical source, toolchain,
+    # profile and inventory identity across the three partitions, and
+    # per-executable test lists that are disjoint and complete.
+    name: Native memory merge (ubuntu-24.04-arm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Require every memory partition job to have succeeded
+        shell: bash
+        env:
+          KURU_COVERAGE_SHARDS_RESULT: ${{ needs.native-memory.result }}
+        run: |
+          if [ "$KURU_COVERAGE_SHARDS_RESULT" != success ]; then
+            echo "Memory partitions finished as '$KURU_COVERAGE_SHARDS_RESULT'; the merge requires success" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: native-memory-merge
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Download every memory partition's evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ci-coverage-ubuntu-24.04-arm-partition-*
+          merge-multiple: false
+          path: ${{ runner.temp }}/kuru-coverage-inputs
+      - name: Require agreeing memory partition receipts
+        shell: bash
+        env:
+          KURU_COVERAGE_OS: ubuntu-24.04-arm
+          KURU_COVERAGE_SOURCE: ${{ github.sha }}
+          KURU_COVERAGE_ATTEMPT: ${{ github.run_attempt }}
+          KURU_COVERAGE_MODE: uninstrumented
+          KURU_COVERAGE_PARTITIONS: "3"
+          KURU_COVERAGE_INPUTS: ${{ runner.temp }}/kuru-coverage-inputs
+          KURU_COVERAGE_REPORT: ${{ runner.temp }}/kuru-coverage-report-${{ github.run_attempt }}/coverage.lcov
+        run: |
+          mkdir -p "$(dirname "$KURU_COVERAGE_REPORT")"
+          mise run //packages/kuru-delivery:coverage:merge
+      - name: Require unchanged dependency locks
+        run: git diff --exit-code -- mise.lock Cargo.lock
+      # merge-summary.json only: an uninstrumented merge writes no LCOV.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: ci-coverage-ubuntu-24.04-arm-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kuru-coverage-report-${{ github.run_attempt }}
+          if-no-files-found: error
 
   native-platform:
     name: Native platform primitives (Windows)
@@ -139,7 +322,7 @@ jobs:
 
   ci-gate:
     if: always()
-    needs: [quality, native-tests, native-build, native-platform]
+    needs: [quality, native-tests, native-build, native-memory, native-memory-merge, native-platform]
     runs-on: ubuntu-latest
     steps:
       - name: Require every static and native check
