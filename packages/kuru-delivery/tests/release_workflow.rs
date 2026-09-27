@@ -502,6 +502,44 @@ fn native_workflow_shards_every_os_and_keeps_the_aggregate_fail_closed() {
     }
 }
 
+/// Splits workflow text into whole step blocks (the same `\n      - `
+/// step-level marker `workflow_steps` uses) and keeps only the ones that
+/// contain a `uses: Swatinem/rust-cache@...` key, however it is ordered
+/// within the step (first key or after `name:`). Each returned block is
+/// exactly one step, bounded by the next step marker or the file end, so a
+/// following `- run:` or `- uses:` step can never be read as part of it.
+fn rust_cache_blocks(text: &str) -> Vec<&str> {
+    text.split("\n      - ")
+        .skip(1)
+        .filter(|block| block.contains("uses: Swatinem/rust-cache@"))
+        .collect()
+}
+
+/// Extracts a rust-cache step block's own `save-if:` value (never one merely
+/// mentioned in a comment line), trimmed and with a surrounding `${{ }}`
+/// template stripped so callers compare against the bare expression.
+fn save_if_value(block: &str) -> Option<&str> {
+    let raw = block
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("save-if:").map(str::trim))?;
+    Some(
+        raw.strip_prefix("${{")
+            .and_then(|value| value.strip_suffix("}}"))
+            .map(str::trim)
+            .unwrap_or(raw),
+    )
+}
+
+/// A `save-if:` value restricts saves to `main` when it is exactly `false`,
+/// solely the main-ref check, or that check combined with another condition
+/// through `&&`. A bare mention of the ref check without `&&` (or without
+/// being the whole expression) does not count, since that shape cannot arise
+/// from a deliberate combination.
+fn save_if_restricts_to_main(value: &str) -> bool {
+    const MAIN_REF: &str = "github.ref == 'refs/heads/main'";
+    value == "false" || value == MAIN_REF || (value.contains(MAIN_REF) && value.contains("&&"))
+}
+
 #[test]
 fn every_rust_cache_step_restricts_saves_to_main() {
     // Every Swatinem/rust-cache step across the CI, quality and native-tests
@@ -513,19 +551,84 @@ fn every_rust_cache_step_restricts_saves_to_main() {
     let workflows = root.join(".github/workflows");
     for name in ["ci.yml", "quality.yml", "native-tests.yml"] {
         let text = fs::read_to_string(workflows.join(name)).unwrap();
-        let steps: Vec<_> = text.split("uses: Swatinem/rust-cache@").skip(1).collect();
-        assert!(!steps.is_empty(), "{name} has no rust-cache steps");
-        for (index, step) in steps.iter().enumerate() {
-            // Each step's own `with:` block ends at the next step (`\n      -
-            // name:`) or the job/file boundary.
-            let block = step.split("\n      - name:").next().unwrap();
+        let blocks = rust_cache_blocks(&text);
+        assert!(!blocks.is_empty(), "{name} has no rust-cache steps");
+        for (index, block) in blocks.iter().enumerate() {
+            let value = save_if_value(block).unwrap_or_else(|| {
+                panic!("{name} rust-cache step {index} has no save-if:\n{block}")
+            });
             assert!(
-                block.contains("github.ref == 'refs/heads/main'")
-                    || block.contains("save-if: false"),
-                "{name} rust-cache step {index} does not restrict saves to main:\n{block}"
+                save_if_restricts_to_main(value),
+                "{name} rust-cache step {index} does not restrict saves to main (save-if: {value}):\n{block}"
             );
         }
     }
+}
+
+#[test]
+fn rust_cache_step_without_save_if_has_no_extracted_value() {
+    // A rust-cache step that never sets save-if must be rejected by the
+    // regression test above (via the `unwrap_or_else` panic), not silently
+    // treated as restricted.
+    let yaml = "\
+  job:
+    steps:
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: example
+      - run: mise run lint:rust
+";
+    let blocks = rust_cache_blocks(yaml);
+    assert_eq!(blocks.len(), 1);
+    assert!(save_if_value(blocks[0]).is_none());
+}
+
+#[test]
+fn rust_cache_step_with_main_ref_only_in_a_comment_is_not_restricted() {
+    // The main-ref check must come from the actual save-if value, not merely
+    // appear anywhere in the step's text (e.g. an explanatory comment). This
+    // also proves the block boundary stops at the next `- run:` step instead
+    // of running on into it.
+    let yaml = "\
+  job:
+    steps:
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          # Only main saves: github.ref == 'refs/heads/main'
+          save-if: true
+      - run: mise run lint:rust
+";
+    let blocks = rust_cache_blocks(yaml);
+    assert_eq!(blocks.len(), 1);
+    assert!(!blocks[0].contains("mise run lint:rust"));
+    let value = save_if_value(blocks[0]).unwrap();
+    assert_eq!(value, "true");
+    assert!(!save_if_restricts_to_main(value));
+}
+
+#[test]
+fn rust_cache_step_named_before_uses_still_extracts_its_save_if() {
+    // `uses:` need not be the step's first key (e.g. a `name:` line comes
+    // first, as in the real windows platform step); the block must still
+    // capture the whole step, including a save-if several keys later.
+    let yaml = "\
+  job:
+    steps:
+      - name: Cache platform Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: native-platform-windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test native platform primitives
+        run: mise run //packages/kuru-platform:coverage
+";
+    let blocks = rust_cache_blocks(yaml);
+    assert_eq!(blocks.len(), 1);
+    let value = save_if_value(blocks[0]).unwrap();
+    assert!(save_if_restricts_to_main(value));
 }
 
 #[test]
