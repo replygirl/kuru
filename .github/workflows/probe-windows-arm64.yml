@@ -197,6 +197,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           Write-Output '===== PROBE: pinned toolchain ====='
+          # The image's rustup proxies, not mise shims: a shim first installs
+          # every configured tool, and this lock lacks a windows-arm64
+          # cargo-llvm-cov entry, so the shim fails before running cargo.
+          $env:PATH = "$env:USERPROFILE\.cargo\bin;" + $env:PATH
+          Write-Output "direct cargo=$((Get-Command cargo).Source) rustup=$((Get-Command rustup).Source)"
           mise --version 2>&1 | ForEach-Object { "$_" }
           Write-Output "mise machine=$(& "$env:RUNNER_TEMP\pe-machine.ps1" -Path (Get-Command mise).Source)"
           Write-Output "PATH cargo=$((Get-Command cargo -ErrorAction SilentlyContinue).Source) rustc=$((Get-Command rustc -ErrorAction SilentlyContinue).Source)"
@@ -249,8 +254,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           Write-Output '===== PROBE: aws-lc-sys build smoke ====='
-          # rustup's cargo directly: `mise x` would first try to install every
-          # configured tool, including any without a windows-arm64 lock entry.
+          # The image's rustup proxies, not mise shims: a shim first installs
+          # every configured tool, and this lock lacks a windows-arm64
+          # cargo-llvm-cov entry, so the shim fails before running cargo.
+          $env:PATH = "$env:USERPROFILE\.cargo\bin;" + $env:PATH
+          Write-Output "direct cargo=$((Get-Command cargo).Source) rustup=$((Get-Command rustup).Source)"
           cargo +1.98.1 check -p kuru-delivery --features tooling --locked 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\aws-lc.log" | ForEach-Object { "$_" }
           Write-Output "cargo check exit=$LASTEXITCODE"
           Write-Output '--- aws-lc-sys build script lines mentioning clang/cmake/cc-builder/requires/error:'
@@ -272,6 +280,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           Write-Output '===== PROBE: instrumented llvm-cov smoke ====='
+          # The image's rustup proxies, not mise shims: a shim first installs
+          # every configured tool, and this lock lacks a windows-arm64
+          # cargo-llvm-cov entry, so the shim fails before running cargo.
+          $env:PATH = "$env:USERPROFILE\.cargo\bin;" + $env:PATH
+          Write-Output "direct cargo=$((Get-Command cargo).Source) rustup=$((Get-Command rustup).Source)"
           rustup component add llvm-tools-preview --toolchain 1.98.1 2>&1 | ForEach-Object { "$_" }
           # Probe only: this lock has no windows-arm64 cargo-llvm-cov entry, so
           # install the pinned version unlocked in this ephemeral checkout.
