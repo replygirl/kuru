@@ -1,10 +1,25 @@
 ## 1. Acceptance evidence (defined before implementation)
 
-- [ ] 1.1 Record the before baseline: wall time for `mise run //packages/kuru-memory:test` and `mise run //packages/kuru-runtime:test`, per-package line coverage from one `mise run coverage`, and the `RUST_TEST_THREADS` history. Verify the numbers are written in this file.
+- [x] 1.1 Record the before baseline: wall time for `mise run //packages/kuru-memory:test` and `mise run //packages/kuru-runtime:test`, per-package line coverage from one `mise run coverage`, and the `RUST_TEST_THREADS` history. Verify the numbers are written in this file.
 - [ ] 1.2 After the default flips, run the full `kuru-memory`, `kuru-runtime` and `kuru-tui` suites locally. Verify that every suite passes with no test removed or ignored.
 - [ ] 1.3 Per-package line coverage after the change stays within noise of the baseline, and the 90% workspace gate holds. Verify by reporting both sets of numbers here.
 - [ ] 1.4 Windows is verified by native CI on the PR head, not assumed: the copied tree passes `Directory`/`LifecycleLease` private-object and DACL validation. Verify the run ID is recorded.
 - [ ] 1.5 The PR's own CI run measures the per-binary saving on each native OS. Verify the timings are recorded against the baseline.
+
+### Observed baseline (before, macOS arm64, base `8225613d`)
+
+- `RUST_TEST_THREADS=2` came from `8e621705` (#11, the Dolt bundling change). It then
+  spread to the coverage shards in `86a4665c` (#19) and to delivery `test:install` in
+  `67448442` (#88). None of those commit messages gives a reason for choosing 2.
+- `mise run //packages/kuru-memory:test`: exit 0, 660 s wall including build. The lib
+  ran 278 tests in 568.82 s; the integration targets ran 5 in 13.28 s, 12 in 19.82 s,
+  1 in 3.12 s and 6 in 0.01 s.
+- `mise run //packages/kuru-runtime:test`: exit 0, 659 s wall. The lib ran 220 tests in
+  603.14 s.
+- `mise run coverage`: exit 0, 1637 s wall, 87,523/93,264 lines (93.84%). By package:
+  kuru-memory 94.63%, kuru-runtime 96.14%, kuru-tui 93.83%, kuru-connectors 94.90%,
+  kuru-core 96.45%, kuru-platform 88.28%, kuru-archive 98.29%, kuru-delivery 84.64%.
+  The per-file summary is kept in local scratch (`template-fixture-coverage-before.txt`).
 
 ## 2. Template creation under lock (T1)
 
