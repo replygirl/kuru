@@ -123,6 +123,8 @@ jobs:
         with:
           cache-bin: false
           shared-key: native-platform-windows
+          # Restrict saves to main so PR runs never thrash the shared cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test native platform primitives and require 90% coverage
         run: mise run //packages/kuru-platform:coverage
       - name: Require unchanged dependency locks
