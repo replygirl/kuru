@@ -304,4 +304,4 @@
 ## 9. Documentation and support claim
 
 - [ ] 9.1 @manual (human) review `docs/install.md`, `docs/release.md`, `docs/development.md` in the final phase-3 commit -> the Windows on Arm row and any "supported" wording appear only after groups 1 to 4 and row 5.4 are green on the branch (recorded above from run 36322392824) (release-time rows 5.1 and 7.1 are post-merge gates that block `deploy-docs` and promotion); `docs:check` passes
-- [ ] 9.2 @regression (agent) `cospec validate --strict` and `cospec:managed:check` before archive -> pass
+- [x] 9.2 @regression (agent) `cospec validate --strict` and `cospec:managed:check` before archive -> pass (observed 2026-09-27 on macOS arm64 at `530466b3`: `mise run cospec -- validate windows-arm64-support --strict` 0 errors, 0 warnings; `mise run cospec:managed:check` exit 0; rerun at archive)
