@@ -6,7 +6,9 @@
 //! else. Only `debug/{deps,build,.fingerprint}` entries named
 //! `<stem>-<16 hex>` whose stem is not a workspace package or crate are
 //! accepted; links, raw profiles, private state and malformed entries are
-//! refused and counted. An absent or evicted seed only makes the build slower.
+//! refused and counted. An absent, evicted or unreadable seed only makes the
+//! build slower: an entry that cannot be read or moved is counted as an `io`
+//! refusal, any partial copy is removed, and Cargo rebuilds what is missing.
 //! Export applies the same allow-list, so a saved seed holds exactly what an
 //! import accepts.
 
@@ -37,6 +39,7 @@ pub enum Refusal {
     Private,
     Shape,
     Present,
+    Io,
 }
 
 impl Refusal {
@@ -48,6 +51,7 @@ impl Refusal {
             Self::Private => "private",
             Self::Shape => "shape",
             Self::Present => "present",
+            Self::Io => "io",
         }
     }
 }
@@ -201,6 +205,7 @@ fn move_entry(source: &Path, destination: &Path) -> Result<()> {
             let partial = std::path::PathBuf::from(partial);
             copy_tree(source, &partial)
                 .and_then(|()| fs::rename(&partial, destination).map_err(Into::into))
+                .inspect_err(|_| remove_entry(&partial))
                 .with_context(|| format!("copy seed entry {}", source.display()))
         }
         Err(error) => {
@@ -209,15 +214,37 @@ fn move_entry(source: &Path, destination: &Path) -> Result<()> {
     }
 }
 
+/// Best-effort removal of a partial destination entry, so Cargo rebuilds it.
+fn remove_entry(path: &Path) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            let _ = fs::remove_dir_all(path);
+        }
+        Ok(_) => {
+            let _ = fs::remove_file(path);
+        }
+        Err(_) => {}
+    }
+}
+
 /// Transfer every allow-listed entry of `from/debug/<kind>` into
 /// `to/debug/<kind>`, counting refusals. Entries already present in the
-/// destination are refused, never replaced.
-fn transfer(from: &Path, to: &Path, workspace: &BTreeSet<String>) -> Result<SeedReport> {
+/// destination are refused, never replaced. An I/O failure never fails the
+/// transfer: the affected entry or directory is counted as an `io` refusal,
+/// and a partially moved entry is removed from the destination.
+fn transfer(from: &Path, to: &Path, workspace: &BTreeSet<String>) -> SeedReport {
     let mut report = SeedReport::default();
-    for entry in fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let metadata = fs::symlink_metadata(entry.path())?;
+    let Ok(entries) = fs::read_dir(from) else {
+        report.refuse(Refusal::Io);
+        return report;
+    };
+    for entry in entries {
+        let Ok((name, metadata)) = entry.and_then(|entry| {
+            fs::symlink_metadata(entry.path()).map(|metadata| (entry.file_name(), metadata))
+        }) else {
+            report.refuse(Refusal::Io);
+            continue;
+        };
         if name != PROFILE {
             report.refuse(if metadata.file_type().is_symlink() {
                 Refusal::Symlink
@@ -236,13 +263,21 @@ fn transfer(from: &Path, to: &Path, workspace: &BTreeSet<String>) -> Result<Seed
     if !fs::symlink_metadata(&profile)
         .is_ok_and(|metadata| metadata.is_dir() && !is_reparse_point(&metadata))
     {
-        return Ok(report);
+        return report;
     }
-    for entry in fs::read_dir(&profile)? {
-        let entry = entry?;
-        let name = entry.file_name();
+    let Ok(kinds) = fs::read_dir(&profile) else {
+        report.refuse(Refusal::Io);
+        return report;
+    };
+    for entry in kinds {
+        let Ok((name, path, metadata)) = entry.and_then(|entry| {
+            fs::symlink_metadata(entry.path())
+                .map(|metadata| (entry.file_name(), entry.path(), metadata))
+        }) else {
+            report.refuse(Refusal::Io);
+            continue;
+        };
         let kind = name.to_str().unwrap_or_default();
-        let metadata = fs::symlink_metadata(entry.path())?;
         if !SEEDED.contains(&kind) {
             report.refuse(if PRIVATE.contains(&kind) {
                 Refusal::Private
@@ -258,14 +293,18 @@ fn transfer(from: &Path, to: &Path, workspace: &BTreeSet<String>) -> Result<Seed
             continue;
         }
         let destination = to.join(PROFILE).join(kind);
-        fs::create_dir_all(&destination)
-            .with_context(|| format!("create {}", destination.display()))?;
-        let mut names: Vec<_> = fs::read_dir(entry.path())?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect::<std::io::Result<_>>()?;
+        let names = fs::create_dir_all(&destination).and_then(|()| {
+            fs::read_dir(&path)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<std::io::Result<Vec<_>>>()
+        });
+        let Ok(mut names) = names else {
+            report.refuse(Refusal::Io);
+            continue;
+        };
         names.sort();
         for name in names {
-            let source = entry.path().join(&name);
+            let source = path.join(&name);
             let Some(text) = name.to_str() else {
                 report.refuse(Refusal::Shape);
                 continue;
@@ -284,12 +323,16 @@ fn transfer(from: &Path, to: &Path, workspace: &BTreeSet<String>) -> Result<Seed
                 report.refuse(Refusal::Present);
                 continue;
             }
-            move_entry(&source, &target)?;
+            if let Err(error) = move_entry(&source, &target) {
+                eprintln!("coverage seed: skipped {}: {error:#}", source.display());
+                report.refuse(Refusal::Io);
+                continue;
+            }
             report.transferred.entries += 1;
             report.transferred.bytes = report.transferred.bytes.saturating_add(bytes);
         }
     }
-    Ok(report)
+    report
 }
 
 /// Import a restored seed into a fresh target. `None` is returned when the
@@ -301,13 +344,17 @@ pub fn import(
 ) -> Result<Option<SeedReport>> {
     match fs::symlink_metadata(seed) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(anyhow::Error::new(error).context(format!("inspect {}", seed.display()))),
+        Err(_) => {
+            let mut report = SeedReport::default();
+            report.refuse(Refusal::Io);
+            Ok(Some(report))
+        }
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             let mut report = SeedReport::default();
             report.refuse(Refusal::Symlink);
             Ok(Some(report))
         }
-        Ok(_) => transfer(seed, target, workspace).map(Some),
+        Ok(_) => Ok(Some(transfer(seed, target, workspace))),
     }
 }
 
@@ -328,7 +375,7 @@ pub fn export(
             anyhow::Error::new(error).context(format!("create {}", destination.display()))
         }
     })?;
-    transfer(target, destination, workspace)
+    Ok(transfer(target, destination, workspace))
 }
 
 #[cfg(test)]
@@ -521,6 +568,56 @@ mod tests {
             assert_eq!(report.refused.get("symlink"), Some(&1));
             assert_eq!(report.transferred, Transfer::default());
         }
+    }
+
+    /// An unreadable kind directory and an entry that cannot be moved are
+    /// counted as `io` refusals; every other entry is still imported.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_or_unmovable_seed_entries_degrade_to_refusals() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("seed");
+        let target = temp.path().join("target");
+        seed(&source);
+        let build = source.join("debug/build");
+        fs::set_permissions(&build, fs::Permissions::from_mode(0o000)).unwrap();
+        // A read-only destination kind directory: moves into it fail.
+        let fingerprint = target.join("debug/.fingerprint");
+        fs::create_dir_all(&fingerprint).unwrap();
+        fs::set_permissions(&fingerprint, fs::Permissions::from_mode(0o555)).unwrap();
+        let readable = fs::read_dir(&build).is_ok();
+        let report = import(&source, &target, &workspace()).unwrap().unwrap();
+        fs::set_permissions(&build, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&fingerprint, fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            // Permissions are not enforced for this user (root); nothing to test.
+            return;
+        }
+        let expected: BTreeSet<_> = [
+            format!("debug/deps/libserde-{HASH}.rlib"),
+            format!("debug/deps/serde-{HASH}.d"),
+            format!("debug/deps/serde_derive-{HASH}.dll.lib"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(names(&target), expected);
+        assert_eq!(report.transferred.entries, 3);
+        // The build directory and the fingerprint entry.
+        assert_eq!(report.refused.get("io"), Some(&2));
+        assert!(
+            source
+                .join(format!("debug/.fingerprint/serde-{HASH}"))
+                .exists()
+        );
+        // An unreadable seed root is one refusal, never an error.
+        let root = temp.path().join("closed");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+        let report = import(&root, &target, &workspace()).unwrap().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(report.refused.get("io"), Some(&1));
     }
 
     #[test]

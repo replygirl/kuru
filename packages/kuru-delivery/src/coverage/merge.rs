@@ -40,6 +40,9 @@ pub struct MergeOptions<'a> {
     pub attempt: &'a str,
     pub count: u32,
     pub mode: Mode,
+    /// The package scope every partition must have built: the whole
+    /// workspace when instrumented, the configured packages otherwise.
+    pub scope: &'a [String],
 }
 
 /// One accepted partition's row of the merge summary.
@@ -327,6 +330,12 @@ fn accept(
             "{label} instrumented scope is not the whole workspace"
         );
     }
+    ensure!(
+        receipt.scope == options.scope,
+        "{label} scope {:?} differs from the expected {:?}",
+        receipt.scope,
+        options.scope
+    );
 
     let inventory =
         read_inventory(&directory.join(INVENTORY_FILE)).with_context(|| label.clone())?;
@@ -682,6 +691,7 @@ mod tests {
         mode: Mode,
         count: u32,
         os: String,
+        scope: Vec<String>,
     }
 
     fn name(os: &str, index: u32, attempt: u64) -> String {
@@ -701,6 +711,10 @@ mod tests {
                 mode,
                 count,
                 os: LOCAL_OS.to_owned(),
+                scope: match mode {
+                    Mode::Instrumented => WORKSPACE_PACKAGES.map(str::to_owned).to_vec(),
+                    Mode::Uninstrumented => vec!["kuru-memory".to_owned()],
+                },
             };
             for index in 1..=count {
                 downloaded.upload(index, 1).await;
@@ -734,6 +748,7 @@ mod tests {
                 attempt: "3",
                 count: self.count,
                 mode: self.mode,
+                scope: &self.scope,
             }
         }
 
@@ -985,6 +1000,18 @@ mod tests {
         // A missing index fails naming it.
         fs::remove_dir_all(downloaded.inputs.join(name(LOCAL_OS, 3, 1))).unwrap();
         downloaded.refuse("coverage partition 3 of 3 has no evidence");
+    }
+
+    #[tokio::test]
+    async fn uninstrumented_partitions_must_build_the_configured_scope() {
+        // Partitions that agree with each other on a scope narrower than the
+        // configured packages are refused before any summary is written.
+        let mut downloaded = Downloaded::new(Mode::Uninstrumented, 2).await;
+        downloaded.scope = vec!["kuru-memory".to_owned(), "kuru-runtime".to_owned()];
+        downloaded.refuse(
+            r#"scope ["kuru-memory"] differs from the expected ["kuru-memory", "kuru-runtime"]"#,
+        );
+        assert!(!downloaded.report.parent().unwrap().exists());
     }
 
     #[test]

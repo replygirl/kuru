@@ -784,6 +784,8 @@ fn arm64_memory_suite_runs_as_gated_uninstrumented_partitions() {
         "KURU_COVERAGE_SHARDS_RESULT: ${{ needs.native-memory.result }}",
         "pattern: ci-coverage-ubuntu-24.04-arm-partition-*\n",
         "KURU_COVERAGE_MODE: uninstrumented\n",
+        // The merge refuses partitions of any other scope.
+        "KURU_COVERAGE_PACKAGES: kuru-memory\n",
         "mise run //packages/kuru-delivery:coverage:merge",
     ] {
         assert!(merge.contains(required), "memory merge lost {required}");

@@ -260,6 +260,7 @@ jobs:
           KURU_COVERAGE_SOURCE: ${{ github.sha }}
           KURU_COVERAGE_ATTEMPT: ${{ github.run_attempt }}
           KURU_COVERAGE_MODE: uninstrumented
+          KURU_COVERAGE_PACKAGES: kuru-memory
           KURU_COVERAGE_PARTITIONS: "3"
           KURU_COVERAGE_INPUTS: ${{ runner.temp }}/kuru-coverage-inputs
           KURU_COVERAGE_REPORT: ${{ runner.temp }}/kuru-coverage-report-${{ github.run_attempt }}/coverage.lcov

@@ -165,6 +165,8 @@ struct ShardInputs {
 #[derive(Debug)]
 struct MergeInputs {
     mode: Mode,
+    /// The package scope every partition must have built.
+    packages: Vec<String>,
     partitions: u64,
     inputs: PathBuf,
     report: PathBuf,
@@ -238,28 +240,34 @@ impl Inputs {
             attempt: text("ATTEMPT"),
             os: text("OS"),
         };
+        let packages = |mode: Mode| -> Result<Vec<String>> {
+            match mode {
+                Mode::Instrumented => {
+                    ensure!(
+                        !values.contains_key("PACKAGES"),
+                        "an instrumented partition builds the whole workspace; unset {INPUT_PREFIX}PACKAGES"
+                    );
+                    Ok(WORKSPACE_PACKAGES.map(str::to_owned).to_vec())
+                }
+                Mode::Uninstrumented => {
+                    let listed = values.get("PACKAGES").with_context(|| {
+                        format!("uninstrumented mode requires {INPUT_PREFIX}PACKAGES")
+                    })?;
+                    let mut packages: Vec<_> = listed
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|package| !package.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    packages.sort();
+                    packages.dedup();
+                    Ok(packages)
+                }
+            }
+        };
         let plan = match step {
             Step::Shard(mode) => {
-                let packages = match mode {
-                    Mode::Instrumented => {
-                        ensure!(
-                            !values.contains_key("PACKAGES"),
-                            "an instrumented partition builds the whole workspace; unset {INPUT_PREFIX}PACKAGES"
-                        );
-                        WORKSPACE_PACKAGES.map(str::to_owned).to_vec()
-                    }
-                    Mode::Uninstrumented => {
-                        let mut packages: Vec<_> = values["PACKAGES"]
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|package| !package.is_empty())
-                            .map(str::to_owned)
-                            .collect();
-                        packages.sort();
-                        packages.dedup();
-                        packages
-                    }
-                };
+                let packages = packages(mode)?;
                 Plan::Shard(ShardInputs {
                     mode,
                     target: path("TARGET")?,
@@ -277,12 +285,16 @@ impl Inputs {
                     seed_key: values.get("SEED_MATCHED_KEY").cloned(),
                 })
             }
-            Step::Merge => Plan::Merge(MergeInputs {
-                mode: Mode::parse(values["MODE"].trim())?,
-                partitions: number("PARTITIONS")?,
-                inputs: path("INPUTS")?,
-                report: path("REPORT")?,
-            }),
+            Step::Merge => {
+                let mode = Mode::parse(values["MODE"].trim())?;
+                Plan::Merge(MergeInputs {
+                    mode,
+                    packages: packages(mode)?,
+                    partitions: number("PARTITIONS")?,
+                    inputs: path("INPUTS")?,
+                    report: path("REPORT")?,
+                })
+            }
         };
         Ok(Self {
             common,
@@ -746,7 +758,8 @@ async fn prepare<H: Host>(
     phases.record("prepare", started)?;
 
     // Seeded dependency units enter the fresh target before any Cargo child
-    // writes into it. A missing seed is a miss, never an error.
+    // writes into it. A missing seed is a miss and an unreadable entry a
+    // counted refusal, never an error.
     let started = unix_now()?;
     let names = seed::workspace_names(workspace.names.iter().map(String::as_str));
     let report = match &inputs.seed {
@@ -1121,6 +1134,7 @@ fn run_merge(common: &Common, inputs: &MergeInputs) -> Result<()> {
         attempt: &common.attempt,
         count,
         mode: inputs.mode,
+        scope: &inputs.packages,
     })
     .with_context(|| format!("coverage merge for {} failed", common.os))?;
     merge::print_summary(&summary);
@@ -2053,6 +2067,9 @@ mod tests {
             unreachable!()
         };
         merge.set("MODE", mode.name());
+        if mode == Mode::Uninstrumented {
+            merge.set("PACKAGES", "kuru-memory");
+        }
         let inputs = merge.job("inputs");
         fs::create_dir_all(&inputs).unwrap();
         for index in (1..=count).filter(|index| Some(*index) != skip) {
@@ -2108,6 +2125,7 @@ mod tests {
         // The mode of the evidence must be the merge's.
         let mut mode = partitions(UNINSTRUMENTED, 1, None).await;
         mode.set("MODE", "instrumented");
+        mode.vars.remove(&format!("{INPUT_PREFIX}PACKAGES"));
         let error = format!("{:#}", mode.run(Step::Merge).await.unwrap_err());
         assert!(
             error.contains("unexpected artifact entries") || error.contains("is uninstrumented"),
@@ -2145,6 +2163,11 @@ mod tests {
         merge.vars.remove(&format!("{INPUT_PREFIX}REPORT"));
         let error = merge.run(Step::Merge).await.unwrap_err().to_string();
         assert_eq!(error, "coverage merge requires KURU_COVERAGE_REPORT");
+        // An uninstrumented merge pins the package scope it expects.
+        let mut scope = Scenario::new(Step::Merge);
+        scope.set("MODE", "uninstrumented");
+        let error = scope.run(Step::Merge).await.unwrap_err().to_string();
+        assert_eq!(error, "uninstrumented mode requires KURU_COVERAGE_PACKAGES");
         let mut mode = Scenario::new(Step::Merge);
         mode.set("MODE", "partial");
         let error = mode.run(Step::Merge).await.unwrap_err().to_string();
