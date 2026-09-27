@@ -698,11 +698,17 @@ asset_pattern = "cospec-*-windows-x64.zip"`: cospec publishes no
 `windows-arm64` release asset, so this pins the lock's `windows-arm64` entry to
 the existing `windows-x64` asset (`asset_pattern` replaces mise's asset
 autodetection for that platform). Every other tool listed here resolves its
-own `windows-arm64` entry without a pin. Two of those entries are x64
-executables run under emulation: `aqua:cocogitto/cocogitto` falls back to its
-`windows-x64` asset through the aqua registry's own `windows_arm_emulation`
-flag, and `aqua:koalaman/shellcheck` publishes a single Windows archive, so its
-`windows-arm64` entry is the same x64 `shellcheck-v0.11.0.zip` as its
+own `windows-arm64` entry without a pin. Three of those entries are x64
+executables run under emulation. `aqua:cocogitto/cocogitto` and
+`aqua:taiki-e/cargo-llvm-cov` fall back to their `windows-x64` assets through
+the aqua registry's own `windows_arm_emulation` flag. For cargo-llvm-cov this
+holds although upstream also publishes `cargo-llvm-cov-aarch64-pc-windows-msvc`
+archives: the aqua backend offers no per-platform asset option (only
+`symlink_bins`, `vars` and `prerelease`; see mise's
+[aqua backend](https://mise.jdx.dev/dev-tools/backends/aqua.html)), so the root
+and delivery locks record `cargo-llvm-cov-x86_64-pc-windows-msvc.tar.gz` for
+`windows-arm64`. `aqua:koalaman/shellcheck` publishes a single Windows archive,
+so its `windows-arm64` entry is the same x64 `shellcheck-v0.11.0.zip` as its
 `windows-x64` entry. The rest resolve native Arm64 Windows assets, each under
 its project's own naming (for example `hk-aarch64-pc-windows-msvc.zip`,
 `actionlint_1.7.12_windows_arm64.zip`, `taplo-windows-aarch64.zip` and

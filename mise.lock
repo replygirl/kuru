@@ -236,6 +236,12 @@ url = "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-
 url_api = "https://api.github.com/repos/taiki-e/cargo-llvm-cov/releases/assets/547403156"
 provenance = "github-attestations"
 
+[tools."aqua:taiki-e/cargo-llvm-cov"."platforms.windows-arm64"]
+checksum = "sha256:15eefd5b90fcdd4006b727c6e710d70a61aff509fcd7bb37f9c2a35c4f024948"
+url = "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-pc-windows-msvc.tar.gz"
+url_api = "https://api.github.com/repos/taiki-e/cargo-llvm-cov/releases/assets/547404213"
+provenance = "github-attestations"
+
 [tools."aqua:taiki-e/cargo-llvm-cov"."platforms.windows-x64"]
 checksum = "sha256:15eefd5b90fcdd4006b727c6e710d70a61aff509fcd7bb37f9c2a35c4f024948"
 url = "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-pc-windows-msvc.tar.gz"
