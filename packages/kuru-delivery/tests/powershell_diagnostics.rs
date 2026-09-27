@@ -302,7 +302,7 @@ fn coverage_tasks_run_the_rust_orchestrator_without_shell_metacharacters() {
     );
     assert_eq!(shard["depends"].as_array().unwrap(), &bundle);
     assert_eq!(
-        shard["tools"]["cargo:cargo-llvm-cov"].as_str(),
+        shard["tools"]["aqua:taiki-e/cargo-llvm-cov"].as_str(),
         Some("0.9.1")
     );
     // Uninstrumented partitions use the prepared snapshot, as kuru-memory:test.
@@ -313,7 +313,11 @@ fn coverage_tasks_run_the_rust_orchestrator_without_shell_metacharacters() {
     );
     assert_eq!(partition["env"]["RUST_TEST_THREADS"].as_str(), Some("2"));
     assert_eq!(partition["depends"].as_array().unwrap(), &bundle);
-    assert!(partition["tools"].get("cargo:cargo-llvm-cov").is_none());
+    assert!(
+        partition["tools"]
+            .get("aqua:taiki-e/cargo-llvm-cov")
+            .is_none()
+    );
     // The merge reads uploaded evidence only: no bundle, tool or supervisor.
     let merge = coverage_task("coverage:merge");
     for key in ["depends", "tools", "env"] {
