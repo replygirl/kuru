@@ -27,7 +27,7 @@ use std::{
 };
 
 /// The pinned cargo-llvm-cov tool request resolved through mise.
-const LLVM_COV_TOOL: &str = "cargo:cargo-llvm-cov@0.9.1";
+const LLVM_COV_TOOL: &str = "aqua:taiki-e/cargo-llvm-cov@0.9.1";
 /// Bound for short captured commands. `show-env` resolves full Cargo metadata,
 /// which may fetch dependency manifests on a cold runner.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -1826,11 +1826,11 @@ mod tests {
             ),
             (
                 |fake| fake.bin_paths = Some(String::new()),
-                "did not name one cargo:cargo-llvm-cov@0.9.1 directory",
+                "did not name one aqua:taiki-e/cargo-llvm-cov@0.9.1 directory",
             ),
             (
                 |fake| fake.bin_paths = Some("/a\n/b".to_owned()),
-                "did not name one cargo:cargo-llvm-cov@0.9.1 directory",
+                "did not name one aqua:taiki-e/cargo-llvm-cov@0.9.1 directory",
             ),
             (
                 |fake| fake.bin_paths = Some("/nonexistent-kuru-bin".to_owned()),

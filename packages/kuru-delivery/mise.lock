@@ -65,11 +65,6 @@ specifiers = ["0.22.2"]
 default-features = "false"
 locked = "true"
 
-[[tools."cargo:cargo-llvm-cov"]]
-version = "0.9.1"
-backend = "cargo:cargo-llvm-cov"
-specifiers = ["0.9.1"]
-
 [[tools."github:jdx/communique"]]
 version = "1.4.2"
 backend = "github:jdx/communique"
