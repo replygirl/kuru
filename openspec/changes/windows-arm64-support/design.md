@@ -96,7 +96,8 @@ Current state, `main` at `501ab92d` unless noted:
   unbundled builds; platform mechanics live in `kuru-platform`; `linux-x64` is the
   only engine build host (lead decision 4); PR6a owns the manifest, both parsers,
   `bundle build`, the Linux determinism job and the arm64 asset data; another
-  session owns `.github/workflows` until its PR5 merge notice; #106 removes
+  session owned `.github/workflows` until its PR5 merge notice (both the PR5 and
+  PR4b notices were received for stage 3, see blocking-changes Phase Gates); #106 removes
   the Intel macOS target from the catalog, `install.sh`, `dolt-assets.json` and
   `bundle_build.rs`, leaving only the `mise.lock` `macos-x64` entries.
 
@@ -640,10 +641,10 @@ stores it as `<archive_sha256>.archive` in the bundle directory, after which
 every later `bundle:prepare` for that target in the same `KURU_DOLT_BUNDLE_DIR`
 is a verified cache hit (so `build`, `prefetch` and `coverage:shard` need no
 further change). PR6a's `Bundle build` workflow (`bundle-build.yml`) runs only on
-path-filtered pull requests and dispatch, builds twice (about 9 minutes each)
-for determinism and uploads `bundle-build-aarch64-pc-windows-msvc` with a
-30-day retention; it is determinism evidence, not a source other workflows can
-depend on. This change therefore owns the hand-off: each workflow that runs an
+path-filtered pull requests and dispatch, builds twice for determinism (the
+two-build job ran in 8m49s on run 36272281338) and uploads
+`bundle-build-aarch64-pc-windows-msvc` with a 30-day retention; it is
+determinism evidence, not a source other workflows can depend on. This change therefore owns the hand-off: each workflow that runs an
 arm64 leg gains one `ubuntu-latest` job, `dolt-windows-arm64`, that runs
 `//packages/kuru-memory:setup:build-tools` and a single
 `//packages/kuru-memory:bundle:build -- --target aarch64-pc-windows-msvc`
@@ -657,8 +658,9 @@ The trust anchor is the committed manifest pin, which the import re-verifies;
 the artifact is transport only. In `native-tests.yml` the job runs only when
 `inputs.os` is `windows-11-arm`, so x64 and Unix calls are unchanged and the
 job is parameterized by OS rather than restructuring shared jobs. Reusing
-`bundle-build.yml` through `workflow_call` was rejected: it double-builds and
-its job is the determinism check. Restoring a previously verified archive from
+`bundle-build.yml` through `workflow_call` was rejected: it is path-filtered
+determinism evidence with a two-build job and a 30-day artifact, not a
+dependency every run can call; the single build's cost is measured in task 3.5. Restoring a previously verified archive from
 `actions/cache` keyed on the pinned `archive_sha256` is an allowed optimization
 decided with the task 3.5 timings, since the import verifies the pin either way.
 
