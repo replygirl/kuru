@@ -137,7 +137,7 @@ jobs:
           mkdir -p "$dir"
           (
             while true; do
-              echo "$(date -u +%T) procs=$(ps -A | wc -l | tr -d ' ') maxproc=$(sysctl -n kern.maxproc)" >> "$dir/procs.log"
+              echo "$(date -u +%T) procs=$(ps -A | wc -l | tr -d ' ') maxproc=$(sysctl -n kern.maxproc) maxprocperuid=$(sysctl -n kern.maxprocperuid) user_procs=$(ps -U "$(id -u)" | wc -l | tr -d ' ')" >> "$dir/procs.log"
               sleep 15
             done
           ) < /dev/null > /dev/null 2>&1 &
