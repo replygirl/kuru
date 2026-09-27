@@ -19,6 +19,8 @@
 //! partitions' mappings are identical and their region counts non-negative: a
 //! region's summed count is nonzero exactly when some partition's is, and a
 //! line's count is the maximum of a structurally chosen set of region counts.
+//! Non-negativity is enforced: a region carrying the clamped count of a
+//! negative counter expression fails the partition's line export.
 
 use super::lcov::relative_source;
 use anyhow::{Context, Result, bail, ensure};
@@ -280,6 +282,9 @@ struct Region {
     kind: Kind,
 }
 
+/// `i64::MAX`, the value `llvm-cov export` gives a negative region count.
+const NEGATIVE_COUNT: u64 = i64::MAX as u64;
+
 fn position(value: u64, what: &str) -> Result<u32> {
     u32::try_from(value).with_context(|| format!("region {what} {value} is out of range"))
 }
@@ -302,6 +307,18 @@ impl Region {
         ensure!(
             region.start <= region.end,
             "region ends before it starts: {region:?}"
+        );
+        // `llvm-cov export` clamps the huge unsigned value of a negative
+        // counter expression (such as lost non-atomic counter updates under
+        // concurrent tests) to i64::MAX; no real count approaches it. A
+        // negative count could cancel in the summed profile while this
+        // partition reports the line covered, so the union would no longer
+        // equal llvm-cov's merged figure. Refuse it and let the partition rerun.
+        ensure!(
+            region.count < NEGATIVE_COUNT,
+            "region {region:?} has count {}, the clamped value of a negative counter expression; \
+             the merged figure would not be exact, so rerun this partition",
+            region.count
         );
         Ok(region)
     }
@@ -1153,6 +1170,14 @@ mod tests {
             ),
             (base.replace("/r/a.rs", "/q/a.rs"), "outside"),
             (base.replace("\"regions\":[[1,1,1,9,1,0,0,0]]", "\"regions\":[]"), "no region"),
+            (
+                base.replace("[1,1,1,9,1,0,0,0]", "[1,1,1,9,9223372036854775807,0,0,0]"),
+                "function f in a.rs: region Region { start: (1, 1), end: (1, 9), count: 9223372036854775807",
+            ),
+            (
+                base.replace("[1,1,1,9,1,0,0,0]", "[1,1,1,9,18446744073709551615,0,0,0]"),
+                "negative counter expression",
+            ),
         ] {
             let error = LlvmExport::parse(&text)
                 .and_then(|export| export.line_export("/r"))
