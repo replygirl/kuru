@@ -15,8 +15,10 @@ supervisor and Dolt process.
   pre-migrated template data directory per fingerprint on disk, in the private
   per-profile test directory beside the prepared supervisor snapshot. The
   fingerprint hashes the supervisor that `test_supervisor()` actually returns
-  (the prepared snapshot, or under coverage the instrumented helper) and the
-  current schema version. Creation holds a file lock, stages in a private
+  (the prepared snapshot, or under coverage the instrumented helper), the
+  current schema versions, the pinned engine version, the fixture scope, a
+  capture format constant and the sources that define the stored schema
+  (migrations run in the test process, not the supervisor). Creation holds a file lock, stages in a private
   temporary directory, captures only a cleanly closed cold open (after reap and
   lifecycle-lease release) and publishes atomically. Reuse revalidates the
   private objects; a template that fails validation is rebuilt under the lock,
