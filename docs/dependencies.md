@@ -15,6 +15,14 @@ upstream archives were re-pinned from the v2.3.4 release assets; their
 `LICENSES` payload is byte-identical to 2.3.3. The Windows arm64 entry builds
 from Go module `v0.40.5-0.20260914203517-373301a56c9a`, and its archive pins
 are committed from the reproducible linux-x64 build.
+It moved to full Dolt 2.3.5 (release commit `ad65af6c`) on 2026-09-27
+because 2.3.5 is the current upstream release (published 2026-09-16); its
+release notes contain nothing aimed at the storage path, and it is not
+claimed to fix the macOS uncertain-write failure, which already recurred on
+2.3.4. The four upstream archives were re-pinned from the v2.3.5 release
+assets; their `LICENSES` payload is byte-identical to 2.3.4. The Windows
+arm64 entry builds from Go module `v0.40.5-0.20260916160725-ad65af6cc937`,
+and its archive pins come from the reproducible linux-x64 build.
 The offline tokenizer addition checked `tiktoken-rs` 0.12.0 on 2026-09-22;
 its embedded `o200k_base.tiktoken` SHA-256 matches [OpenAI's published
 asset hash](https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py),

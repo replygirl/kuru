@@ -1438,7 +1438,7 @@ mod tests {
         for (request, target) in requests.iter().zip(&upstream) {
             let stem = parsed.select(target).unwrap().stem.clone();
             assert!(
-                request.starts_with("GET http://github.com/dolthub/dolt/releases/download/v2.3.4/")
+                request.starts_with("GET http://github.com/dolthub/dolt/releases/download/v2.3.5/")
                     && request.contains(&stem),
                 "{request}"
             );

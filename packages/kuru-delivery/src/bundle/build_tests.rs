@@ -233,7 +233,7 @@ impl Runner for FakeRunner {
                     fs::write(
                         directory.join("cmd/dolt/doltversion/version.go"),
                         behavior.version_go.clone().unwrap_or_else(|| {
-                            "package doltversion\n\nconst (\n\tVersion = \"2.3.4\"\n)\n".into()
+                            "package doltversion\n\nconst (\n\tVersion = \"2.3.5\"\n)\n".into()
                         }),
                     )
                     .unwrap();
@@ -246,7 +246,7 @@ impl Runner for FakeRunner {
                         json!({
                             "Path": path,
                             "Version": version,
-                            "Sum": behavior.sum.clone().unwrap_or_else(|| "h1:WMNOjziFJIYbehzGJ1lPkWk9rcN/RcjmVpVfKoept0U=".into()),
+                            "Sum": behavior.sum.clone().unwrap_or_else(|| "h1:Gr3gztfxO/h2IDl3N6rVmzVDbt5wYe2FKF0tWWMIlGU=".into()),
                             "Dir": directory,
                         })
                         .to_string(),
@@ -749,10 +749,10 @@ async fn tampered_or_mismatched_inputs_fail_closed() {
         (
             "version",
             Behavior {
-                version_go: Some("const Version = \"2.3.3\"".into()),
+                version_go: Some("const Version = \"2.3.4\"".into()),
                 ..Behavior::default()
             },
-            "does not declare version 2.3.4",
+            "does not declare version 2.3.5",
         ),
         (
             "licenses",
