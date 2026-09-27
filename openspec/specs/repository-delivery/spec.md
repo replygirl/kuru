@@ -126,8 +126,8 @@ the existing workspace coverage threshold and release archive contract SHALL rem
 
 The release workflow SHALL build every Windows target in the release catalog,
 currently `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`, from the same
-prepared version commit as the native Unix targets and include each ZIP and
-checksum in the complete staged candidate. Each ZIP SHALL contain exactly the
+prepared version commit as the other native targets in the release catalog and
+include each ZIP and checksum in the complete staged candidate. Each ZIP SHALL contain exactly the
 flat regular members `kuru.exe`, `LICENSE` and `README.md`; the executable SHALL
 include its verified full Dolt bundle for that target. Target selection, expected
 executable names and formats SHALL have one authoritative catalog, and adding a
@@ -143,7 +143,7 @@ the selected commit before the sole final public-release job.
 
 #### Scenario: Release run resumes
 - **WHEN** an interrupted release is rerun after some target artifacts were prepared
-- **THEN** recovery uses the existing planned version commit, verifies the complete catalog candidate inventory and does not create another bump or overwrite published assets.
+- **THEN** recovery uses the existing planned version commit, verifies one core and one paired support archive for every catalog target in the candidate inventory and does not create another bump or overwrite published assets.
 
 ### Requirement: Package-owned published Windows verifier
 
