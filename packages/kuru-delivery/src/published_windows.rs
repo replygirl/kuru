@@ -72,6 +72,112 @@ struct EngineEvidence {
     version: String,
     executable_sha256: String,
     license_sha256: String,
+    /// Each extracted notice a built engine asset lists; empty for upstream.
+    notices: Vec<VerifiedNotice>,
+}
+
+/// Where a Dolt manifest asset's engine came from; the manifest spells every
+/// asset's `provenance` exactly `upstream` or `built`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum EngineProvenance {
+    Upstream,
+    Built,
+}
+
+/// One pinned third-party notice a built engine asset ships beside `LICENSES`.
+/// `from` and `path` are build-time inputs that verification does not interpret.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct EngineNotice {
+    name: String,
+    from: String,
+    path: String,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EngineNotices {
+    provenance: EngineProvenance,
+    executable_name: String,
+    #[serde(default)]
+    notices: Option<Vec<EngineNotice>>,
+}
+
+/// A notice whose extracted bytes matched the manifest, as receipts record it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifiedNotice {
+    pub name: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Require every notice a Dolt manifest `asset` lists for a built engine in the
+/// extracted engine directory, reading each through `read(name)`.
+///
+/// Built assets must list at least one notice and upstream assets none; every
+/// listed notice must be pinned, name one plain file other than `LICENSES` or
+/// the executable, and match its exact size and SHA-256. Upstream assets keep
+/// their `LICENSES`-only check and return no notices.
+pub fn verify_engine_notices(
+    asset: &Value,
+    mut read: impl FnMut(&str) -> Result<Vec<u8>>,
+) -> Result<Vec<VerifiedNotice>> {
+    let declared = EngineNotices::deserialize(asset)
+        .context("decode the Dolt asset provenance and notices")?;
+    let notices = declared.notices.unwrap_or_default();
+    match declared.provenance {
+        EngineProvenance::Upstream => {
+            ensure!(
+                notices.is_empty(),
+                "an upstream Dolt asset must not list notices"
+            );
+            return Ok(Vec::new());
+        }
+        EngineProvenance::Built => ensure!(
+            !notices.is_empty(),
+            "a built Dolt asset must list its pinned notices"
+        ),
+    }
+    let mut names = BTreeSet::new();
+    let mut verified = Vec::with_capacity(notices.len());
+    for notice in notices {
+        let name = notice.name.as_str();
+        ensure!(
+            !name.is_empty()
+                && name != "."
+                && name != ".."
+                && !name.contains(['/', '\\', ':'])
+                && name != "LICENSES"
+                && name != declared.executable_name
+                && names.insert(name.to_owned()),
+            "Dolt notice name {name:?} is not one distinct plain file"
+        );
+        ensure!(
+            is_sha256(&notice.sha256),
+            "Dolt notice {name} has no pinned SHA-256"
+        );
+        let bytes = read(name).with_context(|| format!("read extracted Dolt notice {name}"))?;
+        ensure!(
+            bytes.len() as u64 == notice.bytes && archive::digest(&bytes) == notice.sha256,
+            "extracted Dolt notice {name} differs from the checked-out manifest"
+        );
+        verified.push(VerifiedNotice {
+            name: notice.name,
+            bytes: notice.bytes,
+            sha256: notice.sha256,
+        });
+    }
+    Ok(verified)
 }
 
 #[derive(Debug, Serialize)]
@@ -297,7 +403,12 @@ fn validate_asset_digests(
     Ok(())
 }
 
-fn windows_engine_asset(manifest: &EngineManifest, windows_target: &str) -> Result<EngineAsset> {
+/// Decode the verified Windows target's single manifest entry, returning it
+/// typed and as the raw entry whose provenance and notices are checked later.
+fn windows_engine_asset(
+    manifest: &EngineManifest,
+    windows_target: &str,
+) -> Result<(EngineAsset, Value)> {
     ensure!(
         manifest.schema_version == 2,
         "unsupported Dolt asset manifest schema"
@@ -319,7 +430,7 @@ fn windows_engine_asset(manifest: &EngineManifest, windows_target: &str) -> Resu
         asset.target == windows_target,
         "decoded Dolt asset does not match {windows_target}"
     );
-    Ok(asset)
+    Ok((asset, engine_assets[0].clone()))
 }
 
 fn read_bounded(path: &Path, limit: usize, description: &str) -> Result<Vec<u8>> {
@@ -737,7 +848,8 @@ pub async fn run(options: Options) -> Result<()> {
         METADATA_LIMIT,
         "Dolt asset manifest",
     )?)?;
-    let engine_asset = &windows_engine_asset(&manifest, windows_target)?;
+    let (engine_asset, engine_entry) = windows_engine_asset(&manifest, windows_target)?;
+    let engine_asset = &engine_asset;
 
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().to_owned();
@@ -919,6 +1031,13 @@ pub async fn run(options: Options) -> Result<()> {
                 && archive::digest(&license_bytes) == engine_asset.license_sha256,
             "extracted Dolt licenses differ from the checked-out manifest"
         );
+        let notices = verify_engine_notices(&engine_entry, |name| {
+            read_bounded(
+                &engine_root.join(name),
+                archive::MAX_ARCHIVE_BYTES,
+                "extracted Dolt notice",
+            )
+        })?;
 
         let commands = std::mem::take(&mut install.commands);
         let receipt = Receipt {
@@ -946,6 +1065,7 @@ pub async fn run(options: Options) -> Result<()> {
                 version: manifest.version,
                 executable_sha256: engine_asset.executable_sha256.clone(),
                 license_sha256: engine_asset.license_sha256.clone(),
+                notices,
             },
             cleanup_confirmed: false,
         };
@@ -1116,6 +1236,11 @@ mod tests {
                 version: "2.3.3".into(),
                 executable_sha256: "f".repeat(64),
                 license_sha256: "0".repeat(64),
+                notices: vec![VerifiedNotice {
+                    name: "LICENSE-ICU".into(),
+                    bytes: 27_718,
+                    sha256: "1".repeat(64),
+                }],
             },
             cleanup_confirmed: true,
         };
@@ -1557,17 +1682,20 @@ mod tests {
                 .clone()
         };
         for target in [x64, arm64] {
-            let entry = committed(target);
-            let asset = windows_engine_asset(&manifest, target).unwrap();
+            let committed = committed(target);
+            let (asset, entry) = windows_engine_asset(&manifest, target).unwrap();
             assert_eq!(asset.target, target);
-            assert_eq!(asset.executable_bytes, entry["executable_bytes"]);
-            assert_eq!(asset.executable_sha256, entry["executable_sha256"]);
-            assert_eq!(asset.license_bytes, entry["license_bytes"]);
-            assert_eq!(asset.license_sha256, entry["license_sha256"]);
+            assert_eq!(entry, committed, "{target} selects its committed entry");
+            assert_eq!(asset.executable_bytes, committed["executable_bytes"]);
+            assert_eq!(asset.executable_sha256, committed["executable_sha256"]);
+            assert_eq!(asset.license_bytes, committed["license_bytes"]);
+            assert_eq!(asset.license_sha256, committed["license_sha256"]);
         }
+        let (x64_asset, _) = windows_engine_asset(&manifest, x64).unwrap();
+        let (built, entry) = windows_engine_asset(&manifest, arm64).unwrap();
+        assert_eq!(entry["provenance"], "built");
         assert_ne!(
-            windows_engine_asset(&manifest, x64).unwrap().executable_sha256,
-            windows_engine_asset(&manifest, arm64).unwrap().executable_sha256,
+            x64_asset.executable_sha256, built.executable_sha256,
             "each target selects its own engine"
         );
         assert!(
@@ -1587,5 +1715,164 @@ mod tests {
         let missing = windows_engine_asset(&legacy, x64).unwrap_err().to_string();
         assert!(missing.contains(x64), "{missing}");
         assert!(windows_engine_asset(&legacy, arm64).is_ok());
+    }
+
+    const NOTICE: &[u8] = b"fixture ICU notice";
+
+    fn built_entry(notices: Value) -> Value {
+        json!({
+            "target": "aarch64-pc-windows-msvc",
+            "executable_name": "dolt.exe",
+            "provenance": "built",
+            "notices": notices,
+        })
+    }
+
+    fn icu_notice(bytes: u64, sha256: &str) -> Value {
+        json!([{
+            "name": "LICENSE-ICU",
+            "from": "icu",
+            "path": "icu/LICENSE",
+            "bytes": bytes,
+            "sha256": sha256,
+        }])
+    }
+
+    /// Read notices from a real extracted-engine directory, as both verifiers do.
+    fn engine_dir(files: &[(&str, &[u8])]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for (name, bytes) in files {
+            fs::write(root.path().join(name), bytes).unwrap();
+        }
+        root
+    }
+
+    fn verify_in(root: &tempfile::TempDir, entry: &Value) -> Result<Vec<VerifiedNotice>> {
+        verify_engine_notices(entry, |name| {
+            read_bounded(&root.path().join(name), 1024, "fixture notice")
+        })
+    }
+
+    #[test]
+    fn built_engine_notice_is_verified_and_recorded() {
+        let root = engine_dir(&[("LICENSE-ICU", NOTICE)]);
+        let digest = archive::digest(NOTICE);
+        let verified = verify_in(
+            &root,
+            &built_entry(icu_notice(NOTICE.len() as u64, &digest)),
+        )
+        .unwrap();
+        assert_eq!(
+            verified,
+            [VerifiedNotice {
+                name: "LICENSE-ICU".into(),
+                bytes: NOTICE.len() as u64,
+                sha256: digest,
+            }]
+        );
+    }
+
+    #[test]
+    fn built_engine_missing_notice_is_rejected() {
+        let root = engine_dir(&[]);
+        let entry = built_entry(icu_notice(NOTICE.len() as u64, &archive::digest(NOTICE)));
+        let error = format!("{:#}", verify_in(&root, &entry).unwrap_err());
+        assert!(
+            error.contains("read extracted Dolt notice LICENSE-ICU"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn built_engine_digest_mismatched_notice_is_rejected() {
+        let root = engine_dir(&[("LICENSE-ICU", b"fixture ICU notive")]);
+        let entry = built_entry(icu_notice(NOTICE.len() as u64, &archive::digest(NOTICE)));
+        let error = verify_in(&root, &entry).unwrap_err().to_string();
+        assert!(
+            error.contains("extracted Dolt notice LICENSE-ICU differs"),
+            "{error}"
+        );
+        // A same-digest notice with a different pinned size is also rejected.
+        let root = engine_dir(&[("LICENSE-ICU", NOTICE)]);
+        let entry = built_entry(icu_notice(
+            NOTICE.len() as u64 + 1,
+            &archive::digest(NOTICE),
+        ));
+        assert!(verify_in(&root, &entry).is_err());
+    }
+
+    #[test]
+    fn upstream_engine_without_notices_is_accepted() {
+        let root = engine_dir(&[]);
+        let x64 = "x86_64-pc-windows-msvc";
+        let manifest: EngineManifest =
+            serde_json::from_str(include_str!("../../kuru-memory/support/dolt-assets.json"))
+                .unwrap();
+        let (_, entry) = windows_engine_asset(&manifest, x64).unwrap();
+        assert_eq!(entry["provenance"], "upstream");
+        assert!(entry.get("notices").is_none());
+        assert!(verify_in(&root, &entry).unwrap().is_empty());
+        let mut empty = entry.clone();
+        empty["notices"] = json!([]);
+        assert!(verify_in(&root, &empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn engine_notice_declarations_fail_closed() {
+        let root = engine_dir(&[("LICENSE-ICU", NOTICE)]);
+        let digest = archive::digest(NOTICE);
+        let bytes = NOTICE.len() as u64;
+        let reject = |entry: Value, expected: &str| {
+            let error = format!("{:#}", verify_in(&root, &entry).unwrap_err());
+            assert!(error.contains(expected), "{expected}: {error}");
+        };
+        let mut upstream = built_entry(icu_notice(bytes, &digest));
+        upstream["provenance"] = json!("upstream");
+        reject(upstream, "upstream Dolt asset must not list notices");
+        reject(built_entry(json!([])), "must list its pinned notices");
+        let mut unlisted = built_entry(json!([]));
+        unlisted.as_object_mut().unwrap().remove("notices");
+        reject(unlisted, "must list its pinned notices");
+        let mut unknown = built_entry(icu_notice(bytes, &digest));
+        unknown["provenance"] = json!("mirrored");
+        reject(unknown, "provenance and notices");
+        let mut absent = built_entry(icu_notice(bytes, &digest));
+        absent.as_object_mut().unwrap().remove("provenance");
+        reject(absent, "provenance and notices");
+        reject(
+            built_entry(icu_notice(bytes, "unpinned")),
+            "has no pinned SHA-256",
+        );
+        reject(
+            built_entry(json!([{
+                "name": "LICENSE-ICU", "from": "icu", "path": "icu/LICENSE",
+                "bytes": null, "sha256": digest,
+            }])),
+            "provenance and notices",
+        );
+        reject(
+            built_entry(json!([{
+                "name": "LICENSE-ICU", "from": "icu", "path": "icu/LICENSE",
+                "bytes": bytes, "sha256": digest, "optional": true,
+            }])),
+            "provenance and notices",
+        );
+        for name in [
+            "",
+            ".",
+            "..",
+            "../LICENSE-ICU",
+            "icu\\LICENSE",
+            "LICENSES",
+            "dolt.exe",
+        ] {
+            let mut entry = built_entry(icu_notice(bytes, &digest));
+            entry["notices"][0]["name"] = json!(name);
+            reject(entry, "is not one distinct plain file");
+        }
+        let mut duplicate = built_entry(icu_notice(bytes, &digest));
+        let first = duplicate["notices"][0].clone();
+        duplicate["notices"].as_array_mut().unwrap().push(first);
+        reject(duplicate, "is not one distinct plain file");
     }
 }

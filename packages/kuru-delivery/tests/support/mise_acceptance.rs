@@ -13,7 +13,7 @@ use axum::{
 use kuru_delivery::{
     archive,
     command::{self, Command},
-    published, targets,
+    published, published_windows, targets,
 };
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use kuru_platform::windows::process::configured_command;
@@ -692,6 +692,9 @@ impl Installation {
                 "mise-installed engine {name} differs from embedded manifest"
             );
         }
+        // A built engine also ships each pinned third-party notice it lists.
+        published_windows::verify_engine_notices(asset, |name| Ok(fs::read(engine.join(name))?))
+            .context("mise-installed engine notices differ from embedded manifest")?;
         Ok(())
     }
 }
