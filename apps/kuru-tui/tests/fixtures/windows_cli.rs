@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
                 && task == "//apps/kuru-tui:build:release"
                 && separator == "--"
                 && target == "--target"
-                && triple == "x86_64-pc-windows-msvc" =>
+                && kuru_delivery::archive::host_target().is_ok_and(|host| triple == host) =>
         {
             let destination = PathBuf::from(
                 std::env::var_os("KURU_CLI_FIXTURE_TARGET").expect("isolated target"),

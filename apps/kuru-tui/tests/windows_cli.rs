@@ -826,6 +826,8 @@ fn source_update_builds_through_mise_and_publishes_after_the_trusted_build() {
         .unwrap()
         .to_owned();
     assert_eq!(actions[0], ["-C", &source, "install", "rust"]);
+    // The source update builds for the runner's native catalog target.
+    let host = kuru_delivery::archive::host_target().unwrap();
     assert_eq!(
         actions[1],
         [
@@ -835,7 +837,7 @@ fn source_update_builds_through_mise_and_publishes_after_the_trusted_build() {
             "//apps/kuru-tui:build:release",
             "--",
             "--target",
-            "x86_64-pc-windows-msvc"
+            host
         ]
     );
     success(command(root.path(), &binary).arg("--version"));
