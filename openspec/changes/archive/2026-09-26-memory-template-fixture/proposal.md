@@ -19,14 +19,15 @@ supervisor and Dolt process.
   current schema versions, the pinned engine version, the fixture scope, a
   capture format constant and the sources that define the stored schema
   (migrations run in the test process, not the supervisor). Creation holds a file lock, stages in a private
-  temporary directory, captures only a cleanly closed cold open (after reap and
-  lifecycle-lease release) and publishes atomically. Reuse revalidates the
+  sibling `<fingerprint>.stage-<uuid>` under the template root, captures only a
+  cleanly closed cold open (after reap and lifecycle-lease release) and
+  publishes by moving the verified stage to its final name. Reuse revalidates the
   private objects; a template that fails validation is rebuilt under the lock,
   never accepted. Correct for process-per-test runners; an in-process `OnceLock`
   alone is not relied on.
-- Per-test copy through the crate's private-directory helpers
-  (`kuru_platform::fs::Directory`, `seal_private`, `PrivateTemp`) with an explicit
-  allowlist of files. Lock, lease, PID, socket and endpoint files, including any
+- Per-test copy through checked `kuru_platform::fs::Directory` handles
+  (`Directory::create_private_directory` and `create_new` for each object) with
+  an explicit allowlist of files. Lock, lease, PID, socket and endpoint files, including any
   Dolt server lock/info files left in `data/`, are never copied. Links are
   rejected; owner-only modes and Windows DACLs are created fresh, not inherited.
 - `MemoryStore::temporary()` in `packages/kuru-memory/src/store.rs` is compiled
@@ -50,7 +51,11 @@ Test support only: `packages/kuru-memory/src/test_support*.rs`, the
 `test-support`-gated `temporary()` in `packages/kuru-memory/src/store.rs`, and
 cold opt-outs at tagged test sites. No dependencies, product behavior, coverage
 exclusions or thresholds change. Copies share the template's instance identity
-and secrets, so identity-sensitive tests stay cold. The cold path still runs at
-least once per test binary. The expected local saving is about 2.8 s per open serially
+and secrets, so identity-sensitive tests stay cold. Template creation runs once per
+fingerprint per target directory, so an existing template means a binary may run
+no template-creating cold open at all. Cold-path coverage comes from
+`kuru-memory`'s `temporary_cold()` tests
+(`cold_constructor_runs_every_migration_under_a_new_identity` and the migration
+and receipt-authority tests) and from caller-owned `MemoryStore::open` sites. The expected local saving is about 2.8 s per open serially
 (about 5 minutes for the `kuru-runtime` suite at `RUST_TEST_THREADS=2`), and more
 on CI; the PR's native CI run measures the per-binary saving on each OS.

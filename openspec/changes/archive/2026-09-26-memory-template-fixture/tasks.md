@@ -26,8 +26,25 @@
   - Windows: runtime 1280 s, memory 1428 s, application 1607 s
 - Windows CI passed end to end (build, the copied-tree template path, and
   `Directory`/`LifecycleLease` private-object and DACL validation), satisfying 1.4.
-- No pre-#116 `main` run was measured on the same runner images for a hosted-CI
-  baseline; 1.5's comparison is against this PR's own local numbers (section 6).
+- Hosted-CI baseline for 1.5: run
+  [36280980681](https://github.com/replygirl/kuru/actions/runs/36280980681), the
+  #111 PR run (head `03198541`, merged as `58540e0a`) with the same coverage-shard
+  layout and runner images, before this change. Before -> after per test binary
+  (tests in parentheses when the count differs by OS or changed):
+  - `kuru_runtime` lib: ubuntu 715.54 -> 178.78 s, macOS 695.00 -> 305.47 s,
+    Windows 1242.63 -> 533.08 s (220 tests; 197 on Windows, both runs).
+  - `kuru_memory` lib: ubuntu 384.28 -> 532.38 s, macOS 544.78 -> 487.25 s,
+    Windows 1155.20 -> 872.44 s (278 -> 285 tests; 239 -> 246 on Windows).
+    Ubuntu regressed by 148 s; this is recorded, not explained. The 7 added
+    tests include template creation, rebuild and two-process cold opens.
+  - `kuru` (tui) lib: ubuntu 51.52 -> 29.75 s, macOS 60.80 -> 22.18 s, Windows
+    98.11 -> 59.56 s (114 tests; 111 on Windows).
+  - Shard job wall time before -> after: runtime 1151 -> 515 s, 1153 -> 683 s,
+    1970 -> 1280 s; memory 709 -> 999 s, 1027 -> 741 s, 2004 -> 1428 s;
+    application 885 -> 850 s, 1011 -> 687 s, 1636 -> 1607 s (ubuntu, macOS,
+    Windows).
+- No local `kuru-tui` wall-time baseline was taken before the change; the only
+  before figures for that suite are the hosted-CI per-binary numbers above.
 
 ### Observed baseline (before, macOS arm64, base `8225613d`)
 
@@ -47,13 +64,13 @@
 ## 2. Template creation under lock (T1)
 
 - [x] 2.1 In `packages/kuru-memory/src/test_support.rs` (or `test_support/template.rs`), derive the fingerprint from the SHA-256 of the supervisor `test_supervisor()` returns plus the current schema version. Verify that a unit test shows a changed supervisor or schema version yields a different key.
-- [x] 2.2 Create the template in the private profile directory beside `kuru-test-supervisors`, under a `lock_file` lease, from one cold `temporary_cold()`-style open followed by `close()`, staged in `PrivateTemp` and published atomically. Verify with a test that concurrent processes produce one template and a second process reuses it.
+- [x] 2.2 Create the template in the private profile directory beside `kuru-test-supervisors`, under a `lock_file` lease, from one cold `temporary_cold()`-style open followed by `close()`, staged in a private sibling `<fingerprint>.stage-<uuid>` under the template root and published by moving the verified stage to its final name. Verify with a test that concurrent processes produce one template and a second process reuses it.
 - [x] 2.3 Revalidate an existing template's private objects on reuse, and discard and rebuild an invalid or incomplete one under the lock. Verify that a test corrupts a template and observes the rebuild.
 
 ## 3. Private copy excluding runtime files (T2)
 
 - [x] 3.1 Open and cleanly close one store, list the retained tree and fix an explicit allowlist. Lock, lease, PID, socket, endpoint and Dolt server lock/info files are excluded. Verify with a test asserting the exact copied set.
-- [x] 3.2 Copy per file through `Directory`/`seal_private`, rejecting symlinks and hard links, so owner-only modes and Windows DACLs are recreated. Verify with a test that a link in the template is refused and that the copy passes the store's private-object validation.
+- [x] 3.2 Copy per object through checked `Directory` handles (`create_private_directory`, `create_new`), rejecting symlinks and hard links, so owner-only modes and Windows DACLs are recreated. Verify with a test that a link in the template is refused and that the copy passes the store's private-object validation.
 
 ## 4. Default template API with cold opt-out (T3)
 
@@ -87,7 +104,8 @@
   the parent race; exactly one reports `Created`, the other `Reused`),
   `shared_template_holds_only_clean_private_store_state`,
   `invalid_templates_are_rejected_and_rebuilt` (changed bytes, a missing
-  manifest with an abandoned stage, and, on Unix, a planted link),
+  manifest with an abandoned stage, and, on Unix, a planted link; a hard-link
+  case on every OS was added in review, see below),
   `template_copies_are_isolated_stores_with_their_own_servers` and
   `cold_constructor_runs_every_migration_under_a_new_identity`.
 - Observed template contents: `identity.json`, `ready.json`, `config/`
@@ -144,9 +162,32 @@
 - Static chain: `mise run format:code ::: lint:rust ::: typecheck ::: lint:tooling
   ::: cospec:validate ::: cospec:managed:check ::: docs:check` exit 0 on the
   committed tree.
-- Pending CI: Windows verification (1.4) and per-binary CI timings for the
-  `kuru_runtime` lib, `kuru_memory` lib and `kuru-tui` on each native OS (1.5).
-- Not yet observed: 1.4 and 1.5 need native CI on the pushed PR head, and 6.3
-  archives only after them. The Windows template path (native process spawn in
+- At the time of this local record, 1.4 and 1.5 still needed native CI on the
+  pushed PR head, and 6.3 archived only after them; both were then observed
+  (section 1, "Observed CI"). The Windows template path (native process spawn in
   the two-process test, DACL-checked copies, external lifecycle root) was not
   compiled or run locally.
+
+### Review follow-up (after archive, local macOS arm64)
+
+- `shared_template_holds_only_clean_private_store_state` now reads and validates
+  the shared template under the fingerprint's shared file lock, verified through
+  the template root as `instantiate_in` does.
+- 3.2 hard links: `invalid_templates_are_rejected_and_rebuilt` hard-links the
+  template's `store/identity.json` to a second name outside the template on every
+  OS. Validation and `copy_template` both fail with "exactly one hardlink", and
+  the next `instantiate_in` reports `Rebuilt` and yields an openable copy.
+- Windows symbolic links are not exercised: creating one requires the
+  create-symbolic-link privilege or Developer Mode, which the test runners do not
+  grant. The symbolic-link case stays Unix-only; the hard-link case runs on
+  Windows through native CI on the pushed head, which is not recorded here.
+- Cold path: template creation runs once per fingerprint per target directory,
+  so a binary may run no template-creating cold open when the template already
+  exists. Cold-path coverage comes from the `temporary_cold()` tests
+  (`cold_constructor_runs_every_migration_under_a_new_identity` and the migration
+  and receipt-authority tests in 4.2) and from caller-owned `MemoryStore::open`
+  sites.
+- `mise run //packages/kuru-memory:test`: exit 0, 549 s wall including build; the
+  lib ran 285 tests in 501.92 s, all five template tests passed.
+- Static chain `mise run format:code ::: lint:rust ::: typecheck ::: lint:tooling
+  ::: cospec:validate ::: cospec:managed:check ::: docs:check`: exit 0.
