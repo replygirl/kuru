@@ -199,8 +199,8 @@ The task then runs
 [previous-release update acceptance](#previous-release-update-acceptance)
 against the staged ZIP and its sidecar. Only its release resolver contacts
 public GitHub, as described there; the workflow step passes its read-only
-`GITHUB_TOKEN` for that listing request only, so a shared runner's anonymous
-rate limit does not fail the check.
+`GITHUB_TOKEN` for the release-listing requests only, so a shared runner's
+anonymous rate limit does not fail the check.
 
 ## Previous-release update acceptance
 
@@ -226,17 +226,47 @@ discriminating check. A branch whose workspace version is older than the latest
 published tag fails release selection and must be rebased.
 
 The previous release is resolved at run time from the public GitHub releases
-list: the greatest stable `vX.Y.Z` release other than the candidate, failing if
-none is older or one is newer. The resolver downloads that release's own
-`SHA256SUMS`, the host target's archive (`.tar.gz` on Linux and macOS, `.zip` on
-Windows) and, when the release publishes one, that target's shell-support
-envelope. It verifies each file against that manifest and GitHub's asset digests
-before running anything. An optional `GITHUB_TOKEN` is sent as a bearer token
-only on the single release-listing request to `api.github.com`. Without it, that
-request is anonymous and can fail with `HTTP 403 rate limit exceeded` on shared
-runner addresses; pass the workflow's `${{ github.token }}` with `contents: read`
-to avoid it. Asset downloads are anonymous, and no
-Kuru or mise child process receives the token.
+list, scoped to the host target. Every stable release tag must be a canonical
+`vX.Y.Z`; a stable release newer than the candidate, or the same version listed
+twice, fails the check, and the candidate's own version is skipped. The
+resolver walks the older stable releases from the greatest version down and
+selects the first one whose asset listing names the target's archive
+(`.tar.gz` on Linux and macOS, `.zip` on Windows). A release is skipped only when
+its asset listing and its own `SHA256SUMS` agree that it does not publish that
+archive; if either names the archive and the other does not, the check fails.
+Drafts and prereleases are never inspected. The listing's pages are followed
+through GitHub's `Link: rel="next"` header only while no carrier has been found,
+and only to the exact next page on `api.github.com`; an unreadable page, an
+empty named page or more than 100 pages fails the check instead of concluding
+from a partial listing.
+
+For the selected release, the resolver downloads its own `SHA256SUMS`, the host
+target's archive and, when the release publishes one, that target's
+shell-support envelope, and verifies each file against that manifest and
+GitHub's asset digests before running anything. When no stable older release
+carries the target, which happens on a target's first release, the check
+passes without running an updater and prints one line to the job log:
+
+```text
+no predecessor for <target>: inspected vX.Y.Z, ... across N releases, all pages
+```
+
+It names every stable older release inspected, newest first, and the number of
+releases on every listing page, drafts and prereleases included. That line is
+the acceptance evidence for such a target; look for it in the log of the
+`test:previous-release-update` step, or of the staged Windows acceptance task
+that repeats the check. If no stable release older than the candidate exists at
+all, the check still fails with `no published stable release precedes
+v<candidate>`: the project's first release is not a target's first release.
+
+An optional `GITHUB_TOKEN` is sent as a bearer token only on the release-listing
+requests to `api.github.com`, each listing page included. Without it, those
+requests are anonymous and can fail with `HTTP 403 rate limit exceeded` on
+shared runner addresses; pass the workflow's `${{ github.token }}` with
+`contents: read` to avoid it. Every download is anonymous, including each
+`SHA256SUMS` fetched to inspect a release that lacks the target (bounded to
+64 KiB and authenticated against its listed digest), and no Kuru or mise child
+process receives the token.
 
 The previous executable is installed into fresh isolated user, configuration,
 cache, data, state and temporary roots. A support-aware previous release also

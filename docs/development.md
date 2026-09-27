@@ -698,10 +698,24 @@ asset_pattern = "cospec-*-windows-x64.zip"`: cospec publishes no
 `windows-arm64` release asset, so this pins the lock's `windows-arm64` entry to
 the existing `windows-x64` asset (`asset_pattern` replaces mise's asset
 autodetection for that platform). Every other tool listed here resolves its
-own `windows-arm64` entry without a pin: `aqua:cocogitto/cocogitto` falls back
-to its `windows-x64` asset through the aqua registry's own
-`windows_arm_emulation` flag, and the rest publish native `windows-arm64`
-(`aarch64-pc-windows-msvc`/`aarch64-pc-windows-msvc.zip`) assets.
+own `windows-arm64` entry without a pin. Two of those entries are x64
+executables run under emulation: `aqua:cocogitto/cocogitto` falls back to its
+`windows-x64` asset through the aqua registry's own `windows_arm_emulation`
+flag, and `aqua:koalaman/shellcheck` publishes a single Windows archive, so its
+`windows-arm64` entry is the same x64 `shellcheck-v0.11.0.zip` as its
+`windows-x64` entry. The rest resolve native Arm64 Windows assets, each under
+its project's own naming (for example `hk-aarch64-pc-windows-msvc.zip`,
+`actionlint_1.7.12_windows_arm64.zip`, `taplo-windows-aarch64.zip` and
+`node-v26.8.2-win-arm64.zip`).
+
+A pattern that matches no asset does not make `mise lock` fail: it reports the
+platform as skipped, exits successfully and writes no `windows-arm64` entry for
+cospec, and only a later `MISE_LOCKED=1` installation fails. After refreshing
+the root lock, confirm the entry exists:
+
+```sh
+grep -F '[tools."github:aligned-team/cospec"."platforms.windows-arm64"]' mise.lock
+```
 
 Mise records available provenance for every platform, but normally verifies
 only the current platform's artifact. Before committing an updated Communiqué
