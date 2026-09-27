@@ -748,6 +748,11 @@ try {
                 if (-not $Version -or $Version -ceq $selected) { $chosen += @{ version=$selected; name=$name; hash=$hash } }
             }
         }
+        if ($chosen.Count -eq 0) {
+            # A release that predates this target publishes no archive for it.
+            if ($Version) { throw "Release v$Version publishes no $Target archive; nothing was installed." }
+            throw "The latest release publishes no $Target archive; nothing was installed."
+        }
         if ($chosen.Count -ne 1) { throw 'Checksum manifest must name the release archive exactly once.' }
         $Version = $chosen[0].version
         if ($defaultBase) { $ReleaseBase = "https://github.com/replygirl/kuru/releases/download/v$Version" }

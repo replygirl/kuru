@@ -606,12 +606,22 @@ async fn malformed_manifest_hash_and_zip_fail_before_changing_existing_native_id
     let original_manifest = fs::read(fixture.release.join("SHA256SUMS")).unwrap();
     let mut duplicate = original_manifest.clone();
     duplicate.extend_from_slice(&original_manifest);
+    // A release that predates the native target lists only other targets.
+    let without_native = String::from_utf8(original_manifest.clone())
+        .unwrap()
+        .replace(*TARGET, other_target())
+        .into_bytes();
+    let no_native_archive = format!(
+        "Release v{VERSION} publishes no {} archive; nothing was installed",
+        *TARGET
+    );
     for (manifest, diagnostic) in [
         (b"not a checksum\n".to_vec(), "Malformed checksum manifest"),
         (
             duplicate,
             "Checksum manifest must name the release archive exactly once",
         ),
+        (without_native, no_native_archive.as_str()),
         (vec![b'x'; 65537], "exceeds"),
         (
             original_manifest
