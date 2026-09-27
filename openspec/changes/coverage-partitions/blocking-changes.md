@@ -16,3 +16,9 @@ None.
   implemented with an empty table), provides the uninstrumented partition mode, and replaces `SHARDS` with
   `PARTITIONS`; whichever lands second rewrites the other's matrix assertion. Before pushing, diff that branch's
   `coverage.rs` against #111 and reconcile the tables.
+- 9.2 reconciliation (2026-09-26): `origin/feat/windows-arm64` at `f1442d45` sits directly on #111 (`58540e0a`) and
+  leaves `packages/kuru-delivery/src/coverage.rs` and `coverage/` byte-identical to #111. Its `EXCLUDED_ARTIFACTS`
+  row for `aarch64-pc-windows-msvc`/`kuru-delivery/cospec_contract` exists only as a design contingency in its cospec
+  artifacts, not in code, so there is no table to reconcile yet. When PR6b rebases onto this change it adds that row
+  (if still needed) to the empty `EXCLUDED_ARTIFACTS` here and a `("windows-11-arm", Uninstrumented, N)` row to
+  `PARTITIONS`, and rewrites its `SHARDS` matrix assertion against `PARTITIONS`.

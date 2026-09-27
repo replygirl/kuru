@@ -73,8 +73,14 @@ consistent with the OS, and per-executable assignments that are pairwise
 disjoint and whose union equals the recorded `--list` output. Any mismatch or
 missing receipt fails before any report exists, so there is never a partial
 LCOV. It then unions the partitions' line records, which must cover the same
-files and lines, and enforces the 90% line gate once per OS. Merging on Ubuntu
-therefore needs no macOS or Windows runner and no instrumented objects.
+files and lines, and enforces the 90% line gate once per OS. That gate counts
+unique instrumented source lines, the union of the partitions' `DA` records.
+cargo-llvm-cov's own summary, which `mise run coverage` enforces locally, counts
+a line once per function-instantiation group and cannot be recombined from
+partition LCOV; on this workspace it reads about 0.7 points lower than the
+merged figure for the same tests, and the threshold is not adjusted for the
+difference. Because each partition exports its own LCOV, merging on Ubuntu
+needs no macOS or Windows runner and no instrumented objects.
 
 The partition runner stops test executables at a deadline derived from the job's
 `timeout-minutes`, less a fixed evidence reserve, and checks it before every
