@@ -1173,17 +1173,37 @@ async fn recover_only_restores_exact_old_identity_and_rejects_corrupted_trusted_
 async fn bootstrap_selects_the_native_machine_target_whatever_the_architecture_environment_reports()
 {
     // AMD64 is true on x64 and false on Arm64; ARM64 is the reverse, so every
-    // runner sees one contradicting report in both variables. This proves the
-    // environment is ignored in a native shell. It does not launch the
-    // bootstrap from an emulated process (design D2, task 3.7).
+    // runner sees at least one contradicting report. x86, an empty value and an
+    // unknown name cover reports that name no catalog target at all. This
+    // proves the environment is ignored in a native shell. It does not launch
+    // the bootstrap from an emulated process (design D2, task 3.7).
+    //
+    // The child records the environment it actually received before it runs
+    // the bootstrap, so the injection proof never depends on the bootstrap,
+    // which deliberately never reads these variables. Both variables are in
+    // the child's creation block, but a native x64 runner delivered
+    // PROCESSOR_ARCHITECTURE exactly and PROCESSOR_ARCHITEW6432 empty, so only
+    // the former must arrive exactly; the WOW64 variable may be absent but
+    // never different. The empty case displaces the fixture's native value,
+    // so observing it empty still proves the injection.
     let fixture = Fixture::new();
-    for reported in ["AMD64", "ARM64"] {
-        let destination = fixture.root.path().join(format!("reported {reported}"));
+    let (machine, _) = pe_machine(*TARGET);
+    for (reported, label) in [
+        ("AMD64", "AMD64"),
+        ("ARM64", "ARM64"),
+        ("x86", "x86"),
+        ("", "empty"),
+        ("KURU-NOT-A-MACHINE", "unknown"),
+    ] {
+        let destination = fixture.root.path().join(format!("reported {label}"));
         let mut command = fixture.script(&format!(
             r#"
 $ErrorActionPreference = 'Stop'
+$reported = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE', 'Process')
+$wow64 = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITEW6432', 'Process')
+Write-Output "observed=[$reported]"
+Write-Output "observed-wow64=[$wow64]"
 & $env:KURU_BOOTSTRAP_SCRIPT -Version '{VERSION}' -InstallDir $env:KURU_TEST_DESTINATION
-Write-Output "reported=$env:PROCESSOR_ARCHITECTURE/$env:PROCESSOR_ARCHITEW6432"
 Write-Output "native=$([Kuru.Bootstrap.Native]::MachineTarget([Kuru.Bootstrap.Native]::NativeMachine()))"
 "#
         ));
@@ -1196,14 +1216,27 @@ Write-Output "native=$([Kuru.Bootstrap.Native]::MachineTarget([Kuru.Bootstrap.Na
         let stdout = String::from_utf8_lossy(&result.stdout);
         let lines = stdout.lines().map(str::trim).collect::<Vec<_>>();
         assert!(
-            lines.contains(&format!("reported={reported}/{reported}").as_str()),
-            "injected architecture did not reach the bootstrap: {stdout}"
+            lines.contains(&format!("observed=[{reported}]").as_str()),
+            "the child shell did not receive PROCESSOR_ARCHITECTURE={reported:?}: {stdout}"
+        );
+        assert!(
+            lines.contains(&"observed-wow64=[]")
+                || lines.contains(&format!("observed-wow64=[{reported}]").as_str()),
+            "the child shell received a PROCESSOR_ARCHITEW6432 other than {reported:?}: {stdout}"
         );
         assert!(
             lines.contains(&format!("native={}", *TARGET).as_str()),
-            "bootstrap did not detect the native machine: {stdout}"
+            "bootstrap did not detect the native machine with {reported:?} reported: {stdout}"
         );
         fixture.installed(&destination);
+        let installed = fs::read(destination.join("kuru.exe")).unwrap();
+        let field = machine_field(&installed);
+        assert_eq!(
+            u16::from_le_bytes(installed[field..field + 2].try_into().unwrap()),
+            machine,
+            "installed executable is not the native {} machine with {reported:?} reported",
+            *TARGET
+        );
     }
     fixture.unchanged();
 }
