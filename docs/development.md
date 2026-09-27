@@ -760,7 +760,7 @@ so its `windows-arm64` entry is the same x64 `shellcheck-v0.11.0.zip` as its
 `windows-x64` entry. The rest resolve native Arm64 Windows assets, each under
 its project's own naming (for example `hk-aarch64-pc-windows-msvc.zip`,
 `actionlint_1.7.12_windows_arm64.zip`, `taplo-windows-aarch64.zip` and
-`node-v26.8.2-win-arm64.zip`).
+`node-v26.10.0-win-arm64.zip`).
 
 A pattern that matches no asset does not make `mise lock` fail: it reports the
 platform as skipped, exits successfully and writes no `windows-arm64` entry for

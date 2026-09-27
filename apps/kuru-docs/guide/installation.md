@@ -75,6 +75,8 @@ Replace `VERSION` with a version from [releases](https://github.com/replygirl/ku
 
 The bootstrap freezes latest to an explicit version, verifies the ZIP checksum and its exact three regular members, then publishes `kuru.exe` from private staging. It refuses reparse points, extra hardlinks and ambiguous names. It does not execute the downloaded candidate for validation. A private `.kuru-update` directory beside the executable coordinates installation and recovery.
 
+The script selects the Windows target from the machine the operating system reports, never from `PROCESSOR_ARCHITECTURE` or `PROCESSOR_ARCHITEW6432`, so it installs `x86_64-pc-windows-msvc` on x64 Windows and `aarch64-pc-windows-msvc` on Windows 11 on Arm. Run it from 64-bit stock Windows PowerShell 5.1. An explicit `-Target` must equal that native target: requesting the x64 build on Arm, or the Arm build on x64, fails before anything is downloaded. The downloaded `kuru.exe` must carry the native machine type. A release that publishes no archive for the native target fails without installing anything; releases before Windows on Arm support publish only the x64 ZIP.
+
 ## Supported platforms
 
 | System                           | Architecture  | Target                      |
@@ -83,8 +85,9 @@ The bootstrap freezes latest to an explicit version, verifies the ZIP checksum a
 | Linux                            | ARM64         | `aarch64-unknown-linux-gnu` |
 | Linux                            | x86-64        | `x86_64-unknown-linux-gnu`  |
 | Windows 10 version 1809 or newer | x86-64        | `x86_64-pc-windows-msvc`    |
+| Windows 11 or newer              | ARM64         | `aarch64-pc-windows-msvc`   |
 
-Linux archives are built on Ubuntu 24.04 and need a compatible glibc. Linux support uses GNU targets; musl targets are not supported. The shell bootstrap's `--target` overrides host detection for supported tar targets. PowerShell selects Windows x86-64 and accepts `-Target x86_64-pc-windows-msvc` explicitly.
+Linux archives are built on Ubuntu 24.04 and need a compatible glibc. Linux support uses GNU targets; musl targets are not supported. The shell bootstrap's `--target` overrides host detection for supported tar targets. PowerShell uses the ZIP for the native Windows machine and accepts only that target as an explicit `-Target`. Windows on Arm requires Windows 11 because the installer's stock .NET Framework 4.8.1 runs natively on Arm64 only there; x64 keeps the Windows 10 version 1809 floor. Windows 10 on Arm is not supported.
 
 Intel Macs (`x86_64-apple-darwin`) are not supported after v0.9.0, and the current shell bootstrap refuses them before downloading anything. On Apple Silicon, a Rosetta-translated shell reports `x86_64`; the bootstrap detects the translation and selects `aarch64-apple-darwin` instead. To install v0.9.0 on an Intel Mac, use that tag's own bootstrap with an explicit version:
 
@@ -94,7 +97,7 @@ curl -fsSL https://raw.githubusercontent.com/replygirl/kuru/v0.9.0/packages/kuru
 
 ## Release archives and mirrors
 
-Release archives use `kuru-VERSION-TARGET.tar.gz` for macOS/Linux and `kuru-VERSION-x86_64-pc-windows-msvc.zip` for Windows, alongside `SHA256SUMS`. Archives contain the executable, `LICENSE` and `README.md`. To use a mirror, pass its HTTPS version directory and an explicit version:
+Release archives use `kuru-VERSION-TARGET.tar.gz` for macOS/Linux and `kuru-VERSION-TARGET.zip` for both Windows targets (`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`), alongside `SHA256SUMS`. Archives contain the executable, `LICENSE` and `README.md`. To use a mirror, pass its HTTPS version directory and an explicit version:
 
 ```sh
 bash /tmp/kuru-install.sh --version VERSION \
@@ -167,7 +170,7 @@ For a direct installation, rerun your platform's bootstrap to install latest, or
 kuru update --version VERSION --release-base https://github.com/replygirl/kuru/releases/download/vVERSION
 ```
 
-Replace `VERSION` in both places with the desired version. This command also works in PowerShell; a local release directory also works. The updater validates the archive in Rust and replaces the running executable. No compiler or interpreter is required. Updates are explicit; Kuru does not install background updates.
+Replace `VERSION` in both places with the desired version. This command also works in PowerShell; a local release directory also works. The updater validates the archive in Rust and replaces the running executable. It keeps the running executable's target, so an x64 `kuru.exe` running under emulation on Windows on Arm keeps updating to x64 builds. No compiler or interpreter is required. Updates are explicit; Kuru does not install background updates.
 
 On Windows, a verified copy of the current running executable performs publication and records its result before success is reported. It waits for the original process to exit before deleting the displaced image. The trusted helper stays in a private cache for recovery. Close other old Kuru instances if cleanup remains pending, then rerun the normal PowerShell installer. It reconciles the receipt even if an interrupted update left `kuru.exe` absent, and refuses an unknown occupant at that path. `-Recover` performs recovery alone.
 
