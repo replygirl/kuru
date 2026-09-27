@@ -26,7 +26,7 @@ mr-boxington = { version = "1.18.0", os = ["linux", "macos/arm64", "windows"] }
 "aqua:tamasfe/taplo" = "0.10.0"
 "aqua:koalaman/shellcheck" = "0.11.0"
 "aqua:rhysd/actionlint" = "1.7.12"
-"cargo:cargo-llvm-cov" = "0.9.1"
+"aqua:taiki-e/cargo-llvm-cov" = "0.9.1"
 
 [monorepo]
 config_roots = ["apps/*", "packages/*"]

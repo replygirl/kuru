@@ -72,6 +72,8 @@ jobs:
         with:
           cache-bin: false
           shared-key: quality-lint
+          # Restrict saves to main so PR runs never thrash the shared cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: mise run lint:rust
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
@@ -97,6 +99,8 @@ jobs:
         with:
           cache-bin: false
           shared-key: quality-typecheck
+          # Restrict saves to main so PR runs never thrash the shared cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: mise run typecheck
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
@@ -122,6 +126,8 @@ jobs:
         with:
           cache-bin: false
           shared-key: quality-tooling
+          # Restrict saves to main so PR runs never thrash the shared cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: mise run lint:tooling
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
@@ -189,6 +195,8 @@ jobs:
         with:
           cache-bin: false
           shared-key: quality-docs
+          # Restrict saves to main so PR runs never thrash the shared cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install app-owned documentation tools before task activation
         # With automatic installation disabled, setup's PATH must see the pins
         # before it starts; the runner's preinstalled Node/npm are not substitutes.

@@ -65,7 +65,7 @@ license. The connector package carries the crate and asset MIT attributions in
 | `aqua:tamasfe/taplo` | `0.10.0` |
 | `aqua:koalaman/shellcheck` | `0.11.0` |
 | `aqua:rhysd/actionlint` | `1.7.12` |
-| `cargo:cargo-llvm-cov` | `0.9.1` |
+| `aqua:taiki-e/cargo-llvm-cov` | `0.9.1` |
 | `mr-boxington` | `1.18.0` |
 | `cargo:cargo-audit` (delivery package) | `0.22.2` |
 | Node (docs app only) | `26.10.0` |
