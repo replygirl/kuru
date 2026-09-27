@@ -891,6 +891,52 @@ mod tests {
     }
 
     #[test]
+    fn hosted_linux_and_windows_partitions_are_reproduced_exactly() {
+        // Partition 1 of 8 of kuru on ubuntu-latest and windows-latest (CI run
+        // 36300952644, cargo-llvm-cov 0.9.1, rustc 1.98.1), trimmed to five
+        // sources each with their per-file summaries verbatim. Groups whose
+        // instantiations map different lines are present on both.
+        for (export, root, count, covered, mapped_differs) in [
+            (
+                "linux-partition",
+                "/home/runner/work/kuru/kuru",
+                979,
+                787,
+                7,
+            ),
+            ("windows-partition", r"D:\a\kuru\kuru", 714, 456, 7),
+        ] {
+            let lines = reproduce(
+                &format!("{export}.json"),
+                &format!("{export}.summary.json"),
+                root,
+            );
+            assert_eq!(
+                lines.figures().unwrap().total,
+                Lines { count, covered },
+                "{export}"
+            );
+            assert!(lines.files.iter().all(|file| file.starts_with("packages/")));
+            let mut groups: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+            for instantiation in &lines.instantiations {
+                groups
+                    .entry((
+                        &instantiation.file,
+                        instantiation.line,
+                        instantiation.column,
+                    ))
+                    .or_default()
+                    .insert(&instantiation.mapped.0);
+            }
+            assert_eq!(
+                groups.values().filter(|mapped| mapped.len() > 1).count(),
+                mapped_differs,
+                "{export}"
+            );
+        }
+    }
+
+    #[test]
     fn kuru_partitions_union_into_the_summed_profiles_summary() {
         // kuru-core on aarch64-apple-darwin with cargo-llvm-cov 0.9.1: one
         // instrumented build, two disjoint test selections exported alone (a,

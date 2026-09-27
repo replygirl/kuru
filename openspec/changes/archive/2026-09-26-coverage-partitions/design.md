@@ -197,6 +197,10 @@ spawns a budget-sized chunk.
 - [Own threshold arithmetic replaces `--fail-under-lines`, on a different metric] → D4a records the lead's choice of
   the exact summary metric, self-checked against each partition's `--summary-only` totals. The same drill compares
   the merge's totals with the rebuilt report's `DA` export and cargo-llvm-cov's summary. Branch records are refused, and no percentage is averaged.
+  Residual (not verifiable by the merge): exactness assumes non-negative region counts. A counter expression that
+  evaluates negative (for example, lost updates to non-atomic counters under concurrent tests) is rendered by
+  llvm-cov as a huge count; a sum that cancels across partitions would then differ from the union. Each
+  partition's self-check covers its own figures only.
 - [Count-balanced hash assignment is uneven in time (largest single test 145 s on Windows)] → M records max/mean
   partition test wall per OS. Duration bins are a follow-on using the same pure function with a committed weights
   file.
