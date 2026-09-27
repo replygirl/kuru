@@ -29,12 +29,19 @@ pub fn root() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+// DRAFT experiment: halve the macOS fixture open-concurrency default (4 -> 2)
+// while investigating uncertain-write evidence on that platform. Not for merge.
+#[cfg(target_os = "macos")]
+const DEFAULT_OPEN_PERMITS: usize = 2;
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_OPEN_PERMITS: usize = 4;
+
 pub(crate) fn open_permit_limit() -> usize {
     std::env::var(OPEN_PERMITS_ENV)
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(4)
+        .unwrap_or(DEFAULT_OPEN_PERMITS)
 }
 
 fn nanos() -> u128 {
