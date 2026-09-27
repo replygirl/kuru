@@ -1,5 +1,10 @@
 # Native acceptance of Cargo's actual build-script boundary after source install.
 # Reuse the shipping target/profile; do not run Cargo recursively inside tests.
+# The source installation's release build is the positive control: the same
+# offline shipping command must find it fresh and name the installed bytes
+# before missing and corrupt prepared inputs are rejected. Keep this command
+# identical to //apps/kuru-tui:build:release. The negatives leave the memory
+# build-script fingerprint dirty, so the next build of target/ reruns it.
 [CmdletBinding()]
 param()
 $ErrorActionPreference = 'Stop'
@@ -26,17 +31,23 @@ if ($originalHash -cne $asset.archive_sha256 -or (Get-Item -LiteralPath $archive
 if (-not $env:KURU_EMBEDDED_TEST_BINARY) { throw 'Select the already source-installed executable with KURU_EMBEDDED_TEST_BINARY.' }
 $installed = $env:KURU_EMBEDDED_TEST_BINARY
 $installedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installed).Hash
+# Resolve Cargo's output exactly as the Windows source installation does.
+$targetDirectory = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repo 'target' }
+if (-not [IO.Path]::IsPathRooted($targetDirectory)) { $targetDirectory = Join-Path $repo $targetDirectory }
+$built = Join-Path $targetDirectory "$target/release/kuru.exe"
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('kuru-build-input-' + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($scratch) | Out-Null
 $savedMirror = $env:KURU_DOLT_BUNDLE_DIR
 
-function Invoke-Build([string] $label, [string] $inputMirror, [string] $expectedFailure) {
-    $env:KURU_DOLT_BUNDLE_DIR = $inputMirror
+function Invoke-Build([string] $label, [string] $inputMirror, [string] $expectedFailure, [switch] $control) {
+    # The control keeps the caller's mirror selection verbatim, including an
+    # absent variable: Cargo tracks KURU_DOLT_BUNDLE_DIR for the build script.
+    if ($control) { $env:KURU_DOLT_BUNDLE_DIR = $savedMirror } else { $env:KURU_DOLT_BUNDLE_DIR = $inputMirror }
     # Windows PowerShell wraps native stderr as ErrorRecords. Inspect Cargo's
     # actual status and text, rather than treating its ordinary progress as failure.
     try {
         $ErrorActionPreference = 'Continue'
-        $output = & cargo build -p kuru --release --all-features --locked --offline --target $target 2>&1
+        $output = & cargo build -p kuru --release --locked --offline --target $target 2>&1
         $status = $LASTEXITCODE
     } finally { $ErrorActionPreference = 'Stop' }
     $message = $output | Out-String -Width 4096
@@ -46,7 +57,22 @@ function Invoke-Build([string] $label, [string] $inputMirror, [string] $expected
             -not $message.Contains($expectedFailure) -or -not $message.Contains((Join-Path $inputMirror $archiveName))) {
             throw "$label did not fail at the intended memory build-script boundary (status $status)."
         }
-    } elseif ($status -ne 0) { throw "Valid prepared offline build failed (status $status)." }
+    } elseif ($status -ne 0) {
+        throw "Valid prepared offline build failed (status $status)."
+    } elseif ($control) {
+        # Any recompilation or build-script rerun means the installed build used
+        # different features, profile, target, flags or tracked inputs.
+        if ($message.Contains('Compiling ')) {
+            throw "$label was not fresh: the source installation's build differs from this offline command."
+        }
+        if (-not (Test-Path -LiteralPath $built -PathType Leaf)) { throw "$label found no Cargo output at $built." }
+        # Hash only: Cargo's output is a read-only input to this check.
+        $builtHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $built).Hash
+        if ($builtHash -cne $installedHash) {
+            throw "$label output does not match the installed executable."
+        }
+        Write-Host "Installed executable matches the fresh offline Cargo output: SHA-256 $($builtHash.ToLowerInvariant())"
+    }
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $installed).Hash -cne $installedHash -or
         (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -cne $originalHash) {
         throw "$label changed the installed executable or original prepared archive."
@@ -60,6 +86,7 @@ try {
     $corrupt = Join-Path $scratch 'corrupt'
     [IO.Directory]::CreateDirectory($missing) | Out-Null
     [IO.Directory]::CreateDirectory($corrupt) | Out-Null
+    Invoke-Build 'installed build is the fresh offline control' $mirror '' -control
     Invoke-Build 'missing archive' $missing 'open checked build-input file'
     $bad = Join-Path $corrupt $archiveName
     [IO.File]::Copy($archive, $bad, $false)
@@ -72,7 +99,6 @@ try {
     } finally { $file.Dispose() }
     if ((Get-Item -LiteralPath $bad).Length -ne $asset.compressed_bytes) { throw 'Corrupt fixture changed archive size.' }
     Invoke-Build 'same-size corrupt archive' $corrupt 'prepared Dolt archive checksum mismatch'
-    Invoke-Build 'valid prepared archive' $mirror ''
 } finally {
     $env:KURU_DOLT_BUNDLE_DIR = $savedMirror
     Pop-Location

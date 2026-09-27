@@ -62,7 +62,7 @@ description = "Prepare the actual upstream Windows ZIP for host-independent deco
 depends = [{ task = "bundle:prepare", args = ["--target", "x86_64-pc-windows-msvc"] }]
 
 [tasks."bundle:verify-native-build"]
-description = "Verify actual offline Windows Cargo rejection of missing/corrupt prepared inputs after source installation"
+description = "Verify that the source-installed build is the fresh offline control, then actual offline Windows Cargo rejection of missing/corrupt prepared inputs"
 # Let stock PowerShell reconstruct its module paths when mise was launched by pwsh.
 env.PSModulePath = false
 env.CARGO_BUILD_TARGET = false

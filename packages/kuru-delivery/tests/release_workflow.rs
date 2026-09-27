@@ -917,8 +917,8 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
     ));
     // The updater step is online, receives the token only for release
     // listing, and names the installed shipping executable, never Cargo's
-    // target directory, which the Windows build-input check between
-    // installation and this step has already rebuilt with all features.
+    // target directory, whose memory build-script fingerprint the Windows
+    // build-input check between installation and this step leaves dirty.
     let updater = &steps[step("Accept an update from the previous published release")];
     for required in [
         "KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.temp }}/kuru-bin/kuru${{ runner.os == 'Windows' && '.exe' || '' }}",
@@ -930,6 +930,93 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
     assert!(!updater.contains("CARGO_NET_OFFLINE"));
     assert!(!updater.contains("KURU_DOLT_BUNDLE_OFFLINE"));
     assert!(workflow.contains("permissions:\n  contents: read\n"));
+}
+
+#[test]
+fn native_build_input_check_reuses_the_installed_shipping_build() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |path: &str| fs::read_to_string(root.join(path)).unwrap();
+    let script = read("packages/kuru-memory/support/verify-bundle-build.ps1");
+    let task = |manifest: &str, header: &str| {
+        read(manifest)
+            .split_once(&format!("\n{header}\n"))
+            .unwrap_or_else(|| panic!("missing {header} in {manifest}"))
+            .1
+            .split("\n[")
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let build = task("apps/kuru-tui/mise.toml", r#"[tasks."build:release"]"#);
+    let verify = task(
+        "packages/kuru-memory/mise.toml",
+        r#"[tasks."bundle:verify-native-build"]"#,
+    );
+    // The source installation's release build is the verifier's positive
+    // control, so both must run the same shipping command. Restoring
+    // --all-features (or any other drift) would make the control recompile.
+    let cargo: Vec<_> = script
+        .lines()
+        .filter(|line| line.contains("& cargo "))
+        .collect();
+    assert_eq!(
+        cargo.len(),
+        1,
+        "the verifier must run exactly one Cargo command"
+    );
+    assert!(
+        cargo[0]
+            .contains("& cargo build -p kuru --release --locked --offline --target $target 2>&1")
+    );
+    assert!(script.contains("$target = 'x86_64-pc-windows-msvc'"));
+    assert!(build.contains(
+        "run_windows = 'cargo build -p kuru --release --locked --target {% if usage.target == \"host\" %}x86_64-pc-windows-msvc"
+    ));
+    assert!(!script.contains("--all-features") && !build.contains("--all-features"));
+    for text in [&build, &verify] {
+        for required in [
+            r#"env.CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static""#,
+            "env.CARGO_BUILD_TARGET = false",
+        ] {
+            assert!(
+                text.contains(required),
+                "build or verifier task lost {required}"
+            );
+        }
+    }
+    for required in [
+        r#"env.CARGO_NET_OFFLINE = "true""#,
+        r#"env.KURU_DOLT_BUNDLE_OFFLINE = "true""#,
+    ] {
+        assert!(verify.contains(required), "verifier task lost {required}");
+    }
+    // The fresh control runs first with the caller's own mirror selection; both
+    // offline negatives follow; no valid rebuild relinks target/ afterwards.
+    let calls: Vec<_> = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("Invoke-Build '"))
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            "Invoke-Build 'installed build is the fresh offline control' $mirror '' -control",
+            "Invoke-Build 'missing archive' $missing 'open checked build-input file'",
+            "Invoke-Build 'same-size corrupt archive' $corrupt 'prepared Dolt archive checksum mismatch'",
+        ]
+    );
+    for required in [
+        "if ($control) { $env:KURU_DOLT_BUNDLE_DIR = $savedMirror }",
+        "$message.Contains('Compiling ')",
+        r#"$built = Join-Path $targetDirectory "$target/release/kuru.exe""#,
+        "$builtHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $built).Hash",
+        "if ($builtHash -cne $installedHash)",
+        "failed to run custom build command for `kuru-memory",
+        "-not $message.Contains((Join-Path $inputMirror $archiveName))",
+        "changed the installed executable or original prepared archive",
+    ] {
+        assert!(script.contains(required), "verifier lost {required}");
+    }
 }
 
 #[cfg(unix)]
