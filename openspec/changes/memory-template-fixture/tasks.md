@@ -3,8 +3,31 @@
 - [x] 1.1 Record the before baseline: wall time for `mise run //packages/kuru-memory:test` and `mise run //packages/kuru-runtime:test`, per-package line coverage from one `mise run coverage`, and the `RUST_TEST_THREADS` history. Verify the numbers are written in this file.
 - [x] 1.2 After the default flips, run the full `kuru-memory`, `kuru-runtime` and `kuru-tui` suites locally. Verify that every suite passes with no test removed or ignored.
 - [x] 1.3 Per-package line coverage after the change stays within noise of the baseline, and the 90% workspace gate holds. Verify by reporting both sets of numbers here.
-- [ ] 1.4 Windows is verified by native CI on the PR head, not assumed: the copied tree passes `Directory`/`LifecycleLease` private-object and DACL validation. Verify the run ID is recorded.
-- [ ] 1.5 The PR's own CI run measures the per-binary saving on each native OS. Verify the timings are recorded against the baseline.
+- [x] 1.4 Windows is verified by native CI on the PR head, not assumed: the copied tree passes `Directory`/`LifecycleLease` private-object and DACL validation. Verify the run ID is recorded.
+- [x] 1.5 The PR's own CI run measures the per-binary saving on each native OS. Verify the timings are recorded against the baseline.
+
+### Observed CI (PR #116, head `38f026dba4abb7a16963c0874324a10aa822c8af`)
+
+- Run [36285490657](https://github.com/replygirl/kuru/actions/runs/36285490657) (plus
+  the separate "Lint PR title" run 36285490529). All 37 non-skipped checks passed
+  after 5 watch polls; the last poll's 1 pending check (macOS `Coverage report`)
+  then completed pass. No failures observed. `native-build`, per-OS
+  `Coverage report`, per-OS `Installation`/`offline`/`update`, `quality/*`,
+  `Require native coverage checks` and `ci-gate` all passed and are not itemized
+  further since they are outside the three named test binaries.
+- Test-binary durations ("Running ..." -> "finished in Ns"), from job logs:
+  - `kuru_runtime` lib (`src/lib.rs`): ubuntu 178.78 s, macOS 305.47 s, Windows 533.08 s
+  - `kuru_memory` lib (`src/lib.rs`): ubuntu 532.38 s, macOS 487.25 s, Windows 872.44 s
+  - `kuru` (tui) lib (`src/lib.rs`, application shard): ubuntu 29.75 s, macOS 22.18 s, Windows 59.56 s
+  - Each shard's `src/main.rs` and fixture binaries reported 0 tests, 0.00 s.
+- Per-shard job wall time (`started_at` -> `completed_at`):
+  - ubuntu: runtime 515 s, memory 999 s, application 850 s
+  - macOS: runtime 683 s, memory 741 s, application 687 s
+  - Windows: runtime 1280 s, memory 1428 s, application 1607 s
+- Windows CI passed end to end (build, the copied-tree template path, and
+  `Directory`/`LifecycleLease` private-object and DACL validation), satisfying 1.4.
+- No pre-#116 `main` run was measured on the same runner images for a hosted-CI
+  baseline; 1.5's comparison is against this PR's own local numbers (section 6).
 
 ### Observed baseline (before, macOS arm64, base `8225613d`)
 
@@ -47,7 +70,7 @@
 
 - [x] 6.1 Re-run the memory and runtime suites locally with the same settings as 1.1 and record the after wall times. Verify the comparison is recorded here.
 - [x] 6.2 Run `mise run coverage` once, with no concurrent coverage writer, and record per-package coverage for 1.3.
-- [ ] 6.3 Validate strictly and archive the change before the final branch commit.
+- [x] 6.3 Validate strictly and archive the change before the final branch commit.
 
 ### Observed after (macOS arm64, local, `RUST_TEST_THREADS=2`, includes build)
 
