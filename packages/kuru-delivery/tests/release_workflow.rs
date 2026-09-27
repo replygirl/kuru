@@ -1251,14 +1251,22 @@ fn native_build_input_check_reuses_the_installed_shipping_build() {
         cargo[0]
             .contains("& cargo build -p kuru --release --locked --offline --target $target 2>&1")
     );
-    assert!(script.contains("$target = 'x86_64-pc-windows-msvc'"));
+    // Both sides build the native host tuple: the shipping task names Cargo's
+    // host-tuple and the verifier resolves the same tuple, restricted to the two
+    // Windows catalog targets, so the control and the installed build share one
+    // Cargo output directory on x64 and on Arm64.
+    assert!(script.contains("$target = ([string](& rustc --print host-tuple)).Trim()"));
+    assert!(script.contains(
+        "if ($LASTEXITCODE -ne 0 -or @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc') -cnotcontains $target) {"
+    ));
     assert!(build.contains(
-        "run_windows = 'cargo build -p kuru --release --locked --target {% if usage.target == \"host\" %}x86_64-pc-windows-msvc"
+        "run_windows = 'cargo build -p kuru --release --locked --target {% if usage.target == \"host\" %}host-tuple"
     ));
     assert!(!script.contains("--all-features") && !build.contains("--all-features"));
     for text in [&build, &verify] {
         for required in [
             r#"env.CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static""#,
+            r#"env.CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static""#,
             "env.CARGO_BUILD_TARGET = false",
         ] {
             assert!(
