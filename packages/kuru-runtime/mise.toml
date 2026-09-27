@@ -28,7 +28,7 @@ run = 'cargo build -p kuru-runtime --release --all-features --locked {% if usage
 run_windows = 'cargo build -p kuru-runtime --release --all-features --locked {% if usage.target != "host" %}--target "%usage_target%"{% endif %}'
 
 [tasks."test"]
-env.RUST_TEST_THREADS = "2"
+env.RUST_TEST_THREADS = "4"
 env.KURU_TEST_SUPERVISOR_PREPARED = "1"
 depends = ["//packages/kuru-memory:prefetch"]
 run = "cargo test -p kuru-runtime --all-targets --all-features --locked --no-fail-fast"
@@ -41,4 +41,4 @@ run = "cargo check -p kuru-runtime --all-targets --all-features --locked"
 depends = ["//packages/kuru-memory:bundle:prepare"]
 run = "cargo clippy -p kuru-runtime --all-targets --all-features --locked -- -D warnings"
 [env]
-RUST_TEST_THREADS = "2"
+RUST_TEST_THREADS = "4"

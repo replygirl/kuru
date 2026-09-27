@@ -311,7 +311,7 @@ fn coverage_tasks_run_the_rust_orchestrator_without_shell_metacharacters() {
         partition["env"]["KURU_TEST_SUPERVISOR_PREPARED"].as_str(),
         Some("1")
     );
-    assert_eq!(partition["env"]["RUST_TEST_THREADS"].as_str(), Some("2"));
+    assert_eq!(partition["env"]["RUST_TEST_THREADS"].as_str(), Some("4"));
     assert_eq!(partition["depends"].as_array().unwrap(), &bundle);
     assert!(
         partition["tools"]

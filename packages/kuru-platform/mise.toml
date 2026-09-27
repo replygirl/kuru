@@ -1,7 +1,7 @@
 [env]
 # Each filesystem fixture retains native ancestor handles and child processes.
 # Concurrency regressions create their own deliberate simultaneous operations.
-RUST_TEST_THREADS = "2"
+RUST_TEST_THREADS = "4"
 
 [tasks.setup]
 description = "Install only the pinned Rust components for platform package checks"
@@ -30,7 +30,7 @@ run = "cargo build -p kuru-platform --locked"
 run = "cargo build -p kuru-platform --release --locked"
 
 [tasks.test]
-env.RUST_TEST_THREADS = "2"
+env.RUST_TEST_THREADS = "4"
 run = "cargo test -p kuru-platform --all-targets --all-features --locked --no-fail-fast"
 
 [tasks.typecheck]

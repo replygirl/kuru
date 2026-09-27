@@ -126,6 +126,22 @@ jobs:
         shell: bash
         # Absent everywhere else, so only this partition exports after its receipt.
         run: printf 'KURU_COVERAGE_SEED_EXPORT=%s/kuru-coverage-seed-export\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      # DRAFT: not for merge. Samples macOS process headroom every 15 s into a
+      # separate directory; the evidence and diagnostics directories stay
+      # orchestrator-owned so receipts and their fail-closed checks are unchanged.
+      - name: "DRAFT: sample macOS process counts (not for merge)"
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          dir="$RUNNER_TEMP/kuru-draft-procs-${{ matrix.partition }}-${{ github.run_attempt }}"
+          mkdir -p "$dir"
+          (
+            while true; do
+              echo "$(date -u +%T) procs=$(ps -A | wc -l | tr -d ' ') maxproc=$(sysctl -n kern.maxproc)" >> "$dir/procs.log"
+              sleep 15
+            done
+          ) < /dev/null > /dev/null 2>&1 &
+          disown
       - name: Run one checked coverage partition
         if: runner.os != 'Linux'
         shell: bash
@@ -268,6 +284,15 @@ jobs:
         with:
           name: ${{ inputs.artifact-prefix }}-coverage-diagnostics-${{ inputs.os }}-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.partition }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+      # DRAFT: not for merge. Always uploads the sampler log under a name the
+      # merge's download pattern cannot match.
+      - name: "DRAFT: upload macOS process samples (not for merge)"
+        if: ${{ always() && runner.os == 'macOS' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-prefix }}-draft-procs-${{ inputs.os }}-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kuru-draft-procs-${{ matrix.partition }}-${{ github.run_attempt }}
           if-no-files-found: warn
       # The export exists only after a successful receipt on main; replace the
       # consumed seed path with it so save and restore name the same path.

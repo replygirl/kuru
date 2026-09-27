@@ -52,7 +52,7 @@ run = 'cargo build -p kuru-memory --release --locked {% if usage.target != "host
 run_windows = 'cargo build -p kuru-memory --release --locked {% if usage.target != "host" %}--target "%usage_target%"{% endif %}'
 
 [tasks.test]
-env.RUST_TEST_THREADS = "2"
+env.RUST_TEST_THREADS = "4"
 env.KURU_TEST_SUPERVISOR_PREPARED = "1"
 depends = ["prefetch", "bundle:test-fixtures"]
 run = "cargo test -p kuru-memory --all-targets --all-features --locked --no-fail-fast"
@@ -91,4 +91,4 @@ run = "cargo generate-lockfile"
 [tasks."deps:fetch"]
 run = "cargo fetch --locked"
 [env]
-RUST_TEST_THREADS = "2"
+RUST_TEST_THREADS = "4"

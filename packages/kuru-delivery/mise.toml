@@ -47,7 +47,7 @@ if ((& $llvmCov llvm-cov --version).Trim() -ne 'cargo-llvm-cov 0.9.1') { throw '
 '''
 
 [tasks."coverage:workspace".env]
-RUST_TEST_THREADS = "2"
+RUST_TEST_THREADS = "4"
 KURU_TEST_SUPERVISOR_PREPARED = false
 
 [tasks."coverage:shard"]
@@ -60,7 +60,7 @@ tools."github:jdx/communique" = "{{vars.kuru_communique_version}}"
 run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- coverage shard"
 
 [tasks."coverage:shard".env]
-RUST_TEST_THREADS = "2"
+RUST_TEST_THREADS = "4"
 KURU_TEST_SUPERVISOR_PREPARED = false
 
 [tasks."test:partition"]
@@ -72,7 +72,7 @@ tools."github:jdx/communique" = "{{vars.kuru_communique_version}}"
 run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- coverage shard --uninstrumented"
 
 [tasks."test:partition".env]
-RUST_TEST_THREADS = "2"
+RUST_TEST_THREADS = "4"
 KURU_TEST_SUPERVISOR_PREPARED = "1"
 
 [tasks."coverage:merge"]
@@ -87,7 +87,7 @@ run = "cargo build -p kuru-delivery --all-features --locked"
 run = "cargo build -p kuru-delivery --release --all-features --locked"
 
 [tasks."test"]
-env.RUST_TEST_THREADS = "2"
+env.RUST_TEST_THREADS = "4"
 tools."aqua:cocogitto/cocogitto" = "{{vars.kuru_cocogitto_version}}"
 tools."github:jdx/communique" = "{{vars.kuru_communique_version}}"
 run = "cargo test -p kuru-delivery --all-targets --all-features --locked --no-fail-fast"
@@ -122,7 +122,7 @@ run = "mise run tool -- package"
 run = "mise run tool -- package-shell-support"
 
 [tasks."test:install"]
-env.RUST_TEST_THREADS = "2"
+env.RUST_TEST_THREADS = "4"
 run = [
   "cargo test -p kuru-delivery --all-features --locked archive::tests",
   "cargo test -p kuru-delivery --all-features --locked --test bootstrap_install",

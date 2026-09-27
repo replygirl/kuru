@@ -5,7 +5,7 @@ run = "cargo build -p kuru-connectors --locked"
 run = "cargo build -p kuru-connectors --release --locked"
 
 [tasks."test"]
-env.RUST_TEST_THREADS = "2"
+env.RUST_TEST_THREADS = "4"
 run = "cargo test -p kuru-connectors --all-targets --all-features --locked --no-fail-fast"
 
 [tasks."typecheck"]
