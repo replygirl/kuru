@@ -79,6 +79,32 @@ instrumented executables for an off-OS `llvm-cov report`, which needs cross-obje
 unsupported by cargo-llvm-cov, and large artifacts; (b) keeping a same-OS rebuild collect, which keeps 291-585 s on
 the critical path and a macOS slot; (c) a build-once job, which adds a serial build and saves no wall clock.
 
+**D4a. Gate metric (decision put to the lead; not yet decided).** The brief asks the merge to enforce
+`--fail-under-lines 90` once per OS; #111's collect did so through cargo-llvm-cov. The merge cannot, because
+cargo-llvm-cov's summary is a sum over function-instantiation groups (each group counts the most mapped and the
+most covered lines of any of its instantiations), and partition LCOV carries only file-level `DA`
+lines and per-file `LF`/`LH`, from which that sum cannot be recombined. The merge instead gates on unique instrumented
+lines, the union of `DA` records. On identical tests that reads higher: 94.62% against 93.88% (ubuntu-latest),
+94.63% against 93.88% (macos-latest) and 93.24% against 92.57% (windows-latest) on `main`'s previous-topology green
+run 36280980681, and 95.01% against 94.33% locally (verification 6.3). So at the same nominal 90% the CI gate is
+0.67-0.75 points easier to pass than `mise run coverage`. The threshold number is unchanged, and this change does not
+choose among the options:
+(i) accept the unique-line metric at 90% (effective bar about 89.3% by the summary metric) and record it in AGENTS.md's
+gate wording;
+(ii) keep the metric but raise `LINE_GATE_PERCENT` to 91 (about 90.25% by the summary metric at the measured delta;
+the 94-95% figures pass either way);
+(iii) reproduce the summary metric exactly: each partition also exports, per function instantiation, its mapped and
+covered line sets (a port of llvm-cov's line statistics over `llvm-cov export --format=text` regions, self-checked
+per file against llvm-cov's own `LF`/`LH` in that partition's LCOV and fail-closed on any mismatch); the merge unions
+covered sets per instantiation and takes each group's maximum. This is exact because every partition's profile
+counts are non-negative and the mappings are identical, so a line is covered in the merged profile exactly when some
+partition covers it. Cost: a new module of roughly 400-600 lines plus fixtures;
+(iv) upload one partition's instrumented objects and run `llvm-cov report --fail-under-lines 90` on Ubuntu over
+every partition's `.profdata`, which is rejected option (a) above (cross-object reading, path remapping, multi-GB
+artifacts).
+Merge of this change waits on the lead's choice. Options (i) and (ii) are one-line changes; (iii) is a follow-on
+of its own.
+
 **D5. Seeded dependency cache with an orchestrator-owned allow-list.** `prepare` becomes: fresh target and state →
 `show-env` → `cargo metadata --no-deps` → **seed import** → `cargo test --no-run`. Import moves (or copies across
 devices) only `<seed>/debug/{deps,build,.fingerprint}/<stem>-<16 hex>[.ext]` whose stem is not a workspace package or
@@ -163,8 +189,9 @@ spawns a budget-sized chunk.
   Each partition's LCOV is computed against the binaries that produced its profiles. M runs an equivalence drill by hand on
   one machine and SHA: all partitions' raw profiles fed to one rebuilt `llvm-cov report` (the #111 collect recipe)
   and the DA-merge of their LCOVs must give identical DA sets and LF/LH.
-- [Own threshold arithmetic replaces `--fail-under-lines`] → The same drill compares totals with cargo-llvm-cov's
-  summary. Branch records are refused, and no percentage is averaged.
+- [Own threshold arithmetic replaces `--fail-under-lines`, on a different metric] → D4a puts the metric to the lead
+  with measured deltas. The same drill compares the merge's totals with the rebuilt report's `DA` export and
+  cargo-llvm-cov's summary. Branch records are refused, and no percentage is averaged.
 - [Count-balanced hash assignment is uneven in time (largest single test 145 s on Windows)] → M records max/mean
   partition test wall per OS. Duration bins are a follow-on using the same pure function with a committed weights
   file.

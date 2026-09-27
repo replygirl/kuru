@@ -72,15 +72,25 @@ source, toolchain, profile and inventory identity across them, a target
 consistent with the OS, and per-executable assignments that are pairwise
 disjoint and whose union equals the recorded `--list` output. Any mismatch or
 missing receipt fails before any report exists, so there is never a partial
-LCOV. It then unions the partitions' line records, which must cover the same
-files and lines, and enforces the 90% line gate once per OS. That gate counts
-unique instrumented source lines, the union of the partitions' `DA` records.
-cargo-llvm-cov's own summary, which `mise run coverage` enforces locally, counts
-a line once per function-instantiation group and cannot be recombined from
-partition LCOV; on this workspace it reads about 0.7 points lower than the
-merged figure for the same tests, and the threshold is not adjusted for the
-difference. Because each partition exports its own LCOV, merging on Ubuntu
-needs no macOS or Windows runner and no instrumented objects.
+LCOV.
+
+The merged per-OS gate does not use the metric of `--fail-under-lines 90`, and
+that metric change awaits the lead's decision. The merge unions the partitions'
+line records, which must cover the same files and lines, and requires 90% of
+unique instrumented source lines (the union of the partitions' `DA` records)
+once per OS. cargo-llvm-cov's summary, which `mise run coverage` enforces
+locally with `--fail-under-lines 90`, counts each function-instantiation
+group's lines separately and cannot be recombined from partition LCOV. On the
+same tests it reads 0.67 to 0.75 points lower than the unique-line figure: on
+`main`'s green run of the previous topology it was 93.88% against 94.62%
+(ubuntu-latest), 93.88% against 94.63% (macos-latest) and 92.57% against 93.24%
+(windows-latest), and locally 94.33% against 95.01%. At the same nominal 90%,
+the CI gate is therefore about 0.7 points easier to pass than the local one.
+The threshold is unchanged; whether to accept that difference, raise the merged
+threshold to compensate, or reproduce the summary metric in the merge is put to
+the lead (see the `coverage-partitions` design). Because each partition exports
+its own LCOV, merging on Ubuntu needs no macOS or Windows runner and no
+instrumented objects.
 
 The partition runner stops test executables at a deadline derived from the job's
 `timeout-minutes`, less a fixed evidence reserve, and checks it before every
@@ -136,7 +146,8 @@ Cargo dependency cache. Its complete real-memory suite runs separately through
 three uninstrumented partitions of the same orchestrator
 (`//packages/kuru-delivery:test:partition` with `KURU_COVERAGE_PACKAGES=kuru-memory`)
 and an Ubuntu merge that applies the same receipt agreement, disjointness and
-completeness checks without LCOV or a threshold. The arm64 job remains a
+completeness checks without LCOV or a threshold, and requires every receipt's
+package scope to be exactly `kuru-memory`. The arm64 job remains a
 supported-platform proof of that whole suite; nothing is subset. The Windows
 offline build-input check (`bundle:verify-native-build`) has no test inventory
 to partition and stays in the Windows installation job.
@@ -184,11 +195,11 @@ bridge before any downloaded application can be trusted.
 | `mise run lint` | All-target Clippy with warnings as errors |
 | `mise run typecheck` | Rust compilation checks for all targets/features on the host |
 | `mise run test` | Workspace behavioral and protocol tests |
-| `mise run coverage` | Run the behavioral suite under LLVM instrumentation, minimum 90% workspace line coverage |
+| `mise run coverage` | Run the behavioral suite under LLVM instrumentation, minimum 90% workspace line coverage by cargo-llvm-cov's summary (`--fail-under-lines 90`) |
 | `mise run test:install` | Native archive tests and, on macOS/Linux, real Bash bootstrap tests |
 | `mise run //packages/kuru-delivery:test` | Delivery contracts, including native PowerShell bootstrap/update fixtures on Windows |
 | `mise run //packages/kuru-delivery:coverage:shard` | One fail-closed CI coverage partition, configured by `KURU_COVERAGE_*` ([by hand](#running-a-coverage-partition-by-hand)) |
-| `mise run //packages/kuru-delivery:coverage:merge` | Require agreeing receipts from every partition of one OS and, when instrumented, enforce its 90% merged report |
+| `mise run //packages/kuru-delivery:coverage:merge` | Require agreeing receipts from every partition of one OS and, when instrumented, enforce 90% of unique instrumented lines in its merged report |
 | `mise run //packages/kuru-delivery:test:partition` | One uninstrumented checked partition of the `KURU_COVERAGE_PACKAGES` test suite (CI arm64 memory) |
 | `mise run //apps/kuru-tui:test:embedded-runtime` | Package, install, update and reopen actual Kuru with cold offline memory |
 | `mise run //packages/kuru-delivery:test:previous-release-update` | [Previous published release's updater](release.md#previous-release-update-acceptance) installs `KURU_UPDATE_CANDIDATE_BINARY`; optional `GITHUB_TOKEN` |
@@ -290,7 +301,8 @@ partition's evidence must fail the merge without writing a report.
 The uninstrumented mode takes the same inputs plus `KURU_COVERAGE_PACKAGES`, for
 example `kuru-memory`, and runs through
 `mise run //packages/kuru-delivery:test:partition`; merge its evidence with
-`KURU_COVERAGE_MODE=uninstrumented`. An optional `KURU_COVERAGE_SEED` names a
+`KURU_COVERAGE_MODE=uninstrumented` and the same `KURU_COVERAGE_PACKAGES`, which
+the merge requires every receipt's scope to equal. An optional `KURU_COVERAGE_SEED` names a
 dependency seed directory to import (below); leave it unset locally.
 
 ## Shared build cache
@@ -388,7 +400,9 @@ other entry, and Cargo's own fingerprints rebuild anything stale. On `main`,
 partition 1 exports the seed with the same allow-list after its receipt is
 written, and only that export is saved. The seed does not enter any receipt:
 inventories record workspace artifacts only. An evicted or missing seed imports
-nothing, and the partition is only slower. Private bundle directories must be
+nothing, and the partition is only slower. A seed entry that cannot be read or
+moved is counted as an `io` refusal in the job ledger, any partial copy is
+removed, and Cargo rebuilds it; a bad seed never fails the partition. Private bundle directories must be
 created by the current runner; restoring them inside a Cargo target archive can
 change their permissions. Keep them outside shared build-output caches and
 retain the private directory checks when configuring native test runners.

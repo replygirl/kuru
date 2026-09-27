@@ -8,7 +8,7 @@
 
 - [x] 2.1 Introduce the `Launcher` trait with a `SystemLauncher` wrapping today's Unix group and Windows native supervision unchanged, and route `dispatch_test` through `dispatch_with`; verify the existing supervision, stall and signal tests still pass
 - [x] 2.2 Implement the list run, `windows_command_line_units`, 30,000-unit chunking, per-chunk deadline checks, the `running N tests` equality check and the expanded `RunnerRecord`; verify with verification 1.2 and 1.3
-- [ ] 2.3 Add the live libtest probe tests (own test executable, two no-op probes; Windows budget-sized chunk); verify verification 1.4 on macOS locally and on hosted Windows
+- [x] 2.3 Add the live libtest probe tests (own test executable, two no-op probes; Windows budget-sized chunk); verify verification 1.4 on macOS locally and on hosted Windows (CI run 36290089575, Windows partition 1, job 108538385630)
 
 ## 3. T3 Ubuntu merge with receipt agreement
 
@@ -20,11 +20,13 @@
 
 - [x] 4.1 Add `coverage/seed.rs` allow-list import and export with refusal counts, and call import in `prepare` after `cargo metadata` and before the first build; verify with verification 4.1 and a fake-host ordering assertion
 - [x] 4.2 Use the fixed `KURU_COVERAGE_TARGET` path and add export on `main` partition 1 after the receipt; verify the orchestrator refuses an existing target and an existing export destination
+- [x] 4.3 Degrade every seed read, create or move failure to a counted `io` refusal that removes any partial copy, so an unreadable or corrupt seed only slows the build; verify with `seed::tests::unreadable_or_unmovable_seed_entries_degrade_to_refusals`
 
 ## 5. T5 Uninstrumented mode and arm64 wiring
 
 - [x] 5.1 Add `coverage shard --uninstrumented` (scope-bound inventory, no `show-env`, prefetch into the fresh target, `mode: uninstrumented`) and the `test:partition` task with `KURU_TEST_SUPERVISOR_PREPARED=1`; verify with verification 5.1
 - [x] 5.2 Move the arm64 `kuru-memory` suite from `native-build` into a `native-memory` partition matrix (3) plus an uninstrumented Ubuntu merge in `ci.yml`, and add both to `ci-gate`; leave `bundle:verify-native-build` unchanged per design D9; verify with verification 5.2
+- [x] 5.3 Require `KURU_COVERAGE_PACKAGES` for an uninstrumented merge and refuse any receipt whose scope differs from it; pass `kuru-memory` to the arm64 merge and pin it in `release_workflow.rs`; verify with `merge::tests::uninstrumented_partitions_must_build_the_configured_scope` and the orchestrator input tests
 
 ## 6. T6 Workflows and shard counts
 
@@ -37,7 +39,7 @@
 
 ## 8. T8 Documentation
 
-- [x] 8.1 Update `docs/development.md`: partition topology and counts, the agreement rule stated as "N independent shard builds agreeing rather than a separate rebuild", per-OS 90% gates on the merged LCOV, hand-run partition and merge instructions, the seed cache and its eviction behaviour, the uninstrumented arm64 memory partitions and the ledgers; re-read `AGENTS.md` and record whether any line changes; verify `mise run docs:check` passes. Recorded: the page also states that the merged gate counts unique instrumented lines (union of `DA` records) and why cargo-llvm-cov's summary reads about 0.7 points lower; `AGENTS.md` is unchanged (its "90% workspace line coverage gate" wording stays accurate at its altitude, and the lead may add the precision)
+- [x] 8.1 Update `docs/development.md`: partition topology and counts, the agreement rule stated as "N independent shard builds agreeing rather than a separate rebuild", per-OS 90% gates on the merged LCOV, hand-run partition and merge instructions, the seed cache and its eviction behaviour, the uninstrumented arm64 memory partitions and the ledgers; re-read `AGENTS.md` and record whether any line changes; verify `mise run docs:check` passes. Recorded: the page also states that the merged gate counts unique instrumented lines (union of `DA` records) and why cargo-llvm-cov's summary reads about 0.7 points lower; the page now leads with the fact that the merged gate's metric differs from `--fail-under-lines 90`, names both figures per OS, states which metric each gate enforces, and says the reconciliation awaits the lead (design D4a). `AGENTS.md` is unchanged pending that decision
 
 ## 9. M Measurement and hosted acceptance
 
