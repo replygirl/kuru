@@ -15,4 +15,4 @@
 
 ## 4. Pinning
 
-- [ ] 4.1 (P) Commit the pins printed by the CI round-1 build job (archive, executable and llvm-mingw notice sizes/digests; confirm clang version, notice paths and whether winpthreads needs a notice) and confirm the round-2 run verifies them; verify with verification rows 4.2 and 5.1
+- [x] 4.1 (P) Commit the pins printed by the CI round-1 build job (archive, executable and llvm-mingw notice sizes/digests; confirm clang version, notice paths and whether winpthreads needs a notice) and confirm the round-2 run verifies them; verify with verification rows 4.2 and 5.1
