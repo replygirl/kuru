@@ -633,8 +633,10 @@ import step, is pinned by commit SHA.
 (`windows-arm64-bundle-input`, merge `83666440`) ships the recipe, not a
 consumer hand-off: the `aarch64-pc-windows-msvc` manifest entry is
 `"provenance": "built"` with no URL, committed archive, executable and notice
-pins (archive 40,719,091 B, SHA-256 `d1798568…bb73c`), and neither the archive
-bytes nor a mirror override are committed. `bundle:prepare` refuses a built
+pins in `packages/kuru-memory/support/dolt-assets.json` (the committed pin, which
+#119, `0b951c51`, moved to Dolt v2.3.4; this design and the tests on this branch
+cite and derive from that pin rather than repeating its sizes or digests), and
+neither the archive bytes nor a mirror override are committed. `bundle:prepare` refuses a built
 asset without `--archive` ("engine for aarch64-pc-windows-msvc is built from
 source: ... then import it with --archive"); with `--archive <file>` (and
 `--offline`) it checks the file's size and SHA-256 against the committed pin and
@@ -682,7 +684,10 @@ are delivered afterwards on the workflow owner's per-test partition shape
 `ubuntu-latest` merge job with per-OS gating), calling the same
 `bundle-build.yml` job for the import. The rows below that name the post-PR4b
 shard and collect jobs and the rewritten `native-gate` describe the intent;
-their exact jobs follow PR-C once it merges.
+their exact jobs follow PR-C once it merges. Timing reference: the workflow
+owner measured PR-C's partitioned run at 21 minutes of wall clock in total; the
+arm64 legs' first-run measurements in task 3.5 are compared against it as well
+as against the 90-minute shard budget.
 
 The mirror is designed against the workflow owner's confirmed post-PR5 and
 post-PR4b shapes (Current state), not the `501ab92d` files: the x64 twin runs on
@@ -857,8 +862,8 @@ legs), `GITHUB_TOKEN` from CI for the GitHub REST metadata request. Asset
 downloads stay anonymous over HTTPS. Binary versions and architectures: Rust
 1.98.1 `aarch64-pc-windows-msvc`, mise 2026.9.4 native arm64, cargo-llvm-cov
 0.9.1 built from source (instrumented collection subject to rust-lang/rust#150123), cocogitto 7.0.0 and cospec 0.8.2 x64 assets under
-emulation, communique 1.3.5 and hk 1.58.1 native arm64, Dolt v2.3.3 built by
-PR6a for windows/arm64. Connection limits and deadlines are unchanged: the
+emulation, communique 1.3.5 and hk 1.58.1 native arm64, Dolt at the committed pin
+(v2.3.4 since #119) built by PR6a's recipe for windows/arm64. Connection limits and deadlines are unchanged: the
 resolver's 60-second HTTPS client, 64 KiB `SHA256SUMS` bound, 4 MiB metadata
 bound and the existing archive limits. Installed applications never invoke MSVC
 tools; `dumpbin` is a build-time acceptance dependency only.
