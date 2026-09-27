@@ -251,7 +251,8 @@ no `GetProcAddress` probing. Replace the `:626` gate with:
 - Bootstrap tests (`bootstrap_windows.rs`) gain a case that runs the bootstrap
   with `PROCESSOR_ARCHITECTURE=AMD64` injected on every host and asserts the
   selected target equals the test executable's native target, proving the
-  environment variable is ignored, and a recovery case with an x64-named helper
+  environment variable is ignored wherever the injection arrives (x64; see the
+  observed Windows on Arm behavior below), and a recovery case with an x64-named helper
   receipt and x64 helper image that must recover on either runner. Injecting the
   variable into a native shell does not run `IsWow64Process2` from an emulated
   process. Step zero looks for an x64 launch path on `windows-11-arm` (x64
@@ -267,6 +268,22 @@ no `GetProcAddress` probing. Replace the `:626` gate with:
   probe (task 3.2) and task 3.7; without a launch path, verification 4.4 records
   the claim as limited to the name/PE-machine derivation plus the x64-runner
   case.
+- Observed OS behavior (2026-09-27, run `36317654214`, job `108616153749`,
+  `windows-11-arm`): a native ARM64 (`0xAA64`) stock PowerShell child created
+  with `PROCESSOR_ARCHITECTURE=AMD64` and `PROCESSOR_ARCHITEW6432=AMD64` in its
+  environment block observed `PROCESSOR_ARCHITECTURE=ARM64` and
+  `PROCESSOR_ARCHITEW6432` empty; the bootstrap still selected
+  `aarch64-pc-windows-msvc` and installed. Windows on Arm therefore did not
+  deliver the injected value to a native process (only the `AMD64` case was
+  reached; the `x86`, empty and unknown cases are unobserved until a run
+  reaches them). The injection test keeps exact delivery on x64, where every
+  injected value arrived, and on an aarch64 target also accepts the native
+  `ARM64` name, recording per case whether the value was injected,
+  OS-normalised or indistinguishable. Every behavioral assertion (native
+  target, native PE machine, successful install) is unchanged. The proof that
+  a contradicting environment is ignored comes from the x64 run of the same
+  script; the Arm run proves native selection. The bootstrap still never reads
+  either variable.
 
 Rust-side detection needs no change: the updater and `install-local` select by
 the compiled target (Decision 1).
