@@ -1086,7 +1086,8 @@ async fn run_shard<H: Host>(
     .context("coverage partition receipt failed")?;
 
     // Export after the receipt, so it can never affect evidence. A failed
-    // export only leaves an empty seed and a slower next run.
+    // export leaves no seed, so the workflow saves nothing under this key and
+    // a later run exports again; the next run is only slower.
     if let Some(export) = &inputs.seed_export {
         let started = unix_now()?;
         let names = seed::workspace_names(workspace.names.iter().map(String::as_str));
@@ -1099,10 +1100,15 @@ async fn run_shard<H: Host>(
                 report.refused
             ),
             Err(error) => {
-                eprintln!("coverage partition: seed export failed and is left empty: {error:#}");
-                let _ = fs::remove_dir_all(export);
-                fs::create_dir_all(export)
-                    .with_context(|| format!("create {}", export.display()))?;
+                eprintln!("coverage partition: seed export failed and is removed: {error:#}");
+                if let Err(error) = fs::remove_dir_all(export)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!(
+                        "coverage partition: could not remove the failed seed export {}: {error}",
+                        export.display()
+                    );
+                }
             }
         }
     }

@@ -299,7 +299,8 @@ jobs:
     # built partitions: identical source, toolchain, profile and inventory
     # identity, and per-executable test lists that are disjoint and complete
     # against every partition's recorded --list output. It then unions the
-    # partition LCOV and enforces this OS's 90% line gate.
+    # partition LCOV and enforces this OS's gate: 91% of unique instrumented
+    # lines (see docs/development.md).
     name: Coverage merge (${{ inputs.os }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -344,7 +345,7 @@ jobs:
           pattern: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-partition-*
           merge-multiple: false
           path: ${{ runner.temp }}/kuru-coverage-inputs
-      - name: Require agreeing partition receipts and 90% coverage
+      - name: Require agreeing partition receipts and 91% of unique instrumented lines
         shell: bash
         env:
           KURU_COVERAGE_OS: ${{ inputs.os }}

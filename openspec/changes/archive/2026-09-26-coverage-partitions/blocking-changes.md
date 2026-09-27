@@ -22,3 +22,18 @@ None.
   artifacts, not in code, so there is no table to reconcile yet. When PR6b rebases onto this change it adds that row
   (if still needed) to the empty `EXCLUDED_ARTIFACTS` here and a `("windows-11-arm", Uninstrumented, N)` row to
   `PARTITIONS`, and rewrites its `SHARDS` matrix assertion against `PARTITIONS`.
+
+## Follow-on changes
+
+Tracked here because this change is archived; each needs its own cospec change before implementation.
+
+- [ ] `coverage-instantiation-gate` — design D4a option (iii). Each partition exports per-instantiation mapped and
+  covered line sets from `llvm-cov export`, self-checked per file against llvm-cov's own `LF`/`LH` and failing
+  closed on any mismatch; the merge unions covered sets per instantiation and takes each group's maximum, so the
+  merged per-OS gate reproduces cargo-llvm-cov's `--fail-under-lines 90` exactly and `LINE_GATE_PERCENT` returns to
+  90 of that metric. Until then the merged gate is option (ii), 91% of unique instrumented lines, an interim margin
+  over a measured (0.67-0.75 point), not bounded, difference; AGENTS.md and `docs/development.md` state this. The
+  lead's confirmation of (ii) as the interim is requested on PR #118 and is not recorded here.
+- [ ] `windows-verify-native-build-partitions` — design D9, the Windows `bundle:verify-native-build` half of scope
+  item (4) (task 5.2b). Open lead decision among (a) leave it in the Windows install job, (b) its own parallel
+  Windows job, (c) a `-p kuru-memory` valid-archive build agreed with kuru-memory's owner.

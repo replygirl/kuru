@@ -32,7 +32,7 @@ jobs:
 
   tests:
     if: github.ref == 'refs/heads/main'
-    # One ordinary native test pass on the dispatch SHA. The 90% coverage gate
+    # One ordinary native test pass on the dispatch SHA. The coverage gate
     # is enforced per OS by CI on pull requests, merge groups and main, and the
     # staged candidate is accepted on every supported platform below.
     name: Tests

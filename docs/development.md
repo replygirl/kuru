@@ -564,8 +564,8 @@ with their capability purpose and rerun `mise run cospec:validate`.
 hk validates format/tooling/specs before commits, separate concurrent static
 format, lint, typecheck, tooling, cospec, cospec-managed and docs steps before
 pushes, and conventional commit titles. Behavioral tests and coverage with its
-90% line gate run in CI, not in hooks; run them locally when a change needs
-them. Hooks are installed by mise's postinstall and `mise run setup`. Fix failed
+per-OS line gate (above) run in CI, not in hooks; run them locally when a
+change needs them. Hooks are installed by mise's postinstall and `mise run setup`. Fix failed
 checks instead of bypassing hooks.
 
 Git hooks export repository-selection variables, so a subprocess working directory

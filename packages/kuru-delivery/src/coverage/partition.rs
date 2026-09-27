@@ -145,15 +145,11 @@ pub fn list_sha256(names: &[String]) -> String {
         .collect()
 }
 
-/// UTF-16 units of one argument after Windows command-line quoting, as the
-/// Microsoft C runtime parses it: quote an empty argument or one containing
-/// whitespace or `"`, double backslashes before a quote, escape the quote.
-fn argument_units(argument: &str, force_quotes: bool) -> usize {
-    let quoted = force_quotes
-        || argument.is_empty()
-        || argument
-            .chars()
-            .any(|character| matches!(character, ' ' | '\t' | '\n' | '\u{b}' | '"'));
+/// UTF-16 units of one argument as `kuru_platform`'s Windows process
+/// launcher writes it: every argument is quoted, `n` backslashes before a
+/// literal quote become `2n + 1`, and `n` trailing backslashes become `2n`.
+/// Counting any argument unquoted would undercount the spawned command line.
+fn argument_units(argument: &str) -> usize {
     let mut units = 0;
     let mut backslashes = 0;
     for character in argument.chars() {
@@ -167,20 +163,16 @@ fn argument_units(argument: &str, force_quotes: bool) -> usize {
         }
         units += character.len_utf16();
     }
-    if quoted {
-        units + backslashes + 2
-    } else {
-        units
-    }
+    units + backslashes + 2
 }
 
-/// UTF-16 units of the complete command line, including separators and the
-/// terminator. The program is always counted as quoted.
+/// UTF-16 units of the complete command line the platform launcher builds,
+/// including separators and the terminator.
 pub fn windows_command_line_units(program: &str, args: &[&str]) -> usize {
-    argument_units(program, true)
+    argument_units(program)
         + args
             .iter()
-            .map(|argument| 1 + argument_units(argument, false))
+            .map(|argument| 1 + argument_units(argument))
             .sum::<usize>()
         + 1
 }
@@ -199,7 +191,7 @@ pub fn chunk(
     let mut current: Vec<String> = Vec::new();
     let mut used = base;
     for name in names {
-        let units = 1 + argument_units(name, false);
+        let units = 1 + argument_units(name);
         ensure!(
             base + units <= budget,
             "test {name:?} does not fit a {budget}-unit command line with {program}"
@@ -338,17 +330,39 @@ mod tests {
 
     #[test]
     fn windows_units_follow_command_line_quoting() {
-        assert_eq!(argument_units("abc", false), 3);
-        assert_eq!(argument_units("", false), 2);
-        assert_eq!(argument_units("a b", false), 5);
-        assert_eq!(argument_units("a\"b", false), 6);
-        assert_eq!(argument_units("a\\\"b", false), 8);
-        assert_eq!(argument_units("a\\b", false), 3);
-        assert_eq!(argument_units("a b\\", false), 7);
-        assert_eq!(argument_units("C:\\x", true), 6);
-        assert_eq!(argument_units("é𝄞", false), 3);
-        // "C:\x" --exact a\0
-        assert_eq!(windows_command_line_units("C:\\x", &["--exact", "a"]), 17);
+        assert_eq!(argument_units("abc"), 5);
+        assert_eq!(argument_units(""), 2);
+        assert_eq!(argument_units("a b"), 5);
+        assert_eq!(argument_units("a\"b"), 6);
+        assert_eq!(argument_units("a\\\"b"), 8);
+        assert_eq!(argument_units("a\\b"), 5);
+        assert_eq!(argument_units("a b\\"), 7);
+        assert_eq!(argument_units("C:\\x"), 6);
+        assert_eq!(argument_units("é𝄞"), 5);
+        // "C:\x" "--exact" "a"\0
+        assert_eq!(windows_command_line_units("C:\\x", &["--exact", "a"]), 21);
+    }
+
+    #[test]
+    fn many_short_names_stay_under_the_windows_limit_as_the_launcher_quotes_them() {
+        let program =
+            "D:\\a\\_temp\\kuru-coverage-target\\debug\\deps\\kuru_runtime-0123456789abcdef.exe";
+        let listed: Vec<String> = (0..4000).map(|index| format!("t::c{index:05}")).collect();
+        let chunks = chunk(program, &["--exact"], &listed, COMMAND_LINE_BUDGET).unwrap();
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().any(|chunk| chunk.len() > 1500));
+        for chunk in &chunks {
+            // Independent count: `"program" "--exact" "name"...` plus the
+            // terminator, every argument quoted, all ASCII without quotes.
+            let units = program.len()
+                + 2
+                + (1 + "--exact".len() + 2)
+                + chunk.iter().map(|name| 1 + name.len() + 2).sum::<usize>()
+                + 1;
+            assert!(units <= COMMAND_LINE_BUDGET, "{units}");
+            assert!(units < 32_767, "{units}");
+        }
+        assert_eq!(chunks.concat(), listed);
     }
 
     #[test]

@@ -110,7 +110,9 @@ pub fn excluded_reason(exclusions: &[(&str, &str, &str)], host: &str, key: &str)
 }
 
 /// Every exclusion for this host must name one inventory test executable
-/// once, with a reason. A stale entry fails.
+/// once, with a reason. A stale entry fails. An exclusion for a workspace
+/// package outside a scoped (uninstrumented) inventory is not built there, so
+/// it only has to name a workspace package.
 pub fn check_exclusions(
     exclusions: &[(&str, &str, &str)],
     host: &str,
@@ -133,6 +135,17 @@ pub fn check_exclusions(
             !reason.trim().is_empty(),
             "coverage exclusion {artifact} on {host} has no reason"
         );
+        let package = artifact.split('/').next().unwrap_or_default();
+        if !inventory.scope.iter().any(|scoped| scoped == package) {
+            ensure!(
+                inventory
+                    .workspace_packages
+                    .iter()
+                    .any(|member| member == package),
+                "coverage exclusion {artifact} on {host} names no workspace package"
+            );
+            continue;
+        }
         ensure!(
             keys.iter().any(|key| key == artifact),
             "coverage exclusion {artifact} on {host} names no test executable of the inventory"

@@ -3843,8 +3843,12 @@ mod tests {
         // Stale, reasonless and repeated entries fail.
         for (table, message) in [
             (
-                vec![(fixture::HOST, "gone/lib/gone", reason)],
+                vec![(fixture::HOST, "kuru-memory/lib/gone", reason)],
                 "names no test executable",
+            ),
+            (
+                vec![(fixture::HOST, "gone/lib/gone", reason)],
+                "names no workspace package",
             ),
             (vec![(fixture::HOST, key.as_str(), " ")], "has no reason"),
             (
@@ -3866,6 +3870,34 @@ mod tests {
             &workspace.value,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn scoped_inventories_skip_exclusions_for_packages_they_do_not_build() {
+        let workspace = fixture::Workspace::new(Mode::Uninstrumented);
+        let reason = "not built by this scope";
+        // A host row for an unbuilt workspace package does not fail a scoped
+        // (kuru-memory) inventory, and still leaves nothing excluded there.
+        plan::check_exclusions(
+            &[(fixture::HOST, "kuru-runtime/lib/kuru_runtime", reason)],
+            fixture::HOST,
+            &workspace.value,
+        )
+        .unwrap();
+        // In scope it must still name an executable; a non-member always fails.
+        for (artifact, message) in [
+            ("kuru-memory/lib/gone", "names no test executable"),
+            ("gone/lib/gone", "names no workspace package"),
+        ] {
+            let error = plan::check_exclusions(
+                &[(fixture::HOST, artifact, reason)],
+                fixture::HOST,
+                &workspace.value,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(message), "{artifact}: {error}");
+        }
     }
 
     #[tokio::test]
@@ -4207,11 +4239,13 @@ mod tests {
         assert_eq!(announced, Some(2));
 
         // A selection sized to the command-line budget still starts: absent
-        // names are ordinary filters that select nothing.
+        // names are ordinary filters that select nothing. Short names put the
+        // most quoted arguments on the line, so on Windows the platform
+        // launcher's own 32,767-unit check sees the budget's worst case.
         let program = executable.to_str().unwrap();
         let mut filler = 0;
         loop {
-            let name = format!("coverage::tests::absent_filler_test_name_{filler:06}");
+            let name = format!("absent_{filler:06}");
             let mut next: Vec<&str> = args.iter().map(String::as_str).collect();
             next.push(&name);
             if partition::windows_command_line_units(program, &next)
