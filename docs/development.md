@@ -563,6 +563,14 @@ both digests. A pinned built archive is never downloaded: import the CI artifact
 or a local linux-x64 build with `bundle:prepare -- --target
 aarch64-pc-windows-msvc --archive <file>`.
 
+Workflows that need a built archive call the same workflow through
+`workflow_call`, passing the commit as `ref`. That path does not repeat the
+two-build proof: it restores an archive cached under the pinned digest or builds
+once, fails unless the bytes match the committed pin, and uploads the
+`bundle-input-<target>` artifact. Consuming jobs import it with
+`bundle:prepare -- --target <target> --archive <file> --offline` into their own
+private `KURU_DOLT_BUNDLE_DIR`, which checks the pin again.
+
 `KURU_BUNDLE_BUILD_HOST_OVERRIDE=1` lets `bundle build` run on another host for
 local iteration on the recipe. Its output is **not authoritative**: it requires
 `--print-pins`, never verifies or replaces committed pins, and is labelled as an

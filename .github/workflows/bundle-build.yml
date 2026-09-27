@@ -4,7 +4,22 @@ name: Bundle build
 # only from this linux-x64 job: two builds in fresh private directories must be
 # byte-identical before their pins can be trusted, and once pinned every build
 # must reproduce the committed bytes exactly.
+#
+# Workflows with a Windows on Arm leg call this workflow for its one import
+# input. The call path restores a cached archive or builds once, and fails
+# unless the bytes match the committed pin. The artifact is transport only:
+# each consumer's `bundle:prepare --archive` checks the same pin again.
 on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit whose committed pin and recipe produce the input
+        required: true
+        type: string
+    outputs:
+      artifact:
+        description: Workflow artifact holding the pin-verified engine archive
+        value: ${{ jobs.windows-arm64-input.outputs.artifact }}
   pull_request:
     paths:
       - .github/workflows/bundle-build.yml
@@ -22,10 +37,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: bundle-build-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
   MISE_LOCKED: "1"
   # CI builds stay outside the maintainer mr-boxington cache.
@@ -39,8 +50,14 @@ env:
 jobs:
   windows-arm64-engine:
     name: Reproducible Windows arm64 engine
+    # A called workflow sees its caller's event, so the input selects the path.
+    if: ${{ !inputs.ref }}
     runs-on: ubuntu-latest
     timeout-minutes: 150
+    # Job-level, so a caller's run on the same ref is never cancelled by it.
+    concurrency:
+      group: bundle-build-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -137,3 +154,125 @@ jobs:
             ${{ runner.temp }}/bundle-build-2/out
           if-no-files-found: ignore
           retention-days: 14
+
+  windows-arm64-input:
+    name: Pin-verified Windows arm64 engine input
+    if: ${{ inputs.ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      artifact: ${{ steps.input.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Read the committed pin
+        id: pin
+        run: |
+          set -eu
+          manifest=packages/kuru-memory/support/dolt-assets.json
+          sha="$(jq -r --arg target "$BUILT_TARGET" '.assets[] | select(.target == $target and .provenance == "built") | .archive_sha256' "$manifest")"
+          size="$(jq -r --arg target "$BUILT_TARGET" '.assets[] | select(.target == $target and .provenance == "built") | .compressed_bytes' "$manifest")"
+          if ! printf '%s' "$sha" | grep -Eqx '[0-9a-f]{64}' || ! printf '%s' "$size" | grep -Eqx '[1-9][0-9]*'; then
+            echo "::error::$BUILT_TARGET has no committed archive pin; an import input requires one"
+            exit 1
+          fi
+          {
+            echo "sha256=$sha"
+            echo "bytes=$size"
+          } >> "$GITHUB_OUTPUT"
+      # The key names the pinned bytes and every recipe input whose change
+      # re-runs the determinism proof, so a recipe change is rebuilt once.
+      - name: Restore a previously verified archive
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bundle-input
+          key: bundle-input-${{ env.BUILT_TARGET }}-${{ steps.pin.outputs.sha256 }}-${{ hashFiles('Cargo.lock', 'packages/kuru-archive/src/zip.rs', 'packages/kuru-delivery/src/bundle.rs', 'packages/kuru-delivery/src/bundle/**', 'packages/kuru-delivery/src/main.rs', 'packages/kuru-memory/mise.lock', 'packages/kuru-memory/mise.toml', 'packages/kuru-memory/support/bundle.rs', 'packages/kuru-memory/support/dolt-assets.json') }}
+      - name: Verify restored bytes against the pin
+        id: restored
+        if: steps.restore.outputs.cache-hit == 'true'
+        env:
+          PINNED_SHA256: ${{ steps.pin.outputs.sha256 }}
+          PINNED_BYTES: ${{ steps.pin.outputs.bytes }}
+        run: |
+          set -eu
+          archive="$RUNNER_TEMP/bundle-input/$BUILT_ARCHIVE"
+          if [ -f "$archive" ] && [ ! -L "$archive" ] \
+            && [ "$(stat -c %s "$archive")" = "$PINNED_BYTES" ] \
+            && [ "$(sha256sum "$archive" | cut -d ' ' -f 1)" = "$PINNED_SHA256" ]; then
+            echo "Restored archive matches the committed pin $PINNED_SHA256 ($PINNED_BYTES bytes)"
+            echo "verified=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Restored archive differs from the committed pin; rebuilding"
+            rm -rf -- "$RUNNER_TEMP/bundle-input"
+          fi
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        if: steps.restored.outputs.verified != 'true'
+        with:
+          experimental: true
+          version: 2026.9.4
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.restored.outputs.verified != 'true'
+        with:
+          cache-bin: false
+          shared-key: bundle-build
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install the pinned Go and llvm-mingw toolchains
+        if: steps.restored.outputs.verified != 'true'
+        run: mise run //packages/kuru-memory:setup:build-tools
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      # Without the pin-printing flag the helper refuses output that differs from the
+      # committed pins and reports both digests.
+      - name: Build once against the committed pin
+        if: steps.restored.outputs.verified != 'true'
+        run: |
+          set -eu
+          mise run //packages/kuru-memory:bundle:build -- \
+            --target "$BUILT_TARGET" \
+            --work-dir "$RUNNER_TEMP/bundle-build/work" \
+            --output "$RUNNER_TEMP/bundle-build/out"
+          mkdir "$RUNNER_TEMP/bundle-input"
+          cp "$RUNNER_TEMP/bundle-build/out/$BUILT_ARCHIVE" "$RUNNER_TEMP/bundle-input/"
+      - name: Verify built bytes against the pin
+        if: steps.restored.outputs.verified != 'true'
+        env:
+          PINNED_SHA256: ${{ steps.pin.outputs.sha256 }}
+          PINNED_BYTES: ${{ steps.pin.outputs.bytes }}
+        run: |
+          set -eu
+          archive="$RUNNER_TEMP/bundle-input/$BUILT_ARCHIVE"
+          observed="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+          observed_size="$(stat -c %s "$archive")"
+          if [ "$observed" != "$PINNED_SHA256" ] || [ "$observed_size" != "$PINNED_BYTES" ]; then
+            echo "::error::Built archive differs from the committed pin: pinned $PINNED_SHA256 ($PINNED_BYTES bytes), observed $observed ($observed_size bytes)"
+            exit 1
+          fi
+          echo "Built archive matches the committed pin $PINNED_SHA256 ($PINNED_BYTES bytes)"
+      - name: Require unchanged dependency locks
+        if: steps.restored.outputs.verified != 'true'
+        run: git diff --exit-code -- mise.lock packages/kuru-memory/mise.lock Cargo.lock
+      # Like the Cargo caches, only main saves; a rebuilt archive is saved
+      # only after it matched the pin.
+      - name: Save the verified archive
+        if: steps.restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bundle-input
+          key: ${{ steps.restore.outputs.cache-primary-key }}
+      - name: Select the input artifact
+        id: input
+        run: printf 'artifact=bundle-input-%s\n' "$BUILT_TARGET" >> "$GITHUB_OUTPUT"
+      - name: Upload the pin-verified archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.input.outputs.artifact }}
+          path: ${{ runner.temp }}/bundle-input/${{ env.BUILT_ARCHIVE }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
