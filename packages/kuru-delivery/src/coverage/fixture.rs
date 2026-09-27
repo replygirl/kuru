@@ -6,6 +6,7 @@ use super::{
     Artifact, Inventory, LLVM_COV_VERSION, Launch, Launcher, LibtestProgress, Mode,
     ReceiptIdentity, ReceiptOptions, SCHEMA, StallEvidence, Supervision, dispatch_with,
     ledger::{self, JobLedger},
+    lines::{Instantiation, LINES_SCHEMA, LineExport, LineSet},
     partition::PartitionScheme,
     plan, write_evidence, write_json,
 };
@@ -236,8 +237,10 @@ impl Workspace {
             },
         )?;
         let lcov = state.join("coverage.lcov");
+        let lines = state.join("coverage-lines.json");
         if mode == Mode::Instrumented {
             fs::write(&lcov, lcov_for(partition))?;
+            fs::write(&lines, lines_for(partition))?;
         }
         write_evidence(
             &ReceiptOptions {
@@ -249,6 +252,7 @@ impl Workspace {
                 job_ledger: &job_ledger,
                 profiles: &profiles,
                 lcov: (mode == Mode::Instrumented).then_some(lcov.as_path()),
+                lines: (mode == Mode::Instrumented).then_some(lines.as_path()),
                 run_attempt: &attempt.to_string(),
                 expected_source: SOURCE,
                 llvm_cov: None,
@@ -284,6 +288,32 @@ pub fn lcov_for(partition: &PartitionScheme) -> String {
     }
     text.push_str("end_of_record\n");
     text
+}
+
+/// Lines 1 to 20 of partition `k`, hit as in [`lcov_for`], as the one
+/// instantiation of one group.
+pub fn hits(partition: &PartitionScheme) -> Vec<u32> {
+    (1..20_u32)
+        .filter(|line| (line - 1) % partition.count + 1 == partition.index)
+        .collect()
+}
+
+/// The canonical line export matching [`lcov_for`].
+pub fn lines_for(partition: &PartitionScheme) -> String {
+    let file = "packages/kuru-core/src/lib.rs".to_owned();
+    let export = LineExport {
+        schema: LINES_SCHEMA,
+        files: vec![file.clone()],
+        instantiations: vec![Instantiation {
+            file,
+            name: "_RNvf".to_owned(),
+            line: 1,
+            column: 1,
+            mapped: LineSet::from_sorted((1..=20).collect()),
+            covered: LineSet::from_sorted(hits(partition)),
+        }],
+    };
+    String::from_utf8(export.render().unwrap()).unwrap()
 }
 
 /// A launcher that lists scripted names and "runs" selections instantly.

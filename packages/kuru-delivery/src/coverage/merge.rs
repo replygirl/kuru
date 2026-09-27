@@ -6,16 +6,21 @@
 //! and consistent with the OS label and the expected commit; every uploaded
 //! file matches its receipt digest; every runner ledger proves its plan; and
 //! each executable's plans are disjoint and complete against its listed
-//! tests. Only then does an instrumented merge union the partitions' LCOV and
-//! enforce the OS's 91% unique-line gate. Any failure leaves no report file.
+//! tests. Only then does an instrumented merge union each instantiation's
+//! covered lines across the partitions' line exports and enforce the OS's 90%
+//! gate on cargo-llvm-cov's own line metric, reproduced exactly (see
+//! [`lines`]). The union of their LCOV becomes the merged report, and its
+//! unique-line figure is printed for information only. Any failure leaves no
+//! report file.
 
 use super::{
     ATTEMPT_DIRECTORY, EXCLUDED_ARTIFACTS, INVENTORY_FILE, JOB_LEDGER_FILE, JSON_LIMIT, LCOV_FILE,
-    LLVM_COV_VERSION, LOCAL_OS, Mode, PLAN_FILE, PROFILE_COUNT_LIMIT, PROFILE_TOTAL_LIMIT,
-    RECEIPT_FILE, RUNNER_LEDGER_FILE, RUNNER_LEDGER_LIMIT, Receipt, SCHEMA, WORKSPACE_PACKAGES,
-    archive, canonical_attempt, digest_json, exact_entries,
+    LINES_FILE, LLVM_COV_VERSION, LOCAL_OS, Mode, PLAN_FILE, PROFILE_COUNT_LIMIT,
+    PROFILE_TOTAL_LIMIT, RECEIPT_FILE, RUNNER_LEDGER_FILE, RUNNER_LEDGER_LIMIT, Receipt, SCHEMA,
+    WORKSPACE_PACKAGES, archive, canonical_attempt, digest_json, exact_entries,
     lcov::{self, Lcov, Totals},
     ledger::JobLedger,
+    lines::{self, LineExport, Lines},
     os_target,
     partition::PartitionScheme,
     plan::{self, PartitionPlan},
@@ -71,7 +76,22 @@ pub struct MergeSummary {
     pub tests: usize,
     pub excluded: Vec<(String, String)>,
     pub partitions: Vec<PartitionRow>,
-    pub coverage: Option<Totals>,
+    pub coverage: Option<CoverageFigures>,
+}
+
+/// The merged coverage of an instrumented OS.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageFigures {
+    /// cargo-llvm-cov's line metric over the summed partitions: the gate.
+    pub lines: Lines,
+    pub gate_percent: u64,
+    pub instantiations: usize,
+    /// The same metric per root-relative source file.
+    pub files: BTreeMap<String, Lines>,
+    /// Unique instrumented lines, the union of the LCOV `DA` records. It reads
+    /// higher than the gate metric and is recorded for information only.
+    pub unique_lines: Totals,
 }
 
 pub const SUMMARY_FILE: &str = "merge-summary.json";
@@ -84,6 +104,7 @@ struct Accepted {
     plan: PartitionPlan,
     job: JobLedger,
     lcov: Option<Lcov>,
+    lines: Option<LineExport>,
 }
 
 /// Parse `<prefix>-coverage-<os>-partition-<k>-attempt-<n>`.
@@ -266,7 +287,7 @@ fn accept(
         RUNNER_LEDGER_FILE,
     ];
     if options.mode == Mode::Instrumented {
-        expected.push(LCOV_FILE);
+        expected.extend([LCOV_FILE, LINES_FILE]);
     }
     exact_entries(directory, &expected).with_context(|| label.clone())?;
     let receipt: Receipt = read_versioned(&directory.join(RECEIPT_FILE), "coverage receipt")
@@ -414,6 +435,33 @@ fn accept(
         }
         _ => bail!("{label} LCOV receipt does not match its mode"),
     };
+    let lines = match (&receipt.lines, options.mode) {
+        (Some(expected), Mode::Instrumented) => {
+            let bytes = read_bounded(&directory.join(LINES_FILE), lines::LINES_LIMIT)?;
+            ensure!(
+                bytes.len() as u64 == expected.bytes && archive::digest(&bytes) == expected.sha256,
+                "{label} uploaded line export differs from its receipt hash"
+            );
+            let export =
+                LineExport::parse(&bytes).with_context(|| format!("{label} line export"))?;
+            let figures = export.figures()?;
+            ensure!(
+                export.files.len() == expected.files
+                    && export.instantiation_count() == expected.instantiations
+                    && figures.total.count == expected.count
+                    && figures.total.covered == expected.covered,
+                "{label} line export totals differ from its self-checked receipt"
+            );
+            Some(export)
+        }
+        (None, Mode::Instrumented) => bail!(
+            "{label} receipt lacks the line export hash, so its lines cannot enter the exact gate"
+        ),
+        (None, Mode::Uninstrumented) => None,
+        (Some(_), Mode::Uninstrumented) => {
+            bail!("{label} line export receipt does not match its mode")
+        }
+    };
     Ok(Accepted {
         index,
         attempt,
@@ -421,6 +469,7 @@ fn accept(
         plan: uploaded,
         job,
         lcov,
+        lines,
     })
 }
 
@@ -563,17 +612,32 @@ pub fn merge(options: &MergeOptions<'_>) -> Result<MergeSummary> {
             for (index, lcov) in lcovs {
                 merged.absorb(lcov, &format!("coverage partition {index}"))?;
             }
-            let totals = merged.totals();
+            let lines = lines::union(accepted.iter().map(|partition| {
+                (
+                    format!("coverage partition {}", partition.index),
+                    partition.lines.as_ref().expect("instrumented line export"),
+                )
+            }))?;
+            let figures = lines.figures()?;
             ensure!(
-                lcov::passes_gate(&totals),
-                "{} line coverage {}% ({} of {} lines) is below {}%",
+                lines::passes_gate(&figures.total),
+                "{} line coverage {}% ({} of {} lines by cargo-llvm-cov's metric) is below {}%",
                 options.os,
-                lcov::percent(&totals),
-                totals.lines_hit,
-                totals.lines_found,
-                lcov::LINE_GATE_PERCENT
+                lines::percent(&figures.total),
+                figures.total.covered,
+                figures.total.count,
+                lines::GATE_PERCENT
             );
-            Some((merged, totals))
+            Some((
+                merged.clone(),
+                CoverageFigures {
+                    lines: figures.total,
+                    gate_percent: lines::GATE_PERCENT,
+                    instantiations: lines.instantiation_count(),
+                    files: figures.files,
+                    unique_lines: merged.totals(),
+                },
+            ))
         }
         Mode::Uninstrumented => None,
     };
@@ -602,7 +666,7 @@ pub fn merge(options: &MergeOptions<'_>) -> Result<MergeSummary> {
                     .map(|(artifact, seconds)| (artifact.to_owned(), seconds)),
             })
             .collect(),
-        coverage: merged.as_ref().map(|(_, totals)| *totals),
+        coverage: merged.as_ref().map(|(_, figures)| figures.clone()),
     };
     // Written through a private name and renamed only after every check passed.
     let parent = summary_path.parent().expect("summary parent");
@@ -661,18 +725,34 @@ pub fn print_summary(summary: &MergeSummary) {
     for (artifact, reason) in &summary.excluded {
         println!("excluded {artifact}: {reason}");
     }
-    if let Some(totals) = &summary.coverage {
-        // The union of DA records counts each instrumented source line once;
-        // cargo-llvm-cov's own summary sums lines per function-instantiation
-        // group and reads lower, so the two percentages are not comparable.
+    if let Some(coverage) = &summary.coverage {
+        println!("file lines covered percent");
+        for (file, lines) in &coverage.files {
+            println!(
+                "{file} {} {} {}",
+                lines.count,
+                lines.covered,
+                lines::percent(lines)
+            );
+        }
         println!(
-            "coverage {}: {}% of unique instrumented lines (union of DA records: {} of {}) across {} files; gate {}%",
+            "coverage {}: {}% of lines ({} of {}) across {} files and {} instantiations, by cargo-llvm-cov's line metric (instantiation groups, as `mise run coverage` counts them); gate {}%",
             summary.os,
-            lcov::percent(totals),
-            totals.lines_hit,
-            totals.lines_found,
-            totals.files,
-            lcov::LINE_GATE_PERCENT
+            lines::percent(&coverage.lines),
+            coverage.lines.covered,
+            coverage.lines.count,
+            coverage.files.len(),
+            coverage.instantiations,
+            coverage.gate_percent
+        );
+        // Unique source lines read higher, since a line of several
+        // instantiation groups counts once; it is not the gated figure.
+        let unique = &coverage.unique_lines;
+        println!(
+            "information only: {}% of unique instrumented lines (union of LCOV DA records: {} of {})",
+            lcov::percent(unique),
+            unique.lines_hit,
+            unique.lines_found
         );
     }
 }
@@ -680,6 +760,7 @@ pub fn print_summary(summary: &MergeSummary) {
 #[cfg(test)]
 mod tests {
     use super::super::fixture::{SOURCE, Workspace};
+    use super::super::lines::LineSet;
     use super::*;
 
     /// Every partition's evidence for one OS, placed as the download step
@@ -775,6 +856,27 @@ mod tests {
             });
         }
 
+        /// Replace a partition's line export and rebind its receipt to it.
+        fn replace_lines(&self, index: u32, export: &LineExport) {
+            let bytes = export.render().unwrap();
+            fs::write(self.evidence(index).join(LINES_FILE), &bytes).unwrap();
+            let figures = export.figures().unwrap();
+            self.edit_receipt(index, |receipt| {
+                receipt["lines"] = serde_json::json!({
+                    "bytes": bytes.len(),
+                    "sha256": archive::digest(&bytes),
+                    "files": export.files.len(),
+                    "instantiations": export.instantiation_count(),
+                    "count": figures.total.count,
+                    "covered": figures.total.covered,
+                });
+            });
+        }
+
+        fn lines(&self, index: u32) -> LineExport {
+            LineExport::parse(&fs::read(self.evidence(index).join(LINES_FILE)).unwrap()).unwrap()
+        }
+
         fn merge(&self) -> Result<MergeSummary> {
             merge(&self.options())
         }
@@ -796,13 +898,33 @@ mod tests {
         let downloaded = Downloaded::new(Mode::Instrumented, 3).await;
         let summary = downloaded.merge().unwrap();
         assert_eq!(summary.partitions.len(), 3);
+        let coverage = summary.coverage.clone().unwrap();
         assert_eq!(
-            summary.coverage,
-            Some(Totals {
+            coverage.lines,
+            Lines {
+                count: 20,
+                covered: 19
+            }
+        );
+        assert_eq!(coverage.gate_percent, 90);
+        assert_eq!(coverage.instantiations, 1);
+        assert_eq!(
+            coverage.files,
+            BTreeMap::from([(
+                "packages/kuru-core/src/lib.rs".to_owned(),
+                Lines {
+                    count: 20,
+                    covered: 19
+                }
+            )])
+        );
+        assert_eq!(
+            coverage.unique_lines,
+            Totals {
                 files: 1,
                 lines_found: 20,
                 lines_hit: 19
-            })
+            }
         );
         let runnable = downloaded.workspace.runnable().len();
         assert_eq!(summary.executables, runnable);
@@ -845,7 +967,7 @@ mod tests {
     #[tokio::test]
     async fn receipts_that_disagree_or_misdescribe_their_evidence_fail() {
         type Edit = fn(&mut serde_json::Value);
-        let cases: [(Edit, &str); 17] = [
+        let cases: [(Edit, &str); 20] = [
             (|r| r["source"] = "other".into(), "was built from other"),
             (
                 |r| r["tree"] = "other".into(),
@@ -892,6 +1014,18 @@ mod tests {
                 "uploaded LCOV differs",
             ),
             (
+                |r| r["lines"]["sha256"] = "x".into(),
+                "uploaded line export differs from its receipt hash",
+            ),
+            (
+                |r| r["lines"]["covered"] = 0.into(),
+                "line export totals differ from its self-checked receipt",
+            ),
+            (
+                |r| r["lines"] = serde_json::Value::Null,
+                "receipt lacks the line export hash",
+            ),
+            (
                 |r| r["partition"]["index"] = 1.into(),
                 "carries a receipt for partition 1",
             ),
@@ -914,6 +1048,15 @@ mod tests {
         fs::write(downloaded.evidence(2).join(RECEIPT_FILE), &receipt).unwrap();
         downloaded.edit_receipt(2, |r| r["lcov"] = serde_json::Value::Null);
         downloaded.refuse("LCOV receipt does not match its mode");
+        fs::write(downloaded.evidence(2).join(RECEIPT_FILE), &receipt).unwrap();
+        // A receipt written before the line export existed omits the field.
+        downloaded.edit_receipt(2, |r| {
+            r.as_object_mut().unwrap().remove("lines");
+        });
+        downloaded.refuse("receipt lacks the line export hash");
+        fs::write(downloaded.evidence(2).join(RECEIPT_FILE), &receipt).unwrap();
+        fs::remove_file(downloaded.evidence(2).join(LINES_FILE)).unwrap();
+        downloaded.refuse("unexpected artifact entries");
     }
 
     #[tokio::test]
@@ -969,10 +1112,38 @@ mod tests {
                 None => format!("{line}\n"),
             })
             .collect();
+        // The gate reads the line exports, not the LCOV.
         let low = Downloaded::new(Mode::Instrumented, 2).await;
         low.replace_lcov(1, &hits);
         low.replace_lcov(2, &hits);
-        low.refuse("line coverage 0.00% (0 of 20 lines) is below 91%");
+        low.merge().unwrap();
+        let mut lines = low.lines(1);
+        lines.instantiations[0].covered = LineSet::from_sorted((1..=17).collect());
+        let low = Downloaded::new(Mode::Instrumented, 2).await;
+        low.replace_lines(1, &lines);
+        low.replace_lines(2, &lines);
+        low.refuse("line coverage 85.00% (17 of 20 lines by cargo-llvm-cov's metric) is below 90%");
+        // Exactly 90% passes, as cargo-llvm-cov's --fail-under-lines 90 does.
+        let exact = Downloaded::new(Mode::Instrumented, 2).await;
+        lines.instantiations[0].covered = LineSet::from_sorted((1..=18).collect());
+        exact.replace_lines(1, &lines);
+        lines.instantiations[0].covered = LineSet::from_sorted(vec![18]);
+        exact.replace_lines(2, &lines);
+        let coverage = exact.merge().unwrap().coverage.unwrap();
+        assert_eq!(
+            coverage.lines,
+            Lines {
+                count: 20,
+                covered: 18
+            }
+        );
+        // Instantiations must share their mapped lines across partitions.
+        let drifted = Downloaded::new(Mode::Instrumented, 2).await;
+        let mut lines = drifted.lines(2);
+        lines.instantiations[0].mapped = LineSet::from_sorted((1..=21).collect());
+        drifted.replace_lines(2, &lines);
+        drifted.refuse("coverage partition 2 line export disagrees on 1 instantiations");
+        drifted.refuse("_RNvf maps different lines");
         let absolute = Downloaded::new(Mode::Instrumented, 1).await;
         absolute.replace_lcov(1, &lcov.replace("SF:packages", "SF:/abs/packages"));
         absolute.refuse("not a normalized relative path");

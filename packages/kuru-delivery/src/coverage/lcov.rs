@@ -1,10 +1,12 @@
-//! Strict LCOV parsing, source normalization, union and the line gate.
+//! Strict LCOV parsing, source normalization and union.
 //!
 //! Each instrumented partition exports LCOV against the binaries that produced
 //! its profiles and normalizes every source to a root-relative forward-slash
 //! path. The merge requires every partition to describe identical files,
-//! lines and functions (they were built from one agreed inventory), sums
-//! their hit counts and computes the line total once for the OS.
+//! lines and functions (they were built from one agreed inventory) and sums
+//! their hit counts into the OS's merged report. Its unique-line total is
+//! informational; the gate applies cargo-llvm-cov's own metric (see
+//! [`super::lines`]).
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -12,15 +14,6 @@ use std::collections::BTreeMap;
 
 /// Largest LCOV file a partition may export or the merge may read.
 pub const LCOV_LIMIT: u64 = 256 * 1024 * 1024;
-/// The per-OS line gate, in percent of unique instrumented lines.
-///
-/// This is an interim margin, not an equivalence: on identical tests the
-/// unique-line figure reads 0.67 to 0.75 points above cargo-llvm-cov's
-/// summary, which `mise run coverage` holds to 90%. At 91 the merged gate's
-/// effective bar by that summary metric stays at or above 90% (about 90.25%
-/// at the measured delta) until the merge recombines per-instantiation
-/// line sets itself.
-pub const LINE_GATE_PERCENT: u64 = 91;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FileCoverage {
@@ -148,24 +141,11 @@ impl Lcov {
     /// Rewrite every source to a forward-slash path relative to `root`,
     /// refusing a source outside it. Windows drive letters compare without case.
     pub fn normalize(self, root: &str) -> Result<Self> {
-        let root = comparable(root);
-        let root = root.trim_end_matches('/');
-        ensure!(!root.is_empty(), "coverage root is empty");
         let mut files = BTreeMap::new();
         for (path, file) in self.files {
-            let comparable_path = comparable(&path);
-            let relative = comparable_path
-                .strip_prefix(root)
-                .and_then(|rest| rest.strip_prefix('/'))
-                .with_context(|| format!("LCOV source {path} is outside {root}"))?;
+            let relative = relative_source(&path, root)?;
             ensure!(
-                relative
-                    .split('/')
-                    .all(|part| !part.is_empty() && part != "." && part != ".."),
-                "LCOV source {path} is not a normal path below the root"
-            );
-            ensure!(
-                files.insert(relative.to_owned(), file).is_none(),
+                files.insert(relative, file).is_none(),
                 "LCOV source {path} normalizes onto another source"
             );
         }
@@ -285,7 +265,7 @@ impl FileCoverage {
     /// closure and its parent counts twice. Neither can be derived from the
     /// records or unioned across partitions, so they are accepted as given,
     /// only once each, and the rendered summaries are recomputed from the
-    /// records: the gate counts unique instrumented lines (`DA`).
+    /// records, which count unique instrumented lines (`DA`).
     fn check_summaries(&self, summaries: &[(&str, u64)]) -> Result<()> {
         let mut tags: Vec<_> = summaries.iter().map(|(tag, _)| *tag).collect();
         tags.sort_unstable();
@@ -295,6 +275,26 @@ impl FileCoverage {
         );
         Ok(())
     }
+}
+
+/// A source path as a forward-slash path relative to `root`, refusing a
+/// source outside it. Windows drive letters compare without case.
+pub fn relative_source(path: &str, root: &str) -> Result<String> {
+    let root = comparable(root);
+    let root = root.trim_end_matches('/');
+    ensure!(!root.is_empty(), "coverage root is empty");
+    let comparable_path = comparable(path);
+    let relative = comparable_path
+        .strip_prefix(root)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .with_context(|| format!("source {path} is outside {root}"))?;
+    ensure!(
+        relative
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != ".."),
+        "source {path} is not a normal path below the root"
+    );
+    Ok(relative.to_owned())
 }
 
 /// A path in comparable form: forward slashes, no Windows verbatim prefix and
@@ -311,15 +311,7 @@ fn comparable(path: &str) -> String {
     path
 }
 
-/// Whether `lines_hit / lines_found` reaches the gate, over unique instrumented
-/// lines (`DA` records). No lines never passes.
-pub fn passes_gate(totals: &Totals) -> bool {
-    totals.lines_found > 0
-        && u128::from(totals.lines_hit) * 100
-            >= u128::from(totals.lines_found) * u128::from(LINE_GATE_PERCENT)
-}
-
-/// Percentage with two decimals, for logs only.
+/// Percentage of unique instrumented lines with two decimals, for logs only.
 pub fn percent(totals: &Totals) -> String {
     if totals.lines_found == 0 {
         return "0.00".to_owned();
@@ -494,19 +486,12 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_passes_at_exactly_ninety_one_percent_and_fails_below() {
+    fn unique_line_percentages_truncate_to_two_decimals() {
         let totals = |found, hit| Totals {
             files: 1,
             lines_found: found,
             lines_hit: hit,
         };
-        assert_eq!(LINE_GATE_PERCENT, 91);
-        assert!(passes_gate(&totals(1000, 910)));
-        assert!(!passes_gate(&totals(1000, 909)));
-        assert!(!passes_gate(&totals(1000, 900)));
-        assert!(passes_gate(&totals(10, 10)));
-        assert!(!passes_gate(&totals(0, 0)));
-        assert!(!passes_gate(&totals(100_001, 91_000)));
         assert_eq!(percent(&totals(1000, 910)), "91.00");
         assert_eq!(percent(&totals(3, 2)), "66.66");
         assert_eq!(percent(&totals(0, 0)), "0.00");

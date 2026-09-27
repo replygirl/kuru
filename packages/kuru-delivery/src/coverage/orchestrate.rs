@@ -3,10 +3,12 @@
 //! `coverage shard` compiles the partition's inventory into a fresh target,
 //! optionally seeded with allow-listed dependency artifacts, runs it through
 //! the task-private Cargo runner that lists every executable and runs only
-//! this partition's tests, exports the partition's LCOV when instrumented and
-//! writes its receipt. `coverage merge` accepts an OS's partitions only when
-//! their receipts agree and their plans are disjoint and complete, then
-//! enforces that OS's 91% unique-line gate on the union of their LCOV.
+//! this partition's tests and, when instrumented, exports the partition's LCOV
+//! and its line export, which must reproduce cargo-llvm-cov's own summary of
+//! the partition exactly, then writes its receipt. `coverage merge` accepts an
+//! OS's partitions only when their receipts agree and their plans are disjoint
+//! and complete, then enforces that OS's 90% gate on cargo-llvm-cov's line
+//! metric over their union.
 //!
 //! Every process this module starts goes through [`Host`], so the sequencing
 //! and each refusal are unit-tested with a fake. The coverage environment from
@@ -16,9 +18,9 @@
 use super::{
     COMMAND_OUTPUT_LIMIT, LLVM_COV_VERSION, Mode, RUNNER_LEDGER_FILE, ReceiptOptions,
     RunnerConfigOptions, WORKSPACE_PACKAGES, artifact_os_label, canonical_attempt,
-    check_partitioning, discard_compile_profiles, lcov, ledger, merge, partition::PartitionScheme,
-    plan, seed, unix_now, workspace_identity, write_inventory, write_json, write_new,
-    write_runner_config,
+    check_partitioning, discard_compile_profiles, lcov, ledger, lines, merge,
+    partition::PartitionScheme, plan, seed, unix_now, workspace_identity, write_inventory,
+    write_json, write_new, write_runner_config,
 };
 use crate::command;
 use anyhow::{Context, Result, bail, ensure};
@@ -38,11 +40,13 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Private state directory created inside the fresh coverage target.
 const STATE: &str = "kuru-shard-state";
 /// State copied beside `failure.txt` when a partition fails after creating it.
-const DIAGNOSTIC_COPIES: [&str; 4] = [
+const DIAGNOSTIC_COPIES: [&str; 5] = [
     "inventory.json",
     "runner-config.toml",
     RUNNER_LEDGER_FILE,
     "job-ledger.json",
+    // cargo-llvm-cov's own figures, beside a failed line-export self-check.
+    "coverage.summary.json",
 ];
 const INPUT_PREFIX: &str = "KURU_COVERAGE_";
 /// Process variables that change what Cargo builds or how tests run. Their
@@ -995,54 +999,28 @@ async fn run_shard<H: Host>(
     );
 
     let (profile_count, profile_bytes) = profile_totals(&target)?;
-    let lcov_path = match &llvm_cov {
+    let exports = match &llvm_cov {
         Some(llvm_cov) => {
-            let started = unix_now()?;
             ensure!(
                 profile_count <= super::PROFILE_COUNT_LIMIT
                     && profile_bytes <= super::PROFILE_TOTAL_LIMIT,
                 "coverage partition profiles exceed their limits ({profile_count} files, {profile_bytes} bytes)"
             );
-            let raw = state.join("coverage.raw.lcov");
-            let raw_text = raw.to_str().context("LCOV path is not UTF-8")?;
-            host.stream(
-                &Invocation::new(
-                    llvm_cov,
-                    &[
-                        "llvm-cov",
-                        "report",
-                        "--failure-mode",
-                        "any",
-                        "--lcov",
-                        "--output-path",
-                        raw_text,
-                    ],
-                    &root,
-                )
-                .with_env(&env),
-                None,
+            let root_text = root.to_str().context("coverage root is not UTF-8")?;
+            let lcov =
+                export_lcov(host, llvm_cov, &root, root_text, &env, &state, &mut phases).await?;
+            let lines = export_lines(
+                host,
+                llvm_cov,
+                &root,
+                root_text,
+                &env,
+                &state,
+                &partition,
+                &mut phases,
             )
-            .await
-            .context("partition coverage export failed")?;
-            let bytes = super::read_bounded(&raw, lcov::LCOV_LIMIT)
-                .context("partition coverage export was not written")?;
-            let normalized = lcov::Lcov::parse(
-                std::str::from_utf8(&bytes).context("partition LCOV is not UTF-8")?,
-            )?
-            .normalize(root.to_str().context("coverage root is not UTF-8")?)?;
-            let path = state.join("coverage.lcov");
-            write_new(&path, normalized.render().as_bytes())?;
-            let totals = normalized.totals();
-            eprintln!(
-                "coverage partition {} of {}: {}% of lines in this partition alone ({} of {}); the gate applies to the merge",
-                partition.index,
-                partition.count,
-                lcov::percent(&totals),
-                totals.lines_hit,
-                totals.lines_found
-            );
-            phases.record("lcov_export", started)?;
-            Some(path)
+            .await?;
+            Some((lcov, lines))
         }
         None => None,
     };
@@ -1075,7 +1053,8 @@ async fn run_shard<H: Host>(
         ledger: &ledger_path,
         job_ledger: &job_ledger,
         profiles: &target,
-        lcov: lcov_path.as_deref(),
+        lcov: exports.as_ref().map(|(lcov, _)| lcov.as_path()),
+        lines: exports.as_ref().map(|(_, lines)| lines.as_path()),
         run_attempt: &common.attempt,
         expected_source: &common.source,
         llvm_cov: llvm_cov.as_deref(),
@@ -1113,6 +1092,104 @@ async fn run_shard<H: Host>(
         }
     }
     Ok(())
+}
+
+/// Run `cargo-llvm-cov llvm-cov report` with the coverage environment,
+/// writing `output` inside the private state directory.
+async fn report<H: Host>(
+    host: &mut H,
+    llvm_cov: &Path,
+    root: &Path,
+    env: &[(OsString, OsString)],
+    format: &[&str],
+    output: &Path,
+) -> Result<()> {
+    let output_text = output
+        .to_str()
+        .context("coverage export path is not UTF-8")?;
+    let mut args = vec!["llvm-cov", "report", "--failure-mode", "any"];
+    args.extend(format);
+    args.extend(["--output-path", output_text]);
+    host.stream(&Invocation::new(llvm_cov, &args, root).with_env(env), None)
+        .await
+}
+
+/// Export the partition's normalized LCOV, for the merged report and the
+/// informational unique-line figure.
+async fn export_lcov<H: Host>(
+    host: &mut H,
+    llvm_cov: &Path,
+    root: &Path,
+    root_text: &str,
+    env: &[(OsString, OsString)],
+    state: &Path,
+    phases: &mut Phases,
+) -> Result<PathBuf> {
+    let started = unix_now()?;
+    let raw = state.join("coverage.raw.lcov");
+    report(host, llvm_cov, root, env, &["--lcov"], &raw)
+        .await
+        .context("partition coverage export failed")?;
+    let bytes = super::read_bounded(&raw, lcov::LCOV_LIMIT)
+        .context("partition coverage export was not written")?;
+    let normalized =
+        lcov::Lcov::parse(std::str::from_utf8(&bytes).context("partition LCOV is not UTF-8")?)?
+            .normalize(root_text)?;
+    let path = state.join("coverage.lcov");
+    write_new(&path, normalized.render().as_bytes())?;
+    phases.record("lcov_export", started)?;
+    Ok(path)
+}
+
+/// Export every instantiation's mapped and covered lines and require them to
+/// reproduce this partition's own cargo-llvm-cov summary exactly, per file
+/// and in total, before any evidence names them.
+#[allow(clippy::too_many_arguments)]
+async fn export_lines<H: Host>(
+    host: &mut H,
+    llvm_cov: &Path,
+    root: &Path,
+    root_text: &str,
+    env: &[(OsString, OsString)],
+    state: &Path,
+    partition: &PartitionScheme,
+    phases: &mut Phases,
+) -> Result<PathBuf> {
+    let started = unix_now()?;
+    let full = state.join("coverage.raw.json");
+    report(host, llvm_cov, root, env, &["--json"], &full)
+        .await
+        .context("partition line export failed")?;
+    let summary = state.join("coverage.summary.json");
+    report(
+        host,
+        llvm_cov,
+        root,
+        env,
+        &["--json", "--summary-only"],
+        &summary,
+    )
+    .await
+    .context("partition coverage summary failed")?;
+    let export = lines::LlvmExport::read(&full)?.line_export(root_text)?;
+    let reported = lines::LlvmExport::read(&summary)?.summary_figures(root_text)?;
+    let derived = export.figures()?;
+    lines::self_check(&derived, &reported)
+        .context("coverage partition line export does not reproduce cargo-llvm-cov's summary")?;
+    let path = state.join("coverage-lines.json");
+    write_new(&path, &export.render()?)?;
+    eprintln!(
+        "coverage partition {} of {}: {}% of lines in this partition alone ({} of {}, {} instantiations in {} files; reproduces cargo-llvm-cov's summary exactly); the gate applies to the merge",
+        partition.index,
+        partition.count,
+        lines::percent(&derived.total),
+        derived.total.covered,
+        derived.total.count,
+        export.instantiation_count(),
+        export.files.len()
+    );
+    phases.record("lines_export", started)?;
+    Ok(path)
 }
 
 /// Count and size of the raw profiles in the target root.
@@ -1425,6 +1502,8 @@ mod tests {
         Prefetch,
         TestRun,
         Export,
+        LineExport,
+        Summary,
         Receipt,
     }
 
@@ -1444,6 +1523,9 @@ mod tests {
         verified: Vec<Option<PathBuf>>,
         receipts: Vec<(Mode, PartitionScheme, String, PathBuf)>,
         write_export: bool,
+        /// Added to the covered lines the fake summary reports, so the line
+        /// export no longer reproduces it.
+        summary_offset: u64,
         /// Whether the seeded dependency was already in the target at build.
         seeded_at_build: Option<bool>,
     }
@@ -1481,6 +1563,7 @@ mod tests {
                 verified: Vec::new(),
                 receipts: Vec::new(),
                 write_export: true,
+                summary_offset: 0,
                 seeded_at_build: None,
             }
         }
@@ -1653,6 +1736,48 @@ mod tests {
             Ok(())
         }
 
+        /// cargo-llvm-cov's JSON for the fixture LCOV's one source: twenty
+        /// one-line regions, hit as the LCOV hits them. The summary's figures
+        /// are counted here, not by the port under test.
+        fn llvm_export(&self, partition: &PartitionScheme, functions: bool) -> String {
+            let hits = fixture::hits(partition);
+            let file = self
+                .workspace
+                .join("packages/kuru-core/src/lib.rs")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let lines = serde_json::json!({
+                "count": 20,
+                "covered": hits.len() as u64 + self.summary_offset,
+                "percent": 0.0,
+            });
+            let mut data = serde_json::json!({
+                "files": [{"filename": file, "summary": {"lines": lines}}],
+                "totals": {"lines": lines},
+            });
+            if functions {
+                let regions: Vec<_> = (1..=20_u32)
+                    .map(|line| [line, 1, line, 10, u32::from(hits.contains(&line)), 0, 0, 0])
+                    .collect();
+                data["functions"] = serde_json::json!([{
+                    "name": "_RNvf",
+                    "count": 1,
+                    "filenames": [file],
+                    "regions": regions,
+                    "branches": [],
+                    "mcdc_records": [],
+                }]);
+            }
+            serde_json::json!({
+                "type": "llvm.coverage.json.export",
+                "version": "3.1.0",
+                "cargo_llvm_cov": {"version": "0.9.1", "manifest_path": "Cargo.toml"},
+                "data": [data],
+            })
+            .to_string()
+        }
+
         fn partition_of(target: &Path) -> PartitionScheme {
             let config = target.join(STATE).join("runner-config.toml");
             let text = fs::read_to_string(config).unwrap();
@@ -1755,19 +1880,39 @@ mod tests {
                     self.call(Call::TestRun)?;
                     self.run_tests(invocation).await?;
                 }
-                ["llvm-cov", "report", .., output] => {
+                [
+                    "llvm-cov",
+                    "report",
+                    "--failure-mode",
+                    "any",
+                    ref format @ ..,
+                    "--output-path",
+                    output,
+                ] => {
                     assert!(stdout.is_none());
-                    self.call(Call::Export)?;
                     let target = Self::target(invocation);
                     assert!(!target.join("kuru-0-0.profraw").exists());
+                    let partition = Self::partition_of(&target);
+                    let text = match format {
+                        ["--lcov"] => {
+                            self.call(Call::Export)?;
+                            fixture::lcov_for(&partition).replace(
+                                "SF:packages/",
+                                &format!("SF:{}/packages/", self.workspace.display()),
+                            )
+                        }
+                        ["--json"] => {
+                            self.call(Call::LineExport)?;
+                            self.llvm_export(&partition, true)
+                        }
+                        ["--json", "--summary-only"] => {
+                            self.call(Call::Summary)?;
+                            self.llvm_export(&partition, false)
+                        }
+                        _ => panic!("unexpected export {}", invocation.describe()),
+                    };
                     if self.write_export {
-                        let partition = Self::partition_of(&target);
-                        let relative = fixture::lcov_for(&partition);
-                        let absolute = relative.replace(
-                            "SF:packages/",
-                            &format!("SF:{}/packages/", self.workspace.display()),
-                        );
-                        fs::write(output, absolute)?;
+                        fs::write(output, text)?;
                     }
                 }
                 _ => panic!("unexpected stream {}", invocation.describe()),
@@ -1926,6 +2071,8 @@ mod tests {
                 Call::Rustc,
                 Call::TestRun,
                 Call::Export,
+                Call::LineExport,
+                Call::Summary,
                 Call::Receipt,
             ]
         );
@@ -1937,6 +2084,9 @@ mod tests {
             "inventory.json",
             "coverage.raw.lcov",
             "coverage.lcov",
+            "coverage.raw.json",
+            "coverage.summary.json",
+            "coverage-lines.json",
         ] {
             assert!(state.join(name).is_file(), "{name}");
         }
@@ -1980,16 +2130,23 @@ mod tests {
             ]
             .map(OsString::from)
         );
-        let export = fake
+        let exports: Vec<_> = fake
             .invocations
             .iter()
-            .find(|invocation| {
+            .filter(|invocation| {
                 invocation.args.first().is_some_and(|arg| arg == "llvm-cov")
                     && invocation.args.get(1).is_some_and(|arg| arg == "report")
             })
-            .unwrap();
-        assert!(!export.args.iter().any(|arg| arg == "--fail-under-lines"));
-        assert!(Fake::env(export, "CARGO_LLVM_COV_TARGET_DIR").is_some());
+            .collect();
+        assert_eq!(exports.len(), 3);
+        for export in exports {
+            assert!(!export.args.iter().any(|arg| arg == "--fail-under-lines"));
+            assert_eq!(
+                export.args[2..4],
+                ["--failure-mode", "any"].map(OsString::from)
+            );
+            assert!(Fake::env(export, "CARGO_LLVM_COV_TARGET_DIR").is_some());
+        }
         // Captures that are not Cargo children never see the coverage env.
         for invocation in fake
             .invocations
@@ -2011,8 +2168,25 @@ mod tests {
             lcov.starts_with("SF:packages/kuru-core/src/lib.rs\n"),
             "{lcov}"
         );
+        // The self-checked line export is the fixture's, byte for byte.
+        assert_eq!(
+            fs::read_to_string(evidence.join("coverage-lines.json")).unwrap(),
+            fixture::lines_for(&PartitionScheme::new(2, 3).unwrap())
+        );
+        let lines = receipt.lines.unwrap();
+        assert_eq!(
+            (lines.count, lines.covered, lines.instantiations),
+            (20, 6, 1)
+        );
         let ledger = scenario.job_ledger();
-        for phase in ["prepare", "seed_import", "compile", "tests", "lcov_export"] {
+        for phase in [
+            "prepare",
+            "seed_import",
+            "compile",
+            "tests",
+            "lcov_export",
+            "lines_export",
+        ] {
             assert!(ledger.phases.contains_key(phase), "{phase}");
         }
         assert_eq!(ledger.cache.helper, "unknown");
@@ -2298,7 +2472,9 @@ mod tests {
         );
         let mut ledger = manifests.clone();
         ledger.insert("runner-ledger.jsonl".to_owned());
-        let mut job = ledger.clone();
+        let mut summary = ledger.clone();
+        summary.insert("coverage.summary.json".to_owned());
+        let mut job = summary.clone();
         job.insert("job-ledger.json".to_owned());
         for (call, expected) in [
             (Call::BinPaths, &early),
@@ -2309,6 +2485,8 @@ mod tests {
             (Call::NoRun, &early),
             (Call::TestRun, &manifests),
             (Call::Export, &ledger),
+            (Call::LineExport, &ledger),
+            (Call::Summary, &ledger),
             (Call::Receipt, &job),
         ] {
             let mut scenario = Scenario::new(INSTRUMENTED);
@@ -2333,6 +2511,21 @@ mod tests {
         export.fake.write_export = false;
         let error = format!("{:#}", export.run(INSTRUMENTED).await.unwrap_err());
         assert!(error.contains("export was not written"), "{error}");
+        let mut mismatch = Scenario::new(INSTRUMENTED);
+        mismatch.fake.summary_offset = 1;
+        let error = format!("{:#}", mismatch.run(INSTRUMENTED).await.unwrap_err());
+        assert!(
+            error.contains("does not reproduce cargo-llvm-cov's summary")
+                && error.contains("packages/kuru-core/src/lib.rs: llvm-cov 7/20, port 6/20"),
+            "{error}"
+        );
+        let diagnostics = mismatch.diagnostics();
+        assert!(
+            diagnostics.contains("coverage.summary.json"),
+            "{diagnostics:?}"
+        );
+        assert!(!diagnostics.contains("job-ledger.json"), "{diagnostics:?}");
+        assert!(!mismatch.job("evidence").exists());
         let mut drift = Scenario::new(INSTRUMENTED);
         drift.fake.packages.pop();
         let error = drift.run(INSTRUMENTED).await.unwrap_err().to_string();

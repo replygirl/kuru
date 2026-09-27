@@ -294,13 +294,14 @@ jobs:
     if: always()
     needs: shard
     # Every OS merges on Ubuntu: the partitions already exported their LCOV
-    # against their own instrumented executables, so the merge rebuilds
-    # nothing. Its fail-closed check is the agreement of the independently
-    # built partitions: identical source, toolchain, profile and inventory
-    # identity, and per-executable test lists that are disjoint and complete
-    # against every partition's recorded --list output. It then unions the
-    # partition LCOV and enforces this OS's gate: 91% of unique instrumented
-    # lines (see docs/development.md).
+    # and self-checked line exports against their own instrumented
+    # executables, so the merge rebuilds nothing. Its fail-closed check is the
+    # agreement of the independently built partitions: identical source,
+    # toolchain, profile and inventory identity, and per-executable test lists
+    # that are disjoint and complete against every partition's recorded --list
+    # output. It then unions each instantiation's covered lines and enforces
+    # this OS's 90% line gate by the local coverage task's own metric,
+    # reproduced exactly (see docs/development.md).
     name: Coverage merge (${{ inputs.os }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -345,7 +346,7 @@ jobs:
           pattern: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-partition-*
           merge-multiple: false
           path: ${{ runner.temp }}/kuru-coverage-inputs
-      - name: Require agreeing partition receipts and 91% of unique instrumented lines
+      - name: Require agreeing partition receipts and the 90% line gate
         shell: bash
         env:
           KURU_COVERAGE_OS: ${{ inputs.os }}

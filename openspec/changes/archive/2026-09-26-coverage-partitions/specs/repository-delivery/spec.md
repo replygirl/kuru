@@ -26,12 +26,17 @@ Instead, N independently built partitions MUST agree. The merge MUST require a r
 It MUST require all receipts to be identical on source, tree, Cargo.lock, toolchain, profile environment, mode and
 inventory digest, and consistent with the OS label and the expected source commit. It MUST prove every executable's
 partitions disjoint and complete against its listed tests. Any missing, extra, mismatched or unverifiable receipt
-MUST fail the merge before any report exists. For an instrumented OS, the merge MUST require identical source-file
-and line sets in every partition's normalized LCOV, union their hit counts, write that OS's merged LCOV and enforce
-at least 91% coverage of that OS's unique instrumented source lines (the union of `DA` records). The 91%
-threshold is an interim margin over the measured per-OS difference between that metric and cargo-llvm-cov's summary,
-not an equivalence, chosen so the effective bar by the summary metric stays at or above 90%. No partition
-percentage may be averaged.
+MUST fail the merge before any report exists. Each instrumented partition MUST export, per function instantiation,
+its main source file, group location and mapped and covered line sets, derived from its own llvm-cov export as
+llvm-cov derives line statistics. Before its receipt is written, that export MUST reproduce the partition's own
+cargo-llvm-cov `--summary-only` line figures exactly, per file and in total, and the receipt MUST carry the export's
+digest. For an instrumented OS, the merge MUST refuse a receipt without that digest or an export that differs from
+it. It MUST require identical source files, instantiations, group locations and mapped lines in every partition,
+union each instantiation's covered lines, and enforce at least 90% by cargo-llvm-cov's line metric: per file, the
+sum over instantiation groups of the most mapped and the most covered lines of any instantiation. This is the
+metric `mise run coverage` holds to `--fail-under-lines 90`. The merge MUST also require identical source-file and
+line sets in every partition's normalized LCOV, union their hit counts and write that OS's merged LCOV, whose
+unique-line figure is informational. No partition percentage may be averaged.
 
 #### Scenario: A partition receipt is missing
 - **WHEN** one partition index of an OS has no uploaded receipt
@@ -42,8 +47,16 @@ percentage may be averaged.
 - **THEN** the merge fails without merging any coverage.
 
 #### Scenario: Merged coverage is below the gate
-- **WHEN** the union of an instrumented OS's partitions covers less than 91 percent of its unique instrumented lines
+- **WHEN** the union of an instrumented OS's partitions covers less than 90 percent of its lines by cargo-llvm-cov's line metric
 - **THEN** that OS's merge fails, and no other OS's result can satisfy it.
+
+#### Scenario: A partition's line export does not reproduce its own summary
+- **WHEN** the figures derived from a partition's line export differ from its cargo-llvm-cov `--summary-only` figures in any file or in total
+- **THEN** the partition fails, naming the first mismatching files, and writes no receipt.
+
+#### Scenario: A receipt lacks the line export digest
+- **WHEN** an instrumented partition's receipt has no line export digest, or its uploaded export differs from that digest
+- **THEN** that OS's merge fails and produces no report.
 
 ### Requirement: Evidence-neutral seeded dependency cache
 

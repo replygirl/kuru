@@ -60,8 +60,8 @@ several invocations below the Windows command-line limit, and each invocation
 must announce exactly as many tests as it selected. Assignment balances test
 counts, not durations, and keeps a test in the same partition across commits.
 
-Each partition exports LCOV against its own instrumented executables, with no
-threshold, and records a receipt: source commit, tree, Cargo.lock, toolchain and
+Each partition exports LCOV and a line export against its own instrumented
+executables, with no threshold, and records a receipt: source commit, tree, Cargo.lock, toolchain and
 coverage-tool identity, target, test-profile environment, the artifact
 inventory hash, and each executable's listed and assigned test names (stored in
 its partition plan and hashed in the receipt). Raw profiles stay on the runner;
@@ -74,10 +74,40 @@ disjoint and whose union equals the recorded `--list` output. Any mismatch or
 missing receipt fails before any report exists, so there is never a partial
 LCOV.
 
-The merge unions the partitions' line records, which must cover the same files
-and lines, writes that OS's LCOV and enforces its line gate once per OS.
-Because each partition exports its own LCOV, merging on Ubuntu needs no macOS
-or Windows runner and no instrumented objects.
+The per-OS gate is 90% by the metric `mise run coverage` holds to
+`--fail-under-lines 90`: cargo-llvm-cov reads `totals.lines` of
+`llvm-cov export`, which counts, per source file, each function instantiation
+group once (the functions starting at one location, such as a generic's
+instantiations or a library built with and without `cfg(test)`), with the most
+mapped and the most covered lines of any of its instantiations. Summed profiles
+cannot be recombined from per-file LCOV, so each partition also writes
+`coverage-lines.json`: every instantiation's source file, name, group location
+and mapped and covered lines, derived from its full `llvm-cov export` JSON with
+a port of llvm-cov's line statistics (LLVM 22.1.8, the pinned toolchain's
+`llvm-tools`). Before its receipt is written the partition runs
+cargo-llvm-cov's `--json --summary-only` report over the same profiles and
+requires the export to reproduce it exactly, per file and in total; a mismatch
+fails the partition, names the first mismatching files and keeps the summary in
+its diagnostics. The receipt carries the export's digest and self-checked
+totals.
+
+The merge refuses a receipt without that digest or an export that differs from
+it or from its totals. It requires every partition to report the same files,
+instantiations, group locations and mapped lines, unions each instantiation's
+covered lines, and sums each group's maximum per file and in total. That equals
+the summary of the summed profiles: the mappings are identical and region
+counts are non-negative, so a region's summed count is nonzero exactly when
+some partition's is, and a line's count is the maximum of a structurally chosen
+set of region counts. The exception would be a negative counter expression
+(for example, lost updates to non-atomic counters under concurrent tests), which
+llvm-cov renders as a huge count; the per-partition self-check cannot see a sum
+that cancels across partitions. The merge prints each file's figures and the
+total against the gate. It also unions the partitions' LCOV, which must cover
+the same files and lines, into that OS's merged report, and prints its
+unique-line percentage for information only: a line shared by several groups
+counts once there, so it reads higher than the gate metric. Because each
+partition exports its own coverage, merging on Ubuntu needs no macOS or Windows
+runner and no instrumented objects.
 
 The partition runner stops test executables at a deadline derived from the job's
 `timeout-minutes`, less a fixed evidence reserve, and checks it before every
@@ -186,7 +216,7 @@ bridge before any downloaded application can be trusted.
 | `mise run test:install` | Native archive tests and, on macOS/Linux, real Bash bootstrap tests |
 | `mise run //packages/kuru-delivery:test` | Delivery contracts, including native PowerShell bootstrap/update fixtures on Windows |
 | `mise run //packages/kuru-delivery:coverage:shard` | One fail-closed CI coverage partition, configured by `KURU_COVERAGE_*` ([by hand](#running-a-coverage-partition-by-hand)) |
-| `mise run //packages/kuru-delivery:coverage:merge` | Require agreeing receipts from every partition of one OS and, when instrumented, enforce the line gate on its merged report |
+| `mise run //packages/kuru-delivery:coverage:merge` | Require agreeing receipts from every partition of one OS and, when instrumented, enforce the 90% gate by cargo-llvm-cov's line metric over its partitions' line exports |
 | `mise run //packages/kuru-delivery:test:partition` | One uninstrumented checked partition of the `KURU_COVERAGE_PACKAGES` test suite (CI arm64 memory) |
 | `mise run //apps/kuru-tui:test:embedded-runtime` | Package, install, update and reopen actual Kuru with cold offline memory |
 | `mise run //packages/kuru-delivery:test:previous-release-update` | [Previous published release's updater](release.md#previous-release-update-acceptance) installs `KURU_UPDATE_CANDIDATE_BINARY`; optional `GITHUB_TOKEN` |

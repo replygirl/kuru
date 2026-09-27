@@ -4,6 +4,7 @@
 mod fixture;
 pub mod lcov;
 pub mod ledger;
+pub mod lines;
 pub mod merge;
 pub mod orchestrate;
 pub mod partition;
@@ -285,8 +286,24 @@ pub struct LcovReceipt {
     pub lines_hit: u64,
 }
 
+/// The line export a partition uploaded: every instantiation's mapped and
+/// covered lines, self-checked against that partition's own cargo-llvm-cov
+/// `--summary-only` figures before the receipt is written.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinesReceipt {
+    pub bytes: u64,
+    pub sha256: String,
+    pub files: usize,
+    pub instantiations: usize,
+    /// cargo-llvm-cov's line total for this partition alone.
+    pub count: u64,
+    pub covered: u64,
+}
+
 /// One partition's evidence. Every field but the partition index, attempt,
-/// plan, ledgers, profiles and LCOV must agree across an OS's partitions.
+/// plan, ledgers, profiles, LCOV and line export must agree across an OS's
+/// partitions.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Receipt {
@@ -312,6 +329,9 @@ pub struct Receipt {
     pub job_ledger_sha256: String,
     pub profiles: ProfileSummary,
     pub lcov: Option<LcovReceipt>,
+    /// Required of an instrumented partition; the merge refuses a receipt
+    /// without it.
+    pub lines: Option<LinesReceipt>,
 }
 
 /// Evidence file names inside one uploaded `attempt-<n>` directory.
@@ -321,6 +341,7 @@ const PLAN_FILE: &str = "partition-plan.json";
 const RUNNER_LEDGER_FILE: &str = "runner-ledger.jsonl";
 const JOB_LEDGER_FILE: &str = "job-ledger.json";
 const LCOV_FILE: &str = "coverage.lcov";
+const LINES_FILE: &str = "coverage-lines.json";
 
 /// Parse a schema-bearing JSON document, naming a schema-1 file explicitly.
 fn read_versioned<T: for<'de> Deserialize<'de>>(path: &Path, what: &str) -> Result<T> {
@@ -2242,6 +2263,8 @@ pub struct ReceiptOptions<'a> {
     pub profiles: &'a Path,
     /// The normalized LCOV of an instrumented partition.
     pub lcov: Option<&'a Path>,
+    /// The self-checked line export of an instrumented partition.
+    pub lines: Option<&'a Path>,
     pub run_attempt: &'a str,
     pub expected_source: &'a str,
     pub llvm_cov: Option<&'a Path>,
@@ -2275,6 +2298,7 @@ fn write_evidence(options: &ReceiptOptions<'_>, observed: ReceiptIdentity) -> Re
         job_ledger,
         profiles,
         lcov,
+        lines: lines_path,
         run_attempt,
         profile_env_sha256,
         output,
@@ -2329,6 +2353,26 @@ fn write_evidence(options: &ReceiptOptions<'_>, observed: ReceiptIdentity) -> Re
         }
         None => None,
     };
+    let lines_bytes = match (mode, lines_path) {
+        (Mode::Instrumented, Some(path)) => Some(read_bounded(path, lines::LINES_LIMIT)?),
+        (Mode::Uninstrumented, None) => None,
+        _ => bail!("a line export is required exactly for an instrumented partition"),
+    };
+    let lines_receipt = match &lines_bytes {
+        Some(bytes) => {
+            let export = lines::LineExport::parse(bytes).context("partition line export")?;
+            let figures = export.figures()?;
+            Some(LinesReceipt {
+                bytes: bytes.len() as u64,
+                sha256: archive::digest(bytes),
+                files: export.files.len(),
+                instantiations: export.instantiation_count(),
+                count: figures.total.count,
+                covered: figures.total.covered,
+            })
+        }
+        None => None,
+    };
     let receipt = Receipt {
         schema: SCHEMA,
         partition: (*partition).clone(),
@@ -2352,6 +2396,7 @@ fn write_evidence(options: &ReceiptOptions<'_>, observed: ReceiptIdentity) -> Re
         job_ledger_sha256: archive::digest(&job_ledger_bytes),
         profiles: profile_summary,
         lcov: lcov_receipt,
+        lines: lines_receipt,
     };
     // The uploaded artifact root holds one `attempt-<n>` directory, so the
     // evidence names its attempt whether download-artifact extracts it into
@@ -2368,6 +2413,9 @@ fn write_evidence(options: &ReceiptOptions<'_>, observed: ReceiptIdentity) -> Re
     write_new(&output.join(JOB_LEDGER_FILE), &job_ledger_bytes)?;
     if let Some(bytes) = &lcov_bytes {
         write_new(&output.join(LCOV_FILE), bytes)?;
+    }
+    if let Some(bytes) = &lines_bytes {
+        write_new(&output.join(LINES_FILE), bytes)?;
     }
     write_json(&output.join(RECEIPT_FILE), &receipt)
 }
@@ -2679,6 +2727,7 @@ mod tests {
                 job_ledger: path,
                 profiles: path,
                 lcov: None,
+                lines: None,
                 run_attempt: attempt,
                 expected_source: "HEAD",
                 llvm_cov: None,
@@ -4068,7 +4117,7 @@ mod tests {
                 RUNNER_LEDGER_FILE,
             ];
             if mode == Mode::Instrumented {
-                expected.push(LCOV_FILE);
+                expected.extend([LCOV_FILE, LINES_FILE]);
             }
             exact_entries(&attempt, &expected).unwrap();
             let receipt: Receipt = read_versioned(&attempt.join(RECEIPT_FILE), "receipt").unwrap();
@@ -4077,6 +4126,14 @@ mod tests {
             assert_eq!(receipt.mode, mode);
             assert_eq!(receipt.instrumentation, mode.contract());
             assert_eq!(receipt.lcov.is_some(), mode == Mode::Instrumented);
+            assert_eq!(receipt.lines.is_some(), mode == Mode::Instrumented);
+            if let Some(lines) = &receipt.lines {
+                let bytes = fs::read(attempt.join(LINES_FILE)).unwrap();
+                assert_eq!(lines.sha256, archive::digest(&bytes));
+                assert_eq!(lines.bytes, bytes.len() as u64);
+                assert_eq!((lines.files, lines.instantiations), (1, 1));
+                assert_eq!((lines.count, lines.covered), (20, 10));
+            }
             assert_eq!(receipt.profiles.count > 0, mode == Mode::Instrumented);
             let plan: plan::PartitionPlan =
                 read_versioned(&attempt.join(PLAN_FILE), "plan").unwrap();
@@ -4118,6 +4175,7 @@ mod tests {
             job_ledger: &job,
             profiles: temp,
             lcov,
+            lines: lcov,
             run_attempt: "1",
             expected_source: fixture::SOURCE,
             llvm_cov: None,
