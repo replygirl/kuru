@@ -1,12 +1,13 @@
 # Releases
 
-Kuru releases use one manually dispatched workflow with a version bump as its
-only input. The workflow validates the source, creates a signed version commit
-when necessary, builds every supported native archive, generates Communiqué notes,
-assembles the complete candidate, accepts it on Linux, macOS and Windows, deploys
-documentation from that exact commit, and publishes the release only after those
-gates succeed. A separate
-post-publication Windows job then verifies the immutable public download.
+Kuru releases use one manually dispatched workflow with two inputs: a version
+bump and a mode. The default mode is a [rehearsal](#rehearse-a-release), which
+stops before any publication write. With `mode: publish`, the workflow validates
+the source, creates a signed version commit when necessary, builds every
+supported native archive, generates Communiqué notes, assembles the complete
+candidate, accepts it on Linux, macOS and Windows, deploys documentation from
+that exact commit, and publishes the release only after those gates succeed. A
+separate post-publication Windows job then verifies the immutable public download.
 Pushes and tags do not start release publication or deploy documentation.
 
 ## One-time setup
@@ -49,7 +50,14 @@ Linux, Apple Silicon macOS or Windows x86_64. App installation does not require 
 ## Choose and release a version
 
 After the change is reviewed, merged, and main's checks are green, open Actions →
-Release → Run workflow, select `main`, and choose:
+Release → Run workflow, select `main`, set **Mode** to `publish`, and choose a bump.
+The mode defaults to `rehearsal`, so a dispatch that leaves it unchanged
+publishes nothing. From the command line:
+
+```sh
+gh workflow run release.yml --ref main -f bump=auto -f mode=publish
+```
+
 
 | Bump | Behavior |
 | --- | --- |
@@ -86,6 +94,63 @@ The second command changes the checkout's workspace version and only the local
 workspace package entries in Cargo.lock. It does not create a commit or tag.
 Both commands run native Rust tooling from `packages/kuru-delivery`; no Python
 runtime is involved.
+
+## Rehearse a release
+
+A rehearsal is the same Release workflow dispatched with `mode: rehearsal`, the
+default. There is no second workflow file. The maintainer decides when to run
+one, for example before the first release after a workflow, packaging or
+platform change. Dispatch it from Actions → Release → Run workflow on `main`
+with the default mode, or:
+
+```sh
+gh workflow run release.yml --ref main -f bump=auto -f mode=rehearsal
+```
+
+The run is named "Release rehearsal" and uses its own `release-rehearsal`
+concurrency group, so it never queues behind or replaces a pending publication
+run. `plan` and `assemble-candidate` write
+`REHEARSAL: no commit, tag, release or Pages deployment` to the run summary.
+
+| Job | Rehearsal | Publish |
+| --- | --- | --- |
+| `source-quality`, `tests` | Run on the dispatch SHA | Unchanged |
+| `plan` | Runs; checks `RELEASE_APP_ID` and the notes secret, never the app key | Unchanged |
+| `bump`, `verify` | Skipped: no version commit exists to validate | Unchanged |
+| `build` | Four targets from the dispatch SHA with the planned version stamped locally | Unchanged |
+| `notes` | Runs on the clean dispatch SHA for the planned version | Unchanged |
+| `assemble-candidate` | Runs; uploads `release-candidate-<attempt>` | Unchanged |
+| `verify-staged` | All four legs, on the dispatch SHA stamped locally | Unchanged |
+| `build-docs` | Runs; uploads `github-pages-<attempt>` | Unchanged |
+| `deploy-docs`, `publish`, `verify-published-windows` | Skipped | Unchanged |
+
+Rehearsal jobs check out the dispatch SHA, which is the plan's `base_sha`. The
+`build` and `verify-staged` jobs then run the same `stamp` the `bump` job runs,
+changing only the local working tree's workspace version and Cargo.lock entries.
+Their archives therefore report the planned version, and staged tests compare
+against it, exactly as they would from the version commit. Nothing is committed
+or pushed. `notes` requires a clean checkout of its exact source, so it reads
+the unstamped dispatch commit; the version commit differs from it only in those
+two files. Artifacts keep their publication names and remain workflow artifacts
+of the rehearsal run.
+
+A rehearsal uses the read-only `github.token` and the
+`ANTHROPIC_API_KEY_COMMUNIQUE` notes secret. It never reads
+`RELEASE_APP_PRIVATE_KEY`, mints an app token, holds a write permission or
+receives the Pages deployment environment.
+
+It proves the version plan, every native build and its offline runtime check,
+notes generation, complete candidate assembly, staged acceptance on every
+platform including previous-release update acceptance, and the docs build. It
+does not prove the release app token, the signed version commit or its branch
+rule exception, quality on the version commit, tag creation, draft upload,
+publication, Pages deployment or the public Windows download. Archives are not
+guaranteed to be byte-identical to a later publication. Staged acceptance still
+lists public GitHub releases to find the previous release.
+
+A rehearsal cannot be promoted. Rerunning it keeps its inputs, so it rehearses
+again; publication is a new dispatch with `mode: publish`, which repeats every
+job from the then-current main revision.
 
 ## Validation and publication order
 

@@ -37,7 +37,11 @@ fn v(input: &str) -> Version {
 #[test]
 fn required_release_checks_precede_the_only_publication_job() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let workflow = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    // Publish-mode behavior is asserted on the mode=publish projection, so
+    // every assertion below still describes the unconditional publication.
+    let workflow = publish_projection(
+        &fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap(),
+    );
     let job = |name: &str| {
         workflow
             .split_once(&format!("\n  {name}:\n"))
@@ -265,6 +269,312 @@ fn required_release_checks_precede_the_only_publication_job() {
         workflow.trim_end().ends_with("if-no-files-found: error"),
         "public verification receipt upload must be the final workflow step"
     );
+}
+
+const REHEARSAL_BANNER: &str = "REHEARSAL: no commit, tag, release or Pages deployment";
+const MODE_INPUT: &str = "        default: auto\n      mode:\n        description: Rehearse without a commit, tag, release or Pages deployment, or publish\n        type: choice\n        options: [rehearsal, publish]\n        default: rehearsal\n";
+const RUN_NAME: &str =
+    "run-name: ${{ inputs.mode == 'publish' && 'Release' || 'Release rehearsal' }}\n";
+const REHEARSAL_CONCURRENCY: &str = "  # A rehearsal never queues behind, or replaces a pending, publication run.\n  group: ${{ inputs.mode == 'publish' && 'release' || 'release-rehearsal' }}\n";
+const PUBLISH_GUARD: &str = "    if: inputs.mode == 'publish'\n";
+const PUBLISH_STEP_GUARD: &str = "        if: inputs.mode == 'publish'\n";
+const REHEARSAL_STEP_GUARD: &str = "        if: inputs.mode == 'rehearsal'\n";
+const RELEASE_SOURCE: &str = "inputs.mode == 'publish' && needs.bump.outputs.sha || github.sha";
+const PLAN_BANNER_STEP: &str = "      - name: Label this run as a rehearsal\n        if: inputs.mode == 'rehearsal'\n        run: |\n          echo '## REHEARSAL: no commit, tag, release or Pages deployment' >> \"$GITHUB_STEP_SUMMARY\"\n";
+const REHEARSAL_PREREQUISITES_STEP: &str = "      - name: Check rehearsal prerequisites\n        if: inputs.mode == 'rehearsal'\n        # A rehearsal never reads the release app key; notes still need theirs.\n        env:\n          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}\n          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_COMMUNIQUE }}\n        run: |\n          test -n \"$RELEASE_APP_ID\" || { echo 'Missing RELEASE_APP_ID variable'; exit 1; }\n          test -n \"$ANTHROPIC_API_KEY\" || { echo 'Missing ANTHROPIC_API_KEY_COMMUNIQUE secret'; exit 1; }\n";
+const REHEARSAL_STAMP_STEP: &str = "      - name: Stamp the planned version locally for rehearsal\n        if: inputs.mode == 'rehearsal'\n        # The working tree bump would commit; nothing is committed or pushed.\n        shell: bash\n        env:\n          RELEASE_VERSION: ${{ needs.plan.outputs.version }}\n        run: mise run release:tool -- stamp \"$RELEASE_VERSION\"\n";
+const CANDIDATE_BANNER_STEP: &str = "      - name: Label the rehearsal candidate\n        if: inputs.mode == 'rehearsal'\n        env:\n          RELEASE_VERSION: ${{ needs.plan.outputs.version }}\n          CANDIDATE: ${{ steps.artifact.outputs.name }}\n        run: |\n          {\n            echo '## REHEARSAL: no commit, tag, release or Pages deployment'\n            echo\n            echo \"Candidate \\`$CANDIDATE\\` for v$RELEASE_VERSION was assembled from $GITHUB_SHA with the planned version stamped only in each build's working tree. It is a workflow artifact of this run and cannot be published from it.\"\n          } >> \"$GITHUB_STEP_SUMMARY\"\n";
+
+/// Jobs that also run in a rehearsal, with the needs a rehearsal requires to
+/// succeed. Each also requires `bump` (and `build` also `verify`) skipped.
+const REHEARSAL_JOBS: [(&str, &[&str]); 5] = [
+    ("build", &["plan"]),
+    ("notes", &["plan"]),
+    ("assemble-candidate", &["plan", "build", "notes"]),
+    ("verify-staged", &["plan", "assemble-candidate"]),
+    ("build-docs", &["assemble-candidate"]),
+];
+/// Jobs that write, hold write credentials or observe a publication.
+const PUBLISH_ONLY_JOBS: [&str; 4] = ["bump", "deploy-docs", "publish", "verify-published-windows"];
+
+/// The exact job-level guard of a job that runs in both modes. The publish
+/// branch is literally `success()`, the default GitHub applies to a job
+/// without a status function, so publish-mode scheduling is unchanged.
+fn rehearsal_guard(job: &str, succeeded: &[&str]) -> String {
+    let mut rehearsal = String::from("inputs.mode == 'rehearsal' && !cancelled()");
+    let mut needs: Vec<(&str, &str)> = succeeded.iter().map(|need| (*need, "success")).collect();
+    needs.push(("bump", "skipped"));
+    if job == "build" {
+        needs.push(("verify", "skipped"));
+    }
+    // Keep the workflow's order: plan, bump, then the remaining needs.
+    needs.sort_by_key(|(need, _)| match *need {
+        "plan" => 0,
+        "bump" => 1,
+        "verify" => 2,
+        _ => 3,
+    });
+    for (need, result) in needs {
+        rehearsal.push_str(&format!(" && needs.{need}.result == '{result}'"));
+    }
+    format!(
+        "    # Publish reduces to the default success() gate; a rehearsal needs bump skipped.\n    if: ${{{{ (inputs.mode == 'publish' && success()) || ({rehearsal}) }}}}\n"
+    )
+}
+
+fn release_job(workflow: &str, name: &str) -> String {
+    let body = workflow
+        .split_once(&format!("\n  {name}:\n"))
+        .unwrap_or_else(|| panic!("missing release job {name}"))
+        .1;
+    let mut job = format!("  {name}:\n");
+    for line in body.split_inclusive('\n') {
+        if line.starts_with("  ") && !line.starts_with("    ") {
+            break;
+        }
+        job.push_str(line);
+    }
+    job
+}
+
+fn replace_exactly(text: &str, from: &str, to: &str, count: usize) -> String {
+    assert_eq!(
+        text.matches(from).count(),
+        count,
+        "expected {count} occurrences of {from:?}"
+    );
+    text.replace(from, to)
+}
+
+/// The release workflow as it behaves with `mode: publish`: rehearsal-only
+/// steps removed, publish guards and job guards reduced to GitHub's default
+/// success gate, and mode-selected expressions replaced by their publish
+/// values. Every removal is exact and counted, so any other rehearsal edit
+/// leaves `inputs.mode` in the projection and fails.
+fn publish_projection(raw: &str) -> String {
+    let mut text = replace_exactly(raw, RUN_NAME, "", 1);
+    text = replace_exactly(&text, MODE_INPUT, "        default: auto\n", 1);
+    text = replace_exactly(&text, REHEARSAL_CONCURRENCY, "  group: release\n", 1);
+    text = replace_exactly(&text, PLAN_BANNER_STEP, "", 1);
+    text = replace_exactly(&text, REHEARSAL_PREREQUISITES_STEP, "", 1);
+    text = replace_exactly(&text, REHEARSAL_STAMP_STEP, "", 2);
+    text = replace_exactly(&text, CANDIDATE_BANNER_STEP, "", 1);
+    // The step guard contains the job guard text, so remove it first.
+    text = replace_exactly(&text, PUBLISH_STEP_GUARD, "", 1);
+    text = replace_exactly(&text, PUBLISH_GUARD, "", PUBLISH_ONLY_JOBS.len());
+    for (job, succeeded) in REHEARSAL_JOBS {
+        text = replace_exactly(&text, &rehearsal_guard(job, succeeded), "", 1);
+    }
+    text = replace_exactly(
+        &text,
+        &format!("${{{{ {RELEASE_SOURCE} }}}}"),
+        "${{ needs.bump.outputs.sha }}",
+        6,
+    );
+    assert!(
+        !text.contains("inputs.mode") && !text.contains("REHEARSAL") && !text.contains("rehearsal"),
+        "publish projection retains an unrecognized rehearsal edit"
+    );
+    text
+}
+
+#[test]
+fn rehearsal_mode_stops_before_every_publication_write() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workflow = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    // One dispatch entrypoint; the mode input sits beside bump and defaults to
+    // the rehearsal, so a real release must select publish explicitly.
+    assert!(workflow.contains(&format!(
+        "      bump:\n        description: Conventional version bump\n        type: choice\n        options: [auto, major, minor, patch]\n{MODE_INPUT}\n"
+    )));
+    assert!(workflow.starts_with(&format!(
+        "name: Release\n{RUN_NAME}\non:\n  workflow_dispatch:\n"
+    )));
+    assert!(workflow.contains(&format!(
+        "concurrency:\n{REHEARSAL_CONCURRENCY}  cancel-in-progress: false\n"
+    )));
+    let workflows = fs::read_dir(root.join(".github/workflows"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "yml"))
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        workflows
+            .iter()
+            .filter(|text| text.contains("release:tool -- publish") || text.contains("deploy-pages"))
+            .count(),
+        1,
+        "rehearsal must not add a second publication workflow"
+    );
+
+    // Every input reference is an exact comparison with one of the choices.
+    for (index, _) in workflow.match_indices("inputs.mode") {
+        let rest = &workflow[index + "inputs.mode".len()..];
+        assert!(
+            rest.starts_with(" == 'publish'") || rest.starts_with(" == 'rehearsal'"),
+            "inexact mode reference: {}",
+            &workflow[index..index + 40]
+        );
+    }
+
+    // Publication writes, their credentials and public verification run only
+    // when publish is selected; verify (quality on the version commit) is
+    // skipped with bump.
+    for name in PUBLISH_ONLY_JOBS {
+        let job = release_job(&workflow, name);
+        let header = job.split("    runs-on:").next().unwrap();
+        assert!(
+            header.contains(&format!("\n{PUBLISH_GUARD}")),
+            "{name} lacks the publish guard"
+        );
+        assert_eq!(
+            job.matches("inputs.mode").count(),
+            1,
+            "{name} has extra mode logic"
+        );
+    }
+    let verify = release_job(&workflow, "verify");
+    assert!(
+        verify
+            .starts_with("  verify:\n    needs: bump\n    uses: ./.github/workflows/quality.yml\n")
+    );
+    assert!(!verify.contains("if:"));
+
+    // Jobs shared with the rehearsal keep their needs and add one exact guard.
+    for (name, succeeded) in REHEARSAL_JOBS {
+        let job = release_job(&workflow, name);
+        let guard = rehearsal_guard(name, succeeded);
+        assert_eq!(
+            job.matches(&guard).count(),
+            1,
+            "{name} lost its exact mode guard"
+        );
+        let needs = job
+            .lines()
+            .find(|line| line.starts_with("    needs:"))
+            .unwrap();
+        for need in succeeded.iter().chain(["bump"].iter()) {
+            assert!(
+                needs.contains(need),
+                "{name} guard names a need it lacks: {need}"
+            );
+        }
+        assert!(
+            !job.contains("always()"),
+            "{name} must not run after failures"
+        );
+        assert!(!job.contains("continue-on-error:"));
+        // Rehearsal checks out the dispatch SHA, which plan uses as its base.
+        assert!(
+            !job.contains("${{ needs.bump.outputs.sha }}"),
+            "{name} reads an unset bump SHA"
+        );
+        assert!(job.contains(&format!("ref: ${{{{ {RELEASE_SOURCE} }}}}")));
+        // No write permission, app token or release-writing credential.
+        for forbidden in [
+            ": write",
+            "RELEASE_APP_PRIVATE_KEY",
+            "create-github-app-token",
+            "GH_TOKEN",
+            "deploy-pages",
+            "release:tool -- commit",
+            "release:tool -- publish",
+        ] {
+            assert!(!job.contains(forbidden), "{name} exposes {forbidden}");
+        }
+    }
+    let notes = release_job(&workflow, "notes");
+    assert!(notes.contains(&format!("RELEASE_SHA: ${{{{ {RELEASE_SOURCE} }}}}")));
+    assert_eq!(notes.matches("secrets.").count(), 1);
+    assert!(notes.contains("OPENAI_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_COMMUNIQUE }}"));
+    for name in ["build", "assemble-candidate", "verify-staged", "build-docs"] {
+        assert!(
+            !release_job(&workflow, name).contains("secrets."),
+            "{name} reads a secret"
+        );
+    }
+
+    // Plan never reads the release app key in a rehearsal.
+    let plan = release_job(&workflow, "plan");
+    let steps = workflow_steps(&plan);
+    let publish_check = named_step(&steps, "Check release prerequisites");
+    assert!(publish_check.starts_with(&format!(
+        "name: Check release prerequisites\n{PUBLISH_STEP_GUARD}"
+    )));
+    assert!(plan.contains(REHEARSAL_PREREQUISITES_STEP));
+    assert_eq!(
+        publish_check.matches("RELEASE_APP_PRIVATE_KEY").count(),
+        plan.matches("RELEASE_APP_PRIVATE_KEY").count()
+    );
+    assert_eq!(
+        workflow.matches("secrets.RELEASE_APP_PRIVATE_KEY").count(),
+        2
+    );
+    assert!(
+        release_job(&workflow, "bump")
+            .contains("private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}")
+    );
+    assert!(plan.starts_with("  plan:\n    if: github.ref == 'refs/heads/main'\n"));
+
+    // Rehearsal archives and staged checks see the tree bump would commit.
+    for (name, before) in [
+        (
+            "build",
+            "      - name: Build and package native executable\n",
+        ),
+        ("verify-staged", "      - uses: actions/download-artifact@"),
+    ] {
+        let job = release_job(&workflow, name);
+        let stamp = job
+            .find(REHEARSAL_STAMP_STEP)
+            .unwrap_or_else(|| panic!("{name} lacks its stamp"));
+        assert!(job.find("      - uses: jdx/mise-action@").unwrap() < stamp);
+        assert!(stamp < job.find(before).unwrap(), "{name} stamps too late");
+    }
+    // Notes read the exact clean dispatch commit; nothing else is stamped.
+    assert_eq!(workflow.matches(REHEARSAL_STAMP_STEP).count(), 2);
+
+    // The run summary labels the rehearsal and its candidate.
+    assert_eq!(workflow.matches(REHEARSAL_BANNER).count(), 2);
+    assert!(plan.contains(PLAN_BANNER_STEP));
+    let assembly = release_job(&workflow, "assemble-candidate");
+    assert!(assembly.ends_with(&format!("{CANDIDATE_BANNER_STEP}\n")));
+    // Rehearsal-only steps are never selected by publish, and vice versa.
+    assert_eq!(
+        workflow.matches(REHEARSAL_STEP_GUARD).count(),
+        5,
+        "unexpected rehearsal-only step"
+    );
+
+    // Artifacts keep their names in both modes.
+    for (name, count) in [
+        ("name: release-${{ matrix.target }}\n", 1),
+        ("name: release-notes\n", 2),
+        ("printf 'name=release-candidate-%s\\n' \"$RUN_ATTEMPT\"", 1),
+        ("printf 'name=github-pages-%s\\n' \"$RUN_ATTEMPT\"", 1),
+    ] {
+        assert_eq!(
+            workflow.matches(name).count(),
+            count,
+            "artifact name changed: {name}"
+        );
+    }
+    for step in workflow
+        .split("\n      - ")
+        .map(|step| step.split("\n\n").next().unwrap())
+        .filter(|step| step.contains("-artifact@"))
+    {
+        assert!(
+            !step.contains("inputs.mode"),
+            "artifact step depends on the mode"
+        );
+    }
+
+    // The projection used by the publish-mode assertions removes only these.
+    let projection = publish_projection(&workflow);
+    assert!(projection.contains("concurrency:\n  group: release\n  cancel-in-progress: false\n"));
+    assert!(projection.starts_with("name: Release\n\non:\n"));
 }
 
 #[test]

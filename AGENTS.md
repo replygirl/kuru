@@ -273,10 +273,11 @@ which is authored directly.
 ## Releases and documentation
 
 `.github/workflows/release.yml` is the single publication entrypoint, through
-manual dispatch on main with only the bump strategy as input. Recover interrupted
-runs through automatic reuse of their exact version commit and release; keep
-reruns anchored to the original dispatch SHA and published assets immutable.
-Follow [release operations](docs/release.md) for the
+manual dispatch on main with the bump strategy and a mode as inputs; the default
+rehearsal mode stops before the version commit, docs deployment and publication.
+Recover interrupted runs through automatic reuse of their exact version commit
+and release; keep reruns anchored to the original dispatch SHA and published
+assets immutable. Follow [release operations](docs/release.md) for the
 conventional version calculation, signed app commit, exact-SHA checks, verified
 archives and Communiqué notes. Preserve the scoped credential names documented
 there; no credentials belong in source or generated artifacts.
