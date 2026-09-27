@@ -689,6 +689,27 @@ owner measured PR-C's partitioned run at 21 minutes of wall clock in total; the
 arm64 legs' first-run measurements in task 3.5 are compared against it as well
 as against the 90-minute shard budget.
 
+Part (b) as delivered on PR-C's shape (2026-09-27, after #118 merged as
+`98b6b81a`): Windows on Arm is a `native-tests.yml` OS like the others, with
+`("windows-11-arm", Uninstrumented, 8)` in `coverage::PARTITIONS` and
+`aarch64-pc-windows-msvc` in `OS_TARGETS`. A `dolt-windows-arm64` job selected
+by the caller's label calls the `bundle-build.yml` call job at `inputs.ref`;
+`shard` and `install` need it (success on Windows on Arm, skipped elsewhere,
+never after a cancellation) and import its artifact before any build, with
+steps selected by `runner.os`/`runner.arch` as PR-C requires. Its partitions
+run the distinct `test:partition` task over every workspace package, and the
+Ubuntu merge checks agreement and completeness in uninstrumented mode without
+LCOV or a threshold. PR-C's `native-gate` is deliberately label-independent, so
+the fail-closed OS allowlist that the table below assigns to the gate is the
+`PARTITIONS`/`OS_TARGETS` table instead: an unlisted label, or an instrumented
+Windows on Arm run, fails every partition and merge, and the gate then fails on
+their results. Concurrency: the Windows on Arm call adds about 11 jobs at t = 0
+(8 partitions, installation, the engine job and the `native-platform` leg)
+against PR-C's assumed 40-job cap, which already carried 36; task 3.5 measures
+the resulting queueing instead of reducing the Windows partition count now.
+The `ci.yml` callers (the matrix entry and the `native-platform` leg) are
+edited separately.
+
 The mirror is designed against the workflow owner's confirmed post-PR5 and
 post-PR4b shapes (Current state), not the `501ab92d` files: the x64 twin runs on
 `windows-latest` and the arm64 leg on `windows-11-arm`; `native-tests.yml` is the
