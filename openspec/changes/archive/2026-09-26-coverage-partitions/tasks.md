@@ -45,5 +45,5 @@
 
 - [x] 9.1 Run `mise run //packages/kuru-delivery:test`, `mise run lint`, `mise run typecheck`, `mise run lint:tooling` and `mise run coverage` locally before pushing, and record verification 6.3 (all exited 0 on macOS arm64 at de9bae0e; coverage 94.33% cargo-llvm-cov summary, 95.01% unique lines)
 - [x] 9.2 Before pushing, diff `feat/windows-arm64`'s `coverage.rs` against #111 and reconcile the `PARTITIONS`/`EXCLUDED_ARTIFACTS` tables; record the result in blocking-changes.md coordination notes
-- [ ] 9.3 Run the equivalence drill of verification 3.3 by hand (all partitions on one machine, rebuilt profile-merge report versus DA-merge, and the merge total versus cargo-llvm-cov's summary) and record it
-- [ ] 9.4 Record the hosted evidence of verification 1.5, 2.3, 2.4, 3.2, 4.2, 4.3, 5.2, 7.1, 7.2 and 7.3 with run and job IDs, naming any unrun check and why
+- [x] 9.3 Run the equivalence drill of verification 3.3 by hand (all partitions on one machine, rebuilt profile-merge report versus DA-merge, and the merge total versus cargo-llvm-cov's summary) and record it
+- [x] 9.4 Record the hosted evidence of verification 1.5, 2.3, 2.4, 3.2, 4.2, 4.3, 5.2, 7.1, 7.2 and 7.3 with run and job IDs, naming any unrun check and why (CI run 36290089575; 2.3, 2.4, 4.2, 7.1 and 7.3 deferred with reasons)
