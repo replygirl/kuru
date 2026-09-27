@@ -71,7 +71,8 @@ profiles stay on the runner. Every partition runs `--list` for every executable,
 per OS) downloads `<prefix>-coverage-<os>-partition-*` with one step. Diagnostics are renamed
 `<prefix>-coverage-diagnostics-<os>-…` so that pattern cannot match them. The merge takes each index's latest attempt
 no later than the run attempt and applies the spec's agreement, completeness and LCOV-identity checks. It unions DA and
-FNDA counts, recomputes LF/LH, enforces Σ LH / Σ LF ≥ 0.90, and writes a temp file that it renames only after
+FNDA counts, recomputes LF/LH, enforces unique hit `DA` lines / unique instrumented `DA` lines ≥ 0.90 (cargo-llvm-cov's
+per-instantiation summary cannot be recombined from partition LCOV and reads about 0.7 points lower), and writes a temp file that it renames only after
 passing. It does not compare the Ubuntu host's `identity()`, which says nothing about another OS. Instead it requires
 `target_os`/`target` consistent with the label and `source` equal to the expected commit. Rejected: (a) uploading
 instrumented executables for an off-OS `llvm-cov report`, which needs cross-object reading plus path remapping,

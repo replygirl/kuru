@@ -28,7 +28,8 @@ inventory digest, and consistent with the OS label and the expected source commi
 partitions disjoint and complete against its listed tests. Any missing, extra, mismatched or unverifiable receipt
 MUST fail the merge before any report exists. For an instrumented OS, the merge MUST require identical source-file
 and line sets in every partition's normalized LCOV, union their hit counts, write that OS's merged LCOV and enforce
-at least 90% line coverage for that OS. No partition percentage may be averaged.
+at least 90% coverage of that OS's unique instrumented source lines (the union of `DA` records). No partition
+percentage may be averaged.
 
 #### Scenario: A partition receipt is missing
 - **WHEN** one partition index of an OS has no uploaded receipt
