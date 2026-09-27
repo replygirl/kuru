@@ -283,6 +283,9 @@ const RELEASE_SOURCE: &str = "inputs.mode == 'publish' && needs.bump.outputs.sha
 const PLAN_BANNER_STEP: &str = "      - name: Label this run as a rehearsal\n        if: inputs.mode == 'rehearsal'\n        run: |\n          echo '## REHEARSAL: no commit, tag, release or Pages deployment' >> \"$GITHUB_STEP_SUMMARY\"\n";
 const REHEARSAL_PREREQUISITES_STEP: &str = "      - name: Check rehearsal prerequisites\n        if: inputs.mode == 'rehearsal'\n        # A rehearsal never reads the release app key; notes still need theirs.\n        env:\n          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}\n          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_COMMUNIQUE }}\n        run: |\n          test -n \"$RELEASE_APP_ID\" || { echo 'Missing RELEASE_APP_ID variable'; exit 1; }\n          test -n \"$ANTHROPIC_API_KEY\" || { echo 'Missing ANTHROPIC_API_KEY_COMMUNIQUE secret'; exit 1; }\n";
 const REHEARSAL_STAMP_STEP: &str = "      - name: Stamp the planned version locally for rehearsal\n        if: inputs.mode == 'rehearsal'\n        # The working tree bump would commit; nothing is committed or pushed.\n        shell: bash\n        env:\n          RELEASE_VERSION: ${{ needs.plan.outputs.version }}\n        run: mise run release:tool -- stamp \"$RELEASE_VERSION\"\n";
+const NOTES_COMMIT_STEP: &str = "      - name: Commit the planned version locally for rehearsal\n        if: inputs.mode == 'rehearsal'\n        id: local\n        # Notes read an exact clean commit carrying the planned version. This\n        # commit never leaves the runner: the checkout holds no credentials.\n        env:\n          RELEASE_VERSION: ${{ needs.plan.outputs.version }}\n        run: |\n          mise run release:tool -- stamp \"$RELEASE_VERSION\"\n          git -c user.name=kuru-rehearsal -c user.email=rehearsal@invalid -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q -m \"chore(release): v$RELEASE_VERSION\" -- Cargo.toml Cargo.lock\n          printf 'sha=%s\\n' \"$(git rev-parse HEAD)\" >> \"$GITHUB_OUTPUT\"\n";
+const NOTES_SOURCE: &str =
+    "inputs.mode == 'publish' && needs.bump.outputs.sha || steps.local.outputs.sha";
 const CANDIDATE_BANNER_STEP: &str = "      - name: Label the rehearsal candidate\n        if: inputs.mode == 'rehearsal'\n        env:\n          RELEASE_VERSION: ${{ needs.plan.outputs.version }}\n          CANDIDATE: ${{ steps.artifact.outputs.name }}\n        run: |\n          {\n            echo '## REHEARSAL: no commit, tag, release or Pages deployment'\n            echo\n            echo \"Candidate \\`$CANDIDATE\\` for v$RELEASE_VERSION was assembled from $GITHUB_SHA with the planned version stamped only in each build's working tree. It is a workflow artifact of this run and cannot be published from it.\"\n          } >> \"$GITHUB_STEP_SUMMARY\"\n";
 
 /// Jobs that also run in a rehearsal, with the needs a rehearsal requires to
@@ -358,6 +361,7 @@ fn publish_projection(raw: &str) -> String {
     text = replace_exactly(&text, PLAN_BANNER_STEP, "", 1);
     text = replace_exactly(&text, REHEARSAL_PREREQUISITES_STEP, "", 1);
     text = replace_exactly(&text, REHEARSAL_STAMP_STEP, "", 2);
+    text = replace_exactly(&text, NOTES_COMMIT_STEP, "", 1);
     text = replace_exactly(&text, CANDIDATE_BANNER_STEP, "", 1);
     // The step guard contains the job guard text, so remove it first.
     text = replace_exactly(&text, PUBLISH_STEP_GUARD, "", 1);
@@ -369,7 +373,13 @@ fn publish_projection(raw: &str) -> String {
         &text,
         &format!("${{{{ {RELEASE_SOURCE} }}}}"),
         "${{ needs.bump.outputs.sha }}",
-        6,
+        5,
+    );
+    text = replace_exactly(
+        &text,
+        &format!("${{{{ {NOTES_SOURCE} }}}}"),
+        "${{ needs.bump.outputs.sha }}",
+        1,
     );
     assert!(
         !text.contains("inputs.mode") && !text.contains("REHEARSAL") && !text.contains("rehearsal"),
@@ -485,7 +495,26 @@ fn rehearsal_mode_stops_before_every_publication_write() {
         }
     }
     let notes = release_job(&workflow, "notes");
-    assert!(notes.contains(&format!("RELEASE_SHA: ${{{{ {RELEASE_SOURCE} }}}}")));
+    assert!(notes.contains(&format!("RELEASE_SHA: ${{{{ {NOTES_SOURCE} }}}}")));
+    // Notes read a local, unpushed commit of the stamped tree: the tool
+    // requires an exact clean commit that already carries the planned version.
+    let commit = notes
+        .find(NOTES_COMMIT_STEP)
+        .expect("notes lacks its rehearsal commit");
+    assert!(
+        notes
+            .find("      - name: Install package-owned release tools\n")
+            .unwrap()
+            < commit
+    );
+    assert!(
+        commit
+            < notes
+                .find("      - name: Generate notes without publishing\n")
+                .unwrap()
+    );
+    assert!(notes.contains("persist-credentials: false"));
+    assert!(!notes.contains("git push") && !notes.contains(": write"));
     assert_eq!(notes.matches("secrets.").count(), 1);
     assert!(notes.contains("OPENAI_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_COMMUNIQUE }}"));
     for name in ["build", "assemble-candidate", "verify-staged", "build-docs"] {
@@ -532,8 +561,9 @@ fn rehearsal_mode_stops_before_every_publication_write() {
         assert!(job.find("      - uses: jdx/mise-action@").unwrap() < stamp);
         assert!(stamp < job.find(before).unwrap(), "{name} stamps too late");
     }
-    // Notes read the exact clean dispatch commit; nothing else is stamped.
+    // Only build and verify-staged stamp a working tree; notes commit theirs.
     assert_eq!(workflow.matches(REHEARSAL_STAMP_STEP).count(), 2);
+    assert_eq!(workflow.matches(NOTES_COMMIT_STEP).count(), 1);
 
     // The run summary labels the rehearsal and its candidate.
     assert_eq!(workflow.matches(REHEARSAL_BANNER).count(), 2);
@@ -543,7 +573,7 @@ fn rehearsal_mode_stops_before_every_publication_write() {
     // Rehearsal-only steps are never selected by publish, and vice versa.
     assert_eq!(
         workflow.matches(REHEARSAL_STEP_GUARD).count(),
-        5,
+        6,
         "unexpected rehearsal-only step"
     );
 

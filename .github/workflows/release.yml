@@ -395,12 +395,23 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: mise run //packages/kuru-delivery:setup
+      - name: Commit the planned version locally for rehearsal
+        if: inputs.mode == 'rehearsal'
+        id: local
+        # Notes read an exact clean commit carrying the planned version. This
+        # commit never leaves the runner: the checkout holds no credentials.
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          mise run release:tool -- stamp "$RELEASE_VERSION"
+          git -c user.name=kuru-rehearsal -c user.email=rehearsal@invalid -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q -m "chore(release): v$RELEASE_VERSION" -- Cargo.toml Cargo.lock
+          printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Generate notes without publishing
         env:
           # Communiqué's OpenAI wire adapter calls Anthropic's compatibility API.
           OPENAI_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_COMMUNIQUE }}
           GITHUB_TOKEN: ${{ github.token }}
-          RELEASE_SHA: ${{ inputs.mode == 'publish' && needs.bump.outputs.sha || github.sha }}
+          RELEASE_SHA: ${{ inputs.mode == 'publish' && needs.bump.outputs.sha || steps.local.outputs.sha }}
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
         run: mise run release:tool -- notes --sha "$RELEASE_SHA" --version "$RELEASE_VERSION" --output RELEASE_NOTES.md
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

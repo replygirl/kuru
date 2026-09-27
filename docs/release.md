@@ -58,6 +58,7 @@ publishes nothing. From the command line:
 gh workflow run release.yml --ref main -f bump=auto -f mode=publish
 ```
 
+The bump options are:
 
 | Bump | Behavior |
 | --- | --- |
@@ -118,7 +119,7 @@ run. `plan` and `assemble-candidate` write
 | `plan` | Runs; checks `RELEASE_APP_ID` and the notes secret, never the app key | Unchanged |
 | `bump`, `verify` | Skipped: no version commit exists to validate | Unchanged |
 | `build` | Four targets from the dispatch SHA with the planned version stamped locally | Unchanged |
-| `notes` | Runs on the clean dispatch SHA for the planned version | Unchanged |
+| `notes` | Runs on a local, unpushed commit of the stamped dispatch SHA | Unchanged |
 | `assemble-candidate` | Runs; uploads `release-candidate-<attempt>` | Unchanged |
 | `verify-staged` | All four legs, on the dispatch SHA stamped locally | Unchanged |
 | `build-docs` | Runs; uploads `github-pages-<attempt>` | Unchanged |
@@ -129,9 +130,11 @@ Rehearsal jobs check out the dispatch SHA, which is the plan's `base_sha`. The
 changing only the local working tree's workspace version and Cargo.lock entries.
 Their archives therefore report the planned version, and staged tests compare
 against it, exactly as they would from the version commit. Nothing is committed
-or pushed. `notes` requires a clean checkout of its exact source, so it reads
-the unstamped dispatch commit; the version commit differs from it only in those
-two files. Artifacts keep their publication names and remain workflow artifacts
+or pushed by those jobs. `notes` requires an exact, clean commit that already
+carries the planned version, so it runs the same `stamp` and commits those two
+files locally on the runner, as `bump` would. That rehearsal commit is never
+pushed: the checkout holds no credentials and the job has only read access.
+Artifacts keep their publication names and remain workflow artifacts
 of the rehearsal run.
 
 A rehearsal uses the read-only `github.token` and the
