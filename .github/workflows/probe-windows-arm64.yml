@@ -199,9 +199,10 @@ jobs:
           Write-Output '===== PROBE: pinned toolchain ====='
           mise --version 2>&1 | ForEach-Object { "$_" }
           Write-Output "mise machine=$(& "$env:RUNNER_TEMP\pe-machine.ps1" -Path (Get-Command mise).Source)"
-          mise x -- rustc --version 2>&1 | ForEach-Object { "$_" }
-          mise x -- rustc --print host-tuple 2>&1 | ForEach-Object { "$_" }
-          mise x -- rustup target list --installed 2>&1 | ForEach-Object { "$_" }
+          Write-Output "PATH cargo=$((Get-Command cargo -ErrorAction SilentlyContinue).Source) rustc=$((Get-Command rustc -ErrorAction SilentlyContinue).Source)"
+          rustup run 1.98.1 rustc -vV 2>&1 | ForEach-Object { "$_" }
+          rustup run 1.98.1 rustc --print host-tuple 2>&1 | ForEach-Object { "$_" }
+          rustup target list --installed --toolchain 1.98.1 2>&1 | ForEach-Object { "$_" }
           Write-Output '===== END: pinned toolchain ====='
 
       - name: Locked repository toolchain install
@@ -248,14 +249,16 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           Write-Output '===== PROBE: aws-lc-sys build smoke ====='
-          mise x -- cargo check -p kuru-delivery --features tooling --locked 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\aws-lc.log" | ForEach-Object { "$_" }
+          # rustup's cargo directly: `mise x` would first try to install every
+          # configured tool, including any without a windows-arm64 lock entry.
+          cargo +1.98.1 check -p kuru-delivery --features tooling --locked 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\aws-lc.log" | ForEach-Object { "$_" }
           Write-Output "cargo check exit=$LASTEXITCODE"
           Write-Output '--- aws-lc-sys build script lines mentioning clang/cmake/cc-builder/requires/error:'
           Get-ChildItem target\debug\build -Directory -Filter 'aws-lc-sys-*' -ErrorAction SilentlyContinue | ForEach-Object {
             foreach ($f in @('output', 'stderr')) {
               $p = Join-Path $_.FullName $f
-              if (Test-Path $p) {
-                Select-String -Path $p -Pattern 'clang|cmake|cc-builder|cc_builder|requires|error|CC_|compiler' | ForEach-Object { "$($_.Filename)[$($_.LineNumber)]: $($_.Line)" }
+              if (Test-Path -LiteralPath $p) {
+                Select-String -LiteralPath $p -Pattern 'clang|cmake|cc-builder|cc_builder|requires|error|CC_|compiler' | ForEach-Object { "$($_.Filename)[$($_.LineNumber)]: $($_.Line)" }
               }
             }
           }
@@ -263,26 +266,41 @@ jobs:
 
       - name: Instrumented cargo llvm-cov smoke
         continue-on-error: true
-        timeout-minutes: 15
+        timeout-minutes: 20
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Continue'
           Write-Output '===== PROBE: instrumented llvm-cov smoke ====='
-          mise x -- rustup component add llvm-tools-preview --toolchain 1.98.1 2>&1 | ForEach-Object { "$_" }
-          mise x -- cargo llvm-cov --version 2>&1 | ForEach-Object { "$_" }
-          mise x -- cargo llvm-cov --no-report -p kuru-archive --lib --locked -- stored_deflated 2>&1 | ForEach-Object { "$_" }
+          rustup component add llvm-tools-preview --toolchain 1.98.1 2>&1 | ForEach-Object { "$_" }
+          # Probe only: this lock has no windows-arm64 cargo-llvm-cov entry, so
+          # install the pinned version unlocked in this ephemeral checkout.
+          $env:MISE_LOCKED = '0'
+          mise install aqua:taiki-e/cargo-llvm-cov@0.9.1 2>&1 | ForEach-Object { "$_" }
+          Write-Output "unlocked mise install cargo-llvm-cov exit=$LASTEXITCODE"
+          $llvmcov = (mise which --tool aqua:taiki-e/cargo-llvm-cov@0.9.1 cargo-llvm-cov 2>&1 | Select-Object -Last 1)
+          $env:MISE_LOCKED = '1'
+          Write-Output "cargo-llvm-cov=$llvmcov"
+          if ($llvmcov -and (Test-Path -LiteralPath $llvmcov)) {
+            Write-Output "cargo-llvm-cov machine=$(& "$env:RUNNER_TEMP\pe-machine.ps1" -Path "$llvmcov")"
+            $env:PATH = (Split-Path -Parent $llvmcov) + ';' + $env:PATH
+          }
+          cargo +1.98.1 llvm-cov --version 2>&1 | ForEach-Object { "$_" }
+          cargo +1.98.1 llvm-cov --no-report -p kuru-archive --lib --locked -- stored_deflated 2>&1 | ForEach-Object { "$_" }
           Write-Output "cargo llvm-cov --no-report exit=$LASTEXITCODE"
-          $sysroot = (mise x -- rustc --print sysroot 2>&1 | Select-Object -Last 1)
-          $profdata = Join-Path $sysroot 'lib\rustlib\aarch64-pc-windows-msvc\bin\llvm-profdata.exe'
-          Write-Output "llvm-profdata=$profdata exists=$(Test-Path $profdata)"
-          if (Test-Path $profdata) {
+          $sysroot = (rustup run 1.98.1 rustc --print sysroot 2>&1 | Select-Object -Last 1)
+          $profdata = Join-Path "$sysroot" 'lib\rustlib\aarch64-pc-windows-msvc\bin\llvm-profdata.exe'
+          $exists = Test-Path -LiteralPath $profdata
+          Write-Output "llvm-profdata=$profdata exists=$exists"
+          if ($exists) {
             & $profdata --version 2>&1 | ForEach-Object { "$_" }
-            $raws = Get-ChildItem target -Recurse -Filter *.profraw -ErrorAction SilentlyContinue | ForEach-Object FullName
+            $raws = @(Get-ChildItem target -Recurse -Filter *.profraw -ErrorAction SilentlyContinue | ForEach-Object FullName)
             Write-Output "profraw files: $($raws.Count)"
             if ($raws.Count -gt 0) {
               & $profdata merge -sparse @raws -o "$env:RUNNER_TEMP\probe.profdata" 2>&1 | ForEach-Object { "llvm-profdata merge -sparse: $_" }
               Write-Output "llvm-profdata merge -sparse exit=$LASTEXITCODE"
             }
           }
-          mise x -- cargo llvm-cov report -p kuru-archive 2>&1 | ForEach-Object { "$_" }
+          cargo +1.98.1 llvm-cov report 2>&1 | ForEach-Object { "$_" }
           Write-Output "cargo llvm-cov report exit=$LASTEXITCODE"
           Write-Output '===== END: instrumented llvm-cov smoke ====='
