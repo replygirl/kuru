@@ -21,6 +21,15 @@
 //! line's count is the maximum of a structurally chosen set of region counts.
 //! Non-negativity is enforced: a region carrying the clamped count of a
 //! negative counter expression fails the partition's line export.
+//!
+//! The argument also needs every partition region to be a counted code
+//! region of nonzero length, which is all rustc emits. llvm-cov suppresses
+//! segments for skipped and zero-length regions depending on the counts
+//! around them, so with those present a line's figure would no longer be a
+//! count-independent structural choice. The partition export
+//! ([`LlvmExport::partition_line_export`]) refuses them, naming the function;
+//! the general [`LlvmExport::line_export`] derives every region kind, which
+//! the clang fixtures exercise.
 
 use super::lcov::relative_source;
 use anyhow::{Context, Result, bail, ensure};
@@ -172,7 +181,20 @@ impl LlvmExport {
 
     /// Every instantiation's mapped and covered lines, as llvm-cov derives
     /// them, for the functions whose main view is an exported source file.
+    /// Accepts every region kind.
     pub fn line_export(&self, root: &str) -> Result<LineExport> {
+        self.derive_lines(root, Accept::AnyRegion)
+    }
+
+    /// The line export a coverage partition writes: [`Self::line_export`],
+    /// refusing any main-file region that is not a counted code region of
+    /// nonzero length, since only over those does the partitions' union
+    /// equal the summed profile's figure exactly.
+    pub fn partition_line_export(&self, root: &str) -> Result<LineExport> {
+        self.derive_lines(root, Accept::CountedCode)
+    }
+
+    fn derive_lines(&self, root: &str, accept: Accept) -> Result<LineExport> {
         let data = self.data();
         let functions = data
             .functions
@@ -203,6 +225,18 @@ impl LlvmExport {
                 .map(Region::parse)
                 .collect::<Result<Vec<_>>>()
                 .with_context(|| format!("function {} in {file}", function.name))?;
+            if accept == Accept::CountedCode
+                && let Some(region) = regions
+                    .iter()
+                    .find(|region| region.kind != Kind::Code || region.start == region.end)
+            {
+                bail!(
+                    "function {} in {file}: region {region:?} is not a counted code region of \
+                     nonzero length; llvm-cov's segment suppression for skipped and zero-length \
+                     regions depends on counts, so a partition's line export refuses them",
+                    function.name
+                );
+            }
             let first = regions
                 .first()
                 .with_context(|| format!("function {} has no region in {file}", function.name))?;
@@ -239,6 +273,15 @@ impl LlvmExport {
         export.validate()?;
         Ok(export)
     }
+}
+
+/// Which main-file regions a line export derives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Accept {
+    /// Every region kind llvm-cov exports.
+    AnyRegion,
+    /// Only code regions of nonzero length: a partition's line export.
+    CountedCode,
 }
 
 /// The first file id that no expansion region expands into
@@ -860,9 +903,18 @@ mod tests {
         LlvmExport::read(&Path::new(FIXTURES).join(name)).unwrap()
     }
 
-    /// Derive a fixture's line export and hold it to its own summary.
+    /// Derive a fixture's line export and hold it to its own summary. The
+    /// rustc fixtures also pass the partition export unchanged; the clang
+    /// fixtures carry the region kinds it refuses.
     fn reproduce(export: &str, summary: &str, root: &str) -> LineExport {
         let lines = fixture(export).line_export(root).unwrap();
+        let partition = fixture(export).partition_line_export(root);
+        if export.starts_with("clang-") {
+            let error = format!("{:#}", partition.unwrap_err());
+            assert!(error.contains("not a counted code region"), "{error}");
+        } else {
+            assert_eq!(partition.unwrap(), lines, "{export}");
+        }
         let reported = fixture(summary).summary_figures(root).unwrap();
         self_check(&lines.figures().unwrap(), &reported).unwrap();
         // The full export's own totals agree with its summary-only twin.
@@ -1194,6 +1246,31 @@ mod tests {
             .line_export("/r")
             .unwrap_err();
         assert!(error.to_string().contains("summary-only"), "{error}");
+    }
+
+    #[test]
+    fn partition_exports_refuse_skipped_and_zero_length_regions() {
+        let base = r#"{"type":"llvm.coverage.json.export","version":"3.1.0","data":[{"files":[{"filename":"/r/a.rs","summary":{"lines":{"count":3,"covered":3}}}],"functions":[{"name":"f","filenames":["/r/a.rs"],"regions":[[1,1,3,9,1,0,0,0],[2,1,2,9,1,0,0,0]]}],"totals":{"lines":{"count":3,"covered":3}}}]}"#;
+        let export = LlvmExport::parse(base).unwrap();
+        assert_eq!(
+            export.partition_line_export("/r").unwrap(),
+            export.line_export("/r").unwrap()
+        );
+        for (region, what) in [
+            ("[2,1,2,9,0,0,0,2]", "skipped"),
+            ("[2,1,2,9,1,0,0,3]", "gap"),
+            ("[2,4,2,4,1,0,0,0]", "zero-length code"),
+            ("[2,4,2,4,0,0,0,2]", "zero-length skipped"),
+        ] {
+            let export = LlvmExport::parse(&base.replace("[2,1,2,9,1,0,0,0]", region)).unwrap();
+            export.line_export("/r").unwrap();
+            let error = format!("{:#}", export.partition_line_export("/r").unwrap_err());
+            assert!(
+                error.contains("function f in a.rs: region Region")
+                    && error.contains("not a counted code region of nonzero length"),
+                "{what}: {error}"
+            );
+        }
     }
 
     #[test]

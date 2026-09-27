@@ -197,10 +197,12 @@ spawns a budget-sized chunk.
 - [Own threshold arithmetic replaces `--fail-under-lines`, on a different metric] → D4a records the lead's choice of
   the exact summary metric, self-checked against each partition's `--summary-only` totals. The same drill compares
   the merge's totals with the rebuilt report's `DA` export and cargo-llvm-cov's summary. Branch records are refused, and no percentage is averaged.
-  Residual (not verifiable by the merge): exactness assumes non-negative region counts. A counter expression that
-  evaluates negative (for example, lost updates to non-atomic counters under concurrent tests) is rendered by
-  llvm-cov as a huge count; a sum that cancels across partitions would then differ from the union. Each
-  partition's self-check covers its own figures only.
+  Exactness preconditions, enforced per partition: region counts are non-negative, and every region is a counted
+  code region of nonzero length. Each partition's line export refuses any main-file region whose count is
+  `i64::MAX` (llvm-cov export's rendering of a negative counter expression, for example lost updates to non-atomic
+  counters under concurrent tests), so that partition fails and reruns and a union can never overstate the summed
+  profile. It likewise refuses skipped and zero-length regions, naming the function: llvm-cov's segment suppression
+  for them depends on counts, which would break the structural line choice; rustc emits only nonzero-length code regions.
 - [Count-balanced hash assignment is uneven in time (largest single test 145 s on Windows)] → M records max/mean
   partition test wall per OS. Duration bins are a follow-on using the same pure function with a committed weights
   file.

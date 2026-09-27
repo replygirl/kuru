@@ -1171,7 +1171,7 @@ async fn export_lines<H: Host>(
     )
     .await
     .context("partition coverage summary failed")?;
-    let export = lines::LlvmExport::read(&full)?.line_export(root_text)?;
+    let export = lines::LlvmExport::read(&full)?.partition_line_export(root_text)?;
     let reported = lines::LlvmExport::read(&summary)?.summary_figures(root_text)?;
     let derived = export.figures()?;
     lines::self_check(&derived, &reported)

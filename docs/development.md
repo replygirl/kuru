@@ -103,8 +103,11 @@ to non-atomic counters under concurrent tests) would break that equality, since
 its sum can cancel across partitions where no self-check sees it. `llvm-cov
 export` clamps such a count to `i64::MAX`, which no real count approaches, so
 the line export refuses any region with that count, naming the function and
-region, and the partition fails and must be rerun. The merge prints each file's figures and the
-total against the gate. It also unions the partitions' LCOV, which must cover
+region, and the partition fails and must be rerun. The equality also needs the
+partitions' regions to be all counted code regions, which is all rustc emits;
+a skipped or zero-length region would make llvm-cov's segment suppression
+count-dependent, so the export refuses them, naming the function. The merge
+prints each file's figures and the total against the gate. It also unions the partitions' LCOV, which must cover
 the same files and lines, into that OS's merged report, and prints its
 unique-line percentage for information only: a line shared by several groups
 counts once there, so it reads higher than the gate metric. Because each
