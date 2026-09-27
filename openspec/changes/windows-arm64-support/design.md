@@ -232,7 +232,21 @@ no `GetProcAddress` probing. Replace the `:626` gate with:
   Rejected: checking `"$Target-$sha.exe"`, which would leave an interrupted
   emulated-x64 update unrecoverable and unreinstallable on Arm.
 - `tests/fixtures/install-v0.4.2.ps1` stays x64-only: it is the frozen historical
-  bootstrap the update fixtures replay.
+  bootstrap the update fixtures replay. Its test,
+  `retained_v041_v042_powershell_reader_accepts_the_new_three_member_core`, runs
+  that reader against the runner's native fixture archive; on `windows-11-arm`
+  the fixture executable is an ARM64 PE, which the v0.4.2 reader (environment
+  gate `AMD64`, PE machine `0x8664`) rejects whatever the injected environment.
+  Phase 3 (tasks 3.4 and 3.7) gives it a named, reasoned disposition before the
+  arm64 legs run: either run it against an x64 fixture archive on both runners
+  (the reader's actual audience is an x64 install), or record a named exclusion
+  on Arm with that reason in verification 4.2. A silent `cfg` skip is not
+  acceptable.
+- A release older than the target's first release publishes no archive for it.
+  The bootstrap reports `Release v<version> publishes no <target> archive;
+  nothing was installed.` (or `The latest release ...` without `-Version`)
+  instead of the generic single-entry manifest error, so a `-Version` older than
+  the first arm64 release fails on Arm with a message that names the target.
 - Bootstrap tests (`bootstrap_windows.rs`) gain a case that runs the bootstrap
   with `PROCESSOR_ARCHITECTURE=AMD64` injected on every host and asserts the
   selected target equals the test executable's native target, proving the
@@ -243,7 +257,15 @@ no `GetProcAddress` probing. Replace the `:626` gate with:
   `pwsh` or an equivalent x64 PowerShell host); if one exists, task 3.7 adds a
   real emulated-process bootstrap case, and otherwise the emulated-shell claim
   stays limited to what the tests prove: native detection through
-  `IsWow64Process2` with the environment ignored.
+  `IsWow64Process2` with the environment ignored. The same limit applies to
+  recovery: in phase 2 the x64-named helper receipt recovers on the x64 runner,
+  and the name and PE-machine derivation is exercised by the disagreement case,
+  but on `windows-11-arm` the native test fixture records an arm64 helper, so
+  proving that an x64-named helper recovers there needs a real x64 `kuru.exe`
+  launched under emulation. That proof is tied to the step-zero x64 launch
+  probe (task 3.2) and task 3.7; without a launch path, verification 4.4 records
+  the claim as limited to the name/PE-machine derivation plus the x64-runner
+  case.
 
 Rust-side detection needs no change: the updater and `install-local` select by
 the compiled target (Decision 1).
@@ -257,25 +279,35 @@ the compiled target (Decision 1).
   beside the x64 clear in `bundle:prepare` (`packages/kuru-memory/mise.toml:11`).
   The spec's static-CRT requirement applies per target; the host build-script
   settings stay untouched because the variable is target-scoped.
-- Native host default: `apps/kuru-tui/mise.toml` `run_windows` replaces the
-  literal `x86_64-pc-windows-msvc` with the host tuple. mise templates cannot run
-  `rustc`, so the task passes `--target host` through and the two PowerShell
-  callers (`install-source.ps1`, the release `build` step) already resolve the
-  triple explicitly; the `run_windows` default becomes a small
-  `%KURU_HOST_TARGET%` resolved by a preceding `rustc --print host-tuple` line in
-  the same `cmd` script. Rejected: keeping x64 as the default and requiring
-  `--target` on Arm, which reintroduces a silent x64 assumption.
+- Native host default: `apps/kuru-tui/mise.toml` `build` and `build:release`
+  `run_windows` (`:16,32`) replace the literal `x86_64-pc-windows-msvc` with
+  Cargo's own `--target host-tuple` when the task's `--target` is the default
+  `host`, and pass an explicit triple through unchanged. Cargo 1.98.1 resolves
+  `host-tuple` to the real triple, writes to that triple's directory and applies
+  the triple-scoped `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` to it, so the static-CRT
+  setting still reaches the build without a `cmd` variable expanded at parse
+  time. The two PowerShell callers (`install-source.ps1`, the release `build`
+  step) still resolve and pass the triple explicitly. Rejected: keeping x64 as
+  the default and requiring `--target` on Arm, which reintroduces a silent x64
+  assumption; and a preceding `rustc --print host-tuple` line feeding a
+  `%KURU_HOST_TARGET%` variable, which the first design sketched but `cmd`
+  expands when it parses the line, before the variable is set.
 - `install-source.ps1:23-24` and `verify-bundle-build.ps1:8-10`: accept
   `x86_64-pc-windows-msvc` or `aarch64-pc-windows-msvc` from
   `rustc --print host-tuple`, select the manifest asset by that tuple, and keep
   rejecting anything else.
-- `verify-windows-imports.ps1`: query `vswhere` with `-requires` either
-  `Microsoft.VisualStudio.Component.VC.Tools.x86.x64` or
-  `...VC.Tools.ARM64` (two queries, union), and find `dumpbin.exe` under
-  `bin/Hostx64/x64` or `bin/Hostarm64/arm64` in that order of preference for
-  the native host. `dumpbin /IMPORTS` reads any PE machine, so either host tool
-  is acceptable for the check; the step-zero probe confirms which components the
-  image ships before the arm64 path is trusted.
+- `verify-windows-imports.ps1` (`:14-49`): order the host layouts
+  `bin/Hostx64/x64` and `bin/Hostarm64/arm64` with the one matching the current
+  process first (`PROCESSOR_ARCHITECTURE`, which only orders the search and never
+  selects a target), and for each layout query `vswhere -requires` with
+  `Microsoft.VisualStudio.Component.VC.Tools.x86.x64`, then
+  `...VC.Tools.ARM64`. The first query with a match wins (ordered first match,
+  not a union); a failing `vswhere` exit or no match anywhere throws with every
+  query and its match count in the diagnostic. The script prints no extra
+  stdout line because `windows_cli.rs` asserts exactly two result lines.
+  `dumpbin /IMPORTS` reads any PE machine, so either host tool is acceptable for
+  the check; the step-zero probe confirms which components the image ships
+  before the arm64 path is trusted.
 - `packages/kuru-platform/mise.toml`: add `setup:windows-arm64`,
   `typecheck:windows-arm64` and `lint:windows-arm64` mirroring the x64
   cross-check tasks (`rustup target add aarch64-pc-windows-msvc`).
@@ -313,12 +345,12 @@ Every row of the verified §8 catalogue and every confirmed gap:
 | A11 | `install.ps1:67-99` | no layout change; add one import (D2) |
 | A12 | `tests/fixtures/install-v0.4.2.ps1` | out of scope: frozen historical fixture |
 | A13 | `install-source.ps1:23-24` | accept both Windows tuples (D3) |
-| A14 | `apps/kuru-tui/mise.toml:16,31` | native host tuple (D3) |
+| A14 | `apps/kuru-tui/mise.toml:16,32` | Cargo `--target host-tuple` for the default `host` target (D3) |
 | A15 | `apps/kuru-tui/mise.toml:23` | add the arm64 variable (D3) |
 | A16 | `packages/kuru-memory/mise.toml:11,48` | add the arm64 clear and set (D3) |
 | A17 | `verify-bundle-build.ps1:8-10` | select by host tuple (D3) |
 | A18 | `packages/kuru-memory/mise.toml:37` `bundle:test-fixtures` | out of scope, deliberately: it decodes the real upstream x64 ZIP as a host-independent decoder fixture on every host; recorded in `docs/development.md` |
-| A19 | `verify-windows-imports.ps1:14` | either host dumpbin (D3) |
+| A19 | `verify-windows-imports.ps1:14-49` | either host dumpbin, first match in process-preferred layout order (D3) |
 | A20 | `packages/kuru-platform/mise.toml:16,20,24` | add arm64 tasks (D3) |
 | A21 | `mise_isolation.rs:64` | `native_processor_architecture()` (D3) |
 | A22 | `bootstrap_windows.rs:90` | same helper (D3) |
@@ -345,6 +377,7 @@ Every row of the verified §8 catalogue and every confirmed gap:
 | G4 | tool locks with `windows-x64` entries | add `windows-arm64` entries (D7) |
 | G5 | #106 removes the Intel catalog entry (`0ed39198`) | rebase onto #106 (D10); phase-3 catalog edit is `[Target; 4]` → `[Target; 5]` keeping #106's asserts; #106's untouched `mise.lock` `macos-x64` entries are out of scope |
 | G6 | resolver moved to `published.rs` (#108) | this change targets `published.rs` (D5) |
+| G7 | `apps/kuru-tui/tests/windows_cli.rs:829-840` and `tests/fixtures/windows_cli.rs:80-86` (source update through mise) | found in the stage 2 review: production `cli.rs` `build_windows_source` passes `archive::host_target()`, but the test asserted and the fixture accepted only `--target x86_64-pc-windows-msvc`; both now use `kuru_delivery::archive::host_target()` (the fixture binary belongs to the `kuru` package, which depends on `kuru-delivery`), which is x64-neutral (task 2.5) |
 | — | `openspec/specs/embedded-runtime/spec.md:26-38` | out of scope: PR6a's built-source provenance delta |
 
 ### 5. Previous-release rule in `published.rs`
@@ -440,7 +473,11 @@ cross-check is always possible.
 `docs/release.md` gains the sentence: the check inspects every published stable
 release for the target's archive; on a target's first release it records
 "no predecessor for <target>" with the inspected versions and passes, and that
-line is the acceptance evidence to look for in the job log.
+line is the acceptance evidence to look for in the job log. The sentence names
+no target and claims no Arm support, so it lands in phase 2 with the resolver
+(together with the listing/manifest agreement rule, the distinct "no stable
+older release at all" error and the token scope: every listing page, never a
+download); phase 3 (task 3.9) adds only the arm64-specific release wording.
 
 ### 6. Staged and published verifiers parametrized by target
 
@@ -575,8 +612,12 @@ and `cog --version` under emulation; whether an x64 PowerShell host (for
 example x64 `pwsh`) can be launched, for the emulated-process bootstrap case in D2; and a
 `cargo llvm-cov` instrumented smoke test recording whether the pinned toolchain
 carries the rust-lang/rust#150123 fix (per lead ruling 1 the arm64 suites run
-uninstrumented until one does). It confirms stock PowerShell 5.1 is native
-ARM64 before the bootstrap is trusted on that assumption.
+uninstrumented until one does); and whether clang-cl is present
+(`vswhere -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang` and the
+located `clang-cl.exe`) with an `aws-lc-sys` build smoke for
+`aarch64-pc-windows-msvc`, because that crate's build script requires clang-cl
+for Windows Arm64. It confirms stock PowerShell 5.1 is native ARM64 before the
+bootstrap is trusted on that assumption.
 
 | x64 job | arm64 twin | Parameters | Aggregation |
 |---|---|---|---|
@@ -811,6 +852,14 @@ tools; `dumpbin` is a build-time acceptance dependency only.
 - [The staged fixture's positional asset ids collide or go stale when the
   catalog changes] → A39 (#106) derives them from the catalog; uniqueness
   holds by construction (catalog positions, then `SHA256SUMS` past them).
+- [The `windows-11-arm` image lacks the Visual Studio "C++ Clang tools"
+  component] → `aws-lc-sys`, under the shipping binary's TLS stack, builds
+  for `aarch64-pc-windows-msvc` only with clang-cl (observed on the macOS
+  cross-check: "Windows ARM64 requires clang-cl"), so a missing component
+  blocks every arm64 build job. Step zero checks for the component and runs an
+  `aws-lc-sys` build smoke before any arm64 leg is wired; if it is absent, the
+  jobs install it through the Visual Studio installer in a pinned step, or
+  phase 3 stops for a lead decision rather than changing the TLS stack.
 - [`windows-arm64` is not the lock platform key mise writes] → verified at the
   first `mise lock` run; the docs command is updated to whatever mise emits.
 
