@@ -24,7 +24,7 @@ enum Command {
         #[command(subcommand)]
         command: BundleCommand,
     },
-    /// Prepare and validate fail-closed native coverage shard evidence.
+    /// Run and merge fail-closed partitioned native test and coverage evidence.
     Coverage {
         #[command(subcommand)]
         command: CoverageCommand,
@@ -159,151 +159,46 @@ enum BundleCommand {
 
 #[derive(Subcommand)]
 enum CoverageCommand {
-    /// Reject a different or modified tracked source tree before compiling.
-    VerifySource {
-        #[arg(long, default_value = ".")]
-        root: PathBuf,
-        #[arg(long)]
-        expected_source: String,
-        #[arg(long)]
-        llvm_cov: PathBuf,
-    },
-    /// Canonicalize the full instrumented Cargo artifact inventory.
-    Inventory {
-        #[arg(long)]
-        metadata: PathBuf,
-        #[arg(long)]
-        messages: PathBuf,
-        #[arg(long)]
-        target_dir: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
-    },
-    /// Verify that a package selection reuses the full artifact inventory.
-    Selection {
-        #[arg(long)]
-        inventory: PathBuf,
-        #[arg(long, value_delimiter = ',')]
-        packages: Vec<String>,
-        #[arg(long)]
-        output: PathBuf,
-    },
-    /// Write an exact Cargo native-runner configuration for one shard.
-    RunnerConfig {
-        #[arg(long, default_value = ".")]
-        root: PathBuf,
-        #[arg(long)]
-        host: String,
-        #[arg(long)]
-        helper: PathBuf,
-        #[arg(long)]
-        inventory: PathBuf,
-        #[arg(long)]
-        selection: PathBuf,
-        #[arg(long)]
-        target_dir: PathBuf,
-        #[arg(long)]
-        ledger: PathBuf,
-        /// Existing directory for per-test output logs and stall reports.
-        #[arg(long)]
-        diagnostics: PathBuf,
-        /// Hosted job start in Unix seconds.
-        #[arg(long)]
-        job_started: u64,
-        /// Hosted job `timeout-minutes` limit.
-        #[arg(long)]
-        job_minutes: u64,
-        #[arg(long)]
-        output: PathBuf,
-    },
-    /// Dispatch one Cargo-selected test and record its exact shard action.
+    /// Dispatch one Cargo-selected test executable: list its tests and run
+    /// this partition's share with exact selections (the Cargo runner).
     Dispatch {
         #[arg(long, default_value = ".")]
         root: PathBuf,
         #[arg(long)]
         inventory: PathBuf,
+        /// Rust host target, which keys host-specific exclusions.
         #[arg(long)]
-        selection: PathBuf,
+        host: String,
+        /// One-based partition index.
+        #[arg(long)]
+        partition: u32,
+        /// Partition count of this OS.
+        #[arg(long)]
+        partitions: u32,
         #[arg(long)]
         target_dir: PathBuf,
         #[arg(long)]
         ledger: PathBuf,
         #[arg(long)]
         diagnostics: PathBuf,
-        /// Shard test deadline in Unix seconds.
+        /// Partition test deadline in Unix seconds.
         #[arg(long)]
         deadline: u64,
         executable: PathBuf,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
-    /// Require Cargo to have invoked every full-inventory test exactly once.
-    ValidateRun {
-        #[arg(long)]
-        inventory: PathBuf,
-        #[arg(long)]
-        selection: PathBuf,
-        #[arg(long)]
-        ledger: PathBuf,
-    },
-    /// Remove only compile-phase profiles before accepting uploaded test profiles.
-    DiscardCompileProfiles {
-        #[arg(long)]
-        profiles: PathBuf,
-    },
-    /// Bind successful raw profiles to their exact source and artifact inventory.
-    Receipt {
-        #[arg(long, default_value = ".")]
-        root: PathBuf,
-        #[arg(long)]
-        inventory: PathBuf,
-        #[arg(long)]
-        selection: PathBuf,
-        #[arg(long)]
-        ledger: PathBuf,
-        #[arg(long)]
-        profiles: PathBuf,
-        #[arg(long)]
-        shard: String,
-        #[arg(long)]
-        run_attempt: String,
-        #[arg(long)]
-        expected_source: String,
-        #[arg(long)]
-        llvm_cov: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
-    },
-    /// Verify each shard's latest uploaded (successful) attempt and copy only
-    /// accepted profiles for reporting.
-    CollectProfiles {
-        #[arg(long, default_value = ".")]
-        root: PathBuf,
-        #[arg(long)]
-        inventory: PathBuf,
-        #[arg(long)]
-        inputs: PathBuf,
-        #[arg(long)]
-        target_dir: PathBuf,
-        #[arg(long)]
-        expected_source: String,
-        /// The current workflow run attempt; no shard may claim a later one.
-        #[arg(long)]
-        max_attempt: String,
-        /// Hosted OS label carried by every accepted artifact name.
-        #[arg(long)]
-        artifact_os: String,
-        #[arg(long)]
-        llvm_cov: PathBuf,
-    },
-    /// Run one fail-closed coverage shard from its `KURU_COVERAGE_*` inputs.
+    /// Run one fail-closed test partition from its `KURU_COVERAGE_*` inputs.
     Shard {
         #[arg(long, default_value = ".")]
         root: PathBuf,
+        /// Run the scoped packages without coverage instrumentation.
+        #[arg(long)]
+        uninstrumented: bool,
     },
-    /// Validate every shard receipt and enforce one workspace coverage report
-    /// from the `KURU_COVERAGE_*` inputs.
-    Collect {
+    /// Require one OS's partition receipts to agree and be complete, then
+    /// enforce its coverage gate, from the `KURU_COVERAGE_*` inputs.
+    Merge {
         #[arg(long, default_value = ".")]
         root: PathBuf,
     },
@@ -378,71 +273,12 @@ async fn main() -> Result<()> {
         }
         Command::Coverage {
             command:
-                CoverageCommand::VerifySource {
-                    root,
-                    expected_source,
-                    llvm_cov,
-                },
-        } => {
-            coverage::verify_source(&root, &expected_source, &llvm_cov).await?;
-        }
-        Command::Coverage {
-            command:
-                CoverageCommand::Inventory {
-                    metadata,
-                    messages,
-                    target_dir,
-                    output,
-                },
-        } => {
-            coverage::write_inventory(&metadata, &messages, &target_dir, &output)?;
-        }
-        Command::Coverage {
-            command:
-                CoverageCommand::Selection {
-                    inventory,
-                    packages,
-                    output,
-                },
-        } => {
-            coverage::write_selection(&inventory, &packages, &output)?;
-        }
-        Command::Coverage {
-            command:
-                CoverageCommand::RunnerConfig {
-                    root,
-                    host,
-                    helper,
-                    inventory,
-                    selection,
-                    target_dir,
-                    ledger,
-                    diagnostics,
-                    job_started,
-                    job_minutes,
-                    output,
-                },
-        } => {
-            coverage::write_runner_config(&coverage::RunnerConfigOptions {
-                root: &root,
-                host: &host,
-                helper: &helper,
-                inventory: &inventory,
-                selection: &selection,
-                target_dir: &target_dir,
-                ledger: &ledger,
-                diagnostics: &diagnostics,
-                job_started,
-                job_minutes,
-                output: &output,
-            })?;
-        }
-        Command::Coverage {
-            command:
                 CoverageCommand::Dispatch {
                     root,
                     inventory,
-                    selection,
+                    host,
+                    partition,
+                    partitions,
                     target_dir,
                     ledger,
                     diagnostics,
@@ -451,10 +287,12 @@ async fn main() -> Result<()> {
                     args,
                 },
         } => {
+            let partition = coverage::partition::PartitionScheme::new(partition, partitions)?;
             let status = coverage::dispatch_test(&coverage::DispatchOptions {
                 root: &root,
                 inventory: &inventory,
-                selection: &selection,
+                host: &host,
+                partition: &partition,
                 target_dir: &target_dir,
                 ledger: &ledger,
                 diagnostics: &diagnostics,
@@ -481,85 +319,22 @@ async fn main() -> Result<()> {
         }
         Command::Coverage {
             command:
-                CoverageCommand::ValidateRun {
-                    inventory,
-                    selection,
-                    ledger,
-                },
-        } => {
-            coverage::validate_run_ledger(&inventory, &selection, &ledger)?;
-        }
-        Command::Coverage {
-            command: CoverageCommand::DiscardCompileProfiles { profiles },
-        } => {
-            println!("{}", coverage::discard_compile_profiles(&profiles)?);
-        }
-        Command::Coverage {
-            command:
-                CoverageCommand::Receipt {
+                CoverageCommand::Shard {
                     root,
-                    inventory,
-                    selection,
-                    ledger,
-                    profiles,
-                    shard,
-                    run_attempt,
-                    expected_source,
-                    llvm_cov,
-                    output,
+                    uninstrumented,
                 },
         } => {
-            coverage::write_receipt(&coverage::ReceiptOptions {
-                root: &root,
-                inventory: &inventory,
-                selection: &selection,
-                ledger: &ledger,
-                profiles: &profiles,
-                shard: &shard,
-                run_attempt: &run_attempt,
-                expected_source: &expected_source,
-                llvm_cov: &llvm_cov,
-                output: &output,
-            })
-            .await?;
+            let mode = if uninstrumented {
+                coverage::Mode::Uninstrumented
+            } else {
+                coverage::Mode::Instrumented
+            };
+            coverage::orchestrate::shard(&root, mode).await?;
         }
         Command::Coverage {
-            command:
-                CoverageCommand::CollectProfiles {
-                    root,
-                    inventory,
-                    inputs,
-                    target_dir,
-                    expected_source,
-                    max_attempt,
-                    artifact_os,
-                    llvm_cov,
-                },
+            command: CoverageCommand::Merge { root },
         } => {
-            let selected = coverage::collect_profiles(&coverage::CollectOptions {
-                root: &root,
-                inventory: &inventory,
-                inputs: &inputs,
-                target_dir: &target_dir,
-                expected_source: &expected_source,
-                max_attempt: &max_attempt,
-                artifact_os: &artifact_os,
-                llvm_cov: &llvm_cov,
-            })
-            .await?;
-            for (shard, attempt) in selected {
-                println!("coverage shard {shard}: accepted run attempt {attempt}");
-            }
-        }
-        Command::Coverage {
-            command: CoverageCommand::Shard { root },
-        } => {
-            coverage::orchestrate::shard(&root).await?;
-        }
-        Command::Coverage {
-            command: CoverageCommand::Collect { root },
-        } => {
-            coverage::orchestrate::collect(&root).await?;
+            coverage::orchestrate::merge(&root).await?;
         }
         Command::Install {
             version,

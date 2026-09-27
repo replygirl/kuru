@@ -1,5 +1,5 @@
 use super::{
-    tests::{assert_clean, asset, options},
+    tests::{assert_clean, asset, isolate_lock_release, options},
     *,
 };
 use kuru_platform::fs::{FileIdentity, regular_file_info};
@@ -177,6 +177,7 @@ fn identical_gets(requests: &[Vec<u8>], count: usize) {
 
 #[tokio::test]
 async fn eligible_statuses_recover_on_the_third_get_and_persistent_errors_stop() {
+    isolate_lock_release!(eligible_statuses_recover_on_the_third_get_and_persistent_errors_stop);
     for status in [500, 502, 503, 504] {
         let mut server = Server::start(vec![
             response(status, "", b"error one"),
@@ -234,6 +235,7 @@ async fn eligible_statuses_recover_on_the_third_get_and_persistent_errors_stop()
 
 #[tokio::test]
 async fn production_retry_waits_before_repeating_an_identical_get() {
+    isolate_lock_release!(production_retry_waits_before_repeating_an_identical_get);
     let mut server = Server::start(vec![
         response(500, "", b"retry"),
         response(200, "", EXPECTED),
@@ -256,6 +258,7 @@ async fn production_retry_waits_before_repeating_an_identical_get() {
 
 #[tokio::test]
 async fn permanent_statuses_and_any_retry_after_are_not_retried() {
+    isolate_lock_release!(permanent_statuses_and_any_retry_after_are_not_retried);
     for (status, advice) in [
         (400, ""),
         (401, ""),
@@ -295,6 +298,7 @@ async fn permanent_statuses_and_any_retry_after_are_not_retried() {
 
 #[tokio::test]
 async fn malformed_response_and_integrity_failures_never_start_another_get() {
+    isolate_lock_release!(malformed_response_and_integrity_failures_never_start_another_get);
     let mut corrupt = EXPECTED.to_vec();
     corrupt[0] ^= 1;
     let oversized = [EXPECTED, b"!"].concat();
@@ -346,6 +350,7 @@ async fn timed_out_body_frame_is_typed() {
 
 #[tokio::test]
 async fn timed_out_body_frame_retries_with_a_clean_stage() {
+    isolate_lock_release!(timed_out_body_frame_retries_with_a_clean_stage);
     let mut server = Server::start(vec![Reply::StallBody, response(200, "", EXPECTED)]).await;
     let (_root, options, asset, identity) = setup(&server).await;
     let result = tokio::time::timeout(
@@ -368,6 +373,7 @@ async fn timed_out_body_frame_retries_with_a_clean_stage() {
 
 #[tokio::test]
 async fn interrupted_body_retries_only_three_times_and_releases_the_lock() {
+    isolate_lock_release!(interrupted_body_retries_only_three_times_and_releases_the_lock);
     let mut server = Server::start(vec![
         response(503, "", b"unavailable"),
         Reply::DropBody,
@@ -395,6 +401,7 @@ async fn interrupted_body_retries_only_three_times_and_releases_the_lock() {
 
 #[tokio::test]
 async fn one_download_deadline_covers_all_backoffs_headers_and_body() {
+    isolate_lock_release!(one_download_deadline_covers_all_backoffs_headers_and_body);
     for (replies, budget) in [
         (
             vec![
@@ -439,6 +446,7 @@ async fn one_download_deadline_covers_all_backoffs_headers_and_body() {
 
 #[tokio::test]
 async fn cancellation_after_dropping_error_headers_releases_stage_and_stable_lock() {
+    isolate_lock_release!(cancellation_after_dropping_error_headers_releases_stage_and_stable_lock);
     let mut server = Server::start(vec![Reply::ObserveErrorDrop]).await;
     let (_root, options, asset, identity) = setup(&server).await;
     let client = client();

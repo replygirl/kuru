@@ -45,36 +45,111 @@ platform for the full maintainer gate.
 
 CI runs format, lint, typecheck, repository/workflow tooling, cospec validation,
 managed-file checks and documentation as separate Ubuntu jobs. Native coverage
-runs the same way on Linux x86_64, macOS arm64 and Windows x86_64: five package
-shards in parallel (`delivery-archive`, `application`, `memory`, `runtime` and
-`connectors-core-platform`, matching `SHARDS` in
-`packages/kuru-delivery/src/coverage.rs`) and one report job per OS that validates
-their exact source, toolchain, artifact inventory, Cargo-native runner ledger and
-raw-profile receipts, and then enforces one 90% workspace report. One Rust
-orchestrator, `kuru-delivery coverage shard` and `coverage collect`, sequences
-both jobs on every OS through the `coverage:shard` and `coverage:collect` tasks.
-Each shard compiles the same full workspace/all-target/all-feature graph; its
-task-private runner executes only the assigned standard test targets while Cargo
-retains package cwd and runtime environment. That runner stops test executables
-at a deadline derived from the job's `timeout-minutes`, less a fixed evidence
-reserve. Compilation is not under that deadline: only the hosted job limit
+runs the same way on Linux x86_64, macOS arm64 and Windows x86_64: per-test
+partitions in parallel (eight on Ubuntu and Windows, four on macOS, matching
+`PARTITIONS` in `packages/kuru-delivery/src/coverage.rs`) and one merge job per
+OS on Ubuntu. One Rust orchestrator, `kuru-delivery coverage shard` and
+`coverage merge`, sequences both through the `coverage:shard` and
+`coverage:merge` tasks. Every partition compiles the same full
+workspace/all-target/all-feature instrumented inventory. Its task-private
+runner, which Cargo invokes for each test executable with the package cwd and
+runtime environment, records the executable's `--list` output and runs only the
+tests that a deterministic hash of the artifact identity and test name assigns
+to that partition, by explicit `--exact` names. Name lists are split into
+several invocations below the Windows command-line limit, and each invocation
+must announce exactly as many tests as it selected. Assignment balances test
+counts, not durations, and keeps a test in the same partition across commits.
+
+Each partition exports LCOV and a line export against its own instrumented
+executables, with no threshold, and records a receipt: source commit, tree, Cargo.lock, toolchain and
+coverage-tool identity, target, test-profile environment, the artifact
+inventory hash, and each executable's listed and assigned test names (stored in
+its partition plan and hashed in the receipt). Raw profiles stay on the runner;
+the receipt keeps their count, size and manifest digest. The merge rebuilds
+nothing. Its fail-closed check is N independent shard builds agreeing, rather
+than a separate rebuild: it requires a receipt from every partition, identical
+source, toolchain, profile and inventory identity across them, a target
+consistent with the OS, and per-executable assignments that are pairwise
+disjoint and whose union equals the recorded `--list` output. Any mismatch or
+missing receipt fails before any report exists, so there is never a partial
+LCOV.
+
+The per-OS gate is 90% by the metric `mise run coverage` holds to
+`--fail-under-lines 90`: cargo-llvm-cov reads `totals.lines` of
+`llvm-cov export`, which counts, per source file, each function instantiation
+group once (the functions starting at one location, such as a generic's
+instantiations or a library built with and without `cfg(test)`), with the most
+mapped and the most covered lines of any of its instantiations. Summed profiles
+cannot be recombined from per-file LCOV, so each partition also writes
+`coverage-lines.json`: every instantiation's source file, name, group location
+and mapped and covered lines, derived from its full `llvm-cov export` JSON with
+a port of llvm-cov's line statistics (LLVM 22.1.8, the pinned toolchain's
+`llvm-tools`). Before its receipt is written the partition runs
+cargo-llvm-cov's `--json --summary-only` report over the same profiles and
+requires the export to reproduce it exactly, per file and in total; a mismatch
+fails the partition, names the first mismatching files and keeps the summary in
+its diagnostics. The receipt carries the export's digest and self-checked
+totals.
+
+The merge refuses a receipt without that digest or an export that differs from
+it or from its totals. It requires every partition to report the same files,
+instantiations, group locations and mapped lines, unions each instantiation's
+covered lines, and sums each group's maximum per file and in total. That equals
+the summary of the summed profiles: the mappings are identical and region
+counts are non-negative, so a region's summed count is nonzero exactly when
+some partition's is, and a line's count is the maximum of a structurally chosen
+set of region counts. A negative counter expression (for example, lost updates
+to non-atomic counters under concurrent tests) would break that equality, since
+its sum can cancel across partitions where no self-check sees it. `llvm-cov
+export` clamps such a count to `i64::MAX`, which no real count approaches, so
+the line export refuses any region with that count, naming the function and
+region, and the partition fails and must be rerun. The equality also needs the
+partitions' regions to be all counted code regions, which is all rustc emits;
+a skipped or zero-length region would make llvm-cov's segment suppression
+count-dependent, so the export refuses them, naming the function. The merge
+prints each file's figures and the total against the gate. It also unions the partitions' LCOV, which must cover
+the same files and lines, into that OS's merged report, and prints its
+unique-line percentage for information only: a line shared by several groups
+counts once there, so it reads higher than the gate metric. Because each
+partition exports its own coverage, merging on Ubuntu needs no macOS or Windows
+runner and no instrumented objects.
+
+The partition runner stops test executables at a deadline derived from the job's
+`timeout-minutes`, less a fixed evidence reserve, and checks it before every
+invocation. Compilation is not under that deadline: only the hosted job limit
 bounds it, without evidence. A test executable still running at the deadline is
 terminated through its owned Job on Windows or its owned process group on Unix,
-and the shard fails with a `<prefix>-coverage-<os>-<shard>-diagnostics-attempt-<n>`
-artifact holding each executable's output log, a stall report naming the tests
-libtest reported as unfinished, the error in `failure.txt`, and the shard's
-manifests and runner ledger; any other shard failure uploads the same
-diagnostics. Only a successful shard uploads its
-`<prefix>-coverage-<os>-<shard>-attempt-<n>` receipt artifact, whose root holds
-one `attempt-<n>` directory. Rerunning only the failed jobs is enough. The report
-refuses unless every shard job succeeded, then takes each shard's latest
+and the partition fails with a
+`<prefix>-coverage-diagnostics-<os>-partition-<k>-attempt-<n>` artifact holding
+each executable's output log, a stall report naming the tests libtest reported
+as unfinished, the error in `failure.txt`, and the partition's manifests and
+runner ledger; any other partition failure uploads the same diagnostics. Only a
+successful partition uploads its
+`<prefix>-coverage-<os>-partition-<k>-attempt-<n>` receipt artifact, whose root
+holds one `attempt-<n>` directory; the diagnostics name cannot match the merge's
+download pattern. Rerunning only the failed jobs is enough. The merge refuses
+unless every partition job succeeded, then takes each partition's latest
 uploaded (successful) attempt for its own OS from the same run and validates it
 exactly; an invalid latest attempt is never replaced by an older one. It accepts
-both download layouts: one artifact extracted directly into the shard directory,
-or several in directories named after their artifacts. Each rerun adds one more
-artifact download per rerun shard, bounded by the receipt profile limits, inside
-the report's 30-minute limit; if repeated reruns exhaust it, dispatch a fresh
-run. The report uploads the merged `<prefix>-coverage-<os>-attempt-<n>` LCOV.
+both download layouts: one artifact extracted directly into the inputs
+directory, or several in directories named after their artifacts. It uploads
+`<prefix>-coverage-<os>-attempt-<n>` with the merged LCOV and
+`merge-summary.json`.
+
+Each partition also writes a job ledger with phase timestamps, per-executable
+start and finish times, invocation and raw-profile counts, the helper and
+dependency-seed cache results, and how many dependency and workspace units
+Cargo rebuilt. The merge prints these per partition, so a cold or evicted cache
+is visible as a slower run. Ledger contents never fail a run.
+
+Partition counts follow the critical path and hosted concurrency limits, not a
+fixed ratio. Four macOS partitions and the macOS installation job exactly fill
+the account's five concurrent macOS jobs, so nothing in one run queues behind
+them; a fifth partition would queue the installation job. Windows is the
+slowest OS and sets the run's floor. Ubuntu is not on the critical path, so it
+stays at eight and leaves concurrency for other runs. Change a count in
+`PARTITIONS` and the workflow matrix together, and only after measuring slack.
+
 On every OS, one installation job runs beside coverage after independently
 preparing its locked inputs: it installs the release build offline, verifies the
 installed offline runtime and then runs
@@ -87,18 +162,26 @@ this step has already relinked it with all features. That step needs outbound HT
 groups and `main` pushes; a branch older than the latest published release fails
 it and must be rebased. Linux Clippy does not analyze
 platform-specific conditional code; the native suites compile and test those
-branches. Linux arm64 additionally builds and packages the native executable,
-exercises real memory and verifies the packaged offline runtime; that job
-restores and saves its own per-target Cargo dependency cache.
+branches. Linux arm64 additionally builds and packages the native executable and verifies
+the packaged offline runtime; that job restores and saves its own per-target
+Cargo dependency cache. Its complete real-memory suite runs separately through
+three uninstrumented partitions of the same orchestrator
+(`//packages/kuru-delivery:test:partition` with `KURU_COVERAGE_PACKAGES=kuru-memory`)
+and an Ubuntu merge that applies the same receipt agreement, disjointness and
+completeness checks without LCOV or a threshold, and requires every receipt's
+package scope to be exactly `kuru-memory`. The arm64 job remains a
+supported-platform proof of that whole suite; nothing is subset. The Windows
+offline build-input check (`bundle:verify-native-build`) has no test inventory
+to partition and stays in the Windows installation job.
 Windows primitives retain a separate native coverage job for early feedback. The
 required `ci-gate` accepts only success from every branch of this graph.
 
-Ubuntu's shard and report steps both disable Rust test-profile debug information
-so its instrumented Kuru executable remains a valid input to the same production
-release-archive bound exercised by the packaged-runtime fixture. The two steps
-must carry the same value because it is part of the artifact inventory every
-receipt is validated against. Coverage maps, the full test graph, and the 90%
-line threshold remain enabled. Panic text is retained, but Ubuntu coverage
+Ubuntu's partition steps disable Rust test-profile debug information so the
+instrumented Kuru executable remains a valid input to the same production
+release-archive bound exercised by the packaged-runtime fixture. The value is
+part of the test-profile identity and artifact inventory on which every
+partition's receipt must agree. Coverage maps, the full test graph, and the
+merged line threshold remain enabled. Panic text is retained, but Ubuntu coverage
 backtraces may omit source file and line details; use a focused local run or
 another native job when those details are needed.
 
@@ -137,8 +220,9 @@ bridge before any downloaded application can be trusted.
 | `mise run coverage` | Run the behavioral suite under LLVM instrumentation, minimum 90% workspace line coverage |
 | `mise run test:install` | Native archive tests and, on macOS/Linux, real Bash bootstrap tests |
 | `mise run //packages/kuru-delivery:test` | Delivery contracts, including native PowerShell bootstrap/update fixtures on Windows |
-| `mise run //packages/kuru-delivery:coverage:shard` | One fail-closed CI coverage shard, configured by `KURU_COVERAGE_*` ([by hand](#running-a-coverage-shard-by-hand)) |
-| `mise run //packages/kuru-delivery:coverage:collect` | Validate every shard receipt for one OS and enforce the single 90% report |
+| `mise run //packages/kuru-delivery:coverage:shard` | One fail-closed CI coverage partition, configured by `KURU_COVERAGE_*` ([by hand](#running-a-coverage-partition-by-hand)) |
+| `mise run //packages/kuru-delivery:coverage:merge` | Require agreeing receipts from every partition of one OS and, when instrumented, enforce the 90% gate by cargo-llvm-cov's line metric over its partitions' line exports |
+| `mise run //packages/kuru-delivery:test:partition` | One uninstrumented checked partition of the `KURU_COVERAGE_PACKAGES` test suite (CI arm64 memory) |
 | `mise run //apps/kuru-tui:test:embedded-runtime` | Package, install, update and reopen actual Kuru with cold offline memory |
 | `mise run //packages/kuru-delivery:test:previous-release-update` | [Previous published release's updater](release.md#previous-release-update-acceptance) installs `KURU_UPDATE_CANDIDATE_BINARY`; optional `GITHUB_TOKEN` |
 | `mise run lint:tooling` | Shell, GitHub Actions and metadata validation |
@@ -200,37 +284,48 @@ that observe peer routing, context isolation, persistence, bounded failure,
 protocol payloads and real CLI output. Live authenticated-provider checks are
 separate from deterministic fixture tests and must be reported accurately.
 
-## Running a coverage shard by hand
+## Running a coverage partition by hand
 
-`mise run coverage` remains the local workspace gate. To reproduce one CI shard,
-run the orchestrator from a clean checkout of a committed revision (it refuses
-modified tracked files and a source other than `HEAD`) with a throwaway target,
-evidence and diagnostics directory that do not yet exist:
+`mise run coverage` remains the local workspace gate. To reproduce one CI
+partition, run the orchestrator from a clean checkout of a committed revision
+(it refuses modified tracked files and a source other than `HEAD`) with a
+throwaway target, evidence and diagnostics directory that do not yet exist:
 
 ```sh
 scratch=$(mktemp -d)
 KURU_COVERAGE_OS=local \
 KURU_COVERAGE_SOURCE=$(git rev-parse HEAD) \
 KURU_COVERAGE_ATTEMPT=1 \
-KURU_COVERAGE_SHARD=connectors-core-platform \
-KURU_COVERAGE_PACKAGES=kuru-connectors,kuru-core,kuru-platform \
+KURU_COVERAGE_PARTITION=1 \
+KURU_COVERAGE_PARTITIONS=4 \
 KURU_COVERAGE_TARGET="$scratch/target" \
-KURU_COVERAGE_OUTPUT="$scratch/evidence" \
-KURU_COVERAGE_DIAGNOSTICS="$scratch/diagnostics" \
+KURU_COVERAGE_OUTPUT="$scratch/evidence-1" \
+KURU_COVERAGE_DIAGNOSTICS="$scratch/diagnostics-1" \
 KURU_COVERAGE_JOB_STARTED=$(date +%s) \
-KURU_COVERAGE_JOB_MINUTES=75 \
+KURU_COVERAGE_JOB_MINUTES=45 \
   mise run //packages/kuru-delivery:coverage:shard
 ```
 
-Use a shard name and package list from `SHARDS`. The instrumented build stays in
-`KURU_COVERAGE_TARGET`, separate from `target/`, so it never disturbs ordinary
-builds or the shared build cache; delete the scratch directory afterwards. On
-failure, `diagnostics/failure.txt` and any stall reports explain the stop. To
-exercise collection, run all five shards, copy each shard's evidence (its
-`attempt-<n>` directory) into `$scratch/inputs/<shard>/`, and run
-`mise run //packages/kuru-delivery:coverage:collect` with the same `OS`, `SOURCE`
-and `ATTEMPT`, a fresh `KURU_COVERAGE_TARGET`, `KURU_COVERAGE_INPUTS="$scratch/inputs"`
-and a not-yet-existing `KURU_COVERAGE_REPORT` path whose parent exists.
+Any count works locally; CI uses the counts in `PARTITIONS`. The instrumented
+build stays in `KURU_COVERAGE_TARGET`, separate from `target/`, so it never
+disturbs ordinary builds or the shared build cache; delete the scratch directory
+afterwards. On failure, `diagnostics-1/failure.txt` and any stall reports explain
+the stop. To exercise the merge, run every index from 1 to the count, each with
+its own fresh target, evidence and diagnostics directory, copy each partition's
+evidence (its `attempt-1` directory) into a directory named like the CI
+artifact, `$scratch/inputs/ci-coverage-local-partition-<k>-attempt-1/`, and run
+`mise run //packages/kuru-delivery:coverage:merge` with the same `OS`, `SOURCE`,
+`ATTEMPT` and `PARTITIONS`, `KURU_COVERAGE_MODE=instrumented`,
+`KURU_COVERAGE_INPUTS="$scratch/inputs"` and a not-yet-existing
+`KURU_COVERAGE_REPORT` path whose parent exists. Omitting or altering one
+partition's evidence must fail the merge without writing a report.
+
+The uninstrumented mode takes the same inputs plus `KURU_COVERAGE_PACKAGES`, for
+example `kuru-memory`, and runs through
+`mise run //packages/kuru-delivery:test:partition`; merge its evidence with
+`KURU_COVERAGE_MODE=uninstrumented` and the same `KURU_COVERAGE_PACKAGES`, which
+the merge requires every receipt's scope to equal. An optional `KURU_COVERAGE_SEED` names a
+dependency seed directory to import (below); leave it unset locally.
 
 ## Shared build cache
 
@@ -311,15 +406,31 @@ directory for both preparation and compilation. Valid files are reverified and
 reused; corrupt or unsafe entries fail without replacement. This build cache is
 separate from the installed application's extracted `memory.cache_dir`.
 
-Every cached native CI job (coverage shards and reports, installation and the
-Linux arm64 native build) selects a bundle directory under `${{ runner.temp }}`
-for all its preparation and build steps. Each OS's coverage shards share one
-Cargo cache key that only one shard saves and the report job only restores;
-their instrumented target directories live in `${{ runner.temp }}` and are never
-cached. Private bundle directories must be created by the
-current runner; restoring them inside a Cargo target archive can change their
-permissions. Keep them outside shared build-output caches and retain the private
-directory checks when configuring native test runners.
+Every cached native CI job (coverage partitions and merges, installation and
+the Linux arm64 native build and memory partitions) selects a bundle directory
+under `${{ runner.temp }}` for all its preparation and build steps. Each OS's
+partitions share one Cargo cache key for the delivery helper and registry that
+only partition 1 saves. Their instrumented (or, for arm64 memory,
+uninstrumented) target directories live at one fixed path in
+`${{ runner.temp }}` and are created fresh by the orchestrator; a target is
+never restored from a cache. Instead, a separate dependency seed per OS and mode
+is restored under `${{ runner.temp }}`, and the orchestrator imports from it,
+after creating the fresh target and before the first build, only
+allow-listed outputs of non-workspace dependencies. It never imports workspace
+crate artifacts, raw profiles, shard state, supervisor snapshots, links or any
+other entry, and Cargo's own fingerprints rebuild anything stale. On `main`,
+partition 1 exports the seed with the same allow-list after its receipt is
+written, and only that export is saved. The seed does not enter any receipt:
+inventories record workspace artifacts only. An evicted or missing seed imports
+nothing, and the partition is only slower. A seed entry that cannot be read or
+moved is counted as an `io` refusal in the job ledger, any partial copy is
+removed, and Cargo rebuilds it. An absent, evicted, unreadable or malformed
+seed entry never fails the partition, and Cargo rebuilds anything its
+fingerprints judge stale; a seeded entry whose bytes are corrupt fails the
+build like any corrupt artifact would, without a receipt. Private bundle directories must be
+created by the current runner; restoring them inside a Cargo target archive can
+change their permissions. Keep them outside shared build-output caches and
+retain the private directory checks when configuring native test runners.
 
 Choose a supported target explicitly when preparing or building for it:
 
@@ -471,8 +582,8 @@ with their capability purpose and rerun `mise run cospec:validate`.
 hk validates format/tooling/specs before commits, separate concurrent static
 format, lint, typecheck, tooling, cospec, cospec-managed and docs steps before
 pushes, and conventional commit titles. Behavioral tests and coverage with its
-90% line gate run in CI, not in hooks; run them locally when a change needs
-them. Hooks are installed by mise's postinstall and `mise run setup`. Fix failed
+per-OS line gate (above) run in CI, not in hooks; run them locally when a
+change needs them. Hooks are installed by mise's postinstall and `mise run setup`. Fix failed
 checks instead of bypassing hooks.
 
 Git hooks export repository-selection variables, so a subprocess working directory
