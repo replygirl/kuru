@@ -132,8 +132,11 @@ Their archives therefore report the planned version, and staged tests compare
 against it, exactly as they would from the version commit. Nothing is committed
 or pushed by those jobs. `notes` requires an exact, clean commit that already
 carries the planned version, so it runs the same `stamp` and commits those two
-files locally on the runner, as `bump` would. That rehearsal commit is never
-pushed: the checkout holds no credentials and the job has only read access.
+files locally on the runner, as `bump` would. The commit uses Git plumbing, so
+no installed hook runs, and is skipped when the stamp changes nothing because
+the dispatch SHA already carries the planned version; notes then read that SHA,
+as `bump` would reuse it. That rehearsal commit is never pushed: the checkout
+holds no credentials and the job has only read access.
 Artifacts keep their publication names and remain workflow artifacts
 of the rehearsal run.
 

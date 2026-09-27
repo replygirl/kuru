@@ -400,11 +400,18 @@ jobs:
         id: local
         # Notes read an exact clean commit carrying the planned version. This
         # commit never leaves the runner: the checkout holds no credentials.
+        # Plumbing runs no installed hooks. A HEAD already at the planned
+        # version stamps nothing and is reused, as bump reuses it.
         env:
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
         run: |
           mise run release:tool -- stamp "$RELEASE_VERSION"
-          git -c user.name=kuru-rehearsal -c user.email=rehearsal@invalid -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q -m "chore(release): v$RELEASE_VERSION" -- Cargo.toml Cargo.lock
+          if ! git diff --quiet -- Cargo.toml Cargo.lock; then
+            git add -- Cargo.toml Cargo.lock
+            tree=$(git write-tree)
+            sha=$(git -c user.name=kuru-rehearsal -c user.email=rehearsal@invalid -c commit.gpgsign=false commit-tree "$tree" -p HEAD -m "chore(release): v$RELEASE_VERSION")
+            git update-ref HEAD "$sha"
+          fi
           printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Generate notes without publishing
         env:
