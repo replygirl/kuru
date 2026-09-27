@@ -157,7 +157,10 @@ installed offline runtime and then runs
 previous published release's own updater installs the installed executable
 under the job's temporary `kuru-bin` directory. It never reads Cargo's target
 directory: on Windows, the offline build-input check between installation and
-this step has already relinked it with all features. That step needs outbound HTTPS and receives the workflow's read-only
+this step leaves the memory build-script fingerprint dirty after its rejected
+inputs. Each installation job compiles the release executable once; the Windows
+check reuses the source installation's build as its positive control instead of
+rebuilding it. That step needs outbound HTTPS and receives the workflow's read-only
 `GITHUB_TOKEN`, used only to list releases. It runs on pull requests, merge
 groups and `main` pushes; a branch older than the latest published release fails
 it and must be rebased. Linux Clippy does not analyze
@@ -493,12 +496,19 @@ tools; the installed application does not.
 
 CI's source-install smoke disables both Cargo network access and missing-bundle
 downloads after preparing the dependencies. On Windows, the memory-owned
-`mise run //packages/kuru-memory:bundle:verify-native-build` task also invokes
-the actual Cargo build with isolated missing and same-size corrupt mirrors,
-requires the specific build-script rejection, then restores a valid offline
-build. Run it after source installation with `KURU_EMBEDDED_TEST_BINARY` pointing
-to the installed copy outside Cargo's output directory. It verifies that the
-installed executable and original prepared archive retain their hashes.
+`mise run //packages/kuru-memory:bundle:verify-native-build` task runs the
+shipping `build:release` command with `--offline` three times. First, with the
+caller's own mirror selection, it requires the installed copy to be the fresh
+output of that identical command: Cargo must compile nothing, and its
+`release/kuru.exe`, which the check only hashes, must match the installed
+SHA-256. It then invokes the actual Cargo build with isolated missing and
+same-size corrupt mirrors and requires the specific build-script rejection. Run
+it after source installation, in the same environment, with
+`KURU_EMBEDDED_TEST_BINARY` pointing to the installed copy outside Cargo's output
+directory. It verifies that the installed executable and original prepared
+archive retain their hashes. The rejected builds leave the memory build-script
+fingerprint dirty, so the next build of that target directory reruns the build
+script and recompiles kuru-memory and its dependents.
 
 ### Source-built engine inputs
 
