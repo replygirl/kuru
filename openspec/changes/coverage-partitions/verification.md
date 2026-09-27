@@ -17,7 +17,7 @@
 
 - [ ] 3.1 @unit (agent) LCOV tests -> `SF:` paths are normalized to root-relative forward-slash form (Windows drive case folded) and a source outside the root fails; differing SF sets, DA line sets or FN sets across partitions fail; DA/FNDA counts are summed and LF/LH/FNF/FNH recomputed; `BRDA` is refused; the gate passes at exactly 90.00% and fails just below
 - [ ] 3.2 @runtime (agent) GitHub-hosted ubuntu-latest, macos-latest and windows-latest on this PR's CI run -> each `Coverage merge (<os>)` job runs on ubuntu-latest, passes at ≥ 90% lines for its OS and uploads `ci-coverage-<os>-attempt-<n>`; the per-OS totals are recorded next to #111's run 36270435157 figures
-- [ ] 3.3 @equivalence (agent) one Ubuntu SHA: run today's same-OS rebuilt profile-merge report (`llvm-cov report` over all partitions' profiles against a fresh build) and the DA-merge of the partitions' LCOVs -> identical DA line sets per file and identical LF/LH totals; at least one executable has zero assigned tests in some partition
+- [ ] 3.3 @equivalence (agent) by hand on one machine and SHA (macOS arm64 locally is sufficient): run all N instrumented partitions keeping each partition's target and raw profiles, export and DA-merge their N LCOVs, then build one fresh instrumented target, copy every partition's raw profiles into it and run `llvm-cov report --failure-mode any --lcov` plus its summary (the #111 collect recipe by hand) -> identical DA line sets per file and identical LF/LH totals between the two LCOVs, the merge's Σ LH / Σ LF equals cargo-llvm-cov's printed line percentage, and at least one executable has zero assigned tests in some partition
 
 ## 4. The seeded dependency cache is evidence-neutral and failure-free [critical]
 

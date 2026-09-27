@@ -1,7 +1,7 @@
 ## 1. T1 Receipts and partition assignment
 
 - [ ] 1.1 Add `coverage/partition.rs` with `ArtifactKey`, `parse_libtest_list`, `assign` (`sha256-artifact-test-v1`) and the canonical list hash, and verify with the partition unit tests of verification 1.1
-- [ ] 1.2 Bump `SCHEMA` to 2; add `PartitionScheme`, `ExecutableTests`, `PartitionPlan`, the schema-2 `Receipt` (profile summary, optional LCOV receipt, `profile_env_sha256`, `tests_sha256`) and `WORKSPACE_PACKAGES`/`PARTITIONS`/empty `EXCLUDED_ARTIFACTS`; remove `Selection` and `SHARDS`; verify v1 files are refused by name and `workspace_packages()` still covers the eight packages in `mise run //packages/kuru-delivery:test`
+- [ ] 1.2 Bump `SCHEMA` to 2; add `PartitionScheme`, `ExecutableTests`, `PartitionPlan`, the schema-2 `Receipt` (profile summary, optional LCOV receipt, `profile_env_sha256`, `tests_sha256`) and `WORKSPACE_PACKAGES`/`PARTITIONS`/empty `EXCLUDED_ARTIFACTS`; remove `Selection` and `SHARDS`; widen `artifact_os_label` from `[a-z0-9-]+` to also admit `.` so `ubuntu-24.04-arm` (and PR6b's labels) are valid while the `…-partition-<k>-attempt-<n>` name parser stays unambiguous; verify v1 files are refused by name and `workspace_packages()` still covers the eight packages in `mise run //packages/kuru-delivery:test`
 - [ ] 1.3 Write `partition-plan.json` from the inventory and recorded lists, recompute assignments in `validate_run_ledger`, and handle `exclude` records with reasons; verify a stale exclusion and a tampered plan fail in unit tests
 
 ## 2. T2 `--list`/`--exact` dispatch with chunking
@@ -43,4 +43,5 @@
 
 - [ ] 9.1 Run `mise run //packages/kuru-delivery:test`, `mise run lint`, `mise run typecheck`, `mise run lint:tooling` and `mise run coverage` locally before pushing, and record verification 6.3
 - [ ] 9.2 Before pushing, diff `feat/windows-arm64`'s `coverage.rs` against #111 and reconcile the `PARTITIONS`/`EXCLUDED_ARTIFACTS` tables; record the result in blocking-changes.md coordination notes
-- [ ] 9.3 Record the hosted evidence of verification 1.5, 2.3, 2.4, 3.2, 3.3, 4.2, 4.3, 5.2, 7.1, 7.2 and 7.3 with run and job IDs, naming any unrun check and why
+- [ ] 9.3 Run the equivalence drill of verification 3.3 by hand (all partitions on one machine, rebuilt profile-merge report versus DA-merge, and the merge total versus cargo-llvm-cov's summary) and record it
+- [ ] 9.4 Record the hosted evidence of verification 1.5, 2.3, 2.4, 3.2, 4.2, 4.3, 5.2, 7.1, 7.2 and 7.3 with run and job IDs, naming any unrun check and why

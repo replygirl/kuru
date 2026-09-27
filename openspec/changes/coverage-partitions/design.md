@@ -102,7 +102,7 @@ before the tests. The task `test:partition` sets `KURU_TEST_SUPERVISOR_PREPARED=
 The merge takes an expected mode and refuses a receipt of the other mode.
 
 **D7. Counts and concurrency.** `PARTITIONS` = ubuntu-latest 8, macos-latest 4, windows-latest 8 (instrumented),
-ubuntu-24.04-arm 3 (uninstrumented, `kuru-memory`). The model is F + 1.05 Σ/N plus a ~180 s Ubuntu merge, with F =
+ubuntu-24.04-arm 3 (uninstrumented, `kuru-memory`). `artifact_os_label` (#111: `[a-z0-9-]+`) is widened to admit `.` for `ubuntu-24.04-arm`; PR6b's `windows-11-arm` already fits. The model is F + 1.05 Σ/N plus a ~180 s Ubuntu merge, with F =
 224 / 164 / 246 s (warm seed) or 346 / 304 / 501 s (evicted). The resulting paths are Ubuntu 651 s (10.9 min;
 evicted 12.9), macOS 820 s (13.7; 16.0) and Windows 918 s (15.3; 19.6). arm64 is estimated at about 9-10.5 min, with
 no uninstrumented partition timed yet. The run-level floor is about 15.3 min, set by Windows (today 43.9). macOS:
@@ -159,8 +159,9 @@ spawns a budget-sized chunk.
 ## Risks / Trade-offs
 
 - [Rigor: no independent rebuild] → Every receipt must agree field by field and the lists must be provably complete.
-  Each partition's LCOV is computed against the binaries that produced its profiles. M runs an equivalence drill: on
-  one Ubuntu SHA, today's rebuilt profile-merge report and the DA-merge must give identical DA sets and LF/LH.
+  Each partition's LCOV is computed against the binaries that produced its profiles. M runs an equivalence drill by hand on
+  one machine and SHA: all partitions' raw profiles fed to one rebuilt `llvm-cov report` (the #111 collect recipe)
+  and the DA-merge of their LCOVs must give identical DA sets and LF/LH.
 - [Own threshold arithmetic replaces `--fail-under-lines`] → The same drill compares totals with cargo-llvm-cov's
   summary. Branch records are refused, and no percentage is averaged.
 - [Count-balanced hash assignment is uneven in time (largest single test 145 s on Windows)] → M records max/mean
