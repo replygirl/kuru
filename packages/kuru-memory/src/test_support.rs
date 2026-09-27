@@ -5,6 +5,8 @@
 //! the snapshot prepared before they start. Coverage deliberately does not opt
 //! in: its one workspace build supplies the actual instrumented executable.
 pub use crate::files::PrivateTemp as TempDir;
+/// DRAFT: not for merge.
+pub mod failure_diagnostics;
 #[cfg(windows)]
 pub mod windows;
 use crate::{MemoryStore, OpenOptions, PublicTurnRecord, SessionCatalogRecord, files};

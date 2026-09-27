@@ -365,7 +365,7 @@ async fn framing_is_bounded_and_diagnostics_keep_only_a_tail() -> Result<()> {
     let mut data = vec![b'a'; LOG_LIMIT];
     data.extend(vec![b'b'; LOG_LIMIT]);
     let log = Arc::new(Mutex::new(Vec::new()));
-    drain(data.as_slice(), log.clone()).await;
+    drain(data.as_slice(), log.clone(), LogMirror::default()).await;
     assert_eq!(*log.lock().await, vec![b'b'; LOG_LIMIT]);
     Ok(())
 }

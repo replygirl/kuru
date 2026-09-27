@@ -455,6 +455,14 @@ impl Server {
             if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
                 command.env("LLVM_PROFILE_FILE", profile);
             }
+            // DRAFT: not for merge. Forward the test diagnostics destination.
+            #[cfg(feature = "test-support")]
+            if let Some(root) = crate::test_support::failure_diagnostics::root() {
+                command.env(
+                    crate::test_support::failure_diagnostics::DIAGNOSTICS_ENV,
+                    root,
+                );
+            }
             let child = command
                 .spawn()
                 .context("start memory lifetime supervisor")?;
@@ -519,6 +527,14 @@ impl Server {
                 command
                     .environment
                     .push(("LLVM_PROFILE_FILE".into(), profile));
+            }
+            // DRAFT: not for merge. Forward the test diagnostics destination.
+            #[cfg(feature = "test-support")]
+            if let Some(root) = crate::test_support::failure_diagnostics::root() {
+                command.environment.push((
+                    crate::test_support::failure_diagnostics::DIAGNOSTICS_ENV.into(),
+                    root.into_os_string(),
+                ));
             }
             let child = command
                 .spawn()
@@ -1761,13 +1777,23 @@ async fn supervise_with_port_hook<
         )
         .await?;
         let log = Arc::new(Mutex::new(Vec::new()));
+        // DRAFT: not for merge. Live test-only mirror of the Dolt output.
+        #[cfg(feature = "test-support")]
+        let mirror = crate::test_support::failure_diagnostics::DoltMirror::open(
+            &request.directory,
+            vec![identity.password.clone(), identity.reader_password.clone()],
+        );
+        #[cfg(not(feature = "test-support"))]
+        let mirror: LogMirror = ();
         let stdout = tokio::spawn(drain(
             child.stdout().context("Dolt stdout missing")?,
             log.clone(),
+            mirror.clone(),
         ));
         let stderr = tokio::spawn(drain(
             child.stderr().context("Dolt stderr missing")?,
             log.clone(),
+            mirror,
         ));
         let run_result = async {
         tokio::select! {
@@ -1943,11 +1969,23 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     files::write(path, bytes)
 }
 
-async fn drain<R: AsyncRead + Unpin>(mut reader: R, log: Arc<Mutex<Vec<u8>>>) {
+// DRAFT: not for merge. Test-support-only live mirror of Dolt output.
+#[cfg(feature = "test-support")]
+type LogMirror = Option<Arc<crate::test_support::failure_diagnostics::DoltMirror>>;
+#[cfg(not(feature = "test-support"))]
+type LogMirror = ();
+
+async fn drain<R: AsyncRead + Unpin>(mut reader: R, log: Arc<Mutex<Vec<u8>>>, mirror: LogMirror) {
+    #[cfg(not(feature = "test-support"))]
+    let () = mirror;
     let mut bytes = [0; 4096];
     while let Ok(length) = reader.read(&mut bytes).await {
         if length == 0 {
             break;
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(mirror) = &mirror {
+            mirror.write(&bytes[..length]);
         }
         let mut log = log.lock().await;
         log.extend_from_slice(&bytes[..length]);

@@ -966,6 +966,12 @@ impl RemoteView {
             uncertain: &self.session.uncertain_write,
             complete: false,
         });
+        // DRAFT: not for merge. Bounded operation label for failure diagnostics.
+        #[cfg(any(test, feature = "test-support"))]
+        let diagnostic_operation = mutating
+            .then(crate::test_support::failure_diagnostics::root)
+            .flatten()
+            .map(|_| crate::test_support::failure_diagnostics::bounded_debug(&call));
         let result = attachment.call_with_id(request_id, call).await;
         if attachment.has_definite_mutation_reply() {
             if let Some(pending) = &mut pending {
@@ -999,9 +1005,25 @@ impl RemoteView {
             }
         }
         if mutating && !attachment.has_definite_mutation_reply() {
-            result.context(
+            let result = result.context(
                 "memory service write outcome is uncertain; further client mutations are blocked",
-            )
+            );
+            // DRAFT: not for merge. Observe only; the result is returned unchanged.
+            #[cfg(any(test, feature = "test-support"))]
+            if let (Err(error), Some(operation)) = (&result, &diagnostic_operation)
+                && let Ok(directory) = crate::store::project_directory(
+                    &self.session.options.data_dir,
+                    &self.session.options.project_scope,
+                )
+            {
+                crate::test_support::failure_diagnostics::record(
+                    "client-uncertain",
+                    &directory,
+                    &format!("request {request_id}: {operation}"),
+                    error,
+                );
+            }
+            result
         } else {
             result
         }

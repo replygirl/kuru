@@ -656,6 +656,14 @@ async fn spawn_service(
             .environment
             .push((STARTUP_STAGE_DIAGNOSTIC_ENV.into(), OsString::from("1")));
     }
+    // DRAFT: not for merge. Forward the test diagnostics destination.
+    #[cfg(feature = "test-support")]
+    if let Some(root) = crate::test_support::failure_diagnostics::root() {
+        command.environment.push((
+            crate::test_support::failure_diagnostics::DIAGNOSTICS_ENV.into(),
+            root.into_os_string(),
+        ));
+    }
     command
         .spawn()
         .await

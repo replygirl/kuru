@@ -47,21 +47,35 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # DRAFT: not for merge. Only the shards that hit the macOS Dolt
+        # uncertain-write fence. Fixture open permits use the test-support
+        # default so the baseline and reduced-permit commits are separate runs.
         include:
-          - shard: delivery-archive
-            packages: kuru-delivery,kuru-archive
           - shard: application
             packages: kuru
           - shard: memory
             packages: kuru-memory
           - shard: runtime
             packages: kuru-runtime
-          - shard: connectors-core-platform
-            packages: kuru-connectors,kuru-core,kuru-platform
     steps:
       - name: Record the job start for the inner test deadline
         shell: bash
         run: printf 'KURU_COVERAGE_JOB_STARTED=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
+      # DRAFT: not for merge. Test-support failure diagnostics destination.
+      - name: Select Dolt failure diagnostics
+        shell: bash
+        run: |
+          diagnostics="$RUNNER_TEMP/kuru-dolt-failure-diagnostics"
+          mkdir -p "$diagnostics"
+          printf 'KURU_TEST_FAILURE_DIAGNOSTICS_DIR=%s\n' "$diagnostics" >> "$GITHUB_ENV"
+          {
+            echo "runner: $RUNNER_NAME $ImageOS $ImageVersion"
+            sw_vers || true
+            df -k "$RUNNER_TEMP" || true
+            df -i "$RUNNER_TEMP" || true
+            sysctl hw.ncpu hw.memsize kern.maxfiles kern.maxfilesperproc || true
+            ulimit -a || true
+          } > "$diagnostics/runner-before.txt" 2>&1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
@@ -245,9 +259,42 @@ jobs:
           name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-${{ matrix.shard }}-diagnostics-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.shard }}-${{ github.run_attempt }}
           if-no-files-found: warn
+      # DRAFT: not for merge. Printed to the log and kept with the uploaded
+      # diagnostics; live Dolt output mirrors are already under dolt-live/.
+      - name: Record runner state after the shard
+        if: always()
+        shell: bash
+        run: |
+          diagnostics="${KURU_TEST_FAILURE_DIAGNOSTICS_DIR:-$RUNNER_TEMP/kuru-dolt-failure-diagnostics}"
+          mkdir -p "$diagnostics"
+          {
+            echo "== df -h"; df -h || true
+            echo "== df -h \$RUNNER_TEMP"; df -h "$RUNNER_TEMP" || true
+            echo "== df -i"; df -i || true
+            echo "== df -i \$RUNNER_TEMP"; df -i "$RUNNER_TEMP" || true
+            echo "== ulimit -n"; ulimit -n || true
+            echo "== lsof | wc -l"; lsof 2>/dev/null | wc -l || true
+            if [ "$RUNNER_OS" = macOS ]; then
+              echo "== sysctl"; sysctl kern.num_files kern.maxfiles kern.maxfilesperproc || true
+            fi
+            echo "== Dolt failure bundles"
+            find "$diagnostics/bundles" -maxdepth 1 -mindepth 1 2>/dev/null | sort || true
+            echo "== Dolt live output mirrors"
+            find "$diagnostics/dolt-live" -maxdepth 1 -type f 2>/dev/null | sort || true
+          } 2>&1 | tee "$diagnostics/runner-after.txt"
+      - name: Upload Dolt failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: draft-dolt-diagnostics-${{ inputs.os }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kuru-dolt-failure-diagnostics
+          if-no-files-found: warn
+          retention-days: 14
 
   collect:
-    if: always()
+    # DRAFT: not for merge. The combined report needs every shard; this draft
+    # runs only three of them, so it is skipped for CI callers.
+    if: inputs.artifact-prefix != 'ci'
     needs: shard
     name: Coverage report (${{ inputs.os }})
     runs-on: ${{ inputs.os }}
@@ -482,7 +529,8 @@ jobs:
         run: |
           set -e
           test "$KURU_NATIVE_SHARDS" = success
-          test "$KURU_NATIVE_REPORT" = success
+          # DRAFT: not for merge. CI callers skip the combined report here.
+          test "$KURU_NATIVE_REPORT" = success || test "$KURU_NATIVE_REPORT" = skipped
           if [ "$KURU_NATIVE_INSTALL" = true ]; then
             test "$KURU_NATIVE_INSTALL_RESULT" = success
           else

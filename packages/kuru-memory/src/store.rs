@@ -1949,9 +1949,12 @@ impl MemoryStore {
     /// Real isolated Dolt fixture. Missing runtime/helper is an error, never a skip.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn temporary() -> Result<Self> {
-        static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-        let permit = PERMITS
-            .get_or_init(|| Arc::new(Semaphore::new(4)))
+        let permit = TEMPORARY_PERMITS
+            .get_or_init(|| {
+                Arc::new(Semaphore::new(
+                    crate::test_support::failure_diagnostics::open_permit_limit(),
+                ))
+            })
             .clone()
             .acquire_owned()
             .await?;
@@ -7459,6 +7462,19 @@ pub(crate) fn identifier(label: &str, value: &str, maximum: usize) -> Result<()>
     ensure!(!value.contains('\0'), "{label} must not contain NUL");
     Ok(())
 }
+/// DRAFT: not for merge. Fixture open-concurrency permits, hoisted so failure
+/// diagnostics can report occupancy.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) static TEMPORARY_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+impl MemoryStore {
+    /// DRAFT: not for merge. Project directory for failure diagnostics.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn diagnostics_directory(&self) -> &Path {
+        &self.shared.directory
+    }
+}
+
 pub(crate) fn project_directory(data: &Path, scope: &str) -> Result<PathBuf> {
     let hash = scope
         .strip_prefix("project/")

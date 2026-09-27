@@ -1029,6 +1029,10 @@ async fn respond<S: AsyncWrite + Unpin>(
     progress: &Arc<ReceiptProgress>,
     request: ServiceRequest,
 ) -> Result<()> {
+    // DRAFT: not for merge. Bounded operation label for failure diagnostics.
+    #[cfg(any(test, feature = "test-support"))]
+    let diagnostic_operation = crate::test_support::failure_diagnostics::root()
+        .map(|_| crate::test_support::failure_diagnostics::bounded_debug(&request.call));
     let response = if request.generation == authority.service_generation {
         let processed = async {
             let key = receipt_progress_key(&request.call, request.id, state, store)?;
@@ -1163,6 +1167,21 @@ async fn respond<S: AsyncWrite + Unpin>(
                 } else {
                     ServiceFault::StorageFailed
                 };
+                // DRAFT: not for merge. The exact storage error exists only here.
+                #[cfg(any(test, feature = "test-support"))]
+                if matches!(fault, ServiceFault::StorageFailed)
+                    && let Some(operation) = &diagnostic_operation
+                {
+                    crate::test_support::failure_diagnostics::record(
+                        "service-storage-failed",
+                        store.diagnostics_directory(),
+                        &format!(
+                            "request {} generation {}: {operation}",
+                            request.id, request.generation
+                        ),
+                        &error,
+                    );
+                }
                 #[cfg(any(test, feature = "test-support"))]
                 if let Some(record) = crate::store::candidate_failure_record(&error) {
                     let kind = match fault {

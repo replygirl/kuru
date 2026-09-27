@@ -19,18 +19,16 @@ env:
   # CI and release builds stay outside the maintainer mr-boxington cache.
   KURU_MBX: "0"
 
+# DRAFT: not for merge. This branch only gathers macOS Dolt failure evidence;
+# the quality, native-build and native-platform legs are removed and native
+# tests run on macos-latest only.
 jobs:
-  quality:
-    uses: ./.github/workflows/quality.yml
-    with:
-      ref: ${{ github.sha }}
-      artifact-prefix: ci
-
   native-tests:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # DRAFT: not for merge. macOS 26 only.
+        os: [macos-latest]
     uses: ./.github/workflows/native-tests.yml
     with:
       ref: ${{ github.sha }}
@@ -38,108 +36,10 @@ jobs:
       install: true
       artifact-prefix: ci
 
-  native-build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-    runs-on: ${{ matrix.os }}
-    env:
-      MISE_LOCKED: "1"
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
-      # Native archive and memory tests need only the pinned Rust toolchain.
-      MISE_NO_HOOKS: "1"
-      CARGO_INCREMENTAL: "0"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Select private bundle build inputs
-        shell: bash
-        # Leave the leaf absent so the preparer creates this runner's private ACLs.
-        # Cargo's restored target/ cache must not supply these directory grants.
-        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with:
-          experimental: true
-          version: 2026.9.4
-          install_args: rust
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      # The save-time cleanup keeps only build, .fingerprint and deps in each
-      # profile directory, so the private kuru-test-supervisors snapshot that
-      # kuru-memory:test creates under target/<profile> is never archived.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-bin: false
-          shared-key: native-build-${{ matrix.target }}
-          # Restrict saves to main so PR runs never thrash the shared cache.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build and package native executable
-        env:
-          RELEASE_TARGET: ${{ matrix.target }}
-        run: |
-          mise run //apps/kuru-tui:build:release -- --target "$RELEASE_TARGET"
-          version=$("target/$RELEASE_TARGET/release/kuru" --version)
-          version=${version#kuru }
-          mise run package -- --binary "target/$RELEASE_TARGET/release/kuru" --target "$RELEASE_TARGET" --version "$version"
-          git diff --exit-code --name-only HEAD
-      - name: Verify native Dolt memory
-        run: mise run //packages/kuru-memory:test
-      - name: Verify packaged offline runtime
-        env:
-          KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru
-        run: mise run //apps/kuru-tui:test:embedded-runtime
-
-  native-platform:
-    name: Native platform primitives (Windows)
-    runs-on: windows-latest
-    timeout-minutes: 30
-    env:
-      MISE_LOCKED: "1"
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
-      MISE_NO_HOOKS: "1"
-      CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
-      CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with:
-          experimental: true
-          version: 2026.9.4
-          install_args: rust aqua:taiki-e/cargo-llvm-cov
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - name: Set up platform Rust components
-        run: mise run //packages/kuru-platform:setup
-      - name: Cache platform Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-bin: false
-          shared-key: native-platform-windows
-          # Restrict saves to main so PR runs never thrash the shared cache.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Test native platform primitives and require 90% coverage
-        run: mise run //packages/kuru-platform:coverage
-      - name: Require unchanged dependency locks
-        run: git diff --exit-code -- mise.lock Cargo.lock
-      - name: Upload native platform coverage
-        if: ${{ !cancelled() && (success() || hashFiles('target/kuru-platform-coverage.lcov') != '') }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: coverage-native-platform-windows
-          path: target/kuru-platform-coverage.lcov
-          if-no-files-found: error
-
   ci-gate:
     if: always()
-    needs: [quality, native-tests, native-build, native-platform]
+    # DRAFT: not for merge. Only the retained macOS evidence legs gate.
+    needs: [native-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Require every static and native check

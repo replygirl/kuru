@@ -132,7 +132,7 @@ async fn bounded_frames_and_tail_logs_preserve_shared_protocol_on_windows() -> R
     let mut bytes = vec![b'a'; LOG_LIMIT];
     bytes.extend(vec![b'b'; LOG_LIMIT]);
     let log = Arc::new(Mutex::new(Vec::new()));
-    drain(bytes.as_slice(), log.clone()).await;
+    drain(bytes.as_slice(), log.clone(), LogMirror::default()).await;
     assert_eq!(*log.lock().await, vec![b'b'; LOG_LIMIT]);
     Ok(())
 }
