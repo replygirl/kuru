@@ -707,8 +707,12 @@ their results. Concurrency: the Windows on Arm call adds about 11 jobs at t = 0
 (8 partitions, installation, the engine job and the `native-platform` leg)
 against PR-C's assumed 40-job cap, which already carried 36; task 3.5 measures
 the resulting queueing instead of reducing the Windows partition count now.
-The `ci.yml` callers (the matrix entry and the `native-platform` leg) are
-edited separately.
+The `ci.yml` callers landed separately: `windows-11-arm` in the
+`native-tests` matrix, and a `native-platform` `include` matrix whose
+`mode: behavior` leg on `windows-11-arm` runs the distinct
+`//packages/kuru-platform:test` task under the name
+`Native platform behavior (aarch64-pc-windows-msvc)`, with no coverage tooling
+or upload, while the `mode: coverage` x64 leg keeps the 90% gate.
 
 The mirror is designed against the workflow owner's confirmed post-PR5 and
 post-PR4b shapes (Current state), not the `501ab92d` files: the x64 twin runs on
