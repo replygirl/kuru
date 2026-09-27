@@ -51,9 +51,12 @@ fn required_release_checks_precede_the_only_publication_job() {
     // Without condition overrides, failed, cancelled, or skipped prerequisites
     // prevent their dependent jobs from running under GitHub's default policy.
     for (name, needs) in [
-        ("build", "needs: [plan, bump, verify]"),
+        ("build", "needs: [plan, bump, verify, dolt-windows-arm64]"),
         ("assemble-candidate", "needs: [plan, bump, build, notes]"),
-        ("verify-staged", "needs: [plan, bump, assemble-candidate]"),
+        (
+            "verify-staged",
+            "needs: [plan, bump, assemble-candidate, dolt-windows-arm64]",
+        ),
         ("build-docs", "needs: [bump, assemble-candidate]"),
         ("deploy-docs", "needs: [build-docs, verify-staged]"),
         (
@@ -140,9 +143,82 @@ fn required_release_checks_precede_the_only_publication_job() {
         // Linux release archives keep the documented Ubuntu 24.04 glibc floor.
         "- os: ubuntu-24.04\n            target: x86_64-unknown-linux-gnu\n",
         "- os: ubuntu-24.04-arm\n            target: aarch64-unknown-linux-gnu\n",
+        "- os: windows-latest\n            target: x86_64-pc-windows-msvc\n",
+        "- os: windows-11-arm\n            target: aarch64-pc-windows-msvc\n",
     ] {
         assert!(build.contains(required), "native build lost {required}");
     }
+    // The source-built Windows on Arm engine reaches its legs only through the
+    // one pin-verified bundle-build input, imported before any build.
+    let input = job("dolt-windows-arm64");
+    for required in [
+        "needs: bump",
+        "uses: ./.github/workflows/bundle-build.yml",
+        "ref: ${{ needs.bump.outputs.sha }}",
+    ] {
+        assert!(input.contains(required), "engine input lost {required}");
+    }
+    let imports = |body: &str, before: &str| {
+        let steps = format!("\n{}", body.split("    steps:\n").nth(1).unwrap());
+        let steps: Vec<_> = steps.split("\n      - ").skip(1).collect();
+        let position = |name: &str| {
+            steps
+                .iter()
+                .position(|step| step.starts_with(&format!("name: {name}\n")))
+                .unwrap_or_else(|| panic!("missing step {name}"))
+        };
+        let download = position("Download the Windows arm64 engine input");
+        let import = position("Import the pin-verified Windows arm64 engine");
+        assert!(download < import && import < position(before));
+        for step in [steps[download], steps[import]] {
+            assert!(step.contains("if: matrix.target == 'aarch64-pc-windows-msvc'\n"));
+        }
+        assert!(steps[download].contains(
+            "uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1\n"
+        ));
+        assert!(steps[download].contains("name: ${{ needs.dolt-windows-arm64.outputs.artifact }}"));
+        assert!(steps[import].contains(
+            "mise run //packages/kuru-memory:bundle:prepare -- --target aarch64-pc-windows-msvc --archive $archive --offline"
+        ));
+    };
+    imports(&build, "Build and package native Windows executable");
+    assert!(build.contains("KURU_DOLT_BUNDLE_DIR=$env:RUNNER_TEMP/kuru-bundles-release"));
+    let bundle = fs::read_to_string(root.join(".github/workflows/bundle-build.yml")).unwrap();
+    let bundle_job = |name: &str| {
+        bundle
+            .split_once(&format!("\n  {name}:\n"))
+            .unwrap_or_else(|| panic!("missing bundle job {name}"))
+            .1
+            .lines()
+            .take_while(|line| !line.starts_with("  ") || line.starts_with("    "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // The path-filtered determinism proof and the called input are selected by
+    // the caller's input, never the caller's event, and only the proof cancels.
+    let proof = bundle_job("windows-arm64-engine");
+    let call = bundle_job("windows-arm64-input");
+    assert!(proof.contains("    if: ${{ !inputs.ref }}\n"));
+    assert!(proof.contains("      group: bundle-build-${{ github.ref }}\n"));
+    assert!(proof.contains("--print-pins"));
+    assert!(!bundle.contains("\nconcurrency:"));
+    for required in [
+        "    if: ${{ inputs.ref }}\n",
+        "ref: ${{ inputs.ref }}",
+        "uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+        "key: bundle-input-${{ env.BUILT_TARGET }}-${{ steps.pin.outputs.sha256 }}-",
+        "name: Verify restored bytes against the pin",
+        "mise run //packages/kuru-memory:bundle:build -- \\",
+        "name: Verify built bytes against the pin",
+        "if: steps.restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'",
+        "uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+        "printf 'artifact=bundle-input-%s\\n' \"$BUILT_TARGET\"",
+        "overwrite: true",
+    ] {
+        assert!(call.contains(required), "engine input job lost {required}");
+    }
+    assert!(!call.contains("--print-pins"));
+    assert!(!call.contains("concurrency:"));
 
     let verifier = job("verify-staged");
     // Staged acceptance runs on every supported platform before promotion.
@@ -155,7 +231,7 @@ fn required_release_checks_precede_the_only_publication_job() {
         .unwrap();
     assert_eq!(
         matrix,
-        "          - os: windows-latest\n            target: x86_64-pc-windows-msvc\n          - os: ubuntu-latest\n            target: x86_64-unknown-linux-gnu\n          - os: ubuntu-24.04-arm\n            target: aarch64-unknown-linux-gnu\n          - os: macos-latest\n            target: aarch64-apple-darwin\n"
+        "          - os: windows-latest\n            target: x86_64-pc-windows-msvc\n          - os: windows-11-arm\n            target: aarch64-pc-windows-msvc\n          - os: ubuntu-latest\n            target: x86_64-unknown-linux-gnu\n          - os: ubuntu-24.04-arm\n            target: aarch64-unknown-linux-gnu\n          - os: macos-latest\n            target: aarch64-apple-darwin\n"
     );
     for required in [
         "fail-fast: false",
@@ -165,7 +241,7 @@ fn required_release_checks_precede_the_only_publication_job() {
         "version: 2026.9.4",
         "name: ${{ needs.assemble-candidate.outputs.artifact_name }}",
         "path: candidate",
-        "KURU_STAGED_WINDOWS_ARCHIVE: ${{ github.workspace }}/candidate/dist/kuru-${{ needs.plan.outputs.version }}-x86_64-pc-windows-msvc.zip",
+        "KURU_STAGED_WINDOWS_ARCHIVE: ${{ github.workspace }}/candidate/dist/kuru-${{ needs.plan.outputs.version }}-${{ matrix.target }}.zip",
         "mise run //apps/kuru-tui:verify:staged-windows",
         "RELEASE_ARCHIVE: kuru-${{ needs.plan.outputs.version }}-${{ matrix.target }}.tar.gz",
         "candidate/dist/SHA256SUMS",
@@ -210,6 +286,7 @@ fn required_release_checks_precede_the_only_publication_job() {
             "{name} lost {condition}"
         );
     }
+    imports(&verifier, "Verify the exact staged package");
     let extract = steps[step("Extract the exact staged Unix archive")];
     assert!(extract.find("shasum -a 256 -c").unwrap() < extract.find("tar -xzf").unwrap());
     assert!(
@@ -247,16 +324,22 @@ fn required_release_checks_precede_the_only_publication_job() {
         1
     );
     let published = job("verify-published-windows");
+    // Each Windows target verifies its own public download on its native runner.
+    assert!(published.contains(
+        "        include:\n          - os: windows-latest\n            target: x86_64-pc-windows-msvc\n          - os: windows-11-arm\n            target: aarch64-pc-windows-msvc\n    runs-on: ${{ matrix.os }}\n"
+    ));
     for required in [
         "needs: [plan, bump, publish]",
-        "runs-on: windows-latest",
+        "fail-fast: false",
         "contents: read",
         "ref: ${{ needs.bump.outputs.sha }}",
         "RELEASE_VERSION: ${{ needs.plan.outputs.version }}",
         "RELEASE_SHA: ${{ needs.bump.outputs.sha }}",
-        "KURU_PUBLISHED_WINDOWS_RECEIPT: ${{ runner.temp }}/published-windows-receipt.json",
+        "KURU_PUBLISHED_TARGET: ${{ matrix.target }}",
+        "KURU_PUBLISHED_WINDOWS_RECEIPT: ${{ runner.temp }}/published-windows-${{ matrix.target }}-receipt.json",
         "mise run //packages/kuru-delivery:verify:published-windows",
-        "path: ${{ runner.temp }}/published-windows-receipt.json",
+        "name: published-windows-${{ matrix.target }}-${{ needs.plan.outputs.version }}-${{ github.run_attempt }}",
+        "path: ${{ runner.temp }}/published-windows-${{ matrix.target }}-receipt.json",
         "if-no-files-found: error",
     ] {
         assert!(published.contains(required), "missing {required}");

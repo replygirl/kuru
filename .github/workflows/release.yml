@@ -253,8 +253,16 @@ jobs:
       ref: ${{ needs.bump.outputs.sha }}
       artifact-prefix: validation-verify
 
+  # The Windows on Arm engine is built from source, never downloaded: its legs
+  # import this pin-verified input, and bundle:prepare checks the pin again.
+  dolt-windows-arm64:
+    needs: bump
+    uses: ./.github/workflows/bundle-build.yml
+    with:
+      ref: ${{ needs.bump.outputs.sha }}
+
   build:
-    needs: [plan, bump, verify]
+    needs: [plan, bump, verify, dolt-windows-arm64]
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
       # Archive jobs do not write Git commits or need repository-hook setup.
@@ -273,6 +281,8 @@ jobs:
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -286,6 +296,24 @@ jobs:
           install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
+      - name: Select private bundle build inputs
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        # Leave the leaf absent so the preparer creates this runner's private ACLs.
+        run: Add-Content -LiteralPath $env:GITHUB_ENV "KURU_DOLT_BUNDLE_DIR=$env:RUNNER_TEMP/kuru-bundles-release"
+      - name: Download the Windows arm64 engine input
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.dolt-windows-arm64.outputs.artifact }}
+          path: ${{ runner.temp }}/bundle-input
+      - name: Import the pin-verified Windows arm64 engine
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'bundle-input/dolt-windows-arm64.zip'
+          mise run //packages/kuru-memory:bundle:prepare -- --target aarch64-pc-windows-msvc --archive $archive --offline
+          if ($LASTEXITCODE -ne 0) { throw 'Windows arm64 engine import failed' }
       - name: Build and package native executable
         if: runner.os != 'Windows'
         env:
@@ -424,13 +452,15 @@ jobs:
   verify-staged:
     # Every leg must pass: jobs that need this matrix wait for all of its legs.
     name: Verify staged release (${{ matrix.target }})
-    needs: [plan, bump, assemble-candidate]
+    needs: [plan, bump, assemble-candidate, dolt-windows-arm64]
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
@@ -487,10 +517,23 @@ jobs:
           KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.temp }}/kuru-staged/kuru
           GITHUB_TOKEN: ${{ github.token }}
         run: mise run //packages/kuru-delivery:test:previous-release-update
+      - name: Download the Windows arm64 engine input
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.dolt-windows-arm64.outputs.artifact }}
+          path: ${{ runner.temp }}/bundle-input
+      - name: Import the pin-verified Windows arm64 engine
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'bundle-input/dolt-windows-arm64.zip'
+          mise run //packages/kuru-memory:bundle:prepare -- --target aarch64-pc-windows-msvc --archive $archive --offline
+          if ($LASTEXITCODE -ne 0) { throw 'Windows arm64 engine import failed' }
       - name: Verify the exact staged package
         if: runner.os == 'Windows'
         env:
-          KURU_STAGED_WINDOWS_ARCHIVE: ${{ github.workspace }}/candidate/dist/kuru-${{ needs.plan.outputs.version }}-x86_64-pc-windows-msvc.zip
+          KURU_STAGED_WINDOWS_ARCHIVE: ${{ github.workspace }}/candidate/dist/kuru-${{ needs.plan.outputs.version }}-${{ matrix.target }}.zip
           # The task re-runs previous-release update acceptance; the token
           # authenticates only its release listing on api.github.com.
           GITHUB_TOKEN: ${{ github.token }}
@@ -591,9 +634,17 @@ jobs:
         run: mise run release:tool -- publish --version "$RELEASE_VERSION" --sha "$RELEASE_SHA" --directory dist --notes RELEASE_NOTES.md
 
   verify-published-windows:
-    name: Verify published Windows download
+    name: Verify published Windows download (${{ matrix.target }})
     needs: [plan, bump, publish]
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -617,11 +668,12 @@ jobs:
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
           RELEASE_SHA: ${{ needs.bump.outputs.sha }}
           RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          KURU_PUBLISHED_WINDOWS_RECEIPT: ${{ runner.temp }}/published-windows-receipt.json
+          KURU_PUBLISHED_TARGET: ${{ matrix.target }}
+          KURU_PUBLISHED_WINDOWS_RECEIPT: ${{ runner.temp }}/published-windows-${{ matrix.target }}-receipt.json
         run: mise run //packages/kuru-delivery:verify:published-windows
       - name: Retain public-download verification evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: published-windows-${{ needs.plan.outputs.version }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/published-windows-receipt.json
+          name: published-windows-${{ matrix.target }}-${{ needs.plan.outputs.version }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/published-windows-${{ matrix.target }}-receipt.json
           if-no-files-found: error

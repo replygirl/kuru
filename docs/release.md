@@ -312,7 +312,7 @@ conversation and durable reopen with the bundled engine. It verifies the runner'
 own Windows target: the optional `KURU_PUBLISHED_TARGET` must equal the native
 host target, and the installed executable's PE machine must match it. Its
 cleanup-confirmed receipt records that target and PE machine and is retained as
-the `published-windows-<version>-<attempt>` Actions artifact.
+the `published-windows-<target>-<version>-<attempt>` Actions artifact.
 
 This job has read-only repository permissions and no publication credentials.
 A failed download or runtime check makes the release run fail visibly, while the

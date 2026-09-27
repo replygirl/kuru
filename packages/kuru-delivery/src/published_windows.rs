@@ -1252,16 +1252,6 @@ mod tests {
         }
     }
 
-    // Mirrors the Windows on Arm entry the phase-3 catalog change adds; use
-    // targets::find("aarch64-pc-windows-msvc") once that entry exists.
-    const WINDOWS_ARM64: targets::Target = targets::Target {
-        triple: "aarch64-pc-windows-msvc",
-        os: "windows",
-        arch: "aarch64",
-        executable: "kuru.exe",
-        format: targets::ArchiveFormat::Zip,
-    };
-
     fn pe_image(machine: u16) -> Vec<u8> {
         let mut image = vec![0; 0x100];
         image[..2].copy_from_slice(b"MZ");
@@ -1299,20 +1289,32 @@ mod tests {
                 .contains("not a Windows release target")
         );
         assert!(checked_target(Some("x86_64-pc-windows-gnu"), x64).is_err());
+        // Windows on Arm verifies its own target and never the emulated x64 one.
+        let arm64 = "aarch64-pc-windows-msvc";
+        assert_eq!(checked_target(None, arm64).unwrap().triple, arm64);
+        assert_eq!(checked_target(Some(arm64), arm64).unwrap().triple, arm64);
+        assert!(
+            checked_target(Some(x64), arm64)
+                .unwrap_err()
+                .to_string()
+                .contains("differs from this runner's native target aarch64-pc-windows-msvc")
+        );
+        assert!(checked_target(Some(arm64), x64).is_err());
     }
 
     #[test]
     fn installed_image_pe_machine_must_match_the_target() {
         let x64 = targets::find("x86_64-pc-windows-msvc").unwrap();
+        let arm64 = targets::find("aarch64-pc-windows-msvc").unwrap();
         assert_eq!(expected_machine(x64).unwrap(), (0x8664, "AMD64"));
-        assert_eq!(expected_machine(&WINDOWS_ARM64).unwrap(), (0xaa64, "ARM64"));
+        assert_eq!(expected_machine(arm64).unwrap(), (0xaa64, "ARM64"));
         assert!(expected_machine(targets::find("aarch64-apple-darwin").unwrap()).is_err());
         assert_eq!(
             require_machine(&pe_image(0x8664), x64, "fixture").unwrap(),
             "AMD64"
         );
         assert_eq!(
-            require_machine(&pe_image(0xaa64), &WINDOWS_ARM64, "fixture").unwrap(),
+            require_machine(&pe_image(0xaa64), arm64, "fixture").unwrap(),
             "ARM64"
         );
         let wrong = require_machine(&pe_image(0xaa64), x64, "fixture")
@@ -1322,7 +1324,7 @@ mod tests {
             wrong.contains("0xaa64 differs from x86_64-pc-windows-msvc"),
             "{wrong}"
         );
-        assert!(require_machine(&pe_image(0x8664), &WINDOWS_ARM64, "fixture").is_err());
+        assert!(require_machine(&pe_image(0x8664), arm64, "fixture").is_err());
     }
 
     #[test]

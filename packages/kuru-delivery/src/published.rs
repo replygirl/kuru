@@ -719,8 +719,8 @@ mod tests {
 
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
     /// A catalog target that no fixture release publishes, standing in for a
-    /// newly added target such as `aarch64-pc-windows-msvc`, which joins the
-    /// catalog only together with its release legs.
+    /// newly added target such as `aarch64-pc-windows-msvc`, whose evidence
+    /// line is checked directly below.
     const NEW_TARGET: &str = "aarch64-unknown-linux-gnu";
 
     fn listed(tag: &str, draft: bool, prerelease: bool) -> PublishedRelease {
@@ -982,7 +982,8 @@ mod tests {
     fn previous_release_assets_are_named_per_target() {
         for target in crate::targets::CATALOG {
             let (core, support) = target_assets("0.9.0", target.triple).unwrap();
-            let extension = if target.triple == WINDOWS_TARGET {
+            // Both Windows targets ship ZIP archives; every other target tar.gz.
+            let extension = if target.triple.ends_with("-pc-windows-msvc") {
                 "zip"
             } else {
                 "tar.gz"
