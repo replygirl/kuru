@@ -186,7 +186,7 @@ Package-scoped work uses native mise addresses, for example
 `mise run //packages/kuru-core:test`. Keep root tasks as aggregates or forwards.
 Run the relevant granular checks before committing. hk runs independent static
 format, lint, typecheck, tooling, cospec, cospec-managed and docs steps
-concurrently before a push; coverage and its line gates are enforced in CI,
+concurrently before a push; coverage and its 90% line gate are enforced in CI,
 not in hooks. CI gives static categories separate Ubuntu jobs and runs native
 behavior, installation and updates on their supported platforms. Updating from
 any installed release must remain possible and succeed; as a floor under that
@@ -197,11 +197,7 @@ Keep these scheduling units explicit instead of invoking
 `check` from hooks or workflows. The optional local `mise run check` aggregate
 uses the same task dependencies. Coverage already runs the behavioral suite; do
 not require an ordinary test pass before repeating it under instrumentation.
-Preserve the 90% workspace line coverage gate: `mise run coverage` enforces
-cargo-llvm-cov's `--fail-under-lines 90`. CI's merged per-OS gate instead
-requires 91% of unique instrumented lines, an interim margin over that summary
-metric until the merge recombines per-instantiation line sets; see
-[development](docs/development.md). Lower neither threshold.
+Preserve the 90% workspace line coverage gate.
 Documentation builds and link/content checks are required; keep private
 verification records and local evidence outside the published app directory.
 Do not exclude application modules or

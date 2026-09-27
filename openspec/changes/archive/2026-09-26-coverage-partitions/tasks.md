@@ -13,7 +13,7 @@
 ## 3. T3 Ubuntu merge with receipt agreement
 
 - [x] 3.1 Add the partition LCOV export to the instrumented shard (`llvm-cov report --failure-mode any --lcov`, profile limits checked first) and `coverage/lcov.rs` normalization of `SF:` paths; verify with verification 3.1 normalization cases
-- [x] 3.2 Add `coverage/merge.rs` (artifact layout, latest attempt per index, exact entries and hashes, field-by-field agreement, OS-label/target consistency, disjoint and complete lists, ledger re-validation) and the LCOV union and 90% gate written through a temp file; verify with verification 2.1, 2.2 and 3.1
+- [x] 3.2 Add `coverage/merge.rs` (artifact layout, latest attempt per index, exact entries and hashes, field-by-field agreement, OS-label/target consistency, disjoint and complete lists, ledger re-validation) and the LCOV union and the 90% gate by cargo-llvm-cov's exact summary metric (design D4a) written through a temp file; verify with verification 2.1, 2.2 and 3.1
 - [x] 3.3 Replace `coverage collect` with `coverage merge` in `main.rs`, `orchestrate.rs` and `mise.toml` (`coverage:merge` without bundle depends); verify the orchestrator fake-host tests for merge sequencing and that the task builds and runs without a prepared bundle
 
 ## 4. T4 Seeded dependency cache
@@ -26,7 +26,7 @@
 
 - [x] 5.1 Add `coverage shard --uninstrumented` (scope-bound inventory, no `show-env`, prefetch into the fresh target, `mode: uninstrumented`) and the `test:partition` task with `KURU_TEST_SUPERVISOR_PREPARED=1`; verify with verification 5.1
 - [x] 5.2 Move the arm64 `kuru-memory` suite from `native-build` into a `native-memory` partition matrix (3) plus an uninstrumented Ubuntu merge in `ci.yml`, and add both to `ci-gate`; verify with verification 5.2
-- [ ] 5.2b Windows `bundle:verify-native-build` half of scope item (4): not done in this change. It is left unchanged in the Windows install job, and design D9 (options a, b, c) is an open lead decision tracked as the `windows-verify-native-build-partitions` follow-on in `blocking-changes.md`
+- [x] 5.2b Windows `bundle:verify-native-build` half of scope item (4): closed by the lead's decision of 2026-09-27, design D9 option (a). It stays unchanged in the Windows install job, off the coverage path; it has no test inventory to partition, and no follow-on change is needed
 - [x] 5.3 Require `KURU_COVERAGE_PACKAGES` for an uninstrumented merge and refuse any receipt whose scope differs from it; pass `kuru-memory` to the arm64 merge and pin it in `release_workflow.rs`; verify with `merge::tests::uninstrumented_partitions_must_build_the_configured_scope` and the orchestrator input tests
 
 ## 6. T6 Workflows and shard counts
@@ -40,7 +40,7 @@
 
 ## 8. T8 Documentation
 
-- [x] 8.1 Update `docs/development.md`: partition topology and counts, the agreement rule stated as "N independent shard builds agreeing rather than a separate rebuild", per-OS 90% gates on the merged LCOV, hand-run partition and merge instructions, the seed cache and its eviction behaviour, the uninstrumented arm64 memory partitions and the ledgers; re-read `AGENTS.md` and record whether any line changes; verify `mise run docs:check` passes. Recorded: the page also states that the merged gate counts unique instrumented lines (union of `DA` records) and why cargo-llvm-cov's summary reads about 0.7 points lower; the page now leads with the fact that the merged gate's metric differs from `--fail-under-lines 90`, names both figures per OS, states which metric each gate enforces, and says the reconciliation awaits the lead (design D4a). `AGENTS.md` is unchanged pending that decision
+- [x] 8.1 Update `docs/development.md`: partition topology and counts, the agreement rule stated as "N independent shard builds agreeing rather than a separate rebuild", per-OS 90% gates on the merged LCOV, hand-run partition and merge instructions, the seed cache and its eviction behaviour, the uninstrumented arm64 memory partitions and the ledgers; re-read `AGENTS.md` and record whether any line changes; verify `mise run docs:check` passes. Recorded: the page describes the partition topology, the receipt agreement and that the merge enforces its line gate once per OS; the gate's metric is design D4a, the lead's choice on 2026-09-27 of cargo-llvm-cov's summary metric reproduced exactly at 90%. `AGENTS.md` is unchanged from `main`: its 90% line-gate wording stands
 
 ## 9. M Measurement and hosted acceptance
 

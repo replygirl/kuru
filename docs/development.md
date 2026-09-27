@@ -74,27 +74,10 @@ disjoint and whose union equals the recorded `--list` output. Any mismatch or
 missing receipt fails before any report exists, so there is never a partial
 LCOV.
 
-The merged per-OS gate does not use the metric of `--fail-under-lines 90`.
 The merge unions the partitions' line records, which must cover the same files
-and lines, and requires 91% of unique instrumented source lines (the union of
-the partitions' `DA` records) once per OS. cargo-llvm-cov's summary, which
-`mise run coverage` enforces locally with `--fail-under-lines 90`, counts each
-function-instantiation group's lines separately and cannot be recombined from
-partition LCOV. On the same tests it reads 0.67 to 0.75 points lower than the
-unique-line figure: on `main`'s green run of the previous topology it was
-93.88% against 94.62% (ubuntu-latest), 93.88% against 94.63% (macos-latest)
-and 92.57% against 93.24% (windows-latest), and locally 94.33% against 95.01%.
-The 91% threshold is an interim margin over that empirical per-OS difference,
-not an equivalence: at the largest measured difference it corresponds to about
-90.25% by the summary metric, so the CI bar stays at or above the local 90%
-gate. The difference is measured, not bounded, and a change that shifts it can
-move the effective bar. The durable follow-on is for each partition to export
-per-instantiation mapped and covered line sets that the merge unions and checks
-against llvm-cov's own totals, failing closed on any mismatch, at which point
-the merged gate can return to 90% of the summary metric (see the
-`coverage-partitions` design). Because each partition exports
-its own LCOV, merging on Ubuntu needs no macOS or Windows runner and no
-instrumented objects.
+and lines, writes that OS's LCOV and enforces its line gate once per OS.
+Because each partition exports its own LCOV, merging on Ubuntu needs no macOS
+or Windows runner and no instrumented objects.
 
 The partition runner stops test executables at a deadline derived from the job's
 `timeout-minutes`, less a fixed evidence reserve, and checks it before every
@@ -199,11 +182,11 @@ bridge before any downloaded application can be trusted.
 | `mise run lint` | All-target Clippy with warnings as errors |
 | `mise run typecheck` | Rust compilation checks for all targets/features on the host |
 | `mise run test` | Workspace behavioral and protocol tests |
-| `mise run coverage` | Run the behavioral suite under LLVM instrumentation, minimum 90% workspace line coverage by cargo-llvm-cov's summary (`--fail-under-lines 90`) |
+| `mise run coverage` | Run the behavioral suite under LLVM instrumentation, minimum 90% workspace line coverage |
 | `mise run test:install` | Native archive tests and, on macOS/Linux, real Bash bootstrap tests |
 | `mise run //packages/kuru-delivery:test` | Delivery contracts, including native PowerShell bootstrap/update fixtures on Windows |
 | `mise run //packages/kuru-delivery:coverage:shard` | One fail-closed CI coverage partition, configured by `KURU_COVERAGE_*` ([by hand](#running-a-coverage-partition-by-hand)) |
-| `mise run //packages/kuru-delivery:coverage:merge` | Require agreeing receipts from every partition of one OS and, when instrumented, enforce 91% of unique instrumented lines in its merged report |
+| `mise run //packages/kuru-delivery:coverage:merge` | Require agreeing receipts from every partition of one OS and, when instrumented, enforce the line gate on its merged report |
 | `mise run //packages/kuru-delivery:test:partition` | One uninstrumented checked partition of the `KURU_COVERAGE_PACKAGES` test suite (CI arm64 memory) |
 | `mise run //apps/kuru-tui:test:embedded-runtime` | Package, install, update and reopen actual Kuru with cold offline memory |
 | `mise run //packages/kuru-delivery:test:previous-release-update` | [Previous published release's updater](release.md#previous-release-update-acceptance) installs `KURU_UPDATE_CANDIDATE_BINARY`; optional `GITHUB_TOKEN` |

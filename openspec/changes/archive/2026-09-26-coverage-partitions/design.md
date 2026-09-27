@@ -71,15 +71,14 @@ profiles stay on the runner. Every partition runs `--list` for every executable,
 per OS) downloads `<prefix>-coverage-<os>-partition-*` with one step. Diagnostics are renamed
 `<prefix>-coverage-diagnostics-<os>-…` so that pattern cannot match them. The merge takes each index's latest attempt
 no later than the run attempt and applies the spec's agreement, completeness and LCOV-identity checks. It unions DA and
-FNDA counts, recomputes LF/LH, enforces unique hit `DA` lines / unique instrumented `DA` lines ≥ 0.91 (D4a; cargo-llvm-cov's
-per-instantiation summary cannot be recombined from partition LCOV and reads about 0.7 points lower), and writes a temp file that it renames only after
-passing. It does not compare the Ubuntu host's `identity()`, which says nothing about another OS. Instead it requires
+FNDA counts, recomputes LF/LH, enforces 90% by cargo-llvm-cov's summary metric, reproduced exactly from
+per-instantiation line sets (D4a), and writes a temp file that it renames only after passing. It does not compare the Ubuntu host's `identity()`, which says nothing about another OS. Instead it requires
 `target_os`/`target` consistent with the label and `source` equal to the expected commit. Rejected: (a) uploading
 instrumented executables for an off-OS `llvm-cov report`, which needs cross-object reading plus path remapping,
 unsupported by cargo-llvm-cov, and large artifacts; (b) keeping a same-OS rebuild collect, which keeps 291-585 s on
 the critical path and a macOS slot; (c) a build-once job, which adds a serial build and saves no wall clock.
 
-**D4a. Gate metric (interim: option (ii), 91% of unique lines; option (iii) is the durable follow-on).** The brief asks the merge to enforce
+**D4a. Gate metric (option (iii), the exact summary metric at 90%; the lead's decision of 2026-09-27).** The brief asks the merge to enforce
 `--fail-under-lines 90` once per OS; #111's collect did so through cargo-llvm-cov. The merge cannot, because
 cargo-llvm-cov's summary is a sum over function-instantiation groups (each group counts the most mapped and the
 most covered lines of any of its instantiations), and partition LCOV carries only file-level `DA`
@@ -101,12 +100,14 @@ partition covers it. Cost: a new module of roughly 400-600 lines plus fixtures;
 (iv) upload one partition's instrumented objects and run `llvm-cov report --fail-under-lines 90` on Ubuntu over
 every partition's `.profdata`, which is rejected option (a) above (cross-object reading, path remapping, multi-GB
 artifacts).
-Chosen for this change, pending the lead's confirmation: (ii). `LINE_GATE_PERCENT` is 91, a margin over an
-empirical per-OS delta rather than an equivalence: at the largest measured delta (0.75) it corresponds to about 90.25%
-by the summary metric, so the CI bar stays at or above the local 90% gate. The delta is measured, not bounded, so a
-change that shifts it can move the effective bar. Option (iii) is the durable follow-on, after which the merged gate
-can return to 90% of the summary metric. If the lead instead accepts (i), that decision must be recorded in AGENTS.md's
-coverage-gate wording in the same change that lowers the constant.
+Decision (the lead, 2026-09-27): option (iii), implemented in this change before it merges, not as a follow-on.
+The merged per-OS gate stays 90% by cargo-llvm-cov's summary metric, reproduced exactly: the merge unions covered
+line sets per instantiation and sums each instantiation group's maximum. Each partition's reproduction is
+self-checked against that partition's own `cargo llvm-cov report --summary-only` totals (group-max semantics, the
+figure `--fail-under-lines` enforces), rather than per file against LCOV `LF`/`LH`, and fails closed on any
+mismatch. Option (ii), 91% of unique instrumented lines as an interim margin, was implemented earlier on this branch
+and is superseded; the exact metric replaces it. Option (i) was not taken, and AGENTS.md's 90% line-gate wording
+is unchanged from `main`.
 
 **D5. Seeded dependency cache with an orchestrator-owned allow-list.** `prepare` becomes: fresh target and state →
 `show-env` → `cargo metadata --no-deps` → **seed import** → `cargo test --no-run`. Import moves (or copies across
@@ -152,11 +153,11 @@ counts. The workflow passes the cache-hit outputs as `KURU_COVERAGE_*_CACHE` env
 The merge prints a per-partition table and uploads `merge-summary.json`. Only a malformed ledger that the partition
 itself wrote can fail a job.
 
-**D9. `bundle:verify-native-build` stays in the Windows install job (open lead decision; scope item (4) for Windows is
-not delivered by this change).** It is three offline `cargo build -p kuru
---release` checks of the memory build-script boundary. It has no libtest inventory, so the lead's "run it through
-uninstrumented partitions" has no referent. Options for the lead, none implemented: (a) leave it (recommended; it sits
-in the install job, not the coverage path); (b) give it its own parallel Windows job with its own release build;
+**D9. `bundle:verify-native-build` stays in the Windows install job (the lead's decision (a) of 2026-09-27).** It
+is three offline `cargo build -p kuru --release` checks of the memory build-script boundary. It has no libtest
+inventory, so the lead's "run it through uninstrumented partitions" has no referent. The lead chose (a) on
+2026-09-27: it stays unchanged in the Windows install job, off the coverage path, and scope item (4) for Windows
+needs no follow-on. The options were: (a) leave it (recommended; it sits in the install job, not the coverage path); (b) give it its own parallel Windows job with its own release build;
 (c) ask kuru-memory's owner whether the valid-archive build can be `-p kuru-memory`.
 
 **D10. PR6b table coordination.** `EXCLUDED_ARTIFACTS: [(host target, artifact, reason); 0]` is consumed now. An
@@ -193,9 +194,9 @@ spawns a budget-sized chunk.
   Each partition's LCOV is computed against the binaries that produced its profiles. M runs an equivalence drill by hand on
   one machine and SHA: all partitions' raw profiles fed to one rebuilt `llvm-cov report` (the #111 collect recipe)
   and the DA-merge of their LCOVs must give identical DA sets and LF/LH.
-- [Own threshold arithmetic replaces `--fail-under-lines`, on a different metric] → D4a puts the metric to the lead
-  with measured deltas. The same drill compares the merge's totals with the rebuilt report's `DA` export and
-  cargo-llvm-cov's summary. Branch records are refused, and no percentage is averaged.
+- [Own threshold arithmetic replaces `--fail-under-lines`, on a different metric] → D4a records the lead's choice of
+  the exact summary metric, self-checked against each partition's `--summary-only` totals. The same drill compares
+  the merge's totals with the rebuilt report's `DA` export and cargo-llvm-cov's summary. Branch records are refused, and no percentage is averaged.
 - [Count-balanced hash assignment is uneven in time (largest single test 145 s on Windows)] → M records max/mean
   partition test wall per OS. Duration bins are a follow-on using the same pure function with a committed weights
   file.

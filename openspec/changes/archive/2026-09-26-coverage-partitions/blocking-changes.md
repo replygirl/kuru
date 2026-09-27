@@ -27,13 +27,11 @@ None.
 
 Tracked here because this change is archived; each needs its own cospec change before implementation.
 
-- [ ] `coverage-instantiation-gate` — design D4a option (iii). Each partition exports per-instantiation mapped and
-  covered line sets from `llvm-cov export`, self-checked per file against llvm-cov's own `LF`/`LH` and failing
-  closed on any mismatch; the merge unions covered sets per instantiation and takes each group's maximum, so the
-  merged per-OS gate reproduces cargo-llvm-cov's `--fail-under-lines 90` exactly and `LINE_GATE_PERCENT` returns to
-  90 of that metric. Until then the merged gate is option (ii), 91% of unique instrumented lines, an interim margin
-  over a measured (0.67-0.75 point), not bounded, difference; AGENTS.md and `docs/development.md` state this. The
-  lead's confirmation of (ii) as the interim is requested on PR #118 and is not recorded here.
-- [ ] `windows-verify-native-build-partitions` — design D9, the Windows `bundle:verify-native-build` half of scope
-  item (4) (task 5.2b). Open lead decision among (a) leave it in the Windows install job, (b) its own parallel
-  Windows job, (c) a `-p kuru-memory` valid-archive build agreed with kuru-memory's owner.
+- [x] `coverage-instantiation-gate` — design D4a option (iii). Not a follow-on: the lead chose it on 2026-09-27 for
+  this change, implemented on PR #118 before it merges. The merge reproduces cargo-llvm-cov's summary metric exactly
+  from per-instantiation covered line sets, self-checked against each partition's own
+  `cargo llvm-cov report --summary-only` totals and failing closed on any mismatch, and keeps the 90% gate by that
+  metric. Option (ii), the interim 91% of unique instrumented lines, is superseded.
+- [x] `windows-verify-native-build-partitions` — design D9, the Windows `bundle:verify-native-build` half of scope
+  item (4) (task 5.2b). Closed by the lead's decision (a) of 2026-09-27: it stays in the Windows install job, so no
+  follow-on change is needed.

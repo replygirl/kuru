@@ -27,7 +27,8 @@ fail-closed evidence.
   source, toolchain, profile environment and inventory hash, and every executable's assigned test sets are pairwise
   disjoint with a union equal to its `--list` output. Any mismatch or missing receipt fails the merge before any
   report exists. The merge then unions the LCOV line records, writes that OS's LCOV and enforces at least 90% line
-  coverage once per OS. **BREAKING (CI contract):** the fail-closed check is now N independent partition builds that
+  coverage once per OS by cargo-llvm-cov's summary metric, reproduced exactly from per-instantiation line sets
+  (design D4a). **BREAKING (CI contract):** the fail-closed check is now N independent partition builds that
   agree with each other. The merge job does not rebuild the inventory. This is an explicit lead decision recorded in
   the design.
 - Seeded dependency cache. A partition still creates a fresh target at one fixed per-job path. Before its first
@@ -39,7 +40,7 @@ fail-closed evidence.
   receipts, completeness and agreement checks, with no instrumentation. It runs the Linux arm64 `kuru-memory` suite
   in partitions with its own Ubuntu merge. `native-build` keeps the release build, packaging and the embedded-runtime
   check. Windows `bundle:verify-native-build` stays where it is. It runs three offline `cargo build` checks and has no
-  test inventory to partition. The design lists the lead's options.
+  test inventory to partition. The lead chose to leave it in the Windows install job (design D9, option (a)).
 - Shard counts: Ubuntu 8, macOS 4 (four partitions plus the install job fill the five-job macOS cap; the merge no
   longer uses a macOS slot), Windows 8 and arm64 memory 3. The design gives the arithmetic.
 - Ledgers: the runner ledger records per-executable start and finish timestamps, invocations and profile counts. A
