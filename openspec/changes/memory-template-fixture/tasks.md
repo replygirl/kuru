@@ -108,6 +108,21 @@
   kuru-tui 93.83%, kuru-connectors 94.90%, kuru-core 96.45%, kuru-platform
   88.28%, kuru-archive 98.29%, kuru-delivery 84.64%; every package other than
   kuru-memory is line-for-line identical to the baseline.
+- Per-file check inside kuru-memory: `store.rs` 10,032 to 10,063 covered lines
+  (95.71% to 95.72%), `facade.rs` 4,714/5,140 to 4,714/5,145 (5 new gated lines),
+  `test_support.rs` 89.43% to 91.54%, new `test_support/template.rs` 94.02%.
+  `service.rs` went from 2,790 to 2,787 covered lines (91.63% to 91.53%): lines
+  4041, 4042 and 4045 are the retry body of the idle-service owner-lock wait in a
+  service test that opens caller-owned directories, not `temporary()`. The owner
+  released its lock before the first poll in this run; no cold path lost coverage.
+  In kuru-platform the summary shows `fs.rs` one line lower and `unix.rs` one
+  higher (package total unchanged); a per-line lcov diff of `fs.rs` finds no
+  line covered before that is uncovered after.
+- Static chain: `mise run format:code ::: lint:rust ::: typecheck ::: lint:tooling
+  ::: cospec:validate ::: cospec:managed:check ::: docs:check` exit 0 on the
+  committed tree.
+- Pending CI: Windows verification (1.4) and per-binary CI timings for the
+  `kuru_runtime` lib, `kuru_memory` lib and `kuru-tui` on each native OS (1.5).
 - Not yet observed: 1.4 and 1.5 need native CI on the pushed PR head, and 6.3
   archives only after them. The Windows template path (native process spawn in
   the two-process test, DACL-checked copies, external lifecycle root) was not
