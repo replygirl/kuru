@@ -645,25 +645,44 @@ further change). PR6a's `Bundle build` workflow (`bundle-build.yml`) runs only o
 path-filtered pull requests and dispatch, builds twice for determinism (the
 two-build job ran in 8m49s on run 36272281338) and uploads
 `bundle-build-aarch64-pc-windows-msvc` with a 30-day retention; it is
-determinism evidence, not a source other workflows can depend on. This change therefore owns the hand-off: each workflow that runs an
-arm64 leg gains one `ubuntu-latest` job, `dolt-windows-arm64`, that runs
-`//packages/kuru-memory:setup:build-tools` and a single
-`//packages/kuru-memory:bundle:build -- --target aarch64-pc-windows-msvc`
-without `--print-pins` (so the build must reproduce the committed pins or fail
-with both digests), and uploads `dolt-windows-arm64.zip` as the workflow
-artifact `bundle-input-aarch64-pc-windows-msvc`. Arm64 legs `needs` it, download
-it with the SHA-pinned `actions/download-artifact`, and import it with
-`bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline`
-into their own runner-created private `KURU_DOLT_BUNDLE_DIR` before any build.
-The trust anchor is the committed manifest pin, which the import re-verifies;
-the artifact is transport only. In `native-tests.yml` the job runs only when
-`inputs.os` is `windows-11-arm`, so x64 and Unix calls are unchanged and the
-job is parameterized by OS rather than restructuring shared jobs. Reusing
-`bundle-build.yml` through `workflow_call` was rejected: it is path-filtered
-determinism evidence with a two-build job and a 30-day artifact, not a
-dependency every run can call; the single build's cost is measured in task 3.5. Restoring a previously verified archive from
-`actions/cache` keyed on the pinned `archive_sha256` is an allowed optimization
-decided with the task 3.5 timings, since the import verifies the pin either way.
+determinism evidence, not a source other workflows can depend on. This change
+therefore owns the hand-off, in the shape the PR6a owner approved on
+2026-09-26 (which supersedes this section's earlier per-workflow build jobs and
+its rejection of `workflow_call`): one implementation, a `workflow_call` job
+(`windows-arm64-input`) in `bundle-build.yml`, selected by its required `ref`
+input rather than the caller's event. The path-filtered pull-request trigger
+keeps the two-build determinism proof (its job-level concurrency now cancels
+only that proof, so a caller on the same ref is never cancelled); the call path
+reads the committed pin (failing when it is unpinned), restores
+`actions/cache` (SHA-pinned) keyed on the pinned `archive_sha256`, the target
+and the hash of the recipe and toolchain inputs that trigger the proof,
+verifies restored bytes against the pin and skips the build on a match, and
+otherwise runs one `//packages/kuru-memory:setup:build-tools` and
+`bundle:build -- --target aarch64-pc-windows-msvc` without `--print-pins`,
+failing closed unless the rebuilt size and SHA-256 equal the pin. Only main
+saves the cache, as for the Cargo caches (#114), and only after verification.
+It uploads `dolt-windows-arm64.zip` as the workflow artifact
+`bundle-input-aarch64-pc-windows-msvc`, exposed as the workflow output
+`artifact`. Each workflow with an arm64 leg calls it as a `dolt-windows-arm64`
+job; arm64 legs `needs` it, download it with the SHA-pinned
+`actions/download-artifact`, and import it with `bundle:prepare --target
+aarch64-pc-windows-msvc --archive <file> --offline` into their own
+runner-created private `KURU_DOLT_BUNDLE_DIR` before any build. The trust
+anchor stays the committed manifest pin, which the import re-verifies; the
+artifact and the cache are transport only. The single build's cost is measured
+in task 3.5.
+
+Delivery split (orchestrator sequencing after the workflow owner's review of
+this section): task 3.4 lands now as the catalog entry plus the `release.yml`
+legs and the `bundle-build.yml` call job, since `release_workflow.rs` asserts
+that the catalog and the release matrices agree. The `ci.yml` `native-platform`
+arm64 leg and the `native-tests.yml` shard, collect, install and gate wiring
+are delivered afterwards on the workflow owner's per-test partition shape
+(PR-C, #118: per-test partitions, an uninstrumented receipts mode and an
+`ubuntu-latest` merge job with per-OS gating), calling the same
+`bundle-build.yml` job for the import. The rows below that name the post-PR4b
+shard and collect jobs and the rewritten `native-gate` describe the intent;
+their exact jobs follow PR-C once it merges.
 
 The mirror is designed against the workflow owner's confirmed post-PR5 and
 post-PR4b shapes (Current state), not the `501ab92d` files: the x64 twin runs on
@@ -700,8 +719,8 @@ bootstrap is trusted on that assumption.
 | post-PR4b per-OS collect job | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; download patterns `<prefix>-coverage-<inputs.os>-<shard>-attempt-*` so the two Windows OS calls never cross-contaminate; os-qualified upload; the collector requires every receipt to share one host triple | `native-gate` |
 | PR5 per-OS install/update job (today's `windows-install` plus `test:previous-release-update`) | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; rust-cache key per os; the same arm64 engine import step; tasks generalized per D3; `test:previous-release-update` with `KURU_UPDATE_CANDIDATE_BINARY` at #108's documented `.exe` path, `GITHUB_TOKEN` from CI and network on exactly as PR5 sets them for `windows-latest`; until a release carries `aarch64-pc-windows-msvc` the leg passes on D5's `no predecessor for aarch64-pc-windows-msvc: ...` branch | `native-gate` |
 | `native-gate` (rewritten by PR5 around shard, collect and install) | same job | the rewritten gate recognizes `windows-11-arm` alongside `windows-latest` for its shard, collect and install checks, keeps the Unix labels on the uniform path, and fails any other Windows label with the label in the message (fail-closed allowlist); `release_workflow.rs`'s gate test (today `native_workflow_gate_rejects_incomplete_windows_results`, which extracts the gate script from the live `native-tests.yml`) gains the `windows-11-arm` accept case, each arm64 reject case and an unknown-label reject case in the same commit, with the `windows-latest` cases unchanged; exact script and test names pending the PR5 notice | itself |
-| `release.yml build` Windows leg | add `{os: windows-11-arm, target: aarch64-pc-windows-msvc}` | already keyed on `matrix.target`/`runner.os`; `needs` gains this change's release-scoped `dolt-windows-arm64` job (the pin-verifying `bundle:build` above, checked out at `needs.bump.outputs.sha`), and the asserted `needs` literal in `release_workflow.rs` (post-PR5, without `verify-tests`) changes with it; the artifact download and offline import steps carry `if: matrix.target == 'aarch64-pc-windows-msvc'` (`build` is the one job allowed step conditions) | `assemble-candidate` validates against the catalog, so D1 lands in the same commit |
-| `verify-staged` (PR5 three-OS matrix) | fourth leg `{windows-11-arm, aarch64-pc-windows-msvc}` mirroring the `windows-latest` mise-route leg (`verify:staged-windows`), not the interim Unix leg | `runs-on: ${{ matrix.os }}`; `KURU_STAGED_WINDOWS_ARCHIVE: .../kuru-<version>-${{ matrix.target }}.zip`; the predecessor rule runs inside the task (D5); the Windows leg's step-condition rules follow whatever PR5 asserts for the matrix | `deploy-docs` and `publish` need `verify-staged`, so a failing arm64 leg blocks both; `release_workflow.rs` expectations move with the matrix |
+| `release.yml build` Windows leg | add `{os: windows-11-arm, target: aarch64-pc-windows-msvc}` | already keyed on `matrix.target`/`runner.os`; `needs` gains the `dolt-windows-arm64` job that calls `bundle-build.yml` with `ref: ${{ needs.bump.outputs.sha }}`, and the asserted `needs` literal in `release_workflow.rs` changes with it; the private `KURU_DOLT_BUNDLE_DIR` selection, artifact download and offline import steps carry `if: matrix.target == 'aarch64-pc-windows-msvc'` and precede the Windows build (`build` and `verify-staged` are the jobs allowed step conditions) | `assemble-candidate` validates against the catalog, so D1 lands in the same commit |
+| `verify-staged` (PR5 three-OS matrix) | fourth leg `{windows-11-arm, aarch64-pc-windows-msvc}` mirroring the `windows-latest` mise-route leg (`verify:staged-windows`), not the interim Unix leg | `runs-on: ${{ matrix.os }}`; `needs` gains `dolt-windows-arm64`; the same arm64-conditioned download and import steps into the job's existing private `KURU_DOLT_BUNDLE_DIR` precede `verify:staged-windows`, which compiles the acceptance test and stays the job's last step; `KURU_STAGED_WINDOWS_ARCHIVE: .../kuru-<version>-${{ matrix.target }}.zip`; the predecessor rule runs inside the task (D5) | `deploy-docs` and `publish` need `verify-staged`, so a failing arm64 leg blocks both; `release_workflow.rs` expectations move with the matrix |
 | `verify-published-windows` (unchanged by PR5) | arm64 twin: matrix over `{windows-latest, x86_64-pc-windows-msvc}` and `{windows-11-arm, aarch64-pc-windows-msvc}` | `runs-on`, `KURU_PUBLISHED_TARGET`, receipt `published-windows-<target>-receipt.json`, artifact `published-windows-<target>-<version>-<attempt>`; stays the file's final step (asserted) | none; post-publication |
 
 Caveats carried into the tasks: after PR5, `release.yml` makes no
@@ -825,9 +844,10 @@ notices. `windows-11-arm` GitHub-hosted runners (image `20260920.174.1` with
 Visual Studio 2022 or, after the actions/runner-images#14602 migration completes
 by 2026-09-30, `20260920.164.1` with Visual Studio 2026; 4 vCPU in public
 repositories; zstd 1.5.7 installed) run the native jobs; `ubuntu-latest` runs
-this change's `dolt-windows-arm64` job, a single pin-verifying build with PR6a's
-recipe and tasks, and hands the archive over as a workflow artifact that each
-arm64 job imports offline into its own runner-created private
+the `bundle-build.yml` call job that each workflow's `dolt-windows-arm64` job
+invokes: a pin-verified cache restore or a single pin-verifying build with
+PR6a's recipe and tasks, handing the archive over as a workflow artifact that
+each arm64 job imports offline into its own runner-created private
 `KURU_DOLT_BUNDLE_DIR` (D8).
 No job binds a network listener beyond the existing loopback mise fixture in
 staged acceptance; no new secret is introduced, and the only token used is
@@ -875,9 +895,10 @@ tools; `dumpbin` is a build-time acceptance dependency only.
   `{stem}/bin/`, `{stem}/bin/{executable_name}`, `{stem}/LICENSES`, then one
   `{stem}/<notice.name>` per declared notice. The `"unpinned"` sentinel and
   `null` byte counts are rejected by the verifiers (D6). PR6a supplies no
-  consumer artifact: this change's `dolt-windows-arm64` job builds the archive
-  with a single pin-verifying `bundle:build` on `ubuntu-latest`, uploads it as
-  `bundle-input-aarch64-pc-windows-msvc`, and each arm64 job imports it with
+  consumer artifact: this change's `bundle-build.yml` call job, invoked as each
+  workflow's `dolt-windows-arm64` job, restores a pin-verified cached archive or
+  builds it once with a pin-verifying `bundle:build` on `ubuntu-latest`,
+  uploads it as `bundle-input-aarch64-pc-windows-msvc`, and each arm64 job imports it with
   `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline`,
   which re-verifies the committed pin (D8).
 - Coverage receipts: shard receipts may carry `excluded_artifacts`
