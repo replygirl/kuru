@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
-  "version": "2.3.4",
-  "upstream_commit": "373301a56c9a82d42baadb7ee28c8892267268ca",
+  "version": "2.3.5",
+  "upstream_commit": "ad65af6cc937d10fa3c88e2041fed4325968b581",
   "assets": [
     {
       "target": "aarch64-apple-darwin",
@@ -9,12 +9,12 @@
       "format": "tar.gz",
       "executable_name": "dolt",
       "provenance": "upstream",
-      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.4/dolt-darwin-arm64.tar.gz",
-      "compressed_bytes": 41193931,
-      "archive_sha256": "b5363a00a2b4b4b70208cb3d15df52707a222ae43fc5432a993f6803ac3ae2bc",
-      "expanded_bytes": 120248320,
-      "executable_bytes": 119028850,
-      "executable_sha256": "075872531bdd02ab3b4e8b2c0c6139ec13771f2487a0ef377e659c3b14319035",
+      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.5/dolt-darwin-arm64.tar.gz",
+      "compressed_bytes": 41170527,
+      "archive_sha256": "ad1e3770accbb7e8a059069228ead22bdf6f2759131212451b44f518661b8e40",
+      "expanded_bytes": 120217600,
+      "executable_bytes": 118995762,
+      "executable_sha256": "c10dde6445c4e0a24335ccdc053640ad6427b2181235df243689c02aadf3c8bc",
       "license_bytes": 1212811,
       "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386"
     },
@@ -24,12 +24,12 @@
       "format": "tar.gz",
       "executable_name": "dolt",
       "provenance": "upstream",
-      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.4/dolt-linux-arm64.tar.gz",
-      "compressed_bytes": 40808149,
-      "archive_sha256": "2f13a8f04a924072d679f1d50b65aa34b5b98afcc333d901653404eaba188639",
-      "expanded_bytes": 120238080,
-      "executable_bytes": 119017248,
-      "executable_sha256": "4fcaefe0f9056a5cb93f6d743f6f55dd8d204c5e2e8e26e759bc3c2def3e9dca",
+      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.5/dolt-linux-arm64.tar.gz",
+      "compressed_bytes": 40789338,
+      "archive_sha256": "9ce70fc81e50139e97758ef7f4dc57e9583e4e5ef05ad75d7535c30caa161387",
+      "expanded_bytes": 120176640,
+      "executable_bytes": 118951424,
+      "executable_sha256": "3f3317655fa5178ec19d7c0845163fc6abaa7ee79848d1b3e9d9e77a4ea1be74",
       "license_bytes": 1212811,
       "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386"
     },
@@ -39,12 +39,12 @@
       "format": "tar.gz",
       "executable_name": "dolt",
       "provenance": "upstream",
-      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.4/dolt-linux-amd64.tar.gz",
-      "compressed_bytes": 44044220,
-      "archive_sha256": "7764aab68f11a218d3bdd6bfe7ccefeab22356a7472a0a3112046d0f2613cea3",
-      "expanded_bytes": 128081920,
-      "executable_bytes": 126865544,
-      "executable_sha256": "9fe729ccca1fe53bde0225c7b2903d8d264997f71539f9e1e544498a311eb4bd",
+      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.5/dolt-linux-amd64.tar.gz",
+      "compressed_bytes": 44023897,
+      "archive_sha256": "c49d4c3e004cf1581ba0d4a00c5023a26f84eb2ec15d5fe876eed36d5343f463",
+      "expanded_bytes": 128040960,
+      "executable_bytes": 126824296,
+      "executable_sha256": "e80cfb6e5952d67751c70bb15f1f0bf4d028767326aca9fce2fc15a1501b3e53",
       "license_bytes": 1212811,
       "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386"
     },
@@ -54,12 +54,12 @@
       "format": "zip",
       "executable_name": "dolt.exe",
       "provenance": "upstream",
-      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.4/dolt-windows-amd64.zip",
-      "compressed_bytes": 40107668,
-      "archive_sha256": "ed793e03a860409878ef54d4f9014d93752eba4c3c243a2d0337c39951331d73",
-      "expanded_bytes": 130533771,
-      "executable_bytes": 129320960,
-      "executable_sha256": "34bf2b15f21cfed3a7b3e3b86d57212bb53fa549d35aa37a505e3406eafc48d7",
+      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.5/dolt-windows-amd64.zip",
+      "compressed_bytes": 40082076,
+      "archive_sha256": "55e9c2053496d29a1c1b23e6ad689779da41518f8cc257f531c5b20f37621c5d",
+      "expanded_bytes": 130492811,
+      "executable_bytes": 129280000,
+      "executable_sha256": "0c979911ed88228fff36211cd732e2fd25aee231e4cde2e4870be4ed65f2ad37",
       "license_bytes": 1212811,
       "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386"
     },
@@ -78,8 +78,8 @@
         "sources": {
           "dolt": {
             "module": "github.com/dolthub/dolt/go",
-            "version": "v0.40.5-0.20260914203517-373301a56c9a",
-            "sum": "h1:WMNOjziFJIYbehzGJ1lPkWk9rcN/RcjmVpVfKoept0U="
+            "version": "v0.40.5-0.20260916160725-ad65af6cc937",
+            "sum": "h1:Gr3gztfxO/h2IDl3N6rVmzVDbt5wYe2FKF0tWWMIlGU="
           },
           "icu": {
             "version": "78.3",
@@ -103,11 +103,11 @@
           }
         }
       },
-      "compressed_bytes": 40767983,
-      "archive_sha256": "79616d69733154c24931e9b68c17d8fd356b8549e4ee0887bf9fda6eddf405e2",
-      "expanded_bytes": 119557233,
-      "executable_bytes": 118289408,
-      "executable_sha256": "36819d26dba27f2e6a0c83de7081937622ce77552b8a66f8f7e04419fabc2d48",
+      "compressed_bytes": 40777701,
+      "archive_sha256": "8fc1b7516358f71e4473c42bf058e3db189aef028539b128ea31239a637344f3",
+      "expanded_bytes": 119567473,
+      "executable_bytes": 118299648,
+      "executable_sha256": "6b9c19db6ab936af82d3770e3a0c976cee5ff9dd5a9376ebb4643d5750c85fb3",
       "license_bytes": 1212811,
       "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386",
       "notices": [

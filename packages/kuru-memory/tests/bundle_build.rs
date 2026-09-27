@@ -276,7 +276,7 @@ fn standard_macos_temporary_directory_aliases_remain_valid_build_locations() {
         .unwrap();
     let manifest_path = temporary.path().join("manifest.json");
     fs::write(&manifest_path, MANIFEST).unwrap();
-    assert_eq!(Manifest::load(&manifest_path).unwrap().version, "2.3.4");
+    assert_eq!(Manifest::load(&manifest_path).unwrap().version, "2.3.5");
     let nested = temporary.path().join("nested-link");
     symlink(temporary.path(), &nested).unwrap();
     assert!(Manifest::load(&nested.join("manifest.json")).is_err());
@@ -386,24 +386,24 @@ fn committed_manifest_is_schema_two_with_one_pinned_built_entry() {
     assert_eq!(asset.notices()[1].from, NoticeSource::LlvmMingw);
     assert_eq!(
         build.sources.dolt.version,
-        "v0.40.5-0.20260914203517-373301a56c9a"
+        "v0.40.5-0.20260916160725-ad65af6cc937"
     );
     assert_eq!(
         build.sources.dolt.sum,
-        "h1:WMNOjziFJIYbehzGJ1lPkWk9rcN/RcjmVpVfKoept0U="
+        "h1:Gr3gztfxO/h2IDl3N6rVmzVDbt5wYe2FKF0tWWMIlGU="
     );
-    // The Dolt 2.3.4 pins observed by the reproducible linux-x64 CI build.
+    // The Dolt 2.3.5 pins observed by the reproducible linux-x64 CI build.
     let pins = asset.pins().unwrap();
-    assert_eq!(pins.compressed_bytes, 40_767_983);
+    assert_eq!(pins.compressed_bytes, 40_777_701);
     assert_eq!(
         pins.archive_sha256,
-        "79616d69733154c24931e9b68c17d8fd356b8549e4ee0887bf9fda6eddf405e2"
+        "8fc1b7516358f71e4473c42bf058e3db189aef028539b128ea31239a637344f3"
     );
-    assert_eq!(asset.expanded_bytes, Some(119_557_233));
-    assert_eq!(asset.executable_bytes, Some(118_289_408));
+    assert_eq!(asset.expanded_bytes, Some(119_567_473));
+    assert_eq!(asset.executable_bytes, Some(118_299_648));
     assert_eq!(
         asset.executable_sha256,
-        "36819d26dba27f2e6a0c83de7081937622ce77552b8a66f8f7e04419fabc2d48"
+        "6b9c19db6ab936af82d3770e3a0c976cee5ff9dd5a9376ebb4643d5750c85fb3"
     );
     assert!(asset.notices().iter().all(|notice| notice.bytes.is_some()));
     let generated = manifest.catalog("aarch64-pc-windows-msvc").unwrap();
