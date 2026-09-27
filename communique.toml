@@ -32,7 +32,8 @@ or product name in the release title; Communiqué supplies the version heading.
 
 [defaults]
 # Anthropic's official compatibility API omits the thinking blocks that
-# Communiqué 1.3.5's native Anthropic parser cannot yet deserialize.
+# Communiqué 1.3.5's native Anthropic parser could not deserialize. 1.4.0 adds
+# native thinking-block replay; keep this route until that path is verified.
 model = "claude-sonnet-5"
 provider = "openai"
 base_url = "https://api.anthropic.com/v1"

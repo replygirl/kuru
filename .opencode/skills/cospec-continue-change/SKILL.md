@@ -1,11 +1,11 @@
 ---
 name: cospec-continue-change
-description: Resume a partially-built change and finish its remaining artifacts.
+description: Resume a partially-built change and finish its remaining artifacts. Also use when the user says "cospec continue" or "openspec continue".
 license: MIT
 compatibility: Requires the cospec CLI (@aligned-team/cospec).
 metadata:
   author: cospec
-  generatedBy: cospec@0.7.1
+  generatedBy: cospec@0.8.2
   contentHash: sha256:5452d22965cf5216dc800c0fa52cb756ea521831e1b6063dba1a29ef3dea3daa
 ---
 

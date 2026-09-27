@@ -1,11 +1,11 @@
 ---
 name: cospec-verify-change
-description: Dress-rehearse a change before archiving — validate strictly, walk the verification ledger, and name the hard archive gates.
+description: Dress-rehearse a change before archiving — validate strictly, walk the verification ledger, and name the hard archive gates. Also use when the user says "cospec verify" or "openspec verify".
 license: MIT
 compatibility: Requires the cospec CLI (@aligned-team/cospec).
 metadata:
   author: cospec
-  generatedBy: cospec@0.7.1
+  generatedBy: cospec@0.8.2
   contentHash: sha256:cdade0649f06209a03f7cb00c0e513f72a40638b5b5b14357a6a69585d93d54e
 ---
 
