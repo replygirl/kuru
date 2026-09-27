@@ -49,10 +49,26 @@ async fn cli_refuses_offline_builds_before_any_work() {
 #[tokio::test]
 async fn cli_requires_print_pins_on_a_non_authoritative_host() {
     // Elsewhere the override passes the host gate but cannot verify the
-    // committed arm64 pins, so the build stops before any work. linux-x64 is
-    // the authoritative build host, where a verifying build would start the
-    // real recipe; the injected-host unit tests cover this refusal there.
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    // committed arm64 pins, so the build stops before any work. While those
+    // pins await their first CI build, the unpinned refusal comes first
+    // instead. linux-x64 is the authoritative build host, where a verifying
+    // build would start the real recipe; the injected-host unit tests cover
+    // this refusal there.
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../../kuru-memory/support/dolt-assets.json")).unwrap();
+    let pinned = manifest["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|asset| asset["target"] == "aarch64-pc-windows-msvc")
+        .unwrap()["archive_sha256"]
+        != "unpinned";
+    let refusal = if pinned {
+        "a non-authoritative host cannot verify pins; pass --print-pins"
+    } else {
+        "is built from source and not yet pinned"
+    };
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) || !pinned {
         let (success, stderr) = run(|command| {
             command
                 .args(["--target", "aarch64-pc-windows-msvc"])
@@ -60,10 +76,7 @@ async fn cli_requires_print_pins_on_a_non_authoritative_host() {
         })
         .await;
         assert!(!success);
-        assert!(
-            stderr.contains("a non-authoritative host cannot verify pins; pass --print-pins"),
-            "{stderr}"
-        );
+        assert!(stderr.contains(refusal), "{stderr}");
     }
     let (success, stderr) = run(|command| {
         command

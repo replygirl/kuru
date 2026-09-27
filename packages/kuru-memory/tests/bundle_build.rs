@@ -276,7 +276,7 @@ fn standard_macos_temporary_directory_aliases_remain_valid_build_locations() {
         .unwrap();
     let manifest_path = temporary.path().join("manifest.json");
     fs::write(&manifest_path, MANIFEST).unwrap();
-    assert_eq!(Manifest::load(&manifest_path).unwrap().version, "2.3.3");
+    assert_eq!(Manifest::load(&manifest_path).unwrap().version, "2.3.4");
     let nested = temporary.path().join("nested-link");
     symlink(temporary.path(), &nested).unwrap();
     assert!(Manifest::load(&nested.join("manifest.json")).is_err());
@@ -359,7 +359,7 @@ fn pinned_built(valid: &Value) -> Value {
 }
 
 #[test]
-fn committed_manifest_is_schema_two_with_one_pinned_built_entry() {
+fn committed_manifest_is_schema_two_with_one_round_one_built_entry() {
     let manifest = Manifest::parse(MANIFEST).unwrap();
     assert_eq!(manifest.schema_version, 2);
     let built: Vec<_> = manifest
@@ -384,16 +384,30 @@ fn committed_manifest_is_schema_two_with_one_pinned_built_entry() {
     );
     assert_eq!(asset.notices()[0].from, NoticeSource::Icu);
     assert_eq!(asset.notices()[1].from, NoticeSource::LlvmMingw);
-    // The pins observed by the reproducible linux-x64 CI build.
-    let pins = asset.pins().unwrap();
-    assert_eq!(pins.compressed_bytes, 40_719_091);
     assert_eq!(
-        pins.archive_sha256,
-        "d179856838fd8d1d2105c29c4948cc7eb3c8b78ca7e387be4cdfc854ea3bb73c"
+        build.sources.dolt.version,
+        "v0.40.5-0.20260914203517-373301a56c9a"
     );
+    assert_eq!(
+        build.sources.dolt.sum,
+        "h1:WMNOjziFJIYbehzGJ1lPkWk9rcN/RcjmVpVfKoept0U="
+    );
+    // Round one of the Dolt 2.3.4 pins: the archive awaits the reproducible
+    // linux-x64 CI build, while the Dolt-independent notices stay pinned.
+    let instruction = "not yet pinned: run `mise run //packages/kuru-memory:bundle:build -- --target aarch64-pc-windows-msvc --print-pins` on linux-x64 and commit the pins";
+    assert!(asset.pins().unwrap_err().to_string().contains(instruction));
+    assert!(asset.compressed_bytes.is_none() && asset.expanded_bytes.is_none());
+    assert!(asset.executable_bytes.is_none());
     assert!(asset.notices().iter().all(|notice| notice.bytes.is_some()));
-    let generated = manifest.catalog("aarch64-pc-windows-msvc").unwrap();
-    assert!(generated.contains("pub(crate) const ASSETS: [Asset<'static>; 5]"));
+    assert!(
+        manifest
+            .catalog("aarch64-pc-windows-msvc")
+            .unwrap_err()
+            .to_string()
+            .contains(instruction)
+    );
+    let generated = manifest.catalog("x86_64-pc-windows-msvc").unwrap();
+    assert!(generated.contains("pub(crate) const ASSETS: [Asset<'static>; 4]"));
     for upstream in manifest
         .assets
         .iter()
