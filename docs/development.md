@@ -167,6 +167,16 @@ before they run, so concurrent Cargo builds cannot replace their executable.
 Coverage explicitly clears that snapshot opt-in and does not compile an unused
 ordinary supervisor first.
 
+`MemoryStore::temporary()` copies a pre-migrated template of one cleanly closed
+cold open, then performs the ordinary existing-store open, so each test still
+owns its directory, supervisor and Dolt process. Templates live under
+`target/<profile>/kuru-test-templates`, one per fingerprint of the supervisor,
+schema, engine and schema sources, created and validated under a file lock.
+Copies share the template's instance identity, credentials and migration
+receipts; tests of lifecycle, migration, import or identity use
+`MemoryStore::temporary_cold()`. Old fingerprints are not pruned; `cargo clean`
+removes them.
+
 Ordinary application opens start or attach to the internal per-project memory
 service from the same Kuru executable. The service owns the prepared Dolt child
 and may remain alive for its 30-second idle grace after the last client exits;

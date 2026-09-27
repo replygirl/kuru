@@ -4,7 +4,25 @@
 //! another package is already testing. Ordinary mise test tasks explicitly use
 //! the snapshot prepared before they start. Coverage deliberately does not opt
 //! in: its one workspace build supplies the actual instrumented executable.
+//!
+//! # Temporary stores
+//!
+//! [`MemoryStore::temporary`] is the default isolated store for tests that
+//! only need a current-schema store of their own. It copies a pre-migrated
+//! template (see `template.rs` in this module) and then performs the ordinary
+//! existing-store open, so each test still owns its private directory,
+//! writable open, supervisor and Dolt process. Every copy shares the
+//! template's instance identity, credentials, initial revision and migration
+//! receipts.
+//!
+//! [`MemoryStore::temporary_cold`] performs the complete cold open instead:
+//! a new identity, initialization, every migration, staged validation and
+//! activation. Use it for tests of server, supervisor or process lifecycle,
+//! migration, legacy import or activation, and for any test that compares
+//! instance identity, credentials or migration receipts, or that needs
+//! migrations to run. When in doubt, use the cold constructor.
 pub use crate::files::PrivateTemp as TempDir;
+pub(crate) mod template;
 #[cfg(windows)]
 pub mod windows;
 use crate::{MemoryStore, OpenOptions, PublicTurnRecord, SessionCatalogRecord, files};

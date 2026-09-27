@@ -232,6 +232,9 @@ only verified bundle inputs; the instrumented fixtures provision their engine
 cache, without first compiling or snapshotting an ordinary supervisor. Independent
 checks may overlap, but do not start competing coverage writers or duplicate live
 test suites. Preserve package-owned preparation and Cargo's artifact locking.
+Isolated test stores default to a pre-migrated template copy; lifecycle,
+migration, import, identity and secret tests use the cold constructor (see the
+[development docs](docs/development.md)).
 
 Use conventional commits. Never bypass hk hooks. Do not commit directly to
 main; use a branch and review. Publishing and release tags are external actions
