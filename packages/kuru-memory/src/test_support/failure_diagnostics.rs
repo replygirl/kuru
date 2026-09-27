@@ -186,8 +186,11 @@ fn dolt_live_logs(root: &Path, directory: &Path) -> String {
     text
 }
 
-/// Record a failure bundle and print its path. `kind` is `client-uncertain`
-/// or `service-storage-failed`.
+/// Record a failure bundle. `kind` is `client-uncertain` or
+/// `service-storage-failed`. The bundle path is written into the bundle's
+/// own `summary.txt`, not printed to stderr: this can run inside the TUI
+/// process, where an stderr write corrupts the PTY frame a terminal test
+/// waits on.
 pub(crate) fn record(kind: &str, directory: &Path, operation: &str, error: &anyhow::Error) {
     if let Some(root) = root() {
         record_in(&root, kind, directory, operation, error);
@@ -212,7 +215,8 @@ fn record_in(
     ));
     fs::create_dir_all(&bundle).ok()?;
     let summary = format!(
-        "kind: {kind}\npid: {}\nthread: {thread_name}\nunix_nanos: {}\nexecutable: {:?}\noperation: {operation}\nstore directory: {}\n{}\nerror (display chain): {error:#}\n\nerror (debug):\n{error:?}\n",
+        "kind: {kind}\nbundle: {}\npid: {}\nthread: {thread_name}\nunix_nanos: {}\nexecutable: {:?}\noperation: {operation}\nstore directory: {}\n{}\nerror (display chain): {error:#}\n\nerror (debug):\n{error:?}\n",
+        bundle.display(),
         std::process::id(),
         nanos(),
         std::env::current_exe().ok(),
@@ -229,10 +233,10 @@ fn record_in(
         let tail = &bytes[bytes.len().saturating_sub(OUTPUT_CAP)..];
         let _ = fs::write(bundle.join("server.log.at-record"), tail);
     }
-    eprintln!(
-        "DRAFT failure diagnostics bundle ({kind}): {}",
-        bundle.display()
-    );
+    // Do not eprintln! the bundle path here: this can run inside the TUI
+    // process, and a stderr write corrupts the PTY frame a terminal test is
+    // waiting on. The path is discoverable in the uploaded artifact and is
+    // recorded above in this bundle's own summary.txt.
     // The retained server.log appears only after the supervisor stops. Harvest
     // it if the fixture directory still exists by then.
     let directory = directory.to_owned();
