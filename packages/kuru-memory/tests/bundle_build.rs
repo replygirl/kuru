@@ -359,7 +359,7 @@ fn pinned_built(valid: &Value) -> Value {
 }
 
 #[test]
-fn committed_manifest_is_schema_two_with_one_round_one_built_entry() {
+fn committed_manifest_is_schema_two_with_one_pinned_built_entry() {
     let manifest = Manifest::parse(MANIFEST).unwrap();
     assert_eq!(manifest.schema_version, 2);
     let built: Vec<_> = manifest
@@ -392,22 +392,22 @@ fn committed_manifest_is_schema_two_with_one_round_one_built_entry() {
         build.sources.dolt.sum,
         "h1:Gr3gztfxO/h2IDl3N6rVmzVDbt5wYe2FKF0tWWMIlGU="
     );
-    // Round one of the Dolt 2.3.5 pins: the archive awaits the reproducible
-    // linux-x64 CI build, while the Dolt-independent notices stay pinned.
-    let instruction = "not yet pinned: run `mise run //packages/kuru-memory:bundle:build -- --target aarch64-pc-windows-msvc --print-pins` on linux-x64 and commit the pins";
-    assert!(asset.pins().unwrap_err().to_string().contains(instruction));
-    assert!(asset.compressed_bytes.is_none() && asset.expanded_bytes.is_none());
-    assert!(asset.executable_bytes.is_none());
-    assert!(asset.notices().iter().all(|notice| notice.bytes.is_some()));
-    assert!(
-        manifest
-            .catalog("aarch64-pc-windows-msvc")
-            .unwrap_err()
-            .to_string()
-            .contains(instruction)
+    // The Dolt 2.3.5 pins observed by the reproducible linux-x64 CI build.
+    let pins = asset.pins().unwrap();
+    assert_eq!(pins.compressed_bytes, 40_777_701);
+    assert_eq!(
+        pins.archive_sha256,
+        "8fc1b7516358f71e4473c42bf058e3db189aef028539b128ea31239a637344f3"
     );
-    let generated = manifest.catalog("x86_64-pc-windows-msvc").unwrap();
-    assert!(generated.contains("pub(crate) const ASSETS: [Asset<'static>; 4]"));
+    assert_eq!(asset.expanded_bytes, Some(119_567_473));
+    assert_eq!(asset.executable_bytes, Some(118_299_648));
+    assert_eq!(
+        asset.executable_sha256,
+        "6b9c19db6ab936af82d3770e3a0c976cee5ff9dd5a9376ebb4643d5750c85fb3"
+    );
+    assert!(asset.notices().iter().all(|notice| notice.bytes.is_some()));
+    let generated = manifest.catalog("aarch64-pc-windows-msvc").unwrap();
+    assert!(generated.contains("pub(crate) const ASSETS: [Asset<'static>; 5]"));
     for upstream in manifest
         .assets
         .iter()
