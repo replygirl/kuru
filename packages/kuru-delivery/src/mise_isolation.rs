@@ -21,7 +21,8 @@ pub fn native_processor_architecture() -> &'static str {
     "ARM64"
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+// Only Windows consumes the value; other hosts compile without it.
+#[cfg(all(windows, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
 compile_error!("native_processor_architecture supports only x86_64 and aarch64 hosts");
 
 /// Create empty user, configuration, cache and state roots and return the
@@ -94,6 +95,7 @@ pub fn prepare(root: &Path, project: &Path) -> Result<Vec<(OsString, OsString)>>
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn native_processor_architecture_names_the_compiled_machine() {
         let expected = match std::env::consts::ARCH {

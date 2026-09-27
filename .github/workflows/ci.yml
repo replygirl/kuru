@@ -31,8 +31,10 @@ jobs:
       fail-fast: false
       matrix:
         # Windows on Arm runs its partitions uninstrumented as behavioral
-        # evidence (native-tests.yml selects the mode from PARTITIONS) until a
-        # pinned toolchain carries the fix for rust-lang/rust#150123.
+        # evidence until a pinned toolchain carries the fix for
+        # rust-lang/rust#150123. native-tests.yml selects that mode from the
+        # windows-11-arm label; coverage::PARTITIONS only validates the
+        # label and mode, failing closed on any other combination.
         os: [ubuntu-latest, macos-latest, windows-latest, windows-11-arm]
     uses: ./.github/workflows/native-tests.yml
     with:
