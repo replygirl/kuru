@@ -503,6 +503,31 @@ fn native_workflow_shards_every_os_and_keeps_the_aggregate_fail_closed() {
 }
 
 #[test]
+fn every_rust_cache_step_restricts_saves_to_main() {
+    // Every Swatinem/rust-cache step across the CI, quality and native-tests
+    // workflows must only save from `main`, so PR runs restore the warm
+    // cache instead of thrashing it. A step whose save-if already carries
+    // another condition (e.g. one Windows coverage shard) must combine it
+    // with the main-ref check rather than drop it.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workflows = root.join(".github/workflows");
+    for name in ["ci.yml", "quality.yml", "native-tests.yml"] {
+        let text = fs::read_to_string(workflows.join(name)).unwrap();
+        let steps: Vec<_> = text.split("uses: Swatinem/rust-cache@").skip(1).collect();
+        assert!(!steps.is_empty(), "{name} has no rust-cache steps");
+        for (index, step) in steps.iter().enumerate() {
+            // Each step's own `with:` block ends at the next step (`\n      -
+            // name:`) or the job/file boundary.
+            let block = step.split("\n      - name:").next().unwrap();
+            assert!(
+                block.contains("github.ref == 'refs/heads/main'"),
+                "{name} rust-cache step {index} does not restrict saves to main:\n{block}"
+            );
+        }
+    }
+}
+
+#[test]
 fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os() {
     let workflow = native_workflow();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

@@ -20,7 +20,9 @@ downloading a prebuilt binary.
   - `.github/workflows/native-tests.yml`: `native-coverage`,
     `native-coverage-windows` (combined with its existing
     `matrix.shard == 'connectors-core-platform'` condition),
-    `native-install-windows`
+    `native-install-${{ inputs.os }}` (renamed from `native-install-windows`
+    by main's #110, which also expanded that job to run and cache installs on
+    Linux and macOS, not only Windows)
   - `.github/workflows/ci.yml`: `native-build-${{ matrix.target }}` and
     `native-platform-windows`
   - `.github/workflows/release.yml` calls the same reusable `quality.yml` and
@@ -42,7 +44,8 @@ downloading a prebuilt binary.
 ## Impact
 
 - Jobs: `quality` (lint/typecheck/tooling/docs), `native-tests` (coverage,
-  windows-coverage, windows-install), `native-build` in `ci.yml`, and
+  windows-coverage, install), `native-build` and native-platform primitives in
+  `ci.yml`, and
   everywhere `release.yml` calls those reusable workflows. No job's required
   checks, names, or pass/fail semantics change — only whether a job's
   `rust-cache` step *saves* at the end, and how `cargo-llvm-cov` is installed.
