@@ -38,5 +38,6 @@ provisioning extracts it into a new `2.3.5` cache version directory. Until
 round two lands, the Windows arm64 target cannot be prepared or embedded and
 fails with the documented build instruction; no workflow builds that target
 from the committed manifest in the meantime. The isolation guarantees and the
-uncertain-write fence are unchanged. The existing native install jobs verify
+uncertain-write fence are unchanged. Round two landed in 09694d4b: the Windows arm64 pins are committed and
+the rebuilt archive matches them. The existing native install jobs verify
 the packaged cold offline conversation on every supported OS.
