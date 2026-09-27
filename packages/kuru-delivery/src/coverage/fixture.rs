@@ -274,7 +274,7 @@ pub fn identity(mode: Mode) -> ReceiptIdentity {
 }
 
 /// One file of 20 lines; partition k hits lines k, k + count, ... below 20,
-/// so the union hits 19 of 20 lines (95%) and no partition alone reaches 90%.
+/// so the union hits 19 of 20 lines (95%) and no partition alone reaches the gate.
 pub fn lcov_for(partition: &PartitionScheme) -> String {
     let mut text = String::from("SF:packages/kuru-core/src/lib.rs\nFN:1,_RNvf\n");
     text.push_str(&format!("FNDA:{},_RNvf\n", u32::from(partition.index == 1)));
@@ -295,6 +295,8 @@ pub struct ScriptedLauncher {
     /// Added to the announced count of every selection.
     pub announce_offset: isize,
     pub status: i32,
+    /// The one-based exact selection that exits 101 instead of `status`.
+    pub failing_run: Option<usize>,
     pub stall: bool,
     pub list_error: bool,
     pub run_error: bool,
@@ -345,8 +347,13 @@ impl Launcher for ScriptedLauncher {
             })));
         }
         let selected = launch.args.len() as isize - 1;
+        let status = if self.failing_run == Some(self.runs.len()) {
+            101
+        } else {
+            self.status
+        };
         Ok(Supervision::Exited(
-            exit(self.status),
+            exit(status),
             usize::try_from(selected + self.announce_offset).ok(),
         ))
     }

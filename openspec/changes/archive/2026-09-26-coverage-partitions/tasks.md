@@ -25,7 +25,7 @@
 ## 5. T5 Uninstrumented mode and arm64 wiring
 
 - [x] 5.1 Add `coverage shard --uninstrumented` (scope-bound inventory, no `show-env`, prefetch into the fresh target, `mode: uninstrumented`) and the `test:partition` task with `KURU_TEST_SUPERVISOR_PREPARED=1`; verify with verification 5.1
-- [x] 5.2 Move the arm64 `kuru-memory` suite from `native-build` into a `native-memory` partition matrix (3) plus an uninstrumented Ubuntu merge in `ci.yml`, and add both to `ci-gate`; leave `bundle:verify-native-build` unchanged per design D9; verify with verification 5.2
+- [x] 5.2 Move the arm64 `kuru-memory` suite from `native-build` into a `native-memory` partition matrix (3) plus an uninstrumented Ubuntu merge in `ci.yml`, and add both to `ci-gate`; verify with verification 5.2. Scope item (4)'s Windows `bundle:verify-native-build` half is NOT done: it is left unchanged and design D9 is an open lead decision (options a, b, c), not a completed scope item
 - [x] 5.3 Require `KURU_COVERAGE_PACKAGES` for an uninstrumented merge and refuse any receipt whose scope differs from it; pass `kuru-memory` to the arm64 merge and pin it in `release_workflow.rs`; verify with `merge::tests::uninstrumented_partitions_must_build_the_configured_scope` and the orchestrator input tests
 
 ## 6. T6 Workflows and shard counts

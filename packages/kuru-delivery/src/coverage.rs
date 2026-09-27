@@ -1631,8 +1631,20 @@ async fn dispatch_with<L: Launcher>(
     };
     let chunk_count = chunks.len();
     let mut last = None;
+    // A failing chunk does not stop the executable's remaining chunks, so the
+    // assignment keeps the diagnostics a single `--no-fail-fast` run gave.
+    let mut failed: Option<ExitStatus> = None;
     for (index, names) in chunks.into_iter().enumerate() {
         let Some(remaining) = remaining_until(*deadline)? else {
+            if let Some(status) = failed {
+                eprintln!(
+                    "coverage runner: deadline {deadline} passed before chunk {} of {chunk_count} of {executable} after a failed chunk",
+                    index + 1
+                );
+                record.status_code = status.code();
+                finish_record(&mut record, ledger, target_dir)?;
+                return Ok(Some(status));
+            }
             record.action = plan::DEADLINE.to_owned();
             finish_record(&mut record, ledger, target_dir)?;
             bail!(
@@ -1710,9 +1722,8 @@ async fn dispatch_with<L: Launcher>(
         invocation.status_code = status.code();
         record.invocations.push(invocation);
         if !status.success() {
-            record.status_code = status.code();
-            finish_record(&mut record, ledger, target_dir)?;
-            return Ok(Some(status));
+            failed.get_or_insert(status);
+            continue;
         }
         if announced != Some(names.len()) {
             finish_record(&mut record, ledger, target_dir)?;
@@ -1722,6 +1733,11 @@ async fn dispatch_with<L: Launcher>(
             );
         }
         last = Some(status);
+    }
+    if let Some(status) = failed {
+        record.status_code = status.code();
+        finish_record(&mut record, ledger, target_dir)?;
+        return Ok(Some(status));
     }
     record.success = true;
     record.status_code = Some(0);
@@ -3565,6 +3581,51 @@ mod tests {
                 ) <= partition::COMMAND_LINE_BUDGET
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_failing_chunk_still_runs_the_remaining_chunks() {
+        let workspace = fixture::Workspace::new(Mode::Uninstrumented);
+        let mut launcher = workspace.launcher();
+        let first = workspace
+            .target
+            .join(workspace.runnable()[0].executable.as_deref().unwrap());
+        let names: String = (0..2500)
+            .map(|index| format!("module::with::a::long::path::case_{index:05}: test\n"))
+            .collect();
+        launcher.lists.insert(first, names);
+        launcher.failing_run = Some(1);
+        let partition = PartitionScheme::new(1, 1).unwrap();
+        let ledger = workspace.temp.path().join("ledger.jsonl");
+        workspace
+            .dispatch_all(
+                &mut launcher,
+                &partition,
+                &ledger,
+                &workspace.temp.path().join("d"),
+                &[],
+            )
+            .await
+            .unwrap();
+        let records = plan::read_ledger(&ledger).unwrap();
+        let large = records
+            .iter()
+            .find(|record| record.listed.len() == 2500)
+            .unwrap();
+        let (_, chunks) = large.invocations.split_first().unwrap();
+        assert!(chunks.len() > 2, "{}", chunks.len());
+        assert_eq!(chunks[0].status_code, Some(101));
+        assert!(chunks[1..].iter().all(|chunk| chunk.status_code == Some(0)));
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.names).sum::<usize>(),
+            large.assigned
+        );
+        assert!(!large.success);
+        assert_eq!(large.status_code, Some(101));
+        assert!(
+            plan::validate_run_ledger(&workspace.value, &partition, fixture::HOST, &[], &records)
+                .is_err()
+        );
     }
 
     #[tokio::test]

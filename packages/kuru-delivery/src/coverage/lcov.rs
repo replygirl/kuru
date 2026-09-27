@@ -12,8 +12,15 @@ use std::collections::BTreeMap;
 
 /// Largest LCOV file a partition may export or the merge may read.
 pub const LCOV_LIMIT: u64 = 256 * 1024 * 1024;
-/// The per-OS line gate, in percent.
-pub const LINE_GATE_PERCENT: u64 = 90;
+/// The per-OS line gate, in percent of unique instrumented lines.
+///
+/// This is an interim margin, not an equivalence: on identical tests the
+/// unique-line figure reads 0.67 to 0.75 points above cargo-llvm-cov's
+/// summary, which `mise run coverage` holds to 90%. At 91 the merged gate's
+/// effective bar by that summary metric stays at or above 90% (about 90.25%
+/// at the measured delta) until the merge recombines per-instantiation
+/// line sets itself.
+pub const LINE_GATE_PERCENT: u64 = 91;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FileCoverage {
@@ -487,18 +494,20 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_passes_at_exactly_ninety_percent_and_fails_below() {
+    fn the_gate_passes_at_exactly_ninety_one_percent_and_fails_below() {
         let totals = |found, hit| Totals {
             files: 1,
             lines_found: found,
             lines_hit: hit,
         };
-        assert!(passes_gate(&totals(1000, 900)));
-        assert!(!passes_gate(&totals(1000, 899)));
+        assert_eq!(LINE_GATE_PERCENT, 91);
+        assert!(passes_gate(&totals(1000, 910)));
+        assert!(!passes_gate(&totals(1000, 909)));
+        assert!(!passes_gate(&totals(1000, 900)));
         assert!(passes_gate(&totals(10, 10)));
         assert!(!passes_gate(&totals(0, 0)));
-        assert!(!passes_gate(&totals(100_001, 90_000)));
-        assert_eq!(percent(&totals(1000, 900)), "90.00");
+        assert!(!passes_gate(&totals(100_001, 91_000)));
+        assert_eq!(percent(&totals(1000, 910)), "91.00");
         assert_eq!(percent(&totals(3, 2)), "66.66");
         assert_eq!(percent(&totals(0, 0)), "0.00");
     }

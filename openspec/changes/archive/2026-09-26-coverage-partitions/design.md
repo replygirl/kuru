@@ -71,7 +71,7 @@ profiles stay on the runner. Every partition runs `--list` for every executable,
 per OS) downloads `<prefix>-coverage-<os>-partition-*` with one step. Diagnostics are renamed
 `<prefix>-coverage-diagnostics-<os>-…` so that pattern cannot match them. The merge takes each index's latest attempt
 no later than the run attempt and applies the spec's agreement, completeness and LCOV-identity checks. It unions DA and
-FNDA counts, recomputes LF/LH, enforces unique hit `DA` lines / unique instrumented `DA` lines ≥ 0.90 (cargo-llvm-cov's
+FNDA counts, recomputes LF/LH, enforces unique hit `DA` lines / unique instrumented `DA` lines ≥ 0.91 (D4a; cargo-llvm-cov's
 per-instantiation summary cannot be recombined from partition LCOV and reads about 0.7 points lower), and writes a temp file that it renames only after
 passing. It does not compare the Ubuntu host's `identity()`, which says nothing about another OS. Instead it requires
 `target_os`/`target` consistent with the label and `source` equal to the expected commit. Rejected: (a) uploading
@@ -79,7 +79,7 @@ instrumented executables for an off-OS `llvm-cov report`, which needs cross-obje
 unsupported by cargo-llvm-cov, and large artifacts; (b) keeping a same-OS rebuild collect, which keeps 291-585 s on
 the critical path and a macOS slot; (c) a build-once job, which adds a serial build and saves no wall clock.
 
-**D4a. Gate metric (decision put to the lead; not yet decided).** The brief asks the merge to enforce
+**D4a. Gate metric (interim: option (ii), 91% of unique lines; option (iii) is the durable follow-on).** The brief asks the merge to enforce
 `--fail-under-lines 90` once per OS; #111's collect did so through cargo-llvm-cov. The merge cannot, because
 cargo-llvm-cov's summary is a sum over function-instantiation groups (each group counts the most mapped and the
 most covered lines of any of its instantiations), and partition LCOV carries only file-level `DA`
@@ -87,8 +87,7 @@ lines and per-file `LF`/`LH`, from which that sum cannot be recombined. The merg
 lines, the union of `DA` records. On identical tests that reads higher: 94.62% against 93.88% (ubuntu-latest),
 94.63% against 93.88% (macos-latest) and 93.24% against 92.57% (windows-latest) on `main`'s previous-topology green
 run 36280980681, and 95.01% against 94.33% locally (verification 6.3). So at the same nominal 90% the CI gate is
-0.67-0.75 points easier to pass than `mise run coverage`. The threshold number is unchanged, and this change does not
-choose among the options:
+0.67-0.75 points easier to pass than `mise run coverage`. The options considered were:
 (i) accept the unique-line metric at 90% (effective bar about 89.3% by the summary metric) and record it in AGENTS.md's
 gate wording;
 (ii) keep the metric but raise `LINE_GATE_PERCENT` to 91 (about 90.25% by the summary metric at the measured delta;
@@ -102,8 +101,12 @@ partition covers it. Cost: a new module of roughly 400-600 lines plus fixtures;
 (iv) upload one partition's instrumented objects and run `llvm-cov report --fail-under-lines 90` on Ubuntu over
 every partition's `.profdata`, which is rejected option (a) above (cross-object reading, path remapping, multi-GB
 artifacts).
-Merge of this change waits on the lead's choice. Options (i) and (ii) are one-line changes; (iii) is a follow-on
-of its own.
+Chosen for this change, pending the lead's confirmation: (ii). `LINE_GATE_PERCENT` is 91, a margin over an
+empirical per-OS delta rather than an equivalence: at the largest measured delta (0.75) it corresponds to about 90.25%
+by the summary metric, so the CI bar stays at or above the local 90% gate. The delta is measured, not bounded, so a
+change that shifts it can move the effective bar. Option (iii) is the durable follow-on, after which the merged gate
+can return to 90% of the summary metric. If the lead instead accepts (i), that decision must be recorded in AGENTS.md's
+coverage-gate wording in the same change that lowers the constant.
 
 **D5. Seeded dependency cache with an orchestrator-owned allow-list.** `prepare` becomes: fresh target and state →
 `show-env` → `cargo metadata --no-deps` → **seed import** → `cargo test --no-run`. Import moves (or copies across
@@ -149,7 +152,8 @@ counts. The workflow passes the cache-hit outputs as `KURU_COVERAGE_*_CACHE` env
 The merge prints a per-partition table and uploads `merge-summary.json`. Only a malformed ledger that the partition
 itself wrote can fail a job.
 
-**D9. `bundle:verify-native-build` stays in the Windows install job.** It is three offline `cargo build -p kuru
+**D9. `bundle:verify-native-build` stays in the Windows install job (open lead decision; scope item (4) for Windows is
+not delivered by this change).** It is three offline `cargo build -p kuru
 --release` checks of the memory build-script boundary. It has no libtest inventory, so the lead's "run it through
 uninstrumented partitions" has no referent. Options for the lead, none implemented: (a) leave it (recommended; it sits
 in the install job, not the coverage path); (b) give it its own parallel Windows job with its own release build;

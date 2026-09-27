@@ -7,7 +7,7 @@
 //! file matches its receipt digest; every runner ledger proves its plan; and
 //! each executable's plans are disjoint and complete against its listed
 //! tests. Only then does an instrumented merge union the partitions' LCOV and
-//! enforce the OS's 90% line gate. Any failure leaves no report file.
+//! enforce the OS's 91% unique-line gate. Any failure leaves no report file.
 
 use super::{
     ATTEMPT_DIRECTORY, EXCLUDED_ARTIFACTS, INVENTORY_FILE, JOB_LEDGER_FILE, JSON_LIMIT, LCOV_FILE,
@@ -972,7 +972,7 @@ mod tests {
         let low = Downloaded::new(Mode::Instrumented, 2).await;
         low.replace_lcov(1, &hits);
         low.replace_lcov(2, &hits);
-        low.refuse("line coverage 0.00% (0 of 20 lines) is below 90%");
+        low.refuse("line coverage 0.00% (0 of 20 lines) is below 91%");
         let absolute = Downloaded::new(Mode::Instrumented, 1).await;
         absolute.replace_lcov(1, &lcov.replace("SF:packages", "SF:/abs/packages"));
         absolute.refuse("not a normalized relative path");

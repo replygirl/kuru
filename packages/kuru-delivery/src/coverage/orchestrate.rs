@@ -6,7 +6,7 @@
 //! this partition's tests, exports the partition's LCOV when instrumented and
 //! writes its receipt. `coverage merge` accepts an OS's partitions only when
 //! their receipts agree and their plans are disjoint and complete, then
-//! enforces that OS's 90% line gate on the union of their LCOV.
+//! enforces that OS's 91% unique-line gate on the union of their LCOV.
 //!
 //! Every process this module starts goes through [`Host`], so the sequencing
 //! and each refusal are unit-tested with a fake. The coverage environment from

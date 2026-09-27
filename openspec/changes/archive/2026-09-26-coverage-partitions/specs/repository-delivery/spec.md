@@ -28,7 +28,9 @@ inventory digest, and consistent with the OS label and the expected source commi
 partitions disjoint and complete against its listed tests. Any missing, extra, mismatched or unverifiable receipt
 MUST fail the merge before any report exists. For an instrumented OS, the merge MUST require identical source-file
 and line sets in every partition's normalized LCOV, union their hit counts, write that OS's merged LCOV and enforce
-at least 90% coverage of that OS's unique instrumented source lines (the union of `DA` records). No partition
+at least 91% coverage of that OS's unique instrumented source lines (the union of `DA` records). The 91%
+threshold is an interim margin over the measured per-OS difference between that metric and cargo-llvm-cov's summary,
+not an equivalence, chosen so the effective bar by the summary metric stays at or above 90%. No partition
 percentage may be averaged.
 
 #### Scenario: A partition receipt is missing
@@ -40,7 +42,7 @@ percentage may be averaged.
 - **THEN** the merge fails without merging any coverage.
 
 #### Scenario: Merged coverage is below the gate
-- **WHEN** the union of an instrumented OS's partitions covers less than 90 percent of its lines
+- **WHEN** the union of an instrumented OS's partitions covers less than 91 percent of its unique instrumented lines
 - **THEN** that OS's merge fails, and no other OS's result can satisfy it.
 
 ### Requirement: Evidence-neutral seeded dependency cache
