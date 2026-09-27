@@ -578,6 +578,22 @@ async fn retained_v041_v042_powershell_reader_accepts_the_new_three_member_core(
         .current_dir(fixture.root.path())
         .env_clear()
         .envs(fixture.environment());
+    if *TARGET != "x86_64-pc-windows-msvc" {
+        // The retained readers install x64 only and refuse any host whose
+        // PROCESSOR_ARCHITECTURE is not AMD64 before reading a release, and
+        // Windows on Arm offers no x64 PowerShell host to run them under
+        // emulation. Here they must refuse without touching the installation;
+        // the x64 runner proves they accept the three-member core.
+        let result = fixture.run(&mut command).await;
+        assert!(!result.status.success());
+        assert!(
+            stderr_message(&result).contains("on Windows x64"),
+            "unexpected legacy reader result: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        fixture.unchanged();
+        return;
+    }
     success(&fixture.run(&mut command).await);
     assert_eq!(
         fs::read(fixture.install.join("kuru.exe")).unwrap(),

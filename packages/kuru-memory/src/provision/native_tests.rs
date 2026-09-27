@@ -223,12 +223,21 @@ fn official_windows_archive_decodes_exact_pinned_payloads_on_every_host() {
     decode_prepared_windows_archive("x86_64-pc-windows-msvc");
 }
 
-/// Decode the real prepared archive for a Windows target on any host and
-/// require exactly its pinned payloads. `bundle:test-fixtures` prepares the
-/// upstream x64 archive. The source-built `aarch64-pc-windows-msvc` archive has
-/// no download URL; its live case is enabled where CI imports the pinned build
-/// with `bundle:prepare --archive` (windows-arm64-support task 3.4), and until
-/// then the committed catalog entry is checked at the data level below.
+/// The source-built engine has no download URL. Every Windows on Arm test run
+/// first imports the pinned build with `bundle:prepare --archive`, because the
+/// memory build refuses that target otherwise, so its real archive is present
+/// wherever this compiles; a missing import fails here instead of skipping.
+#[cfg(all(windows, target_arch = "aarch64"))]
+#[test]
+fn source_built_windows_arm64_archive_decodes_exact_pinned_payloads() {
+    decode_prepared_windows_archive("aarch64-pc-windows-msvc");
+}
+
+/// Decode the real prepared archive for a Windows target and require exactly
+/// its pinned payloads. `bundle:test-fixtures` prepares the upstream x64
+/// archive on every host. The source-built `aarch64-pc-windows-msvc` archive is
+/// decoded on Windows on Arm hosts, which import it; elsewhere its committed
+/// catalog entry is checked at the data level below.
 fn decode_prepared_windows_archive(target: &str) {
     let asset = crate::catalog::ASSETS
         .iter()
@@ -252,7 +261,9 @@ fn decode_prepared_windows_archive(target: &str) {
     );
     let archive_path = bundle_dir.join(format!("{}.archive", asset.archive_sha256));
     let (parent, mut file) = files::read(&archive_path, Privacy::Inherited)
-        .expect("prepare the required Windows archive through memory bundle:test-fixtures");
+        .expect(
+            "prepare the required Windows archive through memory bundle:test-fixtures (x64) or bundle:prepare --archive (the built arm64 engine)",
+        );
     assert_eq!(file.metadata().unwrap().len(), asset.compressed_bytes);
     let mut archive = Vec::new();
     (&mut file)
