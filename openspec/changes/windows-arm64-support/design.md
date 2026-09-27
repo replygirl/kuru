@@ -78,7 +78,7 @@ Current state, `main` at `501ab92d` unless noted:
   README last updated 2026-01-16 at image `20260105.41.1`): Rust, mise,
   mise-action, mr-boxington, hk, taplo, actionlint, cargo-llvm-cov, node and
   communique have native arm64 assets; cocogitto and shellcheck are x64-only and
-  run emulated; `github:aligned-team/cospec` 0.7.1 has no arm64 asset (blocker
+  run emulated; `github:aligned-team/cospec` 0.8.2 has no arm64 asset (blocker
   B2). The `windows-11-arm` label is mid-migration (actions/runner-images#14602,
   rolling out 2026-09-21 to 2026-09-30) from image `20260920.174.1` (Visual
   Studio Enterprise 2022 17.14.37710.0) to image `20260920.164.1` (Visual Studio
@@ -531,7 +531,7 @@ download); phase 3 (task 3.9) adds only the arm64-specific release wording.
 | taplo, actionlint, node/npm, communique | native | lock entries |
 | cocogitto 7.0.0 | x64 asset, `windows_arm_emulation: true` in the registry | lock entry to the x64 asset; smoke-test in step zero |
 | shellcheck 0.11.0 | x64 only; not installed on Windows jobs | lock entry to the x64 asset for `MISE_LOCKED=1` completeness |
-| cospec 0.7.1 | no arm64 asset (B2); release assets are `linux-{x64,arm64}[-musl]`, `macos-{x64,arm64}`, `windows-x64.zip`, `SHA256SUMS` | lead decision 1: root `mise.toml` moves the tool to table form with `[tools."github:aligned-team/cospec".platforms] windows-arm64 = { asset_pattern = "cospec-*-windows-x64.zip" }`, and the lock entry is generated from it; step zero runs `cospec --version` under emulation and records it |
+| cospec 0.8.2 (0.7.1 before the rebase onto `58540e0a`) | no arm64 asset (B2); release assets are `linux-{x64,arm64}[-musl]`, `macos-{x64,arm64}`, `windows-x64.zip`, `SHA256SUMS` | lead decision 1: root `mise.toml` moves the tool to table form with `[tools."github:aligned-team/cospec".platforms] windows-arm64 = { asset_pattern = "cospec-*-windows-x64.zip" }`, and the lock entry is generated from it; step zero runs `cospec --version` under emulation and records it |
 
 Lockfiles: root `mise.lock` (hk, shellcheck, actionlint, taplo, cospec,
 mr-boxington), `packages/kuru-delivery/mise.lock` (cocogitto, communique) and
@@ -601,7 +601,7 @@ asset on arm64: drop `github:aligned-team/cospec` from the arm64 jobs'
 ```text
 pub const EXCLUDED_ARTIFACTS: [(&str, &str, &str); 1] = [(
     "aarch64-pc-windows-msvc", "kuru-delivery/cospec_contract",
-    "cospec 0.7.1 publishes no windows-arm64 asset and the x64 asset does not run under emulation; the contract still runs on x64 and Ubuntu",
+    "cospec 0.8.2 publishes no windows-arm64 asset and the x64 asset does not run under emulation; the contract still runs on x64 and Ubuntu",
 )];
 ```
 
@@ -793,7 +793,7 @@ staged acceptance; no new secret is introduced, and the only token used is
 legs), `GITHUB_TOKEN` from CI for the GitHub REST metadata request. Asset
 downloads stay anonymous over HTTPS. Binary versions and architectures: Rust
 1.98.1 `aarch64-pc-windows-msvc`, mise 2026.9.4 native arm64, cargo-llvm-cov
-0.9.1 built from source (instrumented collection subject to rust-lang/rust#150123), cocogitto 7.0.0 and cospec 0.7.1 x64 assets under
+0.9.1 built from source (instrumented collection subject to rust-lang/rust#150123), cocogitto 7.0.0 and cospec 0.8.2 x64 assets under
 emulation, communique 1.3.5 and hk 1.58.1 native arm64, Dolt v2.3.3 built by
 PR6a for windows/arm64. Connection limits and deadlines are unchanged: the
 resolver's 60-second HTTPS client, 64 KiB `SHA256SUMS` bound, 4 MiB metadata
