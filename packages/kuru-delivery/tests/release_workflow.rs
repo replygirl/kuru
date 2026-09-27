@@ -462,7 +462,21 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
         .split("\n  native-build:\n")
         .next()
         .unwrap();
-    assert!(native_tests.contains("os: [ubuntu-latest, macos-latest, windows-latest]"));
+    // Every hosted native-tests label in the partition table is called, and
+    // nothing else; ubuntu-24.04-arm runs its memory partitions in ci.yml.
+    assert!(
+        native_tests.contains(
+            "        os: [ubuntu-latest, macos-latest, windows-latest, windows-11-arm]\n"
+        )
+    );
+    for label in [
+        "ubuntu-latest",
+        "macos-latest",
+        "windows-latest",
+        "windows-11-arm",
+    ] {
+        assert!(os_target(label).is_some(), "{label} is not a hosted label");
+    }
     assert!(native_tests.contains("install: true"));
     for required in [
         "native-gate:",
@@ -1000,6 +1014,62 @@ fn arm64_memory_suite_runs_as_gated_uninstrumented_partitions() {
             .unwrap()
             .starts_with("      - name: Require every memory partition job to have succeeded\n")
     );
+    assert!(ci.contains(
+        "needs: [quality, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
+    ));
+}
+
+#[test]
+fn native_platform_runs_windows_on_arm_as_separately_named_behavioral_evidence() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let job = workflow_job(&ci, "native-platform", "ci-gate");
+    // One job, two legs: the x64 leg keeps the 90% platform gate and Windows
+    // on Arm runs the distinct uninstrumented task under its own name.
+    for required in [
+        "    name: ${{ matrix.mode == 'coverage' && 'Native platform primitives' || 'Native platform behavior' }} (${{ matrix.target }})\n",
+        "    runs-on: ${{ matrix.os }}\n",
+        "      fail-fast: false\n",
+        "        include:\n          - os: windows-latest\n            target: x86_64-pc-windows-msvc\n            mode: coverage\n          - os: windows-11-arm\n            target: aarch64-pc-windows-msvc\n            mode: behavior\n",
+        "      CARGO_BUILD_TARGET: ${{ matrix.target }}\n",
+        "install_args: ${{ matrix.mode == 'coverage' && 'rust aqua:taiki-e/cargo-llvm-cov' || 'rust' }}\n",
+        "shared-key: native-platform-${{ matrix.target }}\n",
+    ] {
+        assert!(job.contains(required), "native-platform lost {required}");
+    }
+    for label in ["windows-latest", "windows-11-arm"] {
+        assert!(os_target(label).is_some(), "{label} is not a hosted label");
+    }
+    let steps = workflow_steps(job);
+    let coverage = named_step(
+        &steps,
+        "Test native platform primitives and require 90% coverage",
+    );
+    assert_eq!(
+        coverage,
+        "name: Test native platform primitives and require 90% coverage\n        if: matrix.mode == 'coverage'\n        run: mise run //packages/kuru-platform:coverage"
+    );
+    // Never the coverage task with instrumentation quietly off.
+    let behavior = named_step(
+        &steps,
+        "Test native platform primitives uninstrumented as behavioral evidence",
+    );
+    assert_eq!(
+        behavior,
+        "name: Test native platform primitives uninstrumented as behavioral evidence\n        if: matrix.mode == 'behavior'\n        run: mise run //packages/kuru-platform:test"
+    );
+    assert!(
+        named_step(&steps, "Set up platform Rust components")
+            .contains("        if: matrix.mode == 'coverage'\n")
+    );
+    let upload = named_step(&steps, "Upload native platform coverage");
+    assert!(upload.contains("        if: ${{ matrix.mode == 'coverage' && !cancelled() && "));
+    assert!(upload.contains("name: coverage-native-platform-${{ matrix.target }}\n"));
+    assert!(
+        named_step(&steps, "Require unchanged dependency locks")
+            .ends_with("run: git diff --exit-code -- mise.lock Cargo.lock")
+    );
+    assert!(!job.contains("KURU_COVERAGE_"));
     assert!(ci.contains(
         "needs: [quality, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
     ));
