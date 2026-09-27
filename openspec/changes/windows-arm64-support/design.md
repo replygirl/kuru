@@ -72,6 +72,13 @@ Current state, `main` at `501ab92d` unless noted:
   OSes for `pull_request`, `merge_group` and main push (`GITHUB_TOKEN` from CI,
   network on, `KURU_UPDATE_CANDIDATE_BINARY` per #108's documented paths); and
   `native-gate` is rewritten around shard, collect and the per-OS install job.
+  (Superseded after phase 2: the workflow owner's PR-C, `coverage-partitions`
+  #118, `98b6b81a`, replaced the five shards, `coverage::SHARDS` and the collect
+  job with hash-assigned per-test `Coverage partition`/`Behavior partition`
+  jobs, one agreement `merge` per OS and the `coverage::PARTITIONS`/`OS_TARGETS`
+  tables, under a 45-minute `timeout-minutes` that `KURU_COVERAGE_JOB_MINUTES`
+  equals; #122, `db25ad31`, made the install job one release build. The
+  delivered arm64 wiring follows that shape; see D8 Part (b) and D11.)
 - Tooling on `windows-11-arm` (design note §7; runner image README
   `actions/runner-images` `images/windows/Windows11-Arm64-Readme.md` at
   `d50c3090b1`, 2026-09-25, which supersedes the `actions/partner-runner-images`
@@ -165,8 +172,8 @@ each is applied:
   Questions).
 - Removing `x86_64-apple-darwin` from the catalog (done by #106) or its
   remaining `mise.lock` `macos-x64` entries.
-- Adding an arm64-only coverage shard, changing `KURU_COVERAGE_JOB_MINUTES`, or
-  tuning runner time budgets before a measured first run.
+- Changing another OS's partition count, `KURU_COVERAGE_JOB_MINUTES` or the
+  45-minute job limit, or tuning runner time budgets before a measured first run.
 - Windows 10 on Arm.
 
 ## Decisions
@@ -626,19 +633,26 @@ pub const EXCLUDED_ARTIFACTS: [(&str, &str, &str); 1] = [(
 
 `write_selection` validates each exclusion against the inventory (the artifact
 must exist, or the exclusion is stale and fails), `runnable_artifacts` omits it
-for the matching host only, and the shard receipt records `excluded_artifacts`
-with the reason so `coverage:windows:collect` and the report show it. Rejected:
-removing the test from the shard's package list (not a named exclusion, and the
-package must stay in `SHARDS`, which is test-bound to the workflow matrix) and
+for the matching host only, and the partition inventory records the exclusion
+with its reason so the merge and the report show it. (Written for the five-shard
+shape; the contingency was never needed, see below.) Rejected:
+removing the test from the package list (not a named exclusion, and every
+workspace package must stay in the partitioned scope) and
 `#[cfg_attr(target_arch = "aarch64", ignore)]` (a silent skip with no receipt).
 
 Lead ruling 5 (kuru-implement-phase2-sep26a, 2026-09-26) accepts this mechanism on one condition: the
 exclusion applies only while the arm64 job actually has no runnable cospec after
 the emulated x64 asset (the `asset_pattern` pin above, lead decision 1) has been
 tried first. If cospec runs there, nothing is excluded and `EXCLUDED_ARTIFACTS`
-carries no arm64 entry. Every arm64 shard receipt records which case applied:
-the `cospec_contract` exclusion with its reason, or that cospec ran under
-emulation and nothing was excluded.
+carries no arm64 entry. The evidence records which case applied: the
+`cospec_contract` exclusion with its reason, or that cospec ran under emulation
+and nothing was excluded. Observed (run 36322392824): cospec ran. The arm64
+partitions' locked install resolved cospec 0.8.2 through the lock's
+`windows-arm64` row (`cospec-0.8.2-windows-x64.zip`),
+`standalone_cospec_emits_one_document_and_preserves_every_gate` passed on
+partition 5, `EXCLUDED_ARTIFACTS` was never added, and the arm64 inventories
+carry 0 `excluded` entries. Partition receipts record no tool list, so this
+is cited from the job logs and inventories (verification 8.2).
 
 ### 8. CI job mirror for `windows-11-arm` (design only; edits in phase 3)
 
@@ -659,7 +673,7 @@ source: ... then import it with --archive"); with `--archive <file>` (and
 `--offline`) it checks the file's size and SHA-256 against the committed pin and
 stores it as `<archive_sha256>.archive` in the bundle directory, after which
 every later `bundle:prepare` for that target in the same `KURU_DOLT_BUNDLE_DIR`
-is a verified cache hit (so `build`, `prefetch` and `coverage:shard` need no
+is a verified cache hit (so `build`, `prefetch` and the partition tasks need no
 further change). PR6a's `Bundle build` workflow (`bundle-build.yml`) runs only on
 path-filtered pull requests and dispatch, builds twice for determinism (the
 two-build job ran in 8m49s on run 36272281338) and uploads
@@ -699,12 +713,15 @@ arm64 leg and the `native-tests.yml` shard, collect, install and gate wiring
 are delivered afterwards on the workflow owner's per-test partition shape
 (PR-C, #118: per-test partitions, an uninstrumented receipts mode and an
 `ubuntu-latest` merge job with per-OS gating), calling the same
-`bundle-build.yml` job for the import. The rows below that name the post-PR4b
-shard and collect jobs and the rewritten `native-gate` describe the intent;
-their exact jobs follow PR-C once it merges. Timing reference: the workflow
+`bundle-build.yml` job for the import. The table rows below that name the post-PR4b
+shard and collect jobs and the rewritten `native-gate` are the superseded
+intent; Part (b) below is the delivered shape. Timing reference: the workflow
 owner measured PR-C's partitioned run at 21 minutes of wall clock in total; the
-arm64 legs' first-run measurements in task 3.5 are compared against it as well
-as against the 90-minute shard budget.
+arm64 legs' first-run measurements in task 3.5 are compared against it and
+against the 45-minute partition job limit (the shard-era plan said 90
+minutes). Measured on run 36322392824: the longest arm64 partition took
+18m45s, the install job 17m10s and the arm64 wall clock 24m47s, so the count
+stays at 8.
 
 Part (b) as delivered on PR-C's shape (2026-09-27, after #118 merged as
 `98b6b81a`): Windows on Arm is a `native-tests.yml` OS like the others, with
@@ -731,7 +748,9 @@ The `ci.yml` callers landed separately: `windows-11-arm` in the
 `Native platform behavior (aarch64-pc-windows-msvc)`, with no coverage tooling
 or upload, while the `mode: coverage` x64 leg keeps the 90% gate.
 
-The mirror is designed against the workflow owner's confirmed post-PR5 and
+The table below is the pre-PR-C design and is kept as the record of intent;
+where it names shards, collect, `coverage::SHARDS` or a gate allowlist,
+Part (b) above supersedes it. The mirror was designed against the workflow owner's confirmed post-PR5 and
 post-PR4b shapes (Current state), not the `501ab92d` files: the x64 twin runs on
 `windows-latest` and the arm64 leg on `windows-11-arm`; `native-tests.yml` is the
 uniform five-shard `coverage:shard` job plus one collect job per OS and PR5's
@@ -762,10 +781,10 @@ bootstrap is trusted on that assumption.
 |---|---|---|---|
 | `ci.yml native-platform` | matrix leg `{os: windows-11-arm, target: aarch64-pc-windows-msvc}` of the same job beside the x64 `windows-latest` leg, name `Native platform primitives (${{ matrix.target }})` | `runs-on: ${{ matrix.os }}`, `CARGO_BUILD_TARGET: ${{ matrix.target }}`, rust-cache `shared-key: native-platform-${{ matrix.target }}`, artifact `coverage-native-platform-${{ matrix.target }}` (the current name would collide) | none; `ci-gate` sees the job result |
 | `ci.yml native-tests` matrix | add `windows-11-arm` beside `windows-latest` in `os` | — | `native-gate` below |
-| post-PR4b shard job (`coverage:shard`, five shards, uniform on every OS) | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; artifacts os-qualified as `<prefix>-coverage-<inputs.os>-<shard>-attempt-<n>` and `...-diagnostics-...` (whatever os qualification PR4b's uniform names already carry is kept, not duplicated); rust-cache key per os; the arm64 engine import step (`needs: dolt-windows-arm64`, the SHA-pinned `download-artifact` of `bundle-input-aarch64-pc-windows-msvc`, then `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline` into the job's private `KURU_DOLT_BUNDLE_DIR`) conditioned on the os before `coverage:shard`; `install_args` per D7; matrix stays byte-equal to `coverage::SHARDS` (five); `KURU_COVERAGE_JOB_MINUTES` stays equal to the timeout | `native-gate` |
-| post-PR4b per-OS collect job | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; download patterns `<prefix>-coverage-<inputs.os>-<shard>-attempt-*` so the two Windows OS calls never cross-contaminate; os-qualified upload; the collector requires every receipt to share one host triple | `native-gate` |
+| post-PR4b shard job (`coverage:shard`, five shards; superseded by PR-C's `Behavior partition` 1..8, Part (b)) | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; artifacts os-qualified as `<prefix>-coverage-<inputs.os>-<shard>-attempt-<n>` and `...-diagnostics-...` (whatever os qualification PR4b's uniform names already carry is kept, not duplicated); rust-cache key per os; the arm64 engine import step (`needs: dolt-windows-arm64`, the SHA-pinned `download-artifact` of `bundle-input-aarch64-pc-windows-msvc`, then `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline` into the job's private `KURU_DOLT_BUNDLE_DIR`) conditioned on the os before `coverage:shard`; `install_args` per D7; matrix stays byte-equal to `coverage::SHARDS` (five); `KURU_COVERAGE_JOB_MINUTES` stays equal to the timeout | `native-gate` |
+| post-PR4b per-OS collect job (superseded by PR-C's `Behavior merge`, Part (b)) | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; download patterns `<prefix>-coverage-<inputs.os>-<shard>-attempt-*` so the two Windows OS calls never cross-contaminate; os-qualified upload; the collector requires every receipt to share one host triple | `native-gate` |
 | PR5 per-OS install/update job (today's `windows-install` plus `test:previous-release-update`) | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; rust-cache key per os; the same arm64 engine import step; tasks generalized per D3; `test:previous-release-update` with `KURU_UPDATE_CANDIDATE_BINARY` at #108's documented `.exe` path, `GITHUB_TOKEN` from CI and network on exactly as PR5 sets them for `windows-latest`; until a release carries `aarch64-pc-windows-msvc` the leg passes on D5's `no predecessor for aarch64-pc-windows-msvc: ...` branch | `native-gate` |
-| `native-gate` (rewritten by PR5 around shard, collect and install) | same job | the rewritten gate recognizes `windows-11-arm` alongside `windows-latest` for its shard, collect and install checks, keeps the Unix labels on the uniform path, and fails any other Windows label with the label in the message (fail-closed allowlist); `release_workflow.rs`'s gate test (today `native_workflow_gate_rejects_incomplete_windows_results`, which extracts the gate script from the live `native-tests.yml`) gains the `windows-11-arm` accept case, each arm64 reject case and an unknown-label reject case in the same commit, with the `windows-latest` cases unchanged; exact script and test names pending the PR5 notice | itself |
+| `native-gate` (rewritten by PR5 around shard, collect and install; PR-C made it label-independent, and the allowlist is the `PARTITIONS` table, Part (b)) | same job | the rewritten gate recognizes `windows-11-arm` alongside `windows-latest` for its shard, collect and install checks, keeps the Unix labels on the uniform path, and fails any other Windows label with the label in the message (fail-closed allowlist); `release_workflow.rs`'s gate test (today `native_workflow_gate_rejects_incomplete_windows_results`, which extracts the gate script from the live `native-tests.yml`) gains the `windows-11-arm` accept case, each arm64 reject case and an unknown-label reject case in the same commit, with the `windows-latest` cases unchanged; exact script and test names pending the PR5 notice | itself |
 | `release.yml build` Windows leg | add `{os: windows-11-arm, target: aarch64-pc-windows-msvc}` | already keyed on `matrix.target`/`runner.os`; `needs` gains the `dolt-windows-arm64` job that calls `bundle-build.yml` with `ref: ${{ needs.bump.outputs.sha }}`, and the asserted `needs` literal in `release_workflow.rs` changes with it; the private `KURU_DOLT_BUNDLE_DIR` selection, artifact download and offline import steps carry `if: matrix.target == 'aarch64-pc-windows-msvc'` and precede the Windows build (`build` and `verify-staged` are the jobs allowed step conditions) | `assemble-candidate` validates against the catalog, so D1 lands in the same commit |
 | `verify-staged` (PR5 three-OS matrix) | fourth leg `{windows-11-arm, aarch64-pc-windows-msvc}` mirroring the `windows-latest` mise-route leg (`verify:staged-windows`), not the interim Unix leg | `runs-on: ${{ matrix.os }}`; `needs` gains `dolt-windows-arm64`; the same arm64-conditioned download and import steps into the job's existing private `KURU_DOLT_BUNDLE_DIR` precede `verify:staged-windows`, which compiles the acceptance test and stays the job's last step; `KURU_STAGED_WINDOWS_ARCHIVE: .../kuru-<version>-${{ matrix.target }}.zip`; the predecessor rule runs inside the task (D5) | `deploy-docs` and `publish` need `verify-staged`, so a failing arm64 leg blocks both; `release_workflow.rs` expectations move with the matrix |
 | `verify-published-windows` (unchanged by PR5) | arm64 twin: matrix over `{windows-latest, x86_64-pc-windows-msvc}` and `{windows-11-arm, aarch64-pc-windows-msvc}` | `runs-on`, `KURU_PUBLISHED_TARGET`, receipt `published-windows-<target>-receipt.json`, artifact `published-windows-<target>-<version>-<attempt>`; stays the file's final step (asserted) | none; post-publication |
@@ -775,15 +794,17 @@ Caveats carried into the tasks: after PR5, `release.yml` makes no
 `ubuntu-latest`), so release time runs no Windows coverage for either
 architecture. Release-time Windows evidence stays staged and published
 acceptance (the former Open Question 6, settled by PR5's shape), while Unix
-gains the interim staged leg; the docs say so. Public-repo Arm runners have 4 vCPU; the 90-minute shard
-budget is measured on the first run before any change, and a fifth-or-more
-shard needs a `SHARDS` code change first. `windows-11-arm` is GA for public
+gains the interim staged leg; the docs say so. Public-repo Arm runners have 4 vCPU; the partition job limit (45 minutes,
+`timeout-minutes` equal to `KURU_COVERAGE_JOB_MINUTES`; the shard-era plan said
+90) is measured on the first run before any change, and more Windows on Arm
+partitions need the `windows-11-arm` count in `coverage::PARTITIONS` raised
+together with the matrix. `windows-11-arm` is GA for public
 repositories and the repository is public; minutes are billed at the Arm rate
 only for private repositories.
 
 Per lead ruling 1 (Open Question 7), until a pinned toolchain carries the
-rust-lang/rust#150123 fix, the arm64 legs of `native-platform` and the shard
-job run the same test suites uninstrumented; the instrumented arm64 shards and
+rust-lang/rust#150123 fix, the arm64 legs of `native-platform` and the partition
+jobs run the same test suites uninstrumented; instrumented arm64 partitions and
 the arm64 `native-platform` coverage upload are held. Those runs are named
 separately in their receipts as arm64 behavioral evidence and never contribute
 to or satisfy the 90% gate, which the instrumented x64 and Unix runs keep
@@ -809,8 +830,8 @@ publishing.
   targets, explicit `-Target` must match; an emulated x64 installation keeps
   updating x64), and the archive-naming sentence. The row and every sentence
   that says Kuru "supports" or "ships" Windows on Arm land only in the final
-  phase-3 commit, after the `windows-11-arm` platform, coverage shards and
-  report, and install and offline runtime (including install-and-update) jobs
+  phase-3 commit, after the `windows-11-arm` platform, Behavior partitions and
+  merge, and install and offline runtime (including install-and-update) jobs
   are green natively on the branch. Until then the docs describe the target as
   "in verification" or do not mention it.
 - `docs/release.md`: both Windows legs in the build list, the staged and
@@ -870,11 +891,14 @@ publishing.
 
 | Native check (AGENTS.md) | Evidence on `windows-11-arm` |
 |---|---|
-| memory | `coverage:shard` shards `memory` and `runtime` (post-PR4b five-shard matrix, uninstrumented per lead ruling 1) pass with the PR6a engine imported offline; `test:embedded-runtime` cold offline conversation |
-| process cleanup | `native-platform` arm64 leg (uninstrumented per lead ruling 1; the 90% platform gate stays with the instrumented x64 and Unix runs) and the `connectors-core-platform` shard's owned-process and supervisor tests |
-| terminal | the `application` shard's ConPTY tests (uninstrumented per lead ruling 1) |
-| installation | the per-OS install/update job: `mise run install` (source), `bundle:verify-native-build`, `verify:windows-imports`, plus the bootstrap tests in the `delivery-archive` shard |
-| update | the per-OS install/update job's `test:embedded-runtime` (`packaged_install_and_update_preserve_complete_offline_memory`) and PR5's `test:previous-release-update` in ordinary CI on the branch (the `no predecessor` branch until a release carries the target) |
+| memory | `Behavior partition` 1..8 and `Behavior merge` (PR-C's per-test partitions, uninstrumented per lead ruling 1; the `kuru-memory` and `kuru-runtime` suites, including `windows_lifecycle`, `server_lifecycle` and `source_built_windows_arm64_archive_decodes_exact_pinned_payloads`) pass with the PR6a engine imported offline; `test:embedded-runtime` cold offline conversation |
+| process cleanup | `native-platform` arm64 leg (uninstrumented per lead ruling 1; the 90% platform gate stays with the instrumented x64 and Unix runs) and the owned-process and supervisor tests in the Behavior partitions (`windows_process`, `windows_commands`, `windows_update`, `service::tests::rejected_publication_reaps_engine_before_owner_lock_releases`) |
+| terminal | the ConPTY tests (`windows_terminal`, `windows_cli`) in the Behavior partitions (uninstrumented per lead ruling 1) |
+| installation | the `Installation, offline runtime and update` job (one release build since #122): `mise run install` (source), `bundle:verify-native-build`, `verify:windows-imports`, plus the `bootstrap_windows` tests in the Behavior partitions |
+| update | the `Installation, offline runtime and update` job's `test:embedded-runtime` (`packaged_install_and_update_preserve_complete_offline_memory`) and `test:previous-release-update` in ordinary CI on the branch (the `no predecessor` branch until a release carries the target) |
+
+All five were observed green on `windows-11-arm` in PR #115 run 36322392824
+(head `598050f2`); verification groups 1 to 5 cite the job ids.
 | staged acceptance (release-time, after merge) | `verify-staged` `{windows-11-arm, aarch64-pc-windows-msvc}` green on the first maintainer-authorized Release run, with the predecessor decision in its log; gates `deploy-docs` and promotion |
 | post-publication (release-time, after merge) | `verify-published-windows` arm64 receipt retained on that run |
 
@@ -882,12 +906,11 @@ publishing.
 
 Every arm64 delivery path runs on the same hosts and with the same secrets as the
 x64 one, whose label is `windows-latest` after PR5 (`windows-2025` before it).
-The arm64 jobs mirror the post-PR4b shard and per-OS collect jobs, PR5's per-OS
+The arm64 jobs mirror PR-C's per-test partition and merge jobs, the per-OS
 install/update job (which runs `test:previous-release-update` on Windows in
 ordinary CI), the `release.yml` build leg, the `windows-11-arm` leg of the
 three-OS `verify-staged` matrix and the arm64 twin of the unchanged
-`verify-published-windows`; exact job text is pending the PR5 and PR4b merge
-notices. `windows-11-arm` GitHub-hosted runners (image `20260920.174.1` with
+`verify-published-windows`. `windows-11-arm` GitHub-hosted runners (image `20260920.174.1` with
 Visual Studio 2022 or, after the actions/runner-images#14602 migration completes
 by 2026-09-30, `20260920.164.1` with Visual Studio 2026; 4 vCPU in public
 repositories; zstd 1.5.7 installed) run the native jobs; `ubuntu-latest` runs
@@ -948,13 +971,12 @@ tools; `dumpbin` is a build-time acceptance dependency only.
   uploads it as `bundle-input-aarch64-pc-windows-msvc`, and each arm64 job imports it with
   `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline`,
   which re-verifies the committed pin (D8).
-- Coverage receipts: shard receipts may carry `excluded_artifacts`
-  (`[{artifact, reason}]`) only when the contingency in D7 is active; the
-  collector reconciles it against the inventory and the report shows it. Per
-  lead ruling 5, every arm64 shard receipt records which D7 case applied
-  (exclusion with reason, or cospec ran and nothing was excluded). Per lead
-  ruling 1, arm64 shard receipts identify uninstrumented behavioral runs that
-  never count toward the 90% gate.
+- Partition receipts and inventories: an exclusion would appear as an
+  inventory `excluded` entry with its reason only when the contingency in D7 is
+  active; it is not, and the arm64 inventories carry none (lead ruling 5). Per
+  lead ruling 1, arm64 partition receipts record `mode: uninstrumented` with
+  null `lcov`, `lines`, `threshold` and `cargo_llvm_cov`, and the merge prints
+  `(uninstrumented)`, so they never count toward the 90% gate.
 
 ## Risks / Trade-offs
 
@@ -975,11 +997,16 @@ tools; `dumpbin` is a build-time acceptance dependency only.
   the catalog.
 - [Artifact-name collisions between the two Windows OS calls in one CI run] →
   every artifact and download pattern carries `inputs.os` or the target; the
-  report collector requires one host triple across its receipts.
-- [The gate accepts an unknown Windows label on the Unix branch] → explicit
-  allowlist that fails on unknown labels, with test cases for each branch.
-- [4 vCPU pushes a shard past 90 minutes] → measure the first run; add a shard
-  through `SHARDS` if needed rather than raising the budget.
+  merge requires every partition receipt to share the OS's declared target.
+- [The gate accepts an unknown Windows label on the Unix branch] → the
+  `coverage::PARTITIONS`/`OS_TARGETS` table is the fail-closed allowlist: an
+  undeclared label or mode fails every partition and merge with `no <mode>
+  partition set is declared for <label>`, so the gate fails; table tests cover
+  each case.
+- [4 vCPU pushes a partition past the 45-minute job limit] → measure the first
+  run (longest arm64 partition 18m45s on run 36322392824); raise the
+  `windows-11-arm` count in `PARTITIONS` with the matrix if needed rather than
+  raising the limit.
 - [The `windows-11-arm` label resolves to either the Visual Studio 2022 or 2026
   image during the actions/runner-images#14602 migration week] → `dumpbin`
   discovery already goes through `vswhere` component queries
@@ -988,8 +1015,8 @@ tools; `dumpbin` is a build-time acceptance dependency only.
   and the README is re-read when phase 3 starts.
 - [rust-lang/rust#150123 breaks instrumented coverage on
   `aarch64-pc-windows-msvc`] → decided by lead ruling 1 (Open Question 7):
-  arm64 runs the same shard suites uninstrumented as separately named
-  behavioral evidence outside the 90% gate, and instrumented arm64 shards are
+  arm64 runs the same partitioned suites uninstrumented as separately named
+  behavioral evidence outside the 90% gate, and instrumented arm64 partitions are
   held until a pinned toolchain carries the fix; step zero records the issue's
   `llvm-profdata merge` step on the pinned toolchain; an uninstrumented run
   never reports or satisfies coverage.
@@ -1062,11 +1089,12 @@ tools; `dumpbin` is a build-time acceptance dependency only.
    are named separately in the receipts and never counted toward the 90%
    gate. Hold instrumented arm64 shards until a pinned toolchain has the
    llvm-profdata fix; record the upstream issue number in docs and the
-   follow-ons file." The arm64 legs run the same shard suites as x64 and Unix,
+   follow-ons file." [The shards the ruling names are PR-C's per-test
+   partitions since #118.] The arm64 legs run the same suites as x64 and Unix,
    uninstrumented, as separately named behavioral evidence (D8 caveats, D11);
    they never report or satisfy coverage, so AGENTS.md's rule against
    substituting an uninstrumented executable in a coverage run holds, and x64
-   and Ubuntu keep enforcing the 90% gate. Instrumented arm64 shards (and the
+   and Ubuntu keep enforcing the 90% gate. Instrumented arm64 partitions (and the
    arm64 `native-platform` coverage upload, which uses the same
    `llvm-profdata` path) are held until a pinned toolchain carries the fix for
    rust-lang/rust#150123; step zero records the pinned toolchain's state. The

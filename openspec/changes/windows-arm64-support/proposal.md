@@ -41,9 +41,10 @@ code path.
 - Parametrize the staged and published Windows verifiers, their receipts and
   artifact names by target.
 - Mirror every x64 Windows CI and Release job on `windows-11-arm` (platform
-  primitives, coverage shards and collect, install/update and offline runtime,
+  primitives, per-test Behavior partitions and merge, install/update and offline runtime,
   release build leg, staged acceptance, post-publication verification) with
-  fail-closed aggregation, against the post-PR5 and post-PR4b workflow shapes.
+  fail-closed aggregation, against the post-PR5 and post-PR4b workflow shapes and PR-C's per-test
+  partition shape (#118).
   Workflow edits are deferred until the workflow owner's PR5 and PR4b merge
   notices; this change designs them and updates `release_workflow.rs` with them.
 - Add `windows-arm64` platform entries to the tool lockfiles, using the x64 cospec

@@ -46,9 +46,10 @@ on that architecture.
 CI SHALL require native Windows MSVC tests on every supported Windows
 architecture, currently x64 and Arm64, for platform, database, runtime, CLI,
 connector, terminal, installation and update behavior. A missing required
-prerequisite MUST fail rather than skip. A Windows runner label that the
-aggregation gate does not recognize MUST fail the gate rather than fall into a
-Unix or x64 branch. Platform-scoped Unix tests SHALL retain their coverage and
+prerequisite MUST fail rather than skip. A runner label that the native test
+partition table does not declare for the requested mode MUST fail every
+partition and merge of that call, and therefore the aggregate gate, rather than
+fall into a Unix or x64 branch. Platform-scoped Unix tests SHALL retain their coverage and
 have actual Windows counterparts for shared behavior. Native Windows coverage and
 its limits MUST be reported honestly per architecture alongside the unchanged
 workspace quality threshold, including any test artifact excluded by name on one
@@ -59,8 +60,8 @@ architecture and the recorded reason.
 - **THEN** the required Windows job for that architecture and the aggregate CI gate fail even if every other job passes.
 
 #### Scenario: Unknown Windows runner label
-- **WHEN** a native-tests call names a Windows runner label the gate does not list
-- **THEN** the gate fails and reports the label instead of accepting Unix-path results for it.
+- **WHEN** a native-tests call names a Windows runner label that the partition table does not declare for its mode
+- **THEN** every partition and the merge of that call fail with `no <mode> partition set is declared for <label>` before any test runs, and the aggregate gate fails on their results instead of accepting Unix-path results for the label.
 
 ### Requirement: Staged Windows release acceptance
 
