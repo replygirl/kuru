@@ -24,15 +24,15 @@ fn target_selection_uses_requested_target_and_generates_coherent_versioned_paylo
         .join("support")
         .join("dolt-assets.json");
     let manifest = Manifest::load(&path).unwrap();
-    for target in [
-        "aarch64-apple-darwin",
-        "aarch64-unknown-linux-gnu",
-        "x86_64-unknown-linux-gnu",
-        "x86_64-pc-windows-msvc",
+    for (target, provenance) in [
+        ("aarch64-apple-darwin", Provenance::Upstream),
+        ("aarch64-unknown-linux-gnu", Provenance::Upstream),
+        ("x86_64-unknown-linux-gnu", Provenance::Upstream),
+        ("x86_64-pc-windows-msvc", Provenance::Upstream),
+        ("aarch64-pc-windows-msvc", Provenance::Built),
     ] {
         let asset = manifest.select(target).unwrap();
-        assert_eq!(asset.provenance, Provenance::Upstream);
-        assert!(asset.notices().is_empty());
+        assert_eq!(asset.provenance, provenance, "{target}");
         assert_eq!(asset.target, target);
         let generated = manifest.catalog(target).unwrap();
         let selected = generated
@@ -43,7 +43,37 @@ fn target_selection_uses_requested_target_and_generates_coherent_versioned_paylo
         assert!(selected.contains(&asset.archive_sha256));
         assert!(selected.contains(&asset.executable_sha256));
         assert!(selected.contains(&asset.license_sha256));
-        assert!(selected.contains("notices: &[] }"));
+        match provenance {
+            // Upstream archives carry only Dolt's own LICENSES.
+            Provenance::Upstream => {
+                assert!(asset.notices().is_empty());
+                assert!(selected.contains("notices: &[] }"));
+            }
+            // A built archive declares each third-party notice beside
+            // LICENSES, and every one reaches the selected catalog line.
+            Provenance::Built => {
+                assert!(!asset.notices().is_empty());
+                assert!(!selected.contains("notices: &[] }"));
+                for notice in asset.notices() {
+                    let bytes = notice.bytes.unwrap();
+                    assert!(
+                        selected.contains(&format!(
+                            "Notice {{ name: {:?}, bytes: {bytes}, sha256: {:?} }}",
+                            notice.name, notice.sha256
+                        )),
+                        "{target} {}",
+                        notice.name
+                    );
+                }
+                // The exact expansion is the executable, LICENSES and notices.
+                let pins = asset.pins().unwrap();
+                let notices: u64 = asset.notices().iter().map(|n| n.bytes.unwrap()).sum();
+                assert_eq!(
+                    pins.expanded_bytes,
+                    pins.executable_bytes + asset.license_bytes + notices
+                );
+            }
+        }
         assert!(generated.contains(&format!("DOLT_VERSION: &str = {:?}", manifest.version)));
     }
     for target in ["", "x86_64-apple-darwin", "aarch64-unknown-linux-musl"] {
