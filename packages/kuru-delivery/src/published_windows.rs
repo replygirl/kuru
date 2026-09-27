@@ -1326,7 +1326,7 @@ mod tests {
                 .unwrap();
         let asset = windows_engine_asset(&manifest).unwrap();
         assert_eq!(asset.target, WINDOWS_TARGET);
-        assert_eq!(asset.executable_bytes, 129_126_400);
+        assert_eq!(asset.executable_bytes, 129_320_960);
         assert!(
             manifest
                 .assets

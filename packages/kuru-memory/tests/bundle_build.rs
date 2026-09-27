@@ -276,7 +276,7 @@ fn standard_macos_temporary_directory_aliases_remain_valid_build_locations() {
         .unwrap();
     let manifest_path = temporary.path().join("manifest.json");
     fs::write(&manifest_path, MANIFEST).unwrap();
-    assert_eq!(Manifest::load(&manifest_path).unwrap().version, "2.3.3");
+    assert_eq!(Manifest::load(&manifest_path).unwrap().version, "2.3.4");
     let nested = temporary.path().join("nested-link");
     symlink(temporary.path(), &nested).unwrap();
     assert!(Manifest::load(&nested.join("manifest.json")).is_err());
