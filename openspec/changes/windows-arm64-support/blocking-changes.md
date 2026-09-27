@@ -9,6 +9,7 @@
 - [x] `coverage-partitions` — PR-C: hash-assigned per-test `Coverage partition`/`Behavior partition` jobs, the uninstrumented receipts mode, the `Behavior merge`/`Coverage merge` agreement job and the `coverage::PARTITIONS`/`OS_TARGETS` tables whose fail-closed allowlist carries the `windows-11-arm` uninstrumented row that task 3.4 part (b) adds (PR #118, merge commit `98b6b81a`) *(archived 2026-09-26)*
 - [x] `install-single-build` — one release build per install job, shared by `mise run install` and `bundle:verify-native-build`, which verification 4.1 and group 6 cite for both Windows tuples (PR #122, merge commit `db25ad31`) *(archived 2026-09-27)*
 - [x] `dolt-2-3-4` — the bundled Dolt engine bump to v2.3.4, which re-pinned the source-built `aarch64-pc-windows-msvc` asset this change imports (PR #119, merge commit `0b951c51`) *(archived 2026-09-27)*
+- [x] `dolt-2-3-5` — the bundled Dolt engine bump to v2.3.5, which moved all five engine pins, including the source-built `aarch64-pc-windows-msvc` asset this change imports; this branch's tests derive from the committed pin, so the rebase needed no test edit beyond resolving one literal in `published_windows.rs` to the derived form (PR #123, merge commit `78bbe35a`) *(archived 2026-09-27)*
 
 ## Soft-blocked by
 
@@ -16,9 +17,9 @@ None.
 
 ## Phase Gates
 
-Stage 3 is based on `origin/main` at `db25ad31`, which contains #106, #107, #108,
-#110 (PR5), #111 (PR4b), #113 (PR6a), #118 (PR-C), #119 and #122; every change
-listed above is archived on that base. (Stage 3 began on `83666440`.)
+Stage 3 is based on `origin/main` at `78bbe35a`, which contains #106, #107, #108,
+#110 (PR5), #111 (PR4b), #113 (PR6a), #118 (PR-C), #119, #122 and #123; every
+change listed above is archived on that base. (Stage 3 began on `83666440`.)
 
 - PR5 and PR4b (workflow ownership): the workflow owner sent both merge notices,
   so stage 3 may edit `.github/workflows` for the arm64 legs, the step-zero
