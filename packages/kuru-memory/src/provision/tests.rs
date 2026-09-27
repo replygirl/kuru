@@ -3,7 +3,7 @@ use flate2::{Compression, write::GzEncoder};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, symlink};
 
-const SCRIPT: &[u8] = b"#!/bin/sh\nprintf 'dolt version 2.3.3\\n'\n";
+const SCRIPT: &[u8] = b"#!/bin/sh\nprintf 'dolt version 2.3.4\\n'\n";
 const LICENSE: &[u8] = b"Fixture license and dependency notices\n";
 type ArchiveEntries = Vec<(String, tar::EntryType, u32, Vec<u8>)>;
 static VALID_FIXTURE: std::sync::LazyLock<Fixture> =
@@ -534,7 +534,7 @@ async fn private_version_probe_requires_exact_version_and_bounds_process_and_out
 async fn isolated_probe_sees_only_private_settings_and_preserves_private_server_identity() {
     let temporary = tempfile::tempdir().unwrap();
     let binary = temporary.path().join("dolt");
-    executable(&binary, b"#!/bin/sh\n[ \"$DOLT_DISABLE_EVENT_FLUSH\" = 1 ] || exit 11\n[ \"$HOME\" = \"$PWD/home\" ] || exit 12\n[ \"$DOLT_ROOT_PATH\" = \"$PWD/root\" ] || exit 13\n[ \"$TMPDIR\" = \"$PWD/tmp\" ] || exit 14\n[ -z \"$DOLT_ROOT_PASSWORD$DOLT_CLI_PASSWORD$ANTHROPIC_API_KEY$OPENAI_API_KEY\" ] || exit 15\n/bin/cat \"$DOLT_ROOT_PATH/.dolt/config_global.json\" | /usr/bin/grep -q '\"versioncheck.disabled\":\"true\"' || exit 16\nprintf 'dolt version 2.3.3\\n'\n");
+    executable(&binary, b"#!/bin/sh\n[ \"$DOLT_DISABLE_EVENT_FLUSH\" = 1 ] || exit 11\n[ \"$HOME\" = \"$PWD/home\" ] || exit 12\n[ \"$DOLT_ROOT_PATH\" = \"$PWD/root\" ] || exit 13\n[ \"$TMPDIR\" = \"$PWD/tmp\" ] || exit 14\n[ -z \"$DOLT_ROOT_PASSWORD$DOLT_CLI_PASSWORD$ANTHROPIC_API_KEY$OPENAI_API_KEY\" ] || exit 15\n/bin/cat \"$DOLT_ROOT_PATH/.dolt/config_global.json\" | /usr/bin/grep -q '\"versioncheck.disabled\":\"true\"' || exit 16\nprintf 'dolt version 2.3.4\\n'\n");
     let home = temporary.path().join("private café home");
     prepare_private_home(&home).unwrap();
     let home = home.canonicalize().unwrap();
@@ -956,7 +956,7 @@ async fn cancellation_retains_stage_and_lock_until_real_extraction_stops() {
 async fn paused_probe(
     cache: PathBuf,
 ) -> (tokio::task::JoinHandle<Result<PathBuf>>, PathBuf, PathBuf) {
-    const CONTROLLED: &[u8] = b"#!/bin/sh\nprintf started > \"$TMPDIR/started\"\nIFS= read -r token < \"$TMPDIR/release\" || exit 17\nprintf 'dolt version 2.3.3\\n'\n";
+    const CONTROLLED: &[u8] = b"#!/bin/sh\nprintf started > \"$TMPDIR/started\"\nIFS= read -r token < \"$TMPDIR/release\" || exit 17\nprintf 'dolt version 2.3.4\\n'\n";
     static FIXTURE: std::sync::LazyLock<Fixture> = std::sync::LazyLock::new(|| {
         let mut fixture = Fixture::new(|entries| entries[2].3 = CONTROLLED.to_vec());
         fixture.binary_digest = digest(CONTROLLED);

@@ -6,6 +6,15 @@ The Dolt change checked SQLx 0.9.0, UUID 1.26.1 and full Dolt 2.3.3 on
 2026-09-10. The memory package's catalog records the measured native archive,
 executable and license digests for each cataloged target. The Windows change
 also pins the native API bindings, strict ZIP codec and ConPTY test driver below.
+The bundled engine moved to full Dolt 2.3.4 (release commit `373301a5`) on
+2026-09-27 for its `journal_writer` bootstrap fix on cancelled contexts
+([dolthub/dolt#11796](https://github.com/dolthub/dolt/pull/11796)) and its
+manifest-root preservation during automatic garbage collection
+([dolthub/dolt#11747](https://github.com/dolthub/dolt/issues/11747)). The four
+upstream archives were re-pinned from the v2.3.4 release assets; their
+`LICENSES` payload is byte-identical to 2.3.3. The Windows arm64 entry builds
+from Go module `v0.40.5-0.20260914203517-373301a56c9a`, and its archive pins
+are committed from the reproducible linux-x64 build.
 The offline tokenizer addition checked `tiktoken-rs` 0.12.0 on 2026-09-22;
 its embedded `o200k_base.tiktoken` SHA-256 matches [OpenAI's published
 asset hash](https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py),

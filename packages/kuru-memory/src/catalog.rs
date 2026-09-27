@@ -48,7 +48,20 @@ mod tests {
             .filter(|asset| asset["archive_sha256"] != "unpinned")
             .count();
         assert_eq!(ASSETS.len(), pinned);
-        assert!(ASSETS.len() >= 5);
+        // Upstream targets are always cataloged; a built target is cataloged
+        // exactly when its committed archive pin has been recorded.
+        let mut upstream = 0;
+        for asset in manifest["assets"].as_array().unwrap() {
+            let cataloged = ASSETS.iter().any(|entry| asset["target"] == entry.target);
+            assert_eq!(
+                cataloged,
+                asset["archive_sha256"] != "unpinned",
+                "{}",
+                asset["target"]
+            );
+            upstream += usize::from(asset["provenance"] == "upstream");
+        }
+        assert!(upstream >= 4);
         assert!(
             ASSETS
                 .iter()

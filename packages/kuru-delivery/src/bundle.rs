@@ -1251,15 +1251,40 @@ mod tests {
         let parsed = parse_manifest(committed).unwrap();
         let built = parsed.select("aarch64-pc-windows-msvc").unwrap();
         assert_eq!(built.provenance, Provenance::Built);
-        assert!(built.archive_pinned());
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("dolt-assets.json");
         fs::write(&path, committed).unwrap();
-        // The committed pinned entry resolves as a built input with no URL.
-        let asset = manifest(&path, "aarch64-pc-windows-msvc").unwrap();
+        // Both pin rounds derive from the committed entry, whichever is
+        // committed. A pinned entry resolves as a built input with no URL.
+        let mut pinned: serde_json::Value = serde_json::from_slice(committed).unwrap();
+        let mut unpinned = pinned.clone();
+        if !built.archive_pinned() {
+            let entry = &mut pinned["assets"][4];
+            assert_eq!(entry["target"], "aarch64-pc-windows-msvc");
+            let executable = 1_000_u64;
+            let notices: u64 = built
+                .notices()
+                .iter()
+                .map(|notice| notice.bytes.unwrap())
+                .sum();
+            for (field, value) in [
+                ("compressed_bytes", serde_json::json!(1_000)),
+                ("archive_sha256", serde_json::json!("a".repeat(64))),
+                (
+                    "expanded_bytes",
+                    serde_json::json!(executable + built.license_bytes + notices),
+                ),
+                ("executable_bytes", serde_json::json!(executable)),
+                ("executable_sha256", serde_json::json!("b".repeat(64))),
+            ] {
+                entry[field] = value;
+            }
+        }
+        let pinned_path = root.path().join("pinned-assets.json");
+        fs::write(&pinned_path, serde_json::to_vec(&pinned).unwrap()).unwrap();
+        let asset = manifest(&pinned_path, "aarch64-pc-windows-msvc").unwrap();
         assert!(asset.built && asset.url.is_empty());
         // Its unpinned round-one form is refused before any work.
-        let mut unpinned: serde_json::Value = serde_json::from_slice(committed).unwrap();
         let entry = &mut unpinned["assets"][4];
         assert_eq!(entry["target"], "aarch64-pc-windows-msvc");
         for (field, sentinel) in [
@@ -1352,7 +1377,7 @@ mod tests {
         for (request, target) in requests.iter().zip(&upstream) {
             let stem = parsed.select(target).unwrap().stem.clone();
             assert!(
-                request.starts_with("GET http://github.com/dolthub/dolt/releases/download/v2.3.3/")
+                request.starts_with("GET http://github.com/dolthub/dolt/releases/download/v2.3.4/")
                     && request.contains(&stem),
                 "{request}"
             );
