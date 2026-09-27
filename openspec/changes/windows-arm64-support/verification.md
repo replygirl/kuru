@@ -1,6 +1,6 @@
 ## 1. Native memory on Windows on Arm [critical]
 
-- [ ] 1.1 @runtime (agent) `coverage:shard` `memory` and `runtime` shards (post-PR4b uniform five-shard job) on `windows-11-arm` with the PR6a engine imported through `bundle:prepare --archive --offline` -> both shards green uninstrumented (design Open Question 7, lead ruling 1), receipts record host triple `aarch64-pc-windows-msvc` and name the runs as arm64 behavioral evidence never counted toward the 90% gate, run id recorded here
+- [ ] 1.1 @runtime (agent) `coverage:shard` `memory` and `runtime` shards (post-PR4b uniform five-shard job) on `windows-11-arm` with the PR6a-recipe engine built by the pin-verifying `dolt-windows-arm64` job and imported through `bundle:prepare --archive --offline` (design D8) -> both shards green uninstrumented (design Open Question 7, lead ruling 1), receipts record host triple `aarch64-pc-windows-msvc` and name the runs as arm64 behavioral evidence never counted toward the 90% gate, run id recorded here
 - [ ] 1.2 @e2e (agent) `//apps/kuru-tui:test:embedded-runtime` on `windows-11-arm` with a cold offline engine cache -> install, first conversation, resume and update pass without any download
 
 ## 2. Owned process cleanup on Windows on Arm [critical]

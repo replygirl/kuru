@@ -3,7 +3,7 @@
 Kuru ships native executables for four targets once #106 removes Intel macOS, but Windows on Arm users have no
 native release: an x64 `kuru.exe` runs only under emulation, and the x64 bootstrap
 refuses an Arm host outright. Upstream Dolt publishes no windows/arm64 asset, so the
-engine must be built from source; the companion change `dolt-source-build-inputs`
+engine must be built from source; the companion change `windows-arm64-bundle-input`
 (PR6a) adds that pinned, verified build input as inert manifest data. This change
 makes `aarch64-pc-windows-msvc` a delivered target end to end: catalog, installer,
 updater, release, acceptance and documentation, with native `windows-11-arm` CI
@@ -92,7 +92,7 @@ None.
 - `packages/kuru-memory`: `mise.toml` (arm64 crt-static clear/set),
   `support/verify-bundle-build.ps1`, `tests/bundle_build.rs`,
   `src/provision/native_tests.rs` (arm64 target). The manifest, both parsers and
-  `bundle build` stay owned by `dolt-source-build-inputs`.
+  `bundle build` stay owned by `windows-arm64-bundle-input`.
 - `packages/kuru-platform`: `mise.toml` arm64 cross-check tasks,
   `tests/windows_commands.rs` fixture. No new unsafe API.
 - `packages/kuru-connectors/src/tools.rs` fixture sites: reviewed, see design.

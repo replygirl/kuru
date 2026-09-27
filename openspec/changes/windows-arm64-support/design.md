@@ -627,6 +627,41 @@ The PR6a owner reviews this wiring before task 3.4 edits any workflow (lead
 decision 4). Every new `uses:` step, including the `actions/download-artifact`
 import step, is pinned by commit SHA.
 
+**Arm64 engine input (reconciled 2026-09-26 with what #113 merged).** PR6a
+(`windows-arm64-bundle-input`, merge `83666440`) ships the recipe, not a
+consumer hand-off: the `aarch64-pc-windows-msvc` manifest entry is
+`"provenance": "built"` with no URL, committed archive, executable and notice
+pins (archive 40,719,091 B, SHA-256 `d1798568…bb73c`), and neither the archive
+bytes nor a mirror override are committed. `bundle:prepare` refuses a built
+asset without `--archive` ("engine for aarch64-pc-windows-msvc is built from
+source: ... then import it with --archive"); with `--archive <file>` (and
+`--offline`) it checks the file's size and SHA-256 against the committed pin and
+stores it as `<archive_sha256>.archive` in the bundle directory, after which
+every later `bundle:prepare` for that target in the same `KURU_DOLT_BUNDLE_DIR`
+is a verified cache hit (so `build`, `prefetch` and `coverage:shard` need no
+further change). PR6a's `Bundle build` workflow (`bundle-build.yml`) runs only on
+path-filtered pull requests and dispatch, builds twice (about 9 minutes each)
+for determinism and uploads `bundle-build-aarch64-pc-windows-msvc` with a
+30-day retention; it is determinism evidence, not a source other workflows can
+depend on. This change therefore owns the hand-off: each workflow that runs an
+arm64 leg gains one `ubuntu-latest` job, `dolt-windows-arm64`, that runs
+`//packages/kuru-memory:setup:build-tools` and a single
+`//packages/kuru-memory:bundle:build -- --target aarch64-pc-windows-msvc`
+without `--print-pins` (so the build must reproduce the committed pins or fail
+with both digests), and uploads `dolt-windows-arm64.zip` as the workflow
+artifact `bundle-input-aarch64-pc-windows-msvc`. Arm64 legs `needs` it, download
+it with the SHA-pinned `actions/download-artifact`, and import it with
+`bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline`
+into their own runner-created private `KURU_DOLT_BUNDLE_DIR` before any build.
+The trust anchor is the committed manifest pin, which the import re-verifies;
+the artifact is transport only. In `native-tests.yml` the job runs only when
+`inputs.os` is `windows-11-arm`, so x64 and Unix calls are unchanged and the
+job is parameterized by OS rather than restructuring shared jobs. Reusing
+`bundle-build.yml` through `workflow_call` was rejected: it double-builds and
+its job is the determinism check. Restoring a previously verified archive from
+`actions/cache` keyed on the pinned `archive_sha256` is an allowed optimization
+decided with the task 3.5 timings, since the import verifies the pin either way.
+
 The mirror is designed against the workflow owner's confirmed post-PR5 and
 post-PR4b shapes (Current state), not the `501ab92d` files: the x64 twin runs on
 `windows-latest` and the arm64 leg on `windows-11-arm`; `native-tests.yml` is the
@@ -658,11 +693,11 @@ bootstrap is trusted on that assumption.
 |---|---|---|---|
 | `ci.yml native-platform` | matrix leg `{os: windows-11-arm, target: aarch64-pc-windows-msvc}` of the same job beside the x64 `windows-latest` leg, name `Native platform primitives (${{ matrix.target }})` | `runs-on: ${{ matrix.os }}`, `CARGO_BUILD_TARGET: ${{ matrix.target }}`, rust-cache `shared-key: native-platform-${{ matrix.target }}`, artifact `coverage-native-platform-${{ matrix.target }}` (the current name would collide) | none; `ci-gate` sees the job result |
 | `ci.yml native-tests` matrix | add `windows-11-arm` beside `windows-latest` in `os` | — | `native-gate` below |
-| post-PR4b shard job (`coverage:shard`, five shards, uniform on every OS) | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; artifacts os-qualified as `<prefix>-coverage-<inputs.os>-<shard>-attempt-<n>` and `...-diagnostics-...` (whatever os qualification PR4b's uniform names already carry is kept, not duplicated); rust-cache key per os; the PR6a import step (`download-artifact bundle-input-aarch64-pc-windows-msvc` then `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline` into the job's private `KURU_DOLT_BUNDLE_DIR`) conditioned on the os before `coverage:shard`; `install_args` per D7; matrix stays byte-equal to `coverage::SHARDS` (five); `KURU_COVERAGE_JOB_MINUTES` stays equal to the timeout | `native-gate` |
+| post-PR4b shard job (`coverage:shard`, five shards, uniform on every OS) | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; artifacts os-qualified as `<prefix>-coverage-<inputs.os>-<shard>-attempt-<n>` and `...-diagnostics-...` (whatever os qualification PR4b's uniform names already carry is kept, not duplicated); rust-cache key per os; the arm64 engine import step (`needs: dolt-windows-arm64`, the SHA-pinned `download-artifact` of `bundle-input-aarch64-pc-windows-msvc`, then `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline` into the job's private `KURU_DOLT_BUNDLE_DIR`) conditioned on the os before `coverage:shard`; `install_args` per D7; matrix stays byte-equal to `coverage::SHARDS` (five); `KURU_COVERAGE_JOB_MINUTES` stays equal to the timeout | `native-gate` |
 | post-PR4b per-OS collect job | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; download patterns `<prefix>-coverage-<inputs.os>-<shard>-attempt-*` so the two Windows OS calls never cross-contaminate; os-qualified upload; the collector requires every receipt to share one host triple | `native-gate` |
-| PR5 per-OS install/update job (today's `windows-install` plus `test:previous-release-update`) | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; rust-cache key per os; the same PR6a import step; tasks generalized per D3; `test:previous-release-update` with `KURU_UPDATE_CANDIDATE_BINARY` at #108's documented `.exe` path, `GITHUB_TOKEN` from CI and network on exactly as PR5 sets them for `windows-latest`; until a release carries `aarch64-pc-windows-msvc` the leg passes on D5's `no predecessor for aarch64-pc-windows-msvc: ...` branch | `native-gate` |
+| PR5 per-OS install/update job (today's `windows-install` plus `test:previous-release-update`) | `windows-11-arm` leg of the same job | `runs-on: ${{ inputs.os }}`; rust-cache key per os; the same arm64 engine import step; tasks generalized per D3; `test:previous-release-update` with `KURU_UPDATE_CANDIDATE_BINARY` at #108's documented `.exe` path, `GITHUB_TOKEN` from CI and network on exactly as PR5 sets them for `windows-latest`; until a release carries `aarch64-pc-windows-msvc` the leg passes on D5's `no predecessor for aarch64-pc-windows-msvc: ...` branch | `native-gate` |
 | `native-gate` (rewritten by PR5 around shard, collect and install) | same job | the rewritten gate recognizes `windows-11-arm` alongside `windows-latest` for its shard, collect and install checks, keeps the Unix labels on the uniform path, and fails any other Windows label with the label in the message (fail-closed allowlist); `release_workflow.rs`'s gate test (today `native_workflow_gate_rejects_incomplete_windows_results`, which extracts the gate script from the live `native-tests.yml`) gains the `windows-11-arm` accept case, each arm64 reject case and an unknown-label reject case in the same commit, with the `windows-latest` cases unchanged; exact script and test names pending the PR5 notice | itself |
-| `release.yml build` Windows leg | add `{os: windows-11-arm, target: aarch64-pc-windows-msvc}` | already keyed on `matrix.target`/`runner.os`; `needs` gains PR6a's release-scoped `dolt-windows-arm64` job built from `needs.bump.outputs.sha`, and the asserted `needs` literal in `release_workflow.rs` (post-PR5, without `verify-tests`) changes with it; the artifact download and offline import steps carry `if: matrix.target == 'aarch64-pc-windows-msvc'` (`build` is the one job allowed step conditions) | `assemble-candidate` validates against the catalog, so D1 lands in the same commit |
+| `release.yml build` Windows leg | add `{os: windows-11-arm, target: aarch64-pc-windows-msvc}` | already keyed on `matrix.target`/`runner.os`; `needs` gains this change's release-scoped `dolt-windows-arm64` job (the pin-verifying `bundle:build` above, checked out at `needs.bump.outputs.sha`), and the asserted `needs` literal in `release_workflow.rs` (post-PR5, without `verify-tests`) changes with it; the artifact download and offline import steps carry `if: matrix.target == 'aarch64-pc-windows-msvc'` (`build` is the one job allowed step conditions) | `assemble-candidate` validates against the catalog, so D1 lands in the same commit |
 | `verify-staged` (PR5 three-OS matrix) | fourth leg `{windows-11-arm, aarch64-pc-windows-msvc}` mirroring the `windows-latest` mise-route leg (`verify:staged-windows`), not the interim Unix leg | `runs-on: ${{ matrix.os }}`; `KURU_STAGED_WINDOWS_ARCHIVE: .../kuru-<version>-${{ matrix.target }}.zip`; the predecessor rule runs inside the task (D5); the Windows leg's step-condition rules follow whatever PR5 asserts for the matrix | `deploy-docs` and `publish` need `verify-staged`, so a failing arm64 leg blocks both; `release_workflow.rs` expectations move with the matrix |
 | `verify-published-windows` (unchanged by PR5) | arm64 twin: matrix over `{windows-latest, x86_64-pc-windows-msvc}` and `{windows-11-arm, aarch64-pc-windows-msvc}` | `runs-on`, `KURU_PUBLISHED_TARGET`, receipt `published-windows-<target>-receipt.json`, artifact `published-windows-<target>-<version>-<attempt>`; stays the file's final step (asserted) | none; post-publication |
 
@@ -753,9 +788,12 @@ publishing.
   that base but touches only `coverage.rs`, `release_workflow.rs`, `ci.yml`,
   `native-tests.yml` and `docs/development.md`, none of which phase 2 edits, so
   it is a phase-3 gate beside PR5 and PR4b. Per the lead's stack-order ruling
-  (Open Question 3) the branch rebases onto PR6a's branch
-  (`feat/windows-arm64-bundle-input`, #113) before PR6b opens, and PR6a's
-  archive gates phase 3.
+  (Open Question 3) the branch was to rebase onto PR6a's branch
+  (`feat/windows-arm64-bundle-input`, #113) before PR6b opened, and PR6a's
+  archive gates phase 3. Superseded 2026-09-26: PR6a merged first (#113,
+  `83666440`, record archived), so stage 3 rebases onto `origin/main` at
+  `83666440`, and draft PR #115 stays a plain PR against main with no stack
+  link, retitled and marked ready at merge-ready.
 - "Phase 1/2/3" names stages inside this change (design and ledger; x64
   generalizations; arm64 enablement), not roadmap phases.
 
@@ -783,9 +821,11 @@ three-OS `verify-staged` matrix and the arm64 twin of the unchanged
 notices. `windows-11-arm` GitHub-hosted runners (image `20260920.174.1` with
 Visual Studio 2022 or, after the actions/runner-images#14602 migration completes
 by 2026-09-30, `20260920.164.1` with Visual Studio 2026; 4 vCPU in public
-repositories; zstd 1.5.7 installed) run the native jobs; `ubuntu-24.04` runs PR6a's
-engine build and hands the archive over as a workflow artifact that each arm64
-job imports offline into its own runner-created private `KURU_DOLT_BUNDLE_DIR`.
+repositories; zstd 1.5.7 installed) run the native jobs; `ubuntu-latest` runs
+this change's `dolt-windows-arm64` job, a single pin-verifying build with PR6a's
+recipe and tasks, and hands the archive over as a workflow artifact that each
+arm64 job imports offline into its own runner-created private
+`KURU_DOLT_BUNDLE_DIR` (D8).
 No job binds a network listener beyond the existing loopback mise fixture in
 staged acceptance; no new secret is introduced, and the only token used is
 `github.token` for mise-action tool downloads and, for
@@ -820,7 +860,8 @@ tools; `dumpbin` is a build-time acceptance dependency only.
   confirmed at the first `mise lock`) are generated from configuration; cocogitto
   resolves its x64 asset through the aqua registry's `windows_arm_emulation`.
   `MISE_LOCKED=1` stays on.
-- PR6a: the arm64 manifest asset (`"schema_version": 2`, exactly six assets)
+- PR6a: the arm64 manifest asset (`"schema_version": 2`, exactly five assets:
+  four upstream and this built one)
   is selected by Cargo `TARGET` exactly as the upstream ones; PR6a's
   target-to-stem map gives `aarch64-pc-windows-msvc` → `dolt-windows-arm64`,
   format `zip` and `dolt.exe`. This change's stage-3 verifiers read the asset
@@ -830,9 +871,12 @@ tools; `dumpbin` is a build-time acceptance dependency only.
   `from`, `path`, `bytes` and `sha256`; a built zip holds `{stem}/`,
   `{stem}/bin/`, `{stem}/bin/{executable_name}`, `{stem}/LICENSES`, then one
   `{stem}/<notice.name>` per declared notice. The `"unpinned"` sentinel and
-  `null` byte counts are rejected by the verifiers (D6). The workflow artifact is
-  named `bundle-input-aarch64-pc-windows-msvc` and imported with
-  `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline`.
+  `null` byte counts are rejected by the verifiers (D6). PR6a supplies no
+  consumer artifact: this change's `dolt-windows-arm64` job builds the archive
+  with a single pin-verifying `bundle:build` on `ubuntu-latest`, uploads it as
+  `bundle-input-aarch64-pc-windows-msvc`, and each arm64 job imports it with
+  `bundle:prepare --target aarch64-pc-windows-msvc --archive <file> --offline`,
+  which re-verifies the committed pin (D8).
 - Coverage receipts: shard receipts may carry `excluded_artifacts`
   (`[{artifact, reason}]`) only when the contingency in D7 is active; the
   collector reconciles it against the inventory and the report shows it. Per
@@ -919,6 +963,10 @@ tools; `dumpbin` is a build-time acceptance dependency only.
    runs on the branch off main, PR6a is soft for `cospec apply` (once its record
    exists on the base) and a hard gate for phase 3 and archive
    (blocking-changes Phase Gates), and PR6b opens only on PR6a's branch.
+   Update 2026-09-26: PR6a merged to main first as #113 (`83666440`) and its
+   record `windows-arm64-bundle-input` is archived, so no stack exists; this
+   change's draft PR #115 is a plain PR against main, rebased onto main for
+   stage 3, and is retitled and marked ready at merge-ready.
 4. Resolved 2026-09-26 by lead ruling 2 (kuru-implement-phase2-sep26a): "Reject an explicit
    -Target that mismatches the native machine, with a message that names the
    native target." (Was: designer default, needs lead confirmation, that an
