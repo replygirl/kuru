@@ -99,20 +99,26 @@ impl Mode {
 }
 
 /// Hosted partition sets: OS label, mode and partition count. Workflow
-/// matrices are pinned against this table.
-pub const PARTITIONS: [(&str, Mode, u32); 4] = [
+/// matrices are pinned against this table, and it is the fail-closed
+/// allowlist of hosted labels: a label or mode it does not name fails every
+/// partition and merge. Windows on Arm runs the whole workspace suite
+/// uninstrumented, as behavioral evidence that never enters a coverage gate,
+/// until a pinned toolchain carries the fix for rust-lang/rust#150123.
+pub const PARTITIONS: [(&str, Mode, u32); 5] = [
     ("ubuntu-latest", Mode::Instrumented, 8),
     ("macos-latest", Mode::Instrumented, 4),
     ("windows-latest", Mode::Instrumented, 8),
     ("ubuntu-24.04-arm", Mode::Uninstrumented, 3),
+    ("windows-11-arm", Mode::Uninstrumented, 8),
 ];
 
 /// The Rust host target every hosted OS label's partitions must report.
-pub const OS_TARGETS: [(&str, &str); 4] = [
+pub const OS_TARGETS: [(&str, &str); 5] = [
     ("ubuntu-latest", "x86_64-unknown-linux-gnu"),
     ("macos-latest", "aarch64-apple-darwin"),
     ("windows-latest", "x86_64-pc-windows-msvc"),
     ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu"),
+    ("windows-11-arm", "aarch64-pc-windows-msvc"),
 ];
 
 /// The OS label that local, by-hand partition runs use. It accepts any
@@ -2632,11 +2638,38 @@ mod tests {
             Some(3)
         );
         assert_eq!(partition_count("ubuntu-latest", Mode::Uninstrumented), None);
-        check_partitioning(LOCAL_OS, Mode::Uninstrumented, 5).unwrap();
-        let error = check_partitioning("windows-2025", Mode::Instrumented, 8)
+        // Windows on Arm runs the Windows partition count uninstrumented; its
+        // instrumented set stays held (rust-lang/rust#150123), so an
+        // instrumented run there is refused, not quietly downgraded.
+        assert_eq!(
+            partition_count("windows-11-arm", Mode::Uninstrumented),
+            partition_count("windows-latest", Mode::Instrumented)
+        );
+        assert_eq!(os_target("windows-11-arm"), Some("aarch64-pc-windows-msvc"));
+        check_partitioning("windows-11-arm", Mode::Uninstrumented, 8).unwrap();
+        let error = check_partitioning("windows-11-arm", Mode::Instrumented, 8)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("no instrumented partition set"), "{error}");
+        assert!(
+            error.contains("no instrumented partition set is declared for windows-11-arm"),
+            "{error}"
+        );
+        check_partitioning(LOCAL_OS, Mode::Uninstrumented, 5).unwrap();
+        // Unknown hosted labels, including near-misses of the Windows ones,
+        // are refused in either mode.
+        for label in ["windows-2025", "windows-11-arm64", "windows-latest-arm"] {
+            assert_eq!(os_target(label), None, "{label}");
+            for mode in [Mode::Instrumented, Mode::Uninstrumented] {
+                let error = check_partitioning(label, mode, 8).unwrap_err().to_string();
+                assert!(
+                    error.contains(&format!(
+                        "no {} partition set is declared for {label}",
+                        mode.name()
+                    )),
+                    "{error}"
+                );
+            }
+        }
         assert_eq!(os_target(LOCAL_OS), None);
         assert!(EXCLUDED_ARTIFACTS.is_empty());
         for mode in [Mode::Instrumented, Mode::Uninstrumented] {

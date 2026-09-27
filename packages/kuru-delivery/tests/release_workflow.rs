@@ -11,7 +11,7 @@ use kuru_delivery::release::{self, GitHub, Version};
 use kuru_delivery::{
     archive::digest,
     command,
-    coverage::{Mode, partition_count},
+    coverage::{Mode, WORKSPACE_PACKAGES, os_target, partition_count},
     shell_support,
 };
 use kuru_platform::fs::make_executable;
@@ -447,7 +447,6 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
         "mise run coverage",
         "matrix.shard",
         "KURU_COVERAGE_SHARD:",
-        "KURU_COVERAGE_PACKAGES",
         "inputs.os != 'windows-latest'",
         "inputs.os == 'windows-latest'",
         "KURU_NATIVE_OS",
@@ -485,7 +484,7 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
         "KURU_COVERAGE_HELPER_CACHE: ${{ steps.helper-cache.outputs.cache-hit }}",
         "KURU_COVERAGE_SEED_CACHE: ${{ steps.seed.outputs.cache-hit }}",
         "KURU_COVERAGE_SEED_MATCHED_KEY: ${{ steps.seed.outputs.cache-matched-key }}",
-        "KURU_COVERAGE_MODE: instrumented",
+        "KURU_COVERAGE_MODE: ${{ inputs.os == 'windows-11-arm' && 'uninstrumented' || 'instrumented' }}\n",
         "KURU_COVERAGE_INPUTS",
         "KURU_COVERAGE_REPORT",
         "run: mise run //packages/kuru-delivery:coverage:shard",
@@ -501,11 +500,12 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
     // partitions' exported LCOV, rebuilding and instrumenting nothing.
     assert!(shards.contains("    runs-on: ${{ inputs.os }}\n"));
     assert!(merge.contains("    runs-on: ubuntu-latest\n"));
-    assert!(merge.contains("    name: Coverage merge (${{ inputs.os }})\n"));
-    assert!(
-        shards
-            .contains("    name: Coverage partition (${{ inputs.os }}, ${{ matrix.partition }})\n")
-    );
+    assert!(merge.contains(
+        "    name: ${{ inputs.os == 'windows-11-arm' && 'Behavior merge' || 'Coverage merge' }} (${{ inputs.os }})\n"
+    ));
+    assert!(shards.contains(
+        "    name: ${{ inputs.os == 'windows-11-arm' && 'Behavior partition' || 'Coverage partition' }} (${{ inputs.os }}, ${{ matrix.partition }})\n"
+    ));
     for forbidden in [
         "cargo-llvm-cov",
         "component add llvm-tools",
@@ -527,7 +527,9 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
     let ubuntu = table_count("ubuntu-latest", Mode::Instrumented);
     let macos = table_count("macos-latest", Mode::Instrumented);
     let windows = table_count("windows-latest", Mode::Instrumented);
+    let windows_arm = table_count("windows-11-arm", Mode::Uninstrumented);
     assert_eq!(ubuntu, windows, "the non-macOS branch names one count");
+    assert_eq!(ubuntu, windows_arm, "the non-macOS branch names one count");
     assert!(shards.contains(&format!(
         "        partition: ${{{{ fromJSON(inputs.os == 'macos-latest' && '{}' || '{}') }}}}\n",
         partition_list(macos),
@@ -536,7 +538,7 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
     let count = format!(
         "KURU_COVERAGE_PARTITIONS: ${{{{ inputs.os == 'macos-latest' && '{macos}' || '{ubuntu}' }}}}\n"
     );
-    assert_eq!(shards.matches(count.as_str()).count(), 2);
+    assert_eq!(shards.matches(count.as_str()).count(), 3);
     assert_eq!(merge.matches(count.as_str()).count(), 1);
     // Every partition and the merge share one helper key per OS; exactly
     // partition 1 saves it. The merge keeps its own helper cache.
@@ -560,12 +562,14 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
     // exports only from main partition 1 on a cache miss, and saves only a
     // staged export, never the consumed remainder of a restored seed.
     let steps = workflow_steps(shards);
-    let restore = named_step(&steps, "Restore the instrumented dependency seed");
+    // Each OS and mode seeds its own dependency outputs: Windows on Arm's
+    // uninstrumented partitions never restore an instrumented seed.
+    let restore = named_step(&steps, "Restore the dependency seed");
     for required in [
         "uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
         "path: ${{ runner.temp }}/kuru-coverage-seed\n",
-        "key: kuru-coverage-seed-v1-${{ inputs.os }}-instrumented-${{ hashFiles('Cargo.lock', 'mise.toml', 'mise.lock') }}",
-        "restore-keys: kuru-coverage-seed-v1-${{ inputs.os }}-instrumented-",
+        "key: kuru-coverage-seed-v1-${{ inputs.os }}-${{ env.KURU_NATIVE_MODE }}-${{ hashFiles('Cargo.lock', 'mise.toml', 'mise.lock') }}",
+        "restore-keys: kuru-coverage-seed-v1-${{ inputs.os }}-${{ env.KURU_NATIVE_MODE }}-",
     ] {
         assert!(restore.contains(required), "seed restore lost {required}");
     }
@@ -576,7 +580,7 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
     let stage = named_step(&steps, "Stage the exported dependency seed");
     assert!(stage.contains("if: env.KURU_COVERAGE_SEED_EXPORT != ''"));
     assert!(stage.contains("rm -rf -- \"$RUNNER_TEMP/kuru-coverage-seed\""));
-    let save = named_step(&steps, "Save the instrumented dependency seed");
+    let save = named_step(&steps, "Save the dependency seed");
     for required in [
         "if: env.KURU_COVERAGE_SEED_READY == 'true'",
         "uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
@@ -595,14 +599,17 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
         position("Run one checked coverage partition with the OS secret store")
             < position("Stage the exported dependency seed")
     );
-    // The merge downloads every partition's attempts in one pattern step.
+    // The merge downloads every partition's attempts in one pattern step;
+    // the only other downloads are the Windows on Arm engine imports of the
+    // partitions and the install job.
     assert_eq!(
         workflow
             .matches("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c")
             .count(),
-        1
+        3
     );
-    assert_eq!(workflow.matches("actions/download-artifact@").count(), 1);
+    assert_eq!(workflow.matches("actions/download-artifact@").count(), 3);
+    assert_eq!(merge.matches("actions/download-artifact@").count(), 1);
     assert!(merge.contains(
         "          pattern: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-partition-*\n          merge-multiple: false\n          path: ${{ runner.temp }}/kuru-coverage-inputs\n"
     ));
@@ -634,7 +641,7 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
         .filter_map(|line| line.trim().strip_prefix("KURU_COVERAGE_JOB_MINUTES: \""))
         .map(|value| value.strip_suffix('"').unwrap())
         .collect();
-    assert_eq!(deadlines, [timeout[0], timeout[0]]);
+    assert_eq!(deadlines, [timeout[0], timeout[0], timeout[0]]);
     // The Linux secret-store leg and the other runners run the same
     // partition under an identical environment, selected by runner.os.
     let other = named_step(&steps, "Run one checked coverage partition");
@@ -642,7 +649,9 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
         &steps,
         "Run one checked coverage partition with the OS secret store",
     );
-    assert!(other.contains("if: runner.os != 'Linux'"));
+    assert!(other.contains(
+        "if: runner.os != 'Linux' && !(runner.os == 'Windows' && runner.arch == 'ARM64')\n"
+    ));
     assert!(linux.contains("if: runner.os == 'Linux'"));
     assert_eq!(step_env(other), step_env(linux));
     assert!(step_env(other).contains(
@@ -665,6 +674,117 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
             assert!(!line.contains("inputs.os"), "step condition {line}");
         }
     }
+}
+
+#[test]
+fn windows_on_arm_partitions_are_uninstrumented_behavioral_evidence_with_an_imported_engine() {
+    let workflow = native_workflow();
+    let label = "windows-11-arm";
+    // The table is the fail-closed allowlist: Windows on Arm has only an
+    // uninstrumented set (rust-lang/rust#150123 holds instrumentation) with
+    // the Windows partition count and the native arm64 host target.
+    assert_eq!(partition_count(label, Mode::Instrumented), None);
+    assert_eq!(
+        partition_count(label, Mode::Uninstrumented),
+        partition_count("windows-latest", Mode::Instrumented)
+    );
+    assert_eq!(os_target(label), Some("aarch64-pc-windows-msvc"));
+
+    // One engine job, selected by the caller's label, calls the single
+    // pin-verifying bundle-build implementation at the validated commit.
+    let engine = workflow_job(&workflow, "dolt-windows-arm64", "shard");
+    assert_eq!(
+        engine,
+        "    if: inputs.os == 'windows-11-arm'\n    uses: ./.github/workflows/bundle-build.yml\n    with:\n      ref: ${{ inputs.ref }}\n"
+    );
+    // Partitions and installation wait for it on Windows on Arm, require its
+    // skip everywhere else and never run after a cancellation.
+    let requires_engine = "if: ${{ !cancelled() && needs.dolt-windows-arm64.result == (inputs.os == 'windows-11-arm' && 'success' || 'skipped') }}\n";
+    let shards = workflow_job(&workflow, "shard", "merge");
+    let merge = workflow_job(&workflow, "merge", "install");
+    let install = workflow_job(&workflow, "install", "native-gate");
+    assert!(shards.contains(&format!(
+        "    needs: dolt-windows-arm64\n    {requires_engine}"
+    )));
+    assert!(install.starts_with(
+        "    needs: dolt-windows-arm64\n    if: ${{ inputs.install && !cancelled() && needs.dolt-windows-arm64.result == (inputs.os == 'windows-11-arm' && 'success' || 'skipped') }}\n"
+    ));
+    assert!(merge.starts_with("    if: always()\n    needs: shard\n"));
+    // The mode follows the label table; the merge and partitions agree on it.
+    let mode = "${{ inputs.os == 'windows-11-arm' && 'uninstrumented' || 'instrumented' }}\n";
+    assert!(shards.contains(&format!("      KURU_NATIVE_MODE: {mode}")));
+    assert!(merge.contains(&format!("          KURU_COVERAGE_MODE: {mode}")));
+
+    // The distinct uninstrumented task runs every workspace package, with
+    // the coverage partition's inputs and no coverage tooling.
+    let packages = WORKSPACE_PACKAGES.join(",");
+    assert_eq!(
+        workflow.matches("KURU_COVERAGE_PACKAGES").count(),
+        2,
+        "only the Windows on Arm partition and merge name a package scope"
+    );
+    assert!(merge.contains(&format!(
+        "          KURU_COVERAGE_PACKAGES: ${{{{ inputs.os == 'windows-11-arm' && '{packages}' || '' }}}}\n"
+    )));
+    let steps = workflow_steps(shards);
+    let arm = named_step(
+        &steps,
+        "Run one checked uninstrumented Windows on Arm partition",
+    );
+    assert!(arm.contains("        if: runner.os == 'Windows' && runner.arch == 'ARM64'\n"));
+    assert!(arm.contains(&format!("          KURU_COVERAGE_PACKAGES: {packages}\n")));
+    assert!(arm.ends_with("        run: mise run //packages/kuru-delivery:test:partition"));
+    assert!(!arm.contains("coverage:shard"));
+    let other = step_env(named_step(&steps, "Run one checked coverage partition"));
+    let arm_env = step_env(arm);
+    for line in other
+        .lines()
+        .filter(|line| line.trim().starts_with("KURU_COVERAGE_"))
+    {
+        assert!(
+            arm_env.contains(line),
+            "Windows on Arm partition lost {line}"
+        );
+    }
+    assert!(
+        named_step(&steps, "Install coverage components")
+            .contains("if: env.KURU_NATIVE_MODE == 'instrumented'\n")
+    );
+
+    // Each Windows on Arm job imports the pinned engine before anything
+    // builds; bundle:prepare checks the committed pin again.
+    let download = "        if: runner.os == 'Windows' && runner.arch == 'ARM64'\n        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1\n        with:\n          name: ${{ needs.dolt-windows-arm64.outputs.artifact }}\n          path: ${{ runner.temp }}/bundle-input";
+    let import = "        if: runner.os == 'Windows' && runner.arch == 'ARM64'\n        shell: pwsh\n        run: |\n          $archive = Join-Path $env:RUNNER_TEMP 'bundle-input/dolt-windows-arm64.zip'\n          mise run //packages/kuru-memory:bundle:prepare -- --target aarch64-pc-windows-msvc --archive $archive --offline\n          if ($LASTEXITCODE -ne 0) { throw 'Windows arm64 engine import failed' }";
+    for (job, first_build) in [
+        (
+            shards,
+            "Run one checked uninstrumented Windows on Arm partition",
+        ),
+        (
+            install,
+            "Fetch locked Cargo inputs before offline verification",
+        ),
+    ] {
+        let steps = workflow_steps(job);
+        let position = |name: &str| {
+            steps
+                .iter()
+                .position(|step| step.starts_with(&format!("name: {name}\n")))
+                .unwrap_or_else(|| panic!("missing step {name}"))
+        };
+        let fetched = position("Download the Windows arm64 engine input");
+        let imported = position("Import the pin-verified Windows arm64 engine");
+        assert!(steps[fetched].ends_with(download), "{}", steps[fetched]);
+        assert!(steps[imported].ends_with(import), "{}", steps[imported]);
+        assert_eq!(fetched + 1, imported);
+        assert!(imported < position(first_build));
+        let tools = steps
+            .iter()
+            .position(|step| step.starts_with("uses: jdx/mise-action@"))
+            .unwrap();
+        assert!(tools < fetched);
+    }
+    assert_eq!(workflow.matches(import).count(), 2);
 }
 
 /// Splits workflow text into whole step blocks (the same `\n      - `
@@ -919,7 +1039,7 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
     assert_eq!(workflow.matches("\n  install:\n").count(), 1);
     let install = workflow_job(&workflow, "install", "native-gate");
     let header = install.split("    steps:\n").next().unwrap();
-    assert!(header.starts_with("    if: inputs.install\n"));
+    assert!(header.starts_with("    needs: dolt-windows-arm64\n    if: ${{ inputs.install && "));
     for required in ["runs-on: ${{ inputs.os }}", "timeout-minutes: 45"] {
         assert!(header.contains(required), "install job lost {required}");
     }
@@ -935,6 +1055,8 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
     };
     let order = [
         "Reserve space for release and test builds",
+        "Download the Windows arm64 engine input",
+        "Import the pin-verified Windows arm64 engine",
         "Fetch locked Cargo inputs before offline verification",
         "Prepare the package-owned bundle",
         "Prepare the package-owned bundle fixtures",
@@ -953,6 +1075,14 @@ fn native_workflow_installs_and_accepts_the_previous_release_update_on_every_os(
         (
             "Reserve space for release and test builds",
             Some("if: runner.os == 'Linux'"),
+        ),
+        (
+            "Download the Windows arm64 engine input",
+            Some("if: runner.os == 'Windows' && runner.arch == 'ARM64'"),
+        ),
+        (
+            "Import the pin-verified Windows arm64 engine",
+            Some("if: runner.os == 'Windows' && runner.arch == 'ARM64'"),
         ),
         (
             "Prepare the package-owned bundle fixtures",
