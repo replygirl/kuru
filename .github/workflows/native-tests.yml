@@ -262,6 +262,19 @@ jobs:
           name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kuru-coverage-evidence-${{ matrix.partition }}-${{ github.run_attempt }}
           if-no-files-found: error
+      # TEMPORARY, removed in this PR before it merges: one partition's raw
+      # llvm-cov export and summary per non-macOS OS, captured as line-export
+      # fixtures.
+      - name: Upload the raw line-export fixture
+        if: matrix.partition == 1 && runner.os != 'macOS'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-prefix }}-lines-fixture-${{ inputs.os }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/kuru-coverage-target/kuru-shard-state/coverage.raw.json
+            ${{ runner.temp }}/kuru-coverage-target/kuru-shard-state/coverage.summary.json
+          if-no-files-found: error
+          retention-days: 3
       - name: Upload failed partition diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
