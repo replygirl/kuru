@@ -41,7 +41,263 @@
 
 ## 8. Tooling and lockfiles on `windows-11-arm`
 
-- [ ] 8.1 @manual (agent) step-zero probe job output -> stock PowerShell 5.1 native machine is ARM64 under both shells; `VC.Tools.ARM64` and `dumpbin.exe` paths listed; `rustc --print host-tuple` is `aarch64-pc-windows-msvc`; `cospec --version` and `cog --version` results, whether an x64 PowerShell host launches, the runner image version and Visual Studio edition/version (README and `vswhere`) recorded because the label migrates to Visual Studio 2026 during 2026-09-21 to 2026-09-30 (actions/runner-images#14602), and the instrumented `cargo llvm-cov` smoke result recorded verbatim, including `llvm-profdata merge -sparse` stderr so rust-lang/rust#150123 is confirmed or ruled out on Rust 1.98.1 (recorded as the pinned toolchain's state; per design Open Question 7, lead ruling 1, the arm64 suites stay uninstrumented until a pinned toolchain carries the fix); also clang-cl presence (`vswhere -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang`, the located `clang-cl.exe`) and an `aws-lc-sys` build smoke for `aarch64-pc-windows-msvc`, whose build script requires clang-cl for Windows Arm64 (observed on the macOS cross-check: "Windows ARM64 requires clang-cl"; a missing component blocks every arm64 build job)
+- [x] 8.1 @manual (agent) step-zero probe job output -> stock PowerShell 5.1 native machine is ARM64 under both shells; `VC.Tools.ARM64` and `dumpbin.exe` paths listed; `rustc --print host-tuple` is `aarch64-pc-windows-msvc`; `cospec --version` and `cog --version` results, whether an x64 PowerShell host launches, the runner image version and Visual Studio edition/version (README and `vswhere`) recorded because the label migrates to Visual Studio 2026 during 2026-09-21 to 2026-09-30 (actions/runner-images#14602), and the instrumented `cargo llvm-cov` smoke result recorded verbatim, including `llvm-profdata merge -sparse` stderr so rust-lang/rust#150123 is confirmed or ruled out on Rust 1.98.1 (recorded as the pinned toolchain's state; per design Open Question 7, lead ruling 1, the arm64 suites stay uninstrumented until a pinned toolchain carries the fix); also clang-cl presence (`vswhere -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang`, the located `clang-cl.exe`) and an `aws-lc-sys` build smoke for `aarch64-pc-windows-msvc`, whose build script requires clang-cl for Windows Arm64 (observed on the macOS cross-check: "Windows ARM64 requires clang-cl"; a missing component blocks every arm64 build job)
+
+  Step-zero probe (task 3.2), observed 2026-09-26 on PR #115 via the temporary `.github/workflows/probe-windows-arm64.yml` (to be removed before merge). Evidence run: https://github.com/replygirl/kuru/actions/runs/36289581514/job/108536962446 (commit ab92798f on the PR merge ref with main 9def614b); earlier runs 36289122306 and 36289378393 (commits f9d82b74, 7cef5d50) recorded the same machine/shell/VS/cospec/cog results but lost the cargo smokes to the mise-shim finding below. Full log: `scratchpad/pr6b/stage3/probe/probe.log` (run 1 and 2 logs beside it).
+
+  - Label resolves: yes; `windows-11-arm` picked the job up within minutes; ImageOS `win11-vs2026-arm64`, ImageVersion `20260920.164.1`, Windows 11 Enterprise 10.0.26200, OSArchitecture "ARM 64-bit Processor".
+  - Native machine: stock Windows PowerShell 5.1.26100.9457 (Desktop, System32, Arm64 process) and pwsh 7.6.6 (Core, Arm64 process) both report `IsWow64Process2 processMachine=0x0000 nativeMachine=0xAA64` through `Add-Type` (Add-Type=ok in both); `PROCESSOR_ARCHITECTURE=ARM64`, `PROCESSOR_ARCHITEW6432` empty.
+  - x64 PowerShell host: none. System32 powershell.exe is 0xAA64, SysWOW64 powershell.exe is 0x014C (x86), no SysArm32 copy, the only pwsh.exe (Program Files\PowerShell\7) is 0xAA64. Task 3.7 therefore takes the no-launch-path branch.
+  - Visual Studio: Visual Studio Enterprise 2026, installationVersion 18.10.12210.168; `-requires Microsoft.VisualStudio.Component.VC.Tools.ARM64` and `-requires Microsoft.VisualStudio.Component.VC.Llvm.Clang` both resolve to `C:\Program Files\Microsoft Visual Studio\18\Enterprise`. Native ARM64 dumpbin: `...\VC\Tools\MSVC\14.51.36231\bin\Hostarm64\arm64\dumpbin.exe` (0xAA64; also 14.44.35207). vswhere.exe itself is x86 (0x014C) and ran under emulation.
+  - clang-cl: present. VS component `...\VC\Tools\Llvm\ARM64\bin\clang-cl.exe` (0xAA64) and `...\Llvm\x64\bin\clang-cl.exe`; PATH resolves `C:\Program Files\LLVM\bin\clang-cl.exe` (image LLVM). cmake on PATH; nasm and dumpbin not on PATH.
+  - Host tuple: image rustc and pinned `rustup run 1.98.1 rustc --print host-tuple` both `aarch64-pc-windows-msvc`; installed target `aarch64-pc-windows-msvc` (image default also has `aarch64-pc-windows-gnullvm`). mise 2026.9.4 is a native windows-arm64 build (0xAA64).
+  - cospec/cog under emulation: yes. `MISE_LOCKED=1` installed `cospec-0.8.2-windows-x64.zip` (cospec.exe 0x8664), `mise run cospec -- --version` printed `0.8.2`, exit 0. `setup:test-tools` installed `cocogitto-7.0.0-x86_64-pc-windows-msvc.tar.gz` (cog.exe 0x8664) and native `communique-aarch64-pc-windows-msvc.zip`; `cog --version` printed `cog 7.0.0`, exit 0. No exclusion is needed (lead ruling 5; task 3.3 takes the "cospec ran" branch).
+  - aws-lc-sys: built. `cargo +1.98.1 check -p kuru-delivery --features tooling --locked` exit 0 in 1m 28s; the build script set `CC_aarch64_pc_windows_msvc: clang-cl` and found clang-cl on PATH (its `stdalign_check.c` feature probe fails under -WX, which is a probe, not a build failure).
+  - Instrumented llvm-cov smoke: rust-lang/rust#150123 CONFIRMED on Rust 1.98.1 (LLVM 22.1.8-rust-1.98.1-stable). The instrumented `kuru-archive` test passed, but `llvm-profdata merge -sparse` rejected all 3 profraw files with "malformed instrumentation profile data: symbol name is empty" and "error: no profile can be merged" (exit 1); `cargo llvm-cov report` failed identically. The instrumented-arm64 hold (lead ruling 1) stays in force.
+  - New finding (lockfile): with main's #114, root `aqua:taiki-e/cargo-llvm-cov@0.9.1` has no `platforms.windows-arm64` lock entry, so `MISE_LOCKED=1 mise install` fails ("No lockfile URL found ... on platform windows-arm64 (--locked mode)") and every `mise x` or mise shim (cargo, rustc, rustup) first attempts that install and fails before running its command. Unlocked, aqua selects `cargo-llvm-cov-x86_64-pc-windows-msvc.tar.gz` (0x8664) although upstream publishes `cargo-llvm-cov-aarch64-pc-windows-msvc.{tar.gz,zip}`. Task 3.4's arm64 legs need a windows-arm64 lock entry for it (or a platform asset_pattern selecting the native asset) after rebasing onto main.
+
+  Delimited probe output (run 36289581514, verbatim; aws-lc-sys section filtered to compiler lines, mise progress-bar frames dropped, ANSI stripped):
+
+  ```text
+  ===== PROBE: runner image =====
+  ImageOS=win11-vs2026-arm64 ImageVersion=20260920.164.1 RUNNER_ARCH=ARM64
+  OS=Microsoft Windows NT 10.0.26200.0
+  Caption        : Microsoft Windows 11 Enterprise
+  Version        : 10.0.26200
+  BuildNumber    : 26200
+  OSArchitecture : ARM 64-bit Processor
+  ===== END: runner image =====
+  ===== PROBE: native machine, stock Windows PowerShell =====
+  PSEdition=Desktop PSVersion=5.1.26100.9457
+  Name                      Value                  
+  ----                      -----                  
+  PSVersion                 5.1.26100.9457         
+  PSEdition                 Desktop                
+  PSCompatibleVersions      {1.0, 2.0, 3.0, 4.0...}
+  BuildVersion              10.0.26100.9457        
+  CLRVersion                4.0.30319.42000        
+  WSManStackVersion         3.0                    
+  PSRemotingProtocolVersion 2.3                    
+  SerializationVersion      1.1.0.1
+  ProcessPath=C:\Windows\System32\WindowsPowerShell\v1.0\powershell.EXE
+  Is64BitProcess=True
+  RuntimeInformation.ProcessArchitecture=Arm64 OSArchitecture=Arm64
+  PROCESSOR_ARCHITECTURE=ARM64 PROCESSOR_ARCHITEW6432=
+  Add-Type=ok
+  IsWow64Process2 processMachine=0x0000 nativeMachine=0xAA64
+  ===== END: native machine, stock Windows PowerShell =====
+  ===== PROBE: native machine, pwsh =====
+  PSEdition=Core PSVersion=7.6.6
+  Name                      Value
+  ----                      -----
+  PSVersion                 7.6.6
+  PSEdition                 Core
+  GitCommitId               7.6.6
+  OS                        Microsoft Windows 10.0.26200
+  Platform                  Win32NT
+  PSCompatibleVersions      {1.0, 2.0, 3.0, 4.0…}
+  PSRemotingProtocolVersion 2.4
+  SerializationVersion      1.1.0.1
+  WSManStackVersion         3.0
+  ProcessPath=C:\Program Files\PowerShell\7\pwsh.EXE
+  Is64BitProcess=True
+  RuntimeInformation.ProcessArchitecture=Arm64 OSArchitecture=Arm64
+  PROCESSOR_ARCHITECTURE=ARM64 PROCESSOR_ARCHITEW6432=
+  Add-Type=ok
+  IsWow64Process2 processMachine=0x0000 nativeMachine=0xAA64
+  ===== END: native machine, pwsh =====
+  ===== PROBE: x64 PowerShell host =====
+  candidate: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe machine=0xAA64
+  candidate: C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe machine=0x014C
+  absent: C:\Windows\SysArm32\WindowsPowerShell\v1.0\powershell.exe
+  candidate: C:\Program Files\PowerShell\7\pwsh.exe machine=0xAA64
+  RESULT: no x64 PowerShell host found
+  ===== END: x64 PowerShell host =====
+  ===== PROBE: Visual Studio =====
+  vswhere=C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe exists=True machine=0x014C
+  displayName=Visual Studio Enterprise 2026 installationVersion=18.10.12210.168 productId=Microsoft.VisualStudio.Product.Enterprise path=C:\Program Files\Microsoft Visual Studio\18\Enterprise
+  requires VC.Tools.ARM64 -> [C:\Program Files\Microsoft Visual Studio\18\Enterprise]
+  requires VC.Llvm.Clang -> [C:\Program Files\Microsoft Visual Studio\18\Enterprise]
+  --- dumpbin.exe:
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.29.30133\bin\HostX64\arm\dumpbin.exe machine=0x8664
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.29.30133\bin\HostX64\arm64\dumpbin.exe machine=0x8664
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.29.30133\bin\HostX64\x64\dumpbin.exe machine=0x8664
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.29.30133\bin\HostX64\x86\dumpbin.exe machine=0x8664
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.29.30133\bin\HostX86\arm\dumpbin.exe machine=0x014C
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.29.30133\bin\HostX86\arm64\dumpbin.exe machine=0x014C
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.29.30133\bin\HostX86\x64\dumpbin.exe machine=0x014C
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.29.30133\bin\HostX86\x86\dumpbin.exe machine=0x014C
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostarm64\arm64\dumpbin.exe machine=0xAA64
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostarm64\x64\dumpbin.exe machine=0xAA64
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\arm64\dumpbin.exe machine=0x8664
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\dumpbin.exe machine=0x8664
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx86\arm64\dumpbin.exe machine=0x014C
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx86\x86\dumpbin.exe machine=0x014C
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostarm64\arm64\dumpbin.exe machine=0xAA64
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostarm64\x64\dumpbin.exe machine=0xAA64
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostarm64\x86\dumpbin.exe machine=0xAA64
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\arm64\dumpbin.exe machine=0x8664
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64\dumpbin.exe machine=0x8664
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x86\dumpbin.exe machine=0x8664
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx86\arm64\dumpbin.exe machine=0x014C
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx86\x64\dumpbin.exe machine=0x014C
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx86\x86\dumpbin.exe machine=0x014C
+  --- clang-cl.exe:
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\ARM64\bin\clang-cl.exe machine=0xAA64
+  C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin\clang-cl.exe machine=0x8664
+  --- PATH lookup:
+  clang-cl.exe -> C:\Program Files\LLVM\bin\clang-cl.exe
+  clang.exe -> C:\Program Files\LLVM\bin\clang.exe
+  cmake.exe -> C:\Program Files\CMake\bin\cmake.exe
+  ===== END: Visual Studio =====
+  ===== PROBE: image toolchain (not pinned) =====
+  rustc 1.98.1 (48a229cea 2026-09-01)
+  binary: rustc
+  commit-hash: 48a229ceaefd4985c50990b14116b6d856af0985
+  commit-date: 2026-09-01
+  host: aarch64-pc-windows-msvc
+  release: 1.98.1
+  LLVM version: 22.1.8
+  Default host: aarch64-pc-windows-msvc
+  rustup home:  C:\Users\runneradmin\.rustup
+
+  installed toolchains
+  --------------------
+  stable-aarch64-pc-windows-msvc (active, default)
+
+  active toolchain
+  ----------------
+  name: stable-aarch64-pc-windows-msvc
+  active because: it's the default toolchain
+  installed targets:
+    aarch64-pc-windows-gnullvm
+    aarch64-pc-windows-msvc
+  ===== END: image toolchain (not pinned) =====
+  ===== PROBE: pinned toolchain =====
+  direct cargo=C:\Users\runneradmin\.cargo\bin\cargo.exe rustup=C:\Users\runneradmin\.cargo\bin\rustup.exe
+  2026.9.4 windows-arm64 (2026-09-09)
+  mise machine=0xAA64
+  PATH cargo=C:\Users\runneradmin\.cargo\bin\cargo.exe rustc=C:\Users\runneradmin\.cargo\bin\rustc.exe
+  rustc 1.98.1 (48a229cea 2026-09-01)
+  binary: rustc
+  commit-hash: 48a229ceaefd4985c50990b14116b6d856af0985
+  commit-date: 2026-09-01
+  host: aarch64-pc-windows-msvc
+  release: 1.98.1
+  LLVM version: 22.1.8
+  aarch64-pc-windows-msvc
+  aarch64-pc-windows-msvc
+  ===== END: pinned toolchain =====
+  ===== PROBE: mise install (MISE_LOCKED=1) =====
+  MISE_LOCKED=1
+  mise by @jdx – installing 8 tools
+  mise ⇢ rust@1.98.1                        62ms · already installed
+  mise ✗ aqua:taiki-e/cargo-llvm-cov@0.9.1  2ms · failed: No lockfile URL found for aqua:taiki-e/cargo-llvm-cov@0.9.1 on platform windows-arm64 (--locked mode)
+  mise ✓ aqua:tamasfe/taplo@0.10.0          815ms  taplo-windows-aarch64.zip
+  mise ✓ aqua:jdx/hk@2.2.0                  967ms  hk-aarch64-pc-windows-msvc.zip
+  mise ✓ aqua:koalaman/shellcheck@0.11.0    1.0s  shellcheck-v0.11.0.zip
+  mise ✓ aqua:rhysd/actionlint@1.7.12       1.2s  actionlint_1.7.12_windows_arm64.zip
+  mise ✓ mr-boxington@1.18.0                1.9s  mbx.powershell
+  mise ✓ github:aligned-team/cospec@0.8.2   2.7s  cospec-0.8.2-windows-x64.zip
+  mise ERROR Failed to install aqua:taiki-e/cargo-llvm-cov@0.9.1: No lockfile URL found for aqua:taiki-e/cargo-llvm-cov@0.9.1 on platform windows-arm64 (--locked mode)
+  hint: Run `mise lock` to generate lockfile URLs, or disable locked mode
+  mise ERROR Version: 2026.9.4 windows-arm64 (2026-09-09)
+  mise ERROR Run with --verbose or MISE_VERBOSE=1 for more information
+  mise install exit=1
+  aqua:jdx/hk                  2.2.0             C:\a\kuru\kuru\mise.toml  2.2.0
+  aqua:koalaman/shellcheck     0.11.0            C:\a\kuru\kuru\mise.toml  0.11.0
+  aqua:rhysd/actionlint        1.7.12            C:\a\kuru\kuru\mise.toml  1.7.12
+  aqua:taiki-e/cargo-llvm-cov  0.9.1 (missing)   C:\a\kuru\kuru\mise.toml  0.9.1
+  aqua:tamasfe/taplo           0.10.0            C:\a\kuru\kuru\mise.toml  0.10.0
+  github:aligned-team/cospec   0.8.2             C:\a\kuru\kuru\mise.toml  0.8.2
+  mr-boxington                 1.18.0            C:\a\kuru\kuru\mise.toml  1.18.0
+  rust                         1.98.1 (symlink)  C:\a\kuru\kuru\mise.toml  1.98.1
+  ===== END: mise install (MISE_LOCKED=1) =====
+  ===== PROBE: cospec and cog =====
+  cospec binary=C:\Users\runneradmin\AppData\Local\mise\installs\github-aligned-team-cospec\0.8.2\cospec.exe machine=0x8664
+  [//:cospec] $ cospec --version
+  0.8.2
+  cospec exit=0
+  [//packages/kuru-delivery:setup:test-too…] $ mise install aqua:cocogitto/cocogitto@7.0.0 github:jdx/communique@1.4.2
+  mise by @jdx – installing 2 tools
+  mise ✓ aqua:cocogitto/cocogitto@7.0.0  400ms  cocogitto-7.0.0-x86_64-pc-windows-msvc.tar.gz
+  mise ✓ github:jdx/communique@1.4.2     796ms  communique-aarch64-pc-windows-msvc.zip
+  mise WARN  aqua:cocogitto/cocogitto, github:jdx/communique installed but not activated — they are not in any config file.
+  To install and activate, run:
+    mise use aqua:cocogitto/cocogitto
+    mise use github:jdx/communique
+  setup:test-tools exit=0
+  cog binary=C:\Users\runneradmin\AppData\Local\mise\installs\aqua-cocogitto-cocogitto\7.0.0\x86_64-pc-windows-msvc\cog.exe machine=0x8664
+  cog 7.0.0
+  cog exit=0
+  ===== END: cospec and cog =====
+  ===== PROBE: aws-lc-sys build smoke =====
+  direct cargo=C:\Users\runneradmin\.cargo\bin\cargo.exe rustup=C:\Users\runneradmin\.cargo\bin\rustup.exe
+    Downloaded cmake v0.1.58
+     Compiling cmake v0.1.58
+      Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 28s
+  cargo check exit=0
+  --- aws-lc-sys build script lines mentioning clang/cmake/cc-builder/requires/error:
+  cargo:warning=Setting CC_aarch64_pc_windows_msvc: clang-cl
+  cargo:warning=Environment Variable found 'CC_aarch64_pc_windows_msvc': 'clang-cl'
+  cargo:warning=Setting CC_aarch64_pc_windows_msvc: clang-cl
+  cargo:warning=C:\Users\RUNNER~1\CARGO~1\registry\src\INDEXC~1.IO-\AWS-LC~1.0\aws-lc\tests\compiler_features_tests\stdalign_check.c(12,14): error: unused parameter 'argc' [-Werror,-Wunused-parameter]
+  cargo:warning=C:\Users\RUNNER~1\CARGO~1\registry\src\INDEXC~1.IO-\AWS-LC~1.0\aws-lc\tests\compiler_features_tests\stdalign_check.c(12,27): error: unused parameter 'argv' [-Werror,-Wunused-parameter]
+  cargo:warning=2 errors generated.
+  cargo:warning=Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 1): \"clang-cl\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"--target=aarch64-pc-windows-msvc\" \"-WX\" \"-W4\" \"-FoC:\\\\a\\\\kuru\\\\kuru\\\\target\\\\debug\\\\build\\\\AWS-LC~4\\\\out\\\\out-stdalign_check\\\\2dcf3a9cab36088c-stdalign_ch
+  ===== END: aws-lc-sys build smoke =====
+  ===== PROBE: instrumented llvm-cov smoke =====
+  direct cargo=C:\Users\runneradmin\.cargo\bin\cargo.exe rustup=C:\Users\runneradmin\.cargo\bin\rustup.exe
+  info: downloading component llvm-tools
+  mise by @jdx – installing 1 tool
+  mise ✓ aqua:taiki-e/cargo-llvm-cov@0.9.1  1.6s  cargo-llvm-cov-x86_64-pc-windows-msvc.tar.gz
+  unlocked mise install cargo-llvm-cov exit=0
+  cargo-llvm-cov=C:\Users\runneradmin\AppData\Local\mise\installs\aqua-taiki-e-cargo-llvm-cov\0.9.1\cargo-llvm-cov.exe
+  cargo-llvm-cov machine=0x8664
+  cargo-llvm-cov 0.9.1
+  info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage
+     Compiling crc32fast v1.5.2
+     Compiling adler2 v2.0.1
+     Compiling simd-adler32 v0.3.10
+     Compiling cfg-if v1.0.4
+     Compiling hashbrown v0.17.1
+     Compiling anyhow v1.0.104
+     Compiling miniz_oxide v0.9.1
+     Compiling equivalent v1.0.2
+     Compiling typed-path v0.12.3
+     Compiling memchr v2.8.3
+     Compiling indexmap v2.14.2
+     Compiling flate2 v1.1.10
+     Compiling zip v8.6.0
+     Compiling kuru-archive v0.9.0 (C:\a\kuru\kuru\packages\kuru-archive)
+      Finished `test` profile [unoptimized + debuginfo] target(s) in 5.54s
+       Running unittests src\lib.rs (target\llvm-cov-target\debug\deps\kuru_archive-7c9d3df30f179d1f.exe)
+
+  running 1 test
+  test zip::tests::stored_deflated_and_empty_members_decode_without_assuming_writer_layout ... ok
+
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+  cargo llvm-cov --no-report exit=0
+  llvm-profdata=C:\Users\runneradmin\.rustup\toolchains\1.98.1-aarch64-pc-windows-msvc\lib\rustlib\aarch64-pc-windows-msvc\bin\llvm-profdata.exe exists=True
+  LLVM (http://llvm.org/):
+    LLVM version 22.1.8-rust-1.98.1-stable
+    Optimized build.
+  profraw files: 3
+  llvm-profdata merge -sparse: warning: C:\a\kuru\kuru\target\llvm-cov-target\kuru-3536-15794415139750836131_0.profraw: malformed instrumentation profile data: symbol name is empty
+  llvm-profdata merge -sparse: warning: C:\a\kuru\kuru\target\llvm-cov-target\kuru-8316-10589015400864982194_0.profraw: malformed instrumentation profile data: symbol name is empty
+  llvm-profdata merge -sparse: warning: C:\a\kuru\kuru\target\llvm-cov-target\kuru-6600-11249919341843589666_0.profraw: malformed instrumentation profile data: symbol name is empty
+  llvm-profdata merge -sparse: error: no profile can be merged
+  llvm-profdata merge -sparse exit=1
+  warning: C:\a\kuru\kuru\target\llvm-cov-target\kuru-3536-15794415139750836131_0.profraw: malformed instrumentation profile data: symbol name is empty
+  warning: C:\a\kuru\kuru\target\llvm-cov-target\kuru-8316-10589015400864982194_0.profraw: malformed instrumentation profile data: symbol name is empty
+  warning: C:\a\kuru\kuru\target\llvm-cov-target\kuru-6600-11249919341843589666_0.profraw: malformed instrumentation profile data: symbol name is empty
+  error: no profile can be merged
+  error: failed to merge profile data: process didn't exit successfully: `C:\Users\runneradmin\.rustup\toolchains\1.98.1-aarch64-pc-windows-msvc\lib\rustlib\aarch64-pc-windows-msvc\bin\llvm-profdata.exe merge -sparse -f C:\a\kuru\kuru\target\llvm-cov-target\kuru-profraw-list -o C:\a\kuru\kuru\target\llvm-cov-target\kuru.profdata` (exit code: 1)
+  cargo llvm-cov report exit=1
+  ===== END: instrumented llvm-cov smoke =====
+  ```
+
 - [ ] 8.2 @integration (agent) `mise install` under `MISE_LOCKED=1` on `windows-11-arm` with the `windows-arm64` lock entries -> every job's `install_args` tool installs; the emulated x64 cospec asset is tried first, and only if cospec still does not run is the named `cospec_contract` exclusion present in the shard receipt with its reason and nothing else skipped; if cospec runs, the receipt records that and nothing is excluded (lead ruling 5)
 - [ ] 8.3 @regression (agent) root `mise.toml` cospec `platforms.windows-arm64.asset_pattern` -> `mise lock` generates the `windows-arm64` entry naming `cospec-0.7.1-windows-x64.zip`, a second `mise lock` produces no diff, the cocogitto `windows-arm64` entry records the x64 asset aqua selected, and a deliberately non-matching `asset_pattern` never falls back to autodetection: `mise lock` skips the platform silently (exit 0, "Updated 0 platform entries (1 skipped)", no `windows-arm64` block) and only a later `MISE_LOCKED=1 mise install` fails, so the documented refresh confirms the cospec `platforms.windows-arm64` block exists after each lock, and `kuru-delivery repo` in `lint:tooling` fails when that element, its `specifiers`, `checksum` or `url` is missing. Known limitation (design D7): unlocked installs drop the non-host option element (`update_lockfiles`/`merge_tool_entries`), and auto-lock re-adds only the row without `specifiers` or, on a GitHub API 403, nothing. Lockfile-stable local runs therefore use `MISE_LOCKED=1` (https://mise.jdx.dev/dev-tools/mise-lock.html). Repro: unlocked `mise run //apps/kuru-docs:format:check` gives `mise.lock | 14 -` under an anonymous API rate limit (`scratchpad/pr6b/stage3/unlocked-docs/`). Unlocked `mise run format:check` gives the one-line `specifiers` loss (`stage3/v0/c_format_check.diff`, and `stage2/lock-repro/` on 2026.9.13 and 2026.9.4). `mise lock` restores both. With `MISE_LOCKED=1`, `mise ls`, `mise x -- cospec --version`, `mise run format:check` and `mise lock` leave all three lockfiles unchanged (`stage3/locked/*.stat`, all empty, mise 2026.9.13). The repository check rejects both damaged shapes on the real lock and in `repo_validation.rs` (observed 2026-09-26 in isolated copies with the pinned mise 2026.9.4: the correct pattern regenerates the committed block byte for byte (`scratchpad/pr6b/stage2/locktest/pos/pos.log`), a second lock with 2026.9.4 and 2026.9.13 produces no diff (`locktest/lock94.log`), and the non-matching pattern behaves as above (`locktest/neg/neg2.log`); the post-lock check is in `docs/development.md`; the cocogitto entry is `cocogitto-7.0.0-x86_64-pc-windows-msvc.tar.gz`, identical to its `windows-x64` entry; unrun: the CI lock diff check on the draft PR)
 
