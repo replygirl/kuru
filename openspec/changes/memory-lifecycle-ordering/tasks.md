@@ -15,8 +15,8 @@
 ## 3. H2: never release a directory before its Dolt is reaped
 
 - [x] 3.1 Make every `MemoryStore::open` error after `Server::open*` await the owned server's bounded close (`close_installed_guard`/`close_migration_worker`) and attach a close failure as context. Sites: store.rs 1724, 1770, 1803, 1878-1890, 1910-1914, 1938-1939 on c986f4ff. Verify task 1.2 turns green. Landed in 34a1a9b4.
-- [x] 3.2 Add `test_support::await_managed_quiescence` (`retire_idle_service`, then `Server::quiescence_at` within `SUPERVISOR_REAP_ALLOWANCE`). Use it in `kuru-runtime/src/dream.rs` and in every managed fixture that task 1.3 reported. Verify the invariant passes across the full kuru-memory and kuru-runtime suites with no test excluded. Landed in f5ec9c1b; fixtures lane reports the kuru-runtime suite green at 220/220 (`--test-threads=2`). The kuru-memory suite was not yet rerun after 34a1a9b4 landed alongside it — full-suite confirmation is still open (task 5.2).
-- [ ] 3.3 Re-run the 0.2 baseline loop and suites with tracing. Record the after-counts (verification 2.3). Not run.
+- [x] 3.2 Add `test_support::await_managed_quiescence` (`retire_idle_service`, then `Server::quiescence_at` within `SUPERVISOR_REAP_ALLOWANCE`). Use it in `kuru-runtime/src/dream.rs` and in every managed fixture that task 1.3 reported. Verify the invariant passes across the full kuru-memory and kuru-runtime suites with no test excluded. Landed in f5ec9c1b; fixtures lane reports the kuru-runtime suite green at 220/220 (`--test-threads=2`). The kuru-memory suite was not yet rerun after 34a1a9b4 landed alongside it — full-suite confirmation: round 1 passed 325/0 at 220997cf, after fixing an invariant false positive in two ungated owner-lock tests.
+- [x] 3.3 Re-run the 0.2 baseline loop and suites with tracing. Record the after-counts (verification 2.3). Round 1: 0 panics, 0 directories removed before exit and 0 unsuccessful supervisor exits across both loops and all traced suites (verification.md round 1 table).
 
 ## 4. Windows cancelled activation
 
@@ -26,7 +26,7 @@
 
 ## 5. Documentation and verification
 
-- [ ] 5.1 Document the fixture teardown invariant and `await_managed_quiescence` in `docs/development.md`, and verify the docs checks pass.
-- [ ] 5.2 Run the repository gates and the coverage gate, and record the results (verification 4.3, 4.4).
+- [x] 5.1 Document the fixture teardown invariant and `await_managed_quiescence` in `docs/development.md`, and verify the docs checks pass. Landed in 171b1903 with the opt-in `measure:lifecycle` task; `docs:check` passed.
+- [ ] 5.2 Run the repository gates and the coverage gate, and record the results (verification 4.3, 4.4). Round 1: local repository gates and all four package suites pass (verification 4.3); coverage not yet run.
 - [ ] 5.3 After push, collect the named macOS evidence set and the Ubuntu/Windows runs, and record every run and job id (verification 4.1, 4.2).
 - [ ] 5.4 Update `tmp/roadmap` dx-followons §16 as superseded, and route items 13 and 14 plus the 10/11 deadline sub-items to the first-launch budget item (untracked notes, not part of the commit).
