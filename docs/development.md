@@ -393,6 +393,15 @@ in `mise.local.toml` has no effect. CI workflows, the source installers and
 depend on a maintainer cache. Instrumented coverage never reads or writes the
 cache: cargo-llvm-cov supplies its own `RUSTC_WRAPPER`, which mbx defers to.
 
+`KURU_MBX=0` does not remove mr-boxington from the configured tool set, so CI
+also keeps it from being downloaded. Each job installs only its `mise-action`
+`install_args`, and every workflow sets `MISE_EXEC_AUTO_INSTALL=false` beside
+`MISE_TASK_RUN_AUTO_INSTALL=false`. On Windows, mise's executable shims run
+`mise x`, which would otherwise install every missing configured tool,
+mr-boxington included, on the first shim call such as `rustup` or `cargo`. A
+job that needs another tool must name it in `install_args`; the source
+installers already install only `rust` and pass it explicitly to `mise exec`.
+
 mbx restores outputs by copy-on-write clone on APFS, Btrfs, XFS with reflink,
 and ReFS. On filesystems without cloning, such as ext4, it hard-links the
 cache's object into `target/` and makes that object read-only first; NTFS

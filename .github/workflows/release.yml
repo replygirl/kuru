@@ -17,6 +17,9 @@ env:
   MISE_LOCKED: "1"
   # CI and release builds stay outside the maintainer mr-boxington cache.
   KURU_MBX: "0"
+  # Jobs install only their mise-action install_args. Windows exe shims run
+  # `mise x`, which would otherwise download every other configured tool.
+  MISE_EXEC_AUTO_INSTALL: "false"
 
 concurrency:
   group: release
