@@ -5333,16 +5333,15 @@ mod tests {
                     original_generation.close();
                     // Force exact old-owner/Dolt retirement, then expose the
                     // retained request only to a verified successor generation.
-                    served
-                        .retire(
+                    let _gate = served
+                        .restart(
+                            _gate,
                             &options,
-                            None,
+                            &project,
                             Duration::from_secs(10),
                             "selected ref old owner did not reap",
                         )
                         .await?;
-                    let successor = service::ServiceOwner::open(options.clone(), &project).await?;
-                    served.serve_successor(successor)?;
                     if staged {
                         ensure!(
                             memory.recover_selected_candidate_abandon().await?
@@ -5495,10 +5494,10 @@ mod tests {
                     })
                     .await
                     .context("owner did not commit the paused candidate write")??;
+                    witness.close();
                     tokio::time::timeout(Duration::from_secs(10), pause.replied.notified())
                         .await
                         .context("owner did not settle and reply to the paused candidate unit write")?;
-                    witness.close();
                     writer.abort();
                     let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
                         .await
@@ -5513,7 +5512,7 @@ mod tests {
                             .to_string()
                             .contains("typed candidate recovery")
                     );
-                    if restart_owner {
+                    let _gate = if restart_owner {
                         // The logical client keeps its pending receipt and fence, but
                         // releases old transports so the owner can reap before a
                         // successor performs the read-only proof and reattachment.
@@ -5522,30 +5521,38 @@ mod tests {
                         };
                         main_remote.attachment.lock().await.close();
                         remote.attachment.lock().await.close();
-                        let permit = tokio::time::timeout(Duration::from_secs(10), async {
-                            loop {
-                                match service::acquire_maintenance_permit(&options).await {
-                                    Ok(permit) => break Ok::<_, anyhow::Error>(permit),
-                                    Err(error)
-                                        if error
-                                            .to_string()
-                                            .contains("memory service has active clients") =>
-                                    {
-                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        // A one-shot successor open; see
+                        // `crate::spawn_gate::excluding_spawns`.
+                        let ((), gate) = crate::spawn_gate::excluding_spawns(_gate, async {
+                            let permit = tokio::time::timeout(Duration::from_secs(10), async {
+                                loop {
+                                    match service::acquire_maintenance_permit(&options).await {
+                                        Ok(permit) => break Ok::<_, anyhow::Error>(permit),
+                                        Err(error)
+                                            if error
+                                                .to_string()
+                                                .contains("memory service has active clients") =>
+                                        {
+                                            tokio::time::sleep(Duration::from_millis(20)).await;
+                                        }
+                                        Err(error) => break Err(error),
                                     }
-                                    Err(error) => break Err(error),
                                 }
-                            }
+                            })
+                            .await
+                            .context("closed candidate transports did not drain before owner retirement")??;
+                            served
+                                .reap(Duration::from_secs(10), "candidate unit old owner did not reap")
+                                .await?;
+                            drop(permit);
+                            let successor = service::ServiceOwner::open(options.clone(), &project).await?;
+                            served.serve_successor(successor)
                         })
-                        .await
-                        .context("closed candidate transports did not drain before owner retirement")??;
-                        served
-                            .reap(Duration::from_secs(10), "candidate unit old owner did not reap")
-                            .await?;
-                        drop(permit);
-                        let successor = service::ServiceOwner::open(options.clone(), &project).await?;
-                        served.serve_successor(successor)?;
-                    }
+                        .await?;
+                        gate
+                    } else {
+                        _gate
+                    };
                     let recovered = private
                         .recover_candidate_unit()
                         .await?
@@ -6014,22 +6021,23 @@ mod tests {
                             .contains("outcome is uncertain")
                     );
                     ensure!(memory.reconcile().await.is_err());
-                    if restart_owner {
+                    let _gate = if restart_owner {
                         // Keep the caller's pending UUID and fence, but release its
                         // old transport so the owner can retire and reap Dolt. The
                         // successor must reattach the ref without replaying Begin.
                         remote.attachment.lock().await.close();
                         served
-                            .retire(
+                            .restart(
+                                _gate,
                                 &options,
-                                None,
+                                &project,
                                 Duration::from_secs(10),
                                 "candidate fixture old owner did not reap",
                             )
-                            .await?;
-                        let successor = service::ServiceOwner::open(options.clone(), &project).await?;
-                        served.serve_successor(successor)?;
-                    }
+                            .await?
+                    } else {
+                        _gate
+                    };
                     let candidate = memory
                         .recover_candidate_begin()
                         .await

@@ -9798,26 +9798,34 @@ mod tests {
                 Ok::<(), anyhow::Error>(())
             }
             .await;
-            crate::test_support::settle(
-                body,
-                served.retire(
-                    &options,
-                    None,
-                    Duration::from_secs(10),
-                    "first owner did not reap after candidate client disconnected",
-                ),
-            )
-            .await?;
+            // The teardown's retirement releases the owner lock that the
+            // one-shot successor open below takes again; see
+            // `crate::spawn_gate::excluding_spawns`.
+            let ((candidate_refs, successor), _gate) =
+                crate::spawn_gate::excluding_spawns(_gate, async {
+                    crate::test_support::settle(
+                        body,
+                        served.retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "first owner did not reap after candidate client disconnected",
+                        ),
+                    )
+                    .await?;
 
-            let first = MemoryStore::open(options.clone()).await?;
-            let candidate_refs = candidate_refs_with_value(&first).await?;
-            ensure!(
-                candidate_refs.len() == 1,
-                "candidate ref was deleted on disconnect"
-            );
-            first.close().await?;
+                    let first = MemoryStore::open(options.clone()).await?;
+                    let candidate_refs = candidate_refs_with_value(&first).await?;
+                    ensure!(
+                        candidate_refs.len() == 1,
+                        "candidate ref was deleted on disconnect"
+                    );
+                    first.close().await?;
 
-            let successor = service::ServiceOwner::open(options.clone(), &project).await?;
+                    let successor = service::ServiceOwner::open(options.clone(), &project).await?;
+                    Ok((candidate_refs, successor))
+                })
+                .await?;
             successor.close().await?;
             let reopened = MemoryStore::open(options).await?;
             ensure!(

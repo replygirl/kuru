@@ -23,8 +23,8 @@ use crate::{
     service::{ServiceOwner, acquire_maintenance_permit},
 };
 use anyhow::{Context, Result, ensure};
-use std::{future::Future, time::Duration};
-use tokio::task::JoinHandle;
+use std::{future::Future, path::Path, time::Duration};
+use tokio::{sync::RwLockReadGuard, task::JoinHandle};
 
 /// The owner task a fixture is serving, or nothing once that task has ended.
 ///
@@ -95,6 +95,35 @@ impl ServedOwner {
         self.reap(reap_within, context).await?;
         drop(permit);
         Ok(())
+    }
+
+    /// Retire the served owner as [`Self::retire`] does, then open and serve
+    /// its successor, all with every other in-binary spawn excluded. Takes the
+    /// caller's shared spawn guard and returns a new one.
+    ///
+    /// [`ServiceOwner::open`] takes the owner lock once and never waits, as it
+    /// does in the product, where only a freshly elected owner process calls
+    /// it. In this multi-threaded test binary a sibling test's child can hold a
+    /// duplicate of the retired owner's lock description between its spawn and
+    /// its exec, so the successor would see a busy lock although no owner
+    /// exists; see [`crate::spawn_gate::excluding_spawns`].
+    pub(crate) async fn restart(
+        &mut self,
+        gate: RwLockReadGuard<'static, ()>,
+        options: &OpenOptions,
+        project: &Path,
+        reap_within: Duration,
+        context: &str,
+    ) -> Result<RwLockReadGuard<'static, ()>> {
+        let ((), gate) = crate::spawn_gate::excluding_spawns(gate, async {
+            self.retire(options, None, reap_within, context).await?;
+            let successor = ServiceOwner::open(options.clone(), project)
+                .await
+                .with_context(|| format!("{context}: its successor did not open"))?;
+            self.serve_successor(successor)
+        })
+        .await?;
+        Ok(gate)
     }
 }
 

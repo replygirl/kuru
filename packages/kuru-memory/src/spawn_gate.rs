@@ -87,6 +87,29 @@ pub(crate) fn spawning_blocking() -> RwLockReadGuard<'static, ()> {
     GATE.spawning_blocking()
 }
 
+/// Release a lock and acquire it again with every other in-binary spawn
+/// excluded: give up the caller's shared guard, run `restart` under the
+/// exclusive guard, then return a new shared guard for the rest of the test.
+///
+/// A one-shot acquisition right after a release (for example a successor
+/// `ServiceOwner::open` after its predecessor closed) needs this. A shared
+/// guard does not exclude a sibling test's spawn, and that sibling's child can
+/// hold a duplicate of the just-released description until its exec. `restart`
+/// must span the release as well as the reacquisition, and the caller must not
+/// hold another shared guard: the gate is fair, so a nested shared acquisition
+/// would wait behind this writer forever. On an error the caller keeps no
+/// guard, which is harmless for a fixture that only tears down afterwards.
+pub(crate) async fn excluding_spawns<T>(
+    held: RwLockReadGuard<'static, ()>,
+    restart: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<(T, RwLockReadGuard<'static, ()>)> {
+    drop(held);
+    let exclusive = locking_async().await;
+    let value = restart.await?;
+    drop(exclusive);
+    Ok((value, spawning().await))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;

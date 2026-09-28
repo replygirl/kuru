@@ -2904,9 +2904,12 @@ mod tests {
                 drop(outcome_server);
                 drop(outcome);
             }
-            owner.close().await?;
-
-            let mut successor = ServiceOwner::open(options, &project).await?;
+            // A one-shot successor open; see `crate::spawn_gate::excluding_spawns`.
+            let (mut successor, _gate) = crate::spawn_gate::excluding_spawns(_gate, async {
+                owner.close().await?;
+                ServiceOwner::open(options, &project).await
+            })
+            .await?;
             ensure!(
                 successor.authority().service_generation != original.service_generation,
                 "owner restart retained its prior generation"
@@ -3595,9 +3598,12 @@ mod tests {
                 CandidateTransitionResult::StillUncertain
             ));
             drop(candidate);
-            owner.close().await?;
-
-            let mut successor = ServiceOwner::open(options, &project).await?;
+            // A one-shot successor open; see `crate::spawn_gate::excluding_spawns`.
+            let (mut successor, _gate) = crate::spawn_gate::excluding_spawns(_gate, async {
+                owner.close().await?;
+                ServiceOwner::open(options, &project).await
+            })
+            .await?;
             let current = successor.authority().clone();
             ensure!(matches!(
                 inspect(&mut successor, &current, &data, &scope, &original.service_generation, CandidateTransitionKind::Promote, (&branch, &base, &target)).await?,
@@ -3763,9 +3769,7 @@ mod tests {
                         }
                     }
                 }).await.context("accepted abandonment proof deadline")??;
-                served.retire(&options, None, Duration::from_secs(10), "promotion fixture owner did not reap").await?;
-                let successor = ServiceOwner::open(options.clone(), &project).await?;
-                served.serve_successor(successor)?;
+                let _gate = served.restart(_gate, &options, &project, Duration::from_secs(10), "promotion fixture owner did not reap").await?;
                 let mut observer = attach_existing(&options, &project).await?
                     .context("successor did not publish its endpoint")?;
                 ensure!(observer.generation() != generation);
@@ -3926,9 +3930,12 @@ mod tests {
                 .store
                 .put("later/main", &serde_json::json!("sibling"))
                 .await?;
-            owner.close().await?;
-
-            let mut successor = ServiceOwner::open(options.clone(), &project).await?;
+            // A one-shot successor open; see `crate::spawn_gate::excluding_spawns`.
+            let (mut successor, _gate) = crate::spawn_gate::excluding_spawns(_gate, async {
+                owner.close().await?;
+                ServiceOwner::open(options.clone(), &project).await
+            })
+            .await?;
             let next = successor.authority().clone();
             ensure!(next.service_generation != original_generation);
             let CandidateCreationOutcome::Open {
@@ -3962,16 +3969,21 @@ mod tests {
                 "candidate private rows disappeared across owner restart"
             );
             drop(retained);
-            successor.close().await?;
+            // The owner lock released by this close is next taken by the final
+            // one-shot open; see `crate::spawn_gate::excluding_spawns`.
+            let (mut final_owner, _gate) = crate::spawn_gate::excluding_spawns(_gate, async {
+                successor.close().await?;
 
-            let local = crate::store::MemoryStore::open(options.clone()).await?;
-            let CandidateLookup::Open(candidate) = local.candidate_for_id(id).await? else {
-                bail!("exact candidate was missing before explicit abandonment")
-            };
-            candidate.abandon().await?;
-            drop(candidate);
-            local.close().await?;
-            let mut final_owner = ServiceOwner::open(options, &project).await?;
+                let local = crate::store::MemoryStore::open(options.clone()).await?;
+                let CandidateLookup::Open(candidate) = local.candidate_for_id(id).await? else {
+                    bail!("exact candidate was missing before explicit abandonment")
+                };
+                candidate.abandon().await?;
+                drop(candidate);
+                local.close().await?;
+                ServiceOwner::open(options, &project).await
+            })
+            .await?;
             let final_authority = final_owner.authority().clone();
             ensure!(matches!(
                 inspect(
@@ -4142,17 +4154,22 @@ mod tests {
                 std::fs::write(&path, b"not a directory")?;
                 path
             };
-            ensure!(
-                ServiceOwner::open(options.clone(), &project).await.is_err(),
-                "blocked native publication unexpectedly published an owner"
-            );
-            std::fs::remove_file(obstruction)?;
-            ensure!(
-                EndpointRecord::read(&data, &scope)?.is_none(),
-                "failed publication left a discoverable endpoint"
-            );
-            let reopened = ServiceOwner::open(options, &project).await?;
-            reopened.close().await?;
+            // The rejected open releases the owner lock that the one-shot reopen
+            // takes again; see `crate::spawn_gate::excluding_spawns`.
+            let ((), _gate) = crate::spawn_gate::excluding_spawns(_gate, async {
+                ensure!(
+                    ServiceOwner::open(options.clone(), &project).await.is_err(),
+                    "blocked native publication unexpectedly published an owner"
+                );
+                std::fs::remove_file(obstruction)?;
+                ensure!(
+                    EndpointRecord::read(&data, &scope)?.is_none(),
+                    "failed publication left a discoverable endpoint"
+                );
+                let reopened = ServiceOwner::open(options, &project).await?;
+                reopened.close().await
+            })
+            .await?;
             Ok::<(), anyhow::Error>(())
         })
         .await
