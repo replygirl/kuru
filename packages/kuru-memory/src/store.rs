@@ -34,6 +34,9 @@ use crate::{
 mod recovery_tests;
 
 #[cfg(test)]
+#[path = "store/lifecycle_measurement_tests.rs"]
+mod lifecycle_measurement_tests;
+#[cfg(test)]
 #[path = "store/migration_lifecycle_tests.rs"]
 mod migration_lifecycle_tests;
 #[cfg(test)]

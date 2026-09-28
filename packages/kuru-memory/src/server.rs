@@ -143,6 +143,9 @@ struct Owner {
     reap_guard: Arc<StdMutex<Option<File>>>,
     #[cfg(test)]
     reaped_observer: Option<oneshot::Sender<()>>,
+    /// Test-support measurement only: the data directory this owner serves.
+    #[cfg(any(test, feature = "test-support"))]
+    trace_directory: PathBuf,
 }
 
 impl Drop for Owner {
@@ -157,6 +160,19 @@ impl Drop for Owner {
             .lock()
             .expect("memory reap guard lock")
             .take();
+        #[cfg(any(test, feature = "test-support"))]
+        let trace = {
+            use crate::test_support::lifecycle_trace as trace;
+            trace::event(
+                "owner_dropped_live",
+                format_args!(
+                    "retained={} directory={}",
+                    retained.is_some(),
+                    self.trace_directory.display()
+                ),
+            );
+            (self.trace_directory.clone(), trace::label())
+        };
         // Independent of Tokio: tests and CLI shutdown may destroy the runtime
         // immediately after the last store handle. Keep fixture files until the
         // supervisor has confirmed that Dolt is reaped.
@@ -167,7 +183,20 @@ impl Drop for Owner {
                 retained,
                 SUPERVISOR_REAP_ALLOWANCE + DROPPED_REAP_WARNING_MARGIN,
                 SupervisorChild::try_wait,
-            )
+            );
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                use crate::test_support::lifecycle_trace as trace;
+                let (directory, label) = trace;
+                trace::event(
+                    "owner_dropped_reaped",
+                    format_args!(
+                        "origin={label} dir_exists={} directory={}",
+                        trace::exists(&directory),
+                        directory.display()
+                    ),
+                );
+            }
         });
     }
 }
@@ -455,6 +484,11 @@ impl Server {
             if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
                 command.env("LLVM_PROFILE_FILE", profile);
             }
+            // Test-support measurement only: forward the inert-by-default trace.
+            #[cfg(any(test, feature = "test-support"))]
+            for (name, value) in crate::test_support::lifecycle_trace::forwarded() {
+                command.env(name, value);
+            }
             let child = command
                 .spawn()
                 .context("start memory lifetime supervisor")?;
@@ -468,6 +502,8 @@ impl Server {
                 reap_guard: reap_guard.clone(),
                 #[cfg(test)]
                 reaped_observer: None,
+                #[cfg(any(test, feature = "test-support"))]
+                trace_directory: directory.clone(),
             };
             let child = owner
                 .child
@@ -520,6 +556,11 @@ impl Server {
                     .environment
                     .push(("LLVM_PROFILE_FILE".into(), profile));
             }
+            // Test-support measurement only: forward the inert-by-default trace.
+            #[cfg(any(test, feature = "test-support"))]
+            command
+                .environment
+                .extend(crate::test_support::lifecycle_trace::forwarded());
             let child = command
                 .spawn()
                 .await
@@ -536,6 +577,8 @@ impl Server {
                 reap_guard: reap_guard.clone(),
                 #[cfg(test)]
                 reaped_observer: None,
+                #[cfg(any(test, feature = "test-support"))]
+                trace_directory: directory.clone(),
             };
             let response = timeout_at(startup_deadline, async {
                 owner.lifetime = Some(
@@ -911,6 +954,16 @@ async fn finish_owner(owner: &mut Owner) -> Result<()> {
         sleep(Duration::from_millis(20)).await;
     };
     owner.child.take();
+    #[cfg(any(test, feature = "test-support"))]
+    crate::test_support::lifecycle_trace::event(
+        "owner_finished",
+        format_args!(
+            "success={} dir_exists={} directory={}",
+            status.success(),
+            crate::test_support::lifecycle_trace::exists(&owner.trace_directory),
+            owner.trace_directory.display()
+        ),
+    );
     ensure!(
         status.success(),
         "memory supervisor exited unsuccessfully ({status})"
@@ -1046,6 +1099,15 @@ impl LifecycleLease {
 
     pub(crate) fn move_to(&mut self, destination: &Path) -> Result<()> {
         self.verify()?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_support::lifecycle_trace::event(
+            "lease_move",
+            format_args!(
+                "from={} to={}",
+                self.directory.path().display(),
+                destination.display()
+            ),
+        );
         self.directory = files::move_directory(&self.directory, destination)?;
         #[cfg(unix)]
         {
@@ -1060,6 +1122,11 @@ impl LifecycleLease {
     /// quarantine identity for a later explicit reconciliation attempt.
     pub(crate) fn remove_tree(self) -> Result<()> {
         self.verify()?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_support::lifecycle_trace::event(
+            "lease_remove_tree",
+            format_args!("directory={}", self.directory.path().display()),
+        );
         let Self {
             directory,
             lock_directory,
@@ -1761,13 +1828,26 @@ async fn supervise_with_port_hook<
         )
         .await?;
         let log = Arc::new(Mutex::new(Vec::new()));
+        // Test-support measurement only: a live mirror outliving the fixture.
+        #[cfg(any(test, feature = "test-support"))]
+        let (mirror, stdout_mirror, stderr_mirror) = {
+            let mirror = crate::test_support::lifecycle_trace::DoltMirror::open(
+                &request.directory,
+                vec![identity.password.clone(), identity.reader_password.clone()],
+            );
+            (mirror.clone(), mirror.clone(), mirror)
+        };
+        #[cfg(not(any(test, feature = "test-support")))]
+        let (stdout_mirror, stderr_mirror): (LogMirror, LogMirror) = ((), ());
         let stdout = tokio::spawn(drain(
             child.stdout().context("Dolt stdout missing")?,
             log.clone(),
+            stdout_mirror,
         ));
         let stderr = tokio::spawn(drain(
             child.stderr().context("Dolt stderr missing")?,
             log.clone(),
+            stderr_mirror,
         ));
         let run_result = async {
         tokio::select! {
@@ -1783,7 +1863,29 @@ async fn supervise_with_port_hook<
             _ = signals.recv() => Ok(()),
         }
         }.await;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(mirror) = &mirror {
+            mirror.note(
+                "stop_begin",
+                format_args!(
+                    "run_ok={} dir_exists={}",
+                    run_result.is_ok(),
+                    crate::test_support::lifecycle_trace::exists(&request.directory)
+                ),
+            );
+        }
         let stopped = stop_child(&mut child).await;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(mirror) = &mirror {
+            mirror.note(
+                "child_exit",
+                format_args!(
+                    "stopped={:?} dir_exists={}",
+                    stopped.as_ref().map_err(|error| format!("{error:#}")),
+                    crate::test_support::lifecycle_trace::exists(&request.directory)
+                ),
+            );
+        }
         if stopped.is_err() {
             // The parent has its own bounded close deadline. A failure to reap
             // cannot make the directory safe to move: retain this supervisor and
@@ -1806,7 +1908,12 @@ async fn supervise_with_port_hook<
             }
             Err(_) => diagnostic.push_str("\nKuru engine shutdown: observed after cleanup error\n"),
         }
-        write_private(&request.directory.join("server.log"), diagnostic.as_bytes())?;
+        let written = write_private(&request.directory.join("server.log"), diagnostic.as_bytes());
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(mirror) = &mirror {
+            mirror.note("server_log_write", format_args!("ok={}", written.is_ok()));
+        }
+        written?;
         if let Some(published) = read_record::<Endpoint>(&request.directory.join("endpoint.json"))?
             && published.instance == endpoint.instance
             && published.port == endpoint.port
@@ -1943,11 +2050,22 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     files::write(path, bytes)
 }
 
-async fn drain<R: AsyncRead + Unpin>(mut reader: R, log: Arc<Mutex<Vec<u8>>>) {
+#[cfg(any(test, feature = "test-support"))]
+type LogMirror = Option<Arc<crate::test_support::lifecycle_trace::DoltMirror>>;
+#[cfg(not(any(test, feature = "test-support")))]
+type LogMirror = ();
+
+async fn drain<R: AsyncRead + Unpin>(mut reader: R, log: Arc<Mutex<Vec<u8>>>, mirror: LogMirror) {
+    #[cfg(not(any(test, feature = "test-support")))]
+    let () = mirror;
     let mut bytes = [0; 4096];
     while let Ok(length) = reader.read(&mut bytes).await {
         if length == 0 {
             break;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(mirror) = &mirror {
+            mirror.write(&bytes[..length]);
         }
         let mut log = log.lock().await;
         log.extend_from_slice(&bytes[..length]);

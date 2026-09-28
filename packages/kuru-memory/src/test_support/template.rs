@@ -846,6 +846,9 @@ mod tests {
                 command.env(name, value);
             }
         }
+        for (name, value) in crate::test_support::lifecycle_trace::forwarded() {
+            command.env(name, value);
+        }
         // Held across the spawn; see `crate::spawn_gate`.
         let _gate = crate::spawn_gate::spawning().await;
         Ok(command.spawn()?)
@@ -902,6 +905,9 @@ mod tests {
                 command.environment.push((name.into(), value));
             }
         }
+        command
+            .environment
+            .extend(crate::test_support::lifecycle_trace::forwarded());
         let stdout: std::os::windows::io::OwnedHandle = File::create(log)?.into();
         let stderr: std::os::windows::io::OwnedHandle =
             File::create(log.with_extension("stderr"))?.into();

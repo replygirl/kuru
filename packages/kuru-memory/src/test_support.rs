@@ -22,6 +22,8 @@
 //! instance identity, credentials or migration receipts, or that needs
 //! migrations to run. When in doubt, use the cold constructor.
 pub use crate::files::PrivateTemp as TempDir;
+/// Env-gated lifecycle ordering measurement trace (inert unless enabled).
+pub mod lifecycle_trace;
 pub(crate) mod template;
 #[cfg(windows)]
 pub mod windows;

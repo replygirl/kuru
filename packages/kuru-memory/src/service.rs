@@ -620,6 +620,11 @@ async fn spawn_service(
     command.stdout(std::process::Stdio::null());
     command.stderr(stderr.map_or_else(std::process::Stdio::null, std::process::Stdio::from));
     command.process_group(0);
+    // Test-support measurement only: name the originating test in the trace.
+    #[cfg(any(test, feature = "test-support"))]
+    for (name, value) in crate::test_support::lifecycle_trace::forwarded() {
+        command.env(name, value);
+    }
     command.spawn().context("start project memory service")
 }
 
@@ -656,6 +661,11 @@ async fn spawn_service(
             .environment
             .push((STARTUP_STAGE_DIAGNOSTIC_ENV.into(), OsString::from("1")));
     }
+    // Test-support measurement only: forward the inert-by-default trace.
+    #[cfg(any(test, feature = "test-support"))]
+    command
+        .environment
+        .extend(crate::test_support::lifecycle_trace::forwarded());
     command
         .spawn()
         .await

@@ -117,6 +117,9 @@ async fn spawn_process_loss_creator(
             command.env(name, value);
         }
     }
+    for (name, value) in crate::test_support::lifecycle_trace::forwarded() {
+        command.env(name, value);
+    }
     // Held across the spawn; see `crate::spawn_gate`.
     let _gate = crate::spawn_gate::spawning().await;
     Ok(command.spawn()?)
@@ -162,6 +165,9 @@ async fn spawn_process_loss_creator(
             command.environment.push((name.into(), value));
         }
     }
+    command
+        .environment
+        .extend(crate::test_support::lifecycle_trace::forwarded());
     let stderr: std::os::windows::io::OwnedHandle = std::fs::File::create(stderr)?.into();
     command.stdin = NativeStdio::Null;
     command.stdout = NativeStdio::Pipe;
