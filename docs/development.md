@@ -479,15 +479,20 @@ calls, and the ledger records it on the next thread that reads the ledger.
 
 A Dolt branch rename or delete must follow server-observed end of every
 session on that branch, not only Kuru's pool close; otherwise Dolt refuses the
-checked procedure as in use (error 1105). `Server::retire_branch_sessions`
-fences the branch's pool admission, retires its pool and awaits that session
-end, and returns a `SessionsEnded` proof. The rename, exclusion-probe and
-delete procedures are built only from that proof, and each borrows its
-admission fence until it has run. The raw pool close is private to
-`server.rs`; the only other close is `close_pool_without_session_end`, which
-grants no branch procedure. The compiler rejects a forged proof, and
-`server::branch_procedure_tests` rejects a rename or delete written as raw SQL
-anywhere else in the crate's non-test code.
+checked procedure as in use (error 1105). The caller first fences the
+branch's pool admission with `Server::fence_pool`; `Server::retire_branch_sessions`
+takes that admission, retires the branch's pool, awaits that session end and
+returns a `SessionsEnded` proof. The rename, exclusion-probe and delete
+procedures are built only from that proof, and each borrows the admission
+fence until it has run. The compiler-checked proof is the enforcement: it
+cannot be forged outside `server.rs` or reused. Keeping the raw pool close
+private is not: `close_pool_without_session_end` is visible to the crate and
+closes the pool the same way; it only cannot produce a proof.
+`server::branch_procedure_tests` is a textual backstop for raw SQL. It rejects
+a quoted rename, delete or force flag (in either quote style, inline, bound,
+assigned or on another line) in any non-test source outside
+`impl SessionsEnded`, but it cannot see a flag or procedure name assembled at
+run time.
 
 The lifecycle-ordering measurements are ignored tests, and their Dolt trace is
 inert unless `KURU_TEST_DOLT_LOG_DIR` names a directory, so neither runs in

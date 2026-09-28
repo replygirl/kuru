@@ -301,3 +301,22 @@ Every other product `DOLT_BRANCH` (`store.rs` candidate creation, `usage_ledger.
 Unchanged: `QUERY_TIMEOUT`, `CLOSE_GRACE`, both steps' error text, the `PoolRetirement` stage, the uncertain-write receipts and the point at which the transition releases its fence. No assertion changed; the gc canary now holds the branch's admission around the step and releases it before its own transition.
 
 Not run: `EngineOwner::drop` and every other `cfg(windows)` path (type-checked only); Linux and coverage-instrumented builds; CI.
+
+## Round 9: source-scan hardening and record corrections (2026-09-28, same host)
+
+Evidence: `$S/flake/ci/pr125-hardening/round9/`. Rebased onto `origin/main` 686eb16b first. `docs/development.md` changed on both sides, but both sides only added separate paragraphs, so Git merged it without a conflict; the diff against `origin/main` removes no line of `main`'s text.
+
+Review of round 8 found that the line-based scan in `server::branch_procedure_tests` passed four shapes: a flag assigned to a variable and bound (the exact delete shape round 8 removed from `store.rs`), a lower-case `dolt_branch`, a double-quoted flag, and a flag on a continuation line. It also found two overstatements in `docs/development.md`: `retire_branch_sessions` takes the caller's admission from `fence_pool` rather than fencing, and the scan does not reject every raw rename or delete. Both are corrected there and in design D9, which now also states that `close_pool_without_session_end` is `pub(crate)` and closes a pool exactly as the private `retire_pool` does, so the proof token, not the private close, is the enforcement.
+
+The scan now rejects any quoted destructive flag literal in either quote style anywhere in a non-test product file, outside `impl SessionsEnded`; it is file-wide and applies to every product file (design D9 gives the reasons). It is a backstop for raw SQL; the compiler-checked token is the enforcement for typed routes, and a flag or procedure name assembled at run time passes the scan.
+
+| check | result |
+|---|---|
+| `the_scan_rejects_every_raw_branch_rename_or_delete_shape` | the review's four probes, four earlier shapes and six new ones (a flag constant in a module that never names the procedure, a raw string with `--force`, `Dolt_Branch('-M', ...)`, `' --MOVE '`, a flag in a bound argument array, a flag returned by a helper) each rejected; creation, `dolt_branches` queries, `"--delete-me"`/`"-dx"`/`"x-d"`, lifetimes and backticked comment flags accepted |
+| `branch_renames_and_deletes_are_built_only_from_a_sessions_ended_proof` on the real sources (`scan-final.log`) | pass; `server.rs` holds exactly four flag literals and three procedures, all inside `impl SessionsEnded`; no product file needed restructuring |
+| the removed delete shape (`let flag = if force { "-D" } else { "-d" };` then `.bind(flag)`) injected into `store/usage_ledger.rs` (`scan-red.log`) | FAIL naming both literals at 1813:28 and 1813:42; the injection was reverted with `git checkout` |
+| affected tests (39, `loop-tests.txt`), once, `--test-threads=8` (`affected-t8.log`) | 39/0 in 34 s; load 3.95 -> 3.77. A first invocation through a relative binary path failed 35 tests before any ran, on the prepared-supervisor absolute-path check (`affected-t8-relative-path-invocation.log`); rerun by absolute path, not a retry of a failure |
+| `//packages/kuru-memory:test` (`memory-test.log`, load 3.70 -> 6.66) | lib 322 passed / 0 failed / 3 ignored; every integration target ok |
+| `format:check`, `lint`, `typecheck`, `lint:tooling` (its log shows `//:lint:workflows` and `//packages/kuru-delivery:check:repo` ran), `docs:check`, `cospec -- validate memory-lifecycle-ordering --strict` (`gates.txt`) | all exit 0; `format:check` first failed on one line of the new test, fixed by `rustfmt` (whitespace only), then passed with `lint`; the scan tests reran green after it. The affected run and `memory:test` preceded that reflow |
+
+No product code changed. Not run: `//packages/kuru-runtime:test` (no runtime source changed), Linux, Windows and coverage-instrumented builds; CI.
