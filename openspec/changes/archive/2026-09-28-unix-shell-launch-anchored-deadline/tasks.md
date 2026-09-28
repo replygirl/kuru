@@ -92,19 +92,17 @@ Not run locally, by name:
   GitHub for the Dolt release archive on `native-tests (windows-11-arm) /
   Behavior partition (windows-11-arm, 2)` (job 109033634834). Neither log
   contains a `unix_shell` string; both are pre-test failures before any
-  `cargo test` invocation. Full triage:
-  `openspec/changes/unix-shell-launch-anchored-deadline` reviewers can find
-  the working file at
-  `/private/tmp/claude-501/-Users-rg-repos-rg-kuru/3ac0133b-39aa-4c41-8cb9-e0aeae87e326/scratchpad/flake/unix-shell-prelaunch/ci-run1/triage.md`;
-  posted as a PR comment at
+  `cargo test` invocation. Full triage posted as a PR comment at
   https://github.com/replygirl/kuru/pull/128#issuecomment-5875034505.
 - Rerun of failed jobs (run 36453397286, final attempt): `gh pr checks 128
-  --repo replygirl/kuru --json name,bucket` reports 55 `pass`, 5 `skipping`
+  --repo replygirl/kuru --json bucket` reports 59 `pass`, 4 `skipping`
   (unrelated `dolt-windows-arm64` jobs), 0 `fail`. Per-job timestamps show
-  only the apt-403 job (109047317600) actually re-executed (17:20:52Z,
-  after the 16:46:01Z run creation); every other job, including the
-  previously-failing `windows-11-arm` behavior partition 2 (now job
-  109047326659), executed once during the original attempt and passed.
+  the rerun actually re-executed both originally-failed leaf jobs — the
+  apt-403 job (now 109047317600) and the Dolt-500 job (now 109047326659),
+  both starting 17:20:52Z, after the 16:46:01Z run creation — plus their
+  dependent merge/require/`ci-gate` jobs. Every coverage-partition job
+  carrying the `unix_shell` tests below executed once during the original
+  attempt (16:46-17:00Z) and passed without needing to re-run.
 - All nine tests this change touches or adds (the four exposed at 10-30 ms,
   the four at 1 s exposure, and the new
   `pre_launch_deadline_expiry_fails_without_launching`) report `... ok` on
@@ -112,8 +110,10 @@ Not run locally, by name:
   (confirmed per-job log grep for `unix_shell::`). `windows-latest`,
   `windows-11-arm` and `ubuntu-24.04-arm` (which only runs
   `Native memory partition`, a `kuru-memory` job) show 0 `unix_shell::`
-  matches, consistent with the Windows-path audit note above. Full table:
-  `/private/tmp/claude-501/-Users-rg-repos-rg-kuru/3ac0133b-39aa-4c41-8cb9-e0aeae87e326/scratchpad/flake/unix-shell-prelaunch/ci-evidence.md`.
+  matches, consistent with the Windows-path audit note above. Full
+  per-test/platform/job-id table in the session's evidence record (not
+  retained past the session; the job ids above and in the PR triage comment
+  are the durable citation).
 
 Not run, by name:
 
