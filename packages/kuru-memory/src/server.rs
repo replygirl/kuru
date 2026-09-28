@@ -164,21 +164,19 @@ impl Drop for Owner {
             .lock()
             .expect("memory reap guard lock")
             .take();
+        // Test-support only: the fixture ledger now waits for this reaper's
+        // report instead of recording when the owner drops.
         #[cfg(any(test, feature = "test-support"))]
-        let ledger = self.ledger.take();
+        let reaper = crate::test_support::engine_ledger::Reaper::handoff(self.ledger.take());
         #[cfg(any(test, feature = "test-support"))]
-        let trace = {
-            use crate::test_support::lifecycle_trace as trace;
-            trace::event(
-                "owner_dropped_live",
-                format_args!(
-                    "retained={} directory={}",
-                    retained.is_some(),
-                    self.trace_directory.display()
-                ),
-            );
-            (self.trace_directory.clone(), trace::label())
-        };
+        crate::test_support::lifecycle_trace::event(
+            "owner_dropped_live",
+            format_args!(
+                "retained={} directory={}",
+                retained.is_some(),
+                self.trace_directory.display()
+            ),
+        );
         // Independent of Tokio: tests and CLI shutdown may destroy the runtime
         // immediately after the last store handle. Keep fixture files until the
         // supervisor has confirmed that Dolt is reaped.
@@ -190,21 +188,11 @@ impl Drop for Owner {
                 SUPERVISOR_REAP_ALLOWANCE + DROPPED_REAP_WARNING_MARGIN,
                 SupervisorChild::try_wait,
             );
+            // Test-support only. This thread may still run while the test
+            // process exits, so it runs no ledger code: it reports the reap,
+            // and the ledger records it on the next thread that reads it.
             #[cfg(any(test, feature = "test-support"))]
-            drop(ledger);
-            #[cfg(any(test, feature = "test-support"))]
-            {
-                use crate::test_support::lifecycle_trace as trace;
-                let (directory, label) = trace;
-                trace::event(
-                    "owner_dropped_reaped",
-                    format_args!(
-                        "origin={label} dir_exists={} directory={}",
-                        trace::exists(&directory),
-                        directory.display()
-                    ),
-                );
-            }
+            reaper.report();
         });
     }
 }
