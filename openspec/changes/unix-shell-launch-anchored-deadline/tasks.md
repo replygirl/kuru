@@ -74,11 +74,51 @@ Local macOS (aarch64-apple-darwin, 14 CPUs), branch
 - `mise run format:check`, `lint:shell`, `//apps/kuru-docs:lint`, `lint:tooling` and `docs:check` each exited 0.
 - `mise run cospec -- validate unix-shell-launch-anchored-deadline --strict` passed with 0 errors and 0 warnings.
 
-Not run, by name:
+Not run locally, by name:
 
 - The root `lint:rust` and `typecheck` aggregates over every other package.
   Disk is tight, the only change is `#[cfg(test)]` code in one package, and
-  its dependents never compile that code.
-- Coverage and native CI on macOS and Linux. Neither can run without a push,
-  and this change makes none. Only repeated CI coverage runs can show that
-  this failure is gone from main.
+  its dependents never compile that code. CI's `quality / Lint` and
+  `quality / Typecheck` jobs cover these workspace-wide on 467d54a9 and both
+  report `pass` (`gh pr checks 128 --repo replygirl/kuru --json
+  name,bucket`), so this is evidenced by CI rather than locally.
+
+### CI (PR #128, `test/unix-shell-prelaunch-deadline`)
+
+- First attempt (run 36453397286, attempt 1): 6 checks failed, all from two
+  unrelated infrastructure outages with no test run — an apt 403 from
+  `packages.microsoft.com` on `native-tests (ubuntu-latest) / Coverage
+  partition (ubuntu-latest, 7)` (job 109033496291) and an HTTP 500 from
+  GitHub for the Dolt release archive on `native-tests (windows-11-arm) /
+  Behavior partition (windows-11-arm, 2)` (job 109033634834). Neither log
+  contains a `unix_shell` string; both are pre-test failures before any
+  `cargo test` invocation. Full triage:
+  `openspec/changes/unix-shell-launch-anchored-deadline` reviewers can find
+  the working file at
+  `/private/tmp/claude-501/-Users-rg-repos-rg-kuru/3ac0133b-39aa-4c41-8cb9-e0aeae87e326/scratchpad/flake/unix-shell-prelaunch/ci-run1/triage.md`;
+  posted as a PR comment at
+  https://github.com/replygirl/kuru/pull/128#issuecomment-5875034505.
+- Rerun of failed jobs (run 36453397286, final attempt): `gh pr checks 128
+  --repo replygirl/kuru --json name,bucket` reports 55 `pass`, 5 `skipping`
+  (unrelated `dolt-windows-arm64` jobs), 0 `fail`. Per-job timestamps show
+  only the apt-403 job (109047317600) actually re-executed (17:20:52Z,
+  after the 16:46:01Z run creation); every other job, including the
+  previously-failing `windows-11-arm` behavior partition 2 (now job
+  109047326659), executed once during the original attempt and passed.
+- All nine tests this change touches or adds (the four exposed at 10-30 ms,
+  the four at 1 s exposure, and the new
+  `pre_launch_deadline_expiry_fails_without_launching`) report `... ok` on
+  every Unix platform where they run: `ubuntu-latest` and `macos-latest`
+  (confirmed per-job log grep for `unix_shell::`). `windows-latest`,
+  `windows-11-arm` and `ubuntu-24.04-arm` (which only runs
+  `Native memory partition`, a `kuru-memory` job) show 0 `unix_shell::`
+  matches, consistent with the Windows-path audit note above. Full table:
+  `/private/tmp/claude-501/-Users-rg-repos-rg-kuru/3ac0133b-39aa-4c41-8cb9-e0aeae87e326/scratchpad/flake/unix-shell-prelaunch/ci-evidence.md`.
+
+Not run, by name:
+
+- Coverage and native CI on macOS and Linux under repeated main runs. The
+  rerun above proves the anchored tests pass once on each Unix platform;
+  only repeated CI coverage runs on `main` can show the pre-existing
+  pre-launch race is gone for good, which is outside what one PR run can
+  show.
