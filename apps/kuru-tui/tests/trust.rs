@@ -60,7 +60,7 @@ impl Sandbox {
     fn new(config: &str) -> Self {
         #[cfg(windows)]
         ensure_powershell_warm();
-        let root = tempfile::tempdir().unwrap();
+        let root = kuru_memory::test_support::tempdir().unwrap();
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project).unwrap();

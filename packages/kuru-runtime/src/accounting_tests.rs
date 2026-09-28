@@ -3554,7 +3554,7 @@ async fn cancellation_settles_admitted_usage_without_a_terminal_report() {
 
 #[tokio::test]
 async fn abandoned_dream_keeps_usage_after_reopen_without_advancing_main() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = kuru_memory::test_support::tempdir().unwrap();
     let scope = crate::project_scope(directory.path()).unwrap();
     let options =
         kuru_memory::test_support::open_options(directory.path().join("memory"), scope).unwrap();

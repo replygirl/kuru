@@ -9,12 +9,14 @@ use anyhow::Context as _;
 /// across the parallel application suite.
 pub struct ServiceCleanup {
     data: Vec<PathBuf>,
-    root: Option<tempfile::TempDir>,
+    root: Option<kuru_memory::test_support::TempDir>,
     pending: bool,
 }
 
 impl ServiceCleanup {
-    pub fn new(root: tempfile::TempDir, data: &Path) -> Self {
+    /// `root` is a guarded fixture root: after this cleanup awaits every
+    /// project store's quiescence, its teardown checks the recorded result.
+    pub fn new(root: kuru_memory::test_support::TempDir, data: &Path) -> Self {
         Self {
             data: vec![data.to_owned()],
             root: Some(root),

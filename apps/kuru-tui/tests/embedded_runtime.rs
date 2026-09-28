@@ -604,7 +604,9 @@ impl Installation {
         let mut options = OpenOptions::new(self.data.clone(), scope);
         options.config = self.memory.clone();
         options.supervisor = Some(self.binary.clone());
-        kuru_memory::test_support::retire_idle_service(&options).await
+        // Retire the owner and record its store's quiescence on the guarded
+        // fixture root.
+        kuru_memory::test_support::await_managed_quiescence(&options).await
     }
     async fn native_auth_status(&self) -> Result<()> {
         let output = execute(self.command().arg("auth")).await?;
@@ -1513,11 +1515,7 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
 
 #[tokio::test]
 async fn packaged_install_and_update_preserve_complete_offline_memory() {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("kuru-embedded-acceptance-");
-    #[cfg(unix)]
-    builder.permissions(fs::Permissions::from_mode(0o700));
-    let root = builder.tempdir().unwrap();
+    let root = kuru_memory::test_support::TempDir::new("kuru-embedded-acceptance-", None).unwrap();
     let private = Directory::ensure_private(&root.path().join("private")).unwrap();
     if let Err(error) = packaged_roundtrip(private.path()).await {
         // Keep private diagnostics on failure; a timeout must never remove a

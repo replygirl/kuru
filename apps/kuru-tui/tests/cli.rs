@@ -48,7 +48,7 @@ impl Sandbox {
     fn new() -> Self {
         #[cfg(windows)]
         ensure_powershell_warm();
-        let root = tempfile::tempdir().unwrap();
+        let root = kuru_memory::test_support::tempdir().unwrap();
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project).unwrap();
@@ -823,7 +823,7 @@ async fn mcp_cli_no_browser_prints_local_callback_guidance_and_settles_once() {
 
 #[test]
 fn failed_service_cleanup_retains_the_fixture_at_its_original_path() {
-    let root = tempfile::tempdir().unwrap();
+    let root = kuru_memory::test_support::tempdir().unwrap();
     let original = root.path().to_path_buf();
     let data = original.join("data");
     std::fs::create_dir(&data).unwrap();
@@ -839,9 +839,9 @@ fn failed_service_cleanup_retains_the_fixture_at_its_original_path() {
     assert!(data.join("memory").is_file());
 
     drop(cleanup);
-    std::fs::remove_dir_all(original).unwrap();
+    std::fs::remove_dir_all(original.parent().unwrap()).unwrap();
 
-    let root = tempfile::tempdir().unwrap();
+    let root = kuru_memory::test_support::tempdir().unwrap();
     let original = root.path().to_path_buf();
     let data = original.join("data");
     std::fs::create_dir(&data).unwrap();
@@ -857,9 +857,9 @@ fn failed_service_cleanup_retains_the_fixture_at_its_original_path() {
         .unwrap();
     assert!(message.contains("managed-memory fixture cleanup failed"));
     assert!(original.is_dir());
-    std::fs::remove_dir_all(original).unwrap();
+    std::fs::remove_dir_all(original.parent().unwrap()).unwrap();
 
-    let root = tempfile::tempdir().unwrap();
+    let root = kuru_memory::test_support::tempdir().unwrap();
     let original = root.path().to_path_buf();
     let data = original.join("data");
     std::fs::create_dir(&data).unwrap();
@@ -875,7 +875,7 @@ fn failed_service_cleanup_retains_the_fixture_at_its_original_path() {
     );
     assert!(original.is_dir());
     assert!(data.join("memory").is_file());
-    std::fs::remove_dir_all(original).unwrap();
+    std::fs::remove_dir_all(original.parent().unwrap()).unwrap();
 }
 
 fn assert_memory_progress(stderr: &str) {

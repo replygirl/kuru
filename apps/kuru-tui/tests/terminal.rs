@@ -101,7 +101,7 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Result<Self> {
-        let root = tempfile::tempdir()?;
+        let root = kuru_memory::test_support::tempdir()?;
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project)?;

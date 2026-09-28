@@ -86,7 +86,7 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Result<Self> {
-        let temporary = tempfile::tempdir()?;
+        let temporary = kuru_memory::test_support::tempdir()?;
         let parent = Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable)?;
         let root = parent
             .create_private_directory("terminal 日本語".as_ref())?

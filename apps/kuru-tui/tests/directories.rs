@@ -131,7 +131,7 @@ fn native_path_selection_preserves_drive_and_unc_roots_and_uses_the_invocation_d
 #[cfg(windows)]
 #[test]
 fn native_roaming_and_local_defaults_and_explicit_precedence_survive_real_reopen() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = kuru_memory::test_support::tempdir().unwrap();
     let root_path = temporary.path().to_owned();
     let local = root_path.join("Local space");
     let override_data = root_path.join("explicit native data");
