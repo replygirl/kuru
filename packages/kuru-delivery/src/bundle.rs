@@ -1,6 +1,7 @@
 //! Verified, hash-addressed build inputs. This helper never executes an archive
 //! or depends on the runtime that will eventually consume its bytes.
 
+use crate::lease::HeldLock;
 use anyhow::{Context, Result, bail, ensure};
 use kuru_platform::fs::{
     Directory as CheckedDirectory, NameRetention, Privacy, Publication, require_private,
@@ -916,16 +917,16 @@ impl Directory {
         self.native.verify(name, held)?;
         Ok(())
     }
-    async fn lock(&self) -> Result<File> {
+    async fn lock(&self) -> Result<HeldLock> {
         let pinned =
             CheckedDirectory::open(self.path(), Privacy::OwnerOnly, NameRetention::Pinned)?;
-        let lock = pinned
+        let file = pinned
             .lock_file(OsStr::new(LOCK_NAME))
             .context("create or open stable lock file")?;
         let deadline = tokio::time::Instant::now() + LOCK_TIMEOUT;
-        loop {
-            match lock.try_lock() {
-                Ok(()) => break,
+        let lock = loop {
+            match file.try_lock() {
+                Ok(()) => break HeldLock::acquired(file),
                 Err(TryLockError::WouldBlock) => {
                     ensure!(
                         tokio::time::Instant::now() < deadline,
@@ -935,7 +936,7 @@ impl Directory {
                 }
                 Err(error) => bail!("lock bundle preparation: {error}"),
             }
-        }
+        };
         self.verify(OsStr::new(LOCK_NAME), &lock, true)
             .context("verify acquired stable lock identity")?;
         Ok(lock)
@@ -984,66 +985,10 @@ mod tests {
             .open(path.join(LOCK_NAME))
             .unwrap();
         lock.try_lock().unwrap();
+        // Release before close, as the product does, so a descriptor a
+        // concurrent spawn copied cannot keep this probe's lock held.
+        lock.unlock().unwrap();
     }
-
-    /// Environment marker naming the one test a re-executed child runs inline.
-    #[cfg(unix)]
-    const LOCK_CHILD: &str = "KURU_BUNDLE_LOCK_CHILD";
-
-    /// Runs the calling test alone in a re-executed test process on Unix and
-    /// returns true in the parent, which must then return without its body.
-    ///
-    /// Release is asserted with an immediate `try_lock` on a new open file
-    /// description. A `flock` belongs to the open file description, and a child
-    /// spawned by any concurrent test thread holds a copy of every descriptor
-    /// until its exec closes the close-on-exec ones. In a shared test process
-    /// a lock this test's owner already released can therefore still appear
-    /// held. The child spawns no other processes; it inherits the complete
-    /// environment, including the `LLVM_PROFILE_FILE` destination.
-    #[cfg(unix)]
-    pub(super) async fn delegated_to_lock_child(module: &str, test: &str) -> bool {
-        let (_, module) = module
-            .split_once("::")
-            .expect("test module path starts with its crate");
-        let name = format!("{module}::{test}");
-        if std::env::var_os(LOCK_CHILD).is_some_and(|selected| selected == name.as_str()) {
-            return false;
-        }
-        let child = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &name, "--test-threads=1"])
-            .env(LOCK_CHILD, &name)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let output = tokio::time::timeout(Duration::from_secs(90), child.wait_with_output())
-            .await
-            .unwrap_or_else(|_| panic!("isolated lock test {name} exceeded 90 seconds"))
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains(&format!("test {name} ... ok")),
-            "isolated lock test {name} failed with {}\nstdout:\n{stdout}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        true
-    }
-
-    /// Delegates the enclosing test to [`delegated_to_lock_child`] on Unix.
-    macro_rules! isolate_lock_release {
-        ($test:ident) => {
-            #[cfg(unix)]
-            if $crate::bundle::tests::delegated_to_lock_child(module_path!(), stringify!($test))
-                .await
-            {
-                return;
-            }
-        };
-    }
-    pub(super) use isolate_lock_release;
 
     #[tokio::test]
     async fn transient_http_500_repeats_the_same_get_and_publishes_verified_bytes() {
@@ -1115,7 +1060,6 @@ mod tests {
 
     #[tokio::test]
     async fn streamed_download_validates_size_hash_and_status_before_publication() {
-        isolate_lock_release!(streamed_download_validates_size_hash_and_status_before_publication);
         let expected = b"verified network archive";
         for (body, status, succeeds) in [
             (expected.as_slice(), 200, true),
@@ -1174,7 +1118,6 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_stalled_download_removes_stage_and_releases_stable_lock() {
-        isolate_lock_release!(cancelling_a_stalled_download_removes_stage_and_releases_stable_lock);
         let root = tempfile::tempdir().unwrap();
         let options = options(root.path());
         let cache = options.bundle_dir.clone();
@@ -1238,6 +1181,27 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    /// A child spawned by any thread holds a duplicate of every descriptor
+    /// until its exec. The owner's release must not wait for that duplicate.
+    #[tokio::test]
+    async fn dropped_lock_is_released_despite_an_inherited_duplicate() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cache");
+        let directory = Directory::open(&path, true, true).unwrap();
+        let held = directory.lock().await.unwrap();
+        // The same open file description, as a concurrent spawn would copy it.
+        let inherited = held.try_clone().unwrap();
+        drop(held);
+        let contender = File::options()
+            .read(true)
+            .write(true)
+            .open(path.join(LOCK_NAME))
+            .unwrap();
+        contender.try_lock().unwrap();
+        contender.unlock().unwrap();
+        drop(inherited);
     }
 
     #[tokio::test]
