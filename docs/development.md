@@ -407,7 +407,7 @@ separate from deterministic fixture tests and must be reported accurately.
 The root `clippy.toml` is the workspace's only Clippy configuration. Clippy
 1.98.1 searches `CLIPPY_CONF_DIR`, else the package directory, and walks up to
 the first directory holding `clippy.toml` or `.clippy.toml`
-([Clippy configuration](https://doc.rust-lang.org/nightly/clippy/configuration.html)).
+([Clippy 1.98.1 configuration](https://github.com/rust-lang/rust/blob/1.98.1/src/tools/clippy/book/src/configuration.md)).
 A package-level file would therefore replace the root file and drop its bans.
 
 The file bans methods through
