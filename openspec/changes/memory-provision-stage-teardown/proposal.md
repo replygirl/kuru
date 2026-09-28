@@ -34,8 +34,8 @@ The flaky-test catalogue (`tmp/roadmap/phase2-handoff-2026-09-26-sources/flakes/
 
 ## Impact
 
-- `packages/kuru-memory/src/provision.rs`: `StageLease`; `provision_with_extractor_observed`, `CheckedColdProbe::probe`, `StagedActivation` and `activate_staged_*` use the lease. `record_retained_stage` takes the publication flag. `emit_retained_stage_diagnostic` has a distinct message for unpublished stages. The Windows recovery loop changes.
-- `packages/kuru-memory/src/provision/tests.rs` (Unix): regression tests for extraction-error retention, cancellation retention and the published receipt-before-release order, plus a test-only diagnostic capture.
+- `packages/kuru-memory/src/provision.rs`: `StageLease`; `provision_with_extractor_observed`, `CheckedColdProbe::probe`, `StagedActivation` and `activate_staged_*` use the lease. `record_retained_stage` takes the publication flag. `emit_retained_stage_diagnostic` has a distinct message for unpublished stages. The Windows recovery loop changes. A `#[cfg(test)]` path-scoped seam (`observe_retained_stages`) lets tests observe each retention report before the lease releases the lock.
+- `packages/kuru-memory/src/provision/tests.rs` (Unix): regression tests for extraction-error retention, cancellation retention and the published receipt-before-release order, observed through a test-only retained-stage seam.
 - `packages/kuru-memory/src/provision/native_tests.rs`: Windows regression tests for cancelled activation with a held stage (M1) and for a first checked result after the window, with and without a pending cancellation (M2). Existing call sites move to the lease and report types. The frozen cancellation test's fixture handle is released, and its tokio clock is paused around the activation so a slow first move cannot close the window before the cancellation reaches the retry-spacing wait (flagged).
 - `docs/memory.md`: retained unpublished stages and the lock order.
 - Follow-on, not changed here: `CacheLock` is still released by descriptor close. The #124 audit already lists it for the shared explicit-release guard.
