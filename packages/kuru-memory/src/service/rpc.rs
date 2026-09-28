@@ -1576,12 +1576,20 @@ pub(super) async fn exchange_attached_with_id<S: AsyncRead + AsyncWrite + Unpin>
 }
 
 /// A per-attachment test barrier after a complete request frame, before the
-/// client reads the reply. Dropping the call future then exercises the real
+/// call returns its reply. Dropping the call future then exercises the real
 /// facade cancellation path without changing owner dispatch or persistence.
+///
+/// The client reads the owner's reply frame while paused and holds it until
+/// `release`. The owner writes that frame only after its handler returned and
+/// the request's receipt settled, so `replied` is the owner-observed event a
+/// test must await before cancelling when it then expects one reconcile to be
+/// definite. A sibling reading the committed row is not that event: storage
+/// can expose a commit before the owner's handler has returned.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub(crate) struct ReplyPause {
     pub sent: tokio::sync::Notify,
+    pub replied: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
     pub promotion_sent: AtomicBool,
 }
@@ -1602,10 +1610,19 @@ pub(super) async fn exchange_attached_with_id_paused<S: AsyncRead + AsyncWrite +
     let request = ServiceRequest::with_id(&authority.service_generation, id, call);
     write_frame(stream, &request, OPERATION_FRAME_LIMIT, OPERATION_TIMEOUT).await?;
     pause.sent.notify_one();
-    tokio::time::timeout(reply_deadline, pause.release.notified())
-        .await
-        .context("test client reply pause exceeded operation deadline")?;
-    let reply: ServiceReply = read_frame(stream, OPERATION_FRAME_LIMIT, reply_deadline).await?;
+    // One reply deadline bounds the whole pause, including the frame read. A
+    // failed read is held like a reply, so the call still ends only at release.
+    let reply = tokio::time::timeout(reply_deadline, async {
+        let reply: Result<ServiceReply> =
+            read_frame(stream, OPERATION_FRAME_LIMIT, reply_deadline).await;
+        if reply.is_ok() {
+            pause.replied.notify_one();
+        }
+        pause.release.notified().await;
+        reply
+    })
+    .await
+    .context("test client reply pause exceeded operation deadline")??;
     ensure!(reply.id == request.id, "memory service reply ID changed");
     ensure!(
         reply.generation == authority.service_generation,

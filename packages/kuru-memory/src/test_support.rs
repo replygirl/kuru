@@ -51,7 +51,8 @@ use std::{
 };
 
 /// A one-shot test barrier after a complete typed service request frame and
-/// before the client reads its reply. The owner continues independently.
+/// before the call returns its reply. The owner continues independently; the
+/// client reads and holds the reply frame until [`ReplyBarrier::release`].
 #[derive(Clone, Default)]
 pub struct ReplyBarrier {
     pub(crate) inner: Arc<crate::service::rpc::ReplyPause>,
@@ -60,6 +61,14 @@ pub struct ReplyBarrier {
 impl ReplyBarrier {
     pub async fn wait_sent(&self) {
         self.inner.sent.notified().await;
+    }
+
+    /// Wait until the owner's reply frame has arrived and is held. The owner
+    /// writes it only after its handler returned and the request's receipt
+    /// settled, so a test that cancels the paused call and then expects one
+    /// reconcile to be definite awaits this first, not a sibling's read.
+    pub async fn wait_replied(&self) {
+        self.inner.replied.notified().await;
     }
 
     pub fn promotion_sent(&self) -> bool {

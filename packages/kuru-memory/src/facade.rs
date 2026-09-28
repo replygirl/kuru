@@ -3084,6 +3084,9 @@ mod tests {
                 })
                 .await
                 .context("owner did not commit paused create")??;
+                tokio::time::timeout(Duration::from_secs(10), create_pause.replied.notified())
+                    .await
+                    .context("owner did not settle and reply to the paused create")?;
                 create.abort();
                 ensure!(
                     tokio::time::timeout(Duration::from_secs(5), create)
@@ -3163,6 +3166,9 @@ mod tests {
                     sibling.revision().await? == before_stale,
                     "definite lifecycle refusal changed the view"
                 );
+                tokio::time::timeout(Duration::from_secs(10), pause.replied.notified())
+                    .await
+                    .context("owner did not settle and reply to the paused rename")?;
                 rename.abort();
                 let stopped = tokio::time::timeout(Duration::from_secs(5), rename)
                     .await
@@ -3225,6 +3231,9 @@ mod tests {
                 })
                 .await
                 .context("owner did not commit paused remove")??;
+                tokio::time::timeout(Duration::from_secs(10), remove_pause.replied.notified())
+                    .await
+                    .context("owner did not settle and reply to the paused remove")?;
                 remove.abort();
                 ensure!(
                     tokio::time::timeout(Duration::from_secs(5), remove)
@@ -3301,6 +3310,9 @@ mod tests {
                 })
                 .await
                 .context("owner did not commit paused restore")??;
+                tokio::time::timeout(Duration::from_secs(10), restore_pause.replied.notified())
+                    .await
+                    .context("owner did not settle and reply to the paused restore")?;
                 restore.abort();
                 ensure!(
                     tokio::time::timeout(Duration::from_secs(5), restore)
@@ -3596,6 +3608,9 @@ mod tests {
                 })
                 .await
                 .context("owner did not commit the paused fork publication")??;
+                tokio::time::timeout(Duration::from_secs(10), pause.replied.notified())
+                    .await
+                    .context("owner did not settle and reply to the paused fork")?;
                 fork.abort();
                 let stopped = tokio::time::timeout(Duration::from_secs(5), fork)
                     .await
@@ -3839,6 +3854,9 @@ mod tests {
                 })
                 .await
                 .context("owner did not commit paused mode and state")??;
+                tokio::time::timeout(Duration::from_secs(10), barrier.wait_replied())
+                    .await
+                    .context("owner did not settle and reply to the paused mode checkpoint")?;
                 change.abort();
                 ensure!(
                     tokio::time::timeout(Duration::from_secs(5), change)
@@ -3971,6 +3989,9 @@ mod tests {
                 })
                 .await
                 .context("owner did not commit the paused public-turn admission")??;
+                tokio::time::timeout(Duration::from_secs(10), pause.replied.notified())
+                    .await
+                    .context("owner did not settle and reply to the paused public-turn admission")?;
                 admission.abort();
                 ensure!(
                     tokio::time::timeout(Duration::from_secs(5), admission)
@@ -4048,6 +4069,9 @@ mod tests {
                 })
                 .await
                 .context("owner did not commit the paused public-turn settlement")??;
+                tokio::time::timeout(Duration::from_secs(10), settlement_barrier.wait_replied())
+                    .await
+                    .context("owner did not settle and reply to the paused public-turn settlement")?;
                 settlement.abort();
                 ensure!(
                     tokio::time::timeout(Duration::from_secs(5), settlement)
@@ -4237,6 +4261,9 @@ mod tests {
                 })
                 .await
                 .context("owner did not commit older continuation before reply loss")??;
+                tokio::time::timeout(Duration::from_secs(10), continuation_barrier.wait_replied())
+                    .await
+                    .context("owner did not settle and reply to the paused older continuation")?;
                 continuation.abort();
                 ensure!(
                     tokio::time::timeout(Duration::from_secs(5), continuation)
@@ -4468,6 +4495,9 @@ mod tests {
                 })
                 .await
                 .context("owner did not commit the paused legacy continuation")??;
+                tokio::time::timeout(Duration::from_secs(10), barrier.wait_replied())
+                    .await
+                    .context("owner did not settle and reply to the paused legacy continuation")?;
                 resume.abort();
                 ensure!(
                     tokio::time::timeout(Duration::from_secs(5), resume)
@@ -5465,6 +5495,9 @@ mod tests {
                     })
                     .await
                     .context("owner did not commit the paused candidate write")??;
+                    tokio::time::timeout(Duration::from_secs(10), pause.replied.notified())
+                        .await
+                        .context("owner did not settle and reply to the paused candidate unit write")?;
                     witness.close();
                     writer.abort();
                     let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
