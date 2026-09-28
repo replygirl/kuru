@@ -165,21 +165,35 @@ pub fn release_after_creator_exit<S>(
     root: TempDir,
     wait: Duration,
     descendants_stopped: bool,
-    mut status: impl FnMut() -> io::Result<Option<S>>,
+    status: impl FnMut() -> io::Result<Option<S>>,
 ) -> CreatorTeardown {
-    let deadline = Instant::now() + wait;
-    loop {
-        match status() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(CREATOR_POLL),
-            _ => return CreatorTeardown::Delayed(root.keep()),
-        }
+    if !await_creator_exit(wait, status) {
+        return CreatorTeardown::Delayed(root.keep());
     }
     if descendants_stopped {
         drop(root);
         CreatorTeardown::Released
     } else {
         CreatorTeardown::Unproven(root.keep())
+    }
+}
+
+/// Query `status` every 20 ms on the calling thread, for at most `wait`,
+/// until the creator has exited. False when the wait ended or a status query
+/// failed; the caller then keeps what the creator worked in, and the creator.
+/// The wait for [`release_after_creator_exit`] and for any fixture that
+/// holds something other than a guarded root until its creator exits.
+pub fn await_creator_exit<S>(
+    wait: Duration,
+    mut status: impl FnMut() -> io::Result<Option<S>>,
+) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        match status() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(CREATOR_POLL),
+            _ => return false,
+        }
     }
 }
 
