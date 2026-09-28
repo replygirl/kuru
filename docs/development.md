@@ -286,14 +286,18 @@ nothing from it. The repository check in `lint:tooling` (`kuru-delivery repo`)
 enforces the checkable part on every workflow. A workflow that runs mise sets
 `MISE_EXEC_AUTO_INSTALL: "false"` and `MISE_TASK_RUN_AUTO_INSTALL: "false"` at
 workflow level and never overrides them in a job, step or script
-([why](#shared-build-cache)). Every `jdx/mise-action` step names its
-`install_args`, and no step runs `mise install` without tool arguments, whatever
-mise options come before or after the subcommand. Every `apt-get` or `apt`
-fetch, including one inside a `sh -c` string, names its list with
-`-o Dir::Etc::sourcelist=/...` and `-o Dir::Etc::sourceparts=/dev/null`, and
-`add-apt-repository` runs with `-n`, so the runner image's third-party
-repositories are never refreshed. Every matrix job that runs a partition task
-(`coverage:shard` or `test:partition`) or has a `partition` axis runs with
+([why](#shared-build-cache)). Every `jdx/mise-action` step's `install_args`
+names at least one tool, not only options, and no step runs `mise install`,
+`mise upgrade` or `mise bootstrap` without tool arguments, whatever mise
+options come before or after the subcommand and whatever `sudo`, `env`,
+`timeout`, `nice`, `nohup`, `exec` or `time` prefix, with its option values,
+precedes it. Every `apt-get` or `apt` fetch, including one inside a `sh -c`
+string, names exactly one list with `-o Dir::Etc::sourcelist=/...`, ends its
+parts settings with `-o Dir::Etc::sourceparts=/dev/null`, and reads no `-c`
+file; no workflow, job or step sets `APT_CONFIG`, and `add-apt-repository`
+runs with `-n`, so the runner image's third-party repositories are never
+refreshed. Every matrix job that runs a partition task (`coverage:shard` or
+`test:partition`) or has a `partition` axis runs with
 `KURU_DOLT_BUNDLE_OFFLINE: "true"` and imports the archives that the CI
 `bundle-inputs` job fetched and verified once for the run
 ([import](#bundled-engine-build-inputs)).
@@ -302,14 +306,33 @@ One exemption is live. The release workflow's `notes` and `build-docs` jobs
 still run `mise run` with task auto-install on, so they download configured
 tools they do not use, and `notes` runs the delivery `setup` task, a bare
 `mise install --include-task-tools`. The check exempts exactly those two jobs
-in their reviewed steps, requires every other release job that uses mise to
-opt out in its job env, and fails if either job changes. The follow-up,
-`release-notes-docs-tool-scope`, scopes those jobs' tool installation; it
-changes release workflow steps, so the maintainer decides it.
+and pins each by the SHA-256 of its whole parsed job together with the
+workflow `env` and `defaults` it inherits. Any change to them, such as another
+mise-action input or version, an env entry, a step, `shell`,
+`working-directory` or `if`, fails the check until someone re-reviews the job
+and records its new digest; comments and formatting are not part of the pin.
+Every other release job that uses mise must opt out in its job env. The
+follow-up, `release-notes-docs-tool-scope`, scopes those jobs' tool
+installation; it changes release workflow steps, so the maintainer decides it.
 
-The check reads workflow text only. Downloads inside the mise tasks a step runs,
-the tools a job does select, the single `bundle-inputs` fetch and the one engine
-download of each installation or native build job remain outside it.
+The check reads workflow text only, so these remain outside it:
+
+- downloads inside the mise tasks a step runs, and settings in a task's own
+  `env`;
+- the tools a job does select, the single `bundle-inputs` fetch and the one
+  engine download of each installation or native build job;
+- a launcher that clears the environment, such as `env -i` or `sudo`'s
+  default `env_reset`, which drops the workflow-level opt-outs before mise
+  runs;
+- spellings assembled at run time: a variable name split by quotes and
+  written to `$GITHUB_ENV`, a task name split by quotes or passed through a
+  variable, an `install_args` expression that evaluates to nothing, and a
+  quoted `;` or `|` inside a command;
+- whether a named apt list is the one a step needs, and an engine fetched
+  with `curl` then imported with `--archive`;
+- `mise bootstrap` with a subcommand, such as `bootstrap packages apply`: it
+  runs a single part, not the tool phase, but a package part may run a system
+  package manager the check does not see.
 
 Coverage prepares the verified engine archives and uses the supervisor from its
 single instrumented workspace build. Its fixtures initialize the engine cache
