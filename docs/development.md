@@ -284,18 +284,32 @@ CI jobs do not fetch what they do not use or what the run has already
 verified: each such download is one more outage that can fail a job needing
 nothing from it. The repository check in `lint:tooling` (`kuru-delivery repo`)
 enforces the checkable part on every workflow. A workflow that runs mise sets
-`MISE_EXEC_AUTO_INSTALL: "false"` at workflow level and never overrides it
-([why](#shared-build-cache)); every `jdx/mise-action` step names its
-`install_args`, and no step runs `mise install` without tool arguments. Every
-`apt-get` or `apt` fetch names its list with `-o Dir::Etc::sourcelist=/...` and
-`-o Dir::Etc::sourceparts=/dev/null`, so the runner image's third-party
-repositories are never refreshed. Every job with a `partition` matrix sets
+`MISE_EXEC_AUTO_INSTALL: "false"` and `MISE_TASK_RUN_AUTO_INSTALL: "false"` at
+workflow level and never overrides them in a job, step or script
+([why](#shared-build-cache)). Every `jdx/mise-action` step names its
+`install_args`, and no step runs `mise install` without tool arguments, whatever
+mise options come before or after the subcommand. Every `apt-get` or `apt`
+fetch, including one inside a `sh -c` string, names its list with
+`-o Dir::Etc::sourcelist=/...` and `-o Dir::Etc::sourceparts=/dev/null`, and
+`add-apt-repository` runs with `-n`, so the runner image's third-party
+repositories are never refreshed. Every matrix job that runs a partition task
+(`coverage:shard` or `test:partition`) or has a `partition` axis runs with
 `KURU_DOLT_BUNDLE_OFFLINE: "true"` and imports the archives that the CI
 `bundle-inputs` job fetched and verified once for the run
-([import](#bundled-engine-build-inputs)). The check reads workflow text only.
-Downloads inside the mise tasks a step runs, the tools a job does select, the
-single `bundle-inputs` fetch and the one engine download of each installation
-or native build job remain outside it.
+([import](#bundled-engine-build-inputs)).
+
+One exemption is live. The release workflow's `notes` and `build-docs` jobs
+still run `mise run` with task auto-install on, so they download configured
+tools they do not use, and `notes` runs the delivery `setup` task, a bare
+`mise install --include-task-tools`. The check exempts exactly those two jobs
+in their reviewed steps, requires every other release job that uses mise to
+opt out in its job env, and fails if either job changes. The follow-up,
+`release-notes-docs-tool-scope`, scopes those jobs' tool installation; it
+changes release workflow steps, so the maintainer decides it.
+
+The check reads workflow text only. Downloads inside the mise tasks a step runs,
+the tools a job does select, the single `bundle-inputs` fetch and the one engine
+download of each installation or native build job remain outside it.
 
 Coverage prepares the verified engine archives and uses the supervisor from its
 single instrumented workspace build. Its fixtures initialize the engine cache
@@ -411,13 +425,18 @@ depend on a maintainer cache. Instrumented coverage never reads or writes the
 cache: cargo-llvm-cov supplies its own `RUSTC_WRAPPER`, which mbx defers to.
 
 `KURU_MBX=0` does not remove mr-boxington from the configured tool set, so CI
-also keeps it from being downloaded. Each job installs only its `mise-action`
-`install_args`, and every workflow that installs tools sets
-`MISE_EXEC_AUTO_INSTALL=false` beside `MISE_TASK_RUN_AUTO_INSTALL=false`. On
-Windows, mise's executable shims run `mise x`, which would otherwise install
-every missing configured tool, mr-boxington included, on the first shim call
-such as `rustup` or `cargo`. A job that needs another tool must name it in
-`install_args`; the source installers already install only `rust` and pass it
+also keeps it from being downloaded. Every workflow that installs tools sets
+`MISE_EXEC_AUTO_INSTALL=false` at workflow level. On Windows, mise's executable
+shims run `mise x`, which would otherwise install every missing configured tool,
+mr-boxington included, on the first shim call such as `rustup` or `cargo`.
+`MISE_TASK_RUN_AUTO_INSTALL=false` stops `mise run` doing the same before a
+task. Every workflow sets it at workflow level except the release workflow,
+which sets it in every job that uses mise except `notes` and `build-docs`.
+Those two jobs still download tools they do not use until
+[their exempted follow-up](#commands) scopes them. Every other job installs
+only its `mise-action` `install_args` and the tools its named install tasks
+select. A job that needs another tool must name it in `install_args`; the
+source installers already install only `rust` and pass it
 explicitly to `mise exec`.
 
 mbx restores outputs by copy-on-write clone on APFS, Btrfs, XFS with reflink,

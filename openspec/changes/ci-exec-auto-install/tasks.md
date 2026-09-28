@@ -13,3 +13,10 @@
 - [x] 2.3 Fetch and verify the pinned upstream engine archives once per CI run in a `bundle-inputs` job and import them offline in every native-tests and native-memory partition
 - [x] 2.4 Document the class rule and the check's coverage in docs/development.md
 - [x] 2.5 Verify with the delivery test, lint and typecheck tasks, the repository check against the worktree and the pre-fix workflows, lint:tooling, format:check, docs:check, cospec validate --strict and cospec:managed:check
+
+## 3. Close the review's gaps in the check
+
+- [x] 3.1 Extend the workflow-level-only rule to `MISE_TASK_RUN_AUTO_INSTALL`, move ci.yml's job-level settings to its workflow level, and exempt release.yml `notes` and `build-docs` by name in their exact steps, requiring every other release job that uses mise to opt out in its job env, with tests that fail when either job changes, is renamed or the exemption goes stale
+- [x] 3.2 Read mise's global options before the subcommand and drop the values of its value-taking options (`-C/--cd`, `-E/--env`, `-j/--jobs`, `--minimum-release-age`, `--shared`, from the v2026.9.4 CLI reference) before deciding that `mise install` names no tool, with the review's bypasses as rejecting cases
+- [x] 3.3 Read a shell's `-c` string as its command, reject `add-apt-repository` without `-n`, and treat any matrix job that runs a partition task as a partition whatever its axis is called
+- [x] 3.4 Correct docs/development.md and this proposal to state the live release exemption and its follow-up `release-notes-docs-tool-scope`, and verify with the same checks as 2.5
