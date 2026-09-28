@@ -617,6 +617,17 @@ fn mise_steps_must_name_the_tools_they_install() {
             ".github/workflows/plain.yml: uses mise, so its workflow-level env must set MISE_EXEC_AUTO_INSTALL: \"false\""
         ]
     );
+    // Prefix options do not hide the program.
+    repo.write(
+        ".github/workflows/plain.yml",
+        "on: push\nenv:\n  MISE_EXEC_AUTO_INSTALL: \"false\"\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sudo -E mise install\n",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            ".github/workflows/plain.yml: job lint step step 1 runs `mise install` without naming the tools to install"
+        ]
+    );
     repo.write(".github/workflows/plain.yml", "jobs: [unterminated");
     assert!(
         repo::check(repo.0.path())
@@ -659,12 +670,20 @@ fn incident_apt_update_over_every_source_is_rejected() {
     repo.replace(
         ".github/workflows/release.yml",
         FIXED_APT,
-        "          sudo apt -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources update; sudo apt-get -oDir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -oDir::Etc::sourceparts=/dev/null install -y dbus\n",
+        "          sudo apt -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources update; sudo apt-get -oDir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -oDir::Etc::sourceparts=/dev/null install -y dbus\n          sudo -E DEBIAN_FRONTEND=noninteractive apt-get upgrade\n",
     );
+    let unrestricted = |command: &str| {
+        format!(
+            ".github/workflows/release.yml: job tests step Install Ubuntu native secret-store fixture tools runs `{command}` over every configured apt source; name the needed list with -o Dir::Etc::sourcelist=/... and -o Dir::Etc::sourceparts=/dev/null"
+        )
+    };
     assert_eq!(
         repo.workflow_errors(),
         [
-            ".github/workflows/release.yml: job tests step Install Ubuntu native secret-store fixture tools runs `apt -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources update` over every configured apt source; name the needed list with -o Dir::Etc::sourcelist=/... and -o Dir::Etc::sourceparts=/dev/null"
+            unrestricted(
+                "apt -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources update"
+            ),
+            unrestricted("apt-get upgrade"),
         ]
     );
 }

@@ -210,13 +210,15 @@ fn commands(script: &str) -> Vec<Vec<String>> {
     commands
 }
 
-/// The program and its arguments, after leading prefixes and assignments.
+/// The program and its arguments, after leading prefixes, their options
+/// (such as `sudo -E`) and assignments.
 fn program(words: &[String]) -> &[String] {
     let start = words
         .iter()
         .position(|word| {
             !PREFIXES.contains(&word.as_str())
-                && !(word.contains('=') && !word.starts_with('-') && !word.starts_with('/'))
+                && !word.starts_with('-')
+                && !(word.contains('=') && !word.starts_with('/'))
         })
         .unwrap_or(words.len());
     &words[start..]
