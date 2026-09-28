@@ -197,3 +197,39 @@ Local (macOS arm64; logs `$S/flake/ci/fix2/`):
 | JSON region export of that run's profiles (`cargo llvm-cov report --json`, the data the partition line export reads; the local `coverage` task itself does not run the partition self-check) | 22,263 functions, 0 regions with the clamped count 9223372036854775807; `Reaper::report` has a single region count in each instance (126 and 5 calls) |
 
 Not run: every `cfg(windows)` line (`Fixture::drop`; this host cannot build the Windows target; the same match and borrows compile here in the `CreatorFixture` test double). The next CI run must show: all 8 windows-latest coverage partitions pass the line export, on two consecutive runs (2, 3 and 8 passed by chance before, so one green run is weak evidence); no negative counter expression for any function, including `scan`, `collect`, `TempDir::drop` and `engine_ledger::with`; `windows_lifecycle` 12/12, with no "cleanup is delayed" or "cleanup is unproven" line.
+
+## Round 6: CI run 36426742472 attempt 2, served-owner fixture teardown (2026-09-28, same host)
+
+Logs: `$S/flake/ci/pr125-run3b/` (CI logs, `diagnosis.md`, `repro/`); this round's evidence: `$S/flake/ci/pr125-run3b/fix/`.
+
+| job (id) | failure | cause | fix |
+|---|---|---|---|
+| Native memory partition ubuntu-24.04-arm 2 (108957163635) | `facade::tests::managed_session_lifecycle_is_reversible_receipted_and_candidate_isolated` panicked at `fixture_dir.rs:129`: the in-process supervisor "has not been reaped" and the store "ran an engine after its quiescence record" | fixture: the body returned `Err` early while its in-process `ServiceOwner` was still serving; the root was a local of the same block, so it dropped under the live engine. The guard's verdict is correct, but its panic replaced the test's own error, which the log cannot recover | fixtures that serve an in-process owner retire it on every exit path (below). Guard, ledger and product unchanged |
+| Native memory merge ubuntu-24.04-arm (108959480947); ci-gate (108966904172) | partitions finished as failure / required jobs failed | downstream of the row above | none needed |
+
+Every Windows job of the attempt was green, including windows-latest coverage partitions 2 and 8 (task 9.4 needs a second consecutive run).
+
+Fix: `test_support::ServedOwner` holds the served owner task and empties once the task has ended; `test_support::settle(body, teardown)` prints a body error to the captured output, then runs the teardown on every path and returns the body error first (a teardown failure is attached as context). The teardown is each fixture's own success tail, `ServedOwner::retire` (maintenance permit, then the reap; 10 s reap, or a 20 s permit and 5 s reap where the fixture used those). Applied to the 22 fixtures the diagnosis lists: `facade.rs` (17), `service.rs` `maintenance_retires_only_an_idle_owner_and_holds_election` and `lost_candidate_transition_replies_survive_sibling_write_and_owner_restart`, `store.rs` `service_disconnect_and_owner_restart_preserve_unresolved_candidate`, `operational_gc_tests.rs` `slow_30s_managed_abandon_cleanup_bound_fences_client_and_keeps_status_ref` (its managed open now runs inside the judged body) and `migrations.rs` `released_v5_summary_identity_survives_v6_v7_upgrade_reopen_and_export`. Successor fixtures reap the old owner and serve the successor through the same slot; the owner tasks' `AbortOnDrop` guards inside the body are removed, since aborting on the error path would drop the owner mid-serve before its teardown. No assertion changed, no test is ignored, and no deadline, retry or sleep was added. The wider class (a local store held across `?` after its owner was reaped, and the outer fixture-deadline drop) is unchanged.
+
+Local (macOS arm64):
+
+| check | result |
+|---|---|
+| red: the diagnosis's env-gated `bail!` after `let sibling = open().await?;` in the failing test, at 95c79127 (`fix/red-before.log`) | panic at `fixture_dir.rs:129` with both CI clauses; the injected error does not appear |
+| green: same probe on the fixed tree (`fix/green-after.log`) | fails with `Error: REPRO injected early error after sibling open`, printed first as `fixture body failed; retiring its service owner ...`; no guard panic. The probe was removed before commit |
+| `test_support::served_owner::tests` with `settle` skipping the teardown on a failed body (`fix/red-helper.log`) | `a_failed_body_retires_its_live_owner_before_the_root_is_released` panics at `fixture_dir.rs:129`; `a_body_error_is_returned_first_with_a_teardown_error_attached` fails |
+| the same three tests on the fixed tree (`fix/green-helper.log`) | 3/3 pass |
+| the 22 fixtures plus the 3 `served_owner` tests, 20 iterations at `--test-threads=2` (`fix/loop-t2/`) | 17 iterations 25/25; iterations 10, 11 and 16 each 24/1, every failure a named body error with no guard panic (below); 0 `fixture_dir.rs:129` panics in 500 test runs |
+| same, 20 iterations at `--test-threads=8` (`fix/loop-t8/`) | 20/20 iterations 25/25 |
+| `//packages/kuru-memory:test` | 344 pass / 0 fail / 3 ignored (lib 316); 0 guard panics, 0 body-failure lines |
+| `//packages/kuru-runtime:test` | first run 219/1 at load average 40-73: `dolt_tests::undo_is_a_new_revision_…` failed in its own `MemoryStore::open` with `verify memory branch pool identity: pool timed out while waiting for an open connection` (no served-owner fixture; kuru-runtime unchanged); rerun at load 7-21: 220/0 |
+| `format:check`, `lint`, `typecheck`, `lint:tooling`, `docs:check`, `cospec -- validate memory-lifecycle-ordering --strict` | all exit 0 |
+
+Newly named errors. The three failed `--test-threads=2` iterations ran while this shared host's load average was 36-48 (other sessions' work; 14 cores). Each failure is now the fixture's own error, printed and returned, with no guard panic:
+
+- run 11: `managed_session_lifecycle_…`: `memory service write outcome remains uncertain` (`facade.rs` `reconcile`, an `InFlight`/`StillUncertain` outcome). This is the CI test; the CI error is still unknown, and whether it was this one is not proven.
+- runs 10 and 16: `candidate_begin_recovery_…` and `lost_candidate_transition_replies_…`: `project already has a memory service owner; wait for its validated endpoint` from the successor's `ServiceOwner::open` right after the old owner was retired and its permit dropped (the same call sequence as before this round).
+
+None is addressed here, and each needs its own diagnosis. Before this round the run-11 error would have been replaced by the guard's panic (its owner was live), as in CI. The run-10 and run-16 errors arise after the old owner was reaped and before a successor serves, so they were already reported as themselves.
+
+Not run: Linux and coverage-instrumented reproductions; `cfg(windows)` code is unchanged by this round.

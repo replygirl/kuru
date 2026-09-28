@@ -409,6 +409,19 @@ and written only on evidence this process observed itself:
   same for one store whose engine ran in another process, such as a spawned
   `kuru` executable.
 
+A kuru-memory fixture that serves an in-process `ServiceOwner` on a task must
+retire it on every exit path, not only at the end of its success path. It keeps
+the root, the options and a `test_support::ServedOwner` outside the body it
+judges, captures the body's `Result` while the root lives, and passes it to
+`test_support::settle` with `ServedOwner::retire` (the maintenance permit, then
+the owner's reap, with the bounds of the fixture's success path) as the
+teardown. An early `?`, `bail!` or `ensure!` then still retires the owner before
+the root drops. `settle` writes a body error to the test's captured output
+before the teardown starts and returns it in preference to a teardown failure.
+When the teardown cannot retire the owner, for example because an aborted
+request still holds a client attachment, the guard still fails the test and its
+panic replaces the returned error; the printed body error remains.
+
 A record is keyed by the store directory's native identity and birth time, so
 it follows a rename, and releasing a root forgets the records beneath it, so a
 directory that recycles a removed store's Linux inode does not inherit its
