@@ -414,10 +414,22 @@ it follows a rename, and releasing a root forgets the records beneath it, so a
 directory that recycles a removed store's Linux inode does not inherit its
 record. A record snapshots the engine-written `server.log` and `endpoint.json`; an engine that starts later in
 any process changes them and makes the record stale. The ledger and the
-teardown scan run in one critical section, so the scan's instrumented counters
-are never updated concurrently. A store that is unreaped, unrecorded or stale keeps the whole root and,
+teardown scan run in one critical section, so a teardown's verdict and its
+forgetting of the records beneath its root see one consistent ledger. A store that is unreaped, unrecorded or stale keeps the whole root and,
 outside an existing failure, fails the test, naming the root, the test and
 each store. A test that is already panicking only keeps the root.
+
+Ledger and guard code must finish before its test function returns. Coverage
+writes each process's profile at exit, and a thread still inside an
+instrumented function then can have its entry counter written without a later
+one, leaving a counter expression negative, which the coverage line export
+refuses. So a fixture never drops a guarded root on a detached thread: one
+that must first wait for a creator process uses
+`test_support::release_after_creator_exit`, which waits on the calling thread
+and releases or keeps the root before it returns. A dropped store owner's
+reaper thread, which outlives its owner by design, only sends a report of the
+reap built from standard-library calls, and the ledger records it on the next
+thread that reads the ledger.
 
 The lifecycle-ordering measurements are ignored tests, and their Dolt trace is
 inert unless `KURU_TEST_DOLT_LOG_DIR` names a directory, so neither runs in
