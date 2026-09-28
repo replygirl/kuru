@@ -268,3 +268,36 @@ Local (macOS arm64, 14 cores; 1-minute load averages from `uptime` before and af
 | `format:check`, `lint`, `typecheck`, `lint:tooling`, `docs:check`, `cospec -- validate memory-lifecycle-ordering --strict` | all exit 0 |
 
 All injections were removed before commit (`git diff` against the saved fix diff was byte-identical; no `SCRATCH` line in the tree). No new failure signature appeared in the final loops. Not run: Linux, Windows and coverage-instrumented builds; CI.
+
+## Round 8: class B structural prevention and the Windows engine fixture teardown (2026-09-28, same host)
+
+Evidence: `$S/flake/ci/pr125-hardening/` (`build.md` indexes it). Rebased onto `origin/main` 5a344499 first, with no conflicts; no file is changed on both sides.
+
+Audit (design D9). Every raw pool close is followed only by procedures that fence and order themselves, so none gained a wait:
+
+| site (before) | after | follows it |
+|---|---|---|
+| `store.rs` promotion worker, `current == target` arm: `retire_pool(open)` | `close_pool_without_session_end` | `cleanup_promoted_candidate` → `delete_candidate_ref` (fence + ordered step) |
+| `store.rs` promotion worker after the merge: `retire_pool(open)` | `close_pool_without_session_end` | same |
+| `store.rs` `abandon_checked`: `retire_pool(open)` | `close_pool_without_session_end` | `abandon_candidate` → `transition_candidate` and `delete_candidate_ref` (fence + ordered step) |
+| `store.rs` `candidate_branch_is_clean`: `retire_pool(branch)` after its inspection | `close_pool_without_session_end` | its callers' transitions and deletes fence and order themselves; after a settled transition, no branch procedure follows |
+| `store.rs` `retire_branch_sessions` | forwards to `Server::retire_branch_sessions`, which returns `SessionsEnded` | the only rename, delete and exclusion probe |
+| rename `-m` (transition), probe `-m` self-rename, delete `-d`/`-D` | `SessionsEnded::rename`, `::exclusion_probe`, `::delete` in `server.rs` | SQL text and bindings unchanged |
+
+Every other product `DOLT_BRANCH` (`store.rs` candidate creation, `usage_ledger.rs`, `migrations.rs`) binds `(name, base)` and creates a branch.
+
+| check | result |
+|---|---|
+| out-of-module shapes, each added alone to `store.rs` and compiled (`compile-fail.log`) | rejected: raw `retire_pool` E0624; forged `SessionsEnded { admission }` E0451; fence dropped before the rename query ran E0505; one proof used for rename and delete E0382; admission guard reached E0616 |
+| `server::branch_procedure_tests` with an injected raw `DOLT_BRANCH(?, ?)` bound to `"-D"` in `store.rs` (`scan-red.log`) | FAIL, naming the line; passes without it |
+| affected tests (39: store, gc, facade candidate, migrations, recovery, usage ledger, the scan), 10 iterations `--test-threads=2` (`loop-t2/summary.txt`) | 10/10 clean, 61-65 s each; 1-minute load 2.8-5.0 |
+| same, `--test-threads=8` (`loop-t8/summary.txt`) | 10/10 clean, 30-41 s each; load 3.4-6.3 |
+| `slow_30s_managed_abandon_cleanup_bound_fences_client_and_keeps_status_ref`, once (`slow30.log`) | pass, 34.1 s; load 5.95 -> 4.37 |
+| `//packages/kuru-memory:test` (`memory-test.log`, load 3.8 -> 2.4) | lib 322 passed / 0 failed / 3 ignored; every integration target ok; 0 guard panics |
+| `//packages/kuru-runtime:test` (`runtime-test.log`, load 2.8 -> 3.6) | 220/0 |
+| Windows `cargo clippy -p kuru-memory --all-targets --all-features --locked --target x86_64-pc-windows-msvc`, fakecc stub (`winclippy.log`) | exit 0; warning set identical to the stage-teardown baseline; none in `test_support/windows.rs`, `fixture_dir.rs`, `store.rs` or the new server items |
+| `format:check`, `lint`, `typecheck`, `lint:tooling`, `docs:check`, `cospec -- validate memory-lifecycle-ordering --strict` | all exit 0 |
+
+Unchanged: `QUERY_TIMEOUT`, `CLOSE_GRACE`, both steps' error text, the `PoolRetirement` stage, the uncertain-write receipts and the point at which the transition releases its fence. No assertion changed; the gc canary now holds the branch's admission around the step and releases it before its own transition.
+
+Not run: `EngineOwner::drop` and every other `cfg(windows)` path (type-checked only); Linux and coverage-instrumented builds; CI.

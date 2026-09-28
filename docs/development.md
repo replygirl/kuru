@@ -469,10 +469,25 @@ one, leaving a counter expression negative, which the coverage line export
 refuses. So a fixture never drops a guarded root on a detached thread: one
 that must first wait for a creator process uses
 `test_support::release_after_creator_exit`, which waits on the calling thread
-and releases or keeps the root before it returns. A dropped store owner's
-reaper thread, which outlives its owner by design, only sends a report of the
-reap built from standard-library calls, and the ledger records it on the next
-thread that reads the ledger.
+and releases or keeps the root before it returns. A fixture that holds
+something other than a guarded root until a child exits, such as the Windows
+engine fixture's directory handle, waits with `await_creator_exit` on the
+dropping thread and keeps both the child and the handle when the wait ends
+without an exit. A dropped store owner's reaper thread, which outlives its
+owner by design, only sends a report of the reap built from standard-library
+calls, and the ledger records it on the next thread that reads the ledger.
+
+A Dolt branch rename or delete must follow server-observed end of every
+session on that branch, not only Kuru's pool close; otherwise Dolt refuses the
+checked procedure as in use (error 1105). `Server::retire_branch_sessions`
+fences the branch's pool admission, retires its pool and awaits that session
+end, and returns a `SessionsEnded` proof. The rename, exclusion-probe and
+delete procedures are built only from that proof, and each borrows its
+admission fence until it has run. The raw pool close is private to
+`server.rs`; the only other close is `close_pool_without_session_end`, which
+grants no branch procedure. The compiler rejects a forged proof, and
+`server::branch_procedure_tests` rejects a rename or delete written as raw SQL
+anywhere else in the crate's non-test code.
 
 The lifecycle-ordering measurements are ignored tests, and their Dolt trace is
 inert unless `KURU_TEST_DOLT_LOG_DIR` names a directory, so neither runs in
