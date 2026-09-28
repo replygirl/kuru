@@ -36,21 +36,33 @@
 //! store. A thread that is already unwinding keeps the root without a second
 //! panic. The check never waits and writes nothing to stdout or stderr. The
 //! whole scan runs inside the ledger's critical section
-//! ([`engine_ledger::with`]), so no two teardowns execute it concurrently,
-//! and in the same section the teardown forgets the records beneath its
-//! root.
+//! ([`engine_ledger::with`]), and in the same section the teardown forgets
+//! the records beneath its root, so no owner is registered, reaped or
+//! recorded between the verdict and the forgetting.
+//!
+//! The teardown runs on the thread that drops the root, and that thread must
+//! finish before the test function returns. Never move a root into a
+//! detached thread: one still inside the scan when the test process exits
+//! has its coverage counters written mid-function, which leaves a counter
+//! expression negative and fails the coverage partition, and its verdict
+//! never reaches the test. A fixture that must first wait for a creator
+//! process uses [`release_after_creator_exit`], which waits on the calling
+//! thread and releases or keeps the root before it returns.
 
 use super::engine_ledger::{self, Key, Ledger};
 use crate::files::PrivateTemp;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
-    fs,
+    fs, io,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 const MAX_DEPTH: usize = 8;
 const MAX_ENTRIES: usize = 4096;
+/// How often [`release_after_creator_exit`] queries its creator.
+const CREATOR_POLL: Duration = Duration::from_millis(20);
 
 /// A private fixture root, checked for unexplained memory owners before
 /// removal.
@@ -124,6 +136,50 @@ impl Drop for TempDir {
             self.label,
             violations.join("; ")
         );
+    }
+}
+
+/// How [`release_after_creator_exit`] ended. Either way the root was released
+/// or kept on the calling thread before it returned.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CreatorTeardown {
+    /// The creator exited and the fixture proved its descendants stopped:
+    /// the root went through the guard's teardown on the calling thread.
+    Released,
+    /// The creator exited, but the fixture did not prove its descendants
+    /// stopped: the root is kept, unchecked, at this path.
+    Unproven(PathBuf),
+    /// The creator did not exit within the wait, or its status query failed:
+    /// the root is kept, unchecked, at this path, and the caller must keep
+    /// the creator.
+    Delayed(PathBuf),
+}
+
+/// Teardown for a fixture root a creator process worked in: query `status`
+/// every 20 ms, for at most `wait`, until the creator has exited, then
+/// release the root through the guard if `descendants_stopped`, else keep it.
+///
+/// Everything happens on the calling thread, before this returns, so the
+/// guard's verdict reaches the test and no guard code outlives it.
+pub fn release_after_creator_exit<S>(
+    root: TempDir,
+    wait: Duration,
+    descendants_stopped: bool,
+    mut status: impl FnMut() -> io::Result<Option<S>>,
+) -> CreatorTeardown {
+    let deadline = Instant::now() + wait;
+    loop {
+        match status() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(CREATOR_POLL),
+            _ => return CreatorTeardown::Delayed(root.keep()),
+        }
+    }
+    if descendants_stopped {
+        drop(root);
+        CreatorTeardown::Released
+    } else {
+        CreatorTeardown::Unproven(root.keep())
     }
 }
 
@@ -479,6 +535,176 @@ mod tests {
         drop(root);
         assert!(!path.exists(), "a recorded root is removed");
         drop(inherited);
+    }
+
+    /// A creator process as the Windows owner fixtures hold one: it exits
+    /// after `polls` status queries. `handle` stands for its retained process
+    /// handle.
+    struct Creator {
+        polls: usize,
+        queried: usize,
+        handle: std::sync::Arc<()>,
+    }
+
+    impl Creator {
+        fn exiting_after(polls: usize) -> Self {
+            Self {
+                polls,
+                queried: 0,
+                handle: std::sync::Arc::new(()),
+            }
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<()>> {
+            self.queried += 1;
+            Ok((self.queried > self.polls).then_some(()))
+        }
+    }
+
+    /// The shape of `tests/windows_lifecycle.rs`'s `Fixture`, whose drop
+    /// waits for its creator and then releases or keeps the root.
+    struct CreatorFixture {
+        root: Option<TempDir>,
+        creator: Option<Creator>,
+        descendants_stopped: bool,
+        wait: Duration,
+        outcome: std::sync::mpsc::Sender<CreatorTeardown>,
+    }
+
+    impl CreatorFixture {
+        fn new(
+            root: TempDir,
+            creator: Creator,
+            descendants_stopped: bool,
+            wait: Duration,
+        ) -> (Self, std::sync::mpsc::Receiver<CreatorTeardown>) {
+            let (outcome, received) = std::sync::mpsc::channel();
+            let fixture = Self {
+                root: Some(root),
+                creator: Some(creator),
+                descendants_stopped,
+                wait,
+                outcome,
+            };
+            (fixture, received)
+        }
+    }
+
+    impl Drop for CreatorFixture {
+        // The same match as the real fixture's drop, so its borrows compile
+        // here too: the creator is kept only when the teardown was delayed.
+        fn drop(&mut self) {
+            let root = self.root.take().unwrap();
+            let mut creator = self.creator.take().unwrap();
+            match release_after_creator_exit(root, self.wait, self.descendants_stopped, || {
+                creator.try_wait()
+            }) {
+                CreatorTeardown::Delayed(root) => {
+                    // As the real fixture keeps its creator's process handle.
+                    std::mem::forget(creator);
+                    self.outcome.send(CreatorTeardown::Delayed(root)).unwrap();
+                }
+                outcome => self.outcome.send(outcome).unwrap(),
+            }
+        }
+    }
+
+    /// The Windows owner fixtures' teardown releases the root on the test
+    /// thread: it is gone by the time the fixture's drop returns.
+    #[test]
+    fn a_creator_fixture_releases_its_root_before_its_drop_returns() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let store = stopped_store(root.path());
+        engine_ledger::record(&store);
+        let path = root.path().to_path_buf();
+        let creator = Creator::exiting_after(2);
+        let handle = creator.handle.clone();
+        let (fixture, outcome) = CreatorFixture::new(root, creator, true, Duration::from_secs(40));
+        drop(fixture);
+        assert_eq!(outcome.try_recv(), Ok(CreatorTeardown::Released));
+        assert!(
+            !path.exists(),
+            "the root must be released before the fixture's drop returns"
+        );
+        assert_eq!(
+            std::sync::Arc::strong_count(&handle),
+            1,
+            "an exited creator is released"
+        );
+    }
+
+    /// The guard's verdict reaches the test thread: an unexplained store
+    /// fails the fixture's own drop, which a detached thread never could.
+    #[test]
+    fn a_creator_fixture_fails_its_own_drop_for_an_unexplained_store() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let store = stopped_store(root.path());
+        let path = root.path().to_path_buf();
+        let (fixture, outcome) = CreatorFixture::new(
+            root,
+            Creator::exiting_after(0),
+            true,
+            Duration::from_secs(40),
+        );
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(fixture)))
+            .expect_err("the guard must fail the fixture's drop on this thread");
+        let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+        let expected = format!("store {} has no quiescence record", store.display());
+        assert!(
+            message.contains(&expected),
+            "{expected:?} missing: {message}"
+        );
+        assert!(
+            outcome.try_recv().is_err(),
+            "the failing drop reported no outcome"
+        );
+        assert!(path.exists(), "an unexplained root is kept");
+        remove_kept(&path);
+    }
+
+    /// Unproven descendants and a creator that outlives the wait keep the
+    /// root, unchecked, before the drop returns: an unexplained store in it
+    /// does not fail.
+    #[test]
+    fn a_creator_fixture_keeps_its_root_for_unproven_descendants_or_a_live_creator() {
+        for (creator, descendants_stopped, wait) in [
+            (Creator::exiting_after(1), false, Duration::from_secs(40)),
+            (Creator::exiting_after(usize::MAX), true, Duration::ZERO),
+        ] {
+            let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+            stopped_store(root.path());
+            let path = root.path().to_path_buf();
+            let handle = creator.handle.clone();
+            let (fixture, outcome) = CreatorFixture::new(root, creator, descendants_stopped, wait);
+            drop(fixture);
+            // Only a creator that did not exit keeps its handle.
+            let (expected, handles) = if descendants_stopped {
+                (CreatorTeardown::Delayed(path.clone()), 2)
+            } else {
+                (CreatorTeardown::Unproven(path.clone()), 1)
+            };
+            assert_eq!(outcome.try_recv(), Ok(expected));
+            assert!(path.exists(), "a kept root stays in place");
+            assert_eq!(std::sync::Arc::strong_count(&handle), handles);
+            remove_kept(&path);
+        }
+    }
+
+    /// A failed status query keeps the root at once, as the fixture reported
+    /// a failed query at once before.
+    #[test]
+    fn a_failed_creator_status_query_keeps_the_root_without_waiting() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let path = root.path().to_path_buf();
+        let mut queries = 0;
+        let outcome = release_after_creator_exit(root, Duration::from_secs(40), true, || {
+            queries += 1;
+            Err::<Option<()>, _>(io::Error::other("controlled status query failure"))
+        });
+        assert_eq!(outcome, CreatorTeardown::Delayed(path.clone()));
+        assert_eq!(queries, 1);
+        assert!(path.exists());
+        remove_kept(&path);
     }
 
     #[test]

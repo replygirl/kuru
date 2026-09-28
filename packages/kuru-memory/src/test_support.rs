@@ -23,7 +23,7 @@
 //! migrations to run. When in doubt, use the cold constructor.
 /// Fixture roots whose teardown refuses to release a live memory owner.
 mod fixture_dir;
-pub use fixture_dir::TempDir;
+pub use fixture_dir::{CreatorTeardown, TempDir, release_after_creator_exit};
 /// Process-local live-owner and quiescence records the fixture guard reads.
 pub(crate) mod engine_ledger;
 /// Env-gated lifecycle ordering measurement trace (inert unless enabled).
