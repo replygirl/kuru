@@ -23,8 +23,13 @@ fn lifecycle_root(options: &OpenOptions) -> Option<PathBuf> {
 /// `Server::quiescence_at` rejects a zero wait; one millisecond is a single
 /// attempt, far shorter than any Dolt stop. A violation panics here, before
 /// the fixture root drops, so the report names this contract.
+///
+/// The lease is a real lifecycle flock taken in this process, and the fixture
+/// root's teardown probes that same lock, so the attempt and the release both
+/// hold the lock gate; see `crate::spawn_gate`.
 async fn assert_reaped(options: &OpenOptions, directory: &Path) -> Result<()> {
     let root = lifecycle_root(options);
+    let _gate = crate::spawn_gate::locking_async().await;
     match Server::quiescence_at(directory, root.as_deref(), Duration::from_millis(1)).await {
         Ok(lease) => {
             drop(lease);
@@ -84,12 +89,12 @@ async fn staged_open_error_returns_only_after_its_server_is_reaped() -> Result<(
 async fn active_open_validation_error_returns_only_after_its_server_is_reaped() -> Result<()> {
     let root = crate::test_support::tempdir()?;
     let options = options(&root, '5')?;
-    let store = MemoryStore::open(options.clone()).await?;
+    let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     sqlx::query("UPDATE kuru_schema SET version = 99")
         .execute(store.pool.as_ref())
         .await?;
     store.close().await?;
-    let error = MemoryStore::open(options.clone())
+    let error = crate::test_support::spawn_gated_open(options.clone())
         .await
         .expect_err("an unsupported schema version cannot open memory");
     assert!(format!("{error:#}").contains("unsupported"));
@@ -104,7 +109,7 @@ async fn active_open_validation_error_returns_only_after_its_server_is_reaped() 
 async fn established_store_open_error_returns_only_after_its_server_is_reaped() -> Result<()> {
     let root = crate::test_support::tempdir()?;
     let options = options(&root, '6')?;
-    let store = MemoryStore::open(options.clone()).await?;
+    let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     let usage_pool = store
         .shared
         .usage_pool
@@ -121,11 +126,54 @@ async fn established_store_open_error_returns_only_after_its_server_is_reaped() 
         .await?;
     drop(usage_pool);
     store.close().await?;
-    let error = MemoryStore::open(options.clone())
+    let error = crate::test_support::spawn_gated_open(options.clone())
         .await
         .expect_err("a malformed usage receipt schema cannot open writable memory");
     // The usage ledger's historical receipt query is the refusing step.
     assert!(format!("{error:#}").contains("\"label\""));
     let directory = project_directory(&options.data_dir, &options.project_scope)?;
     assert_reaped(&options, &directory).await
+}
+
+/// Active open of a current-schema store that fails its final validation: a
+/// dirty main working set.
+#[tokio::test]
+async fn active_open_final_validation_error_returns_only_after_its_server_is_reaped() -> Result<()>
+{
+    let root = crate::test_support::tempdir()?;
+    let options = options(&root, '7')?;
+    let store = crate::test_support::spawn_gated_open(options.clone()).await?;
+    sqlx::query("CREATE TABLE uncommitted_fixture (id INT PRIMARY KEY)")
+        .execute(store.pool.as_ref())
+        .await?;
+    store.close().await?;
+    let error = crate::test_support::spawn_gated_open(options.clone())
+        .await
+        .expect_err("a dirty main working set cannot open writable memory");
+    assert!(
+        format!("{error:#}").contains("uncommitted changes"),
+        "the open failed before its final validation: {error:#}"
+    );
+    let directory = project_directory(&options.data_dir, &options.project_scope)?;
+    assert_reaped(&options, &directory).await
+}
+
+/// A close that fails after a failed open is attached to the open's error,
+/// which stays the root cause; a clean close leaves the error unchanged.
+#[test]
+fn a_failed_close_is_attached_to_the_open_error() {
+    let attached = with_close_failure(
+        anyhow::anyhow!("open refused"),
+        Err(anyhow::anyhow!("supervisor reap exceeded its allowance")),
+    );
+    assert_eq!(attached.root_cause().to_string(), "open refused");
+    assert_eq!(
+        format!("{attached:#}"),
+        "memory server close after the failed open also failed: \
+         supervisor reap exceeded its allowance: open refused"
+    );
+
+    let unchanged = with_close_failure(anyhow::anyhow!("open refused"), Ok(()));
+    assert_eq!(format!("{unchanged:#}"), "open refused");
+    assert_eq!(unchanged.chain().count(), 1);
 }
