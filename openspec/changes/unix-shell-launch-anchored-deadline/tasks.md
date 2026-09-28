@@ -40,6 +40,26 @@
   shell starts `timeout(duration, …)` only after `spawn()`, so it has no
   pre-launch deadline. `unix_shell_outlives_a_destroyed_parent_runtime` uses
   `timeout_ms` 120000 with a readiness marker, so it is not exposed.
+  `unix_shell_timeout_projects_a_fixed_failure_without_captured_stderr` and
+  `unix_shell_timeout_keeps_eof_complete_redacted_stderr` use `timeout_ms:
+  3_000`, with the deadline starting at acceptance and a 5 s bounded wait for
+  the readiness marker. These are **residual lower exposure**, not unexposed:
+  a pre-launch stall past 3 s still fails them (the readiness marker is never
+  written, so `ready_result` expires), the same class of exposure this change
+  anchors in `unix_shell.rs`, only lower because it needs a multi-second
+  stall instead of a 10–30 ms one. Anchoring them would need a `pub(crate)`
+  accessor on `ShellRegistry` analogous to the test-only launch anchor; that
+  is follow-on work, out of scope here.
+- Known limit, pre-existing and outside this change:
+  `retained_cleanup_uses_capped_exponential_observation_backoff`'s caller
+  fallback lands about 20 ms (the test's budget) after the launch deadline,
+  while the worker records the primary failure category on its next
+  read-loop observation, at most about 10 ms after the deadline plus
+  scheduling. A stall exceeding roughly that 10 ms window there can still
+  make the caller return `shell cleanup unconfirmed; …` instead of the
+  primary category. The launch anchor narrows this race (the fallback
+  previously counted from acceptance, not from launch) but does not close
+  it; closing it is out of scope for this change.
 
 ## Observed evidence
 

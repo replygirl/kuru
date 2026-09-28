@@ -16,6 +16,13 @@ never runs (main run 36362325789, macOS coverage partition 4).
   command duration from that instant and hands the launch deadline to the
   caller, whose fallback is anchored at the same instant. Release builds
   compile the same `execute`, `worker` and `before_launch` behaviour as before.
+  The caller's wait for that launch (or an earlier pre-launch finish) is
+  itself bounded by a new `LAUNCH_ANCHOR_BOUND` (10 s). This is a new
+  test-only diagnostic bound, not a raised product timeout: no existing
+  deadline, budget or backoff changes. If it expires, the caller cancels the
+  owner and returns a named `"test launch anchor: …"` error instead of
+  hanging; that expiry arm is not exercised by any test in this change
+  (uncovered `cfg(test)` code).
 - The tests `cleanup_panic_keeps_the_timeout_primary_and_retains_the_owner`,
   `retained_owner_holds_process_wide_admission_across_dropped_registries`,
   `delayed_interruption_retains_the_real_worker_then_confirms_once` and
