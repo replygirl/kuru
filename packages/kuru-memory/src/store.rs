@@ -40,6 +40,9 @@ mod lifecycle_measurement_tests;
 #[path = "store/migration_lifecycle_tests.rs"]
 mod migration_lifecycle_tests;
 #[cfg(test)]
+#[path = "store/open_error_reap_tests.rs"]
+mod open_error_reap_tests;
+#[cfg(test)]
 #[path = "store/open_pool_budget_tests.rs"]
 mod open_pool_budget_tests;
 #[cfg(test)]
@@ -765,11 +768,14 @@ fn candidate_branch_rename_reason(
     vendor: u16,
     message: &str,
 ) -> &'static str {
-    // Dolt 2.3.3's branch procedure returns this fixed message only when an
-    // active session prevents the checked rename. Keep its text private.
+    // Dolt's branch procedure returns this fixed message only when another
+    // session holds the branch, for the checked status rename and equally for
+    // cleanup's checked delete and exclusion probe. Keep its text private.
     const BRANCH_IN_USE: &str = "unsafe to delete or rename branches in use in other sessions; use --force to force the change";
-    if matches!(stage, CandidateFailureStage::BranchRename)
-        && sqlstate == "HY000"
+    if matches!(
+        stage,
+        CandidateFailureStage::BranchRename | CandidateFailureStage::Cleanup
+    ) && sqlstate == "HY000"
         && vendor == 1105
         && message == BRANCH_IN_USE
     {
@@ -1165,6 +1171,28 @@ async fn preserve_resolved_cleanup(
     Ok(())
 }
 
+/// Retire Kuru's pool for `branch`, then wait until the server itself no
+/// longer lists a session on it. Closing the client pool is not enough: Dolt
+/// removes a session only when its per-connection loop observes the close,
+/// and until then a checked rename, delete or exclusion probe of the branch
+/// is refused as in use. The caller holds the branch's pool admission fence,
+/// so no Kuru session can reopen it before the branch procedure.
+async fn retire_branch_sessions(
+    store: &MemoryStore,
+    branch: &str,
+    retirement_deadline: Duration,
+) -> Result<()> {
+    store
+        .shared
+        .server
+        .retire_pool(branch)
+        .await
+        .context(CandidateFailureStage::PoolRetirement)?;
+    await_branch_sessions_end(store, branch, retirement_deadline)
+        .await
+        .context(CandidateFailureStage::PoolRetirement)
+}
+
 async fn transition_candidate(
     store: &MemoryStore,
     source: &str,
@@ -1188,15 +1216,7 @@ async fn transition_candidate_with_retirement_deadline(
         .fence_pool(source)
         .await
         .context(CandidateFailureStage::PoolRetirement)?;
-    store
-        .shared
-        .server
-        .retire_pool(source)
-        .await
-        .context(CandidateFailureStage::PoolRetirement)?;
-    await_branch_sessions_end(store, source, retirement_deadline)
-        .await
-        .context(CandidateFailureStage::PoolRetirement)?;
+    retire_branch_sessions(store, source, retirement_deadline).await?;
     let (mut connection, id) = owned_connection(&store.pool).await?;
     *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
         pool: store.pool.clone(),
@@ -1255,6 +1275,7 @@ async fn delete_candidate_ref(
     branch: &str,
     expected: &str,
     force: bool,
+    retirement_deadline: Duration,
 ) -> Result<()> {
     let before =
         candidate_heads(&store.pool, &CandidateNames::from_status_or_open(branch)?).await?;
@@ -1265,8 +1286,29 @@ async fn delete_candidate_ref(
         head == expected,
         "candidate cleanup found an unexpected ref head"
     );
-    store.shared.server.retire_pool(branch).await?;
+    // The probe and delete run on owned connections from this store's pool,
+    // whose session selects `kuru/<store branch>`; it must never be the
+    // branch being deleted, or the caller would hold it itself.
+    ensure!(
+        store.branch != branch,
+        "candidate cleanup cannot delete the branch its own session selects"
+    );
+    // Order exactly as the status rename: fence admission, retire the pool,
+    // and wait for server-observed session end after the last Kuru session
+    // on the branch (including cleanup's working-set inspection) closed.
+    // Admission stays fenced through the branch procedure and its settlement.
+    let _admission = store
+        .shared
+        .server
+        .fence_pool(branch)
+        .await
+        .context(CandidateFailureStage::PoolRetirement)?;
+    retire_branch_sessions(store, branch, retirement_deadline).await?;
     if force {
+        // `-D` skips Dolt's in-use check, so this checked self-rename remains
+        // the server's own confirmation that no session holds the branch. It
+        // also sees sessions whose processlist database is not branch
+        // qualified, which the wait above cannot.
         confirm_no_live_candidate_session(store, branch, expected).await?;
     }
     let (mut connection, id) = owned_connection(&store.pool).await?;
@@ -1352,9 +1394,9 @@ async fn cleanup_promoted_candidate(
         }
     }
     if heads.contains_key(&names.open) {
-        delete_candidate_ref(store, &names.open, target, false).await?;
+        delete_candidate_ref(store, &names.open, target, false, QUERY_TIMEOUT).await?;
     }
-    delete_candidate_ref(store, &names.promoting, target, false).await
+    delete_candidate_ref(store, &names.promoting, target, false, QUERY_TIMEOUT).await
 }
 
 async fn cleanup_abandoned_candidate(
@@ -1379,7 +1421,7 @@ async fn cleanup_abandoned_candidate(
     // remains explicitly recoverable.
     for branch in [&names.open, &names.promoting, &names.abandoned] {
         if heads.contains_key(branch) {
-            delete_candidate_ref(store, branch, target, true).await?;
+            delete_candidate_ref(store, branch, target, true, QUERY_TIMEOUT).await?;
         }
     }
     Ok(())
@@ -1724,7 +1766,10 @@ impl MemoryStore {
                 )
                 .await
                 .context("open staged memory server")?;
-                let pool = server.pool("main").await.context("open staged main pool")?;
+                let pool = match server.pool("main").await.context("open staged main pool") {
+                    Ok(pool) => pool,
+                    Err(error) => return Err(close_failed_open(&server, error).await),
+                };
                 let initialized = async {
                     initialize(&pool).await?;
                     if let Some(legacy) = &legacy {
@@ -1770,7 +1815,10 @@ impl MemoryStore {
                 )
                 .await
                 .context("reopen staged memory server for migration")?;
-                let pool = server.pool("main").await.context("open staged main pool")?;
+                let pool = match server.pool("main").await.context("open staged main pool") {
+                    Ok(pool) => pool,
+                    Err(error) => return Err(close_failed_open(&server, error).await),
+                };
                 #[cfg(test)]
                 let (returned_lock, migrated) =
                     run_migration_worker(server, pool, options.migration_hooks.clone()).await?;
@@ -1800,10 +1848,14 @@ impl MemoryStore {
                 if let Some((delay, entered)) = options.migrated_stage_pool_delay.clone() {
                     server.delay_next_pool_authentication(delay, entered);
                 }
-                let pool = server
+                let pool = match server
                     .pool("main")
                     .await
-                    .context("open migrated staged main pool")?;
+                    .context("open migrated staged main pool")
+                {
+                    Ok(pool) => pool,
+                    Err(error) => return Err(close_failed_open(&server, error).await),
+                };
                 let activated = async {
                     migrations::validate_active(&server, &pool).await?;
                     let initial_revision = revision(&pool).await?;
@@ -1877,20 +1929,35 @@ impl MemoryStore {
         )
         .await
         .context("open active memory server")?;
-        let pool = server.pool("main").await.context("open active main pool")?;
-        let found = migrations::version(&pool).await?;
+        let pool = match server.pool("main").await.context("open active main pool") {
+            Ok(pool) => pool,
+            Err(error) => return Err(close_failed_open(&server, error).await),
+        };
+        let inspected = async {
+            let found = migrations::version(&pool).await?;
+            if (options.read_only && found < migrations::CURRENT_VERSION)
+                || found > migrations::CURRENT_VERSION
+            {
+                migrations::validate_supported(&pool).await?;
+            }
+            ensure!(
+                found <= migrations::CURRENT_VERSION,
+                "unsupported Dolt memory schema version {found}"
+            );
+            Ok::<_, anyhow::Error>(found)
+        }
+        .await;
+        let found = match inspected {
+            Ok(found) => found,
+            Err(error) => return Err(close_failed_open(&server, error).await),
+        };
         if options.read_only && found < migrations::CURRENT_VERSION {
-            migrations::validate_supported(&pool).await?;
             let lock: File = server.close_installed_guard().await?;
             drop(lock);
             bail!(
                 "memory schema version {found} requires writable upgrade to {}",
                 migrations::CURRENT_VERSION
             );
-        }
-        if found > migrations::CURRENT_VERSION {
-            migrations::validate_supported(&pool).await?;
-            bail!("unsupported Dolt memory schema version {found}");
         }
         let (server, pool) = if found < migrations::CURRENT_VERSION {
             #[cfg(test)]
@@ -1903,18 +1970,21 @@ impl MemoryStore {
             let server = Server::open_with_guard(make_options(directory.clone(), false), lock)
                 .await
                 .context("reopen migrated memory server")?;
-            let pool = server
-                .pool("main")
-                .await
-                .context("open migrated main pool")?;
+            let pool = match server.pool("main").await.context("open migrated main pool") {
+                Ok(pool) => pool,
+                Err(error) => return Err(close_failed_open(&server, error).await),
+            };
             (server, pool)
         } else {
             (server, pool)
         };
-        if options.read_only {
-            migrations::validate_inspection(&server, &pool).await?;
+        let validated = if options.read_only {
+            migrations::validate_inspection(&server, &pool).await
         } else {
-            migrations::validate_active(&server, &pool).await?;
+            migrations::validate_active(&server, &pool).await
+        };
+        if let Err(error) = validated {
+            return Err(close_failed_open(&server, error).await);
         }
         let shared = Arc::new(Shared {
             server,
@@ -1939,8 +2009,14 @@ impl MemoryStore {
             logical_receipt: None,
         };
         if !options.read_only {
+            // The recovery worker closes its server before reporting failure.
             run_candidate_recovery_worker(&store).await?;
-            usage_ledger::establish(&store).await?;
+            if let Err(error) = usage_ledger::establish(&store).await {
+                // Recovery already released the startup guard to this store,
+                // so close the server itself rather than its installed guard.
+                let closed = store.shared.server.close().await;
+                return Err(with_close_failure(error, closed));
+            }
         } else {
             let lock: File = store.shared.server.take_reap_guard();
             drop(lock);
@@ -4375,6 +4451,27 @@ async fn close_candidate_recovery_worker(store: MemoryStore) -> Result<()> {
     let lock = stopped?;
     drop(lock);
     Ok(())
+}
+
+/// Keep the error that required a close, noting a close that also failed.
+fn with_close_failure(error: anyhow::Error, closed: Result<()>) -> anyhow::Error {
+    match closed {
+        Ok(()) => error,
+        Err(cleanup) => error.context(format!(
+            "memory server close after the failed open also failed: {cleanup:#}"
+        )),
+    }
+}
+
+/// An open that fails after starting its server returns only after that
+/// server's owned, bounded close (`close_pools_and_owner`: pool drain, then
+/// the supervisor reap allowance) and only then releases the startup guard.
+/// `Err` from `MemoryStore::open` therefore means Dolt is reaped, and a caller
+/// may release or remove the directory. A close that exceeds its bound keeps
+/// the guard with the supervisor observer and is attached to `error`.
+async fn close_failed_open(server: &Server, error: anyhow::Error) -> anyhow::Error {
+    let closed = server.close_installed_guard().await.map(drop);
+    with_close_failure(error, closed)
 }
 
 async fn close_migration_worker(server: Server, _pool: Arc<MySqlPool>) -> Result<File> {
@@ -7379,7 +7476,10 @@ async fn recover_staging(
             )
             .await?;
             let pool = if inspection {
-                Some(server.pool("main").await?)
+                match server.pool("main").await {
+                    Ok(pool) => Some(pool),
+                    Err(error) => return Err(close_failed_open(&server, error).await),
+                }
             } else {
                 None
             };

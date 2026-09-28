@@ -19,10 +19,17 @@ fn candidate_failure_record_exposes_only_fixed_stage_and_sql_class() {
 #[test]
 fn branch_rename_reason_requires_the_exact_pinned_dolt_error() {
     const MESSAGE: &str = "unsafe to delete or rename branches in use in other sessions; use --force to force the change";
-    assert_eq!(
-        candidate_branch_rename_reason(CandidateFailureStage::BranchRename, "HY000", 1105, MESSAGE),
-        "branch_in_use"
-    );
+    // A checked cleanup delete or exclusion probe meets the same Dolt check as
+    // the status rename, so both stages name it; the message stays private.
+    for stage in [
+        CandidateFailureStage::BranchRename,
+        CandidateFailureStage::Cleanup,
+    ] {
+        assert_eq!(
+            candidate_branch_rename_reason(stage, "HY000", 1105, MESSAGE),
+            "branch_in_use"
+        );
+    }
     for (stage, state, vendor, message) in [
         (
             CandidateFailureStage::BranchRename,
@@ -30,7 +37,22 @@ fn branch_rename_reason_requires_the_exact_pinned_dolt_error() {
             1105,
             "another Dolt error",
         ),
+        (
+            CandidateFailureStage::Cleanup,
+            "HY000",
+            1105,
+            "another Dolt error",
+        ),
+        (CandidateFailureStage::Cleanup, "HY001", 1105, MESSAGE),
+        (CandidateFailureStage::Cleanup, "HY000", 1106, MESSAGE),
         (CandidateFailureStage::RefInspection, "HY000", 1105, MESSAGE),
+        (
+            CandidateFailureStage::PoolRetirement,
+            "HY000",
+            1105,
+            MESSAGE,
+        ),
+        (CandidateFailureStage::MainMerge, "HY000", 1105, MESSAGE),
         (CandidateFailureStage::BranchRename, "HY001", 1105, MESSAGE),
         (CandidateFailureStage::BranchRename, "HY000", 1106, MESSAGE),
         (
@@ -896,5 +918,325 @@ async fn full_gc_preserves_live_candidate_historical_and_export_views() -> Resul
         1
     );
     candidate.abandon().await?;
+    store.close().await
+}
+
+/// One real server session on `branch` that Kuru's pool bookkeeping no longer
+/// owns: it stands in for a session the server still counts after the client
+/// released it. It ends only when the test sends on the returned channel.
+struct LingeringSession {
+    id: u64,
+    database: String,
+    release: tokio::sync::oneshot::Sender<()>,
+    closed: tokio::task::JoinHandle<Result<()>>,
+}
+
+async fn lingering_session(store: &MemoryStore, branch: &str) -> Result<LingeringSession> {
+    let pool = store.shared.server.pool(branch).await?;
+    let mut connection = pool.acquire().await?.detach();
+    drop(pool);
+    let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(&mut connection)
+        .await?;
+    let database: String = sqlx::query_scalar("SELECT DATABASE()")
+        .fetch_one(&mut connection)
+        .await?;
+    assert_eq!(database, format!("kuru/{branch}"));
+    assert_eq!(session_count(store, id, &database).await?, 1);
+    let (release, released) = tokio::sync::oneshot::channel();
+    let closed = tokio::spawn(async move {
+        let _ = released.await;
+        sqlx::Connection::close(connection).await?;
+        Ok(())
+    });
+    Ok(LingeringSession {
+        id,
+        database,
+        release,
+        closed,
+    })
+}
+
+impl LingeringSession {
+    async fn end(self, store: &MemoryStore) -> Result<()> {
+        let _ = self.release.send(());
+        tokio::time::timeout(TEST_DEADLINE, self.closed).await???;
+        await_session_end(&store.pool, self.id, TEST_DEADLINE).await
+    }
+}
+
+async fn session_count(store: &MemoryStore, id: u64, database: &str) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.processlist WHERE ID = ? AND BINARY DB = BINARY ?",
+    )
+    .bind(id)
+    .bind(database)
+    .fetch_one(store.pool.as_ref())
+    .await?)
+}
+
+/// Reach promotion's committed state without its cleanup: the checked status
+/// rename, then the same fast-forward merge on main that `promote_checked`
+/// issues. `promote()` then takes its already-merged arm straight to cleanup.
+async fn merged_promoting_candidate(
+    store: &MemoryStore,
+    label: &str,
+) -> Result<(Arc<Candidate>, CandidateNames, String)> {
+    let candidate = store.begin_candidate(label).await?;
+    candidate.view().put(label, &json!(true)).await?;
+    let names = CandidateNames::from_open(&candidate.view.branch)?;
+    let target = candidate.view().revision().await?;
+    transition_candidate(store, &names.open, &names.promoting, &target).await?;
+    let (mut main, _) = owned_connection(&store.pool).await?;
+    // The owned connections that issue checked branch procedures come from
+    // this pool; its session must never hold a candidate branch itself.
+    let main_database: String = sqlx::query_scalar("SELECT DATABASE()")
+        .fetch_one(&mut main)
+        .await?;
+    assert_eq!(main_database, format!("kuru/{}", store.branch));
+    assert_ne!(store.branch, names.promoting);
+    tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query("CALL DOLT_MERGE(?, '--ff-only')")
+            .bind(&names.promoting)
+            .fetch_all(&mut main),
+    )
+    .await??;
+    sqlx::Connection::close(main).await?;
+    assert_eq!(store.revision().await?, target);
+    Ok((Arc::new(candidate), names, target))
+}
+
+/// Race the spawned cleanup against the product's session-wait observation.
+/// Before the wait existed the checked branch procedure met the lingering
+/// session at once; report exactly the fixed diagnostic record it produced.
+async fn await_session_wait<T: std::fmt::Debug>(
+    wait_started: tokio::sync::oneshot::Receiver<()>,
+    operation: &mut tokio::task::JoinHandle<Result<T>>,
+    path: &str,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        observed = tokio::time::timeout(TEST_DEADLINE, wait_started) => {
+            observed.with_context(|| format!("{path} did not observe its lingering session"))??;
+            Ok(())
+        }
+        finished = &mut *operation => {
+            let result = finished?;
+            let record = result.as_ref().err().and_then(candidate_failure_record);
+            bail!(
+                "{path} ran its checked branch procedure while a server session still held \
+                 the branch: ok={} record={record:?}",
+                result.is_ok()
+            )
+        }
+    }
+}
+
+#[tokio::test]
+async fn promoted_cleanup_deletes_status_ref_only_after_its_lingering_session_ends() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let (candidate, names, target) =
+        merged_promoting_candidate(&store, "promoted cleanup linger").await?;
+    let session = lingering_session(&store, &names.promoting).await?;
+
+    let wait_started = store.shared.server.observe_next_candidate_wait().await;
+    let promoting = candidate.clone();
+    let mut promotion = tokio::spawn(async move { promoting.promote().await });
+    await_session_wait(wait_started, &mut promotion, "promoted cleanup").await?;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), &mut promotion)
+            .await
+            .is_err(),
+        "promoted cleanup finished while its status session remained active"
+    );
+    assert_eq!(
+        session_count(&store, session.id, &session.database).await?,
+        1
+    );
+    let heads = candidate_heads(&store.pool, &names).await?;
+    assert_eq!(heads.get(&names.promoting), Some(&target));
+    assert!(
+        store
+            .shared
+            .uncertain
+            .lock()
+            .expect("uncertain lock")
+            .is_none(),
+        "the checked delete was issued before the session wait ended"
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(80),
+            store.shared.server.fence_pool(&names.promoting),
+        )
+        .await
+        .is_err(),
+        "status admission was not fenced during the session wait"
+    );
+
+    session.end(&store).await?;
+    let promoted = tokio::time::timeout(TEST_DEADLINE, promotion).await???;
+    assert_eq!(promoted, target);
+    assert!(candidate_heads(&store.pool, &names).await?.is_empty());
+    assert_eq!(store.revision().await?, target);
+    assert_eq!(
+        store.get("promoted cleanup linger").await?,
+        Some(json!(true))
+    );
+    drop(candidate);
+    store.close().await
+}
+
+#[tokio::test]
+async fn abandoned_cleanup_probes_and_deletes_only_after_its_lingering_session_ends() -> Result<()>
+{
+    let store = MemoryStore::temporary().await?;
+    let base = store.revision().await?;
+    let candidate = Arc::new(store.begin_candidate("abandoned cleanup linger").await?);
+    candidate
+        .view()
+        .put("abandoned cleanup linger", &json!(true))
+        .await?;
+    let names = CandidateNames::from_open(&candidate.view.branch)?;
+    let target = candidate.view().revision().await?;
+    transition_candidate(&store, &names.open, &names.abandoned, &target).await?;
+    let session = lingering_session(&store, &names.abandoned).await?;
+
+    let wait_started = store.shared.server.observe_next_candidate_wait().await;
+    let abandoning = candidate.clone();
+    let mut abandonment = tokio::spawn(async move { abandoning.abandon().await });
+    await_session_wait(wait_started, &mut abandonment, "abandoned cleanup").await?;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), &mut abandonment)
+            .await
+            .is_err(),
+        "abandoned cleanup finished while its status session remained active"
+    );
+    assert_eq!(
+        session_count(&store, session.id, &session.database).await?,
+        1
+    );
+    let heads = candidate_heads(&store.pool, &names).await?;
+    assert_eq!(heads.get(&names.abandoned), Some(&target));
+    assert!(
+        store
+            .shared
+            .uncertain
+            .lock()
+            .expect("uncertain lock")
+            .is_none(),
+        "the exclusion probe or forced delete was issued before the session wait ended"
+    );
+
+    session.end(&store).await?;
+    tokio::time::timeout(TEST_DEADLINE, abandonment).await???;
+    assert!(candidate_heads(&store.pool, &names).await?.is_empty());
+    assert_eq!(store.revision().await?, base);
+    assert_eq!(store.get("abandoned cleanup linger").await?, None);
+    drop(candidate);
+    store.close().await
+}
+
+/// A session that outlives the retirement bound fails the step before any
+/// branch procedure: no ref changes, no forced or repeated delete, and the
+/// fixed record names pool retirement, exactly as the gated rename does.
+#[tokio::test]
+async fn candidate_deletion_refuses_a_session_that_outlives_retirement() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let (promoted, promoted_names, promoted_target) =
+        merged_promoting_candidate(&store, "promoted retirement bound").await?;
+    let abandoned = Arc::new(store.begin_candidate("abandoned retirement bound").await?);
+    abandoned
+        .view()
+        .put("abandoned retirement bound", &json!(true))
+        .await?;
+    let abandoned_names = CandidateNames::from_open(&abandoned.view.branch)?;
+    let abandoned_target = abandoned.view().revision().await?;
+    transition_candidate(
+        &store,
+        &abandoned_names.open,
+        &abandoned_names.abandoned,
+        &abandoned_target,
+    )
+    .await?;
+
+    for (names, branch, target, force) in [
+        (
+            &promoted_names,
+            &promoted_names.promoting,
+            &promoted_target,
+            false,
+        ),
+        (
+            &abandoned_names,
+            &abandoned_names.abandoned,
+            &abandoned_target,
+            true,
+        ),
+    ] {
+        let session = lingering_session(&store, branch).await?;
+        let error = tokio::time::timeout(
+            TEST_DEADLINE,
+            delete_candidate_ref(&store, branch, target, force, Duration::from_millis(500)),
+        )
+        .await?
+        .expect_err("a checked candidate delete crossed a live server session");
+        assert_eq!(
+            candidate_failure_record(&error).as_deref(),
+            Some(
+                "candidate_owner stage=pool_retirement class=non_sql sqlstate=none vendor=0 reason=other"
+            ),
+            "force={force}: the refusal was not the bounded session wait"
+        );
+        assert!(
+            format!("{error:#}").contains("candidate source session retirement deadline exceeded")
+        );
+        assert_eq!(
+            session_count(&store, session.id, &session.database).await?,
+            1
+        );
+        let heads = candidate_heads(&store.pool, names).await?;
+        assert_eq!(heads.get(branch.as_str()), Some(target));
+        assert!(
+            store
+                .shared
+                .uncertain
+                .lock()
+                .expect("uncertain lock")
+                .is_none()
+        );
+        session.end(&store).await?;
+    }
+    assert!(
+        promoted
+            .promoted
+            .lock()
+            .expect("candidate result lock")
+            .is_none(),
+        "a refused cleanup recorded the promotion as complete"
+    );
+
+    // Nothing was lost: once the sessions end, the ordinary product paths finish.
+    assert_eq!(
+        tokio::time::timeout(TEST_DEADLINE, promoted.promote()).await??,
+        promoted_target
+    );
+    tokio::time::timeout(TEST_DEADLINE, abandoned.abandon()).await??;
+    assert!(
+        candidate_heads(&store.pool, &promoted_names)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        candidate_heads(&store.pool, &abandoned_names)
+            .await?
+            .is_empty()
+    );
+    assert_eq!(store.revision().await?, promoted_target);
+    drop(promoted);
+    drop(abandoned);
     store.close().await
 }

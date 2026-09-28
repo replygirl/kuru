@@ -417,7 +417,7 @@ async fn measure_lingering_session_consequence_for_delete_and_rename() -> Result
 
         let session = lingering_session(&store, &names.promoting, linger).await?;
         let started = Instant::now();
-        let delete = delete_candidate_ref(&store, &names.promoting, &target, false)
+        let delete = delete_candidate_ref(&store, &names.promoting, &target, false, QUERY_TIMEOUT)
             .await
             .context(CandidateFailureStage::Cleanup);
         let delete_ms = started.elapsed().as_millis();
