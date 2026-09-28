@@ -394,7 +394,13 @@ held when it drops. A live owner always keeps the directory; outside an
 existing failure it also fails the test, naming the test and each live owner. Close every in-process store before the root
 drops; managed fixtures close their clients and then call
 `test_support::await_managed_quiescence(&options)`, which retires the idle
-owner and confirms its Dolt was reaped.
+owner and confirms its Dolt was reaped. A Unix lock released in-process while
+another thread spawns a child stays held by the child's transient descriptor
+until it executes, so kuru-memory tests that take a lifecycle or owner lock
+before a guarded root drops hold `spawn_gate::locking_async` across the
+acquire and release, and open stores through `spawn_gated_open`. That gate is
+test-only inside kuru-memory; in kuru-runtime and kuru-tui the same race can
+rarely fail a test with a released owner reported live, and the root is kept.
 
 The lifecycle-ordering measurements are ignored tests, and their Dolt trace is
 inert unless `KURU_TEST_DOLT_LOG_DIR` names a directory, so neither runs in
