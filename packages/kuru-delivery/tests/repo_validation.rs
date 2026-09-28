@@ -579,7 +579,7 @@ fn incident_exec_auto_install_workflow_is_rejected() {
 #[test]
 fn mise_steps_must_name_the_tools_they_install() {
     let repo = Repository::new();
-    let workflow = "name: Fixture\non: push\nenv:\n  MISE_EXEC_AUTO_INSTALL: false\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0\n        with:\n          install_args: rust\n      - name: Selected tools\n        run: |\n          mise install --locked rust aqua:rhysd/actionlint\n          MISE_LOCKED=1 mise i cargo:cargo-audit\n";
+    let workflow = "name: Fixture\non: push\nenv:\n  MISE_EXEC_AUTO_INSTALL: false\n  MISE_TASK_RUN_AUTO_INSTALL: false\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0\n        with:\n          install_args: rust\n      - name: Selected tools\n        run: |\n          mise install --locked rust aqua:rhysd/actionlint\n          MISE_LOCKED=1 mise i cargo:cargo-audit\n";
     repo.write(".github/workflows/fixture.yaml", workflow);
     repo.write(".github/workflows/notes.md", "mise install");
     assert!(repo.errors().is_empty(), "{:?}", repo.errors());
@@ -614,20 +614,51 @@ fn mise_steps_must_name_the_tools_they_install() {
     assert_eq!(
         repo.workflow_errors(),
         [
-            ".github/workflows/plain.yml: uses mise, so its workflow-level env must set MISE_EXEC_AUTO_INSTALL: \"false\""
+            ".github/workflows/plain.yml: uses mise, so its workflow-level env must set MISE_EXEC_AUTO_INSTALL: \"false\"",
+            ".github/workflows/plain.yml: uses mise, so its workflow-level env must set MISE_TASK_RUN_AUTO_INSTALL: \"false\"",
         ]
     );
-    // Prefix options do not hide the program.
-    repo.write(
-        ".github/workflows/plain.yml",
-        "on: push\nenv:\n  MISE_EXEC_AUTO_INSTALL: \"false\"\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sudo -E mise install\n",
-    );
-    assert_eq!(
-        repo.workflow_errors(),
-        [
-            ".github/workflows/plain.yml: job lint step step 1 runs `mise install` without naming the tools to install"
-        ]
-    );
+    // Options, their values and prefixes do not hide a bare install. The
+    // value options are mise 2026.9.4's global `-C/--cd`, `-E/--env` and
+    // `-j/--jobs`, and install's `-j/--jobs`, `--minimum-release-age` and
+    // `--shared`.
+    let script = |command: &str| {
+        format!(
+            "on: push\nenv:\n  MISE_EXEC_AUTO_INSTALL: \"false\"\n  MISE_TASK_RUN_AUTO_INSTALL: \"false\"\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: {command}\n"
+        )
+    };
+    for bare in [
+        "sudo -E mise install",
+        "mise install --jobs 4",
+        "mise install --env ci",
+        "mise install --shared /opt/mise",
+        "mise -y install",
+        "mise --cd . install",
+        "mise install -j 4",
+        "mise install --minimum-release-age 90d",
+        "mise -C . -E ci -yj 4 install --locked",
+        "/home/runner/.local/bin/mise i --",
+    ] {
+        repo.write(".github/workflows/plain.yml", &script(bare));
+        assert_eq!(
+            repo.workflow_errors(),
+            [
+                ".github/workflows/plain.yml: job lint step step 1 runs `mise install` without naming the tools to install"
+            ],
+            "{bare}"
+        );
+    }
+    for named in [
+        "mise install --jobs 4 rust",
+        "mise --cd . install --shared /opt/mise rust",
+        "mise install --jobs=4 rust",
+        "mise -j4 install rust",
+        "mise install -- rust",
+        "mise run install",
+    ] {
+        repo.write(".github/workflows/plain.yml", &script(named));
+        assert!(repo.errors().is_empty(), "{named}: {:?}", repo.errors());
+    }
     repo.write(".github/workflows/plain.yml", "jobs: [unterminated");
     assert!(
         repo::check(repo.0.path())
@@ -686,6 +717,24 @@ fn incident_apt_update_over_every_source_is_rejected() {
             unrestricted("apt-get upgrade"),
         ]
     );
+    // A shell's -c string and add-apt-repository, which updates every
+    // source unless told not to (add-apt-repository(1) on noble: `-n,
+    // --no-update`), are read as the fetches they run.
+    let repo = Repository::with_workflows();
+    repo.replace(
+        ".github/workflows/release.yml",
+        FIXED_APT,
+        "          sudo sh -c 'apt-get update'\n          bash --noprofile -ec \"apt-get -y upgrade\"\n          bash -o pipefail -c 'apt-get dist-upgrade'\n          sudo add-apt-repository -y universe\n          sudo add-apt-repository -yn universe\n          sudo apt-add-repository --no-update ppa:example/tools\n",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            ".github/workflows/release.yml: job tests step Install Ubuntu native secret-store fixture tools runs `add-apt-repository -y universe`, which refreshes every configured apt source; pass -n (--no-update) and update only the needed list".to_owned(),
+            unrestricted("apt-get -y upgrade"),
+            unrestricted("apt-get dist-upgrade"),
+            unrestricted("apt-get update"),
+        ]
+    );
 }
 
 #[test]
@@ -695,7 +744,7 @@ fn incident_partition_download_is_rejected() {
     let repo = Repository::with_workflows();
     repo.replace(".github/workflows/native-tests.yml", PARTITION_OFFLINE, "");
     repo.replace(".github/workflows/ci.yml", PARTITION_OFFLINE, "");
-    let offline = "must set KURU_DOLT_BUNDLE_OFFLINE: \"true\" in its job env and import the bundle inputs an earlier job of the run verified";
+    let offline = "must run with KURU_DOLT_BUNDLE_OFFLINE: \"true\" from its job env, or the workflow env without a job override, and import the bundle inputs an earlier job of the run verified";
     assert_eq!(
         repo.workflow_errors(),
         [
@@ -722,6 +771,39 @@ fn incident_partition_download_is_rejected() {
             ".github/workflows/native-tests.yml: job shard step Run one checked uninstrumented Windows on Arm partition overrides the partition's KURU_DOLT_BUNDLE_OFFLINE",
         ]
     );
+    // Renaming the axis does not hide a job that runs a partition task.
+    let repo = Repository::with_workflows();
+    repo.replace(".github/workflows/native-tests.yml", PARTITION_OFFLINE, "");
+    repo.replace(
+        ".github/workflows/native-tests.yml",
+        "        partition: ${{ fromJSON",
+        "        part: ${{ fromJSON",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [format!(
+            ".github/workflows/native-tests.yml: partition job shard {offline}"
+        )]
+    );
+    // The workflow env may supply the setting; a job override may not undo it.
+    let repo = Repository::new();
+    let fan_out = |job_env: &str| {
+        format!(
+            "on: push\nenv:\n  MISE_EXEC_AUTO_INSTALL: \"false\"\n  MISE_TASK_RUN_AUTO_INSTALL: \"false\"\n  KURU_DOLT_BUNDLE_OFFLINE: \"true\"\njobs:\n  legs:\n    strategy:\n      matrix:\n        leg: [1, 2]\n    runs-on: ubuntu-latest{job_env}\n    steps:\n      - run: mise run //packages/kuru-delivery:test:partition\n"
+        )
+    };
+    repo.write(".github/workflows/legs.yml", &fan_out(""));
+    assert!(repo.errors().is_empty(), "{:?}", repo.errors());
+    repo.write(
+        ".github/workflows/legs.yml",
+        &fan_out("\n    env:\n      KURU_DOLT_BUNDLE_OFFLINE: \"false\""),
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [format!(
+            ".github/workflows/legs.yml: partition job legs {offline}"
+        )]
+    );
     // A matrix without partitions is not a fan-out of the same inputs.
     let repo = Repository::new();
     repo.write(
@@ -729,4 +811,185 @@ fn incident_partition_download_is_rejected() {
         "on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        target: [a, b]\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n  shard:\n    strategy:\n      matrix:\n        partition: [1, 2]\n    env:\n      KURU_DOLT_BUNDLE_OFFLINE: true\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n",
     );
     assert!(repo.errors().is_empty(), "{:?}", repo.errors());
+}
+
+#[test]
+fn every_partition_task_fan_out_must_be_offline() {
+    // The check names the package's partition tasks; each task that runs
+    // `coverage shard` must be recognized under any axis name.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mise.toml");
+    let manifest: toml::Value = toml::from_str(&fs::read_to_string(manifest).unwrap()).unwrap();
+    let mut tasks: Vec<&str> = manifest["tasks"]
+        .as_table()
+        .unwrap()
+        .iter()
+        .filter(|(_, task)| {
+            task.get("run")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|run| run.contains("-- coverage shard"))
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    tasks.sort_unstable();
+    assert_eq!(tasks, ["coverage:shard", "test:partition"]);
+    let repo = Repository::new();
+    for task in tasks {
+        repo.write(
+            ".github/workflows/legs.yml",
+            &format!(
+                "on: push\nenv:\n  MISE_EXEC_AUTO_INSTALL: \"false\"\n  MISE_TASK_RUN_AUTO_INSTALL: \"false\"\njobs:\n  legs:\n    strategy:\n      matrix:\n        slice: [1, 2]\n    runs-on: ubuntu-latest\n    steps:\n      - run: mise run //packages/kuru-delivery:{task}\n"
+            ),
+        );
+        assert_eq!(
+            repo.workflow_errors(),
+            [
+                ".github/workflows/legs.yml: partition job legs must run with KURU_DOLT_BUNDLE_OFFLINE: \"true\" from its job env, or the workflow env without a job override, and import the bundle inputs an earlier job of the run verified"
+            ],
+            "{task}"
+        );
+    }
+}
+
+const FIXED_TASK: &str = "  MISE_TASK_RUN_AUTO_INSTALL: \"false\"\n";
+
+#[test]
+fn task_auto_install_is_off_at_workflow_level_only() {
+    // `mise run` installs every missing configured tool before a task unless
+    // MISE_TASK_RUN_AUTO_INSTALL is false, the same download as run
+    // 36319170835's `mise x`.
+    let repo = Repository::with_workflows();
+    repo.replace(".github/workflows/native-tests.yml", FIXED_TASK, "");
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            ".github/workflows/native-tests.yml: uses mise, so its workflow-level env must set MISE_TASK_RUN_AUTO_INSTALL: \"false\""
+        ]
+    );
+    let repo = Repository::with_workflows();
+    repo.replace(
+        ".github/workflows/ci.yml",
+        "      MISE_LOCKED: \"1\"\n      MISE_NO_HOOKS: \"1\"\n      CARGO_INCREMENTAL: \"0\"\n      # Import",
+        "      MISE_LOCKED: \"1\"\n      MISE_TASK_RUN_AUTO_INSTALL: \"false\"\n      MISE_NO_HOOKS: \"1\"\n      CARGO_INCREMENTAL: \"0\"\n      # Import",
+    );
+    repo.replace(
+        ".github/workflows/quality.yml",
+        "      - run: mise run docs:check\n",
+        "      - run: mise run docs:check\n        env:\n          MISE_TASK_RUN_AUTO_INSTALL: \"true\"\n      - run: export MISE_TASK_RUN_AUTO_INSTALL=true\n",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            ".github/workflows/ci.yml: job native-memory overrides MISE_TASK_RUN_AUTO_INSTALL; set it only in the workflow-level env",
+            ".github/workflows/quality.yml: job docs step step 5 overrides MISE_TASK_RUN_AUTO_INSTALL; set it only in the workflow-level env",
+            ".github/workflows/quality.yml: job docs step step 6 overrides MISE_TASK_RUN_AUTO_INSTALL in its script; set it only in the workflow-level env",
+        ]
+    );
+}
+
+/// The one exemption's reason, as every finding about it quotes it.
+const RELEASE_EXEMPTION: &str = "these release jobs still install every missing configured tool through `mise run`, and notes' setup task runs a bare `mise install --include-task-tools`; follow-up release-notes-docs-tool-scope scopes their tool installation, a release workflow change for the maintainer to decide";
+
+#[test]
+fn release_task_auto_install_exemption_covers_only_two_reviewed_jobs() {
+    // release.yml's notes and build-docs still run `mise run` with task
+    // auto-install on. They are exempted by name in their exact reviewed
+    // steps; every other release job that uses mise opts out itself.
+    let shape = |job: &str| {
+        format!(
+            ".github/workflows/release.yml: job {job} is exempted from MISE_TASK_RUN_AUTO_INSTALL only in its reviewed shape and no longer has it; scope its tool installation and remove the exemption, or review the new shape ({RELEASE_EXEMPTION})"
+        )
+    };
+    // Another task run, other tools or a job-level opt-out change the shape.
+    let repo = Repository::with_workflows();
+    repo.replace(
+        ".github/workflows/release.yml",
+        "        run: mise run //packages/kuru-delivery:setup\n",
+        "        run: |\n          mise run //packages/kuru-delivery:setup\n          mise run lint\n",
+    );
+    repo.replace(
+        ".github/workflows/release.yml",
+        "          install_args: rust aqua:jdx/hk\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      - run: mise run //apps/kuru-docs:setup\n",
+        "          install_args: rust\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      - run: mise run //apps/kuru-docs:setup\n",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [shape("build-docs"), shape("notes")]
+    );
+    let repo = Repository::with_workflows();
+    repo.replace(
+        ".github/workflows/release.yml",
+        "    needs: [plan, bump]\n    runs-on: ubuntu-latest\n    steps:\n",
+        "    needs: [plan, bump]\n    runs-on: ubuntu-latest\n    env:\n      MISE_TASK_RUN_AUTO_INSTALL: \"false\"\n    steps:\n",
+    );
+    assert_eq!(repo.workflow_errors(), [shape("notes")]);
+    let unexempted = |job: &str| {
+        format!(
+            ".github/workflows/release.yml: job {job} uses mise and is not exempted, so its job env must set MISE_TASK_RUN_AUTO_INSTALL: \"false\" while the workflow level does not"
+        )
+    };
+    // A missing job is a stale exemption, and a renamed one is not exempted.
+    let repo = Repository::with_workflows();
+    repo.replace(
+        ".github/workflows/release.yml",
+        "\n  notes:\n",
+        "\n  release-notes:\n",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [shape("notes"), unexempted("release-notes")]
+    );
+    // No other release job may leave task auto-install on.
+    let repo = Repository::with_workflows();
+    repo.replace(
+        ".github/workflows/release.yml",
+        "      MISE_NO_HOOKS: \"1\"\n      MISE_TASK_RUN_AUTO_INSTALL: \"false\"\n      CARGO_INCREMENTAL: \"0\"\n      CARGO_PROFILE_DEV_DEBUG: line-tables-only\n      # Keep the genuine",
+        "      MISE_NO_HOOKS: \"1\"\n      MISE_TASK_RUN_AUTO_INSTALL: \"true\"\n      CARGO_INCREMENTAL: \"0\"\n      CARGO_PROFILE_DEV_DEBUG: line-tables-only\n      # Keep the genuine",
+    );
+    repo.replace(
+        ".github/workflows/release.yml",
+        "\n  deploy-docs:\n",
+        "\n  extra:\n    runs-on: ubuntu-latest\n    steps:\n      - run: mise run lint\n\n  deploy-docs:\n",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [unexempted("extra"), unexempted("tests")]
+    );
+    // A step still cannot override it, even in an exempted job.
+    let repo = Repository::with_workflows();
+    repo.replace(
+        ".github/workflows/release.yml",
+        "      - run: mise run //apps/kuru-docs:setup\n",
+        "      - run: mise run //apps/kuru-docs:setup\n        env:\n          MISE_TASK_RUN_AUTO_INSTALL: \"true\"\n",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            ".github/workflows/release.yml: job build-docs step step 3 overrides MISE_TASK_RUN_AUTO_INSTALL; set it only in the workflow-level env"
+        ]
+    );
+    // Setting it for the whole workflow ends the exemption, which must go.
+    let repo = Repository::with_workflows();
+    repo.replace(
+        ".github/workflows/release.yml",
+        "  MISE_EXEC_AUTO_INSTALL: \"false\"\n\nconcurrency",
+        "  MISE_EXEC_AUTO_INSTALL: \"false\"\n  MISE_TASK_RUN_AUTO_INSTALL: \"false\"\n\nconcurrency",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [format!(
+            ".github/workflows/release.yml: sets MISE_TASK_RUN_AUTO_INSTALL at workflow level, so the exemption for jobs notes, build-docs is stale; remove it ({RELEASE_EXEMPTION})"
+        )]
+    );
+    // The exemption is release.yml's alone.
+    let repo = Repository::new();
+    repo.write(
+        ".github/workflows/notes.yml",
+        "on: push\nenv:\n  MISE_EXEC_AUTO_INSTALL: \"false\"\njobs:\n  notes:\n    runs-on: ubuntu-latest\n    steps:\n      - run: mise run //packages/kuru-delivery:setup\n",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            ".github/workflows/notes.yml: uses mise, so its workflow-level env must set MISE_TASK_RUN_AUTO_INSTALL: \"false\""
+        ]
+    );
 }
