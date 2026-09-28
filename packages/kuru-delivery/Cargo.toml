@@ -9,7 +9,15 @@ description = "Native Kuru installation, packaging and maintainer tooling"
 
 [features]
 default = []
-tooling = ["dep:clap", "dep:toml", "dep:scraper", "dep:roxmltree", "dep:base64", "dep:rustix"]
+tooling = [
+  "dep:clap",
+  "dep:toml",
+  "dep:scraper",
+  "dep:roxmltree",
+  "dep:base64",
+  "dep:rustix",
+  "dep:serde_yaml_ng",
+]
 
 [[bin]]
 name = "kuru-delivery"
@@ -49,6 +57,7 @@ serde_json.workspace = true
 toml = { workspace = true, optional = true }
 scraper = { workspace = true, optional = true }
 roxmltree = { workspace = true, optional = true }
+serde_yaml_ng = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, optional = true, features = ["fs", "process"] }

@@ -461,3 +461,253 @@ fn per_platform_tool_options_require_their_complete_lock_entry() {
             .any(|error| error.contains("options must be a table"))
     );
 }
+
+const WORKFLOWS: [&str; 6] = [
+    "bundle-build.yml",
+    "ci.yml",
+    "native-tests.yml",
+    "pr-title.yml",
+    "quality.yml",
+    "release.yml",
+];
+
+/// The fixed apt step text in native-tests.yml and release.yml.
+const FIXED_APT: &str = "          # These packages come from the Ubuntu archive. apt reads only its deb822
+          # list and no other sources.list.d entry, so an outage of a third-party
+          # repository on the runner image cannot fail this step; errors from the
+          # archive still fail it.
+          if [ ! -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            echo 'The runner image has no Ubuntu archive list at /etc/apt/sources.list.d/ubuntu.sources' >&2
+            exit 1
+          fi
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null update
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null \\
+            install -y --no-install-recommends dbus gnome-keyring libsecret-tools
+";
+/// The same step before the fix, as run 36453397286 partition 7 ran it.
+const INCIDENT_APT: &str = "          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dbus gnome-keyring libsecret-tools
+";
+const FIXED_EXEC: &str =
+    "  # Jobs install only their mise-action install_args. Windows exe shims run
+  # `mise x`, which would otherwise download every other configured tool.
+  MISE_EXEC_AUTO_INSTALL: \"false\"
+";
+const PARTITION_OFFLINE: &str =
+    "      # Import the run's verified bundle inputs; never download them here.
+      KURU_DOLT_BUNDLE_OFFLINE: \"true\"
+";
+
+impl Repository {
+    /// A repository carrying this checkout's actual workflows.
+    fn with_workflows() -> Self {
+        let repo = Self::new();
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
+        for name in WORKFLOWS {
+            let text = fs::read_to_string(source.join(name)).unwrap();
+            repo.write(&format!(".github/workflows/{name}"), &text);
+        }
+        repo
+    }
+
+    fn workflow_errors(&self) -> Vec<String> {
+        self.errors()
+            .into_iter()
+            .filter(|error| error.starts_with(".github/workflows/"))
+            .collect()
+    }
+}
+
+#[test]
+fn actual_workflows_fetch_only_what_each_job_uses() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
+    let mut present: Vec<_> = fs::read_dir(&source)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    present.sort();
+    assert_eq!(present, WORKFLOWS, "a new workflow must join this check");
+    let repo = Repository::with_workflows();
+    assert!(repo.errors().is_empty(), "{:?}", repo.errors());
+}
+
+#[test]
+fn incident_exec_auto_install_workflow_is_rejected() {
+    // Run 36319170835: without the workflow-level opt-out, a Windows shim's
+    // `mise x` downloaded five unselected tools and mr-boxington returned 500.
+    let repo = Repository::with_workflows();
+    repo.replace(".github/workflows/native-tests.yml", FIXED_EXEC, "");
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            ".github/workflows/native-tests.yml: uses mise, so its workflow-level env must set MISE_EXEC_AUTO_INSTALL: \"false\""
+        ]
+    );
+    // An explicit "true" or an override below the workflow brings it back.
+    let repo = Repository::with_workflows();
+    repo.replace(
+        ".github/workflows/quality.yml",
+        "MISE_EXEC_AUTO_INSTALL: \"false\"",
+        "MISE_EXEC_AUTO_INSTALL: \"true\"",
+    );
+    repo.replace(
+        ".github/workflows/native-tests.yml",
+        "      KURU_NATIVE_MODE:",
+        "      MISE_EXEC_AUTO_INSTALL: \"true\"\n      KURU_NATIVE_MODE:",
+    );
+    repo.replace(
+        ".github/workflows/native-tests.yml",
+        "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      - name: Install coverage components",
+        "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n          MISE_EXEC_AUTO_INSTALL: \"true\"\n      - name: Install coverage components",
+    );
+    repo.replace(
+        ".github/workflows/ci.yml",
+        "        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles\\n' \"$RUNNER_TEMP\" >> \"$GITHUB_ENV\"\n      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0\n        with:\n          experimental: true\n          version: 2026.9.4\n          install_args: rust\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n        with:\n          cache-bin: false\n          shared-key: bundle-inputs",
+        "        run: echo 'MISE_EXEC_AUTO_INSTALL=true' >> \"$GITHUB_ENV\"\n      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0\n        with:\n          experimental: true\n          version: 2026.9.4\n          install_args: rust\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n        with:\n          cache-bin: false\n          shared-key: bundle-inputs",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            ".github/workflows/ci.yml: job bundle-inputs step Select private bundle build inputs overrides MISE_EXEC_AUTO_INSTALL in its script; set it only in the workflow-level env",
+            ".github/workflows/native-tests.yml: job shard overrides MISE_EXEC_AUTO_INSTALL; set it only in the workflow-level env",
+            ".github/workflows/native-tests.yml: job shard step jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c overrides MISE_EXEC_AUTO_INSTALL; set it only in the workflow-level env",
+            ".github/workflows/quality.yml: uses mise, so its workflow-level env must set MISE_EXEC_AUTO_INSTALL: \"false\"",
+        ]
+    );
+}
+
+#[test]
+fn mise_steps_must_name_the_tools_they_install() {
+    let repo = Repository::new();
+    let workflow = "name: Fixture\non: push\nenv:\n  MISE_EXEC_AUTO_INSTALL: false\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0\n        with:\n          install_args: rust\n      - name: Selected tools\n        run: |\n          mise install --locked rust aqua:rhysd/actionlint\n          MISE_LOCKED=1 mise i cargo:cargo-audit\n";
+    repo.write(".github/workflows/fixture.yaml", workflow);
+    repo.write(".github/workflows/notes.md", "mise install");
+    assert!(repo.errors().is_empty(), "{:?}", repo.errors());
+    repo.replace(
+        ".github/workflows/fixture.yaml",
+        "        with:\n          install_args: rust\n",
+        "        with:\n          install_args: \" \"\n      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0\n",
+    );
+    repo.replace(
+        ".github/workflows/fixture.yaml",
+        "          MISE_LOCKED=1 mise i cargo:cargo-audit\n",
+        "          MISE_LOCKED=1 mise i\n          sudo env mise install --locked # every configured tool\n          echo ready && mise.exe install --yes\n",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            ".github/workflows/fixture.yaml: job build step Selected tools runs `mise install` without naming the tools to install",
+            ".github/workflows/fixture.yaml: job build step jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c uses jdx/mise-action without explicit install_args naming the tools the job uses",
+        ]
+    );
+    // A workflow that never runs mise needs no opt-out.
+    let repo = Repository::new();
+    repo.write(
+        ".github/workflows/plain.yml",
+        "on: push\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo mise is not called here\n",
+    );
+    assert!(repo.errors().is_empty(), "{:?}", repo.errors());
+    repo.write(
+        ".github/workflows/plain.yml",
+        "on: push\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: mise run lint\n",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            ".github/workflows/plain.yml: uses mise, so its workflow-level env must set MISE_EXEC_AUTO_INSTALL: \"false\""
+        ]
+    );
+    repo.write(".github/workflows/plain.yml", "jobs: [unterminated");
+    assert!(
+        repo::check(repo.0.path())
+            .unwrap_err()
+            .to_string()
+            .contains("parse .github/workflows/plain.yml")
+    );
+}
+
+#[test]
+fn incident_apt_update_over_every_source_is_rejected() {
+    // Run 36453397286, Ubuntu coverage partition 7: `apt-get update` failed
+    // on packages.microsoft.com (403), a runner-image list the step never used.
+    let repo = Repository::with_workflows();
+    for name in ["native-tests.yml", "release.yml"] {
+        repo.replace(
+            &format!(".github/workflows/{name}"),
+            FIXED_APT,
+            INCIDENT_APT,
+        );
+    }
+    let errors = repo.workflow_errors();
+    let expected: Vec<String> = [
+        ("native-tests.yml", "shard"),
+        ("release.yml", "tests"),
+    ]
+    .iter()
+    .flat_map(|(name, job)| {
+        [
+            "apt-get install -y --no-install-recommends dbus gnome-keyring libsecret-tools",
+            "apt-get update",
+        ]
+        .map(|command| format!(".github/workflows/{name}: job {job} step Install Ubuntu native secret-store fixture tools runs `{command}` over every configured apt source; name the needed list with -o Dir::Etc::sourcelist=/... and -o Dir::Etc::sourceparts=/dev/null"))
+    })
+    .collect();
+    assert_eq!(errors, expected);
+    // Naming a list is not enough while the parts directory is still read,
+    // and the `apt` front end fetches the same way.
+    let repo = Repository::with_workflows();
+    repo.replace(
+        ".github/workflows/release.yml",
+        FIXED_APT,
+        "          sudo apt -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources update; sudo apt-get -oDir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -oDir::Etc::sourceparts=/dev/null install -y dbus\n",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            ".github/workflows/release.yml: job tests step Install Ubuntu native secret-store fixture tools runs `apt -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources update` over every configured apt source; name the needed list with -o Dir::Etc::sourcelist=/... and -o Dir::Etc::sourceparts=/dev/null"
+        ]
+    );
+}
+
+#[test]
+fn incident_partition_download_is_rejected() {
+    // Run 36453397286, Windows on Arm behavior partition 2: every partition
+    // downloaded the Dolt Windows x64 archive itself, and one got HTTP 500.
+    let repo = Repository::with_workflows();
+    repo.replace(".github/workflows/native-tests.yml", PARTITION_OFFLINE, "");
+    repo.replace(".github/workflows/ci.yml", PARTITION_OFFLINE, "");
+    let offline = "must set KURU_DOLT_BUNDLE_OFFLINE: \"true\" in its job env and import the bundle inputs an earlier job of the run verified";
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            format!(".github/workflows/ci.yml: partition job native-memory {offline}"),
+            format!(".github/workflows/native-tests.yml: partition job shard {offline}"),
+        ]
+    );
+    // A step cannot reopen the network for bundle preparation.
+    let repo = Repository::with_workflows();
+    repo.replace(
+        ".github/workflows/native-tests.yml",
+        "          KURU_COVERAGE_PACKAGES: kuru,",
+        "          KURU_DOLT_BUNDLE_OFFLINE: \"false\"\n          KURU_COVERAGE_PACKAGES: kuru,",
+    );
+    repo.replace(
+        ".github/workflows/ci.yml",
+        "          cd -- \"$GITHUB_WORKSPACE\"\n",
+        "          cd -- \"$GITHUB_WORKSPACE\"\n          unset KURU_DOLT_BUNDLE_OFFLINE\n",
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            ".github/workflows/ci.yml: job native-memory step Import the run's verified bundle inputs overrides the partition's KURU_DOLT_BUNDLE_OFFLINE in its script",
+            ".github/workflows/native-tests.yml: job shard step Run one checked uninstrumented Windows on Arm partition overrides the partition's KURU_DOLT_BUNDLE_OFFLINE",
+        ]
+    );
+    // A matrix without partitions is not a fan-out of the same inputs.
+    let repo = Repository::new();
+    repo.write(
+        ".github/workflows/matrix.yml",
+        "on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        target: [a, b]\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n  shard:\n    strategy:\n      matrix:\n        partition: [1, 2]\n    env:\n      KURU_DOLT_BUNDLE_OFFLINE: true\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n",
+    );
+    assert!(repo.errors().is_empty(), "{:?}", repo.errors());
+}

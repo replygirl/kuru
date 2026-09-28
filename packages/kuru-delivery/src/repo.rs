@@ -9,6 +9,9 @@ use std::{
 use anyhow::{Context, Result};
 use toml::Value;
 
+#[path = "repo/workflows.rs"]
+mod workflows;
+
 fn read_toml(path: &Path) -> Result<Value> {
     let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     toml::from_str(&content).with_context(|| format!("parse {}", path.display()))
@@ -299,5 +302,6 @@ pub fn check(root: &Path) -> Result<Vec<String>> {
             }
         }
     }
+    workflows::check(root, &mut errors)?;
     Ok(errors.into_iter().collect())
 }
