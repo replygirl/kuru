@@ -141,56 +141,54 @@ async fn provision_with_extractor_observed(
         progress.report(MemoryOpenStage::VerifyingRuntimeCache);
         return verify_existing_cache(&destination, asset, progress).await;
     }
-    let staging = PrivateTemp::new(".install-", Some(&versions))?;
+    // From here the stage and the lock travel as one lease, so every exit -
+    // an error, a cancelled caller or a worker that outlives it - resolves
+    // the stage before the lock is released (see `StageLease`).
+    let lease = StageLease::new(PrivateTemp::new(".install-", Some(&versions))?, lock, asset);
     progress.report(MemoryOpenStage::ExtractingEmbeddedRuntime);
-    let candidate = staging.path().join("runtime");
+    let candidate = lease.path().join("runtime");
     let candidate_path = candidate.clone();
-    let (staging, lock, extraction) = tokio::task::spawn_blocking(move || {
+    let (lease, extraction) = tokio::task::spawn_blocking(move || {
         let result = extractor(&archive, &candidate_path, asset);
-        // Keep the stage and stable lock until the worker exits, even if its
-        // caller is cancelled. Drop the stage before releasing the lock.
-        (staging, lock, result)
+        // Keep the lease until the worker exits, even if its caller is
+        // cancelled; a dropped lease resolves its stage here, after the last
+        // write, and only then releases the lock.
+        (lease, result)
     })
     .await?;
-    extraction?;
+    if let Err(error) = extraction {
+        return Err(lease.discard_after(error));
+    }
     progress.report(MemoryOpenStage::CheckingRuntimeVersion);
-    let probe_home = staging.path().join("probe");
+    let probe_home = lease.path().join("probe");
     let candidate_path = candidate.clone();
     let probe_path = probe_home.clone();
-    let (probe, staging, lock) = tokio::task::spawn_blocking(move || {
+    let (probe, lease) = tokio::task::spawn_blocking(move || {
         // On cancellation, the completed output drops in this field order:
-        // checked probe, disposable stage, then installation authority.
+        // the checked probe, then the lease (its stage, then the lock).
         (
             prepare_cold_probe(&candidate_path, &probe_path, asset),
-            staging,
-            lock,
+            lease,
         )
     })
     .await?;
     let probe = match probe {
         Ok(probe) => probe,
-        Err(error) => {
-            drop(staging);
-            drop(lock);
-            return Err(error);
-        }
+        Err(error) => return Err(lease.discard_after(error)),
     };
-    let (probe, (staging, lock)) = probe.probe((staging, lock)).await?;
-    let cleanup =
-        activate_staged_after_probe(staging, lock, probe, &candidate, &destination).await?;
-    if let Some(failure) = cleanup {
-        // The engine is published and verified; a stage that outlived its own
-        // bounded removal is receipted for a later collection instead of
-        // failing this open.
-        let report = record_retained_stage(&versions, asset, failure);
-        // A stage whose receipt could not be written is not collectable by any
-        // later sweep, so it is never reported as waiting for one.
+    let (probe, lease) = probe.probe(lease).await?;
+    let retained = activate_staged_after_probe(lease, probe, &candidate, &destination).await?;
+    if let Some(report) = retained {
+        // The engine is published and verified. Its lease already receipted
+        // and reported the stage that outlived its bounded removal, before
+        // releasing the lock; that never fails this open. A stage whose
+        // receipt could not be written is not collectable by any later sweep,
+        // so it is never reported as waiting for one.
         progress.report(if report.receipt_error.is_some() {
             MemoryOpenStage::RetainedUnreceiptedInstallStage
         } else {
             MemoryOpenStage::RetainedInstallStage
         });
-        emit_retained_stage_diagnostic(&report);
     }
     Ok(destination.join(asset.executable_name))
 }
@@ -198,10 +196,12 @@ async fn provision_with_extractor_observed(
 /// Receipts naming the retained install stages of one engine version.
 const LEFTOVER_STAGE_RECEIPTS: &str = ".leftovers";
 
-/// What was retained after a published and verified engine could not remove its
-/// own private stage: where it is, why it stayed, and which publication it
-/// belongs to. `attempts` and `elapsed` describe the bounded recovery window
-/// that actually ran, and are absent when the cause is not that exhaustion.
+/// What was retained when an installation could not remove its own private
+/// stage: where it is, why it stayed, and which engine it belongs to.
+/// `published` distinguishes a published and verified engine from an
+/// installation that failed, was cancelled or unwound before publication.
+/// `attempts` and `elapsed` describe the bounded recovery window that actually
+/// ran, and are absent when the cause is not that exhaustion.
 #[derive(Debug)]
 pub(crate) struct StageCleanupReport {
     pub stage: PathBuf,
@@ -262,7 +262,9 @@ struct StageCleanupReceipt<'a> {
     recorded_at: u64,
 }
 
-/// Record a retained stage so a later open can collect it.
+/// Record a retained stage so a later open can collect it. `published` says
+/// whether its engine was published and verified, or its installation stopped
+/// (an error or a cancelled caller) before publication.
 ///
 /// A receipt that cannot be written leaves the stage waiting for an operator;
 /// it never turns a published, verified engine into a failed open.
@@ -270,8 +272,10 @@ fn record_retained_stage(
     versions: &Path,
     asset: Asset<'_>,
     failure: StageCleanupFailure,
+    published: bool,
 ) -> StageCleanupReport {
     let mut report = StageCleanupReport::new(failure, asset);
+    report.published = published;
     if let Err(error) = write_stage_receipt(versions, &report) {
         report.receipt_error = Some(format!("{error:#}"));
     }
@@ -318,8 +322,24 @@ fn write_stage_receipt(versions: &Path, report: &StageCleanupReport) -> Result<(
 /// is never model-visible and never written to memory: nothing here touches
 /// the conversation, a provider request, or a database write. The unabridged
 /// receipt (`write_stage_receipt`) remains the durable, on-disk copy of the
-/// same facts.
+/// same facts. A stage whose installation stopped before publication
+/// (`published = false`) uses the same fields and its own message.
 fn emit_retained_stage_diagnostic(report: &StageCleanupReport) {
+    if !report.published {
+        tracing::warn!(
+            target: "kuru.memory",
+            stage = %report.stage.display(),
+            digest = %report.executable_sha256,
+            published = report.published,
+            first_cause = %report.first_cause,
+            os_error = report.os_error,
+            attempts = report.attempts,
+            elapsed_ms = report.elapsed.map(|elapsed| elapsed.as_millis() as u64),
+            receipt_error = report.receipt_error.as_deref(),
+            "retained private install stage after an unpublished installation"
+        );
+        return;
+    }
     tracing::warn!(
         target: "kuru.memory",
         stage = %report.stage.display(),
@@ -568,7 +588,7 @@ impl CheckedColdProbe {
         Ok(())
     }
 
-    async fn probe<T: Send + 'static>(self, retained: T) -> Result<(Self, T)> {
+    async fn probe(self, retained: StageLease) -> Result<(Self, StageLease)> {
         let binary = self.binary.clone();
         let home = self.home.clone();
         let (send, receive) = tokio::sync::oneshot::channel();
@@ -592,10 +612,10 @@ impl CheckedColdProbe {
             .await
             .context("owned Dolt cold probe did not return its result")?;
         if let Err(error) = result {
-            // Drop the probe handles and stage before releasing the retained lock.
+            // Close the probe handles, then resolve the stage through its
+            // lease before that lease releases the installation lock.
             drop(probe);
-            drop(retained);
-            return Err(error);
+            return Err(retained.discard_after(error));
         }
         Ok((probe, retained))
     }
@@ -789,51 +809,134 @@ fn extract(archive: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Installation authority over one private install stage: the stage, the
+/// cache lock that serializes it, and the engine it installs.
+///
+/// Every exit resolves the stage before it releases the lock. The stage is
+/// removed through `PrivateTemp::close_or_keep` (with Windows' bounded checked
+/// recovery); or a refused or uncertain removal is receipted under
+/// `.leftovers` and reported to diagnostics; or, after a failed activation,
+/// `keep` preserves it as evidence named by the caller's error. Nothing here
+/// goes through `tempfile::TempDir::drop`, which discards a failed removal.
+///
+/// `Drop` resolves the stage of a cancelled or unwinding owner exactly as an
+/// unpublished `discard_after` does. It blocks its thread only for that
+/// bounded removal (at most `CLEANUP_RETRY_LIMIT` on Windows, one
+/// `remove_dir_all` on Unix) and one receipt write - never indefinitely.
+struct StageLease {
+    staging: Option<PrivateTemp>,
+    lock: Option<CacheLock>,
+    asset: Asset<'static>,
+}
+
+impl StageLease {
+    fn new(staging: PrivateTemp, lock: CacheLock, asset: Asset<'static>) -> Self {
+        Self {
+            staging: Some(staging),
+            lock: Some(lock),
+            asset,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.staging
+            .as_ref()
+            .expect("a live stage lease owns its stage")
+            .path()
+    }
+
+    /// The engine is published and verified: remove the stage, or receipt and
+    /// report it, then release the lock. A retained stage never fails an open.
+    fn close_published(mut self) -> Option<StageCleanupReport> {
+        self.release(true)
+    }
+
+    /// Nothing was published: remove the stage, or receipt and report it,
+    /// then release the lock. The caller's error still propagates and names a
+    /// retained stage.
+    fn discard_after(mut self, error: anyhow::Error) -> anyhow::Error {
+        match self.release(false) {
+            None => error,
+            Some(report) => error.context(format!(
+                "retained private install stage at {} after its checked removal failed",
+                report.stage.display()
+            )),
+        }
+    }
+
+    /// Preserve the stage as evidence of a failed activation, then release
+    /// the lock. The caller names the returned stage in its error.
+    fn keep(mut self) -> PathBuf {
+        let retained = self
+            .staging
+            .take()
+            .expect("a live stage lease owns its stage")
+            .keep();
+        drop(self.lock.take());
+        retained
+    }
+
+    fn release(&mut self, published: bool) -> Option<StageCleanupReport> {
+        let report = self.staging.take().and_then(|staging| {
+            let mut failure = staging.close_or_keep().err()?;
+            failure.cause = failure.cause.context(if published {
+                "Dolt engine publication succeeded, but private stage cleanup failed"
+            } else {
+                "Dolt engine installation stopped before publication, and private stage cleanup failed"
+            });
+            let versions = failure.stage.parent().unwrap_or(Path::new("")).to_owned();
+            let report = record_retained_stage(&versions, self.asset, failure, published);
+            emit_retained_stage_diagnostic(&report);
+            Some(report)
+        });
+        // Only now, with its stage gone or receipted and reported, may another
+        // installer take the lock.
+        drop(self.lock.take());
+        report
+    }
+}
+
+impl Drop for StageLease {
+    fn drop(&mut self) {
+        self.release(false);
+    }
+}
+
 struct StagedActivation {
     // Rust drops fields in declaration order. Close the candidate and probe
-    // authorities before the disposable private stage, then the cache lease.
+    // authorities before the lease resolves the stage and releases the lock.
     source: Option<Directory>,
     probe: Option<CheckedColdProbe>,
-    staging: PrivateTemp,
-    lock: CacheLock,
+    lease: StageLease,
 }
 
 impl StagedActivation {
     /// The engine is published and verified before this runs, so a stage that
     /// survives its own bounded removal is reported, not raised: only integrity
-    /// failures fail an open. The returned failure names a retained stage.
-    fn finish_published(self) -> Result<Option<StageCleanupFailure>> {
+    /// failures fail an open. The returned report names a retained stage that
+    /// the lease already receipted before releasing the lock.
+    fn finish_published(self) -> Option<StageCleanupReport> {
         let Self {
             source,
             probe,
-            staging,
-            lock,
+            lease,
         } = self;
         drop(source);
         drop(probe);
-        let result = staging.close_or_keep();
-        drop(lock);
-        Ok(result.err().map(|mut failure| {
-            failure.cause = failure
-                .cause
-                .context("Dolt engine publication succeeded, but private stage cleanup failed");
-            failure
-        }))
+        lease.close_published()
     }
 
     fn retain(self, error: anyhow::Error) -> anyhow::Error {
         let Self {
             source,
             probe,
-            staging,
-            lock,
+            lease,
         } = self;
         // Close the checked candidate before retaining its stage, then release
         // the cache lock only after stage ownership has been decided.
         drop(source);
         drop(probe);
-        let retained = staging.keep();
-        drop(lock);
+        let retained = lease.keep();
         error.context(format!(
             "verified Dolt activation failed; preserved private stage at {}",
             retained.display()
@@ -847,18 +950,18 @@ async fn activate_staged(
     lock: CacheLock,
     candidate: &Path,
     destination: &Path,
-) -> Result<Option<StageCleanupFailure>> {
-    activate_staged_with(staging, lock, None, candidate, destination, |_| {}).await
+) -> Result<Option<StageCleanupReport>> {
+    let lease = StageLease::new(staging, lock, BUNDLED_ASSET);
+    activate_staged_with(lease, None, candidate, destination, |_| {}).await
 }
 
 async fn activate_staged_after_probe(
-    staging: PrivateTemp,
-    lock: CacheLock,
+    lease: StageLease,
     probe: CheckedColdProbe,
     candidate: &Path,
     destination: &Path,
-) -> Result<Option<StageCleanupFailure>> {
-    activate_staged_with(staging, lock, Some(probe), candidate, destination, |_| {}).await
+) -> Result<Option<StageCleanupReport>> {
+    activate_staged_with(lease, Some(probe), candidate, destination, |_| {}).await
 }
 
 #[cfg(test)]
@@ -868,23 +971,22 @@ async fn activate_staged_observed(
     candidate: &Path,
     destination: &Path,
     observer: impl FnMut(bool),
-) -> Result<Option<StageCleanupFailure>> {
-    activate_staged_with(staging, lock, None, candidate, destination, observer).await
+) -> Result<Option<StageCleanupReport>> {
+    let lease = StageLease::new(staging, lock, BUNDLED_ASSET);
+    activate_staged_with(lease, None, candidate, destination, observer).await
 }
 
 async fn activate_staged_with(
-    staging: PrivateTemp,
-    lock: CacheLock,
+    lease: StageLease,
     probe: Option<CheckedColdProbe>,
     candidate: &Path,
     destination: &Path,
     mut observer: impl FnMut(bool),
-) -> Result<Option<StageCleanupFailure>> {
+) -> Result<Option<StageCleanupReport>> {
     let mut activation = StagedActivation {
         source: None,
         probe,
-        staging,
-        lock,
+        lease,
     };
     activation.source = match files::directory(candidate) {
         Ok(source) => Some(source),
@@ -902,7 +1004,7 @@ async fn activate_staged_with(
         match activate_once(source, destination) {
             Ok(files::DirectoryMove::Moved(_)) => {
                 observer(false);
-                activation.finish_published()
+                Ok(activation.finish_published())
             }
             Ok(files::DirectoryMove::ProvenNoMove(error)) => {
                 observer(true);
@@ -929,7 +1031,7 @@ async fn activate_staged_with(
             match activate_once(source, destination) {
                 Ok(files::DirectoryMove::Moved(_)) => {
                     observer(false);
-                    return activation.finish_published();
+                    return Ok(activation.finish_published());
                 }
                 Ok(files::DirectoryMove::ProvenNoMove(error)) => {
                     observer(true);
@@ -942,7 +1044,14 @@ async fn activate_staged_with(
                     }
                     let now = tokio::time::Instant::now();
                     if now >= deadline {
-                        let error = terminal_activation_error(first_error, error, retries);
+                        // A recoverable result that arrives after the window,
+                        // even the first one, ends recovery as stopped.
+                        let error = match first_error {
+                            Some(first_error) => {
+                                terminal_activation_error(Some(first_error), error, retries)
+                            }
+                            None => expired_activation_error(error, retries),
+                        };
                         return Err(activation.retain(error));
                     }
                     if first_error.is_none() {
