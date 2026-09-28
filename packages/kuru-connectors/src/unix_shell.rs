@@ -40,6 +40,10 @@ const OBSERVE_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_RETAINED_SHELL_OWNERS: usize = 16;
 const RETAINED_CLEANUP_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const RETAINED_CLEANUP_MAX_BACKOFF: Duration = Duration::from_secs(1);
+/// Diagnostic bound on a caller waiting for a launch-anchored test worker to
+/// either spawn its shell or finish before launch.
+#[cfg(test)]
+const LAUNCH_ANCHOR_BOUND: Duration = Duration::from_secs(10);
 
 struct ShellAdmission {
     state: Mutex<usize>,
@@ -118,6 +122,26 @@ struct TestHooks {
     cleanup_budget_ms: Arc<AtomicU64>,
     retained_initial_backoff_ms: Arc<AtomicU64>,
     retained_max_backoff_ms: Arc<AtomicU64>,
+    deadline_anchored_at_launch: Arc<AtomicBool>,
+    launches: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Test-only handoff from a worker to its caller at the instant the shell is
+/// spawned. The worker measures the command duration from that instant and the
+/// caller anchors its fallback to the same launch deadline.
+#[cfg(test)]
+struct LaunchAnchor {
+    duration: Duration,
+    deadline: oneshot::Sender<Instant>,
+}
+
+#[cfg(test)]
+impl LaunchAnchor {
+    fn launched(self) -> Instant {
+        let deadline = Instant::now() + self.duration;
+        let _ = self.deadline.send(deadline);
+        deadline
+    }
 }
 
 #[cfg(test)]
@@ -219,7 +243,29 @@ impl TestHooks {
             retained_max_backoff_ms: Arc::new(AtomicU64::new(
                 RETAINED_CLEANUP_MAX_BACKOFF.as_millis() as u64,
             )),
+            deadline_anchored_at_launch: Arc::new(AtomicBool::new(false)),
+            launches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Measure later command deadlines from the shell's spawn instead of from
+    /// acceptance, so a slow pre-launch phase cannot expire a test's deadline
+    /// before the post-spawn path it exercises is reached.
+    fn anchor_deadline_at_launch(&self) {
+        self.deadline_anchored_at_launch
+            .store(true, Ordering::Release);
+    }
+
+    fn deadline_anchored_at_launch(&self) -> bool {
+        self.deadline_anchored_at_launch.load(Ordering::Acquire)
+    }
+
+    fn record_launch(&self) {
+        self.launches.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn launches(&self) -> usize {
+        self.launches.load(Ordering::Acquire)
     }
 
     fn set_point(&self, point: TestPoint) {
@@ -450,6 +496,16 @@ impl ShellRegistry {
             ensure!(!state.closing, "shell host is shutting down");
             state.owners.insert(id, control.clone());
         }
+        #[cfg(test)]
+        let (launch_anchor, launch_deadline) = if self.test_hooks.deadline_anchored_at_launch() {
+            let (deadline, launch_deadline) = oneshot::channel();
+            (
+                Some(LaunchAnchor { duration, deadline }),
+                Some(launch_deadline),
+            )
+        } else {
+            (None, None)
+        };
         let weak = Arc::downgrade(&self.inner);
         let request = WorkerRequest {
             root_guard,
@@ -461,6 +517,8 @@ impl ShellRegistry {
             admission,
             #[cfg(test)]
             test_hooks: self.test_hooks.clone(),
+            #[cfg(test)]
+            launch_anchor,
         };
         let worker_control = control.clone();
         let start = move || worker(weak, id, worker_control, request);
@@ -476,6 +534,28 @@ impl ShellRegistry {
             remove(&self.inner, id);
             bail!("cannot start retained shell owner: {error}");
         }
+        #[cfg(test)]
+        let fallback = match launch_deadline {
+            Some(launch_deadline) => {
+                match timeout_at(
+                    tokio::time::Instant::from_std(accepted + LAUNCH_ANCHOR_BOUND),
+                    launch_deadline,
+                )
+                .await
+                {
+                    Ok(Ok(launch_deadline)) => launch_deadline + cleanup_allowance,
+                    // A worker that ends before launch has already reported.
+                    Ok(Err(_)) => fallback,
+                    Err(_) => {
+                        self.cancel(id);
+                        bail!(
+                            "test launch anchor: shell worker neither launched nor finished within {LAUNCH_ANCHOR_BOUND:?}"
+                        );
+                    }
+                }
+            }
+            None => fallback,
+        };
 
         match timeout_at(tokio::time::Instant::from_std(fallback), receiver).await {
             Ok(Ok(result)) => result,
@@ -642,6 +722,8 @@ struct WorkerRequest {
     admission: ShellAdmissionPermit,
     #[cfg(test)]
     test_hooks: TestHooks,
+    #[cfg(test)]
+    launch_anchor: Option<LaunchAnchor>,
 }
 
 fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request: WorkerRequest) {
@@ -655,7 +737,11 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
         admission,
         #[cfg(test)]
         test_hooks,
+        #[cfg(test)]
+        launch_anchor,
     } = request;
+    #[cfg(test)]
+    let deadline_anchored_at_launch = launch_anchor.is_some();
     let finish = WorkerFinish {
         registry,
         id,
@@ -666,7 +752,12 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
     };
     #[cfg(test)]
     test_hooks.await_start();
-    if let Some(error) = before_launch(&control, deadline) {
+    if let Some(error) = before_launch(
+        &control,
+        deadline,
+        #[cfg(test)]
+        deadline_anchored_at_launch,
+    ) {
         finish.complete(Err(error));
         return;
     }
@@ -679,7 +770,12 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
             return;
         }
     };
-    if let Some(error) = before_launch(&control, deadline) {
+    if let Some(error) = before_launch(
+        &control,
+        deadline,
+        #[cfg(test)]
+        deadline_anchored_at_launch,
+    ) {
         finish.complete(Err(error));
         return;
     }
@@ -701,7 +797,12 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
             return;
         }
     };
-    if let Some(error) = before_launch(&control, deadline) {
+    if let Some(error) = before_launch(
+        &control,
+        deadline,
+        #[cfg(test)]
+        deadline_anchored_at_launch,
+    ) {
         finish.complete(Err(error));
         return;
     }
@@ -727,7 +828,12 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(error) = before_launch(&control, deadline) {
+    if let Some(error) = before_launch(
+        &control,
+        deadline,
+        #[cfg(test)]
+        deadline_anchored_at_launch,
+    ) {
         finish.complete(Err(error));
         return;
     }
@@ -746,6 +852,13 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
     };
     drop(root_pin);
     finish.spawned.store(true, Ordering::Release);
+    #[cfg(test)]
+    test_hooks.record_launch();
+    #[cfg(test)]
+    let deadline = match launch_anchor {
+        Some(anchor) => anchor.launched(),
+        None => deadline,
+    };
 
     // Keep `group` outside the panic boundary. A post-spawn panic can then use
     // the same signal-before-reap path instead of dropping the anchored child.
@@ -1061,13 +1174,19 @@ fn retain_until_confirmed(
     }
 }
 
-fn before_launch(control: &Control, deadline: Instant) -> Option<anyhow::Error> {
+fn before_launch(
+    control: &Control,
+    deadline: Instant,
+    #[cfg(test)] deadline_anchored_at_launch: bool,
+) -> Option<anyhow::Error> {
+    #[cfg(not(test))]
+    let deadline_anchored_at_launch = false;
     if control.cancelled_or_closed() {
         Some(shell_failure(
             ShellFailureCategory::Cancelled,
             &ShellCapture::new(),
         ))
-    } else if Instant::now() >= deadline {
+    } else if !deadline_anchored_at_launch && Instant::now() >= deadline {
         Some(shell_failure(
             ShellFailureCategory::TimedOut,
             &ShellCapture::new(),
@@ -1253,6 +1372,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let admission = Arc::new(ShellAdmission::new(1));
         let registry = ShellRegistry::with_admission(admission.clone());
+        registry.test_hooks.anchor_deadline_at_launch();
         registry.test_hooks.set_point(TestPoint::PreSpawnPanic);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1270,6 +1390,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("panicked before launch"));
+        assert_eq!(registry.test_hooks.launches(), 0);
         assert_eq!(registry.owner_count(), 0);
         assert_eq!(admission.in_use(), 0);
         assert!(!root.path().join("launched-after-panic").exists());
@@ -1279,6 +1400,7 @@ mod tests {
     fn cleanup_panic_keeps_the_timeout_primary_and_retains_the_owner() {
         let root = tempfile::tempdir().unwrap();
         let registry = ShellRegistry::new();
+        registry.test_hooks.anchor_deadline_at_launch();
         registry.test_hooks.set_point(TestPoint::CleanupPanic);
         let retained_cleanup = registry.test_hooks.arm_retained_cleanup_gate();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1297,6 +1419,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
+        assert_eq!(registry.test_hooks.launches(), 1);
         assert_eq!(
             error,
             "shell timed out; cleanup: unconfirmed ownership retained; stderr: <pending EOF>"
@@ -1323,6 +1446,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let admission = Arc::new(ShellAdmission::new(1));
             let registry = ShellRegistry::with_admission(admission.clone());
+            registry.test_hooks.anchor_deadline_at_launch();
             registry.test_hooks.set_point(point);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1340,6 +1464,7 @@ mod tests {
                 .unwrap_err();
 
             assert!(error.to_string().contains(expected), "{error:#}");
+            assert_eq!(registry.test_hooks.launches(), 0);
             assert_eq!(registry.owner_count(), 0);
             assert_eq!(admission.in_use(), 0);
             assert!(!root.path().join("launched-before-spawn-failure").exists());
@@ -1347,10 +1472,62 @@ mod tests {
     }
 
     #[test]
+    fn pre_launch_deadline_expiry_fails_without_launching() {
+        const DURATION: Duration = Duration::from_millis(20);
+        let root = tempfile::tempdir().unwrap();
+        let admission = Arc::new(ShellAdmission::new(1));
+        let registry = ShellRegistry::with_admission(admission.clone());
+        let start = registry.test_hooks.arm_start_gate();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let error = runtime
+            .block_on(async {
+                let (result, ()) = tokio::join!(
+                    registry.execute(
+                        retained_root(root.path()),
+                        root.path().to_path_buf(),
+                        ": > launched-after-deadline".into(),
+                        DURATION,
+                        Vec::new,
+                    ),
+                    async {
+                        tokio::time::timeout(Duration::from_secs(1), async {
+                            while !start.entered() {
+                                sleep(OBSERVE_INTERVAL).await;
+                            }
+                        })
+                        .await
+                        .expect("worker did not reach its start gate");
+                        // The call was accepted before its worker reached the
+                        // gate, so its deadline has passed once DURATION has
+                        // elapsed on the same monotonic clock from here.
+                        let gate_reached = Instant::now();
+                        while gate_reached.elapsed() < DURATION {
+                            sleep(OBSERVE_INTERVAL).await;
+                        }
+                        start.release();
+                    },
+                );
+                result
+            })
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "shell timed out; stderr: <pending EOF>");
+        assert_eq!(registry.test_hooks.launches(), 0);
+        assert_eq!(registry.owner_count(), 0);
+        assert_eq!(admission.in_use(), 0);
+        assert!(!root.path().join("launched-after-deadline").exists());
+    }
+
+    #[test]
     fn retained_owner_holds_process_wide_admission_across_dropped_registries() {
         let root = tempfile::tempdir().unwrap();
         let admission = Arc::new(ShellAdmission::new(1));
         let registry = ShellRegistry::with_admission(admission.clone());
+        registry.test_hooks.anchor_deadline_at_launch();
         registry.test_hooks.set_point(TestPoint::CleanupPanic);
         let retained_cleanup = registry.test_hooks.arm_retained_cleanup_gate();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1367,6 +1544,7 @@ mod tests {
                 Vec::new,
             ))
             .unwrap_err();
+        assert_eq!(registry.test_hooks.launches(), 1);
         assert_eq!(
             error.to_string(),
             "shell timed out; cleanup: unconfirmed ownership retained; stderr: <pending EOF>"
@@ -1431,6 +1609,7 @@ mod tests {
         ] {
             let root = tempfile::tempdir().unwrap();
             let registry = ShellRegistry::new();
+            registry.test_hooks.anchor_deadline_at_launch();
             registry.test_hooks.set_point(point);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1447,6 +1626,7 @@ mod tests {
                 ))
                 .unwrap_err();
 
+            assert_eq!(registry.test_hooks.launches(), 1, "{expected}: {error:#}");
             assert!(
                 error
                     .to_string()
@@ -1584,6 +1764,7 @@ mod tests {
     fn delayed_interruption_retains_the_real_worker_then_confirms_once() {
         let root = tempfile::tempdir().unwrap();
         let registry = ShellRegistry::new();
+        registry.test_hooks.anchor_deadline_at_launch();
         registry.test_set_cleanup_budget(Duration::from_millis(80));
         let interruption = registry.test_arm_interrupted_cleanup();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1603,6 +1784,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
+        assert_eq!(registry.test_hooks.launches(), 1);
         assert!(started.elapsed() >= Duration::from_millis(80));
         assert_eq!(
             error,
@@ -1627,6 +1809,7 @@ mod tests {
     fn retained_cleanup_uses_capped_exponential_observation_backoff() {
         let root = tempfile::tempdir().unwrap();
         let registry = ShellRegistry::new();
+        registry.test_hooks.anchor_deadline_at_launch();
         registry.test_set_cleanup_budget(Duration::from_millis(20));
         registry.test_set_retained_backoff(Duration::from_millis(20), Duration::from_millis(40));
         let interruption = registry.test_arm_interrupted_cleanup();
@@ -1644,6 +1827,7 @@ mod tests {
                 Vec::new,
             ))
             .unwrap_err();
+        assert_eq!(registry.test_hooks.launches(), 1);
         assert_eq!(
             error.to_string(),
             "shell timed out; cleanup: unconfirmed ownership retained; stderr: <pending EOF>"
@@ -1685,6 +1869,7 @@ mod tests {
     fn successful_capture_never_reports_success_before_unconfirmed_cleanup() {
         let root = tempfile::tempdir().unwrap();
         let registry = ShellRegistry::new();
+        registry.test_hooks.anchor_deadline_at_launch();
         registry.test_set_cleanup_budget(Duration::from_millis(80));
         let interruption = registry.test_arm_interrupted_cleanup();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1708,6 +1893,7 @@ mod tests {
             "shell cleanup unconfirmed; cleanup: unconfirmed ownership retained; stderr: "
         );
         assert!(!error.contains("exit_code"), "{error}");
+        assert_eq!(registry.test_hooks.launches(), 1);
         assert_eq!(registry.owner_count(), 1);
         assert_eq!(registry.test_transitions(), 0);
         interruption.release();
