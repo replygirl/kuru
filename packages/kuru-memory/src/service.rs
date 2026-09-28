@@ -2281,6 +2281,9 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
+            // The owner ran in another process: record its store's quiescence
+            // for the fixture root's teardown.
+            crate::test_support::await_managed_quiescence(&options).await?;
             Ok::<(), anyhow::Error>(())
         })
         .await
@@ -2370,6 +2373,9 @@ mod tests {
             );
             recovered.close();
             drop(acquire_maintenance_permit(&options).await?);
+            // Both owners ran in other processes: record their store's
+            // quiescence for the fixture root's teardown.
+            crate::test_support::await_managed_quiescence(&options).await?;
             Ok::<(), anyhow::Error>(())
         })
         .await
