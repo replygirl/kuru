@@ -64,15 +64,27 @@ Each partition exports LCOV and a line export against its own instrumented
 executables, with no threshold, and records a receipt: source commit, tree, Cargo.lock, toolchain and
 coverage-tool identity, target, test-profile environment, the artifact
 inventory hash, and each executable's listed and assigned test names (stored in
-its partition plan and hashed in the receipt). Raw profiles stay on the runner;
+its partition plan and hashed in the receipt). The test-profile environment is
+the build and test variables that change what Cargo builds or how tests run,
+plus the coverage environment from cargo-llvm-cov's `show-env`. Before it is
+digested, the partition's target path becomes a fixed token, and so does the
+merge-pool size `N` of the `%<N>m` specifier in the profile file name, which
+`show-env` sets to the host's available parallelism: hosted runners of one
+image can report different CPU counts. Every other value, including a
+`%m` without a size, is compared as written. The partition uploads this
+neutralised environment as `profile-env.json`, whose digest is the receipt's;
+it holds Cargo and test settings, paths, flags and crate names, never
+credentials. Raw profiles stay on the runner;
 the receipt keeps their count, size and manifest digest. The merge rebuilds
 nothing. Its fail-closed check is N independent shard builds agreeing, rather
 than a separate rebuild: it requires a receipt from every partition, identical
 source, toolchain, profile and inventory identity across them, a target
 consistent with the OS, and per-executable assignments that are pairwise
-disjoint and whose union equals the recorded `--list` output. Any mismatch or
-missing receipt fails before any report exists, so there is never a partial
-LCOV.
+disjoint and whose union equals the recorded `--list` output. The merge
+requires each uploaded `profile-env.json` to match its receipt's digest and,
+when two partitions' environments differ, names every differing key with both
+values. Any mismatch or missing receipt fails before any report exists, so
+there is never a partial LCOV.
 
 The per-OS gate is 90% by the metric `mise run coverage` holds to
 `--fail-under-lines 90`: cargo-llvm-cov reads `totals.lines` of
@@ -98,8 +110,10 @@ covered lines, and sums each group's maximum per file and in total. That equals
 the summary of the summed profiles: the mappings are identical and region
 counts are non-negative, so a region's summed count is nonzero exactly when
 some partition's is, and a line's count is the maximum of a structurally chosen
-set of region counts. A negative counter expression (for example, lost updates
-to non-atomic counters under concurrent tests) would break that equality, since
+set of region counts. A negative counter expression (for example, when
+instrumented code is still running on a detached thread while the process
+writes its profile at exit, so the written counters are mutually inconsistent;
+the counter updates themselves are atomic) would break that equality, since
 its sum can cancel across partitions where no self-check sees it. `llvm-cov
 export` clamps such a count to `i64::MAX`, which no real count approaches, so
 the line export refuses any region with that count, naming the function and

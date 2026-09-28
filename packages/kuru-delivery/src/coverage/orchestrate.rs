@@ -16,7 +16,7 @@
 //! own process, which is also Cargo's runner, is never instrumented.
 
 use super::{
-    COMMAND_OUTPUT_LIMIT, LLVM_COV_VERSION, Mode, RUNNER_LEDGER_FILE, ReceiptOptions,
+    COMMAND_OUTPUT_LIMIT, LLVM_COV_VERSION, Mode, ProfileEnv, RUNNER_LEDGER_FILE, ReceiptOptions,
     RunnerConfigOptions, WORKSPACE_PACKAGES, artifact_os_label, canonical_attempt,
     check_partitioning, discard_compile_profiles, lcov, ledger, lines, merge,
     partition::PartitionScheme, plan, seed, unix_now, workspace_identity, write_inventory,
@@ -64,6 +64,11 @@ const PROFILE_ENV: [&str; 8] = [
 /// The token that replaces the target path inside the digested environment,
 /// so partitions with different target paths can still agree.
 const TARGET_TOKEN: &str = "${KURU_COVERAGE_TARGET}";
+/// The token that replaces the merge-pool size `N` of a `%<N>m` specifier in
+/// the profile file name. cargo-llvm-cov 0.9.1's `show-env` sets `N` to the
+/// host's available parallelism, so hosted runners of one OS image with
+/// different CPU counts would otherwise never agree.
+const POOL_TOKEN: &str = "${KURU_COVERAGE_POOL}";
 
 /// Run one partition from the process's `KURU_COVERAGE_*` inputs.
 pub async fn shard(root: &Path, mode: Mode) -> Result<()> {
@@ -591,17 +596,19 @@ struct Prepared {
     inventory: PathBuf,
     messages: PathBuf,
     workspace: super::WorkspaceIdentity,
-    profile_env_sha256: String,
+    profile_env: ProfileEnv,
     seed: ledger::CacheLedger,
 }
 
-/// Digest of the build and test environment with the target path replaced by
-/// a token: equal for partitions of one OS whatever their target paths.
-fn profile_env_sha256(
+/// The build and test environment the receipt digests, with the target path
+/// and the profile file name's merge-pool size replaced by tokens: equal for
+/// partitions of one OS whatever their target paths and CPU counts. Every
+/// other difference, including a pool-less `%m`, remains.
+fn digested_profile_env(
     profile_env: &BTreeMap<String, Option<String>>,
     coverage: &[(String, String)],
     targets: &[&str],
-) -> Result<String> {
+) -> ProfileEnv {
     let neutral = |value: &str| {
         targets
             .iter()
@@ -610,7 +617,7 @@ fn profile_env_sha256(
                 value.replace(target, TARGET_TOKEN)
             })
     };
-    let mut digested = BTreeMap::new();
+    let mut digested = ProfileEnv::new();
     for (name, value) in profile_env {
         digested.insert(
             format!("env:{name}"),
@@ -618,9 +625,35 @@ fn profile_env_sha256(
         );
     }
     for (name, value) in coverage {
-        digested.insert(format!("show-env:{name}"), neutral(value));
+        let value = neutral(value);
+        let value = match name.as_str() {
+            "LLVM_PROFILE_FILE" => neutral_pool(&value),
+            _ => value,
+        };
+        digested.insert(format!("show-env:{name}"), value);
     }
-    super::digest_json(&digested)
+    digested
+}
+
+/// Replace the size of each `%<digits>m` merge-pool specifier in the file
+/// name of an `LLVM_PROFILE_FILE` pattern with [`POOL_TOKEN`]. Directories,
+/// `%m` without a size and every other specifier are kept.
+fn neutral_pool(pattern: &str) -> String {
+    let (directory, mut name) = pattern.split_at(pattern.rfind(['/', '\\']).map_or(0, |at| at + 1));
+    let mut neutral = directory.to_owned();
+    while let Some(at) = name.find('%') {
+        neutral.push_str(&name[..=at]);
+        let rest = &name[at + 1..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && rest[digits..].starts_with('m') {
+            neutral.push_str(POOL_TOKEN);
+            name = &rest[digits..];
+        } else {
+            name = rest;
+        }
+    }
+    neutral.push_str(name);
+    neutral
 }
 
 /// Package arguments for Cargo: the workspace, or each scoped package.
@@ -733,8 +766,7 @@ async fn prepare<H: Host>(
             None
         }
     };
-    let profile_env_sha256 =
-        profile_env_sha256(profile_env, &coverage, &[&shown_target, &target_text])?;
+    let profile_env = digested_profile_env(profile_env, &coverage, &[&shown_target, &target_text]);
 
     let metadata = state.join("metadata.json");
     host.stream(
@@ -825,7 +857,7 @@ async fn prepare<H: Host>(
         inventory,
         messages,
         workspace,
-        profile_env_sha256,
+        profile_env,
         seed,
     })
 }
@@ -898,7 +930,7 @@ async fn run_shard<H: Host>(
         inventory,
         messages,
         workspace,
-        profile_env_sha256,
+        profile_env: digested_env,
         seed: mut cache,
     } = prepared;
 
@@ -1058,7 +1090,7 @@ async fn run_shard<H: Host>(
         run_attempt: &common.attempt,
         expected_source: &common.source,
         llvm_cov: llvm_cov.as_deref(),
-        profile_env_sha256: &profile_env_sha256,
+        profile_env: &digested_env,
         output: &inputs.output,
     })
     .await
@@ -1291,9 +1323,19 @@ fn show_env_line(line: &str) -> Result<(&str, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{DispatchOptions, Inventory, dispatch_with, fixture, read_json};
+    use super::super::{
+        DispatchOptions, Inventory, digest_json, dispatch_with, fixture, read_json,
+    };
     use super::*;
     use tempfile::TempDir;
+
+    fn profile_env_sha256(
+        profile_env: &BTreeMap<String, Option<String>>,
+        coverage: &[(String, String)],
+        targets: &[&str],
+    ) -> Result<String> {
+        digest_json(&digested_profile_env(profile_env, coverage, targets))
+    }
 
     const MACOS_CAPTURED: &str =
         include_str!("../../tests/fixtures/coverage-show-env/macos-captured.pwsh.txt");
@@ -2097,6 +2139,34 @@ mod tests {
             Fake::env(show_env, "LLVM_PROFILE_FILE").unwrap(),
             target.join("kuru-%p-%m.profraw").as_os_str()
         );
+        // The digested environment is uploaded beside the receipt with the
+        // target path and show-env's merge-pool size neutralised; the Cargo
+        // children below still receive show-env's real `%4m` pattern.
+        let attempts: Vec<_> = fs::read_dir(scenario.job("evidence"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let [attempt] = &attempts[..] else {
+            panic!("{attempts:?}")
+        };
+        let digested: ProfileEnv =
+            read_json(&attempt.join(super::super::PROFILE_ENV_FILE)).unwrap();
+        assert_eq!(
+            digested["show-env:LLVM_PROFILE_FILE"],
+            format!(
+                "{TARGET_TOKEN}{}kuru-%p-%{POOL_TOKEN}m.profraw",
+                std::path::MAIN_SEPARATOR
+            )
+        );
+        assert_eq!(digested["show-env:CARGO_LLVM_COV_TARGET_DIR"], TARGET_TOKEN);
+        assert_eq!(digested["show-env:RUSTC_WRAPPER"], "/fake/cargo-llvm-cov");
+        assert_eq!(
+            digested
+                .keys()
+                .filter(|key| key.starts_with("env:"))
+                .count(),
+            PROFILE_ENV.len()
+        );
         let cargo: Vec<_> = fake
             .invocations
             .iter()
@@ -2679,6 +2749,129 @@ mod tests {
             package_args(Mode::Uninstrumented, &["a".to_owned(), "b".to_owned()]),
             ["-p", "a", "-p", "b"]
         );
+    }
+
+    /// The named variables with `RUST_TEST_THREADS=2` and one optional
+    /// override, as a partition's process environment would supply them.
+    fn named_env(extra: Option<(&str, &str)>) -> BTreeMap<String, Option<String>> {
+        PROFILE_ENV
+            .iter()
+            .map(|name| {
+                let value = match (*name, extra) {
+                    (name, Some((key, value))) if name == key => Some(value.to_owned()),
+                    ("RUST_TEST_THREADS", _) => Some("2".to_owned()),
+                    _ => None,
+                };
+                ((*name).to_owned(), value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn profile_environment_digests_ignore_the_host_merge_pool_size_only() {
+        // cargo-llvm-cov 0.9.1 `show-env` writes the host's available
+        // parallelism into LLVM_PROFILE_FILE's `%<N>m` merge-pool specifier.
+        let digest = |target: &str, name: &str, extra| {
+            let coverage = vec![
+                (
+                    "LLVM_PROFILE_FILE".to_owned(),
+                    format!("{target}/{name}.profraw"),
+                ),
+                ("CARGO_LLVM_COV_TARGET_DIR".to_owned(), target.to_owned()),
+            ];
+            profile_env_sha256(&named_env(extra), &coverage, &[target]).unwrap()
+        };
+        // Runners with 3 and 5 logical CPUs and different target paths agree,
+        // as do one-, two- and many-digit pools.
+        let three = digest("/a/t1", "kuru-%p-%3m", None);
+        assert_eq!(three, digest("/b/t2", "kuru-%p-%5m", None));
+        assert_eq!(three, digest("/a/t1", "kuru-%p-%14m", None));
+        assert_eq!(three, digest("/a/t1", "kuru-%p-%128m", None));
+        // Every other difference in the profile file name is still seen: the
+        // pool-less `%m`, another specifier, stem or extension, and a pool
+        // specifier outside the file name.
+        for other in [
+            "kuru-%p-%m",
+            "kuru-%3m",
+            "kuru-%p-%h-%3m",
+            "other-%p-%3m",
+            "kuru-%p-%3mx",
+            "kuru-%p-%3n",
+            "kuru-%p-%%3m",
+        ] {
+            assert_ne!(three, digest("/a/t1", other, None), "{other}");
+        }
+        assert_ne!(
+            digest("/a/t1", "sub%3m/kuru-%p-%3m", None),
+            digest("/a/t1", "sub%5m/kuru-%p-%3m", None)
+        );
+        // A genuine build difference beside the pool size still differs.
+        assert_ne!(
+            three,
+            digest("/b/t2", "kuru-%p-%5m", Some(("RUSTFLAGS", "-Cdebuginfo=2")))
+        );
+        assert_ne!(
+            three,
+            digest("/b/t2", "kuru-%p-%5m", Some(("CARGO_INCREMENTAL", "1")))
+        );
+    }
+
+    #[test]
+    fn captured_show_env_digests_agree_across_merge_pool_sizes() {
+        // The captured environments, as two hosts of each OS with different
+        // parallelism and target paths would report them.
+        for (captured, pool, target) in [
+            (
+                MACOS_CAPTURED,
+                "%14m",
+                "/private/tmp/kuru-coverage-show-env/target",
+            ),
+            (
+                LINUX_CAPTURED,
+                "%4m",
+                "/home/runner/work/_temp/kuru-coverage-show-env-1",
+            ),
+            (
+                WINDOWS_CAPTURED,
+                "%4m",
+                r"D:\a\_temp/kuru-coverage-show-env-1",
+            ),
+        ] {
+            let shown = parse_show_env(captured).unwrap();
+            assert!(
+                shown.iter().any(|(_, value)| value.contains(pool)),
+                "{pool}"
+            );
+            let moved = format!("{target}-elsewhere");
+            let host: Vec<_> = shown
+                .iter()
+                .map(|(name, value)| {
+                    let value = value.replace(target, &moved).replace(pool, "%3m");
+                    (name.clone(), value)
+                })
+                .collect();
+            let env = named_env(None);
+            assert_eq!(
+                profile_env_sha256(&env, &shown, &[target]).unwrap(),
+                profile_env_sha256(&env, &host, &[&moved]).unwrap(),
+                "{target}"
+            );
+            // Another wrapper flag in the same captured environment differs.
+            let flagged: Vec<_> = shown
+                .iter()
+                .map(|(name, value)| match name.as_str() {
+                    "__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS" => {
+                        (name.clone(), format!("{value}\u{1f}--cfg=other"))
+                    }
+                    _ => (name.clone(), value.clone()),
+                })
+                .collect();
+            assert_ne!(
+                profile_env_sha256(&env, &shown, &[target]).unwrap(),
+                profile_env_sha256(&env, &flagged, &[target]).unwrap(),
+                "{target}"
+            );
+        }
     }
 
     #[test]

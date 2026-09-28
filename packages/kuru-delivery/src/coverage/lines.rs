@@ -352,8 +352,10 @@ impl Region {
             "region ends before it starts: {region:?}"
         );
         // `llvm-cov export` clamps the huge unsigned value of a negative
-        // counter expression (such as lost non-atomic counter updates under
-        // concurrent tests) to i64::MAX; no real count approaches it. A
+        // counter expression (such as instrumented code still running on a
+        // detached thread while the process writes its profile at exit, so the
+        // written counters are mutually inconsistent) to i64::MAX; no real
+        // count approaches it. A
         // negative count could cancel in the summed profile while this
         // partition reports the line covered, so the union would no longer
         // equal llvm-cov's merged figure. Refuse it and let the partition rerun.

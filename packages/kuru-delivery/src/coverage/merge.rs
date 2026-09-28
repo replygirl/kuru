@@ -15,9 +15,9 @@
 
 use super::{
     ATTEMPT_DIRECTORY, EXCLUDED_ARTIFACTS, INVENTORY_FILE, JOB_LEDGER_FILE, JSON_LIMIT, LCOV_FILE,
-    LINES_FILE, LLVM_COV_VERSION, LOCAL_OS, Mode, PLAN_FILE, PROFILE_COUNT_LIMIT,
-    PROFILE_TOTAL_LIMIT, RECEIPT_FILE, RUNNER_LEDGER_FILE, RUNNER_LEDGER_LIMIT, Receipt, SCHEMA,
-    WORKSPACE_PACKAGES, archive, canonical_attempt, digest_json, exact_entries,
+    LINES_FILE, LLVM_COV_VERSION, LOCAL_OS, Mode, PLAN_FILE, PROFILE_COUNT_LIMIT, PROFILE_ENV_FILE,
+    PROFILE_TOTAL_LIMIT, ProfileEnv, RECEIPT_FILE, RUNNER_LEDGER_FILE, RUNNER_LEDGER_LIMIT,
+    Receipt, SCHEMA, WORKSPACE_PACKAGES, archive, canonical_attempt, digest_json, exact_entries,
     lcov::{self, Lcov, Totals},
     ledger::JobLedger,
     lines::{self, LineExport, Lines},
@@ -29,7 +29,7 @@ use super::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -101,6 +101,8 @@ struct Accepted {
     index: u32,
     attempt: u64,
     receipt: Receipt,
+    /// The environment behind the receipt's profile-environment digest.
+    profile_env: ProfileEnv,
     plan: PartitionPlan,
     job: JobLedger,
     lcov: Option<Lcov>,
@@ -271,6 +273,35 @@ fn agreement(receipt: &Receipt) -> Result<Vec<(&'static str, String)>> {
     ])
 }
 
+/// Name each profile-environment key whose values differ, with both values
+/// bounded, as `; <key>: <partition value> != <partition 1 value>`.
+fn differing_keys(first: &ProfileEnv, other: &ProfileEnv) -> String {
+    const SHOWN: usize = 160;
+    let shown = |value: Option<&String>| match value {
+        None => "<absent>".to_owned(),
+        Some(value) if value.chars().count() <= SHOWN => format!("{value:?}"),
+        Some(value) => format!(
+            "{:?}... ({} bytes)",
+            value.chars().take(SHOWN).collect::<String>(),
+            value.len()
+        ),
+    };
+    first
+        .keys()
+        .chain(other.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|key| first.get(*key) != other.get(*key))
+        .map(|key| {
+            format!(
+                "; {key}: {} != {}",
+                shown(other.get(key)),
+                shown(first.get(key))
+            )
+        })
+        .collect()
+}
+
 /// Check one partition's evidence against its receipt and the expectation.
 fn accept(
     options: &MergeOptions<'_>,
@@ -283,6 +314,7 @@ fn accept(
         INVENTORY_FILE,
         JOB_LEDGER_FILE,
         PLAN_FILE,
+        PROFILE_ENV_FILE,
         RECEIPT_FILE,
         RUNNER_LEDGER_FILE,
     ];
@@ -358,6 +390,15 @@ fn accept(
         options.scope
     );
 
+    let profile_env: ProfileEnv = serde_json::from_slice(&read_bounded(
+        &directory.join(PROFILE_ENV_FILE),
+        JSON_LIMIT,
+    )?)
+    .with_context(|| format!("{label} profile environment"))?;
+    ensure!(
+        digest_json(&profile_env)? == receipt.profile_env_sha256,
+        "{label} uploaded profile environment differs from its receipt"
+    );
     let inventory =
         read_inventory(&directory.join(INVENTORY_FILE)).with_context(|| label.clone())?;
     ensure!(
@@ -466,6 +507,7 @@ fn accept(
         index,
         attempt,
         receipt,
+        profile_env,
         plan: uploaded,
         job,
         lcov,
@@ -586,9 +628,15 @@ pub fn merge(options: &MergeOptions<'_>) -> Result<MergeSummary> {
     for partition in &accepted[1..] {
         for ((field, expected), (_, actual)) in reference.iter().zip(agreement(&partition.receipt)?)
         {
+            let keys = match *field {
+                "profile environment" => {
+                    differing_keys(&accepted[0].profile_env, &partition.profile_env)
+                }
+                _ => String::new(),
+            };
             ensure!(
                 *expected == actual,
-                "coverage partition {} receipt differs from partition 1 in {field}: {actual} != {expected}",
+                "coverage partition {} receipt differs from partition 1 in {field}: {actual} != {expected}{keys}",
                 partition.index
             );
         }
@@ -759,7 +807,7 @@ pub fn print_summary(summary: &MergeSummary) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixture::{SOURCE, Workspace};
+    use super::super::fixture::{self, SOURCE, Workspace};
     use super::super::lines::LineSet;
     use super::*;
 
@@ -978,7 +1026,7 @@ mod tests {
             (|r| r["cargo"] = "cargo 1.99".into(), "in cargo:"),
             (
                 |r| r["profile_env_sha256"] = "x".into(),
-                "in profile environment",
+                "uploaded profile environment differs from its receipt",
             ),
             (
                 |r| r["cargo_llvm_cov"] = "cargo-llvm-cov 0.9.0".into(),
@@ -1057,6 +1105,89 @@ mod tests {
         fs::write(downloaded.evidence(2).join(RECEIPT_FILE), &receipt).unwrap();
         fs::remove_file(downloaded.evidence(2).join(LINES_FILE)).unwrap();
         downloaded.refuse("unexpected artifact entries");
+    }
+
+    impl Downloaded {
+        /// Replace a partition's profile environment and rebind its receipt.
+        fn replace_profile_env(&self, index: u32, profile_env: &ProfileEnv) {
+            let path = self.evidence(index).join(PROFILE_ENV_FILE);
+            fs::write(&path, serde_json::to_vec_pretty(profile_env).unwrap()).unwrap();
+            let digest = digest_json(profile_env).unwrap();
+            self.edit_receipt(index, |receipt| {
+                receipt["profile_env_sha256"] = digest.clone().into();
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_environments_that_differ_are_refused_naming_each_key() {
+        for mode in [Mode::Instrumented, Mode::Uninstrumented] {
+            let downloaded = Downloaded::new(mode, 3).await;
+            let first = fixture::profile_env();
+            // Any genuine difference fails the merge and names its keys with
+            // both values; agreeing keys are not named.
+            let mut other = first.clone();
+            other.insert("env:RUSTFLAGS".to_owned(), "-Cdebuginfo=2".to_owned());
+            other.insert(
+                "show-env:LLVM_PROFILE_FILE".to_owned(),
+                "${KURU_COVERAGE_TARGET}/kuru-%p-%m.profraw".to_owned(),
+            );
+            other.remove("env:RUST_TEST_THREADS");
+            downloaded.replace_profile_env(3, &other);
+            let error = format!("{:#}", downloaded.merge().unwrap_err());
+            assert!(
+                error.contains(
+                    "coverage partition 3 receipt differs from partition 1 in profile environment"
+                ),
+                "{error}"
+            );
+            assert!(
+                error.contains("; env:RUSTFLAGS: \"-Cdebuginfo=2\" != <absent>"),
+                "{error}"
+            );
+            assert!(
+                error.contains("; env:RUST_TEST_THREADS: <absent> != \"2\""),
+                "{error}"
+            );
+            assert!(
+                error.contains(
+                    "; show-env:LLVM_PROFILE_FILE: \"${KURU_COVERAGE_TARGET}/kuru-%p-%m.profraw\" \
+                     != \"${KURU_COVERAGE_TARGET}/kuru-%p-%${KURU_COVERAGE_POOL}m.profraw\""
+                ),
+                "{error}"
+            );
+            assert_eq!(error.matches("; ").count(), 3, "{error}");
+            downloaded.refuse("in profile environment");
+            // A long value is shown bounded, with its length.
+            let mut long = first.clone();
+            long.insert("env:RUSTFLAGS".to_owned(), "x".repeat(400));
+            downloaded.replace_profile_env(3, &long);
+            let error = format!("{:#}", downloaded.merge().unwrap_err());
+            assert!(
+                error.contains(&format!(
+                    "\"{}\"... (400 bytes) != <absent>",
+                    "x".repeat(160)
+                )),
+                "{error}"
+            );
+            // An environment that differs from its receipt, or is missing,
+            // is refused before any comparison.
+            downloaded.replace_profile_env(3, &first);
+            downloaded.merge().map(drop).unwrap();
+            fs::remove_dir_all(downloaded.report.parent().unwrap()).unwrap_or(());
+            fs::write(
+                downloaded.evidence(2).join(PROFILE_ENV_FILE),
+                serde_json::to_vec(&other).unwrap(),
+            )
+            .unwrap();
+            downloaded.refuse(
+                "coverage partition 2 (attempt 1) uploaded profile environment differs from its receipt",
+            );
+            fs::write(downloaded.evidence(2).join(PROFILE_ENV_FILE), b"[]").unwrap();
+            downloaded.refuse("profile environment");
+            fs::remove_file(downloaded.evidence(2).join(PROFILE_ENV_FILE)).unwrap();
+            downloaded.refuse("unexpected artifact entries");
+        }
     }
 
     #[tokio::test]
