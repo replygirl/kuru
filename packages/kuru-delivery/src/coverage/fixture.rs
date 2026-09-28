@@ -3,7 +3,7 @@
 //! dispatcher, ledger validation and evidence writer.
 
 use super::{
-    Artifact, Inventory, LLVM_COV_VERSION, Launch, Launcher, LibtestProgress, Mode,
+    Artifact, Inventory, LLVM_COV_VERSION, Launch, Launcher, LibtestProgress, Mode, ProfileEnv,
     ReceiptIdentity, ReceiptOptions, SCHEMA, StallEvidence, Supervision, dispatch_with,
     ledger::{self, JobLedger},
     lines::{Instantiation, LINES_SCHEMA, LineExport, LineSet},
@@ -256,12 +256,23 @@ impl Workspace {
                 run_attempt: &attempt.to_string(),
                 expected_source: SOURCE,
                 llvm_cov: None,
-                profile_env_sha256: "env",
+                profile_env: &profile_env(),
                 output,
             },
             identity(mode),
         )
     }
+}
+
+/// A partition's digested profile environment.
+pub fn profile_env() -> ProfileEnv {
+    ProfileEnv::from([
+        ("env:RUST_TEST_THREADS".to_owned(), "2".to_owned()),
+        (
+            "show-env:LLVM_PROFILE_FILE".to_owned(),
+            "${KURU_COVERAGE_TARGET}/kuru-%p-%${KURU_COVERAGE_POOL}m.profraw".to_owned(),
+        ),
+    ])
 }
 
 pub fn identity(mode: Mode) -> ReceiptIdentity {

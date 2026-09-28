@@ -273,7 +273,13 @@ An executable whose tests are not run on a host MUST be recorded with its reason
 Each OS's partition evidence SHALL be merged on one Linux runner. The merge does not rebuild the inventory.
 Instead, N independently built partitions MUST agree. The merge MUST require a receipt for every partition index.
 It MUST require all receipts to be identical on source, tree, Cargo.lock, toolchain, profile environment, mode and
-inventory digest, and consistent with the OS label and the expected source commit. It MUST prove every executable's
+inventory digest, and consistent with the OS label and the expected source commit. The profile environment is the
+named build and test process variables and cargo-llvm-cov's `show-env` coverage environment. Only the partition's
+target path and the merge-pool size `N` of a `%<N>m` specifier in the profile file name, which `show-env` derives from
+the host's available parallelism, MAY be replaced by fixed tokens before digesting. Every other value MUST be compared
+as written. Each partition MUST upload the neutralised environment whose digest its receipt carries. That environment
+MUST NOT contain credentials. The merge MUST refuse an uploaded environment that differs from its receipt's digest
+and, when two partitions' environments differ, MUST name every differing key. It MUST prove every executable's
 partitions disjoint and complete against its listed tests. Any missing, extra, mismatched or unverifiable receipt
 MUST fail the merge before any report exists. Each instrumented partition MUST export, per function instantiation,
 its main source file, group location and mapped and covered line sets, derived from its own llvm-cov export as
@@ -306,6 +312,18 @@ unique-line figure is informational. No partition percentage may be averaged.
 #### Scenario: A receipt lacks the line export digest
 - **WHEN** an instrumented partition's receipt has no line export digest, or its uploaded export differs from that digest
 - **THEN** that OS's merge fails and produces no report.
+
+#### Scenario: Partitions ran on hosts with different CPU counts
+- **WHEN** two partitions of one OS were built identically on runners whose available parallelism differs, so `show-env` reported `%3m` and `%5m` merge pools at different target paths
+- **THEN** their profile-environment digests are equal and the merge accepts them.
+
+#### Scenario: Profile environments genuinely differ
+- **WHEN** two partitions' profile environments differ in any other value, such as `RUSTFLAGS`, a size-less `%m` profile file pattern or another file-name specifier
+- **THEN** the merge fails naming every differing key with both values and writes no report.
+
+#### Scenario: An uploaded profile environment misdescribes its receipt
+- **WHEN** a partition's uploaded profile environment is missing or does not digest to its receipt's profile-environment digest
+- **THEN** the merge fails before comparing receipts and writes no report.
 
 ### Requirement: Evidence-neutral seeded dependency cache
 

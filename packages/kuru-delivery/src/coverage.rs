@@ -348,6 +348,15 @@ const RUNNER_LEDGER_FILE: &str = "runner-ledger.jsonl";
 const JOB_LEDGER_FILE: &str = "job-ledger.json";
 const LCOV_FILE: &str = "coverage.lcov";
 const LINES_FILE: &str = "coverage-lines.json";
+/// The digested profile environment, whose digest is the receipt's
+/// `profile_env_sha256`.
+const PROFILE_ENV_FILE: &str = "profile-env.json";
+
+/// The build and test environment a partition's receipt digests, by
+/// `env:<name>` or `show-env:<name>`, with host-specific tokens neutralised.
+/// Its values are Cargo and test settings and cargo-llvm-cov's coverage
+/// environment (paths, flags and crate names), never credentials.
+pub type ProfileEnv = BTreeMap<String, String>;
 
 /// Parse a schema-bearing JSON document, naming a schema-1 file explicitly.
 fn read_versioned<T: for<'de> Deserialize<'de>>(path: &Path, what: &str) -> Result<T> {
@@ -2274,7 +2283,8 @@ pub struct ReceiptOptions<'a> {
     pub run_attempt: &'a str,
     pub expected_source: &'a str,
     pub llvm_cov: Option<&'a Path>,
-    pub profile_env_sha256: &'a str,
+    /// Uploaded beside the receipt, which carries its digest.
+    pub profile_env: &'a ProfileEnv,
     pub output: &'a Path,
 }
 
@@ -2306,7 +2316,7 @@ fn write_evidence(options: &ReceiptOptions<'_>, observed: ReceiptIdentity) -> Re
         lcov,
         lines: lines_path,
         run_attempt,
-        profile_env_sha256,
+        profile_env,
         output,
         ..
     } = options;
@@ -2394,7 +2404,7 @@ fn write_evidence(options: &ReceiptOptions<'_>, observed: ReceiptIdentity) -> Re
         cargo_llvm_cov: observed.cargo_llvm_cov,
         instrumentation: mode.contract().to_owned(),
         target_os: observed.target_os,
-        profile_env_sha256: (*profile_env_sha256).to_owned(),
+        profile_env_sha256: digest_json(profile_env)?,
         inventory_sha256: digest_json(&inventory)?,
         plan_sha256: digest_json(&plan)?,
         tests_sha256: plan::tests_sha256(&plan)?,
@@ -2415,6 +2425,7 @@ fn write_evidence(options: &ReceiptOptions<'_>, observed: ReceiptIdentity) -> Re
     fs::create_dir(output).with_context(|| format!("create {}", output.display()))?;
     write_json(&output.join(INVENTORY_FILE), &inventory)?;
     write_json(&output.join(PLAN_FILE), &plan)?;
+    write_json(&output.join(PROFILE_ENV_FILE), profile_env)?;
     write_new(&output.join(RUNNER_LEDGER_FILE), &runner_ledger)?;
     write_new(&output.join(JOB_LEDGER_FILE), &job_ledger_bytes)?;
     if let Some(bytes) = &lcov_bytes {
@@ -2764,7 +2775,7 @@ mod tests {
                 run_attempt: attempt,
                 expected_source: "HEAD",
                 llvm_cov: None,
-                profile_env_sha256: "env",
+                profile_env: &ProfileEnv::new(),
                 output: &path.join("output"),
             })
             .await
@@ -4146,6 +4157,7 @@ mod tests {
                 INVENTORY_FILE,
                 JOB_LEDGER_FILE,
                 PLAN_FILE,
+                PROFILE_ENV_FILE,
                 RECEIPT_FILE,
                 RUNNER_LEDGER_FILE,
             ];
@@ -4154,6 +4166,13 @@ mod tests {
             }
             exact_entries(&attempt, &expected).unwrap();
             let receipt: Receipt = read_versioned(&attempt.join(RECEIPT_FILE), "receipt").unwrap();
+            let profile_env: ProfileEnv =
+                serde_json::from_slice(&fs::read(attempt.join(PROFILE_ENV_FILE)).unwrap()).unwrap();
+            assert_eq!(profile_env, fixture::profile_env());
+            assert_eq!(
+                receipt.profile_env_sha256,
+                digest_json(&profile_env).unwrap()
+            );
             assert_eq!(receipt.partition, partition);
             assert_eq!(receipt.run_attempt, "2");
             assert_eq!(receipt.mode, mode);
@@ -4212,7 +4231,7 @@ mod tests {
             run_attempt: "1",
             expected_source: fixture::SOURCE,
             llvm_cov: None,
-            profile_env_sha256: "env",
+            profile_env: Box::leak(Box::new(ProfileEnv::new())),
             output: Box::leak(temp.join("out").into_boxed_path()),
         };
         let error = write_evidence(
