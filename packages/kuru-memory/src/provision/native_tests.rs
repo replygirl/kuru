@@ -1270,6 +1270,16 @@ async fn cancelled_activation_recovery_receipts_a_held_stage_before_releasing_th
     let abort_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<tokio::task::AbortHandle>));
     let observer_abort_slot = abort_slot.clone();
     let task_destination = destination.clone();
+    // As in `cancelling_checked_activation_recovery_drops_stage_before_cache_lock`,
+    // the native move and reconciliation are synchronous and have no product
+    // time bound, and recovery's only await point is its retry-spacing wait,
+    // taken only while the tokio clock is inside the recovery window. Keep the
+    // real lock acquisition above, then isolate this cancellation from runner
+    // wall-clock load: a slow first move cannot close the window before the
+    // cancellation reaches that wait. The held stage's bounded teardown on drop
+    // keeps its own wall-clock bound (`std::time::Instant` in `files.rs`),
+    // which pausing tokio time does not touch.
+    tokio::time::pause();
     let task = tokio::spawn(async move {
         let mut held = Some(held);
         activate_staged_observed(
@@ -1293,6 +1303,7 @@ async fn cancelled_activation_recovery_receipts_a_held_stage_before_releasing_th
     });
     *abort_slot.lock().unwrap() = Some(task.abort_handle());
     assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::resume();
     drop(observer);
     assert!(!destination.exists());
     let observed = std::mem::take(&mut *observed.lock().unwrap());
