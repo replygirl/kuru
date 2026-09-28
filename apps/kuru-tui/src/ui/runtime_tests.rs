@@ -781,12 +781,13 @@ impl Backend for FailingBackend {
 }
 
 async fn persistent_store() -> (
-    tempfile::TempDir,
+    kuru_memory::test_support::TempDir,
     tempfile::TempDir,
     kuru_memory::OpenOptions,
     MemoryStore,
 ) {
-    let root = tempfile::tempdir().unwrap();
+    // A guarded root: its teardown fails the test if a Dolt it hosted is still live.
+    let root = kuru_memory::test_support::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let options = open_options(
         root.path().join("data"),
@@ -957,7 +958,7 @@ async fn notice_text_never_reaches_the_provider_request_for_a_real_tui_turn() {
     let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
     let provider = CapturingProvider::new();
     let (project, harness, models) =
-        harness_with_provider_in(project, store, provider.clone()).await;
+        harness_with_provider_in(project, store.clone(), provider.clone()).await;
     let (input_tx, input_rx) = mpsc::channel(8);
     let input = Box::pin(stream::unfold(input_rx, |mut input_rx| async move {
         input_rx.recv().await.map(|event| (Ok(event), input_rx))
@@ -1012,6 +1013,8 @@ async fn notice_text_never_reaches_the_provider_request_for_a_real_tui_turn() {
         .expect("TUI loop task panicked")
         .unwrap_err();
     assert!(format!("{error:#}").contains("terminal input closed"));
+    // The loop released its harness; reap this store's Dolt before its root drops.
+    store.close().await.unwrap();
     drop(project);
     drop(data_root);
 }
