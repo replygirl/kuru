@@ -389,8 +389,10 @@ so this service boundary does not make simultaneous conversation tests valid.
 
 Dolt panics at close when its data directory disappears before it exits, so a
 fixture root from `kuru_memory::test_support::tempdir()` requires, when it
-drops, a quiescence record for every memory store beneath it (a directory
-holding a lifecycle lease file, or the store a service owner lock names). It
+drops, a quiescence record for every memory store beneath it: a directory
+holding the Unix `lifecycle.lock`, a directory holding `identity.json` whose
+Windows lease `lifecycles/<identity>.lock` exists, or the store a service owner
+lock names. A template or an unopened copy has no lease and is not a store. It
 never probes a lock: on Unix a lock released in-process can stay held by a
 sibling thread's child between `posix_spawn` and `exec`, so a lock's state
 cannot tell a live owner from a released one. The records are process-local
@@ -407,9 +409,12 @@ and written only on evidence this process observed itself:
   same for one store whose engine ran in another process, such as a spawned
   `kuru` executable.
 
-A record snapshots the engine-written `server.log` and `endpoint.json`; an
-engine that starts later in any process changes them and makes the record
-stale. A store that is unreaped, unrecorded or stale keeps the whole root and,
+A record is keyed by the store directory's native identity and birth time, so
+it follows a rename but not a recycled Linux inode, and snapshots the
+engine-written `server.log` and `endpoint.json`; an engine that starts later in
+any process changes them and makes the record stale. The ledger and the
+teardown scan run in one critical section, so the scan's instrumented counters
+are never updated concurrently. A store that is unreaped, unrecorded or stale keeps the whole root and,
 outside an existing failure, fails the test, naming the root, the test and
 each store. A test that is already panicking only keeps the root.
 
