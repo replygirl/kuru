@@ -30,7 +30,7 @@ async fn gated_verify_version(binary: &Path, private_home: &Path) -> Result<()> 
 /// What was true at the instant a retained install stage was reported.
 #[derive(Debug)]
 pub(super) struct RetainedStageObservation {
-    pub published: Option<bool>,
+    pub published: bool,
     pub stage: PathBuf,
     /// A fresh handle could not take the installation lock.
     pub lock_held: bool,
@@ -38,100 +38,59 @@ pub(super) struct RetainedStageObservation {
     pub receipted: bool,
 }
 
-#[derive(Default)]
-struct RetainedStageFields {
-    message: String,
-    stage: String,
-    published: Option<bool>,
-}
-
-impl tracing::field::Visit for RetainedStageFields {
-    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        if field.name() == "published" {
-            self.published = Some(value);
-        }
-    }
-
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        match field.name() {
-            "message" => self.message = format!("{value:?}"),
-            "stage" => self.stage = format!("{value:?}"),
-            _ => {}
-        }
-    }
-}
-
-/// Observes each retained-stage diagnostic synchronously, at the moment it is
-/// emitted, so a test can prove what the installation still held then.
-struct RetainedStageCapture {
-    lock_path: PathBuf,
-    observed: std::sync::Arc<std::sync::Mutex<Vec<RetainedStageObservation>>>,
-}
-
-impl tracing::Subscriber for RetainedStageCapture {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata.target() == "kuru.memory"
-    }
-
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        let mut fields = RetainedStageFields::default();
-        event.record(&mut fields);
-        if !fields.message.starts_with("retained private install stage") {
-            return;
-        }
-        let stage = PathBuf::from(fields.stage);
-        let receipted = match (stage.parent(), stage.file_name()) {
+/// Observe, through the lease's own test seam, every retained-stage report for
+/// a stage under `scope`, together with the installation lock and receipt
+/// state at the instant it is reported. The seam is path-scoped and runs on
+/// whichever thread resolves the lease, so neither a concurrent test nor the
+/// resolving thread can hide a report; see [`observe_retained_stages`].
+pub(super) fn observe_retained_stage_reports(
+    scope: &Path,
+    lock_path: &Path,
+) -> (
+    RetainedStageObserver,
+    std::sync::Arc<std::sync::Mutex<Vec<RetainedStageObservation>>>,
+) {
+    let observed = std::sync::Arc::<std::sync::Mutex<Vec<_>>>::default();
+    let sink = std::sync::Arc::clone(&observed);
+    let lock_path = lock_path.to_owned();
+    let guard = observe_retained_stages(scope, move |report| {
+        let receipted = match (report.stage.parent(), report.stage.file_name()) {
             (Some(versions), Some(name)) => versions
                 .join(LEFTOVER_STAGE_RECEIPTS)
                 .join(format!("{}.json", name.to_string_lossy()))
                 .is_file(),
             _ => false,
         };
-        let contender = open_regular(&self.lock_path).unwrap();
+        let contender = open_regular(&lock_path).unwrap();
         let lock_held = match contender.try_lock() {
             Ok(()) => false,
             Err(TryLockError::WouldBlock) => true,
             Err(error) => panic!("inspect the installation lock: {error}"),
         };
         drop(contender);
-        self.observed
-            .lock()
-            .unwrap()
-            .push(RetainedStageObservation {
-                published: fields.published,
-                stage,
-                lock_held,
-                receipted,
-            });
-    }
-
-    fn enter(&self, _: &tracing::span::Id) {}
-
-    fn exit(&self, _: &tracing::span::Id) {}
-}
-
-/// Capture, on this thread only, every retained-stage report together with the
-/// installation lock and receipt state at the instant it is emitted.
-pub(super) fn capture_retained_stages(
-    lock_path: &Path,
-) -> (
-    tracing::subscriber::DefaultGuard,
-    std::sync::Arc<std::sync::Mutex<Vec<RetainedStageObservation>>>,
-) {
-    let observed = std::sync::Arc::default();
-    let guard = tracing::subscriber::set_default(RetainedStageCapture {
-        lock_path: lock_path.to_owned(),
-        observed: std::sync::Arc::clone(&observed),
+        sink.lock().unwrap().push(RetainedStageObservation {
+            published: report.published,
+            stage: report.stage.clone(),
+            lock_held,
+            receipted,
+        });
     });
     (guard, observed)
+}
+
+/// The `.json` receipts in a `.leftovers` directory. `files::write` keeps its
+/// own `staging` directory beside them, which is not a receipt; the product's
+/// sweep skips it the same way.
+#[cfg(windows)]
+fn leftover_stage_receipts(receipts: &Path) -> Vec<PathBuf> {
+    fs::read_dir(receipts)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect()
 }
 
 /// Bound both the removal retry below and the post-removal absence wait: the
@@ -1151,7 +1110,7 @@ async fn cancelled_activation_recovery_receipts_a_held_stage_before_releasing_th
     let held = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
     let destination = cache.join("active");
     let lock_path = cache.join(".install.lock");
-    let (capture, observed) = capture_retained_stages(&lock_path);
+    let (observer, observed) = observe_retained_stage_reports(&cache, &lock_path);
     let abort_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<tokio::task::AbortHandle>));
     let observer_abort_slot = abort_slot.clone();
     let task_destination = destination.clone();
@@ -1178,24 +1137,29 @@ async fn cancelled_activation_recovery_receipts_a_held_stage_before_releasing_th
     });
     *abort_slot.lock().unwrap() = Some(task.abort_handle());
     assert!(task.await.unwrap_err().is_cancelled());
-    drop(capture);
+    drop(observer);
     assert!(!destination.exists());
     let observed = std::mem::take(&mut *observed.lock().unwrap());
     assert_eq!(observed.len(), 1, "one retention report: {observed:?}");
     assert_eq!(observed[0].stage, stage_container);
-    assert_eq!(observed[0].published, Some(false));
+    assert!(!observed[0].published, "{observed:?}");
     assert!(
         observed[0].receipted && observed[0].lock_held,
         "the held stage is receipted and reported before the cache lock is released: {observed:?}"
     );
-    let receipts: Vec<PathBuf> = fs::read_dir(cache.join(LEFTOVER_STAGE_RECEIPTS))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect();
-    assert_eq!(receipts.len(), 1);
+    let receipts = leftover_stage_receipts(&cache.join(LEFTOVER_STAGE_RECEIPTS));
+    assert_eq!(receipts.len(), 1, "exactly one retained stage is receipted");
     let receipt: serde_json::Value =
         serde_json::from_slice(&fs::read(&receipts[0]).unwrap()).unwrap();
     assert_eq!(receipt["published"], false);
+    assert_eq!(
+        receipt["stage"],
+        stage_container
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
     let cause = receipt["first_cause"].as_str().unwrap();
     assert!(
         cause.contains("exhausted its bounded recovery"),

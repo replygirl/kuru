@@ -352,6 +352,82 @@ fn emit_retained_stage_diagnostic(report: &StageCleanupReport) {
     );
 }
 
+/// A test observer of retained-stage reports, called synchronously as each
+/// report is emitted and so before the lease releases the installation lock.
+#[cfg(test)]
+type RetainedStageObserverFn = std::sync::Arc<dyn Fn(&StageCleanupReport) + Send + Sync>;
+
+#[cfg(test)]
+struct RetainedStageObserverEntry {
+    id: u64,
+    scope: PathBuf,
+    observer: RetainedStageObserverFn,
+}
+
+#[cfg(test)]
+static RETAINED_STAGE_OBSERVERS: std::sync::Mutex<Vec<RetainedStageObserverEntry>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Test support: observe every retained-stage report for a stage under
+/// `scope` until the returned guard drops.
+///
+/// The registry is process-wide and scoped by path, not by thread: a report
+/// is observed on whichever thread resolves the lease (a cancelled task's
+/// drop, a blocking worker or the caller), and a concurrent test that emits
+/// the same diagnostic cannot suppress it. A thread-scoped tracing subscriber
+/// can: tracing caches callsite interest process-wide, and while one scoped
+/// subscriber is the only live dispatcher a callsite first reached on another
+/// thread is cached as never enabled (CI run 36424722859).
+#[cfg(test)]
+pub(crate) fn observe_retained_stages(
+    scope: &Path,
+    observer: impl Fn(&StageCleanupReport) + Send + Sync + 'static,
+) -> RetainedStageObserver {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RETAINED_STAGE_OBSERVERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(RetainedStageObserverEntry {
+            id,
+            scope: scope.to_owned(),
+            observer: std::sync::Arc::new(observer),
+        });
+    RetainedStageObserver { id }
+}
+
+/// Unregisters its observer when dropped.
+#[cfg(test)]
+pub(crate) struct RetainedStageObserver {
+    id: u64,
+}
+
+#[cfg(test)]
+impl Drop for RetainedStageObserver {
+    fn drop(&mut self) {
+        RETAINED_STAGE_OBSERVERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|entry| entry.id != self.id);
+    }
+}
+
+#[cfg(test)]
+fn observe_retained_stage(report: &StageCleanupReport) {
+    // Run the observers outside the registry lock: they inspect the
+    // filesystem and the installation lock.
+    let observers: Vec<RetainedStageObserverFn> = RETAINED_STAGE_OBSERVERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|entry| report.stage.starts_with(&entry.scope))
+        .map(|entry| std::sync::Arc::clone(&entry.observer))
+        .collect();
+    for observer in observers {
+        observer(report);
+    }
+}
+
 /// Report a sweep that left at least `LEFTOVER_STAGE_CAP` stages behind.
 ///
 /// Reporting only: the cap never decides what to delete. Below it the sweep
@@ -885,6 +961,8 @@ impl StageLease {
             let versions = failure.stage.parent().unwrap_or(Path::new("")).to_owned();
             let report = record_retained_stage(&versions, self.asset, failure, published);
             emit_retained_stage_diagnostic(&report);
+            #[cfg(test)]
+            observe_retained_stage(&report);
             Some(report)
         });
         // Only now, with its stage gone or receipted and reported, may another

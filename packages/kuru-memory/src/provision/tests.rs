@@ -1762,8 +1762,10 @@ async fn failed_extraction_receipts_a_refused_stage_before_releasing_the_lock() 
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("cache");
     private_directory(&cache).unwrap();
-    let (capture, observed) =
-        super::native_tests::capture_retained_stages(&cache.join(".install.lock"));
+    let (observer, observed) = super::native_tests::observe_retained_stage_reports(
+        &cache.canonicalize().unwrap(),
+        &cache.join(".install.lock"),
+    );
     let (staged, received) = tokio::sync::oneshot::channel();
     let error = provision_with_extractor(
         &MemoryConfig::default(),
@@ -1778,7 +1780,7 @@ async fn failed_extraction_receipts_a_refused_stage_before_releasing_the_lock() 
     )
     .await
     .unwrap_err();
-    drop(capture);
+    drop(observer);
     let candidate = received.await.unwrap();
     let stage = candidate.parent().unwrap().parent().unwrap().to_owned();
     let detail = format!("{error:#}");
@@ -1796,7 +1798,7 @@ async fn failed_extraction_receipts_a_refused_stage_before_releasing_the_lock() 
     let observed = std::mem::take(&mut *observed.lock().unwrap());
     assert_eq!(observed.len(), 1, "one retention report: {observed:?}");
     assert_eq!(observed[0].stage, stage);
-    assert_eq!(observed[0].published, Some(false));
+    assert!(!observed[0].published, "{observed:?}");
     assert!(
         observed[0].receipted && observed[0].lock_held,
         "the retention is receipted and reported while the lock is held: {observed:?}"
@@ -1872,8 +1874,10 @@ async fn published_stage_retention_is_receipted_before_the_lock_is_released() {
         offline: true,
         ..Default::default()
     };
-    let (capture, observed) =
-        super::native_tests::capture_retained_stages(&cache.join(".install.lock"));
+    let (observer, observed) = super::native_tests::observe_retained_stage_reports(
+        &cache.canonicalize().unwrap(),
+        &cache.join(".install.lock"),
+    );
     let binary = {
         let _forced = crate::files::ForcedStageCleanupFailure::new();
         provision_managed(
@@ -1885,11 +1889,11 @@ async fn published_stage_retention_is_receipted_before_the_lock_is_released() {
         .await
         .expect("a published engine must not fail its open because a stage stayed behind")
     };
-    drop(capture);
+    drop(observer);
     assert_eq!(fs::read(&binary).unwrap(), SCRIPT);
     let observed = std::mem::take(&mut *observed.lock().unwrap());
     assert_eq!(observed.len(), 1, "one retention report: {observed:?}");
-    assert_eq!(observed[0].published, Some(true));
+    assert!(observed[0].published, "{observed:?}");
     assert!(
         observed[0].receipted && observed[0].lock_held,
         "the published stage is receipted and reported while the lock is held: {observed:?}"
