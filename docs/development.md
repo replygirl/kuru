@@ -410,8 +410,9 @@ and written only on evidence this process observed itself:
   `kuru` executable.
 
 A record is keyed by the store directory's native identity and birth time, so
-it follows a rename but not a recycled Linux inode, and snapshots the
-engine-written `server.log` and `endpoint.json`; an engine that starts later in
+it follows a rename, and releasing a root forgets the records beneath it, so a
+directory that recycles a removed store's Linux inode does not inherit its
+record. A record snapshots the engine-written `server.log` and `endpoint.json`; an engine that starts later in
 any process changes them and makes the record stale. The ledger and the
 teardown scan run in one critical section, so the scan's instrumented counters
 are never updated concurrently. A store that is unreaped, unrecorded or stale keeps the whole root and,
