@@ -245,13 +245,14 @@ published and verified, Kuru keeps that stage with a receipt and collects it on 
 later open; leftover stages are counted, and a sweep that leaves at least a small
 cap of them behind is reported to diagnostics. An installation that stops before
 publishing, after an error or a cancelled open, is handled the same way: a stage
-it cannot remove is receipted as unpublished, reported to diagnostics and named in
-the returned error. Kuru records a retained stage before it releases the
-installation lock, so another installer never finds an unrecorded one. A failed
-activation instead keeps its stage deliberately as evidence and names it in the
-error. No stage whose removal is still uncertain is deleted. If even the receipt
-cannot be written, the startup notice and diagnostics say so: that stage is never
-collected automatically and has to be removed by hand.
+it cannot remove is receipted as unpublished and reported to diagnostics, and
+when the open returns an error, that error names the stage. Kuru records a
+retained stage before it releases the installation lock, so another installer
+never finds an unrecorded one. A failed activation instead keeps its stage
+deliberately as evidence and names it in the error. No stage whose removal is
+still uncertain is deleted. If even the receipt cannot be written, diagnostics
+say so, as does the startup notice when the engine was published: that stage is
+never collected automatically and has to be removed by hand.
 
 ## Backup and recovery
 
