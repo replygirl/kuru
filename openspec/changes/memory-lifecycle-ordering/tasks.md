@@ -9,7 +9,7 @@
 ## 2. H1: release sessions before a candidate ref is deleted or renamed
 
 - [x] 2.1 Make candidate retirement end at server-observed session end (processlist absence on `kuru/<branch>`), bounded by the existing `QUERY_TIMEOUT` retirement deadline and tagged `PoolRetirement`. Place it per design D1, and use it before every delete, rename and exclusion probe. Verify tasks 1.1 turn green and the canary passes unmodified (verification 1.1, 1.2, 1.4). Landed in 34a1a9b4 as `retire_branch_sessions`, used by both the rename and delete paths.
-- [x] 2.2 Add the never-ending-session test with a test-supplied deadline. Verify the `PoolRetirement` failure, that no ref changed, that no `--force` was used and that the fence trips (verification 1.3). Landed in 34a1a9b4.
+- [x] 2.2 Add the never-ending-session test with a test-supplied deadline. Verify the `PoolRetirement` failure, that no ref changed, that no `--force` was used and that the fence trips (verification 1.3). Landed in 34a1a9b4 for the store-level step; the managed-client fence leg is not exercised end to end and stays open under task 7.3 and verification 1.3.
 - [x] 2.3 Extend `candidate_branch_rename_reason` to label the exact in-use message at `Cleanup`. Verify only the diagnostic record changes (verification 1.5). Landed in 34a1a9b4 (`operational_gc_tests.rs`).
 
 ## 3. H2: never release a directory before its Dolt is reaped
@@ -42,6 +42,6 @@ Not part of this change. The draft teardown was never type-checked or run on Win
 ## 7. Round 3 hardening (review M2 residual rejected)
 
 - [x] 7.1 Replace the fixture guard's non-waiting flock probe with process-local quiescence records (`test_support/engine_ledger.rs`): in-process supervisors stay live until this process reaps them and that reap records the store; `await_store_quiescence` records while it holds the lifecycle lease; `await_managed_quiescence` uses it for the project store and its staging siblings. Add the deterministic tests for an unrecorded store, a duplicated lease descriptor after awaited quiescence, a panicking test, an unreaped owner and a stale record (verification 2.5).
-- [x] 7.2 Move memory data roots under plain `tempfile` directories in consumer test code to the guarded root (review N9): kuru-runtime `accounting_tests::abandoned_dream_keeps_usage_after_reopen_without_advancing_main` and `review_tests` (failed MCP fixture), the kuru-tui integration `ServiceCleanup` roots (14 call sites) and the packaged `embedded_runtime` acceptance root.
+- [x] 7.2 Move memory data roots under plain `tempfile` directories in consumer test code to the guarded root (review N9): kuru-runtime `accounting_tests::abandoned_dream_keeps_usage_after_reopen_without_advancing_main` and `review_tests` (failed MCP fixture), the kuru-tui integration `ServiceCleanup` roots (14 call sites) and the packaged `embedded_runtime` acceptance root (acceptance passed locally).
 - [ ] 7.3 Exercise the managed-client fence for the session-wait timeout end to end (verification 1.3). Not possible without a product change; see verification 1.3.
 - [x] 7.4 Restate design D5, verification 2.5 and `docs/development.md` for the record-based invariant.

@@ -383,10 +383,9 @@ pub(crate) async fn await_store_quiescence_observed(
     lifecycle_root: Option<&Path>,
     while_held: impl FnOnce(&crate::server::LifecycleLease),
 ) -> Result<()> {
-    // Keeps this lib's own non-waiting lease probes (open_error_reap_tests,
-    // server_tests) from observing this acquisition; see `crate::spawn_gate`.
-    #[cfg(test)]
-    let _gate = crate::spawn_gate::locking_async().await;
+    // A waiting acquisition, not a probe: a descriptor a sibling's child
+    // inherited only delays it, and the fixture guard reads the record, not
+    // this lock. It takes no spawn gate, so callers may hold `spawning()`.
     let lease = crate::server::Server::quiescence_at(
         directory,
         lifecycle_root,
