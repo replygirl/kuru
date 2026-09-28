@@ -233,3 +233,38 @@ Newly named errors. The three failed `--test-threads=2` iterations ran while thi
 None is addressed here, and each needs its own diagnosis. Before this round the run-11 error would have been replaced by the guard's panic (its owner was live), as in CI. The run-10 and run-16 errors arise after the old owner was reaped and before a successor serves, so they were already reported as themselves.
 
 Not run: Linux and coverage-instrumented reproductions; `cfg(windows)` code is unchanged by this round.
+
+## Round 7: the two round-6 residuals, fixture ordering (2026-09-28, same host)
+
+Diagnoses: `$S/flake/ci/pr125-residual/uncertain-write/diagnosis.md` and `$S/flake/ci/pr125-residual/successor-owner/diagnosis.md`. This round's evidence: `$S/flake/ci/pr125-residual/fix/` (`fix.md` indexes it). Both residuals are fixture ordering defects; test support and tests only, no product change.
+
+| residual | mechanism | fix |
+|---|---|---|
+| round 6 run 11: `managed_session_lifecycle_…` "memory service write outcome remains uncertain" | the test cancelled the paused client when a sibling could read the committed row and asserted one `reconcile() == Some(true)`; the owner answers the outcome query `InFlight` from its receipt registry until the original handler returns, and Dolt exposes the row before `DOLT_COMMIT` has replied to the owner, so the two events were unordered | the paused exchange reads and holds the reply frame and raises `ReplyPause::replied` / `ReplyBarrier::wait_replied`; single-reconcile tests await it before cancelling (design D7) |
+| round 6 runs 10 and 16: `candidate_begin_recovery_…`, `lost_candidate_transition_replies_…` "project already has a memory service owner" | a sibling test's child, between `posix_spawn`'s descriptor copy and its `exec`, held a duplicate of the just-released owner-lock description while the fixture made its one-shot successor `ServiceOwner::open` under only the shared spawn guard | `spawn_gate::excluding_spawns` / `ServedOwner::restart` hold the exclusive guard across the release and the one-shot open, and hand it down to the caller's shared guard atomically (design D8) |
+
+Sites changed (read one by one before changing):
+
+- Reply signal (13): `facade.rs` `managed_session_lifecycle_…` create, rename (after the stale sibling rename, which still races the held reply), remove, restore; `managed_fork_lost_reply_…`; `managed_mode_checkpoint_lost_reply_…`; `managed_public_turn_lost_reply_…` admission and settlement; the older-continuation step of the same test; `managed_legacy_continuation_lost_reply_…`; `lost_candidate_unit_reply_reattaches_…`. Two found by reading that were not in the diagnosis list and have the same shape: `store/migrations.rs` `released_v5_summary_identity_survives_v6_v7_upgrade_reopen_and_export` and kuru-runtime `hook_tests::lost_annotation_reply_reconciles_the_exact_session_without_replaying_effects` (the engine's own single reconcile after the dropped write).
+- Read and not of the shape: `usage_reply_recovery_…` and the three `recover_candidate_transition` tests (the pending receipt is set after a call that returned); `selected_abandon_lost_reply_…` (owner restarted before recovery); the `service.rs` lost-reply tests (`serve_one` is joined before the outcome query); `store/recovery_tests.rs` (no service owner); kuru-runtime `accounting_tests` (released and awaited, or the owner is retired before reconciling) and `dream.rs` (polls reconcile).
+- Exclusive restart (10, as listed): `service.rs` `lost_reply_receipt_survives_…`, `candidate_transition_query_preserves_…`, `lost_candidate_transition_replies_…`, `lost_candidate_begin_reply_…` (both reopens; the second spans the close, a local open/abandon/close and the final open), `rejected_publication_reaps_…` (spans the rejected open through the reopen); `facade.rs` `selected_abandon_lost_reply_…`, `lost_candidate_unit_reply_…` (spans the existing permit loop, reap and open), `candidate_begin_recovery_…`; `store.rs` `service_disconnect_and_owner_restart_…` (spans the teardown retirement, the local open/close and the successor open). Every listed site had the shape.
+
+Local (macOS arm64, 14 cores; 1-minute load averages from `uptime` before and after each run):
+
+| check | result |
+|---|---|
+| A red: `managed_session_lifecycle_…`, owner's "remove session" handler held 1500 ms after commit, at 32c63435 (`a-red-before.log`, load 10.3 -> 9.8) | FAIL `memory service write outcome remains uncertain` |
+| A green: same injection, fixed tree (`a-green-after.log`, 5.2 -> 4.7); every lifecycle handler held (`a-green-after-all-labels.log`, 4.7); fork test with every handler held (`a-green-after-fork.log`, 4.0 -> 4.3) | pass, pass, pass |
+| B red: both failing tests, a child given a duplicate of the permit's owner-lock description for 500 ms when the shared gate is obtainable, at 32c63435 (`b-red-before.log`, 9.8 -> 9.4) | both FAIL `project already has a memory service owner; wait for its validated endpoint` |
+| B green: same injection, fixed tree (`b-green-after.log`, 4.7 -> 4.4) | both pass; "sibling spawn excluded by the exclusive spawn gate" at each restart |
+| affected tests (16 kuru-memory tests plus the runtime hook test), 20 iterations, `--test-threads=2`, first handover (`loop-t2-shared-reacquire/`) | 20/20 clean; load 6.6-20.8 |
+| same, `--test-threads=8`, first handover (`loop-t8-shared-reacquire/`, stopped after 11) | 4/11 clean: iterations 3-9 each failed `selected_abandon_lost_reply_…` with `memory service exited before readiness: exit status: 101`; load 17.6-115.3 |
+| that failure, reproduced: a 31 s hold after the restart (`c-idle-confirm.log`, 31.6 -> 26.8) | the same error: the served successor idled out (30 s) before recovery attached, and the election spawned the test binary. Cause: the first `excluding_spawns` waited for a fresh shared guard behind other fixtures' queued restarts |
+| downgrade: `spawn_gate::tests::a_restart_returns_its_shared_guard_without_waiting_behind_a_queued_writer` (`d-downgrade-red-before.log`, `d-downgrade-green-after.log`) | FAIL (5 s timeout) with the release-then-reacquire handover; pass with `RwLockWriteGuard::downgrade` |
+| affected tests, 20 iterations, `--test-threads=8`, final head (`loop-t8/`) | 20/20 clean; load 5.8-28.5 (the failing window's 53-115 did not recur, so the unit test above is the deterministic proof) |
+| same, `--test-threads=2`, final head (`loop-t2/`) | 20/20 clean; load 2.8-9.3 |
+| `//packages/kuru-memory:test` (`final-checks/`, load 3.5 -> 4.0) | 345 pass / 0 fail / 3 ignored (lib 317); 0 guard panics, 0 body-failure lines |
+| `//packages/kuru-runtime:test` (load 4.0 -> 3.2) | 220/0 |
+| `format:check`, `lint`, `typecheck`, `lint:tooling`, `docs:check`, `cospec -- validate memory-lifecycle-ordering --strict` | all exit 0 |
+
+All injections were removed before commit (`git diff` against the saved fix diff was byte-identical; no `SCRATCH` line in the tree). No new failure signature appeared in the final loops. Not run: Linux, Windows and coverage-instrumented builds; CI.
