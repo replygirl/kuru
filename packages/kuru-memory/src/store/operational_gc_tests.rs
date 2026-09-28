@@ -588,7 +588,9 @@ async fn candidate_pool_retirement_observes_exact_server_sessions_before_rename(
         assert_eq!(ids.len(), 4);
         drop(connections);
 
-        store.shared.server.retire_pool(&names.open).await?;
+        // The product's own retirement step before every candidate rename and
+        // delete; its session wait makes the count below a guarantee.
+        retire_branch_sessions(&store, &names.open, QUERY_TIMEOUT).await?;
         let mut active_after_close = 0;
         for id in ids {
             let active: i64 = sqlx::query_scalar(
