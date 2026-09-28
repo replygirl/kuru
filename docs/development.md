@@ -417,7 +417,8 @@ judges, captures the body's `Result` while the root lives, and passes it to
 the owner's reap, with the bounds of the fixture's success path) as the
 teardown. An early `?`, `bail!` or `ensure!` then still retires the owner before
 the root drops. `settle` writes a body error to the test's captured output
-before the teardown starts and returns it in preference to a teardown failure.
+before the teardown starts and returns it as the root cause, with any teardown
+failure attached as context.
 When the teardown cannot retire the owner, for example because an aborted
 request still holds a client attachment, the guard still fails the test and its
 panic replaces the returned error; the printed body error remains.
