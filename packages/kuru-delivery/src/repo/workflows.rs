@@ -6,7 +6,7 @@
 //! - mise: Windows exe shims run `mise x`, and `mise run` prepares a task's
 //!   tools; each installs every missing configured tool unless its automatic
 //!   installation is off for the whole workflow. Each job names the tools it
-//!   installs. [`EXEMPTIONS`] names the jobs that still do not.
+//!   installs.
 //! - apt: `apt-get update` refreshes every configured list, including the
 //!   runner image's third-party repositories, so each apt fetch names its
 //!   source list and reads no parts directory.
@@ -20,8 +20,7 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
 use anyhow::{Context, Result};
-use serde_yaml_ng::{Mapping, Value};
-use sha2::{Digest, Sha256};
+use serde_yaml_ng::Value;
 
 /// mise 2026.9.4 `settings.toml`: `exec_auto_install` (`mise x`, which
 /// Windows shims run) and `task.run_auto_install` (`mise run`), both on by
@@ -109,37 +108,6 @@ const MISE_VALUE_LONG: [&str; 11] = [
 /// installs the versioned tools (`docs/cli/*.md` at v2026.9.4).
 const MISE_INSTALLS: [(&str, &str); 3] = [("install", "i"), ("upgrade", "up"), ("bootstrap", "bs")];
 
-/// Jobs that may still leave one automatic installation on, exempted by name
-/// as reviewed. The exempted workflow does not set the variable at workflow
-/// level, so every other job that uses mise sets it to "false".
-struct Exemption {
-    workflow: &'static str,
-    variable: &'static str,
-    /// Each job and the SHA-256 of its [`reviewed`] text: the whole parsed
-    /// job with the workflow `env` and `defaults` it inherits. Any change to
-    /// them, such as another mise-action input, env entry, `shell`,
-    /// `working-directory`, `if` or step, fails the check until someone
-    /// reviews the changed job and records its new digest here.
-    jobs: &'static [(&'static str, &'static str)],
-    reason: &'static str,
-}
-
-const EXEMPTIONS: [Exemption; 1] = [Exemption {
-    workflow: ".github/workflows/release.yml",
-    variable: TASK_AUTO_INSTALL,
-    jobs: &[
-        (
-            "notes",
-            "00e5f2b74cdf5e2362c2c9a41d16f3e3d6ef3538f59502563311da4098270f7c",
-        ),
-        (
-            "build-docs",
-            "0c2d21f040bfd0a778d30ef7ef48865716dcd87e00cc3c7a3e2d5356b9f50766",
-        ),
-    ],
-    reason: "these release jobs still install every missing configured tool through `mise run`, and notes' setup task runs a bare `mise install --include-task-tools`; follow-up release-notes-docs-tool-scope scopes their tool installation, a release workflow change for the maintainer to decide",
-}];
-
 pub(super) fn check(root: &Path, errors: &mut BTreeSet<String>) -> Result<()> {
     let directory = root.join(".github/workflows");
     if !directory.is_dir() {
@@ -183,24 +151,6 @@ fn names(value: Option<&Value>, key: &str) -> bool {
 
 fn basename(word: &str) -> &str {
     word.rsplit(['/', '\\']).next().unwrap_or(word)
-}
-
-/// A job as an exemption pins it: the canonical YAML of the parsed job
-/// beside the workflow `env` and `defaults` it inherits. Comments and
-/// formatting are not part of it; every value, key and key order is.
-fn reviewed(workflow: &Value, job: &Value) -> String {
-    let mut pinned = Mapping::new();
-    for key in ["env", "defaults"] {
-        pinned.insert(key.into(), workflow.get(key).cloned().unwrap_or_default());
-    }
-    pinned.insert("job".into(), job.clone());
-    // An unserializable job yields an empty text, whose digest matches no
-    // reviewed job.
-    let text = serde_yaml_ng::to_string(&Value::Mapping(pinned)).unwrap_or_default();
-    Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 /// What one job's steps do, read before any rule applies.
@@ -257,71 +207,21 @@ fn rules(name: &str, workflow: &Value, errors: &mut BTreeSet<String>) {
         ));
     }
     for variable in AUTO_INSTALL {
-        match EXEMPTIONS
-            .iter()
-            .find(|exemption| exemption.workflow == name && exemption.variable == variable)
-        {
-            None => {
-                for (id, job, _) in &jobs {
-                    if names(job.get("env"), variable) {
-                        errors.insert(format!(
-                            "{name}: job {id} overrides {variable}; set it only in the workflow-level env"
-                        ));
-                    }
-                }
-                if uses_mise && !is(workflow_env.and_then(|env| env.get(variable)), false) {
-                    errors.insert(format!(
-                        "{name}: uses mise, so its workflow-level env must set {variable}: \"false\""
-                    ));
-                }
+        for (id, job, _) in &jobs {
+            if names(job.get("env"), variable) {
+                errors.insert(format!(
+                    "{name}: job {id} overrides {variable}; set it only in the workflow-level env"
+                ));
             }
-            Some(exemption) => exempted(name, workflow, &jobs, exemption, errors),
+        }
+        if uses_mise && !is(workflow_env.and_then(|env| env.get(variable)), false) {
+            errors.insert(format!(
+                "{name}: uses mise, so its workflow-level env must set {variable}: \"false\""
+            ));
         }
     }
     for (id, job, facts) in &jobs {
         job_rules(name, id, job, facts, workflow_env, errors);
-    }
-}
-
-/// An exempted workflow: the named jobs stay exactly as reviewed and every
-/// other job that uses mise opts out itself.
-fn exempted(
-    name: &str,
-    workflow: &Value,
-    jobs: &[(&str, &Value, Job)],
-    exemption: &Exemption,
-    errors: &mut BTreeSet<String>,
-) {
-    let variable = exemption.variable;
-    let reason = exemption.reason;
-    let exempt: Vec<&str> = exemption.jobs.iter().map(|(id, _)| *id).collect();
-    if names(workflow.get("env"), variable) {
-        errors.insert(format!(
-            "{name}: sets {variable} at workflow level, so the exemption for jobs {} is stale; remove it ({reason})",
-            exempt.join(", ")
-        ));
-        return;
-    }
-    for (id, digest) in exemption.jobs {
-        let actual = jobs.iter().find(|(job_id, _, _)| job_id == id).map_or_else(
-            || "missing".to_owned(),
-            |(_, job, _)| format!("SHA-256 {}", reviewed(workflow, job)),
-        );
-        if actual != format!("SHA-256 {digest}") {
-            errors.insert(format!(
-                "{name}: job {id} is exempted from {variable} only as reviewed (SHA-256 {digest} of the job with the workflow env and defaults it inherits), and it is now {actual}; re-review the exemption: scope the job's tool installation and remove the exemption, or review the whole changed job and record its new digest ({reason})"
-            ));
-        }
-    }
-    for (id, job, facts) in jobs {
-        if exempt.contains(id) || !facts.uses_mise {
-            continue;
-        }
-        if !is(job.get("env").and_then(|env| env.get(variable)), false) {
-            errors.insert(format!(
-                "{name}: job {id} uses mise and is not exempted, so its job env must set {variable}: \"false\" while the workflow level does not ({reason})"
-            ));
-        }
     }
 }
 

@@ -17,6 +17,7 @@ use kuru_delivery::{
 use kuru_platform::fs::make_executable;
 use serde_json::{Value, json};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -375,6 +376,414 @@ fn optional_published_windows_diagnostic_keeps_its_native_launcher() {
     );
     assert!(!task.contains("kuru-memory"));
     assert!(!task.contains("kuru-tui"));
+}
+
+/// A mise task as a release job reaches it on Linux: the config root that
+/// owns it, its resolved dependencies, its `run` commands and the tools it
+/// declares for itself.
+struct MiseTask {
+    root: String,
+    depends: Vec<String>,
+    run: Vec<String>,
+    tools: BTreeSet<String>,
+}
+
+/// A tool's identity in mise configuration, install arguments and task
+/// tool tables: its name without a version or backend options, so that
+/// `aqua:cocogitto/cocogitto@{{vars.kuru_cocogitto_version}}` names
+/// `tools."aqua:cocogitto/cocogitto"`.
+fn tool_identity(spec: &str) -> String {
+    spec.trim_matches(['"', '\''])
+        .split(['@', '['])
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+/// A task address as mise's monorepo resolves it from a config root: an
+/// unqualified name belongs to the same config, `//path:name` to that one.
+fn task_address(reference: &str, root: &str) -> String {
+    if reference.starts_with("//") {
+        reference.to_owned()
+    } else {
+        format!("//{root}:{reference}")
+    }
+}
+
+/// Every task of the root, app and package mise configurations, by address.
+fn mise_tasks(repository: &Path) -> BTreeMap<String, MiseTask> {
+    let mut roots = vec![String::new()];
+    for parent in ["apps", "packages"] {
+        let mut members: Vec<String> = fs::read_dir(repository.join(parent))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.join("mise.toml").is_file())
+            .map(|path| format!("{parent}/{}", path.file_name().unwrap().to_string_lossy()))
+            .collect();
+        members.sort();
+        roots.extend(members);
+    }
+    let mut tasks = BTreeMap::new();
+    for root in roots {
+        let manifest: toml::Value =
+            toml::from_str(&fs::read_to_string(repository.join(&root).join("mise.toml")).unwrap())
+                .unwrap();
+        let Some(table) = manifest.get("tasks").and_then(toml::Value::as_table) else {
+            continue;
+        };
+        for (name, task) in table {
+            let strings = |key: &str| -> Vec<String> {
+                match task.get(key) {
+                    None => Vec::new(),
+                    Some(toml::Value::String(one)) => vec![one.clone()],
+                    // A `{ task = "...", args = [...] }` entry runs that task.
+                    Some(toml::Value::Array(many)) => many
+                        .iter()
+                        .map(|item| match (item.as_str(), item.get("task")) {
+                            (Some(one), _) => one.to_owned(),
+                            (None, Some(toml::Value::String(task))) if key == "run" => {
+                                format!("mise run {task}")
+                            }
+                            (None, Some(toml::Value::String(task))) => task.clone(),
+                            _ => panic!("task //{root}:{name} has an unmodelled {key}: {item}"),
+                        })
+                        .collect(),
+                    Some(other) => panic!("task //{root}:{name} has an unmodelled {key}: {other}"),
+                }
+            };
+            let tools = task
+                .get("tools")
+                .and_then(toml::Value::as_table)
+                .map(|tools| tools.keys().map(|key| tool_identity(key)).collect())
+                .unwrap_or_default();
+            let depends = strings("depends")
+                .iter()
+                .map(|reference| task_address(reference, &root))
+                .collect();
+            tasks.insert(
+                task_address(name, &root),
+                MiseTask {
+                    root: root.clone(),
+                    depends,
+                    run: strings("run"),
+                    tools,
+                },
+            );
+        }
+    }
+    tasks
+}
+
+/// The words of each simple command in a script: continuation lines joined,
+/// split at newlines, `;`, `&&`, `||` and `|`, comments and quotes removed
+/// and leading assignments dropped. Nothing is expanded, so a command
+/// substitution or a template branch is refused rather than guessed at.
+fn script_commands(script: &str) -> Vec<Vec<String>> {
+    assert!(
+        !script.contains("$(") && !script.contains('`') && !script.contains("{%"),
+        "the tool derivation does not model command substitution or templates: {script}"
+    );
+    let mut commands = Vec::new();
+    for line in script.replace("\\\n", " ").lines() {
+        let line = line.replace("&&", "\n").replace("||", "\n");
+        for command in line.split(['\n', ';', '|']) {
+            let words: Vec<String> = command
+                .split_whitespace()
+                .take_while(|word| !word.starts_with('#'))
+                .map(|word| word.trim_matches(['"', '\'']).to_owned())
+                .skip_while(|word| {
+                    word.split_once('=').is_some_and(|(name, _)| {
+                        !name.is_empty()
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    })
+                })
+                .collect();
+            if !words.is_empty() {
+                commands.push(words);
+            }
+        }
+    }
+    commands
+}
+
+/// The configured tools each program a reached command runs needs on PATH.
+/// Programs the Ubuntu runner image provides need none. Any other program
+/// fails the derivation until someone classifies it here.
+fn program_tools(program: &str) -> &'static [&'static str] {
+    match program {
+        "cargo" | "rustc" | "rustup" => &["rust"],
+        "node" => &["node"],
+        "npm" | "npx" => &["node", "npm"],
+        "git" | "printf" | "echo" | "test" => &[],
+        // npm's generated bin scripts run under `#!/usr/bin/env node`.
+        _ if program.starts_with("node_modules/.bin/") => &["node"],
+        _ => panic!("the tool derivation does not know which tool provides `{program}`"),
+    }
+}
+
+/// What one top-level command does to a job's tools: every tool it needs,
+/// with the task or step that needs it; the tools it installs by name; and
+/// any install that names no tool, which installs every configured one.
+#[derive(Default)]
+struct ToolEffect {
+    uses: Vec<(String, String)>,
+    installs: BTreeSet<String>,
+    unnamed_installs: Vec<String>,
+}
+
+impl ToolEffect {
+    fn command(
+        &mut self,
+        tasks: &BTreeMap<String, MiseTask>,
+        root: &str,
+        by: &str,
+        words: &[String],
+    ) {
+        let program = words[0].as_str();
+        if program != "mise" {
+            for tool in program_tools(program) {
+                self.uses.push(((*tool).to_owned(), by.to_owned()));
+            }
+            return;
+        }
+        let mut operands = words[1..]
+            .iter()
+            .take_while(|word| *word != "--")
+            .filter(|word| !word.starts_with('-'));
+        match operands.next().map(String::as_str) {
+            Some("run") => {
+                let task = operands
+                    .next()
+                    .unwrap_or_else(|| panic!("{by} runs mise without a task"));
+                self.task(tasks, &task_address(task, root));
+            }
+            Some("install" | "i") => {
+                let named: Vec<String> = operands.map(|word| tool_identity(word)).collect();
+                if named.is_empty() {
+                    self.unnamed_installs.push(by.to_owned());
+                }
+                self.installs.extend(named);
+            }
+            other => panic!("the tool derivation does not model `mise {other:?}` in {by}"),
+        }
+    }
+
+    /// A task's dependencies run first, inside the same `mise run`; then its
+    /// declared tools and the programs of its commands are needed.
+    fn task(&mut self, tasks: &BTreeMap<String, MiseTask>, address: &str) {
+        let task = tasks
+            .get(address)
+            .unwrap_or_else(|| panic!("no mise task {address}"));
+        for dependency in &task.depends {
+            self.task(tasks, dependency);
+        }
+        for tool in &task.tools {
+            self.uses.push((tool.clone(), address.to_owned()));
+        }
+        for script in &task.run {
+            for words in script_commands(script) {
+                self.command(tasks, &task.root, address, &words);
+            }
+        }
+    }
+}
+
+/// Every tool one Linux job needs, with the steps that need it.
+type NeededTools = BTreeMap<String, BTreeSet<String>>;
+
+/// Derives the tools one Linux job needs from its steps and the mise tasks
+/// they run, and reports each tool needed before an earlier command
+/// installed it by name, and each install that names no tool.
+///
+/// mise-action's `install_args` are installed before the next step. A named
+/// `mise install`, directly or inside a task, counts only once its whole
+/// top-level command has finished: `mise run` fixes a task's PATH when it
+/// starts, so with automatic installation off a dependency that installs a
+/// tool does not put it on the PATH of the same run (quality.yml's docs job
+/// installs `setup:tools` in its own step for this reason). Declared task
+/// tools count as needed even where the task's program does not run them.
+fn job_tool_findings(
+    workflow: &serde_yaml_ng::Value,
+    tasks: &BTreeMap<String, MiseTask>,
+    id: &str,
+) -> (NeededTools, Vec<String>) {
+    let job = &workflow["jobs"][id];
+    assert_eq!(
+        job["runs-on"].as_str(),
+        Some("ubuntu-latest"),
+        "{id}: the derivation reads Linux `run` commands only"
+    );
+    let mut available = BTreeSet::new();
+    let mut needed = NeededTools::new();
+    let mut findings = Vec::new();
+    for (index, step) in job["steps"].as_sequence().unwrap().iter().enumerate() {
+        let label = step["name"]
+            .as_str()
+            .map_or_else(|| format!("step {}", index + 1), str::to_owned);
+        if let Some(uses) = step["uses"].as_str() {
+            if uses.starts_with("jdx/mise-action@") {
+                let arguments = step["with"]["install_args"].as_str().unwrap();
+                available.extend(
+                    arguments
+                        .split_whitespace()
+                        .filter(|word| !word.starts_with('-'))
+                        .map(tool_identity),
+                );
+            }
+            continue;
+        }
+        let script = step["run"].as_str().unwrap();
+        for words in script_commands(script) {
+            let by = format!("{label} (`{}`)", words.join(" "));
+            let mut effect = ToolEffect::default();
+            effect.command(tasks, "", &by, &words);
+            for (tool, user) in effect.uses {
+                if !available.contains(&tool) {
+                    findings.push(format!(
+                        "{id}: {by} needs {tool} for {user} before an earlier command installs it by name"
+                    ));
+                }
+                needed.entry(tool).or_default().insert(label.clone());
+            }
+            for task in effect.unnamed_installs {
+                findings.push(format!(
+                    "{id}: {by} installs every configured tool through {task} instead of naming them"
+                ));
+            }
+            available.extend(effect.installs);
+        }
+    }
+    findings.sort();
+    findings.dedup();
+    (needed, findings)
+}
+
+fn release_repository() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+#[test]
+fn release_notes_and_docs_jobs_install_every_tool_they_run_before_its_first_use() {
+    // PR CI cannot run the release workflow, so derive what these two jobs
+    // run from their steps and the mise task graph, and require an explicit,
+    // earlier, named install of each tool with automatic installation off.
+    let root = release_repository();
+    let text = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    let workflow: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).unwrap();
+    let tasks = mise_tasks(&root);
+    let mut problems = Vec::new();
+    for variable in ["MISE_EXEC_AUTO_INSTALL", "MISE_TASK_RUN_AUTO_INSTALL"] {
+        if workflow["env"][variable].as_str() != Some("false") {
+            problems.push(format!(
+                "the derivation needs {variable}: \"false\" for the whole release workflow"
+            ));
+        }
+    }
+    let set = |tools: &[&str]| -> BTreeSet<String> {
+        tools.iter().map(|tool| (*tool).to_owned()).collect()
+    };
+    for (id, expected) in [
+        (
+            "notes",
+            set(&["aqua:cocogitto/cocogitto", "github:jdx/communique", "rust"]),
+        ),
+        ("build-docs", set(&["node", "npm", "rust"])),
+    ] {
+        let (needed, findings) = job_tool_findings(&workflow, &tasks, id);
+        problems.extend(findings);
+        let derived: BTreeSet<String> = needed.keys().cloned().collect();
+        if derived != expected {
+            problems.push(format!("{id} needs {derived:?}, not {expected:?}"));
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[test]
+fn release_tool_derivation_rejects_each_unscoped_install_it_replaced() {
+    let root = release_repository();
+    let text = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    let tasks = mise_tasks(&root);
+    let findings = |job: &str, old: &str, new: &str| {
+        assert!(text.contains(old), "release.yml no longer contains {old}");
+        let workflow = serde_yaml_ng::from_str(&text.replacen(old, new, 1)).unwrap();
+        job_tool_findings(&workflow, &tasks, job).1
+    };
+    let missing = |job: &str, by: &str, tool: &str, user: &str| {
+        format!("{job}: {by} needs {tool} for {user} before an earlier command installs it by name")
+    };
+    // Before this change notes ran the delivery `setup` task, a bare
+    // `mise install --include-task-tools` that installs every configured tool.
+    let notes_install = "      - name: Install package-owned release tools\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n        run: mise run //packages/kuru-delivery:setup:test-tools\n";
+    let generate = "Generate notes without publishing (`mise run release:tool -- notes --sha $RELEASE_SHA --version $RELEASE_VERSION --output RELEASE_NOTES.md`)";
+    let release = "//packages/kuru-delivery:release";
+    assert_eq!(
+        findings(
+            "notes",
+            notes_install,
+            &notes_install.replace(":setup:test-tools", ":setup")
+        ),
+        [
+            missing("notes", generate, "aqua:cocogitto/cocogitto", release),
+            missing("notes", generate, "github:jdx/communique", release),
+            "notes: Install package-owned release tools (`mise run //packages/kuru-delivery:setup`) installs every configured tool through //packages/kuru-delivery:setup instead of naming them".to_owned(),
+        ]
+    );
+    // A named install of other tools leaves the notes tools missing.
+    assert_eq!(
+        findings(
+            "notes",
+            notes_install,
+            &notes_install.replace(":setup:test-tools", ":setup:advisories")
+        ),
+        [
+            missing("notes", generate, "aqua:cocogitto/cocogitto", release),
+            missing("notes", generate, "github:jdx/communique", release),
+        ]
+    );
+    // Without the explicit docs tool step, setup:tools runs only as a
+    // dependency inside the same `mise run` as its first Node/npm use.
+    let docs_tools = "      - name: Install app-owned documentation tools before task activation\n        # With automatic installation disabled, setup's PATH must see the pins\n        # before it starts; the runner's preinstalled Node/npm are not substitutes.\n        run: mise run //apps/kuru-docs:setup:tools\n";
+    let setup_step = "step 3 (`mise run //apps/kuru-docs:setup`)";
+    let early_use = [
+        missing(
+            "build-docs",
+            setup_step,
+            "node",
+            "//apps/kuru-docs:check:toolchain",
+        ),
+        missing("build-docs", setup_step, "node", "//apps/kuru-docs:setup"),
+        missing("build-docs", setup_step, "npm", "//apps/kuru-docs:setup"),
+    ];
+    assert_eq!(findings("build-docs", docs_tools, ""), early_use);
+    // An install after the first use does not count either.
+    let setup = "      - run: mise run //apps/kuru-docs:setup\n";
+    assert_eq!(
+        findings(
+            "build-docs",
+            &format!("{docs_tools}{setup}"),
+            &format!("{setup}{docs_tools}")
+        ),
+        early_use
+    );
+    // A tool nothing installs is found where the task graph first needs it.
+    let action = "          install_args: rust aqua:jdx/hk\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      - name: Install app-owned";
+    assert_eq!(
+        findings(
+            "build-docs",
+            action,
+            &action.replace(
+                "install_args: rust aqua:jdx/hk",
+                "install_args: aqua:jdx/hk"
+            )
+        ),
+        [missing(
+            "build-docs",
+            "Build and validate public documentation (`mise run //packages/kuru-delivery:tool -- docs --base $KURU_DOCS_BASE`)",
+            "rust",
+            "//packages/kuru-delivery:tool"
+        )]
+    );
 }
 
 fn native_workflow() -> String {

@@ -166,11 +166,15 @@ raw-header validation. Windows ZIP paths require exactly three regular members.
 No installer runs the candidate to validate it.
 
 Release jobs inherit `MISE_LOCKED=1`, including nested package tasks. This keeps
-tool installation from extending lockfiles after source validation. The bump
-and publish jobs explicitly install locked Rust/hk and disable automatic task-tool
-installation. Native build jobs install only Rust and set `MISE_NO_HOOKS=1` to
-omit mise's repository-setup postinstall hook, since archive construction does not
-create Git commits. Local Git hooks and the
+tool installation from extending lockfiles after source validation. The whole
+workflow also turns off mise's automatic installation (`MISE_EXEC_AUTO_INSTALL`
+and `MISE_TASK_RUN_AUTO_INSTALL`), so every job installs its tools by name. The
+bump and publish jobs install locked Rust/hk. The notes job adds only the
+delivery package's Cocogitto and Communiqué pins (`setup:test-tools`). The docs
+build installs the docs app's Node/npm pins (`setup:tools`) in a step of its own
+before its documentation tasks start. Native build jobs install only Rust and set
+`MISE_NO_HOOKS=1` to omit mise's repository-setup postinstall hook, since archive
+construction does not create Git commits. Local Git hooks and the
 release bump, publish, notes and docs jobs retain hk. Native archive subcommands
 do not need the notes toolchain. Reusable quality and native-test workflows skip
 hook setup and install only their scoped tools, with frozen locks.
@@ -400,6 +404,15 @@ Matching draft assets are retained, missing assets are uploaded, and publication
 occurs only after the draft is complete. A corrupted draft needs maintainer
 inspection; the workflow will not delete it. For a partial draft, rerunning only
 the failed jobs also retains the original build artifacts rather than rebuilding.
+
+A rerun repeats the workflow file of the original dispatch SHA. It recovers a
+transient failure, such as a download outage, but not a fault in the workflow
+itself, such as a tool that no step installs. `notes` and `build-docs` both
+precede documentation deployment and publication, so such a fault in either
+deploys and publishes nothing, although the version commit may already be on
+main. Fix the fault on main through a reviewed change, then dispatch a new
+release. That run starts from the current main revision, so it may select a
+new version.
 
 If publication succeeded and only documentation failed, rerun `build-docs` and
 `deploy-docs` on that existing Release run in the Actions UI. They reuse the
