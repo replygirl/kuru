@@ -1126,7 +1126,10 @@ async fn verify_installed_powershell_activation(root: &Path, installed: &Path) -
             "SystemRoot",
             system.parent().context("Windows system root")?,
         )
-        .env("PROCESSOR_ARCHITECTURE", "AMD64")
+        .env(
+            "PROCESSOR_ARCHITECTURE",
+            kuru_delivery::mise_isolation::native_processor_architecture(),
+        )
         .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
         .env("USERPROFILE", &isolated)
         .env("APPDATA", &isolated)
@@ -1195,7 +1198,10 @@ async fn warm_up_powershell_engine(
             "SystemRoot",
             system.parent().context("Windows system root")?,
         )
-        .env("PROCESSOR_ARCHITECTURE", "AMD64")
+        .env(
+            "PROCESSOR_ARCHITECTURE",
+            kuru_delivery::mise_isolation::native_processor_architecture(),
+        )
         .env("USERPROFILE", isolated)
         .env("APPDATA", isolated)
         .env("LOCALAPPDATA", isolated)
@@ -1247,7 +1253,10 @@ async fn install_packaged(
             "SystemRoot",
             system.parent().context("Windows system root")?,
         )
-        .env("PROCESSOR_ARCHITECTURE", "AMD64")
+        .env(
+            "PROCESSOR_ARCHITECTURE",
+            kuru_delivery::mise_isolation::native_processor_architecture(),
+        )
         .env("USERPROFILE", &isolated)
         .env("APPDATA", &isolated)
         .env("LOCALAPPDATA", &isolated)

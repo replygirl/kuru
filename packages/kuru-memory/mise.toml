@@ -11,6 +11,7 @@ env.CARGO_BUILD_TARGET = false
 env.RUSTFLAGS = false
 env.CARGO_ENCODED_RUSTFLAGS = false
 env.CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = false
+env.CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS = false
 env.KURU_DOLT_BUNDLE_TARGET = "{{vars.kuru_memory_bundle_target}}"
 run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- bundle prepare"
 
@@ -69,6 +70,7 @@ env.CARGO_BUILD_TARGET = false
 env.CARGO_NET_OFFLINE = "true"
 env.KURU_DOLT_BUNDLE_OFFLINE = "true"
 env.CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static"
+env.CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static"
 run = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/verify-bundle-build.ps1"
 
 [tasks.typecheck]

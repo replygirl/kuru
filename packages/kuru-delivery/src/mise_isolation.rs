@@ -5,6 +5,26 @@ use anyhow::Result;
 use std::fs;
 use std::{ffi::OsString, path::Path};
 
+/// Windows `PROCESSOR_ARCHITECTURE` value of the native machine this
+/// executable was compiled for. Native test and acceptance executables run
+/// unemulated, so the compiled architecture is the runner's native machine.
+#[cfg(target_arch = "x86_64")]
+pub fn native_processor_architecture() -> &'static str {
+    "AMD64"
+}
+
+/// Windows `PROCESSOR_ARCHITECTURE` value of the native machine this
+/// executable was compiled for. Native test and acceptance executables run
+/// unemulated, so the compiled architecture is the runner's native machine.
+#[cfg(target_arch = "aarch64")]
+pub fn native_processor_architecture() -> &'static str {
+    "ARM64"
+}
+
+// Only Windows consumes the value; other hosts compile without it.
+#[cfg(all(windows, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+compile_error!("native_processor_architecture supports only x86_64 and aarch64 hosts");
+
 /// Create empty user, configuration, cache and state roots and return the
 /// complete environment for an `env_clear`ed native mise child.
 pub fn prepare(root: &Path, project: &Path) -> Result<Vec<(OsString, OsString)>> {
@@ -61,11 +81,28 @@ pub fn prepare(root: &Path, project: &Path) -> Result<Vec<(OsString, OsString)>>
         ));
         environment.push(("PATH".into(), system.into()));
         environment.push(("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into()));
-        environment.push(("PROCESSOR_ARCHITECTURE".into(), "AMD64".into()));
+        environment.push((
+            "PROCESSOR_ARCHITECTURE".into(),
+            native_processor_architecture().into(),
+        ));
         environment.push(("MISE_CEILING_PATHS".into(), root.into()));
         environment.push(("MISE_TRUSTED_CONFIG_PATHS".into(), project.into()));
         environment.push(("MISE_YES".into(), "1".into()));
         environment.push(("MISE_COLOR".into(), "0".into()));
         Ok(environment)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn native_processor_architecture_names_the_compiled_machine() {
+        let expected = match std::env::consts::ARCH {
+            "x86_64" => "AMD64",
+            "aarch64" => "ARM64",
+            other => panic!("unsupported test host architecture {other}"),
+        };
+        assert_eq!(super::native_processor_architecture(), expected);
     }
 }

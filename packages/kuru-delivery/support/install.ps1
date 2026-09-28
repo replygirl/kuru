@@ -37,6 +37,9 @@ Write-Verbose 'Kuru bootstrap phase: entered'
 # https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-createfilew
 # https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-lockfileex
 # https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-movefileexw
+# IsWow64Process2 (Windows 10 1511+) reports the native machine even to an
+# emulated or WOW64 process, whose environment reports the emulated view:
+# https://learn.microsoft.com/windows/win32/api/wow64apiset/nf-wow64apiset-iswow64process2
 if (-not ('Kuru.Bootstrap.Native' -as [type])) {
 if ($PSBoundParameters.ContainsKey('Verbose') -and [bool]$PSBoundParameters['Verbose']) {
     [Console]::Error.WriteLine('Kuru bootstrap direct checkpoint: native bridge starting')
@@ -97,8 +100,33 @@ public static class Native {
     [DllImport("advapi32.dll")] static extern uint GetSecurityInfo(SafeFileHandle handle, int kind, uint fields, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr descriptor);
     [DllImport("advapi32.dll")] static extern uint GetSecurityDescriptorLength(IntPtr descriptor);
     [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr value);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool IsWow64Process2(IntPtr process, out ushort processMachine, out ushort nativeMachine);
 
     static Exception Error(string message) { return new IOException(message, new Win32Exception(Marshal.GetLastWin32Error())); }
+    // The operating system's native machine, never an environment variable:
+    // PROCESSOR_ARCHITECTURE and PROCESSOR_ARCHITEW6432 describe the calling
+    // process's emulated view under x64 emulation or WOW64.
+    public static ushort NativeMachine() {
+        ushort processMachine, nativeMachine;
+        using (Process self = Process.GetCurrentProcess()) {
+            if (!IsWow64Process2(self.Handle, out processMachine, out nativeMachine)) throw Error("cannot determine the native machine architecture");
+        }
+        return nativeMachine;
+    }
+    // The Windows catalog targets and their PE machine values.
+    public static string MachineTarget(ushort machine) {
+        if (machine == 0x8664) return "x86_64-pc-windows-msvc";
+        if (machine == 0xAA64) return "aarch64-pc-windows-msvc";
+        throw new InvalidDataException("unsupported Windows machine 0x" + machine.ToString("X4") + "; Kuru supports x64 (0x8664) and ARM64 (0xAA64)");
+    }
+    public static ushort TargetMachine(string target) {
+        if (target == "x86_64-pc-windows-msvc") return 0x8664;
+        if (target == "aarch64-pc-windows-msvc") return 0xAA64;
+        throw new InvalidDataException("unsupported Windows target: " + target);
+    }
+    public static string[] WindowsTargets() { return new string[]{ MachineTarget(0x8664), MachineTarget(0xAA64) }; }
+    static string MachineName(ushort machine) { return machine == 0xAA64 ? "ARM64" : machine == 0x8664 ? "x64" : "0x" + machine.ToString("X4"); }
     static void Require(bool condition, string message) { if (!condition) throw new InvalidDataException(message); }
     static string Extended(string path) { return "\\\\?\\" + path; }
     public static string PathName(string path) {
@@ -404,7 +432,7 @@ public static class Native {
     }
     static readonly uint[] CrcTable = MakeCrcTable();
     static uint[] MakeCrcTable() { uint[] table = new uint[256]; for (uint n = 0; n < 256; n++) { uint c = n; for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? 0xedb88320 ^ (c >> 1) : c >> 1; table[n] = c; } return table; }
-    public static Dictionary<string,byte[]> Members(byte[] bytes, bool support) {
+    public static Dictionary<string,byte[]> Members(byte[] bytes, bool support, ushort machine) {
         int limit = support ? 4 * 1024 * 1024 : Limit;
         int memberLimit = support ? 512 * 1024 : Limit;
         string[] allowed = support
@@ -454,10 +482,10 @@ public static class Native {
             }
         }
         Require(next == central && outputFiles.Count == expectedCount, "ZIP members are absent or physical bytes are unaccounted");
-        if (!support) { Require(outputFiles["kuru.exe"].Length > 0, "ZIP executable is empty"); Pe(outputFiles["kuru.exe"]); }
+        if (!support) { Require(outputFiles["kuru.exe"].Length > 0, "ZIP executable is empty"); Pe(outputFiles["kuru.exe"], machine); }
         return outputFiles;
     }
-    public static byte[] Executable(byte[] bytes) { return Members(bytes,false)["kuru.exe"]; }
+    public static byte[] Executable(byte[] bytes, ushort machine) { return Members(bytes,false,machine)["kuru.exe"]; }
     public static bool RequiresSupport(byte[] readme) {
         Require(readme.Length <= 65536, "release README exceeds size limit");
         string text = new UTF8Encoding(false,true).GetString(readme);
@@ -509,12 +537,24 @@ public static class Native {
             install.Verify();
         }
     }
-    public static void Pe(byte[] value) {
+    // Validates a PE32+ executable header (never a DLL) and returns its machine.
+    public static ushort ImageMachine(byte[] value) {
         Require(value.Length >= 64 && value[0] == 'M' && value[1] == 'Z', "release executable is not PE");
         int offset = checked((int)U32(value,60));
-        Require(offset >= 64 && offset <= value.Length - 26 && U32(value,offset) == 0x00004550 && U16(value,offset+4) == 0x8664 && (U16(value,offset+22) & 2) != 0 && (U16(value,offset+22) & 0x2000) == 0 && U16(value,offset+24) == 0x20b, "release executable must be an x64 PE32+ executable, not a DLL");
+        Require(offset >= 64 && offset <= value.Length - 26 && U32(value,offset) == 0x00004550 && (U16(value,offset+22) & 2) != 0 && (U16(value,offset+22) & 0x2000) == 0 && U16(value,offset+24) == 0x20b, "release executable must be a PE32+ executable, not a DLL");
         int optional = U16(value,offset+20), sections = U16(value,offset+6);
         Require(optional >= 112 && sections > 0 && sections <= 96 && (long)offset + 24 + optional + sections * 40 <= value.Length, "PE header bounds are invalid");
+        return U16(value,offset+4);
+    }
+    // Reads only a bounded header prefix from the already verified, held file.
+    public static ushort ImageMachine(FileLease file) {
+        int length = (int)Math.Min(file.Stream.Length, 65536L); byte[] header = new byte[length];
+        file.Stream.Position = 0; int read = 0;
+        while (read < length) { int count = file.Stream.Read(header, read, length - read); Require(count > 0, "executable header is truncated"); read += count; }
+        return ImageMachine(header);
+    }
+    public static void Pe(byte[] value, ushort machine) {
+        Require(ImageMachine(value) == machine, "release executable must be an " + MachineName(machine) + " PE32+ executable for " + MachineTarget(machine) + ", not a DLL or another machine");
     }
     public static void Publish(DirectoryLease stage, DirectoryLease parent, byte[] bytes) { Publish(stage,parent,bytes,null); }
     // Explicit callback seam for the native post-move fault fixture. The public
@@ -623,9 +663,13 @@ function Read-KuruReceipt($State, $Parent) {
 
 $parent = $null; $state = $null; $lease = $null; $stage = $null
 try {
-    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or -not [Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Use native 64-bit Windows PowerShell 5.1 on Windows x64.' }
-    if (-not $Target) { $Target = 'x86_64-pc-windows-msvc' }
-    if ($Target -cne 'x86_64-pc-windows-msvc') { throw 'This bootstrap installs the native Windows x64 target only.' }
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or -not [Environment]::Is64BitProcess) { throw 'Use 64-bit Windows PowerShell 5.1 on Windows x64 or Windows 11 on Arm64.' }
+    # The operating system reports the native machine. Architecture environment
+    # variables describe an emulated or WOW64 process's view and are ignored.
+    $nativeTarget = [Kuru.Bootstrap.Native]::MachineTarget([Kuru.Bootstrap.Native]::NativeMachine())
+    if (-not $Target) { $Target = $nativeTarget }
+    if ($Target -cne $nativeTarget) { throw "Requested target $Target does not match the native machine target $nativeTarget; nothing was downloaded or installed." }
+    $machine = [Kuru.Bootstrap.Native]::TargetMachine($Target)
     if (-not $InstallDir) { $InstallDir = $env:KURU_INSTALL_DIR }
     if (-not $InstallDir) {
         if (-not $env:LOCALAPPDATA) { throw 'Provide -InstallDir when LOCALAPPDATA is unset.' }
@@ -638,13 +682,21 @@ try {
     $receipt = Read-KuruReceipt $state $parent
     if ($null -ne $receipt -and $receipt.phase -cnotin @('complete','rolled_back')) {
         $helperPath = [Kuru.Bootstrap.Native]::RecordedLaunchPath($receipt.helper)
-        if ([IO.Path]::GetFileName($helperPath) -cne "x86_64-pc-windows-msvc-$($receipt.helper_image.sha256).exe" -or
+        # The helper keeps the target of the executable that recorded it (an
+        # emulated x64 kuru.exe on Arm64 records an x64 helper), independent of
+        # the native target selected for installation.
+        $helperTarget = $null
+        foreach ($windowsTarget in [Kuru.Bootstrap.Native]::WindowsTargets()) {
+            if ([IO.Path]::GetFileName($helperPath) -ceq "$windowsTarget-$($receipt.helper_image.sha256).exe") { $helperTarget = $windowsTarget }
+        }
+        if ($null -eq $helperTarget -or
             $receipt.helper_image.sha256 -cne $receipt.original.sha256 -or $receipt.helper_image.bytes -ne $receipt.original.bytes) { throw 'Receipt does not name a trusted original helper.' }
         $helperParent = [Kuru.Bootstrap.Native+DirectoryLease]::new([IO.Path]::GetDirectoryName($helperPath), $false, $true)
         $helper = $null
         try {
             $helper = [Kuru.Bootstrap.Native+FileLease]::new($helperPath, $true, $false, 3)
             if (-not [Kuru.Bootstrap.Native]::Equal($helper.Id, [byte[]]$receipt.helper_image.identity) -or $helper.Stream.Length -ne $receipt.helper_image.bytes -or [Kuru.Bootstrap.Native]::FileHash($helper) -cne $receipt.helper_image.sha256) { throw 'Trusted helper identity or checksum changed; refusing execution.' }
+            if ([Kuru.Bootstrap.Native]::MachineTarget([Kuru.Bootstrap.Native]::ImageMachine($helper)) -cne $helperTarget) { throw 'Recorded helper name and executable machine disagree; refusing execution.' }
             $request = @{ recovery = $parent.Path } | ConvertTo-Json -Compress
             $lease.Dispose(); $lease = $null
             [Kuru.Bootstrap.Native]::Recover($helperPath, $request, $parent.Path)
@@ -690,11 +742,16 @@ try {
             if (-not $line) { continue }
             if ($line -cnotmatch '^([0-9a-fA-F]{64}) [ *]([^\s]+)$') { throw 'Malformed checksum manifest.' }
             $hash = $Matches[1].ToLowerInvariant(); $name = $Matches[2]
-            $pattern = '^kuru-([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.-]+)?)-x86_64-pc-windows-msvc\.zip$'
+            $pattern = '^kuru-([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.-]+)?)-' + [regex]::Escape($Target) + '\.zip$'
             if ($name -cmatch $pattern) {
                 $selected = $Matches[1]
                 if (-not $Version -or $Version -ceq $selected) { $chosen += @{ version=$selected; name=$name; hash=$hash } }
             }
+        }
+        if ($chosen.Count -eq 0) {
+            # A release that predates this target publishes no archive for it.
+            if ($Version) { throw "Release v$Version publishes no $Target archive; nothing was installed." }
+            throw "The latest release publishes no $Target archive; nothing was installed."
         }
         if ($chosen.Count -ne 1) { throw 'Checksum manifest must name the release archive exactly once.' }
         $Version = $chosen[0].version
@@ -704,11 +761,11 @@ try {
         if ([Kuru.Bootstrap.Native]::Hash($archive) -cne $chosen[0].hash) { throw 'Release archive checksum mismatch; existing executable unchanged.' }
         Write-Verbose 'Kuru bootstrap phase: release archive verified'
         Write-Output 'Verifying Kuru release archive.'
-        $core = [Kuru.Bootstrap.Native]::Members($archive, $false)
+        $core = [Kuru.Bootstrap.Native]::Members($archive, $false, $machine)
         $payload = $core['kuru.exe']
         $requiresSupport = [Kuru.Bootstrap.Native]::RequiresSupport($core['README.md'])
         if ($requiresSupport) {
-            $supportName = "kuru-$Version-x86_64-pc-windows-msvc-shell-support.zip"
+            $supportName = "kuru-$Version-$Target-shell-support.zip"
             $supportMatches = @()
             foreach ($line in ($manifest -split "`n")) {
                 $line = $line.TrimEnd("`r")
@@ -719,8 +776,8 @@ try {
             if ($supportMatches.Count -ne 1) { throw 'Checksum manifest must name the paired shell-support archive exactly once; existing executable unchanged.' }
             $supportArchive = [Kuru.Bootstrap.Native]::Fetch($ReleaseBase, $supportName, 4 * 1024 * 1024)
             if ([Kuru.Bootstrap.Native]::Hash($supportArchive) -cne $supportMatches[0]) { throw 'Shell-support archive checksum mismatch; existing executable unchanged.' }
-            $supportFiles = [Kuru.Bootstrap.Native]::Members($supportArchive, $true)
-            [Kuru.Bootstrap.Native]::PublishSupport($parent, $Version, 'x86_64-pc-windows-msvc', $supportFiles)
+            $supportFiles = [Kuru.Bootstrap.Native]::Members($supportArchive, $true, $machine)
+            [Kuru.Bootstrap.Native]::PublishSupport($parent, $Version, $Target, $supportFiles)
         }
         Write-Verbose 'Kuru bootstrap phase: release archive validated'
         $stage = [Kuru.Bootstrap.Native+DirectoryLease]::new($parent.Child(".kuru-install-$([Guid]::NewGuid().ToString('D'))"), $true, $true)

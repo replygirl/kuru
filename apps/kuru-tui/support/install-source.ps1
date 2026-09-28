@@ -20,8 +20,8 @@ $env:MISE_NO_HOOKS = '1'
 & mise -C $repo install rust
 if ($LASTEXITCODE -ne 0) { throw 'Could not install the pinned Rust toolchain.' }
 $hostTarget = (& mise -C $repo exec rust -- rustc --print host-tuple).Trim()
-if ($LASTEXITCODE -ne 0 -or $hostTarget -ne 'x86_64-pc-windows-msvc') {
-    throw 'Source installation requires the supported native x86_64 MSVC toolchain.'
+if ($LASTEXITCODE -ne 0 -or @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc') -cnotcontains $hostTarget) {
+    throw 'Source installation requires a supported native x86_64 or aarch64 MSVC toolchain.'
 }
 if ($env:CARGO_BUILD_TARGET -and $env:CARGO_BUILD_TARGET -ne 'host' -and $env:CARGO_BUILD_TARGET -ne $hostTarget) {
     throw "Source installation runs on $hostTarget; use the build task to cross-compile."

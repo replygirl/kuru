@@ -26,7 +26,7 @@ pub struct Target {
     pub format: ArchiveFormat,
 }
 
-pub const CATALOG: [Target; 4] = [
+pub const CATALOG: [Target; 5] = [
     Target {
         triple: "aarch64-apple-darwin",
         os: "macos",
@@ -52,6 +52,13 @@ pub const CATALOG: [Target; 4] = [
         triple: "x86_64-pc-windows-msvc",
         os: "windows",
         arch: "x86_64",
+        executable: "kuru.exe",
+        format: ArchiveFormat::Zip,
+    },
+    Target {
+        triple: "aarch64-pc-windows-msvc",
+        os: "windows",
+        arch: "aarch64",
         executable: "kuru.exe",
         format: ArchiveFormat::Zip,
     },
@@ -101,12 +108,18 @@ mod tests {
             assert_eq!(find(target.triple).unwrap(), target);
             assert_eq!(for_platform(target.os, target.arch).unwrap(), target);
         }
-        let windows = for_platform("windows", "x86_64").unwrap();
-        assert_eq!(windows.executable, "kuru.exe");
-        assert_eq!(windows.format.extension(), "zip");
-        assert!(for_platform("windows", "aarch64").is_err());
+        for (arch, triple) in [
+            ("x86_64", "x86_64-pc-windows-msvc"),
+            ("aarch64", "aarch64-pc-windows-msvc"),
+        ] {
+            let windows = for_platform("windows", arch).unwrap();
+            assert_eq!(windows.triple, triple);
+            assert_eq!(windows.executable, "kuru.exe");
+            assert_eq!(windows.format.extension(), "zip");
+        }
         assert!(for_platform("macos", "x86_64").is_err());
         assert!(find("x86_64-apple-darwin").is_err());
         assert!(find("x86_64-pc-windows-gnu").is_err());
+        assert!(find("aarch64-pc-windows-gnullvm").is_err());
     }
 }

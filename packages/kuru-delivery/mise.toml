@@ -138,6 +138,9 @@ run = "cargo test -p kuru-delivery --features tooling --locked --test previous_r
 
 [tasks."verify:published-windows"]
 description = "Verify the exact published Windows release through ordinary mise"
+# Inputs: RELEASE_VERSION, RELEASE_SHA, RELEASE_RUN_URL and
+# KURU_PUBLISHED_WINDOWS_RECEIPT (required); KURU_PUBLISHED_TARGET (optional)
+# names the Windows target and must equal the runner's native host target.
 dir = "{{config_root}}/../.."
 run = "echo 'verify:published-windows requires native Windows' >&2; exit 1"
 run_windows = "pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File packages/kuru-delivery/support/verify-published-windows.ps1"

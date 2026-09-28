@@ -40,7 +40,7 @@ The delivery package activates Cocogitto and Communiqué only for its tests,
 combined coverage and release tasks. Its `setup` task preinstalls those tools
 with mise's `--include-task-tools` option; lean CI jobs use `setup:test-tools`
 to install only those two exact package-owned pins. Communiqué 1.4.2 provides Linux x86_64
-and arm64, macOS arm64 and Windows x86_64 binaries, which cover every supported
+and arm64, macOS arm64 and Windows x86_64 and arm64 binaries, which cover every supported
 platform for the full maintainer gate.
 
 CI runs format, lint, typecheck, repository/workflow tooling, cospec validation,
@@ -178,6 +178,25 @@ offline build-input check (`bundle:verify-native-build`) has no test inventory
 to partition and stays in the Windows installation job.
 Windows primitives retain a separate native coverage job for early feedback. The
 required `ci-gate` accepts only success from every branch of this graph.
+
+Windows on Arm (`windows-11-arm`) runs the same partitioned workspace suites as
+x64, uninstrumented, as separately named behavioral evidence: `Behavior
+partition` 1..8 run `//packages/kuru-delivery:test:partition` over every
+workspace package, and `Behavior merge` checks receipt agreement, disjointness
+and completeness on Ubuntu without LCOV or a threshold. Their receipts record
+`mode: uninstrumented` with null coverage, and they never count toward the 90%
+gate, which x64, macOS and Ubuntu keep enforcing. Instrumented Windows on Arm
+partitions are held until a pinned Rust toolchain carries the fix for
+[rust-lang/rust#150123](https://github.com/rust-lang/rust/issues/150123), whose
+`llvm-profdata merge` failure on `aarch64-pc-windows-msvc` the pinned 1.98.1
+reproduces; `coverage::PARTITIONS` rejects an instrumented `windows-11-arm` set.
+`native-platform` is a two-leg matrix: the x64 leg keeps
+`//packages/kuru-platform:coverage` and its 90% gate, and the arm64 leg,
+`Native platform behavior (aarch64-pc-windows-msvc)`, runs
+`//packages/kuru-platform:test` with no coverage upload. The arm64 partitions
+and installation job import the source-built engine from the
+`dolt-windows-arm64` job before building (see
+[source-built engine inputs](#source-built-engine-inputs)).
 
 Ubuntu's partition steps disable Rust test-profile debug information so the
 instrumented Kuru executable remains a valid input to the same production
@@ -488,7 +507,22 @@ $env:CARGO_NET_OFFLINE = 'true'
 mise run //apps/kuru-tui:build:release -- --target x86_64-pc-windows-msvc
 ```
 
-The shipping binary is under `target/x86_64-pc-windows-msvc/release/kuru.exe`
+On Windows on Arm, import the source-built archive (a `Bundle build` artifact or
+a linux-x64 build; see [source-built engine inputs](#source-built-engine-inputs))
+the same way and build for the Arm target:
+
+```powershell
+$env:KURU_DOLT_BUNDLE_DIR = 'C:\BuildInputs\kuru'
+mise run //packages/kuru-memory:bundle:prepare -- --target aarch64-pc-windows-msvc --archive C:\Downloads\dolt-windows-arm64.zip --offline
+$env:KURU_DOLT_BUNDLE_OFFLINE = 'true'
+$env:CARGO_NET_OFFLINE = 'true'
+mise run //apps/kuru-tui:build:release -- --target aarch64-pc-windows-msvc
+```
+
+`verify:windows-imports` finds `dumpbin.exe` through `vswhere` under either the
+x64 or the ARM64 MSVC host tools.
+
+The shipping binary is under `target/<target>/release/kuru.exe`
 unless `CARGO_TARGET_DIR` selects another target directory. For its native import
 check, set `KURU_EMBEDDED_TEST_BINARY` to that absolute path and run
 `mise run //apps/kuru-tui:verify:windows-imports`. This maintainer check uses MSVC
@@ -521,7 +555,13 @@ host. Preparing, compiling or provisioning any other target never fetches,
 builds or reads a built asset's inputs. Runtime provisioning never builds or
 downloads an engine.
 
-The build host is **linux-x64 only**. llvm-mingw's target runtimes embed paths
+`//packages/kuru-memory:bundle:test-fixtures`, a dependency of the memory
+tests, always prepares the upstream `x86_64-pc-windows-msvc` ZIP, on every host
+including Windows on Arm: it is a host-independent fixture for the archive
+decoder, not an engine for the host.
+
+The build host is **linux-x64 only**, including for the Windows on Arm engine
+that CI and release jobs import; no Windows or Arm runner builds it. llvm-mingw's target runtimes embed paths
 from the package that compiled them, so the same recipe on another host produces
 different bytes. Go and llvm-mingw are pinned as task-scoped tools in
 `packages/kuru-memory/mise.toml` and locked, for linux-x64 only, by
@@ -562,6 +602,14 @@ pins; from then on every build verifies against them and any drift fails with
 both digests. A pinned built archive is never downloaded: import the CI artifact
 or a local linux-x64 build with `bundle:prepare -- --target
 aarch64-pc-windows-msvc --archive <file>`.
+
+Workflows that need a built archive call the same workflow through
+`workflow_call`, passing the commit as `ref`. That path does not repeat the
+two-build proof: it restores an archive cached under the pinned digest or builds
+once, fails unless the bytes match the committed pin, and uploads the
+`bundle-input-<target>` artifact. Consuming jobs import it with
+`bundle:prepare -- --target <target> --archive <file> --offline` into their own
+private `KURU_DOLT_BUNDLE_DIR`, which checks the pin again.
 
 `KURU_BUNDLE_BUILD_HOST_OVERRIDE=1` lets `bundle build` run on another host for
 local iteration on the recipe. Its output is **not authoritative**: it requires
@@ -684,12 +732,63 @@ differently-named sibling task.
 ## Dependency and release updates
 
 Change workspace dependency pins centrally and regenerate Cargo.lock. Change
-tool pins with the matching four-platform lock refresh:
+tool pins with the matching five-platform lock refresh:
 
 ```sh
-mise lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64
-mise -C apps/kuru-docs lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64
-mise -C packages/kuru-delivery lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64
+mise lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64,windows-arm64
+mise -C apps/kuru-docs lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64,windows-arm64
+mise -C packages/kuru-delivery lock --platform linux-x64,linux-arm64,macos-arm64,windows-x64,windows-arm64
+```
+
+Root `mise.toml` pins the standalone `github:aligned-team/cospec` tool in
+table form with `[tools."github:aligned-team/cospec".platforms.windows-arm64]
+asset_pattern = "cospec-*-windows-x64.zip"`: cospec publishes no
+`windows-arm64` release asset, so this pins the lock's `windows-arm64` entry to
+the existing `windows-x64` asset (`asset_pattern` replaces mise's asset
+autodetection for that platform). Every other tool listed here resolves its
+own `windows-arm64` entry without a pin. Three of those entries are x64
+executables run under emulation. `aqua:cocogitto/cocogitto` and
+`aqua:taiki-e/cargo-llvm-cov` fall back to their `windows-x64` assets through
+the aqua registry's own `windows_arm_emulation` flag. For cargo-llvm-cov this
+holds although upstream also publishes `cargo-llvm-cov-aarch64-pc-windows-msvc`
+archives: the aqua backend offers no per-platform asset option (only
+`symlink_bins`, `vars` and `prerelease`; see mise's
+[aqua backend](https://mise.jdx.dev/dev-tools/backends/aqua.html)), so the root
+and delivery locks record `cargo-llvm-cov-x86_64-pc-windows-msvc.tar.gz` for
+`windows-arm64`. `aqua:koalaman/shellcheck` publishes a single Windows archive,
+so its `windows-arm64` entry is the same x64 `shellcheck-v0.11.0.zip` as its
+`windows-x64` entry. The rest resolve native Arm64 Windows assets, each under
+its project's own naming (for example `hk-aarch64-pc-windows-msvc.zip`,
+`actionlint_1.7.12_windows_arm64.zip`, `taplo-windows-aarch64.zip` and
+`node-v26.10.0-win-arm64.zip`).
+
+A pattern that matches no asset does not make `mise lock` fail: it reports the
+platform as skipped, exits successfully and writes no `windows-arm64` entry for
+cospec, and only a later `MISE_LOCKED=1` installation fails.
+
+Mise records a per-platform option as a second
+`[[tools."github:aligned-team/cospec"]]` lock element carrying
+`options.asset_pattern`, its own `specifiers` and the `windows-arm64` row (see
+mise's [lockfile format](https://mise.jdx.dev/dev-tools/mise-lock.html), where
+one version can have several entries distinguished by `options`). Unlocked
+installs, including the nested `mise install node npm` behind
+`//apps/kuru-docs:setup:tools` that `format:check`, `docs:*` and the hk hooks
+reach, rewrite each per-project lockfile from the host's resolved toolset.
+They drop that non-host element, and mise's best-effort auto-lock may then
+re-add the `windows-arm64` row without `specifiers` or, when the GitHub API
+refuses the query, not at all. Only `mise lock` restores it. Run every
+command other than an intentional lock refresh with `MISE_LOCKED=1`, which
+stops automatic lockfile updates and fails on a missing entry instead of
+resolving it ([strict lockfile mode](https://mise.jdx.dev/dev-tools/mise-lock.html)).
+The refresh commands above still write with `MISE_LOCKED=1` set. CI
+already exports `MISE_LOCKED=1`. The repository check in `lint:tooling`
+(`mise run //packages/kuru-delivery:check:repo`) fails unless the lock holds, for
+each root tool with a `platforms` table, an element with those options, the
+pinned version in `specifiers` and a `checksum` and `url` for that platform.
+Run it after refreshing the root lock:
+
+```sh
+MISE_LOCKED=1 mise run //packages/kuru-delivery:check:repo
 ```
 
 Mise records available provenance for every platform, but normally verifies
@@ -702,6 +801,7 @@ MISE_OS=linux MISE_ARCH=x86_64 mise -C packages/kuru-delivery lock github:jdx/co
 MISE_OS=linux MISE_ARCH=aarch64 mise -C packages/kuru-delivery lock github:jdx/communique --platform linux-arm64
 MISE_OS=macos MISE_ARCH=aarch64 mise -C packages/kuru-delivery lock github:jdx/communique --platform macos-arm64
 MISE_OS=windows MISE_ARCH=x86_64 mise -C packages/kuru-delivery lock github:jdx/communique --platform windows-x64
+MISE_OS=windows MISE_ARCH=aarch64 mise -C packages/kuru-delivery lock github:jdx/communique --platform windows-arm64
 ```
 
 Review the resulting `provenance_verified` metadata alongside URLs and checksums.

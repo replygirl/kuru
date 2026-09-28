@@ -30,7 +30,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Windows on Arm runs its partitions uninstrumented as behavioral
+        # evidence until a pinned toolchain carries the fix for
+        # rust-lang/rust#150123. native-tests.yml selects that mode from the
+        # windows-11-arm label; coverage::PARTITIONS only validates the
+        # label and mode, failing closed on any other combination.
+        os: [ubuntu-latest, macos-latest, windows-latest, windows-11-arm]
     uses: ./.github/workflows/native-tests.yml
     with:
       ref: ${{ github.sha }}
@@ -278,14 +283,28 @@ jobs:
           if-no-files-found: error
 
   native-platform:
-    name: Native platform primitives (Windows)
-    runs-on: windows-latest
+    # The x64 leg enforces the 90% platform coverage gate. Windows on Arm runs
+    # the same package tests through the distinct uninstrumented test task, as
+    # separately named behavioral evidence that never reports or satisfies
+    # coverage, until a pinned toolchain carries the fix for rust-lang/rust#150123.
+    name: ${{ matrix.mode == 'coverage' && 'Native platform primitives' || 'Native platform behavior' }} (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            mode: coverage
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            mode: behavior
     env:
       MISE_LOCKED: "1"
       MISE_TASK_RUN_AUTO_INSTALL: "false"
       MISE_NO_HOOKS: "1"
-      CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
@@ -297,27 +316,32 @@ jobs:
         with:
           experimental: true
           version: 2026.9.4
-          install_args: rust aqua:taiki-e/cargo-llvm-cov
+          install_args: ${{ matrix.mode == 'coverage' && 'rust aqua:taiki-e/cargo-llvm-cov' || 'rust' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Set up platform Rust components
+        if: matrix.mode == 'coverage'
         run: mise run //packages/kuru-platform:setup
       - name: Cache platform Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
-          shared-key: native-platform-windows
+          shared-key: native-platform-${{ matrix.target }}
           # Restrict saves to main so PR runs never thrash the shared cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test native platform primitives and require 90% coverage
+        if: matrix.mode == 'coverage'
         run: mise run //packages/kuru-platform:coverage
+      - name: Test native platform primitives uninstrumented as behavioral evidence
+        if: matrix.mode == 'behavior'
+        run: mise run //packages/kuru-platform:test
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock Cargo.lock
       - name: Upload native platform coverage
-        if: ${{ !cancelled() && (success() || hashFiles('target/kuru-platform-coverage.lcov') != '') }}
+        if: ${{ matrix.mode == 'coverage' && !cancelled() && (success() || hashFiles('target/kuru-platform-coverage.lcov') != '') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: coverage-native-platform-windows
+          name: coverage-native-platform-${{ matrix.target }}
           path: target/kuru-platform-coverage.lcov
           if-no-files-found: error
 

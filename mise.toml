@@ -21,12 +21,17 @@ npm = "npm:npm"
 # source installation).
 rust = { version = "1.98.1", mr_boxington = "{{ get_env(name='KURU_MBX', default='1') != '0' }}" }
 mr-boxington = { version = "1.18.0", os = ["linux", "macos/arm64", "windows"] }
-"github:aligned-team/cospec" = "0.8.2"
 "aqua:jdx/hk" = "2.2.0"
 "aqua:tamasfe/taplo" = "0.10.0"
 "aqua:koalaman/shellcheck" = "0.11.0"
 "aqua:rhysd/actionlint" = "1.7.12"
 "aqua:taiki-e/cargo-llvm-cov" = "0.9.1"
+
+[tools."github:aligned-team/cospec"]
+version = "0.8.2"
+
+[tools."github:aligned-team/cospec".platforms.windows-arm64]
+asset_pattern = "cospec-*-windows-x64.zip"
 
 [monorepo]
 config_roots = ["apps/*", "packages/*"]

@@ -220,9 +220,28 @@ async fn invalid_memory_config_fails_before_provision_creates_cache() {
 
 #[test]
 fn official_windows_archive_decodes_exact_pinned_payloads_on_every_host() {
+    decode_prepared_windows_archive("x86_64-pc-windows-msvc");
+}
+
+/// The source-built engine has no download URL. Every Windows on Arm test run
+/// first imports the pinned build with `bundle:prepare --archive`, because the
+/// memory build refuses that target otherwise, so its real archive is present
+/// wherever this compiles; a missing import fails here instead of skipping.
+#[cfg(all(windows, target_arch = "aarch64"))]
+#[test]
+fn source_built_windows_arm64_archive_decodes_exact_pinned_payloads() {
+    decode_prepared_windows_archive("aarch64-pc-windows-msvc");
+}
+
+/// Decode the real prepared archive for a Windows target and require exactly
+/// its pinned payloads. `bundle:test-fixtures` prepares the upstream x64
+/// archive on every host. The source-built `aarch64-pc-windows-msvc` archive is
+/// decoded on Windows on Arm hosts, which import it; elsewhere its committed
+/// catalog entry is checked at the data level below.
+fn decode_prepared_windows_archive(target: &str) {
     let asset = crate::catalog::ASSETS
         .iter()
-        .find(|asset| asset.target == "x86_64-pc-windows-msvc")
+        .find(|asset| asset.target == target)
         .copied()
         .unwrap();
     let bundle_dir = std::env::var_os("KURU_DOLT_BUNDLE_DIR")
@@ -242,7 +261,9 @@ fn official_windows_archive_decodes_exact_pinned_payloads_on_every_host() {
     );
     let archive_path = bundle_dir.join(format!("{}.archive", asset.archive_sha256));
     let (parent, mut file) = files::read(&archive_path, Privacy::Inherited)
-        .expect("prepare the required Windows archive through memory bundle:test-fixtures");
+        .expect(
+            "prepare the required Windows archive through memory bundle:test-fixtures (x64) or bundle:prepare --archive (the built arm64 engine)",
+        );
     assert_eq!(file.metadata().unwrap().len(), asset.compressed_bytes);
     let mut archive = Vec::new();
     (&mut file)
@@ -255,11 +276,22 @@ fn official_windows_archive_decodes_exact_pinned_payloads_on_every_host() {
     let root = crate::test_support::tempdir().unwrap();
     let candidate = root.path().join("real Windows archive");
     extract(&archive, &candidate, asset).unwrap();
-    assert_eq!(fs::read_dir(&candidate).unwrap().count(), 2);
-    for (name, size, digest) in [
+    assert_eq!(
+        fs::read_dir(&candidate).unwrap().count(),
+        2 + asset.notices.len()
+    );
+    let payloads = [
         ("dolt.exe", asset.executable_bytes, asset.executable_sha256),
         ("LICENSES", asset.license_bytes, asset.license_sha256),
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        asset
+            .notices
+            .iter()
+            .map(|notice| (notice.name, notice.bytes, notice.sha256)),
+    );
+    for (name, size, digest) in payloads {
         let (_parent, file) = files::read(&candidate.join(name), Privacy::OwnerOnly).unwrap();
         kuru_platform::fs::require_private(&file).unwrap();
         assert_eq!(file.metadata().unwrap().len(), size);
@@ -268,6 +300,49 @@ fn official_windows_archive_decodes_exact_pinned_payloads_on_every_host() {
             digest
         );
     }
+}
+
+#[test]
+fn source_built_windows_arm64_catalog_entry_declares_its_pinned_notices() {
+    let asset = crate::catalog::ASSETS
+        .iter()
+        .find(|asset| asset.target == "aarch64-pc-windows-msvc")
+        .copied()
+        .expect("the pinned built Windows on Arm engine is catalogued");
+    assert_eq!(
+        (asset.stem, asset.format, asset.executable_name),
+        ("dolt-windows-arm64", "zip", "dolt.exe")
+    );
+    let x64 = crate::catalog::ASSETS
+        .iter()
+        .find(|asset| asset.target == "x86_64-pc-windows-msvc")
+        .unwrap();
+    assert!(
+        x64.notices.is_empty(),
+        "upstream archives declare no notices"
+    );
+    // Dolt's own dependency notices are byte-identical to upstream.
+    assert_eq!(
+        (asset.license_bytes, asset.license_sha256),
+        (x64.license_bytes, x64.license_sha256)
+    );
+    let names: Vec<_> = asset.notices.iter().map(|notice| notice.name).collect();
+    assert_eq!(
+        names,
+        ["LICENSE-ICU", "LICENSE-LLVM", "LICENSE-MINGW-W64-RUNTIME"]
+    );
+    for notice in asset.notices {
+        assert!(notice.bytes > 0 && notice.sha256.len() == 64, "{notice:?}");
+    }
+    // Extraction requires exactly these members, so the pinned expansion is
+    // the executable, LICENSES and every declared notice.
+    let notices: u64 = asset.notices.iter().map(|notice| notice.bytes).sum();
+    assert_eq!(
+        asset.expanded_bytes,
+        asset.executable_bytes + asset.license_bytes + notices
+    );
+    assert!(asset.compressed_bytes <= crate::catalog::MAX_COMPRESSED);
+    assert!(asset.expanded_bytes <= crate::catalog::MAX_EXPANDED);
 }
 
 fn zip() -> Vec<u8> {

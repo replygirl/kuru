@@ -4,7 +4,9 @@
 //! Run through `mise run //packages/kuru-delivery:test:previous-release-update`
 //! with `KURU_UPDATE_CANDIDATE_BINARY` naming the absolute release-profile
 //! `kuru` executable built from this tree. `GITHUB_TOKEN` is optional and only
-//! authenticates the single GitHub release-listing request. Keep this binary
+//! authenticates the GitHub release-listing requests. When no published release
+//! carries the host target, the run passes on the resolver's
+//! `no predecessor for <target>: ...` evidence line. Keep this binary
 //! single-threaded: the helper writes an executable and then runs it, and a
 //! concurrent spawn could inherit that descriptor (Linux ETXTBSY).
 
@@ -112,19 +114,23 @@ async fn run() -> Result<()> {
     );
 
     let token = published::checked_token(std::env::var_os("GITHUB_TOKEN"))?;
-    let previous = published::previous_release(&version, target, token.as_deref()).await?;
-    println!(
-        "candidate v{version} (built as v{WORKSPACE_VERSION}) for {target}; previous release v{} archive_sha256={} support={}",
-        previous.version,
-        archive::digest(&previous.archive),
-        if previous.support.is_some() {
-            "published"
-        } else {
-            "absent"
-        }
-    );
+    let predecessor = published::previous_release(&version, target, token.as_deref()).await?;
+    // The no-predecessor branch's evidence line is printed by the shared
+    // helper, which then runs no updater.
+    if let published::Predecessor::Release(previous) = &predecessor {
+        println!(
+            "candidate v{version} (built as v{WORKSPACE_VERSION}) for {target}; previous release v{} archive_sha256={} support={}",
+            previous.version,
+            archive::digest(&previous.archive),
+            if previous.support.is_some() {
+                "published"
+            } else {
+                "absent"
+            }
+        );
+    }
     previous_updater::previous_updater_accepts_candidate(
-        &previous,
+        &predecessor,
         &previous_updater::Candidate {
             directory,
             requested_version: &version,

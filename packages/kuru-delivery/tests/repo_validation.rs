@@ -376,3 +376,88 @@ fn member_symlink_does_not_read_an_external_manifest() {
             .any(|error| error.contains("escapes repository"))
     );
 }
+
+#[test]
+fn per_platform_tool_options_require_their_complete_lock_entry() {
+    const PLATFORM_PIN: &str = "[tools.\"github:aligned-team/cospec\"]\nversion = \"0.7.1\"\n\n[tools.\"github:aligned-team/cospec\".platforms.windows-arm64]\nasset_pattern = \"cospec-*-windows-x64.zip\"\n";
+    const HOST_ELEMENT: &str = "[[tools.\"github:aligned-team/cospec\"]]\nversion = \"0.7.1\"\nbackend = \"github:aligned-team/cospec\"\nspecifiers = [\"0.7.1\"]\n\n[tools.\"github:aligned-team/cospec\".\"platforms.windows-x64\"]\nchecksum = \"sha256:823a\"\nurl = \"https://example.invalid/cospec-0.7.1-windows-x64.zip\"\n";
+    const OPTION_ELEMENT: &str = "\n[[tools.\"github:aligned-team/cospec\"]]\nversion = \"0.7.1\"\nbackend = \"github:aligned-team/cospec\"\nspecifiers = [\"0.7.1\"]\n\n[tools.\"github:aligned-team/cospec\".options]\nasset_pattern = \"cospec-*-windows-x64.zip\"\n\n[tools.\"github:aligned-team/cospec\".\"platforms.windows-arm64\"]\nchecksum = \"sha256:823a\"\nurl = \"https://example.invalid/cospec-0.7.1-windows-x64.zip\"\n";
+    let lock_error = |repo: &Repository| {
+        repo.errors()
+            .iter()
+            .any(|error| error.contains("windows-arm64 option entry"))
+    };
+
+    let repo = Repository::new();
+    let config = format!(
+        "{}{PLATFORM_PIN}",
+        std::fs::read_to_string(repo.0.path().join("mise.toml")).unwrap()
+    );
+    repo.write("mise.toml", &config);
+    repo.write(
+        "mise.lock",
+        &format!("lockfile_version = 1\n\n{HOST_ELEMENT}{OPTION_ELEMENT}"),
+    );
+    assert!(repo.errors().is_empty(), "{:?}", repo.errors());
+
+    // An unlocked install on another host removes the whole option element.
+    repo.write(
+        "mise.lock",
+        &format!("lockfile_version = 1\n\n{HOST_ELEMENT}"),
+    );
+    assert!(lock_error(&repo));
+
+    // Auto-lock can re-add the platform row without the request binding.
+    repo.write(
+        "mise.lock",
+        &format!("lockfile_version = 1\n\n{HOST_ELEMENT}{OPTION_ELEMENT}"),
+    );
+    repo.replace(
+        "mise.lock",
+        "specifiers = [\"0.7.1\"]\n\n[tools.\"github:aligned-team/cospec\".options]",
+        "\n[tools.\"github:aligned-team/cospec\".options]",
+    );
+    assert!(lock_error(&repo));
+
+    for (old, new) in [
+        (
+            "checksum = \"sha256:823a\"\nurl = \"https://example.invalid/cospec-0.7.1-windows-x64.zip\"\n",
+            "url = \"https://example.invalid/cospec-0.7.1-windows-x64.zip\"\n",
+        ),
+        (
+            "asset_pattern = \"cospec-*-windows-x64.zip\"\n\n[tools.\"github:aligned-team/cospec\".\"platforms.windows-arm64\"]",
+            "asset_pattern = \"cospec-*-windows-arm64.zip\"\n\n[tools.\"github:aligned-team/cospec\".\"platforms.windows-arm64\"]",
+        ),
+    ] {
+        repo.write(
+            "mise.lock",
+            &format!("lockfile_version = 1\n\n{HOST_ELEMENT}{OPTION_ELEMENT}"),
+        );
+        let content = std::fs::read_to_string(repo.0.path().join("mise.lock")).unwrap();
+        let at = content.rfind(old).unwrap();
+        repo.write(
+            "mise.lock",
+            &format!("{}{new}{}", &content[..at], &content[at + old.len()..]),
+        );
+        assert!(lock_error(&repo));
+    }
+
+    std::fs::remove_file(repo.0.path().join("mise.lock")).unwrap();
+    assert!(
+        repo::check(repo.0.path())
+            .unwrap_err()
+            .to_string()
+            .contains("mise.lock")
+    );
+
+    repo.replace("mise.toml", "[tools.\"github:aligned-team/cospec\".platforms.windows-arm64]\nasset_pattern = \"cospec-*-windows-x64.zip\"\n", "[tools.\"github:aligned-team/cospec\".platforms]\nwindows-arm64 = \"cospec-*-windows-x64.zip\"\n");
+    repo.write(
+        "mise.lock",
+        &format!("lockfile_version = 1\n\n{HOST_ELEMENT}{OPTION_ELEMENT}"),
+    );
+    assert!(
+        repo.errors()
+            .iter()
+            .any(|error| error.contains("options must be a table"))
+    );
+}

@@ -124,19 +124,21 @@ the existing workspace coverage threshold and release archive contract SHALL rem
 
 ### Requirement: Native Windows release artifact
 
-The release workflow SHALL build `x86_64-pc-windows-msvc` from the same prepared
-version commit as the other native targets in the release catalog and include
-its ZIP and checksum in the complete staged candidate. The ZIP SHALL contain
-exactly the flat regular members `kuru.exe`, `LICENSE` and `README.md`; the
-executable SHALL include its verified full Dolt bundle. Target selection,
-expected executable names and formats SHALL have one authoritative catalog. The
-release SHALL retain strategy-only dispatch, conventional-commit version
-selection, automatic exact-commit recovery, immutable publication, and
-documentation deployment from the selected commit before the sole final
-public-release job.
+The release workflow SHALL build every Windows target in the release catalog,
+currently `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`, from the same
+prepared version commit as the other native targets in the release catalog and
+include each ZIP and checksum in the complete staged candidate. Each ZIP SHALL contain exactly the
+flat regular members `kuru.exe`, `LICENSE` and `README.md`; the executable SHALL
+include its verified full Dolt bundle for that target. Target selection, expected
+executable names and formats SHALL have one authoritative catalog, and adding a
+Windows target to that catalog SHALL be the same change that adds its release
+build, staged acceptance and published verification jobs. The release SHALL
+retain strategy-only dispatch, conventional-commit version selection, automatic
+exact-commit recovery, immutable publication, and documentation deployment from
+the selected commit before the sole final public-release job.
 
 #### Scenario: Windows artifact is missing or invalid
-- **WHEN** any required Windows package or native packaged-runtime check fails
+- **WHEN** any required Windows package or native packaged-runtime check fails for any catalog Windows target
 - **THEN** candidate acceptance fails, final Pages deployment does not run, and no partial successful release is made public.
 
 #### Scenario: Release run resumes
@@ -146,31 +148,36 @@ public-release job.
 ### Requirement: Package-owned published Windows verifier
 
 The delivery package SHALL provide one native Windows verifier and mise task for
-an exact published Kuru version and expected commit. The verifier MUST use the
-ordinary `github:replygirl/kuru@VERSION` backend in isolated mise and user roots,
-with no inherited release token, provider credential, proxy, OAuth store, lock,
-or endpoint replacement. It MUST independently verify the published tag and
-commit, complete release asset inventory, checksum manifest, Windows archive,
-selected installed executable, embedded Dolt executable, and bundled licenses.
+an exact published Kuru version and expected commit, parametrized by the Windows
+target it runs on. The verifier MUST use the ordinary
+`github:replygirl/kuru@VERSION` backend in isolated mise and user roots, with no
+inherited release token, provider credential, proxy, OAuth store, lock, or
+endpoint replacement. It MUST independently verify the published tag and commit,
+complete release asset inventory, checksum manifest, the selected target's
+Windows archive, selected installed executable, embedded Dolt executable, and
+bundled licenses, and MUST require that the installed executable's PE machine
+matches the target it verifies.
 
 #### Scenario: Ordinary published installation
-- **WHEN** the verifier runs with an exact published version, expected commit, checked-out asset manifest, and native mise executable
+- **WHEN** the verifier runs with an exact published version, expected commit, checked-out asset manifest, native mise executable and a target matching the runner's native machine
 - **THEN** it selects, installs, locates, and executes that version through mise without a custom endpoint, a compiler-built Kuru executable, or a separately installed Dolt
 
 #### Scenario: Publication identity disagrees
-- **WHEN** the tag, resolved commit, asset inventory, checksums, archive, installed executable, engine, or licenses disagree with the exact expected release
+- **WHEN** the tag, resolved commit, asset inventory, checksums, archive, installed executable, engine, or licenses disagree with the exact expected release for the selected target
 - **THEN** verification fails rather than accepting mise installation alone as provenance evidence
 
 ### Requirement: Bounded published verification receipt
 
 Published Windows verification SHALL bound command execution and output, await
 owned cleanup, and emit a bounded JSON evidence receipt containing fixed safe
-metadata only after isolated state has been removed. It MUST parse Kuru machine
-results from stdout without requiring stderr to be empty.
+metadata only after isolated state has been removed. The receipt and its uploaded
+artifact name MUST identify the verified target so receipts from different
+Windows architectures in one release run never collide. It MUST parse Kuru
+machine results from stdout without requiring stderr to be empty.
 
 #### Scenario: Verification completes
 - **WHEN** every release, installation, runtime, persistence, and cleanup check succeeds
-- **THEN** the receipt records exact version and commit identity, digests, command milestones, durable session observations, bundled-runtime observations, and confirmed cleanup without raw child output or credentials
+- **THEN** the receipt records exact version, commit identity and target, digests, command milestones, durable session observations, bundled-runtime observations, and confirmed cleanup without raw child output or credentials
 
 #### Scenario: Child emits informational stderr
 - **WHEN** an otherwise successful Kuru command emits an informational first-run notice on stderr while retaining its JSON stdout contract

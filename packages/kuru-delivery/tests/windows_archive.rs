@@ -7,12 +7,29 @@ use kuru_delivery::{
     shell_support,
     targets::{self, ArchiveFormat},
 };
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::LazyLock};
 
 #[path = "support/files.rs"]
 mod files;
 
-const WINDOWS: &str = "x86_64-pc-windows-msvc";
+// These tests exercise the Windows ZIP contract on every host. A native
+// Windows runner packages its own compiled target; other hosts use a Windows
+// catalog target, since every Windows entry shares the ZIP and kuru.exe layout.
+static WINDOWS: LazyLock<&'static str> = LazyLock::new(|| {
+    let target = if cfg!(windows) {
+        archive::host_target().expect("Windows tests require a catalog host target")
+    } else {
+        "x86_64-pc-windows-msvc"
+    };
+    let entry = targets::find(target).unwrap();
+    assert!(
+        entry.os == "windows"
+            && entry.executable == "kuru.exe"
+            && entry.format == ArchiveFormat::Zip,
+        "{target} is not a Windows ZIP catalog target"
+    );
+    target
+});
 
 fn limits() -> Limits {
     Limits {
@@ -23,7 +40,7 @@ fn limits() -> Limits {
 }
 
 fn manifest(directory: &Path, bytes: &[u8]) {
-    let name = archive::archive_name("0.2.0", WINDOWS).unwrap();
+    let name = archive::archive_name("0.2.0", *WINDOWS).unwrap();
     fs::write(directory.join(&name), bytes).unwrap();
     fs::write(
         directory.join("SHA256SUMS"),
@@ -37,9 +54,9 @@ async fn real_packager_writes_exact_reproducible_windows_zip_and_installer_runs_
     let root = tempfile::tempdir().unwrap();
     let binary = Path::new(env!("CARGO_BIN_EXE_kuru-delivery-fixture"));
     let releases = root.path().join("release files");
-    let path = archive::package(binary, WINDOWS, "0.2.0", &releases).unwrap();
+    let path = archive::package(binary, *WINDOWS, "0.2.0", &releases).unwrap();
     let bytes = fs::read(&path).unwrap();
-    assert!(path.ends_with("kuru-0.2.0-x86_64-pc-windows-msvc.zip"));
+    assert!(path.ends_with(format!("kuru-0.2.0-{}.zip", *WINDOWS)));
     let expected = ["kuru.exe", "LICENSE", "README.md"].map(|name| MemberSpec {
         name,
         kind: MemberKind::File,
@@ -64,15 +81,15 @@ async fn real_packager_writes_exact_reproducible_windows_zip_and_installer_runs_
         assert_eq!(payload, expected);
     }
     drop(zip);
-    archive::package(binary, WINDOWS, "0.2.0", &releases).unwrap();
+    archive::package(binary, *WINDOWS, "0.2.0", &releases).unwrap();
     assert_eq!(fs::read(&path).unwrap(), bytes);
     let generated = root.path().join("generated support");
     for name in shell_support::NAMES {
         let file = generated.join(name);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
-        fs::write(&file, format!("generated {name} for {WINDOWS}\n")).unwrap();
+        fs::write(&file, format!("generated {name} for {}\n", *WINDOWS)).unwrap();
     }
-    let support = shell_support::package(&generated, WINDOWS, "0.2.0", &releases).unwrap();
+    let support = shell_support::package(&generated, *WINDOWS, "0.2.0", &releases).unwrap();
     fs::write(
         releases.join("SHA256SUMS"),
         format!(
@@ -87,7 +104,7 @@ async fn real_packager_writes_exact_reproducible_windows_zip_and_installer_runs_
         releases.to_str().unwrap(),
         "0.2.0",
         &destination,
-        Some(WINDOWS),
+        Some(*WINDOWS),
     )
     .await
     .unwrap();
@@ -100,7 +117,7 @@ async fn real_packager_writes_exact_reproducible_windows_zip_and_installer_runs_
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(result.stdout, b"native fixture 0.2.0\n");
-    let installed_support = destination.join("share/kuru/0.2.0").join(WINDOWS);
+    let installed_support = destination.join("share/kuru/0.2.0").join(*WINDOWS);
     assert_eq!(
         shell_support::read_generated(&installed_support).unwrap(),
         shell_support::read_generated(&generated).unwrap()
@@ -169,7 +186,7 @@ async fn verified_zip_wrong_inventory_modes_and_crc_preserve_previous_image() {
                 releases.to_str().unwrap(),
                 "0.2.0",
                 &destination,
-                Some(WINDOWS)
+                Some(*WINDOWS)
             )
             .await
             .is_err()

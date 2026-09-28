@@ -60,15 +60,21 @@ mise run //packages/kuru-platform:check:native
 
 This runs package formatting, strict lint, type checking, behavioral fixtures and
 coverage with the 90% line gate. Windows process/IPC fixtures execute on the required
-native Windows CI job; Unix runs the shared filesystem checks. Tests use isolated
+native Windows CI jobs (x64 with the coverage gate, Windows on Arm as the
+uninstrumented `//packages/kuru-platform:test` behavior leg); Unix runs the shared filesystem checks. Tests use isolated
 paths and compiled Rust fixtures. Passing this package's checks establishes its
 native operations; full Windows application acceptance belongs to the consumer
 integration change.
 
-For Windows type checking from another host, prepare the pinned standard library
-and run the package task before native CI:
+For Windows type checking and lint from another host, prepare the pinned
+standard library for each Windows target and run the package tasks before
+native CI:
 
 ```sh
 mise run //packages/kuru-platform:setup:windows
 mise run //packages/kuru-platform:typecheck:windows
+mise run //packages/kuru-platform:lint:windows
+mise run //packages/kuru-platform:setup:windows-arm64
+mise run //packages/kuru-platform:typecheck:windows-arm64
+mise run //packages/kuru-platform:lint:windows-arm64
 ```

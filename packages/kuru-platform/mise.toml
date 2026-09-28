@@ -23,6 +23,18 @@ run = "cargo check -p kuru-platform --target x86_64-pc-windows-msvc --all-target
 description = "Check Windows-specific Rust diagnostics before native CI"
 run = "cargo clippy -p kuru-platform --target x86_64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings"
 
+[tasks."setup:windows-arm64"]
+description = "Install the pinned Windows on Arm standard library for cross-target type checking"
+run = "rustup target add aarch64-pc-windows-msvc --toolchain 1.98.1"
+
+[tasks."typecheck:windows-arm64"]
+description = "Type-check Windows on Arm code; native behavior remains a Windows on Arm CI requirement"
+run = "cargo check -p kuru-platform --target aarch64-pc-windows-msvc --all-targets --all-features --locked"
+
+[tasks."lint:windows-arm64"]
+description = "Check Windows on Arm Rust diagnostics before native CI"
+run = "cargo clippy -p kuru-platform --target aarch64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings"
+
 [tasks.build]
 run = "cargo build -p kuru-platform --locked"
 

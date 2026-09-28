@@ -105,9 +105,14 @@ runtime is involved.
    commit when it remains in main's history. Later main changes are excluded.
 3. Run the quality jobs on that exact version commit; they must pass before
    building native archives
-   on Linux x86_64/arm64, macOS arm64 and Windows x86_64 MSVC, verifying
-   each binary's version and bundled offline engine. The Windows build uses a
-   static CRT and validates its PE imports against the allowed system DLLs.
+   on Linux x86_64/arm64, macOS arm64 and Windows x86_64 and arm64 MSVC,
+   verifying each binary's version and bundled offline engine. The Windows builds
+   use a static CRT and validate their PE imports against the allowed system
+   DLLs. The Windows arm64 leg (`windows-11-arm`) first imports the source-built
+   engine: the `dolt-windows-arm64` job calls `bundle-build.yml` at the version
+   commit, which restores a pin-verified cached archive or builds it once on
+   `ubuntu-latest` and fails unless it matches the committed pin, and the leg
+   imports that artifact with `bundle:prepare --archive ... --offline`.
 4. Generate notes in a separate job with a read-only GitHub token, alongside final
    validation of the selected version commit. No release writes are available to
    that job. Its output is an artifact for publication, which still waits for
@@ -117,11 +122,13 @@ runtime is involved.
    generates `SHA256SUMS`, validates the bounded notes, and retains `dist/` plus
    `RELEASE_NOTES.md` for the remaining jobs. Invalid or incomplete inputs stop
    here without creating a tag, draft, or public release.
-6. Accept the staged candidate natively on Windows x86_64, Linux x86_64,
-   Linux arm64 and macOS arm64 (the `verify-staged` matrix). In parallel, `build-docs` checks
-   out the selected commit and builds and validates the site. On Windows, run
-   the ordinary mise installation route against simulated GitHub metadata that
-   serves the exact staged Windows ZIP. The Windows check verifies candidate
+6. Accept the staged candidate natively on Windows x86_64, Windows arm64,
+   Linux x86_64, Linux arm64 and macOS arm64 (the `verify-staged` matrix). In parallel, `build-docs` checks
+   out the selected commit and builds and validates the site. On each Windows
+   runner, run the ordinary mise installation route against simulated GitHub
+   metadata that serves the exact staged ZIP for that runner's target; the arm64
+   leg imports the same pin-verified engine input before compiling the
+   acceptance task. The Windows check verifies candidate
    checksums and bytes, installation, activation, bundled Dolt, an offline
    conversation and durable reopen. It then repeats
    [previous-release update acceptance](#previous-release-update-acceptance)
@@ -146,9 +153,8 @@ runtime is involved.
    response. GitHub selects the latest release by version and date; recovering
    an older draft does not force it to become latest.
 
-The Unix archives retain `kuru-VERSION-TARGET.tar.gz`; Windows uses
-`kuru-VERSION-x86_64-pc-windows-msvc.zip` with exactly `kuru.exe`, `LICENSE` and
-`README.md`. All are published alongside `SHA256SUMS`. Users install through
+The Unix archives retain `kuru-VERSION-TARGET.tar.gz`; both Windows targets use
+`kuru-VERSION-TARGET.zip` with exactly `kuru.exe`, `LICENSE` and `README.md`. All are published alongside `SHA256SUMS`. Users install through
 mise or the package-owned
 [shell](install.md#install-with-the-shell-bootstrap) and
 [PowerShell](install.md#install-with-powershell) bootstraps, which resolve
@@ -176,10 +182,13 @@ in the version commit.
 ## Verify the staged candidate
 
 Before publication, the Release workflow's `verify-staged` matrix downloads its
-complete candidate on `windows-latest`, `ubuntu-latest`, `ubuntu-24.04-arm`
-and `macos-latest`. The
+complete candidate on `windows-latest`, `windows-11-arm`, `ubuntu-latest`,
+`ubuntu-24.04-arm` and `macos-latest`. Each
 Windows leg invokes `//apps/kuru-tui:verify:staged-windows` with the exact
-staged Windows ZIP. The task resolves the pinned native mise executable before
+staged ZIP for its target (`x86_64-pc-windows-msvc` or
+`aarch64-pc-windows-msvc`). `build` and `verify-staged` need the
+`dolt-windows-arm64` engine-input job, so a failure there blocks every target's
+build and staged acceptance, and therefore publication. The task resolves the pinned native mise executable before
 clearing its child environment, then routes the ordinary
 `github:replygirl/kuru@VERSION` backend through isolated loopback release metadata
 in fresh user, project, configuration, cache, data, state and temporary roots.
@@ -199,8 +208,8 @@ The task then runs
 [previous-release update acceptance](#previous-release-update-acceptance)
 against the staged ZIP and its sidecar. Only its release resolver contacts
 public GitHub, as described there; the workflow step passes its read-only
-`GITHUB_TOKEN` for that listing request only, so a shared runner's anonymous
-rate limit does not fail the check.
+`GITHUB_TOKEN` for the release-listing requests only, so a shared runner's
+anonymous rate limit does not fail the check.
 
 ## Previous-release update acceptance
 
@@ -209,7 +218,7 @@ it does. As a floor under that policy, not a replacement for it, the previous
 published release's own updater must install every candidate. Ordinary PR and
 main CI runs `//packages/kuru-delivery:test:previous-release-update` natively on
 the platforms where it runs native behavior tests: Linux x86-64, macOS Apple
-Silicon and Windows x86-64. Other published targets are built in CI but not
+Silicon, Windows x86-64 and Windows on Arm. Other published targets are built in CI but not
 exercised by this check. The task requires `KURU_UPDATE_CANDIDATE_BINARY`, the
 absolute path of the release-profile `kuru` built from the tree under test, and
 outbound HTTPS to GitHub. It has no bundle-preparation dependency, because the
@@ -226,17 +235,51 @@ discriminating check. A branch whose workspace version is older than the latest
 published tag fails release selection and must be rebased.
 
 The previous release is resolved at run time from the public GitHub releases
-list: the greatest stable `vX.Y.Z` release other than the candidate, failing if
-none is older or one is newer. The resolver downloads that release's own
-`SHA256SUMS`, the host target's archive (`.tar.gz` on Linux and macOS, `.zip` on
-Windows) and, when the release publishes one, that target's shell-support
-envelope. It verifies each file against that manifest and GitHub's asset digests
-before running anything. An optional `GITHUB_TOKEN` is sent as a bearer token
-only on the single release-listing request to `api.github.com`. Without it, that
-request is anonymous and can fail with `HTTP 403 rate limit exceeded` on shared
-runner addresses; pass the workflow's `${{ github.token }}` with `contents: read`
-to avoid it. Asset downloads are anonymous, and no
-Kuru or mise child process receives the token.
+list, scoped to the host target. Every stable release tag must be a canonical
+`vX.Y.Z`; a stable release newer than the candidate, or the same version listed
+twice, fails the check, and the candidate's own version is skipped. The
+resolver walks the older stable releases from the greatest version down and
+selects the first one whose asset listing names the target's archive
+(`.tar.gz` on Linux and macOS, `.zip` on Windows). A release is skipped only when
+its asset listing and its own `SHA256SUMS` agree that it does not publish that
+archive; if either names the archive and the other does not, the check fails.
+Drafts and prereleases are never inspected. The listing's pages are followed
+through GitHub's `Link: rel="next"` header only while no carrier has been found,
+and only to the exact next page on `api.github.com`; an unreadable page, an
+empty named page or more than 100 pages fails the check instead of concluding
+from a partial listing.
+
+For the selected release, the resolver downloads its own `SHA256SUMS`, the host
+target's archive and, when the release publishes one, that target's
+shell-support envelope, and verifies each file against that manifest and
+GitHub's asset digests before running anything. When no stable older release
+carries the target, which happens on a target's first release, the check
+passes without running an updater and prints one line to the job log:
+
+```text
+no predecessor for <target>: inspected vX.Y.Z, ... across N releases, all pages
+```
+
+It names every stable older release inspected, newest first, and the number of
+releases on every listing page, drafts and prereleases included. That line is
+the acceptance evidence for such a target; look for it in the log of the
+`test:previous-release-update` step, or of the staged Windows acceptance task
+that repeats the check. Until a release carries `aarch64-pc-windows-msvc`, the Windows on Arm CI
+installation job and the first release's staged arm64 leg take this branch and
+print `no predecessor for aarch64-pc-windows-msvc: ...`; that line, not an
+updater run, is the first release's predecessor evidence for the target. If no
+stable release older than the candidate exists at
+all, the check still fails with `no published stable release precedes
+v<candidate>`: the project's first release is not a target's first release.
+
+An optional `GITHUB_TOKEN` is sent as a bearer token only on the release-listing
+requests to `api.github.com`, each listing page included. Without it, those
+requests are anonymous and can fail with `HTTP 403 rate limit exceeded` on
+shared runner addresses; pass the workflow's `${{ github.token }}` with
+`contents: read` to avoid it. Every download is anonymous, including each
+`SHA256SUMS` fetched to inspect a release that lacks the target (bounded to
+64 KiB and authenticated against its listed digest), and no Kuru or mise child
+process receives the token.
 
 The previous executable is installed into fresh isolated user, configuration,
 cache, data, state and temporary roots. A support-aware previous release also
@@ -273,13 +316,20 @@ Kuru release. If Pages deploys and final publication then fails, rerun the faile
 publication work in the same Release run; the workflow does not claim that Pages
 and GitHub Releases commit atomically.
 
-After `publish` succeeds, `verify-published-windows` runs on Windows from the
-same selected release commit. It invokes the delivery package's existing
+After `publish` succeeds, `verify-published-windows` runs from the same selected
+release commit as a two-leg matrix, `{windows-latest, x86_64-pc-windows-msvc}`
+and `{windows-11-arm, aarch64-pc-windows-msvc}`, with `KURU_PUBLISHED_TARGET`
+set to each leg's target. It invokes the delivery package's existing
 `verify:published-windows` task with the exact version, expected commit and run
 URL. It resolves the public tag and asset inventory, verifies checksums, installs
 through the unmodified public mise route, and exercises a cold offline
-conversation and durable reopen with the bundled engine. Its cleanup-confirmed
-receipt is retained as the `published-windows-<version>-<attempt>` Actions artifact.
+conversation and durable reopen with the bundled engine. It verifies the runner's
+own Windows target: the optional `KURU_PUBLISHED_TARGET` must equal the native
+host target, and the installed executable's PE machine must match it. Its
+cleanup-confirmed receipt, `published-windows-<target>-receipt.json`, records
+that target and PE machine (`ARM64` on the arm64 leg) and, for the source-built
+arm64 engine, each verified third-party notice; it is retained as the
+`published-windows-<target>-<version>-<attempt>` Actions artifact.
 
 This job has read-only repository permissions and no publication credentials.
 A failed download or runtime check makes the release run fail visibly, while the
