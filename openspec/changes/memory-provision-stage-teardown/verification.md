@@ -1,23 +1,33 @@
 # Verification
 
+Code at bdee33d5 (branch `fix/memory-provision-stage-teardown`, on main a97200ab). Local host: macOS 27.0 arm64. Windows rows are unrun here and are named with the CI partitions that prove them. The coverage partitions assign tests by name, so each Windows test runs in whichever of `Coverage partition (windows-latest, 1..8)` and `Behavior partition (windows-11-arm, 1..8)` (`.github/workflows/native-tests.yml`, job `shard`) its inventory lists.
+
 ## 1. The installation lock outlives an unresolved stage on no path [critical]
 
-- [ ] 1.1 @regression (agent) Unix `provision::tests::failed_extraction_receipts_a_refused_stage_before_releasing_the_lock` on unfixed and fixed code -> FAILS before (no retention named, no receipt), PASSES after with the diagnostic observed while the lock is held
-- [ ] 1.2 @regression (agent) Unix `provision::tests::cancelled_extraction_receipts_a_refused_stage_before_releasing_the_lock` on unfixed and fixed code -> FAILS before (no receipt when the lock becomes free), PASSES after
-- [ ] 1.3 @regression (agent) Unix `provision::tests::published_stage_retention_is_receipted_before_the_lock_is_released` on unfixed and fixed code -> FAILS before (lock already free at the diagnostic), PASSES after
-- [ ] 1.4 @regression (agent) Windows `provision::native_tests::cancelled_activation_recovery_receipts_a_held_stage_before_releasing_the_lock` -> PASSES in the windows-latest and windows-11-arm partitions that list it
+- [x] 1.1 @regression (agent) Unix `provision::tests::failed_extraction_receipts_a_refused_stage_before_releasing_the_lock` (tests.rs:1761) on unfixed and fixed code -> FAILS before, PASSES after. Observed 2026-09-28. On a97200ab with only the new tests added, it panicked at tests.rs:1789, "a refused stage removal is named, never swallowed: fixture extraction failure": no retention was named and the lock had already been released before the stage (scratchpad `flake/stage-teardown/red.log`). At bdee33d5 it passed, with one retention diagnostic observed while the lock was held (`lock_held: true`) and receipted (`receipted: true`, `published: false`).
+- [x] 1.2 @regression (agent) Unix `provision::tests::cancelled_extraction_receipts_a_refused_stage_before_releasing_the_lock` (tests.rs:1819) on unfixed and fixed code -> FAILS before, PASSES after. Observed 2026-09-28. Unfixed, it panicked at tests.rs:1756, "exactly one retained stage is receipted", left 0, right 1: the dropped worker output released the lock with the stage silently retained. At bdee33d5 the contender that takes the lock finds the unpublished receipt already written.
+- [x] 1.3 @regression (agent) Unix `provision::tests::published_stage_retention_is_receipted_before_the_lock_is_released` (tests.rs:1866) on unfixed and fixed code -> FAILS before, PASSES after. Observed 2026-09-28. Unfixed, it panicked at tests.rs:1893 with `RetainedStageObservation { published: Some(true), …, lock_held: false, receipted: true }`: review S5, where the lock was released before the report. At bdee33d5, `lock_held: true`.
+- [~] 1.4 @regression (agent) Windows `provision::native_tests::cancelled_activation_recovery_receipts_a_held_stage_before_releasing_the_lock` (native_tests.rs:1121): a no-delete-share file held in the stage while activation is cancelled mid-recovery -> defer: `cfg(windows)`, cannot run on macOS; proven by the windows-latest and windows-11-arm partitions that list it. Type-checked and clippy-clean for `x86_64-pc-windows-msvc` locally (`cargo clippy -p kuru-memory --all-targets --all-features --target x86_64-pc-windows-msvc`, exit 0, using a local type-check-only C stub for `libsqlite3-sys`, which cannot compile on this host)
 
 ## 2. Windows activation recovery boundary [critical]
 
-- [ ] 2.1 @regression (agent) Windows `provision::native_tests::first_checked_no_move_after_the_window_reports_stopped_recovery` -> PASSES in the windows partitions (red on unfixed code by construction: bare first error)
-- [ ] 2.2 @regression (agent) Windows `provision::native_tests::cancellation_at_a_late_first_checked_no_move_is_cancelled` -> PASSES in the windows partitions (red on unfixed code by construction: `Ok(Err)`, the job 108878373677 panic)
-- [ ] 2.3 @unit (agent) frozen tests `persistent_held_descendant_exhausts_checked_recovery_and_preserves_stage` and `cancelling_checked_activation_recovery_drops_stage_before_cache_lock` -> PASS with unchanged assertions in the windows partitions
+- [~] 2.1 @regression (agent) Windows `provision::native_tests::first_checked_no_move_after_the_window_reports_stopped_recovery` (native_tests.rs:1206): the test observer holds the first result past `ACTIVATION_RETRY_LIMIT` -> defer: `cfg(windows)`; proven in the windows partitions. It is red on a97200ab by construction: first_error is `None` at the deadline and the bare error is returned, the item 1 failure. Type-checked as in 1.4.
+- [~] 2.2 @regression (agent) Windows `provision::native_tests::cancellation_at_a_late_first_checked_no_move_is_cancelled` (native_tests.rs:1260) -> defer: `cfg(windows)`; proven in the windows partitions. It is red on a97200ab by construction: there is no await after `observer(true)` when the deadline has passed, so `Ok(Err)` reaches `unwrap_err`, the job 108878373677 panic. Type-checked as in 1.4.
+- [~] 2.3 @unit (agent) frozen tests `persistent_held_descendant_exhausts_checked_recovery_and_preserves_stage` (native_tests.rs:928) and `cancelling_checked_activation_recovery_drops_stage_before_cache_lock` (native_tests.rs:1011) -> defer: `cfg(windows)`; proven in the windows partitions. Assertions are unchanged. The cancellation test's only change releases the `runtime` directory handle from `files::read` together with its blocker (design.md decision 7, flagged for review).
 
 ## 3. Unchanged behavior and gates
 
-- [ ] 3.1 @unit (agent) provision test modules at `--test-threads=2` (including the existing cancellation, probe, receipt and sweep tests) -> all pass
-- [ ] 3.2 @integration (agent) `mise run //packages/kuru-memory:test`, `format:check`, `lint`, `typecheck`, `lint:tooling`, `docs:check`, `cospec validate --strict` -> all exit 0
+- [x] 3.1 @unit (agent) provision test modules at `--test-threads=2` -> all pass. Observed 2026-09-28 at bdee33d5 content: `cargo test -p kuru-memory --lib --locked -- provision:: --test-threads=2` gave `51 passed; 0 failed`, including `cancellation_retains_stage_and_lock_until_real_extraction_stops`, `cancellation_during_actual_probe_retains_stage_and_lock_but_never_activates`, `runtime_destruction_during_probe_retains_process_resources_until_exit_without_activation`, the `exhausted_stage_cleanup_*` receipt tests and `activation_source_open_failure_preserves_stage_before_releasing_cache_lock`.
+- [x] 3.2 @integration (agent) `mise run //packages/kuru-memory:test`, `format:check`, `lint`, `typecheck`, `lint:tooling`, `docs:check`, `cospec validate --strict` -> all exit 0. Observed 2026-09-28: `//packages/kuru-memory:test` exited 0 (library 290 passed; every integration target passed). Root `format:check`, `lint`, `typecheck`, `lint:tooling` and `docs:check` each exited 0. `cargo fmt -p kuru-memory --check` was clean after the last test edit. The hk pre-commit hooks passed on bdee33d5. `mise run cospec -- validate memory-provision-stage-teardown --strict` exited 0 after this record.
 
 ## 4. Catalogue dispositions
 
-- [ ] 4.1 @manual (agent) item 6 (M1, job 108544879759), item 1 (M2, job 108484586358) and the PR #124 occurrence (M2, job 108878373677) -> each mapped to its mechanism and regression test here and in `flaky-tests.md`
+- [x] 4.1 @manual (agent) each catalogued occurrence mapped to its mechanism and regression test -> Recorded 2026-09-28 from the job logs; the mapping is listed below. The catalogue file itself is left to the orchestrator.
+
+Dispositions:
+
+| Occurrence | Mechanism | Covered by |
+|---|---|---|
+| Item 6 (PR #115, job 108544879759) | M1: teardown swallowed | 1.1–1.4, 2.3 |
+| Item 1 (PR #110, job 108484586358) | M2: first checked result after the window returned without recovery context | 2.1 |
+| New PR #124 occurrence (run 36407104338, job 108878373677, `native_tests.rs:947:24`: `unwrap_err` on `Ok(Err(… preserved private stage … Rejected … os error 5))`, no recovery context) | M2: no cancellation point after the observer | 2.2 |
