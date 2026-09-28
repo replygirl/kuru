@@ -280,6 +280,23 @@ run already executes the behavioral tests, so CI does not first run a duplicate
 ordinary suite; hk runs neither before a push. Keep only one coverage writer
 active per target directory, and preserve the instrumented child fixtures.
 
+CI jobs do not fetch what they do not use or what the run has already
+verified: each such download is one more outage that can fail a job needing
+nothing from it. The repository check in `lint:tooling` (`kuru-delivery repo`)
+enforces the checkable part on every workflow. A workflow that runs mise sets
+`MISE_EXEC_AUTO_INSTALL: "false"` at workflow level and never overrides it
+([why](#shared-build-cache)); every `jdx/mise-action` step names its
+`install_args`, and no step runs `mise install` without tool arguments. Every
+`apt-get` or `apt` fetch names its list with `-o Dir::Etc::sourcelist=/...` and
+`-o Dir::Etc::sourceparts=/dev/null`, so the runner image's third-party
+repositories are never refreshed. Every job with a `partition` matrix sets
+`KURU_DOLT_BUNDLE_OFFLINE: "true"` and imports the archives that the CI
+`bundle-inputs` job fetched and verified once for the run
+([import](#bundled-engine-build-inputs)). The check reads workflow text only.
+Downloads inside the mise tasks a step runs, the tools a job does select, the
+single `bundle-inputs` fetch and the one engine download of each installation
+or native build job remain outside it.
+
 Coverage prepares the verified engine archives and uses the supervisor from its
 single instrumented workspace build. Its fixtures initialize the engine cache
 when needed. Ordinary package tests still prepare a private supervisor snapshot
