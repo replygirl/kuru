@@ -24,6 +24,11 @@
 /// Fixture roots whose teardown refuses to release a live memory owner.
 mod fixture_dir;
 pub use fixture_dir::{CreatorTeardown, TempDir, release_after_creator_exit};
+/// In-process service owners a fixture retires on every exit path.
+#[cfg(test)]
+mod served_owner;
+#[cfg(test)]
+pub(crate) use served_owner::{ServedOwner, settle};
 /// Process-local live-owner and quiescence records the fixture guard reads.
 pub(crate) mod engine_ledger;
 /// Env-gated lifecycle ordering measurement trace (inert unless enabled).

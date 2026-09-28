@@ -9767,38 +9767,47 @@ mod tests {
             let options = crate::test_support::open_options(root.path().join("private"), scope)?;
             let _gate = crate::spawn_gate::spawning().await;
             let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let mut client = service::attach_existing(&options, &project)
-                .await?
-                .context("service endpoint did not admit a candidate client")?;
-            let ServiceValue::CandidateStarted { handle, .. } = client
-                .call(ServiceCall::BeginCandidate {
-                    label: "disconnect-dream".into(),
-                })
-                .await?
-            else {
-                bail!("service did not return the candidate identity");
-            };
-            ensure!(
-                matches!(
-                    client
-                        .call(ServiceCall::View {
-                            candidate: Some(handle),
-                            operation: Box::new(ViewOperation::PutMany {
-                                values: vec![("dream-private".into(), json!("retained"))],
-                            }),
-                        })
-                        .await?,
-                    ServiceValue::Unit
+            let mut served = crate::test_support::ServedOwner::spawn(owner);
+            let body = async {
+                let mut client = service::attach_existing(&options, &project)
+                    .await?
+                    .context("service endpoint did not admit a candidate client")?;
+                let ServiceValue::CandidateStarted { handle, .. } = client
+                    .call(ServiceCall::BeginCandidate {
+                        label: "disconnect-dream".into(),
+                    })
+                    .await?
+                else {
+                    bail!("service did not return the candidate identity");
+                };
+                ensure!(
+                    matches!(
+                        client
+                            .call(ServiceCall::View {
+                                candidate: Some(handle),
+                                operation: Box::new(ViewOperation::PutMany {
+                                    values: vec![("dream-private".into(), json!("retained"))],
+                                }),
+                            })
+                            .await?,
+                        ServiceValue::Unit
+                    ),
+                    "service did not accept the candidate write"
+                );
+                drop(client);
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            crate::test_support::settle(
+                body,
+                served.retire(
+                    &options,
+                    None,
+                    Duration::from_secs(10),
+                    "first owner did not reap after candidate client disconnected",
                 ),
-                "service did not accept the candidate write"
-            );
-            drop(client);
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
-                .await
-                .context("first owner did not reap after candidate client disconnected")???;
-            drop(permit);
+            )
+            .await?;
 
             let first = MemoryStore::open(options.clone()).await?;
             let candidate_refs = candidate_refs_with_value(&first).await?;

@@ -3921,87 +3921,96 @@ mod tests {
         store.close().await?;
         let _gate = crate::spawn_gate::spawning().await;
         let owner = crate::service::ServiceOwner::open(options.clone(), &project).await?;
-        let served = tokio::spawn(owner.serve());
-        let executable = std::env::current_exe()?;
-        let open = || {
-            crate::MemoryStore::open_managed_observed(
-                options.clone(),
-                project.clone(),
-                executable.clone(),
-            )
-            .1
-        };
-        let managed = open().await?;
-        let sibling = open().await?;
-        let barrier = crate::test_support::ReplyBarrier::default();
-        managed.fixture_pause_next_service_reply(&barrier).await?;
-        let mut resume = tokio::spawn({
-            let managed = managed.clone();
-            let namespace = format!("{scope}/transcript/legacy-session");
-            let journal_key = legacy_journal_key.clone();
-            let expected_journal = legacy_pending_journal.clone();
-            let prefix = prefix.clone();
-            async move {
-                managed
-                    .checkpoint_session_turn(
-                        &namespace,
-                        "legacy-session",
-                        &[],
-                        &[(journal_key.clone(), legacy_resumed_journal)],
-                        &super::super::SessionTurnCheckpoint::Resume {
-                            expected_generation: 0,
-                            turn_id: "legacy-safe-turn".into(),
-                            legacy: Some(super::super::LegacySessionTurnResume {
-                                legacy_prefix: prefix,
-                                journal_key,
-                                expected_journal,
-                            }),
-                        },
-                    )
-                    .await
-            }
-        });
-        let _resume_cleanup = AbortOnDrop(resume.abort_handle());
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::select! {
-                () = barrier.wait_sent() => Ok(()),
-                result = &mut resume => bail!("migrated safe-journal resume completed before reply pause: {result:?}"),
-            }
-        })
-        .await
-        .context("migrated safe-journal resume frame was not flushed")??;
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let page = sibling
-                    .public_transcript_page("legacy-session", None, 16)
-                    .await?;
-                if matches!(page.pending.as_ref(), Some(record)
-                    if record.kind == super::super::PublicTurnKind::LegacyContinuation
-                        && record.turn_id == legacy_turn_id)
-                {
-                    break Ok::<(), anyhow::Error>(());
+        let mut served = crate::test_support::ServedOwner::spawn(owner);
+        let body = async {
+            let executable = std::env::current_exe()?;
+            let open = || {
+                crate::MemoryStore::open_managed_observed(
+                    options.clone(),
+                    project.clone(),
+                    executable.clone(),
+                )
+                .1
+            };
+            let managed = open().await?;
+            let sibling = open().await?;
+            let barrier = crate::test_support::ReplyBarrier::default();
+            managed.fixture_pause_next_service_reply(&barrier).await?;
+            let mut resume = tokio::spawn({
+                let managed = managed.clone();
+                let namespace = format!("{scope}/transcript/legacy-session");
+                let journal_key = legacy_journal_key.clone();
+                let expected_journal = legacy_pending_journal.clone();
+                let prefix = prefix.clone();
+                async move {
+                    managed
+                        .checkpoint_session_turn(
+                            &namespace,
+                            "legacy-session",
+                            &[],
+                            &[(journal_key.clone(), legacy_resumed_journal)],
+                            &super::super::SessionTurnCheckpoint::Resume {
+                                expected_generation: 0,
+                                turn_id: "legacy-safe-turn".into(),
+                                legacy: Some(super::super::LegacySessionTurnResume {
+                                    legacy_prefix: prefix,
+                                    journal_key,
+                                    expected_journal,
+                                }),
+                            },
+                        )
+                        .await
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .context("migrated safe-journal resume was not committed before reply loss")??;
-        resume.abort();
-        ensure!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), resume)
-                .await
-                .context("cancelled migrated safe-journal resume did not end")?
-                .is_err_and(|error| error.is_cancelled()),
-            "migrated safe-journal resume completed before its reply was lost"
-        );
-        ensure!(managed.reconcile().await? == Some(true));
-        managed.close().await?;
-        sibling.close().await?;
-        let permit = crate::service::acquire_maintenance_permit(&options).await?;
-        tokio::time::timeout(std::time::Duration::from_secs(10), served)
+            });
+            let _resume_cleanup = AbortOnDrop(resume.abort_handle());
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    () = barrier.wait_sent() => Ok(()),
+                    result = &mut resume => bail!("migrated safe-journal resume completed before reply pause: {result:?}"),
+                }
+            })
             .await
-            .context("migrated safe-journal service owner did not reap")???;
-        drop(permit);
+            .context("migrated safe-journal resume frame was not flushed")??;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let page = sibling
+                        .public_transcript_page("legacy-session", None, 16)
+                        .await?;
+                    if matches!(page.pending.as_ref(), Some(record)
+                        if record.kind == super::super::PublicTurnKind::LegacyContinuation
+                            && record.turn_id == legacy_turn_id)
+                    {
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("migrated safe-journal resume was not committed before reply loss")??;
+            resume.abort();
+            ensure!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), resume)
+                    .await
+                    .context("cancelled migrated safe-journal resume did not end")?
+                    .is_err_and(|error| error.is_cancelled()),
+                "migrated safe-journal resume completed before its reply was lost"
+            );
+            ensure!(managed.reconcile().await? == Some(true));
+            managed.close().await?;
+            sibling.close().await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        crate::test_support::settle(
+            body,
+            served.retire(
+                &options,
+                None,
+                std::time::Duration::from_secs(10),
+                "migrated safe-journal service owner did not reap",
+            ),
+        )
+        .await?;
         let store = super::super::MemoryStore::open(options.clone()).await?;
         let pending_legacy = store
             .public_transcript_page("legacy-session", None, 16)
