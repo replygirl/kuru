@@ -32,9 +32,16 @@ Not part of this change. The draft teardown was never type-checked or run on Win
 ## 6. Review round 1 findings
 
 - [x] 6.1 Hold `spawn_gate::locking_async` across the in-process lifecycle lease acquire and release in `open_error_reap_tests::assert_reaped`, and open every store in those tests through `spawn_gated_open`; no assertion changed and the fixture probe still never waits (review M2a). Landed in 545b0dc4.
-- [x] 6.2 Decide the kuru-runtime/kuru-tui invariant exposure (review M2b): recorded as an accepted residual with a measured bound (verification 2.5, design D5), pending maintainer confirmation; no gate added outside kuru-memory.
+- [x] 6.2 Decide the kuru-runtime/kuru-tui invariant exposure (review M2b). Round 2 recorded it as an accepted residual; that decision was rejected and replaced by task 7.1, which removes the exposure.
 - [x] 6.3 Point the canary at `retire_branch_sessions` with its assertions byte-identical (review S6, design D1 fallback). Landed in cc17e7a3.
 - [x] 6.4 Replace the copied `MANAGED_REAP_ALLOWANCE` with `server::SUPERVISOR_REAP_ALLOWANCE` (review S2; value unchanged, 13 s). Landed in 0f944821.
 - [x] 6.5 Add a test that a failing close is attached to the original open error, and cover the final-validation open arm (review S1, verification 2.4). Landed in 545b0dc4.
 - [x] 6.6 Park the uncommitted Windows draft on its own branch and restore this worktree to the verified head (review S4).
 - [x] 6.7 Fix the Class B kuru-tui fixture the round-2 traces found (`notice_text_never_reaches_the_provider_request_for_a_real_tui_turn`) by closing its store before the root drops, and guard its root (verification 2.6). Landed in 13e81e31.
+
+## 7. Round 3 hardening (review M2 residual rejected)
+
+- [x] 7.1 Replace the fixture guard's non-waiting flock probe with process-local quiescence records (`test_support/engine_ledger.rs`): in-process supervisors stay live until this process reaps them and that reap records the store; `await_store_quiescence` records while it holds the lifecycle lease; `await_managed_quiescence` uses it for the project store and its staging siblings. Add the deterministic tests for an unrecorded store, a duplicated lease descriptor after awaited quiescence, a panicking test, an unreaped owner and a stale record (verification 2.5).
+- [x] 7.2 Move memory data roots under plain `tempfile` directories in consumer test code to the guarded root (review N9): kuru-runtime `accounting_tests::abandoned_dream_keeps_usage_after_reopen_without_advancing_main` and `review_tests` (failed MCP fixture), the kuru-tui integration `ServiceCleanup` roots (14 call sites) and the packaged `embedded_runtime` acceptance root.
+- [ ] 7.3 Exercise the managed-client fence for the session-wait timeout end to end (verification 1.3). Not possible without a product change; see verification 1.3.
+- [x] 7.4 Restate design D5, verification 2.5 and `docs/development.md` for the record-based invariant.

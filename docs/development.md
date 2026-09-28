@@ -388,19 +388,30 @@ directory. The application still holds the project conversation-driver lease,
 so this service boundary does not make simultaneous conversation tests valid.
 
 Dolt panics at close when its data directory disappears before it exits, so a
-fixture root from `kuru_memory::test_support::tempdir()` checks, without
-waiting, that no lifecycle lease or service owner lock beneath it is still
-held when it drops. A live owner always keeps the directory; outside an
-existing failure it also fails the test, naming the test and each live owner. Close every in-process store before the root
-drops; managed fixtures close their clients and then call
-`test_support::await_managed_quiescence(&options)`, which retires the idle
-owner and confirms its Dolt was reaped. A Unix lock released in-process while
-another thread spawns a child stays held by the child's transient descriptor
-until it executes, so kuru-memory tests that take a lifecycle or owner lock
-before a guarded root drops hold `spawn_gate::locking_async` across the
-acquire and release, and open stores through `spawn_gated_open`. That gate is
-test-only inside kuru-memory; in kuru-runtime and kuru-tui the same race can
-rarely fail a test with a released owner reported live, and the root is kept.
+fixture root from `kuru_memory::test_support::tempdir()` requires, when it
+drops, a quiescence record for every memory store beneath it (a directory
+holding a lifecycle lease file, or the store a service owner lock names). It
+never probes a lock: on Unix a lock released in-process can stay held by a
+sibling thread's child between `posix_spawn` and `exec`, so a lock's state
+cannot tell a live owner from a released one. The records are process-local
+and written only on evidence this process observed itself:
+
+- Closing a store records it. Every Dolt supervisor the test process spawns
+  stays live in the ledger until the process reaps that supervisor, and the
+  reap records the store.
+- `test_support::await_managed_quiescence(&options)` retires the idle managed
+  owner, then waits for each project store's lifecycle lease (bounded by the
+  supervisor's reap allowance; a timeout fails the test) and records it while
+  the lease is held. Managed fixtures call it after their clients close.
+- `test_support::await_store_quiescence(&directory, lifecycle_root)` does the
+  same for one store whose engine ran in another process, such as a spawned
+  `kuru` executable.
+
+A record snapshots the engine-written `server.log` and `endpoint.json`; an
+engine that starts later in any process changes them and makes the record
+stale. A store that is unreaped, unrecorded or stale keeps the whole root and,
+outside an existing failure, fails the test, naming the root, the test and
+each store. A test that is already panicking only keeps the root.
 
 The lifecycle-ordering measurements are ignored tests, and their Dolt trace is
 inert unless `KURU_TEST_DOLT_LOG_DIR` names a directory, so neither runs in
