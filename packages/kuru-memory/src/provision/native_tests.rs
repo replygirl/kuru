@@ -27,10 +27,14 @@ async fn gated_verify_version(binary: &Path, private_home: &Path) -> Result<()> 
     verify_version(binary, private_home).await
 }
 
-/// What was true at the instant a retained install stage was reported.
+/// What was true at the instant a retained-stage diagnostic was emitted.
 #[derive(Debug)]
 pub(super) struct RetainedStageObservation {
-    pub published: bool,
+    /// The event's full message.
+    pub message: String,
+    /// The event's `published` field.
+    pub published: Option<bool>,
+    /// The event's `stage` field.
     pub stage: PathBuf,
     /// A fresh handle could not take the installation lock.
     pub lock_held: bool,
@@ -38,11 +42,150 @@ pub(super) struct RetainedStageObservation {
     pub receipted: bool,
 }
 
-/// Observe, through the lease's own test seam, every retained-stage report for
-/// a stage under `scope`, together with the installation lock and receipt
-/// state at the instant it is reported. The seam is path-scoped and runs on
-/// whichever thread resolves the lease, so neither a concurrent test nor the
-/// resolving thread can hide a report; see [`observe_retained_stages`].
+/// The fields a retained-stage observer reads from the `kuru.memory` event.
+#[derive(Default)]
+struct RetainedStageFields {
+    message: String,
+    stage: String,
+    published: Option<bool>,
+}
+
+impl tracing::field::Visit for RetainedStageFields {
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        if field.name() == "published" {
+            self.published = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "stage" => self.stage = format!("{value:?}"),
+            _ => {}
+        }
+    }
+}
+
+type RetainedStageObserverFn = std::sync::Arc<dyn Fn(&RetainedStageFields) + Send + Sync>;
+
+struct RetainedStageObserverEntry {
+    id: u64,
+    scope: PathBuf,
+    observer: RetainedStageObserverFn,
+}
+
+/// Observers of retained-stage events, scoped by the stage path.
+static RETAINED_STAGE_OBSERVERS: std::sync::Mutex<Vec<RetainedStageObserverEntry>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The process-wide recorder of `kuru.memory` retained-stage events.
+///
+/// It is installed once as the global default dispatcher, so every thread
+/// resolves to it: a report is observed on whichever thread resolves the
+/// lease (a cancelled task's drop, a blocking worker or the caller). A
+/// thread-scoped subscriber cannot do this. tracing-core caches callsite
+/// interest process-wide, and while one scoped subscriber is the only
+/// dispatcher, a callsite first reached on a thread without it is cached as
+/// never enabled, hiding the event from the scoped subscriber too (CI run
+/// 36424722859). No other code in this test binary installs a subscriber.
+struct RetainedStageRecorder;
+
+impl tracing::Subscriber for RetainedStageRecorder {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if metadata.target() == "kuru.memory" {
+            tracing::subscriber::Interest::always()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "kuru.memory"
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if event.metadata().target() != "kuru.memory" {
+            return;
+        }
+        let mut fields = RetainedStageFields::default();
+        event.record(&mut fields);
+        if !fields.message.starts_with("retained private install stage") {
+            return;
+        }
+        // Run the observers outside the registry lock: they inspect the
+        // filesystem and the installation lock.
+        let stage = Path::new(&fields.stage);
+        let observers: Vec<RetainedStageObserverFn> = RETAINED_STAGE_OBSERVERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|entry| stage.starts_with(&entry.scope))
+            .map(|entry| std::sync::Arc::clone(&entry.observer))
+            .collect();
+        for observer in observers {
+            observer(&fields);
+        }
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Install [`RetainedStageRecorder`] as the process's global dispatcher once,
+/// then rebuild every cached callsite interest against it.
+///
+/// `Dispatch::new` registers the recorder before the global default is
+/// stored, so a callsite that another thread registered in that gap can have
+/// cached `never` from the then-empty default. tracing-core 0.1.36 links a
+/// callsite into its registry before computing its interest, so the rebuild
+/// here (repeated on every observer registration) reaches it. The one
+/// remaining interleaving, a registration that read the empty default before
+/// the store and wrote its interest after this rebuild, fails loudly as a
+/// missing observation; it cannot pass falsely.
+fn install_retained_stage_recorder() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        tracing::subscriber::set_global_default(RetainedStageRecorder).expect(
+            "the retained-stage recorder is the only global tracing subscriber in kuru-memory's tests",
+        );
+    });
+    tracing::callsite::rebuild_interest_cache();
+}
+
+/// Unregisters its observer when dropped.
+pub(super) struct RetainedStageObserver {
+    id: u64,
+}
+
+impl Drop for RetainedStageObserver {
+    fn drop(&mut self) {
+        RETAINED_STAGE_OBSERVERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|entry| entry.id != self.id);
+    }
+}
+
+/// Observe every `kuru.memory` retained-stage diagnostic whose `stage` lies
+/// under `scope`, recording the event's message and fields together with the
+/// installation lock and receipt state at the instant it is emitted.
+///
+/// The observation is the product's own tracing event, delivered by the
+/// process-wide [`RetainedStageRecorder`]; the registry is scoped by path, so
+/// concurrent tests with separate directories cannot see or hide each other's
+/// events.
 pub(super) fn observe_retained_stage_reports(
     scope: &Path,
     lock_path: &Path,
@@ -50,11 +193,14 @@ pub(super) fn observe_retained_stage_reports(
     RetainedStageObserver,
     std::sync::Arc<std::sync::Mutex<Vec<RetainedStageObservation>>>,
 ) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    install_retained_stage_recorder();
     let observed = std::sync::Arc::<std::sync::Mutex<Vec<_>>>::default();
     let sink = std::sync::Arc::clone(&observed);
     let lock_path = lock_path.to_owned();
-    let guard = observe_retained_stages(scope, move |report| {
-        let receipted = match (report.stage.parent(), report.stage.file_name()) {
+    let observer = move |fields: &RetainedStageFields| {
+        let stage = PathBuf::from(&fields.stage);
+        let receipted = match (stage.parent(), stage.file_name()) {
             (Some(versions), Some(name)) => versions
                 .join(LEFTOVER_STAGE_RECEIPTS)
                 .join(format!("{}.json", name.to_string_lossy()))
@@ -69,13 +215,23 @@ pub(super) fn observe_retained_stage_reports(
         };
         drop(contender);
         sink.lock().unwrap().push(RetainedStageObservation {
-            published: report.published,
-            stage: report.stage.clone(),
+            message: fields.message.clone(),
+            published: fields.published,
+            stage,
             lock_held,
             receipted,
         });
-    });
-    (guard, observed)
+    };
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RETAINED_STAGE_OBSERVERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(RetainedStageObserverEntry {
+            id,
+            scope: scope.to_owned(),
+            observer: std::sync::Arc::new(observer),
+        });
+    (RetainedStageObserver { id }, observed)
 }
 
 /// The `.json` receipts in a `.leftovers` directory. `files::write` keeps its
@@ -1142,7 +1298,11 @@ async fn cancelled_activation_recovery_receipts_a_held_stage_before_releasing_th
     let observed = std::mem::take(&mut *observed.lock().unwrap());
     assert_eq!(observed.len(), 1, "one retention report: {observed:?}");
     assert_eq!(observed[0].stage, stage_container);
-    assert!(!observed[0].published, "{observed:?}");
+    assert_eq!(
+        observed[0].message, "retained private install stage after an unpublished installation",
+        "{observed:?}"
+    );
+    assert_eq!(observed[0].published, Some(false), "{observed:?}");
     assert!(
         observed[0].receipted && observed[0].lock_held,
         "the held stage is receipted and reported before the cache lock is released: {observed:?}"

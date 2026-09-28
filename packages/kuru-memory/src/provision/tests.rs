@@ -1798,7 +1798,11 @@ async fn failed_extraction_receipts_a_refused_stage_before_releasing_the_lock() 
     let observed = std::mem::take(&mut *observed.lock().unwrap());
     assert_eq!(observed.len(), 1, "one retention report: {observed:?}");
     assert_eq!(observed[0].stage, stage);
-    assert!(!observed[0].published, "{observed:?}");
+    assert_eq!(
+        observed[0].message, "retained private install stage after an unpublished installation",
+        "{observed:?}"
+    );
+    assert_eq!(observed[0].published, Some(false), "{observed:?}");
     assert!(
         observed[0].receipted && observed[0].lock_held,
         "the retention is receipted and reported while the lock is held: {observed:?}"
@@ -1893,7 +1897,11 @@ async fn published_stage_retention_is_receipted_before_the_lock_is_released() {
     assert_eq!(fs::read(&binary).unwrap(), SCRIPT);
     let observed = std::mem::take(&mut *observed.lock().unwrap());
     assert_eq!(observed.len(), 1, "one retention report: {observed:?}");
-    assert!(observed[0].published, "{observed:?}");
+    assert_eq!(
+        observed[0].message, "retained private install stage after published engine",
+        "{observed:?}"
+    );
+    assert_eq!(observed[0].published, Some(true), "{observed:?}");
     assert!(
         observed[0].receipted && observed[0].lock_held,
         "the published stage is receipted and reported while the lock is held: {observed:?}"
