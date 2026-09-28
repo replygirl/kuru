@@ -19,6 +19,21 @@
 //! retires the endpoint, so an engine that ran after the record, in any
 //! process, makes it stale. Duplicated lock descriptors (a sibling thread's
 //! child between `posix_spawn` and `exec`) change none of this.
+//!
+//! A native identity names a directory only while it exists: Linux recycles a
+//! removed directory's inode at once, so a new store can carry the `(device,
+//! inode)` of a recorded store that was since removed. A key therefore also
+//! holds the directory's birth time, which a rename preserves and a recycled
+//! identity does not. Where the filesystem reports no birth time the key is
+//! the identity alone, and a record for a removed directory can again stand
+//! for a new one with the same snapshot.
+//!
+//! Every read and write of the ledger, and the fixture guard's whole scan,
+//! runs inside one critical section ([`with`]). Its work is then never
+//! concurrent, so the instrumented coverage counters of this code (plain,
+//! non-atomic increments) cannot lose an update. A lost update in the guard's
+//! scan loop, which every test thread's teardown runs, left a counter
+//! expression negative, which the coverage partition refuses.
 
 use std::{
     collections::HashMap,
@@ -31,12 +46,32 @@ use std::{
     time::SystemTime,
 };
 
+/// A store directory: its identity, and its birth time where the filesystem
+/// reports one.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct Key {
+    identity: Identity,
+    born: Option<SystemTime>,
+}
+
 /// Native identity of a store directory, or its canonical path when the
 /// directory cannot be opened as a private directory.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum Key {
+enum Identity {
     Native([u8; 24]),
     Path(PathBuf),
+}
+
+impl Key {
+    /// The file name of this directory's external lifecycle lease, as the
+    /// Windows `LifecycleLease` names it beneath its `lifecycles` root.
+    pub(crate) fn lease_name(&self) -> Option<String> {
+        let Identity::Native(bytes) = &self.identity else {
+            return None;
+        };
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        Some(format!("{hex}.lock"))
+    }
 }
 
 /// One engine-written file, as far as a later start or stop would change it.
@@ -62,7 +97,7 @@ struct LiveOwner {
 }
 
 #[derive(Default)]
-struct Ledger {
+pub(crate) struct Ledger {
     live: HashMap<u64, LiveOwner>,
     records: HashMap<Key, Snapshot>,
 }
@@ -77,17 +112,23 @@ fn ledger() -> MutexGuard<'static, Option<Ledger>> {
     LEDGER.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn with<T>(action: impl FnOnce(&mut Ledger) -> T) -> T {
+/// Run `action` inside the ledger's single critical section. Nothing called
+/// from it may take the ledger again.
+pub(crate) fn with<T>(action: impl FnOnce(&mut Ledger) -> T) -> T {
     let mut guard = ledger();
     action(guard.get_or_insert_with(Ledger::default))
 }
 
 pub(crate) fn key(directory: &Path) -> Option<Key> {
     let canonical = fs::canonicalize(directory).ok()?;
-    match crate::files::directory(&canonical) {
-        Ok(opened) => Some(Key::Native(opened.identity().to_bytes())),
-        Err(_) => Some(Key::Path(canonical)),
-    }
+    let born = fs::metadata(&canonical)
+        .and_then(|metadata| metadata.created())
+        .ok();
+    let identity = match crate::files::directory(&canonical) {
+        Ok(opened) => Identity::Native(opened.identity().to_bytes()),
+        Err(_) => Identity::Path(canonical),
+    };
+    Some(Key { identity, born })
 }
 
 fn file_state(path: &Path) -> Option<FileState> {
@@ -110,26 +151,23 @@ pub(crate) fn snapshot(directory: &Path) -> Snapshot {
 /// Record that `directory` has no live engine now. Callers hold the evidence
 /// themselves: the store's lifecycle lease, or their own reap of its owner.
 pub(crate) fn record(directory: &Path) {
-    if let Some(key) = key(directory) {
-        record_as(key, directory);
-    }
-}
-
-fn record_as(key: Key, directory: &Path) {
-    let snapshot = snapshot(directory);
-    with(|ledger| ledger.records.insert(key, snapshot));
-}
-
-/// The current record for `directory`, if any.
-pub(crate) fn recorded(key: &Key) -> Option<Snapshot> {
-    with(|ledger| ledger.records.get(key).cloned())
-}
-
-/// Live owners whose store lies beneath `root` (canonical), for a failure
-/// message.
-pub(crate) fn live_under(root: &Path) -> Vec<String> {
     with(|ledger| {
-        let mut owners = ledger
+        if let Some(key) = key(directory) {
+            ledger.records.insert(key, snapshot(directory));
+        }
+    });
+}
+
+impl Ledger {
+    /// The current record for a store, if any.
+    pub(crate) fn recorded(&self, key: &Key) -> Option<&Snapshot> {
+        self.records.get(key)
+    }
+
+    /// Live owners whose store lies beneath `root` (canonical), for a failure
+    /// message.
+    pub(crate) fn live_under(&self, root: &Path) -> Vec<String> {
+        let mut owners = self
             .live
             .values()
             .filter(|owner| owner.directory.starts_with(root))
@@ -144,7 +182,7 @@ pub(crate) fn live_under(root: &Path) -> Vec<String> {
             .collect::<Vec<_>>();
         owners.sort();
         owners
-    })
+    }
 }
 
 /// A spawned supervisor this process has not reaped yet. Drop it only after
@@ -157,26 +195,32 @@ pub(crate) struct LiveEngine {
 /// (canonical, as `Server::open` resolves it).
 pub(crate) fn register(directory: &Path) -> LiveEngine {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let owner = LiveOwner {
-        directory: directory.to_path_buf(),
-        key: key(directory),
-        label: super::lifecycle_trace::label(),
-    };
-    with(|ledger| ledger.live.insert(id, owner));
+    with(|ledger| {
+        let owner = LiveOwner {
+            directory: directory.to_path_buf(),
+            key: key(directory),
+            label: super::lifecycle_trace::label(),
+        };
+        ledger.live.insert(id, owner);
+    });
     LiveEngine { id }
 }
 
 impl Drop for LiveEngine {
     fn drop(&mut self) {
-        let Some(owner) = with(|ledger| ledger.live.remove(&self.id)) else {
-            return;
-        };
-        // The supervisor wrote its final `server.log` and retired its endpoint
-        // before it exited, and this process has reaped it. The key was taken
-        // while the directory was known to be this store.
-        if let Some(key) = owner.key {
-            record_as(key, &owner.directory);
-        }
+        with(|ledger| {
+            // The supervisor wrote its final `server.log` and retired its
+            // endpoint before it exited, and this process has reaped it. The
+            // key was taken while the directory was known to be this store.
+            if let Some(LiveOwner {
+                directory,
+                key: Some(key),
+                ..
+            }) = ledger.live.remove(&self.id)
+            {
+                ledger.records.insert(key, snapshot(&directory));
+            }
+        });
     }
 }
 

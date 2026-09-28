@@ -12,8 +12,13 @@
 //!
 //! - a directory holding `lifecycle.lock` (the Unix lifecycle lease),
 //! - `memory/<hash>` for a `memory/locks/<hash>.service-owner.lock`,
-//! - on Windows, where the lease lives under `lifecycles`, every directory
-//!   holding `identity.json`.
+//! - a directory holding `identity.json` whose native identity names a
+//!   `lifecycles/<identity>.lock` lease (the Windows lifecycle lease, which
+//!   lives outside the store). A supervisor takes that lease before it writes
+//!   `identity.json` and starts Dolt, so a template or an unopened copy,
+//!   which carries `identity.json` but no lease, is not a store.
+//!
+//! Both lease forms are recognised on every platform.
 //!
 //! Each store must then be explained by the process-local ledger
 //! ([`super::engine_ledger`]):
@@ -29,12 +34,15 @@
 //! If any store is unexplained, teardown keeps the whole root, so a live
 //! engine can finish, and fails the test with the fixture, the test and each
 //! store. A thread that is already unwinding keeps the root without a second
-//! panic. The check never waits and writes nothing to stdout or stderr.
+//! panic. The check never waits and writes nothing to stdout or stderr. The
+//! whole scan runs inside the ledger's critical section
+//! ([`engine_ledger::with`]), so no two teardowns execute it concurrently.
 
-use super::engine_ledger::{self, Key};
+use super::engine_ledger::{self, Key, Ledger};
 use crate::files::PrivateTemp;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
 };
@@ -114,39 +122,79 @@ impl Drop for TempDir {
 /// Every store beneath `root` that no quiescence record explains, described
 /// for a failure message.
 pub(crate) fn violations(root: &Path) -> Vec<String> {
+    engine_ledger::with(|ledger| scan(ledger, root))
+}
+
+fn scan(ledger: &Ledger, root: &Path) -> Vec<String> {
     let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let mut found = Vec::new();
+    let mut found = Found::default();
     let mut budget = MAX_ENTRIES;
     collect(root, 0, &mut budget, &mut found);
-    let mut violations = engine_ledger::live_under(&canonical);
+    let mut violations = ledger.live_under(&canonical);
     let mut stores = BTreeMap::new();
-    for store in found {
+    for store in found.leased {
         if let Some(key) = engine_ledger::key(&store) {
+            stores.entry(store).or_insert(key);
+        }
+    }
+    for store in found.identified {
+        if let Some(key) = engine_ledger::key(&store)
+            && key
+                .lease_name()
+                .is_some_and(|name| found.leases.contains(OsStr::new(&name)))
+        {
             stores.entry(store).or_insert(key);
         }
     }
     violations.extend(
         stores
             .into_iter()
-            .filter_map(|(store, key)| unexplained(&store, &key)),
+            .filter_map(|(store, key)| unexplained(ledger, &store, &key)),
     );
     violations
 }
 
-fn unexplained(store: &Path, key: &Key) -> Option<String> {
-    let Some(record) = engine_ledger::recorded(key) else {
+fn unexplained(ledger: &Ledger, store: &Path, key: &Key) -> Option<String> {
+    let Some(record) = ledger.recorded(key) else {
         return Some(format!(
             "store {} has no quiescence record",
             store.display()
         ));
     };
-    (record != engine_ledger::snapshot(store)).then(|| {
+    (*record != engine_ledger::snapshot(store)).then(|| {
         format!(
             "store {} ran an engine after its quiescence record (server.log or endpoint.json \
              changed)",
             store.display()
         )
     })
+}
+
+/// The lease files and store candidates one scan finds.
+#[derive(Default)]
+struct Found {
+    /// Store directories named by an in-store or service-owner lock.
+    leased: Vec<PathBuf>,
+    /// Directories holding `identity.json`.
+    identified: Vec<PathBuf>,
+    /// File names beneath every `lifecycles` directory.
+    leases: BTreeSet<OsString>,
+}
+
+impl Found {
+    fn file(&mut self, directory: &Path, path: &Path) {
+        if let Some(store) = store_of(path) {
+            self.leased.push(store);
+        }
+        let Some(name) = path.file_name() else {
+            return;
+        };
+        if name == "identity.json" {
+            self.identified.push(directory.to_path_buf());
+        } else if directory.file_name() == Some(OsStr::new("lifecycles")) {
+            self.leases.insert(name.to_owned());
+        }
+    }
 }
 
 /// The store directory a lock file beneath the root stands for.
@@ -163,7 +211,7 @@ fn store_of(path: &Path) -> Option<PathBuf> {
         .filter(|store| store.is_dir())
 }
 
-fn collect(directory: &Path, depth: usize, budget: &mut usize, stores: &mut Vec<PathBuf>) {
+fn collect(directory: &Path, depth: usize, budget: &mut usize, found: &mut Found) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -183,15 +231,9 @@ fn collect(directory: &Path, depth: usize, budget: &mut usize, stores: &mut Vec<
         };
         let path = entry.path();
         if kind.is_dir() {
-            collect(&path, depth + 1, budget, stores);
+            collect(&path, depth + 1, budget, found);
         } else if kind.is_file() {
-            if let Some(store) = store_of(&path) {
-                stores.push(store);
-            }
-            #[cfg(windows)]
-            if entry.file_name() == "identity.json" {
-                stores.push(directory.to_path_buf());
-            }
+            found.file(directory, &path);
         }
     }
 }
@@ -204,7 +246,9 @@ mod tests {
     /// A stopped store as its supervisor leaves it: private, with a lease
     /// file and a final `server.log`.
     fn stopped_store(root: &Path) -> PathBuf {
-        let store = root.join("memory/abcdef");
+        // Joined by component, so the expected path matches the one the
+        // guard reads back from the directory on every platform.
+        let store = root.join("memory").join("abcdef");
         for directory in [root.join("memory"), store.clone()] {
             files::private_dir(&directory).unwrap();
         }
@@ -238,9 +282,44 @@ mod tests {
             (root.path().join("cache/versions/install.lock"), None),
         ];
         for (path, store) in expected {
-            assert_eq!(store_of(&path), store, "{}", path.display());
+            // Inside the ledger's section, as every scan calls it.
+            let named = engine_ledger::with(|_| store_of(&path));
+            assert_eq!(named, store, "{}", path.display());
         }
         engine_ledger::record(&store);
+    }
+
+    /// The Windows lease lives outside the store, as
+    /// `lifecycles/<identity>.lock`. A directory holding `identity.json` is a
+    /// store only once such a lease names it: a template or an unopened copy
+    /// carries the file but never ran an engine.
+    #[test]
+    fn an_identified_directory_is_a_store_only_under_its_external_lease() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let memory = root.path().join("memory");
+        let store = memory.join("0123");
+        for directory in [&memory, &store] {
+            files::private_dir(directory).unwrap();
+        }
+        files::write(&store.join("identity.json"), b"{}").unwrap();
+        assert_eq!(violations(root.path()), Vec::<String>::new());
+        let lease = engine_ledger::with(|_| engine_ledger::key(&store))
+            .and_then(|key| key.lease_name())
+            .expect("a private store directory has a native identity");
+        let lifecycles = memory.join("lifecycles");
+        files::private_dir(&lifecycles).unwrap();
+        files::write(&lifecycles.join("00ff.lock"), b"").unwrap();
+        assert_eq!(violations(root.path()), Vec::<String>::new());
+        files::write(&lifecycles.join(lease), b"").unwrap();
+        assert_eq!(
+            violations(root.path()),
+            [format!(
+                "store {} has no quiescence record",
+                store.display()
+            )]
+        );
+        engine_ledger::record(&store);
+        assert_eq!(violations(root.path()), Vec::<String>::new());
     }
 
     #[test]
@@ -260,6 +339,36 @@ mod tests {
                 "{expected:?} missing: {message}"
             );
         }
+        remove_kept(&path);
+    }
+
+    /// A record describes the directory it was taken for, not whichever
+    /// directory later carries the same native identity. Linux recycles a
+    /// removed directory's inode at once, so a new store can share the
+    /// `(device, inode)` of a recorded store that no longer exists. Moving the
+    /// recorded store's birth time stands in for that recycled identity here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_record_for_an_earlier_directory_with_the_same_identity_explains_nothing() {
+        use std::os::darwin::fs::FileTimesExt;
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let store = stopped_store(root.path());
+        engine_ledger::record(&store);
+        assert!(violations(root.path()).is_empty());
+        let born = fs::metadata(&store).unwrap().created().unwrap();
+        fs::File::open(&store)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_created(born - std::time::Duration::from_secs(3600)),
+            )
+            .unwrap();
+        let path = root.path().to_path_buf();
+        let message = panic_message(root);
+        let expected = format!("store {} has no quiescence record", store.display());
+        assert!(
+            message.contains(&expected),
+            "{expected:?} missing: {message}"
+        );
         remove_kept(&path);
     }
 
