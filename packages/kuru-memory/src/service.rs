@@ -1838,8 +1838,10 @@ mod tests {
 
     #[tokio::test]
     async fn inspection_waits_for_a_booting_owner_without_starting_dolt() -> Result<()> {
-        // Held for the whole test: it takes a real owner flock and never spawns,
-        // and the fixture root's teardown probes that lock; see `crate::spawn_gate`.
+        // Held for the whole test: it takes a real owner flock and never spawns.
+        // Since round 3 the fixture root's teardown reads process-local
+        // quiescence records rather than probing this lock; the gate here is
+        // only to keep this test's own owner flock held; see `crate::spawn_gate`.
         let _gate = crate::spawn_gate::locking_async().await;
         let root = crate::test_support::tempdir()?;
         let project = root.path().join("project");
@@ -1938,8 +1940,10 @@ mod tests {
 
     #[tokio::test]
     async fn purge_refuses_a_live_service_owner_before_writing_intent() -> Result<()> {
-        // Held for the whole test: it takes a real owner flock and never spawns,
-        // and the fixture root's teardown probes that lock; see `crate::spawn_gate`.
+        // Held for the whole test: it takes a real owner flock and never spawns.
+        // Since round 3 the fixture root's teardown reads process-local
+        // quiescence records rather than probing this lock; the gate here is
+        // only to keep this test's own owner flock held; see `crate::spawn_gate`.
         let _gate = crate::spawn_gate::locking_async().await;
         let data = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "a".repeat(64));

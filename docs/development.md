@@ -410,7 +410,8 @@ and written only on evidence this process observed itself:
   `kuru` executable.
 
 A kuru-memory fixture that serves an in-process `ServiceOwner` on a task must
-retire it on every exit path, not only at the end of its success path. It keeps
+retire it on every exit path the body itself returns through (an early `?`,
+`bail!` or `ensure!`), not only at the end of its success path. It keeps
 the root, the options and a `test_support::ServedOwner` outside the body it
 judges, captures the body's `Result` while the root lives, and passes it to
 `test_support::settle` with `ServedOwner::retire` (the maintenance permit, then
@@ -422,6 +423,13 @@ failure attached as context.
 When the teardown cannot retire the owner, for example because an aborted
 request still holds a client attachment, the guard still fails the test and its
 panic replaces the returned error; the printed body error remains.
+Open should-fix (final review S1): a fixture that creates its guarded root
+inside the future passed to `tokio::time::timeout(deadline, ...)` does not go
+through this teardown if the deadline elapses first — the future is dropped
+before `settle` runs, so the root can drop under a still-live served owner and
+the fixture guard panics in place of the deadline's own error. The rule above
+covers every exit the body's own control flow reaches; a dropped future is not
+one of those exits. Not yet fixed.
 
 A kuru-memory fixture that releases a lock and takes it again at once through a
 one-shot acquisition, such as a successor `ServiceOwner::open` after its
