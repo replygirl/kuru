@@ -9,7 +9,7 @@
 ## 2. Local development and source installation are unchanged
 
 - [x] 2.1 @integration (agent) `mise ls --current` lists `mr-boxington 1.18.0` both with `KURU_MBX=0` and with it unset, and `mise.toml` and `mise.lock` have no diff -> both resolutions list mr-boxington 1.18.0 and the other seven root tools; `git diff --quiet -- mise.toml mise.lock` succeeds
-- [x] 2.2 @manual (agent) source installers install only `rust` and pass it explicitly to `mise exec`, so exec never installs the rest of the tool set -> `scripts/install.sh:16-17`, `apps/kuru-tui/support/install-source.ps1:20-22` and `kuru update --source` (`apps/kuru-tui/src/cli.rs`) run `mise install rust` and `mise exec rust -- rustc`; an explicit tool argument restricts exec to installing that tool, and task auto-install is already off
+- [x] 2.2 @manual (agent) source installers stay safe under `MISE_EXEC_AUTO_INSTALL=false`, which stops `exec` from installing anything, including a named tool -> `scripts/install.sh:16-17`, `apps/kuru-tui/support/install-source.ps1:20-22` and `kuru update --source` (`apps/kuru-tui/src/cli.rs`) each run an explicit `mise install rust` before `mise exec rust -- rustc`, so `rust` is already installed by the time `exec` runs; `exec` never needs to install it, and task auto-install is already off
 
 ## 3. Documentation
 
