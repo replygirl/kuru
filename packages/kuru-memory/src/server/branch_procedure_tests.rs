@@ -1,20 +1,44 @@
-//! Structural check that a Dolt branch rename or delete is built only from a
-//! [`SessionsEnded`] proof.
+//! Textual backstop for the rule that a Dolt branch rename or delete is built
+//! only from a [`SessionsEnded`] proof.
 //!
-//! The compiler already rejects constructing the proof outside `server.rs`
-//! (its field is private), calling the raw pool retirement (private), reusing
-//! one proof twice (rename and delete consume it) and releasing the admission
-//! fence before the procedure has run (the procedure borrows it). It cannot
-//! see a raw SQL string, so this test rejects any other source of a branch
-//! rename or delete in the crate's non-test code. Test files (`*tests.rs`)
-//! may still issue raw procedures to construct fault states.
+//! The enforcement for typed routes is the compiler-checked token, not this
+//! test: the compiler rejects constructing the proof outside `server.rs` (its
+//! field is private), reusing one proof twice (rename and delete consume it)
+//! and releasing the admission fence before the procedure has run (the
+//! procedure borrows it). Making the raw pool close private is not itself a
+//! guarantee: `Server::close_pool_without_session_end` is `pub(crate)` and does
+//! exactly what the raw close does; it simply cannot produce a proof.
+//!
+//! The compiler cannot see SQL text, so this scan backstops raw SQL. In every
+//! non-test source of the crate, outside `impl SessionsEnded` in `server.rs`,
+//! it rejects any string literal, in either quote style, whose contents are a
+//! rename, delete or force flag of `DOLT_BRANCH` (compared ASCII
+//! case-insensitively and ignoring surrounding spaces). That covers the flag
+//! written inline in SQL, bound as an argument, assigned to a variable or
+//! constant, or placed on another line than the procedure name.
+//!
+//! The rule is file-wide rather than per function because function bounds
+//! cannot be read reliably from text, and it applies to every product file,
+//! not only files that name `dolt_branch`, so a flag constant defined in one
+//! module and used in another is also rejected. Both choices are the stricter
+//! option. The real product sources pass: branch creation passes names only.
+//!
+//! Limits: the scan sees only literal text. A flag assembled at run time (for
+//! example `format!("-{}", "D")`, a concatenation, or bytes decoded from data)
+//! passes it, as does a procedure name assembled at run time. Test files
+//! (`*tests.rs`) are exempt because they construct fault states with raw
+//! procedures.
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
 /// Dolt branch procedure arguments that rename, delete or overwrite a branch.
+/// Matched ASCII case-insensitively, so `-M` and `-F` are rejected as well.
 const DESTRUCTIVE_FLAGS: &[&str] = &["-m", "--move", "-d", "-D", "--delete", "-f", "--force"];
+
+/// Characters that open or close a string literal in Rust or SQL.
+const QUOTES: &[char] = &['"', '\''];
 
 fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(directory).expect("read source directory") {
@@ -27,36 +51,63 @@ fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every violation in one file's text: a `DOLT_BRANCH` call naming a
-/// destructive flag, a destructive flag bound as an argument, or (outside
-/// `server.rs`, where the compiler also rejects it) a struct literal of the
-/// proof.
-fn violations(text: &str, proof_literal_allowed: bool) -> Vec<String> {
+/// Whether the flag at `line[start..end]` is the whole contents of a quoted
+/// literal: after optional spaces, a quote on each side. Backslashes between
+/// the flag and its closing quote are skipped, so an escaped `\"-D\"` inside
+/// a Rust string counts; its opening backslash precedes the quote.
+fn is_quoted(line: &str, start: usize, end: usize) -> bool {
+    let before = line[..start].trim_end_matches([' ', '\t']);
+    let after = line[end..].trim_start_matches([' ', '\t', '\\']);
+    before.ends_with(QUOTES) && after.starts_with(QUOTES)
+}
+
+/// Every quoted destructive-flag literal in `text`, as `line:column: line`.
+fn flag_literals(text: &str) -> Vec<String> {
     let mut found = Vec::new();
     for (index, line) in text.lines().enumerate() {
-        let line_number = index + 1;
+        let lower = line.to_ascii_lowercase();
+        let mut columns: Vec<usize> = Vec::new();
         for flag in DESTRUCTIVE_FLAGS {
-            let quoted = format!("'{flag}'");
-            let bound = format!(".bind(\"{flag}\")");
-            if (line.contains("DOLT_BRANCH") && line.contains(&quoted)) || line.contains(&bound) {
-                found.push(format!("{line_number}: {}", line.trim()));
+            let flag = flag.to_ascii_lowercase();
+            for (start, _) in lower.match_indices(flag.as_str()) {
+                if is_quoted(line, start, start + flag.len()) && !columns.contains(&start) {
+                    columns.push(start);
+                }
             }
         }
-        if !proof_literal_allowed && line.contains("SessionsEnded {") {
-            found.push(format!("{line_number}: {}", line.trim()));
+        columns.sort_unstable();
+        for column in columns {
+            found.push(format!("{}:{}: {}", index + 1, column + 1, line.trim()));
         }
     }
     found
 }
 
-/// The lines of `server.rs` inside `impl<'a> SessionsEnded<'a>`, the only
-/// place a branch procedure may be written.
+/// Every violation in one file's text: a quoted destructive flag, or
+/// (outside `server.rs`, where the compiler also rejects it) a struct literal
+/// of the proof.
+fn violations(text: &str, proof_literal_allowed: bool) -> Vec<String> {
+    let mut found = flag_literals(text);
+    if !proof_literal_allowed {
+        for (index, line) in text.lines().enumerate() {
+            if line.contains("SessionsEnded {") {
+                found.push(format!("{}: {}", index + 1, line.trim()));
+            }
+        }
+    }
+    found
+}
+
+/// `server.rs` with the lines of `impl<'a> SessionsEnded<'a>`, the only place
+/// a branch procedure may be written, blanked (line numbers are kept).
 fn outside_proof_impl(text: &str) -> String {
     let mut inside = false;
+    let mut found = false;
     let mut kept = String::new();
     for line in text.lines() {
         if line.starts_with("impl<'a> SessionsEnded<'a> {") {
             inside = true;
+            found = true;
         } else if inside && line == "}" {
             inside = false;
         } else if !inside {
@@ -64,27 +115,54 @@ fn outside_proof_impl(text: &str) -> String {
         }
         kept.push('\n');
     }
+    assert!(found, "server.rs has no `impl<'a> SessionsEnded<'a>` block");
+    assert!(
+        !inside,
+        "the `impl SessionsEnded` block in server.rs never closed"
+    );
     kept
 }
 
 #[test]
 fn the_scan_rejects_every_raw_branch_rename_or_delete_shape() {
     for bad in [
+        // Shapes reported by review of round 8 (each got 0 violations then).
+        "        let flag = if force { \"-D\" } else { \"-d\" };\n        sqlx::query(\"CALL DOLT_BRANCH(?, ?)\")\n            .bind(flag)\n            .bind(branch)",
+        "sqlx::query(\"CALL dolt_branch('-D', ?)\")",
+        "sqlx::query(\"CALL DOLT_BRANCH(\\\"-D\\\", ?)\")",
+        "sqlx::query(\"CALL DOLT_BRANCH(\n '-D', ?)\")",
+        // Earlier shapes.
         "sqlx::query(\"CALL DOLT_BRANCH('-m', ?, ?)\")",
-        "sqlx::query(\"CALL DOLT_BRANCH('-D', ?)\")",
         "sqlx::query(\"CALL DOLT_BRANCH('--delete', ?)\")",
         ".bind(\"-d\")",
         "let proof = SessionsEnded { admission };",
+        // A flag constant in a module that never names the procedure.
+        "pub(crate) const FORCE_DELETE: &str = \"--delete\";",
+        // A raw string literal with a long force flag.
+        "sqlx::query(r#\"CALL DOLT_BRANCH('--force', ?, ?)\"#)",
+        // Mixed-case procedure and upper-case move flag.
+        "sqlx::query(\"CALL Dolt_Branch('-M', ?, ?)\")",
+        // Upper-case long flag padded with spaces inside its quotes.
+        "sqlx::query(\"CALL DOLT_BRANCH(' --MOVE ', ?, ?)\")",
+        // A flag in an argument array bound in a loop.
+        "for argument in [\"-f\", name, base] { query = query.bind(argument); }",
+        // A flag returned by a helper, away from the procedure that binds it.
+        "fn delete_flag() -> &'static str {\n    \"-D\"\n}",
     ] {
-        assert_eq!(violations(bad, false).len(), 1, "scan missed {bad}");
+        assert!(!violations(bad, false).is_empty(), "scan missed {bad}");
     }
-    for create in [
+    for accepted in [
         "sqlx::query(\"CALL DOLT_BRANCH(?, ?)\").bind(&name).bind(&base)",
         "sqlx::query(\"CALL DOLT_BRANCH('candidate_test')\")",
+        "sqlx::query(\"SELECT name FROM dolt_branches WHERE name = ?\")",
+        "let name = \"--delete-me\"; let other = \"-dx\"; let third = \"x-d\";",
+        "impl<'a> Proof<'a> { fn branch(&self) -> &'a str { self.name } }",
+        "// a checked delete (`-d`) and a forced one (`-D`)",
     ] {
-        assert!(
-            violations(create, false).is_empty(),
-            "scan rejected {create}"
+        assert_eq!(
+            violations(accepted, false),
+            Vec::<String>::new(),
+            "scan rejected {accepted}"
         );
     }
 }
@@ -111,9 +189,18 @@ fn branch_renames_and_deletes_are_built_only_from_a_sessions_ended_proof() {
         let text = fs::read_to_string(file).expect("read source file");
         let is_server = *file == server;
         let text = if is_server {
-            let procedures = text.matches("sqlx::query(\"CALL DOLT_BRANCH(").count();
+            // The scan must see the real procedures: two `-m` renames and the
+            // `-D`/`-d` delete flag, all inside `impl SessionsEnded`.
             assert_eq!(
-                procedures, 3,
+                flag_literals(&text).len(),
+                4,
+                "server.rs should name exactly the rename, exclusion probe and \
+                 two delete flags: {:?}",
+                flag_literals(&text)
+            );
+            assert_eq!(
+                text.matches("sqlx::query(\"CALL DOLT_BRANCH(").count(),
+                3,
                 "server.rs should build exactly the rename, exclusion probe and delete"
             );
             outside_proof_impl(&text)
