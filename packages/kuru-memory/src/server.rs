@@ -123,6 +123,63 @@ struct ServerInner {
     closed: AtomicBool,
 }
 
+/// One branch's pool admission fence: while it lives, [`Server::pool`] cannot
+/// open a Kuru session on the branch.
+pub(crate) struct BranchAdmission {
+    branch: String,
+    _gate: OwnedMutexGuard<()>,
+}
+
+/// A checked Dolt branch procedure, built with the SQLx lifetime of the
+/// admission it was proven under.
+pub(crate) type BranchProcedure<'a> =
+    sqlx::query::Query<'a, sqlx::MySql, sqlx::mysql::MySqlArguments>;
+
+/// Proof that the server has ended every session on one fenced branch.
+///
+/// Only [`Server::retire_branch_sessions`] constructs it (its field is private
+/// to this module), and the only rename, delete and exclusion-probe
+/// procedures for a branch are built from it. A call site therefore cannot
+/// rename or delete a branch without first retiring its pool and awaiting
+/// server-observed session end. It borrows the admission fence, and each
+/// procedure it builds carries that borrow, so the fence cannot be released
+/// before the procedure has run. Not `Clone`: rename and delete consume it.
+#[must_use = "a branch's sessions were retired to run a branch procedure"]
+pub(crate) struct SessionsEnded<'a> {
+    admission: &'a BranchAdmission,
+}
+
+impl<'a> SessionsEnded<'a> {
+    /// The branch whose sessions ended.
+    pub(crate) fn branch(&self) -> &'a str {
+        &self.admission.branch
+    }
+
+    /// The checked rename of this branch to `to`.
+    pub(crate) fn rename(self, to: &str) -> BranchProcedure<'a> {
+        sqlx::query("CALL DOLT_BRANCH('-m', ?, ?)")
+            .bind(self.admission.branch.as_str())
+            .bind(to.to_owned())
+    }
+
+    /// The checked self-rename that asks the server itself to confirm no
+    /// session holds this branch; it leaves the ref unchanged on success.
+    pub(crate) fn exclusion_probe(&self) -> BranchProcedure<'a> {
+        sqlx::query("CALL DOLT_BRANCH('-m', ?, ?)")
+            .bind(self.admission.branch.as_str())
+            .bind(self.admission.branch.as_str())
+    }
+
+    /// Delete this branch: checked (`-d`), or `-D` when `force`, which skips
+    /// Dolt's in-use check and so needs a prior [`Self::exclusion_probe`].
+    pub(crate) fn delete(self, force: bool) -> BranchProcedure<'a> {
+        let flag = if force { "-D" } else { "-d" };
+        sqlx::query("CALL DOLT_BRANCH(?, ?)")
+            .bind(flag)
+            .bind(self.admission.branch.as_str())
+    }
+}
+
 impl fmt::Debug for Server {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Server")
@@ -823,7 +880,7 @@ impl Server {
     /// Prevent a new pool for one branch while its checked status transition
     /// retires server sessions and observes the resulting ref. The short map
     /// lookup never holds a global lock across Dolt work.
-    pub(crate) async fn fence_pool(&self, branch: &str) -> Result<OwnedMutexGuard<()>> {
+    pub(crate) async fn fence_pool(&self, branch: &str) -> Result<BranchAdmission> {
         validate_branch(branch)?;
         let gate = {
             let mut gates = self.0.pool_admission.lock().await;
@@ -836,7 +893,10 @@ impl Server {
                 gate
             }
         };
-        Ok(gate.lock_owned().await)
+        Ok(BranchAdmission {
+            branch: branch.to_owned(),
+            _gate: gate.lock_owned().await,
+        })
     }
 
     #[cfg(test)]
@@ -857,7 +917,68 @@ impl Server {
         }
     }
 
-    pub(crate) async fn retire_pool(&self, branch: &str) -> Result<()> {
+    /// Close Kuru's pool for `branch` without waiting for the server to end
+    /// its sessions. It releases the pool early and nothing more: a branch
+    /// rename or delete still requires [`Self::retire_branch_sessions`], whose
+    /// [`SessionsEnded`] the branch procedures take.
+    pub(crate) async fn close_pool_without_session_end(&self, branch: &str) -> Result<()> {
+        self.retire_pool(branch).await
+    }
+
+    /// Retire Kuru's pool for the fenced branch, then wait until the server
+    /// itself no longer lists a session on it. Closing the client pool is not
+    /// enough: Dolt removes a session only when its per-connection loop
+    /// observes the close, and until then a checked rename, delete or
+    /// exclusion probe of the branch is refused as in use. The admission
+    /// fence keeps any Kuru session from reopening the branch, and the
+    /// returned proof borrows it, so the fence outlives every procedure the
+    /// proof builds. `observer` must select a different branch.
+    pub(crate) async fn retire_branch_sessions<'a>(
+        &self,
+        admission: &'a BranchAdmission,
+        observer: &MySqlPool,
+        deadline: Duration,
+    ) -> Result<SessionsEnded<'a>> {
+        self.retire_pool(&admission.branch).await?;
+        self.await_branch_sessions_end(observer, &admission.branch, deadline)
+            .await?;
+        Ok(SessionsEnded { admission })
+    }
+
+    /// Wait, within `duration`, until the server lists no session on
+    /// `kuru/<branch>`. Observation alone; it grants no branch procedure.
+    pub(crate) async fn await_branch_sessions_end(
+        &self,
+        observer: &MySqlPool,
+        branch: &str,
+        duration: Duration,
+    ) -> Result<()> {
+        let database = format!("kuru/{branch}");
+        timeout(duration, async {
+            loop {
+                let active: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM information_schema.processlist WHERE BINARY DB = BINARY ?",
+                )
+                .bind(&database)
+                .fetch_one(observer)
+                .await?;
+                if active == 0 {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                #[cfg(test)]
+                self.notify_candidate_wait().await;
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("candidate source session retirement deadline exceeded")?
+    }
+
+    /// The raw pool close. Private: outside this module a pool is released
+    /// only through [`Self::close_pool_without_session_end`], whose name
+    /// states what it does not guarantee, or through the ordered
+    /// [`Self::retire_branch_sessions`].
+    async fn retire_pool(&self, branch: &str) -> Result<()> {
         validate_branch(branch)?;
         let pool = self
             .0
@@ -2254,6 +2375,9 @@ mod stale_endpoint_tests {
     }
 }
 
+#[cfg(test)]
+#[path = "server/branch_procedure_tests.rs"]
+mod branch_procedure_tests;
 #[cfg(test)]
 #[path = "server/startup_budget_tests.rs"]
 mod startup_budget_tests;

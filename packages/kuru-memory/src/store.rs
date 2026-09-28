@@ -26,7 +26,7 @@ use crate::{
     migration::{self, LegacyImport, MigrationReceipt},
     progress::ProgressReporter,
     provision,
-    server::{LifecycleLease, Server, ServerOptions},
+    server::{BranchAdmission, LifecycleLease, Server, ServerOptions, SessionsEnded},
 };
 
 #[cfg(test)]
@@ -909,7 +909,7 @@ impl Candidate {
                 fail_candidate_cleanup_once(&live)?;
                 live.shared
                     .server
-                    .retire_pool(&names.open)
+                    .close_pool_without_session_end(&names.open)
                     .await
                     .context(CandidateFailureStage::PoolRetirement)?;
                 cleanup_promoted_candidate(&live, &names, &target)
@@ -954,7 +954,7 @@ impl Candidate {
             fail_candidate_cleanup_once(&live)?;
             live.shared
                 .server
-                .retire_pool(&names.open)
+                .close_pool_without_session_end(&names.open)
                 .await
                 .context(CandidateFailureStage::PoolRetirement)?;
             cleanup_promoted_candidate(&live, &names, &target)
@@ -1010,7 +1010,7 @@ impl Candidate {
             }
             live.shared
                 .server
-                .retire_pool(&names.open)
+                .close_pool_without_session_end(&names.open)
                 .await
                 .context(CandidateFailureStage::PoolRetirement)?;
             abandon_candidate(&live, &names).await
@@ -1120,7 +1120,7 @@ async fn candidate_branch_is_clean(store: &MemoryStore, branch: &str) -> Result<
     let cleanup = store
         .shared
         .server
-        .retire_pool(branch)
+        .close_pool_without_session_end(branch)
         .await
         .context(CandidateFailureStage::PoolRetirement);
     match (result, cleanup) {
@@ -1171,24 +1171,21 @@ async fn preserve_resolved_cleanup(
     Ok(())
 }
 
-/// Retire Kuru's pool for `branch`, then wait until the server itself no
-/// longer lists a session on it. Closing the client pool is not enough: Dolt
-/// removes a session only when its per-connection loop observes the close,
-/// and until then a checked rename, delete or exclusion probe of the branch
-/// is refused as in use. The caller holds the branch's pool admission fence,
-/// so no Kuru session can reopen it before the branch procedure.
-async fn retire_branch_sessions(
+/// Retire Kuru's pool for the fenced branch, then wait until the server
+/// itself no longer lists a session on it ([`Server::retire_branch_sessions`],
+/// observed through this store's own pool). The returned proof is the only
+/// way to build a rename, delete or exclusion probe of the branch.
+///
+/// [`Server::retire_branch_sessions`]: crate::server::Server::retire_branch_sessions
+async fn retire_branch_sessions<'a>(
     store: &MemoryStore,
-    branch: &str,
+    admission: &'a BranchAdmission,
     retirement_deadline: Duration,
-) -> Result<()> {
+) -> Result<SessionsEnded<'a>> {
     store
         .shared
         .server
-        .retire_pool(branch)
-        .await
-        .context(CandidateFailureStage::PoolRetirement)?;
-    await_branch_sessions_end(store, branch, retirement_deadline)
+        .retire_branch_sessions(admission, store.pool.as_ref(), retirement_deadline)
         .await
         .context(CandidateFailureStage::PoolRetirement)
 }
@@ -1216,7 +1213,7 @@ async fn transition_candidate_with_retirement_deadline(
         .fence_pool(source)
         .await
         .context(CandidateFailureStage::PoolRetirement)?;
-    retire_branch_sessions(store, source, retirement_deadline).await?;
+    let sessions = retire_branch_sessions(store, &source_admission, retirement_deadline).await?;
     let (mut connection, id) = owned_connection(&store.pool).await?;
     *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
         pool: store.pool.clone(),
@@ -1229,10 +1226,7 @@ async fn transition_candidate_with_retirement_deadline(
     });
     let result = tokio::time::timeout(
         QUERY_TIMEOUT,
-        sqlx::query("CALL DOLT_BRANCH('-m', ?, ?)")
-            .bind(source)
-            .bind(status)
-            .fetch_all(&mut connection),
+        sessions.rename(status).fetch_all(&mut connection),
     )
     .await;
     drop(connection);
@@ -1297,19 +1291,19 @@ async fn delete_candidate_ref(
     // and wait for server-observed session end after the last Kuru session
     // on the branch (including cleanup's working-set inspection) closed.
     // Admission stays fenced through the branch procedure and its settlement.
-    let _admission = store
+    let admission = store
         .shared
         .server
         .fence_pool(branch)
         .await
         .context(CandidateFailureStage::PoolRetirement)?;
-    retire_branch_sessions(store, branch, retirement_deadline).await?;
+    let sessions = retire_branch_sessions(store, &admission, retirement_deadline).await?;
     if force {
         // `-D` skips Dolt's in-use check, so this checked self-rename remains
         // the server's own confirmation that no session holds the branch. It
         // also sees sessions whose processlist database is not branch
         // qualified, which the wait above cannot.
-        confirm_no_live_candidate_session(store, branch, expected).await?;
+        confirm_no_live_candidate_session(store, &sessions, expected).await?;
     }
     let (mut connection, id) = owned_connection(&store.pool).await?;
     *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
@@ -1320,13 +1314,9 @@ async fn delete_candidate_ref(
             expected: expected.to_owned(),
         },
     });
-    let flag = if force { "-D" } else { "-d" };
     let result = tokio::time::timeout(
         QUERY_TIMEOUT,
-        sqlx::query("CALL DOLT_BRANCH(?, ?)")
-            .bind(flag)
-            .bind(branch)
-            .fetch_all(&mut connection),
+        sessions.delete(force).fetch_all(&mut connection),
     )
     .await;
     drop(connection);
@@ -1345,9 +1335,10 @@ async fn delete_candidate_ref(
 
 async fn confirm_no_live_candidate_session(
     store: &MemoryStore,
-    branch: &str,
+    sessions: &SessionsEnded<'_>,
     expected: &str,
 ) -> Result<()> {
+    let branch = sessions.branch();
     let (mut connection, id) = owned_connection(&store.pool).await?;
     *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
         pool: store.pool.clone(),
@@ -1359,10 +1350,7 @@ async fn confirm_no_live_candidate_session(
     });
     let result = tokio::time::timeout(
         QUERY_TIMEOUT,
-        sqlx::query("CALL DOLT_BRANCH('-m', ?, ?)")
-            .bind(branch)
-            .bind(branch)
-            .fetch_all(&mut connection),
+        sessions.exclusion_probe().fetch_all(&mut connection),
     )
     .await;
     drop(connection);
@@ -7250,30 +7238,19 @@ async fn await_session_end(pool: &MySqlPool, id: u64, duration: Duration) -> Res
     .context("memory SQL session teardown deadline exceeded")?
 }
 
+/// Observe server-side session end on `kuru/<branch>` through this store's
+/// own pool, without retiring anything or granting a branch procedure.
+#[cfg(test)]
 async fn await_branch_sessions_end(
     store: &MemoryStore,
     branch: &str,
     duration: Duration,
 ) -> Result<()> {
-    let database = format!("kuru/{branch}");
-    tokio::time::timeout(duration, async {
-        loop {
-            let active: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM information_schema.processlist WHERE BINARY DB = BINARY ?",
-            )
-            .bind(&database)
-            .fetch_one(store.pool.as_ref())
-            .await?;
-            if active == 0 {
-                return Ok::<_, anyhow::Error>(());
-            }
-            #[cfg(test)]
-            store.shared.server.notify_candidate_wait().await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .context("candidate source session retirement deadline exceeded")?
+    store
+        .shared
+        .server
+        .await_branch_sessions_end(store.pool.as_ref(), branch, duration)
+        .await
 }
 
 async fn operation_exists(pool: &MySqlPool, operation: &str) -> Result<bool> {
