@@ -83,17 +83,40 @@ fn flag_literals(text: &str) -> Vec<String> {
     found
 }
 
+/// Every struct literal of the proof in `text`, as `line: line`: the name,
+/// optionally a turbofish, then an opening brace, with or without spaces.
+/// Comment lines are skipped; a type position (`SessionsEnded<'a>`) is not a
+/// construction.
+fn proof_constructions(text: &str) -> Vec<String> {
+    const PROOF: &str = "SessionsEnded";
+    let mut found = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        for (start, _) in line.match_indices(PROOF) {
+            let mut rest = line[start + PROOF.len()..].trim_start();
+            if let Some(generics) = rest.strip_prefix("::<") {
+                rest = generics
+                    .split_once('>')
+                    .map_or("", |(_, after)| after)
+                    .trim_start();
+            }
+            if rest.starts_with('{') {
+                found.push(format!("{}: {}", index + 1, line.trim()));
+            }
+        }
+    }
+    found
+}
+
 /// Every violation in one file's text: a quoted destructive flag, or
 /// (outside `server.rs`, where the compiler also rejects it) a struct literal
 /// of the proof.
 fn violations(text: &str, proof_literal_allowed: bool) -> Vec<String> {
     let mut found = flag_literals(text);
     if !proof_literal_allowed {
-        for (index, line) in text.lines().enumerate() {
-            if line.contains("SessionsEnded {") {
-                found.push(format!("{}: {}", index + 1, line.trim()));
-            }
-        }
+        found.extend(proof_constructions(text));
     }
     found
 }
@@ -121,6 +144,33 @@ fn outside_proof_impl(text: &str) -> String {
         "the `impl SessionsEnded` block in server.rs never closed"
     );
     kept
+}
+
+/// Every violation in `server.rs`'s text: a quoted destructive flag outside
+/// `impl SessionsEnded`, a `Self` literal inside it, and any number of proof
+/// constructions other than exactly one (the one where the wait returned).
+fn server_violations(text: &str) -> Vec<String> {
+    let outside = outside_proof_impl(text);
+    let mut found = violations(&outside, true);
+    for (index, (line, kept)) in text.lines().zip(outside.lines()).enumerate() {
+        let compact: String = line.split_whitespace().collect();
+        if kept.is_empty() && !line.is_empty() && compact.contains("Self{") {
+            found.push(format!(
+                "{}: a proof literal inside impl SessionsEnded: {}",
+                index + 1,
+                line.trim()
+            ));
+        }
+    }
+    let constructions = proof_constructions(text);
+    if constructions.len() != 1 {
+        found.push(format!(
+            "server.rs must construct SessionsEnded exactly once, where the session wait \
+             returned; found {}: {constructions:?}",
+            constructions.len()
+        ));
+    }
+    found
 }
 
 #[test]
@@ -188,7 +238,7 @@ fn branch_renames_and_deletes_are_built_only_from_a_sessions_ended_proof() {
         scanned += 1;
         let text = fs::read_to_string(file).expect("read source file");
         let is_server = *file == server;
-        let text = if is_server {
+        let found = if is_server {
             // The scan must see the real procedures: two `-m` renames and the
             // `-D`/`-d` delete flag, all inside `impl SessionsEnded`.
             assert_eq!(
@@ -203,11 +253,11 @@ fn branch_renames_and_deletes_are_built_only_from_a_sessions_ended_proof() {
                 3,
                 "server.rs should build exactly the rename, exclusion probe and delete"
             );
-            outside_proof_impl(&text)
+            server_violations(&text)
         } else {
-            text
+            violations(&text, false)
         };
-        for violation in violations(&text, is_server) {
+        for violation in found {
             rejected.push(format!(
                 "{}:{violation}",
                 file.strip_prefix(&root).unwrap_or(file).display()
@@ -220,5 +270,52 @@ fn branch_renames_and_deletes_are_built_only_from_a_sessions_ended_proof() {
         "a Dolt branch rename or delete must be built from SessionsEnded \
          (Server::retire_branch_sessions), never written directly:\n{}",
         rejected.join("\n")
+    );
+}
+
+/// `server.rs` may construct the proof exactly once, where the wait returned:
+/// a second construction anywhere in the file, with or without a space before
+/// its brace, is rejected.
+#[test]
+fn the_server_scan_rejects_a_second_proof_construction() {
+    let server = |extra: &str| {
+        format!(
+            "pub(crate) struct SessionsEnded<'a> {{\n    admission: &'a BranchAdmission,\n}}\n\
+             impl<'a> SessionsEnded<'a> {{\n    fn rename(&self) {{}}\n}}\n\
+             async fn retire_branch_sessions() {{\n        Ok(SessionsEnded {{ admission }})\n}}\n{extra}"
+        )
+    };
+    assert_eq!(server_violations(&server("")), Vec::<String>::new());
+    for second in [
+        "fn forge(admission: &BranchAdmission) -> SessionsEnded<'_> {\n    SessionsEnded { admission }\n}\n",
+        "fn forge(admission: &BranchAdmission) -> SessionsEnded<'_> {\n    SessionsEnded{admission}\n}\n",
+        "fn forge(admission: &BranchAdmission) -> SessionsEnded<'_> {\n    SessionsEnded::<'_> { admission }\n}\n",
+    ] {
+        assert!(
+            !server_violations(&server(second)).is_empty(),
+            "the server scan accepted a second proof construction: {second}"
+        );
+    }
+}
+
+/// A `Self` literal inside `impl SessionsEnded` and a file with no
+/// construction at all are rejected too.
+#[test]
+fn the_server_scan_rejects_a_self_literal_and_a_missing_construction() {
+    let with_self = "impl<'a> SessionsEnded<'a> {\n    fn copy(&self) -> Self {\n        Self { admission: self.admission }\n    }\n}\nfn wait() {\n    Ok(SessionsEnded { admission })\n}\n";
+    assert!(
+        server_violations(with_self)
+            .iter()
+            .any(|violation| violation.contains("inside impl SessionsEnded")),
+        "{:?}",
+        server_violations(with_self)
+    );
+    let without = "impl<'a> SessionsEnded<'a> {\n    fn rename(&self) {}\n}\n";
+    assert!(
+        server_violations(without)
+            .iter()
+            .any(|violation| violation.contains("exactly once")),
+        "{:?}",
+        server_violations(without)
     );
 }
