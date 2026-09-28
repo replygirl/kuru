@@ -1812,7 +1812,7 @@ async fn cancellation_after_compact_settlement_drains_the_atomic_checkpoint() {
         harness.shutdown(false).await.unwrap();
         sibling.close().await.unwrap();
         memory.close().await.unwrap();
-        kuru_memory::test_support::retire_idle_service(&options)
+        kuru_memory::test_support::await_managed_quiescence(&options)
             .await
             .unwrap();
     })
@@ -1916,7 +1916,7 @@ async fn unrelated_peer_write_during_compact_inference_preserves_source_and_usag
         assert_eq!(provider.compact_streams.load(Ordering::SeqCst), 1);
         harness.shutdown(false).await.unwrap();
         memory.close().await.unwrap();
-        kuru_memory::test_support::retire_idle_service(&options)
+        kuru_memory::test_support::await_managed_quiescence(&options)
             .await
             .unwrap();
     })
@@ -2229,7 +2229,7 @@ async fn accepted_compact_checkpoint_lost_reply_reconciles_on_a_successor_withou
 
         harness.shutdown(false).await.unwrap();
         harness.memory.clone().close().await.unwrap();
-        kuru_memory::test_support::retire_idle_service(&options)
+        kuru_memory::test_support::await_managed_quiescence(&options)
             .await
             .unwrap();
     })
@@ -2400,7 +2400,7 @@ async fn manual_compact_reports_its_immutable_checkpoint_after_a_concurrent_adva
         harness.shutdown(false).await.unwrap();
         sibling.close().await.unwrap();
         memory.close().await.unwrap();
-        kuru_memory::test_support::retire_idle_service(&options)
+        kuru_memory::test_support::await_managed_quiescence(&options)
             .await
             .unwrap();
     })
@@ -2554,7 +2554,7 @@ async fn ordinary_context_refuses_a_shared_summary_changed_after_its_window_read
         harness.shutdown(false).await.unwrap();
         sibling.close().await.unwrap();
         memory.close().await.unwrap();
-        kuru_memory::test_support::retire_idle_service(&options)
+        kuru_memory::test_support::await_managed_quiescence(&options)
             .await
             .unwrap();
     })
@@ -2705,7 +2705,7 @@ async fn ordinary_context_refuses_a_cursor_advanced_after_its_prior_summary_read
         harness.shutdown(false).await.unwrap();
         sibling.close().await.unwrap();
         memory.close().await.unwrap();
-        kuru_memory::test_support::retire_idle_service(&options)
+        kuru_memory::test_support::await_managed_quiescence(&options)
             .await
             .unwrap();
     })

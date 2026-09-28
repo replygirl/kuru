@@ -98,7 +98,7 @@ impl ServiceCleanup {
                 runtime.block_on(async move {
                     for (data, scope) in projects {
                         let options = kuru_memory::OpenOptions::new(data, scope);
-                        kuru_memory::test_support::retire_idle_service(&options)
+                        kuru_memory::test_support::await_managed_quiescence(&options)
                             .await
                             .with_context(|| {
                                 format!("retire fixture memory owner for {}", options.project_scope)

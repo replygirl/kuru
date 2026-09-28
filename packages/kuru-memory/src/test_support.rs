@@ -21,7 +21,9 @@
 //! migration, legacy import or activation, and for any test that compares
 //! instance identity, credentials or migration receipts, or that needs
 //! migrations to run. When in doubt, use the cold constructor.
-pub use crate::files::PrivateTemp as TempDir;
+/// Fixture roots whose teardown refuses to release a live memory owner.
+mod fixture_dir;
+pub use fixture_dir::TempDir;
 /// Env-gated lifecycle ordering measurement trace (inert unless enabled).
 pub mod lifecycle_trace;
 pub(crate) mod template;
@@ -293,6 +295,51 @@ pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
     drop(permit);
     Ok(())
 }
+
+/// Wait until a managed fixture's store has no live Dolt, before its data
+/// root is released.
+///
+/// The managed service deliberately outlives its last client by an idle
+/// grace, so closing every client does not stop its engine. Call this after
+/// every client handle for `options` has closed (an attached client makes
+/// [`retire_idle_service`] fail with "active clients"). It retires the idle
+/// owner, whose owner lock is released only after its Dolt is reaped, and
+/// then acquires and releases the store's lifecycle lease, bounded by the
+/// supervisor's own reap allowance. The product's asynchronous idle close is
+/// unchanged; only fixtures wait for it.
+pub async fn await_managed_quiescence(options: &OpenOptions) -> Result<()> {
+    retire_idle_service(options).await?;
+    let directory = crate::store::project_directory(&options.data_dir, &options.project_scope)?;
+    if !lifecycle_trace::exists(&directory) {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    let lifecycle_root: Option<PathBuf> = None;
+    #[cfg(windows)]
+    let lifecycle_root = Some(options.data_dir.join("memory/lifecycles"));
+    // Acquires a real lifecycle flock; see `crate::spawn_gate`.
+    #[cfg(test)]
+    let _gate = crate::spawn_gate::locking_async().await;
+    let lease = crate::server::Server::quiescence_at(
+        &directory,
+        lifecycle_root.as_deref(),
+        MANAGED_REAP_ALLOWANCE,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "managed fixture store {} kept a live Dolt after its owner retired",
+            directory.display()
+        )
+    })?;
+    drop(lease);
+    Ok(())
+}
+
+/// The supervisor's reap allowance (`server::SUPERVISOR_REAP_ALLOWANCE`: the
+/// 8 s graceful stop, the 3 s kill grace and the transport allowance).
+const MANAGED_REAP_ALLOWANCE: Duration =
+    Duration::from_secs(11).saturating_add(crate::server::SUPERVISOR_TRANSPORT_ALLOWANCE);
 
 #[cfg(test)]
 pub(crate) async fn open_local_fixture(options: OpenOptions) -> Result<crate::store::MemoryStore> {

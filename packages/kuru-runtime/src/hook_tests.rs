@@ -1104,7 +1104,7 @@ async fn lost_annotation_reply_reconciles_the_exact_session_without_replaying_ef
     drop(harness);
     memory.close().await.unwrap();
     sibling.close().await.unwrap();
-    kuru_memory::test_support::retire_idle_service(&options)
+    kuru_memory::test_support::await_managed_quiescence(&options)
         .await
         .unwrap();
 }

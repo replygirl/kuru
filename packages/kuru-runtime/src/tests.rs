@@ -387,6 +387,8 @@ async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() 
             .any(|event| event.kind() == "speaker-selection" && event.detail() == "active-focus")
     );
     resumed.shutdown(false).await.unwrap();
+    // Reap the reopened store's Dolt before `data` is released.
+    memory.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -2408,10 +2410,14 @@ async fn sessions_resume_mode_and_memory_and_projects_do_not_share_namespaces() 
     )
     .await
     .unwrap();
-    let another = Harness::new(config, other.path(), other_memory, fake, None)
+    let another = Harness::new(config, other.path(), other_memory.clone(), fake, None)
         .await
         .unwrap();
     assert_ne!(resumed.scope, another.scope);
+    // Reap both stores' Dolt before `db` is released.
+    drop((resumed, another));
+    memory.close().await.unwrap();
+    other_memory.close().await.unwrap();
 }
 
 #[tokio::test]

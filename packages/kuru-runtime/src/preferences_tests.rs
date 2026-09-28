@@ -125,6 +125,9 @@ async fn preferences_survive_reopening_without_resuming_chats_or_crossing_projec
             .unwrap(),
         preferences
     );
+    // Reap the reopened store's Dolt before `state` is released.
+    drop(resumed);
+    memory.close().await.unwrap();
 }
 
 #[tokio::test]

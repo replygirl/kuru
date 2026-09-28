@@ -702,6 +702,8 @@ async fn undo_is_a_new_revision_that_preserves_later_chats_preferences_and_archi
     assert!(harness.resolve(&added).is_err());
     assert!(harness.undo_dream().await.is_err());
     harness.shutdown(false).await.unwrap();
+    // Reap the reopened store's Dolt before `data` is released.
+    harness.memory.clone().close().await.unwrap();
 }
 
 #[tokio::test]

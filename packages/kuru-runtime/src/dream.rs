@@ -1112,6 +1112,9 @@ mod cancellation_tests {
             observer.close().await?;
             sibling.close().await?;
             memory.close().await?;
+            // The managed owner outlives its last client by its idle grace;
+            // release `data` only after that owner has reaped its Dolt.
+            kuru_memory::test_support::await_managed_quiescence(&options).await?;
             }
             Ok::<(), anyhow::Error>(())
         }).await.context("managed lost-promotion fixture exceeded 150 seconds")??;
