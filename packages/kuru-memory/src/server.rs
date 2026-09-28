@@ -67,7 +67,7 @@ const KILL_GRACE: Duration = Duration::from_secs(3);
 pub(crate) const SUPERVISOR_TRANSPORT_ALLOWANCE: Duration = Duration::from_secs(2);
 /// Bound for the supervisor to stop Dolt gracefully, kill it, and report its
 /// own exit after its lifetime closes. `finish_owner` enforces it.
-const SUPERVISOR_REAP_ALLOWANCE: Duration = CLOSE_GRACE
+pub(crate) const SUPERVISOR_REAP_ALLOWANCE: Duration = CLOSE_GRACE
     .saturating_add(KILL_GRACE)
     .saturating_add(SUPERVISOR_TRANSPORT_ALLOWANCE);
 /// A dropped owner's background observer warns only once the supervisor has

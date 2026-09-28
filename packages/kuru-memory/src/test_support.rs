@@ -323,7 +323,7 @@ pub async fn await_managed_quiescence(options: &OpenOptions) -> Result<()> {
     let lease = crate::server::Server::quiescence_at(
         &directory,
         lifecycle_root.as_deref(),
-        MANAGED_REAP_ALLOWANCE,
+        crate::server::SUPERVISOR_REAP_ALLOWANCE,
     )
     .await
     .with_context(|| {
@@ -335,11 +335,6 @@ pub async fn await_managed_quiescence(options: &OpenOptions) -> Result<()> {
     drop(lease);
     Ok(())
 }
-
-/// The supervisor's reap allowance (`server::SUPERVISOR_REAP_ALLOWANCE`: the
-/// 8 s graceful stop, the 3 s kill grace and the transport allowance).
-const MANAGED_REAP_ALLOWANCE: Duration =
-    Duration::from_secs(11).saturating_add(crate::server::SUPERVISOR_TRANSPORT_ALLOWANCE);
 
 #[cfg(test)]
 pub(crate) async fn open_local_fixture(options: OpenOptions) -> Result<crate::store::MemoryStore> {
