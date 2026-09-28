@@ -146,6 +146,10 @@ struct Owner {
     /// Test-support measurement only: the data directory this owner serves.
     #[cfg(any(test, feature = "test-support"))]
     trace_directory: PathBuf,
+    /// Test-support only: this owner stays live in the fixture ledger until
+    /// this process has reaped its supervisor.
+    #[cfg(any(test, feature = "test-support"))]
+    ledger: Option<crate::test_support::engine_ledger::LiveEngine>,
 }
 
 impl Drop for Owner {
@@ -160,6 +164,8 @@ impl Drop for Owner {
             .lock()
             .expect("memory reap guard lock")
             .take();
+        #[cfg(any(test, feature = "test-support"))]
+        let ledger = self.ledger.take();
         #[cfg(any(test, feature = "test-support"))]
         let trace = {
             use crate::test_support::lifecycle_trace as trace;
@@ -184,6 +190,8 @@ impl Drop for Owner {
                 SUPERVISOR_REAP_ALLOWANCE + DROPPED_REAP_WARNING_MARGIN,
                 SupervisorChild::try_wait,
             );
+            #[cfg(any(test, feature = "test-support"))]
+            drop(ledger);
             #[cfg(any(test, feature = "test-support"))]
             {
                 use crate::test_support::lifecycle_trace as trace;
@@ -504,6 +512,8 @@ impl Server {
                 reaped_observer: None,
                 #[cfg(any(test, feature = "test-support"))]
                 trace_directory: directory.clone(),
+                #[cfg(any(test, feature = "test-support"))]
+                ledger: Some(crate::test_support::engine_ledger::register(&directory)),
             };
             let child = owner
                 .child
@@ -579,6 +589,8 @@ impl Server {
                 reaped_observer: None,
                 #[cfg(any(test, feature = "test-support"))]
                 trace_directory: directory.clone(),
+                #[cfg(any(test, feature = "test-support"))]
+                ledger: Some(crate::test_support::engine_ledger::register(&directory)),
             };
             let response = timeout_at(startup_deadline, async {
                 owner.lifetime = Some(

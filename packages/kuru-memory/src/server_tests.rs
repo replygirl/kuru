@@ -152,6 +152,7 @@ fn owner_drop_transfers_installed_reap_guard_until_real_child_reaps() -> Result<
             reap_guard,
             reaped_observer: None,
             trace_directory: PathBuf::new(),
+            ledger: None,
         });
     }
     let held_before_release =

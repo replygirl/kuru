@@ -24,6 +24,8 @@
 /// Fixture roots whose teardown refuses to release a live memory owner.
 mod fixture_dir;
 pub use fixture_dir::TempDir;
+/// Process-local live-owner and quiescence records the fixture guard reads.
+pub(crate) mod engine_ledger;
 /// Env-gated lifecycle ordering measurement trace (inert unless enabled).
 pub mod lifecycle_trace;
 pub(crate) mod template;
@@ -296,42 +298,104 @@ pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
     Ok(())
 }
 
-/// Wait until a managed fixture's store has no live Dolt, before its data
-/// root is released.
+/// Wait until a managed fixture's store has no live Dolt, and record that on
+/// its fixture root, before the root is released.
 ///
 /// The managed service deliberately outlives its last client by an idle
 /// grace, so closing every client does not stop its engine. Call this after
 /// every client handle for `options` has closed (an attached client makes
 /// [`retire_idle_service`] fail with "active clients"). It retires the idle
-/// owner, whose owner lock is released only after its Dolt is reaped, and
-/// then acquires and releases the store's lifecycle lease, bounded by the
-/// supervisor's own reap allowance. The product's asynchronous idle close is
+/// owner, whose owner lock is released only after its Dolt is reaped, then
+/// awaits [`await_store_quiescence`] for the project store and each of its
+/// remaining staging directories. The product's asynchronous idle close is
 /// unchanged; only fixtures wait for it.
 pub async fn await_managed_quiescence(options: &OpenOptions) -> Result<()> {
     retire_idle_service(options).await?;
     let directory = crate::store::project_directory(&options.data_dir, &options.project_scope)?;
-    if !lifecycle_trace::exists(&directory) {
-        return Ok(());
-    }
     #[cfg(unix)]
     let lifecycle_root: Option<PathBuf> = None;
     #[cfg(windows)]
     let lifecycle_root = Some(options.data_dir.join("memory/lifecycles"));
-    // Acquires a real lifecycle flock; see `crate::spawn_gate`.
+    for store in project_store_directories(&directory)? {
+        await_store_quiescence(&store, lifecycle_root.as_deref())
+            .await
+            .with_context(|| {
+                format!(
+                    "managed fixture store {} kept a live Dolt after its owner retired",
+                    store.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// The project store and its `.staging-*` siblings that exist now.
+fn project_store_directories(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut stores = Vec::new();
+    if lifecycle_trace::exists(directory) {
+        stores.push(directory.to_path_buf());
+    }
+    let (Some(parent), Some(name)) = (
+        directory.parent(),
+        directory.file_name().and_then(OsStr::to_str),
+    ) else {
+        return Ok(stores);
+    };
+    let prefix = format!("{name}.staging-");
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(stores),
+        Err(error) => return Err(error.into()),
+    };
+    for (index, entry) in entries.enumerate() {
+        ensure!(
+            index < MAX_STAGE_ENTRIES,
+            "too many entries beside managed fixture store {}",
+            directory.display()
+        );
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|entry| entry.starts_with(&prefix))
+            && entry.file_type()?.is_dir()
+        {
+            stores.push(entry.path());
+        }
+    }
+    Ok(stores)
+}
+
+/// Await the lifecycle lease of one store directory, bounded by the
+/// supervisor's own reap allowance, and record on the fixture ledger, while
+/// the lease is held, that no engine is live there.
+///
+/// This is the record [`TempDir`]'s teardown requires for any store whose
+/// engine this process did not reap itself: a store served by a managed
+/// service process, by a spawned `kuru` process, or a lease-only directory.
+/// A timeout is returned as an error, so the fixture fails.
+pub async fn await_store_quiescence(directory: &Path, lifecycle_root: Option<&Path>) -> Result<()> {
+    await_store_quiescence_observed(directory, lifecycle_root, |_| ()).await
+}
+
+pub(crate) async fn await_store_quiescence_observed(
+    directory: &Path,
+    lifecycle_root: Option<&Path>,
+    while_held: impl FnOnce(&crate::server::LifecycleLease),
+) -> Result<()> {
+    // Keeps this lib's own non-waiting lease probes (open_error_reap_tests,
+    // server_tests) from observing this acquisition; see `crate::spawn_gate`.
     #[cfg(test)]
     let _gate = crate::spawn_gate::locking_async().await;
     let lease = crate::server::Server::quiescence_at(
-        &directory,
-        lifecycle_root.as_deref(),
+        directory,
+        lifecycle_root,
         crate::server::SUPERVISOR_REAP_ALLOWANCE,
     )
     .await
-    .with_context(|| {
-        format!(
-            "managed fixture store {} kept a live Dolt after its owner retired",
-            directory.display()
-        )
-    })?;
+    .with_context(|| format!("memory store {} did not quiesce", directory.display()))?;
+    engine_ledger::record(lease.directory.path());
+    while_held(&lease);
     drop(lease);
     Ok(())
 }

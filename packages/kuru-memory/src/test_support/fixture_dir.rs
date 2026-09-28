@@ -5,36 +5,45 @@
 //! supervisor's final `server.log` write then fails. So a fixture root is
 //! released only after every Dolt it hosted has been reaped.
 //!
-//! [`TempDir`]'s teardown checks that invariant without waiting. Beneath its
-//! root it makes one non-blocking attempt on every lock that an owner holds
-//! until its Dolt is reaped:
+//! [`TempDir`]'s teardown checks that invariant from records, never from the
+//! state of a lock. A lock probe cannot tell a live owner from a descriptor a
+//! sibling thread's child inherited between `posix_spawn` and `exec`, so the
+//! guard only uses lock *files* to find the stores beneath its root:
 //!
-//! - `lifecycle.lock` in a store or stage directory (the Unix lifecycle lease
-//!   held by the owned supervisor),
-//! - `*.lock` in a `lifecycles` directory (the Windows external lifecycle
-//!   lease),
-//! - `*.service-owner.lock` (a managed service owner, held until its Dolt is
-//!   reaped).
+//! - a directory holding `lifecycle.lock` (the Unix lifecycle lease),
+//! - `memory/<hash>` for a `memory/locks/<hash>.service-owner.lock`,
+//! - on Windows, where the lease lives under `lifecycles`, every directory
+//!   holding `identity.json`.
 //!
-//! If any is still held, teardown keeps the whole root, so the live engine can
-//! finish, and fails the test with the fixture, the test and each live owner.
-//! A thread that is already unwinding keeps the root without a second panic.
-//! The check never waits, so it cannot hide a missing retirement: fixtures
-//! close their stores, or call [`super::await_managed_quiescence`] for managed
-//! services, before the root drops. It writes nothing to stdout or stderr
-//! itself, and skips the check while the thread is already unwinding.
+//! Each store must then be explained by the process-local ledger
+//! ([`super::engine_ledger`]):
+//!
+//! - no Dolt supervisor this process spawned for it is still unreaped, and
+//! - it has a quiescence record whose snapshot of the engine-written
+//!   `server.log` and `endpoint.json` still matches, so no engine ran after
+//!   it. This process writes the record itself when it reaps a supervisor
+//!   (every store close path), and [`super::await_store_quiescence`] writes it
+//!   while holding the lifecycle lease (managed services and engines run by
+//!   other processes, through [`super::await_managed_quiescence`]).
+//!
+//! If any store is unexplained, teardown keeps the whole root, so a live
+//! engine can finish, and fails the test with the fixture, the test and each
+//! store. A thread that is already unwinding keeps the root without a second
+//! panic. The check never waits and writes nothing to stdout or stderr.
 
+use super::engine_ledger::{self, Key};
 use crate::files::PrivateTemp;
 use std::{
-    fs::{self, File},
+    collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
 };
 
 const MAX_DEPTH: usize = 8;
 const MAX_ENTRIES: usize = 4096;
-const ENDPOINT_LIMIT: u64 = 64 * 1024;
 
-/// A private fixture root, checked for live memory owners before removal.
+/// A private fixture root, checked for unexplained memory owners before
+/// removal.
 pub struct TempDir {
     inner: Option<PrivateTemp>,
     label: String,
@@ -54,6 +63,15 @@ impl TempDir {
             .expect("fixture root is present until drop")
             .path()
     }
+
+    /// Keep the root in place, unchecked, for a fixture that reports its own
+    /// cleanup failure. Nothing beneath it is removed.
+    pub fn keep(mut self) -> PathBuf {
+        self.inner
+            .take()
+            .expect("fixture root is present until drop")
+            .keep()
+    }
 }
 
 impl std::fmt::Debug for TempDir {
@@ -70,65 +88,82 @@ impl Drop for TempDir {
         let Some(inner) = self.inner.take() else {
             return;
         };
-        let owners = live_owners(inner.path());
-        if owners.is_empty() {
+        let violations = violations(inner.path());
+        if violations.is_empty() {
             return;
         }
-        // Never delete the tree under a live engine, even while this test is
-        // already failing; only a thread that is not unwinding reports it.
+        // Never delete the tree under a possibly live engine, even while this
+        // test is already failing; only a thread that is not unwinding reports.
         let kept = inner.keep();
         if std::thread::panicking() {
             return;
         }
         panic!(
-            "fixture root {} (created by test {}) was released while a memory owner is \
-             still alive, so it is kept in place for the engine to stop. Close every store \
-             and retire managed services (test_support::await_managed_quiescence) before \
-             the root drops. Live owners: {}",
+            "fixture root {} (created by test {}) was released without awaited memory \
+             quiescence, so it is kept in place. Close every store, and await \
+             test_support::await_managed_quiescence (managed services) or \
+             test_support::await_store_quiescence (engines run by another process) before \
+             the root drops. Unexplained stores: {}",
             kept.display(),
             self.label,
-            owners.join("; ")
+            violations.join("; ")
         );
     }
 }
 
-/// Every lock beneath `root` whose owner is still alive, described for a
-/// failure message. Secrets in endpoint records are never read into it.
-pub(crate) fn live_owners(root: &Path) -> Vec<String> {
-    let mut locks = Vec::new();
+/// Every store beneath `root` that no quiescence record explains, described
+/// for a failure message.
+pub(crate) fn violations(root: &Path) -> Vec<String> {
+    let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut found = Vec::new();
     let mut budget = MAX_ENTRIES;
-    collect_locks(root, 0, &mut budget, &mut locks);
-    locks
-        .into_iter()
-        .filter_map(|(path, kind)| held(&path).map(|how| describe(&path, kind, &how)))
-        .collect()
+    collect(root, 0, &mut budget, &mut found);
+    let mut violations = engine_ledger::live_under(&canonical);
+    let mut stores = BTreeMap::new();
+    for store in found {
+        if let Some(key) = engine_ledger::key(&store) {
+            stores.entry(store).or_insert(key);
+        }
+    }
+    violations.extend(
+        stores
+            .into_iter()
+            .filter_map(|(store, key)| unexplained(&store, &key)),
+    );
+    violations
 }
 
-#[derive(Clone, Copy)]
-enum LockKind {
-    Lifecycle,
-    WindowsLifecycle,
-    ServiceOwner,
+fn unexplained(store: &Path, key: &Key) -> Option<String> {
+    let Some(record) = engine_ledger::recorded(key) else {
+        return Some(format!(
+            "store {} has no quiescence record",
+            store.display()
+        ));
+    };
+    (record != engine_ledger::snapshot(store)).then(|| {
+        format!(
+            "store {} ran an engine after its quiescence record (server.log or endpoint.json \
+             changed)",
+            store.display()
+        )
+    })
 }
 
-fn classify(path: &Path) -> Option<LockKind> {
+/// The store directory a lock file beneath the root stands for.
+fn store_of(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?.to_str()?;
     if name == "lifecycle.lock" {
-        return Some(LockKind::Lifecycle);
+        return path.parent().map(Path::to_path_buf);
     }
-    if name.ends_with(".service-owner.lock") {
-        return Some(LockKind::ServiceOwner);
-    }
-    let parent = path.parent()?.file_name()?;
-    (parent == "lifecycles" && name.ends_with(".lock")).then_some(LockKind::WindowsLifecycle)
+    let hash = name.strip_suffix(".service-owner.lock")?;
+    let locks = path.parent()?;
+    (locks.file_name()? == "locks")
+        .then(|| locks.parent().map(|memory| memory.join(hash)))
+        .flatten()
+        .filter(|store| store.is_dir())
 }
 
-fn collect_locks(
-    directory: &Path,
-    depth: usize,
-    budget: &mut usize,
-    locks: &mut Vec<(PathBuf, LockKind)>,
-) {
+fn collect(directory: &Path, depth: usize, budget: &mut usize, stores: &mut Vec<PathBuf>) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -148,200 +183,183 @@ fn collect_locks(
         };
         let path = entry.path();
         if kind.is_dir() {
-            collect_locks(&path, depth + 1, budget, locks);
-        } else if kind.is_file()
-            && let Some(lock) = classify(&path)
-        {
-            locks.push((path, lock));
+            collect(&path, depth + 1, budget, stores);
+        } else if kind.is_file() {
+            if let Some(store) = store_of(&path) {
+                stores.push(store);
+            }
+            #[cfg(windows)]
+            if entry.file_name() == "identity.json" {
+                stores.push(directory.to_path_buf());
+            }
         }
     }
-}
-
-/// `Some(reason)` when a non-blocking exclusive attempt finds the lock held.
-fn held(path: &Path) -> Option<String> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        // A Windows owner may hold the lock file without read sharing.
-        #[cfg(windows)]
-        Err(error) if error.raw_os_error() == Some(32) => {
-            return Some("lock file is open without sharing".into());
-        }
-        Err(_) => return None,
-    };
-    match file.try_lock() {
-        Ok(()) => None,
-        Err(std::fs::TryLockError::WouldBlock) => Some("lock is held".into()),
-        Err(std::fs::TryLockError::Error(_)) => None,
-    }
-}
-
-fn describe(path: &Path, kind: LockKind, how: &str) -> String {
-    match kind {
-        LockKind::Lifecycle => {
-            let directory = path.parent().unwrap_or(path);
-            format!(
-                "Dolt supervisor for store {} ({}; {how}: {})",
-                directory.display(),
-                store_endpoint(directory),
-                path.display()
-            )
-        }
-        LockKind::WindowsLifecycle => {
-            format!(
-                "Dolt supervisor lifecycle lease ({how}: {})",
-                path.display()
-            )
-        }
-        LockKind::ServiceOwner => format!(
-            "managed memory service owner ({}; {how}: {})",
-            service_endpoint(path),
-            path.display()
-        ),
-    }
-}
-
-fn read_json(path: &Path) -> Option<serde_json::Value> {
-    let bytes = crate::files::read_bytes(path, ENDPOINT_LIMIT).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-/// The supervised server's published instance and loopback port.
-fn store_endpoint(directory: &Path) -> String {
-    read_json(&directory.join("endpoint.json")).map_or_else(
-        || "no published endpoint".into(),
-        |endpoint| {
-            format!(
-                "instance {} on 127.0.0.1:{}",
-                endpoint["instance"].as_str().unwrap_or("?"),
-                endpoint["port"]
-                    .as_u64()
-                    .map_or_else(|| "?".into(), |port| port.to_string())
-            )
-        },
-    )
-}
-
-/// The service's published transport address only; its authority record
-/// carries a connection secret that is never read into a message.
-fn service_endpoint(lock: &Path) -> String {
-    let endpoint = lock
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_suffix(".service-owner.lock"))
-        .zip(lock.parent().and_then(Path::parent))
-        .and_then(|(hash, memory)| {
-            read_json(&memory.join("services").join(hash).join("endpoint.json"))
-        });
-    endpoint
-        .as_ref()
-        .and_then(|record| record["address"].as_str())
-        .map_or_else(
-            || "no published endpoint".into(),
-            |address| format!("address {address}"),
-        )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::files;
 
-    #[test]
-    fn classifies_only_owner_locks() {
-        let kinds = [
-            ("a/lifecycle.lock", Some("lifecycle")),
-            ("memory/locks/abc.service-owner.lock", Some("service")),
-            ("memory/locks/abc.service-start.lock", None),
-            ("memory/lifecycles/00ff.lock", Some("windows")),
-            ("profile/kuru-test-supervisors/prepare.lock", None),
-            ("cache/versions/install.lock", None),
-        ];
-        for (path, expected) in kinds {
-            let kind = classify(Path::new(path)).map(|kind| match kind {
-                LockKind::Lifecycle => "lifecycle",
-                LockKind::WindowsLifecycle => "windows",
-                LockKind::ServiceOwner => "service",
-            });
-            assert_eq!(kind, expected, "{path}");
+    /// A stopped store as its supervisor leaves it: private, with a lease
+    /// file and a final `server.log`.
+    fn stopped_store(root: &Path) -> PathBuf {
+        let store = root.join("memory/abcdef");
+        for directory in [root.join("memory"), store.clone()] {
+            files::private_dir(&directory).unwrap();
         }
+        files::write(&store.join("server.log"), b"Kuru engine shutdown: Ok").unwrap();
+        files::write(&store.join("lifecycle.lock"), b"").unwrap();
+        store
+    }
+
+    fn panic_message(root: TempDir) -> String {
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(root)))
+            .expect_err("an unexplained store must fail teardown");
+        panic.downcast_ref::<String>().cloned().unwrap_or_default()
+    }
+
+    fn remove_kept(path: &Path) {
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
-    fn a_held_owner_lock_keeps_the_root_and_names_the_test_and_owner() {
-        // This test acquires real flocks; see `crate::spawn_gate`.
-        let _gate = crate::spawn_gate::locking();
+    fn lock_files_name_their_stores() {
         let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
-        for directory in [
-            "memory",
-            "memory/abcdef",
-            "memory/locks",
-            "memory/services",
-            "memory/services/abcdef",
-        ] {
-            crate::files::private_dir(&root.path().join(directory)).unwrap();
-        }
-        let store = root.path().join("memory/abcdef");
+        let store = stopped_store(root.path());
         let locks = root.path().join("memory/locks");
-        let services = root.path().join("memory/services/abcdef");
-        // Records are private files, as the product publishes them.
-        crate::files::write(
-            &store.join("endpoint.json"),
-            br#"{"instance":"fixture-instance","port":4242}"#,
-        )
-        .unwrap();
-        crate::files::write(
-            &services.join("endpoint.json"),
-            br#"{"authority":{"connection_secret":"never-printed"},"address":"kuru-fixture.sock"}"#,
-        )
-        .unwrap();
-        let lifecycle = File::create(store.join("lifecycle.lock")).unwrap();
-        let owner = File::create(locks.join("abcdef.service-owner.lock")).unwrap();
-        File::create(locks.join("abcdef.service-start.lock"))
-            .unwrap()
-            .lock()
-            .unwrap();
-        assert!(
-            live_owners(root.path()).is_empty(),
-            "unlocked files are not owners"
-        );
-        lifecycle.lock().unwrap();
-        owner.lock().unwrap();
+        files::private_dir(&locks).unwrap();
+        let expected = [
+            (store.join("lifecycle.lock"), Some(store.clone())),
+            (locks.join("abcdef.service-owner.lock"), Some(store.clone())),
+            (locks.join("missing.service-owner.lock"), None),
+            (locks.join("abcdef.service-start.lock"), None),
+            (root.path().join("memory/lifecycles/00ff.lock"), None),
+            (root.path().join("cache/versions/install.lock"), None),
+        ];
+        for (path, store) in expected {
+            assert_eq!(store_of(&path), store, "{}", path.display());
+        }
+        engine_ledger::record(&store);
+    }
 
+    #[test]
+    fn a_store_without_a_quiescence_record_keeps_the_root_and_names_the_test() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let store = stopped_store(root.path());
         let path = root.path().to_path_buf();
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(root)))
-            .expect_err("a live owner must fail teardown");
-        let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+        let message = panic_message(root);
         assert!(path.exists(), "a violating root must be kept: {message}");
         for expected in [
             path.display().to_string(),
-            "a_held_owner_lock_keeps_the_root_and_names_the_test_and_owner".into(),
-            "instance fixture-instance on 127.0.0.1:4242".into(),
-            "managed memory service owner (address kuru-fixture.sock".into(),
+            "a_store_without_a_quiescence_record_keeps_the_root_and_names_the_test".into(),
+            format!("store {} has no quiescence record", store.display()),
         ] {
             assert!(
                 message.contains(&expected),
                 "{expected:?} missing: {message}"
             );
         }
-        assert!(!message.contains("never-printed"), "{message}");
-        assert!(!message.contains("service-start"), "{message}");
-
-        drop((lifecycle, owner));
-        assert!(live_owners(&path).is_empty());
-        let container = path.parent().unwrap().to_path_buf();
-        fs::remove_dir_all(container).unwrap();
+        remove_kept(&path);
     }
 
     #[test]
-    fn released_owner_locks_remove_the_root_quietly() {
-        let _gate = crate::spawn_gate::locking();
+    fn an_unreaped_in_process_owner_fails_until_its_reap_records_quiescence() {
         let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
-        let store = root.path().join("memory/abcdef");
-        fs::create_dir_all(&store).unwrap();
-        let lifecycle = File::create(store.join("lifecycle.lock")).unwrap();
-        lifecycle.lock().unwrap();
-        drop(lifecycle);
+        let store = fs::canonicalize(stopped_store(root.path())).unwrap();
+        let live = engine_ledger::register(&store);
+        assert!(
+            violations(root.path()).iter().any(|violation| violation
+                .contains("has not been reaped")
+                && violation.contains(&store.display().to_string())
+                && violation.contains(
+                    "an_unreaped_in_process_owner_fails_until_its_reap_records_quiescence"
+                )),
+            "{:?}",
+            violations(root.path())
+        );
+        // This process observed the reap: the owner leaves the ledger and
+        // records the store it served.
+        drop(live);
         let path = root.path().to_path_buf();
         drop(root);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_engine_run_after_the_record_makes_it_stale() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let store = stopped_store(root.path());
+        engine_ledger::record(&store);
+        assert!(violations(root.path()).is_empty());
+        // A later engine publishes an endpoint; its stop rewrites the log.
+        files::write(
+            &store.join("endpoint.json"),
+            br#"{"instance":"later","port":4242}"#,
+        )
+        .unwrap();
+        let path = root.path().to_path_buf();
+        let message = panic_message(root);
+        assert!(
+            message.contains("ran an engine after its quiescence record"),
+            "{message}"
+        );
+        remove_kept(&path);
+    }
+
+    /// The fork race the old lock probe mistook for a live owner: the lease
+    /// descriptor the quiescence wait held is duplicated into a child that
+    /// has not reached `exec` yet, so the flock is still held when the root
+    /// drops. The record, not the lock, decides.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_duplicated_lease_descriptor_after_awaited_quiescence_does_not_fail() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let store = stopped_store(root.path());
+        let mut inherited = None;
+        super::super::await_store_quiescence_observed(&store, None, |lease| {
+            inherited = Some(
+                lease
+                    .try_clone()
+                    .expect("duplicate the held lease descriptor"),
+            );
+        })
+        .await
+        .unwrap();
+        let inherited = inherited.expect("the lease was observed while held");
+        let probe = fs::File::open(store.join("lifecycle.lock")).unwrap();
+        assert!(
+            matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "the duplicated descriptor must still hold the lease"
+        );
+        drop(probe);
+        let path = root.path().to_path_buf();
+        drop(root);
+        assert!(!path.exists(), "a recorded root is removed");
+        drop(inherited);
+    }
+
+    #[test]
+    fn a_panicking_test_keeps_the_root_without_a_second_panic() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let joined = std::thread::Builder::new()
+            .name("fixture-invariant-unwinding".into())
+            .spawn(move || {
+                let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+                stopped_store(root.path());
+                sender.send(root.path().to_path_buf()).unwrap();
+                panic!("original test failure");
+            })
+            .unwrap()
+            .join();
+        let payload = joined.expect_err("the test body panicked");
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("original test failure"),
+            "the guard must not replace or add to the original panic"
+        );
+        let path = receiver.recv().unwrap();
+        assert!(path.exists(), "an unexplained root is kept while unwinding");
+        remove_kept(&path);
     }
 }

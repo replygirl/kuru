@@ -12509,6 +12509,12 @@ mod tests {
         // The supervisor creates its stable lock before writing store identity.
         #[cfg(unix)]
         private_file(&incomplete.join("lifecycle.lock")).unwrap();
+        // No engine ever starts under this stage: record that for the fixture
+        // root's teardown, which follows it to `interrupted`.
+        #[cfg(unix)]
+        crate::test_support::await_store_quiescence(&incomplete, None)
+            .await
+            .unwrap();
         let store = MemoryStore::open(options.clone()).await.unwrap();
         assert_eq!(
             store.revision().await.unwrap(),

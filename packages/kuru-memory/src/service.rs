@@ -3322,6 +3322,11 @@ mod tests {
                 .await
                 .context("successor did not retire for fixture maintenance")?;
             drop(permit);
+            // Both owners ran in other processes; record their store's
+            // quiescence before the guarded root drops.
+            // The quiescence wait takes the lock side of the spawn gate.
+            drop(_gate);
+            crate::test_support::await_managed_quiescence(&options).await?;
             Ok::<(), anyhow::Error>(())
         })
         .await
