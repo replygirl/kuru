@@ -193,5 +193,7 @@ Local (macOS arm64; logs `$S/flake/ci/fix2/`):
 | `//packages/kuru-runtime:test` | 220/0; 0 invariant failures |
 | `//apps/kuru-tui:test` | 245/0 (4 ignored); 0 invariant failures |
 | `format:check`, `lint`, `typecheck`, `lint:tooling`, `docs:check`, `cospec -- validate --strict` | all exit 0 |
+| `mise run coverage` at 12a7cb0b (1,328 s) | exit 0; 94.35% workspace lines (98,046 / 103,913) against `--fail-under-lines 90`, no exclusions |
+| JSON region export of that run's profiles (`cargo llvm-cov report --json`, the data the partition line export reads; the local `coverage` task itself does not run the partition self-check) | 22,263 functions, 0 regions with the clamped count 9223372036854775807; `Reaper::report` has a single region count in each instance (126 and 5 calls) |
 
 Not run: every `cfg(windows)` line (`Fixture::drop`; this host cannot build the Windows target; the same match and borrows compile here in the `CreatorFixture` test double). The next CI run must show: all 8 windows-latest coverage partitions pass the line export, on two consecutive runs (2, 3 and 8 passed by chance before, so one green run is weak evidence); no negative counter expression for any function, including `scan`, `collect`, `TempDir::drop` and `engine_ledger::with`; `windows_lifecycle` 12/12, with no "cleanup is delayed" or "cleanup is unproven" line.
