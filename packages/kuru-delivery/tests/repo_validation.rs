@@ -638,6 +638,13 @@ fn mise_steps_must_name_the_tools_they_install() {
         "mise install --minimum-release-age 90d",
         "mise -C . -E ci -yj 4 install --locked",
         "/home/runner/.local/bin/mise i --",
+        // A prefix's option value or timeout's duration is not the program.
+        "timeout 600 mise install",
+        "timeout -k 5 -s KILL 600 mise install",
+        "sudo -u runner mise install",
+        "sudo -Eu runner env -u MISE_ENV nice -n 5 nohup mise install",
+        "exec -a mise-install mise install",
+        "env -S 'mise install'",
     ] {
         repo.write(".github/workflows/plain.yml", &script(bare));
         assert_eq!(
@@ -655,8 +662,61 @@ fn mise_steps_must_name_the_tools_they_install() {
         "mise -j4 install rust",
         "mise install -- rust",
         "mise run install",
+        "sudo -u runner mise install rust",
+        "timeout -k 5 600 mise install rust",
+        "mise upgrade rust",
+        "mise bootstrap packages apply --yes",
     ] {
         repo.write(".github/workflows/plain.yml", &script(named));
+        assert!(repo.errors().is_empty(), "{named}: {:?}", repo.errors());
+    }
+    // `upgrade` and `bootstrap` also install every configured tool when
+    // given none (mise 2026.9.4 `docs/cli/upgrade.md`, `docs/cli/bootstrap.md`:
+    // phase 6, versioned tools).
+    for (bare, subcommand) in [
+        ("mise upgrade", "upgrade"),
+        ("mise up -x go --minimum-release-age 90d", "upgrade"),
+        ("mise bootstrap", "bootstrap"),
+        ("mise bs --yes --only tools", "bootstrap"),
+        (
+            "timeout 900 mise bootstrap --from-dir /tmp/x -y",
+            "bootstrap",
+        ),
+    ] {
+        repo.write(".github/workflows/plain.yml", &script(bare));
+        assert_eq!(
+            repo.workflow_errors(),
+            [format!(
+                ".github/workflows/plain.yml: job lint step step 1 runs `mise {subcommand}` without naming the tools to install"
+            )],
+            "{bare}"
+        );
+    }
+    // mise-action runs `mise install <install_args>`: options alone are the
+    // same bare install.
+    let action = |arguments: &str| {
+        format!(
+            "on: push\nenv:\n  MISE_EXEC_AUTO_INSTALL: \"false\"\n  MISE_TASK_RUN_AUTO_INSTALL: \"false\"\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0\n        with:\n          install_args: {arguments}\n"
+        )
+    };
+    for bare in [
+        "--jobs 4",
+        "-y",
+        "--shared /opt/x",
+        "-j 4 --locked --",
+        "\"\"",
+    ] {
+        repo.write(".github/workflows/plain.yml", &action(bare));
+        assert_eq!(
+            repo.workflow_errors(),
+            [
+                ".github/workflows/plain.yml: job lint step jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c uses jdx/mise-action without explicit install_args naming the tools the job uses"
+            ],
+            "{bare}"
+        );
+    }
+    for named in ["--jobs 4 rust", "-- rust", "rust aqua:jdx/hk"] {
+        repo.write(".github/workflows/plain.yml", &action(named));
         assert!(repo.errors().is_empty(), "{named}: {:?}", repo.errors());
     }
     repo.write(".github/workflows/plain.yml", "jobs: [unterminated");
@@ -691,7 +751,7 @@ fn incident_apt_update_over_every_source_is_rejected() {
             "apt-get install -y --no-install-recommends dbus gnome-keyring libsecret-tools",
             "apt-get update",
         ]
-        .map(|command| format!(".github/workflows/{name}: job {job} step Install Ubuntu native secret-store fixture tools runs `{command}` over every configured apt source; name the needed list with -o Dir::Etc::sourcelist=/... and -o Dir::Etc::sourceparts=/dev/null"))
+        .map(|command| format!(".github/workflows/{name}: job {job} step Install Ubuntu native secret-store fixture tools runs `{command}` over every configured apt source; name the needed list with one -o Dir::Etc::sourcelist=/..., make the last -o Dir::Etc::sourceparts=/dev/null, and pass no -c"))
     })
     .collect();
     assert_eq!(errors, expected);
@@ -705,7 +765,7 @@ fn incident_apt_update_over_every_source_is_rejected() {
     );
     let unrestricted = |command: &str| {
         format!(
-            ".github/workflows/release.yml: job tests step Install Ubuntu native secret-store fixture tools runs `{command}` over every configured apt source; name the needed list with -o Dir::Etc::sourcelist=/... and -o Dir::Etc::sourceparts=/dev/null"
+            ".github/workflows/release.yml: job tests step Install Ubuntu native secret-store fixture tools runs `{command}` over every configured apt source; name the needed list with one -o Dir::Etc::sourcelist=/..., make the last -o Dir::Etc::sourceparts=/dev/null, and pass no -c"
         )
     };
     assert_eq!(
@@ -733,6 +793,52 @@ fn incident_apt_update_over_every_source_is_rejected() {
             unrestricted("apt-get -y upgrade"),
             unrestricted("apt-get dist-upgrade"),
             unrestricted("apt-get update"),
+        ]
+    );
+    // Prefix values and durations do not hide apt. apt applies settings in
+    // order, so a later parts directory, a second list or a configuration
+    // file can restore every source (apt-get(8), apt.conf(5)); its keys
+    // ignore case.
+    let repo = Repository::with_workflows();
+    let restricted = "-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null";
+    repo.replace(
+        ".github/workflows/release.yml",
+        FIXED_APT,
+        &format!(
+            "          sudo -u root apt-get update\n          timeout 300 sudo apt-get -q update\n          sudo apt-get {restricted} -o Dir::Etc::sourceparts=/etc/apt/sources.list.d update\n          sudo apt-get {restricted} -o Dir::Etc::sourcelist=/etc/apt/sources.list install -y dbus\n          sudo apt-get -c /tmp/apt.conf {restricted} upgrade\n          sudo apt-get -o dir::etc::SOURCELIST=/etc/apt/sources.list.d/ubuntu.sources --option=DIR::ETC::SOURCEPARTS=/dev/null -yo Dir::Etc::sourceparts=/dev/null update\n"
+        ),
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            unrestricted(&format!("apt-get -c /tmp/apt.conf {restricted} upgrade")),
+            unrestricted(&format!(
+                "apt-get {restricted} -o Dir::Etc::sourcelist=/etc/apt/sources.list install -y dbus"
+            )),
+            unrestricted(&format!(
+                "apt-get {restricted} -o Dir::Etc::sourceparts=/etc/apt/sources.list.d update"
+            )),
+            unrestricted("apt-get -q update"),
+            unrestricted("apt-get update"),
+        ]
+    );
+    // APT_CONFIG names a configuration file apt reads, at any level.
+    let repo = Repository::with_workflows();
+    repo.replace(
+        ".github/workflows/release.yml",
+        FIXED_APT,
+        &format!("          APT_CONFIG=/tmp/apt.conf sudo -E apt-get {restricted} update\n"),
+    );
+    repo.replace(
+        ".github/workflows/native-tests.yml",
+        FIXED_EXEC,
+        &format!("{FIXED_EXEC}  APT_CONFIG: /tmp/apt.conf\n"),
+    );
+    assert_eq!(
+        repo.workflow_errors(),
+        [
+            ".github/workflows/native-tests.yml: sets APT_CONFIG at workflow level; apt must read only the lists each fetch names",
+            ".github/workflows/release.yml: job tests step Install Ubuntu native secret-store fixture tools sets APT_CONFIG; apt must read only the lists each fetch names",
         ]
     );
 }
@@ -888,18 +994,44 @@ fn task_auto_install_is_off_at_workflow_level_only() {
 
 /// The one exemption's reason, as every finding about it quotes it.
 const RELEASE_EXEMPTION: &str = "these release jobs still install every missing configured tool through `mise run`, and notes' setup task runs a bare `mise install --include-task-tools`; follow-up release-notes-docs-tool-scope scopes their tool installation, a release workflow change for the maintainer to decide";
+/// The reviewed digests of release.yml's exempted jobs.
+const NOTES: &str = "00e5f2b74cdf5e2362c2c9a41d16f3e3d6ef3538f59502563311da4098270f7c";
+const BUILD_DOCS: &str = "0c2d21f040bfd0a778d30ef7ef48865716dcd87e00cc3c7a3e2d5356b9f50766";
+
+impl Repository {
+    /// The workflow findings, with each changed job's new digest, which the
+    /// finding reports for the reviewer, replaced by `<new>`.
+    fn exemption_errors(&self) -> Vec<String> {
+        const NOW: &str = "and it is now SHA-256 ";
+        self.workflow_errors()
+            .into_iter()
+            .map(|error| match error.split_once(NOW) {
+                Some((before, after)) => {
+                    let (digest, rest) = after.split_at(64);
+                    assert!(digest.chars().all(|c| c.is_ascii_hexdigit()), "{error}");
+                    format!("{before}{NOW}<new>{rest}")
+                }
+                None => error,
+            })
+            .collect()
+    }
+}
 
 #[test]
 fn release_task_auto_install_exemption_covers_only_two_reviewed_jobs() {
     // release.yml's notes and build-docs still run `mise run` with task
-    // auto-install on. They are exempted by name in their exact reviewed
-    // steps; every other release job that uses mise opts out itself.
-    let shape = |job: &str| {
+    // auto-install on. They are exempted by name, each pinned by the digest
+    // of its whole parsed job and the workflow env and defaults it inherits;
+    // every other release job that uses mise opts out itself.
+    let changed = |job: &str, now: &str| {
+        let digest = if job == "notes" { NOTES } else { BUILD_DOCS };
         format!(
-            ".github/workflows/release.yml: job {job} is exempted from MISE_TASK_RUN_AUTO_INSTALL only in its reviewed shape and no longer has it; scope its tool installation and remove the exemption, or review the new shape ({RELEASE_EXEMPTION})"
+            ".github/workflows/release.yml: job {job} is exempted from MISE_TASK_RUN_AUTO_INSTALL only as reviewed (SHA-256 {digest} of the job with the workflow env and defaults it inherits), and it is now {now}; re-review the exemption: scope the job's tool installation and remove the exemption, or review the whole changed job and record its new digest ({RELEASE_EXEMPTION})"
         )
     };
-    // Another task run, other tools or a job-level opt-out change the shape.
+    let shape = |job: &str| changed(job, "SHA-256 <new>");
+    assert!(Repository::with_workflows().exemption_errors().is_empty());
+    // Another task run, other tools or a job-level opt-out change the job.
     let repo = Repository::with_workflows();
     repo.replace(
         ".github/workflows/release.yml",
@@ -912,7 +1044,7 @@ fn release_task_auto_install_exemption_covers_only_two_reviewed_jobs() {
         "          install_args: rust\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      - run: mise run //apps/kuru-docs:setup\n",
     );
     assert_eq!(
-        repo.workflow_errors(),
+        repo.exemption_errors(),
         [shape("build-docs"), shape("notes")]
     );
     let repo = Repository::with_workflows();
@@ -921,10 +1053,82 @@ fn release_task_auto_install_exemption_covers_only_two_reviewed_jobs() {
         "    needs: [plan, bump]\n    runs-on: ubuntu-latest\n    steps:\n",
         "    needs: [plan, bump]\n    runs-on: ubuntu-latest\n    env:\n      MISE_TASK_RUN_AUTO_INSTALL: \"false\"\n    steps:\n",
     );
-    assert_eq!(repo.workflow_errors(), [shape("notes")]);
+    assert_eq!(repo.exemption_errors(), [shape("notes")]);
+    // Every other part of the job, and what it inherits, is pinned too: X1
+    // another mise-action input that adds tools, X2 a job env entry that
+    // loads another configuration, X3 the mise version, then a step's shell,
+    // working directory, condition and env, and a workflow env or defaults
+    // entry.
+    let notes_action = "          version: 2026.9.4\n          install_args: rust aqua:jdx/hk\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      - name: Install package-owned release tools\n";
+    for (old, new) in [
+        (
+            notes_action,
+            notes_action.replace(
+                "install_args: rust aqua:jdx/hk\n",
+                "install_args: rust aqua:jdx/hk\n          mise_toml: |\n            [tools]\n            node = \"24\"\n",
+            ),
+        ),
+        (
+            "    needs: [plan, bump]\n    runs-on: ubuntu-latest\n    steps:\n",
+            "    needs: [plan, bump]\n    runs-on: ubuntu-latest\n    env:\n      MISE_ENV: release\n    steps:\n".to_owned(),
+        ),
+        (
+            notes_action,
+            notes_action.replace("version: 2026.9.4", "version: latest"),
+        ),
+        (
+            "        run: mise run //packages/kuru-delivery:setup\n",
+            "        shell: bash\n        working-directory: packages/kuru-delivery\n        run: mise run //packages/kuru-delivery:setup\n".to_owned(),
+        ),
+        (
+            "        run: mise run //packages/kuru-delivery:setup\n",
+            "        if: always()\n        run: mise run //packages/kuru-delivery:setup\n".to_owned(),
+        ),
+        (
+            "      - name: Install package-owned release tools\n        env:\n",
+            "      - name: Install package-owned release tools\n        env:\n          MISE_ENV: release\n".to_owned(),
+        ),
+    ] {
+        let repo = Repository::with_workflows();
+        repo.replace(".github/workflows/release.yml", old, &new);
+        assert_eq!(repo.exemption_errors(), [shape("notes")], "{new}");
+    }
+    for inherited in [
+        "  MISE_EXEC_AUTO_INSTALL: \"false\"\n  MISE_ENV: release\n",
+        "  MISE_EXEC_AUTO_INSTALL: \"false\"\n\ndefaults:\n  run:\n    working-directory: packages\n",
+    ] {
+        let repo = Repository::with_workflows();
+        repo.replace(
+            ".github/workflows/release.yml",
+            "  MISE_EXEC_AUTO_INSTALL: \"false\"\n",
+            inherited,
+        );
+        assert_eq!(
+            repo.exemption_errors(),
+            [shape("build-docs"), shape("notes")],
+            "{inherited}"
+        );
+    }
+    // Comments and formatting are not part of the reviewed job.
+    let repo = Repository::with_workflows();
+    repo.replace(
+        ".github/workflows/release.yml",
+        "  notes:\n    # Generate read-only notes",
+        "  notes:\n    # A reworded comment.\n    # Generate read-only notes",
+    );
+    repo.replace(
+        ".github/workflows/release.yml",
+        "    needs: [plan, bump]\n    runs-on: ubuntu-latest\n    steps:\n",
+        "    needs: [ plan, bump ]\n    runs-on: 'ubuntu-latest'\n    steps:\n",
+    );
+    assert!(
+        repo.exemption_errors().is_empty(),
+        "{:?}",
+        repo.exemption_errors()
+    );
     let unexempted = |job: &str| {
         format!(
-            ".github/workflows/release.yml: job {job} uses mise and is not exempted, so its job env must set MISE_TASK_RUN_AUTO_INSTALL: \"false\" while the workflow level does not"
+            ".github/workflows/release.yml: job {job} uses mise and is not exempted, so its job env must set MISE_TASK_RUN_AUTO_INSTALL: \"false\" while the workflow level does not ({RELEASE_EXEMPTION})"
         )
     };
     // A missing job is a stale exemption, and a renamed one is not exempted.
@@ -935,8 +1139,8 @@ fn release_task_auto_install_exemption_covers_only_two_reviewed_jobs() {
         "\n  release-notes:\n",
     );
     assert_eq!(
-        repo.workflow_errors(),
-        [shape("notes"), unexempted("release-notes")]
+        repo.exemption_errors(),
+        [changed("notes", "missing"), unexempted("release-notes")]
     );
     // No other release job may leave task auto-install on.
     let repo = Repository::with_workflows();
@@ -954,7 +1158,8 @@ fn release_task_auto_install_exemption_covers_only_two_reviewed_jobs() {
         repo.workflow_errors(),
         [unexempted("extra"), unexempted("tests")]
     );
-    // A step still cannot override it, even in an exempted job.
+    // A step still cannot override it, even in an exempted job (X4), and
+    // the change is also one to the reviewed job.
     let repo = Repository::with_workflows();
     repo.replace(
         ".github/workflows/release.yml",
@@ -962,9 +1167,10 @@ fn release_task_auto_install_exemption_covers_only_two_reviewed_jobs() {
         "      - run: mise run //apps/kuru-docs:setup\n        env:\n          MISE_TASK_RUN_AUTO_INSTALL: \"true\"\n",
     );
     assert_eq!(
-        repo.workflow_errors(),
+        repo.exemption_errors(),
         [
-            ".github/workflows/release.yml: job build-docs step step 3 overrides MISE_TASK_RUN_AUTO_INSTALL; set it only in the workflow-level env"
+            shape("build-docs"),
+            ".github/workflows/release.yml: job build-docs step step 3 overrides MISE_TASK_RUN_AUTO_INSTALL; set it only in the workflow-level env".to_owned(),
         ]
     );
     // Setting it for the whole workflow ends the exemption, which must go.

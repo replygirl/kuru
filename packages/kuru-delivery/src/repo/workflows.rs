@@ -20,7 +20,8 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
 use anyhow::{Context, Result};
-use serde_yaml_ng::Value;
+use serde_yaml_ng::{Mapping, Value};
+use sha2::{Digest, Sha256};
 
 /// mise 2026.9.4 `settings.toml`: `exec_auto_install` (`mise x`, which
 /// Windows shims run) and `task.run_auto_install` (`mise run`), both on by
@@ -33,8 +34,12 @@ const MISE_ACTION: &str = "jdx/mise-action@";
 /// The kuru-delivery tasks that run one partition (`coverage shard`). A test
 /// rejects a fan-out of every such task the package defines.
 const PARTITION_TASKS: [&str; 2] = ["coverage:shard", "test:partition"];
-const APT_SOURCE_LIST: &str = "Dir::Etc::sourcelist=/";
-const APT_NO_SOURCE_PARTS: &str = "Dir::Etc::sourceparts=/dev/null";
+/// apt configuration keys, which apt compares without regard to case
+/// (apt.conf(5)).
+const APT_SOURCE_LIST: &str = "dir::etc::sourcelist";
+const APT_SOURCE_PARTS: &str = "dir::etc::sourceparts";
+/// apt reads this file of configuration after its defaults (apt.conf(5)).
+const APT_CONFIG: &str = "APT_CONFIG";
 const APT_FETCHES: [&str; 5] = [
     "update",
     "install",
@@ -42,33 +47,80 @@ const APT_FETCHES: [&str; 5] = [
     "dist-upgrade",
     "full-upgrade",
 ];
-/// Words that may precede the program in a shell command.
-const PREFIXES: [&str; 5] = ["sudo", "env", "exec", "command", "time"];
+/// A word that may precede the program in a shell command, with its options
+/// that take the next word as their value: short letters, then long names.
+/// sudo(8), env(1), timeout(1), nice(1), time(1) and bash's `exec -a`, on
+/// Ubuntu 24.04. timeout also takes its duration before the program.
+type Prefix = (&'static str, &'static [char], &'static [&'static str]);
+const PREFIXES: [Prefix; 8] = [
+    (
+        "sudo",
+        &['u', 'g', 'h', 'p', 'C', 'D', 'r', 't', 'U', 'T', 'R'],
+        &[
+            "--user",
+            "--group",
+            "--host",
+            "--prompt",
+            "--close-from",
+            "--chdir",
+            "--role",
+            "--type",
+            "--other-user",
+            "--command-timeout",
+            "--chroot",
+        ],
+    ),
+    // `-S` is not listed: its string is the command, and [`commands`] has
+    // already split it into words.
+    ("env", &['u', 'C'], &["--unset", "--chdir"]),
+    ("exec", &['a'], &[]),
+    ("command", &[], &[]),
+    ("time", &['f', 'o'], &["--format", "--output"]),
+    ("timeout", &['k', 's'], &["--kill-after", "--signal"]),
+    ("nice", &['n'], &["--adjustment"]),
+    ("nohup", &[], &[]),
+];
 /// Shells whose `-c` string is itself a command.
 const SHELLS: [&str; 4] = ["sh", "bash", "dash", "zsh"];
 /// mise options that take the next word as their value. Global options, which
 /// mise also accepts after the subcommand: `-C/--cd`, `-E/--env`, `-j/--jobs`
 /// (`docs/cli/index.md` at v2026.9.4). `install`: `-j/--jobs`,
-/// `--minimum-release-age`, `--shared` (`docs/cli/install.md` at v2026.9.4).
-/// Every other option of both is a flag.
-const MISE_VALUE_SHORT: [char; 3] = ['C', 'E', 'j'];
-const MISE_VALUE_LONG: [&str; 5] = [
+/// `--minimum-release-age`, `--shared` (`docs/cli/install.md`). `upgrade`:
+/// `-j/--jobs`, `-x/--exclude`, `--minimum-release-age`
+/// (`docs/cli/upgrade.md`). `bootstrap`: `--from`, `--adopt`, `--from-dir`,
+/// `--only`, `--skip` (`docs/cli/bootstrap.md`). Every other option of these
+/// is a flag.
+const MISE_VALUE_SHORT: [char; 4] = ['C', 'E', 'j', 'x'];
+const MISE_VALUE_LONG: [&str; 11] = [
     "--cd",
     "--env",
     "--jobs",
     "--minimum-release-age",
     "--shared",
+    "--exclude",
+    "--from",
+    "--adopt",
+    "--from-dir",
+    "--only",
+    "--skip",
 ];
+/// mise subcommands that install every configured tool when given no tool:
+/// `install` (`i`), `upgrade` (`up`) and `bootstrap` (`bs`), whose phase 6
+/// installs the versioned tools (`docs/cli/*.md` at v2026.9.4).
+const MISE_INSTALLS: [(&str, &str); 3] = [("install", "i"), ("upgrade", "up"), ("bootstrap", "bs")];
 
 /// Jobs that may still leave one automatic installation on, exempted by name
-/// in their reviewed shape. The exempted workflow does not set the variable
-/// at workflow level, so every other job that uses mise sets it to "false".
+/// as reviewed. The exempted workflow does not set the variable at workflow
+/// level, so every other job that uses mise sets it to "false".
 struct Exemption {
     workflow: &'static str,
     variable: &'static str,
-    /// Each job and its steps: `uses <action>` (with ` install_args <tools>`
-    /// for mise-action) or `run <script>`.
-    jobs: &'static [(&'static str, &'static [&'static str])],
+    /// Each job and the SHA-256 of its [`reviewed`] text: the whole parsed
+    /// job with the workflow `env` and `defaults` it inherits. Any change to
+    /// them, such as another mise-action input, env entry, `shell`,
+    /// `working-directory`, `if` or step, fails the check until someone
+    /// reviews the changed job and records its new digest here.
+    jobs: &'static [(&'static str, &'static str)],
     reason: &'static str,
 }
 
@@ -78,25 +130,11 @@ const EXEMPTIONS: [Exemption; 1] = [Exemption {
     jobs: &[
         (
             "notes",
-            &[
-                "uses actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-                "uses jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c install_args rust aqua:jdx/hk",
-                "run mise run //packages/kuru-delivery:setup",
-                "run mise run release:tool -- notes --sha \"$RELEASE_SHA\" --version \"$RELEASE_VERSION\" --output RELEASE_NOTES.md",
-                "uses actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-            ],
+            "00e5f2b74cdf5e2362c2c9a41d16f3e3d6ef3538f59502563311da4098270f7c",
         ),
         (
             "build-docs",
-            &[
-                "uses actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-                "uses jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c install_args rust aqua:jdx/hk",
-                "run mise run //apps/kuru-docs:setup",
-                "uses actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d",
-                "run mise run docs:build\nmise run //packages/kuru-delivery:tool -- docs --base \"$KURU_DOCS_BASE\"\n",
-                "run printf 'name=github-pages-%s\\n' \"$RUN_ATTEMPT\" >> \"$GITHUB_OUTPUT\"",
-                "uses actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9",
-            ],
+            "0c2d21f040bfd0a778d30ef7ef48865716dcd87e00cc3c7a3e2d5356b9f50766",
         ),
     ],
     reason: "these release jobs still install every missing configured tool through `mise run`, and notes' setup task runs a bare `mise install --include-task-tools`; follow-up release-notes-docs-tool-scope scopes their tool installation, a release workflow change for the maintainer to decide",
@@ -147,21 +185,22 @@ fn basename(word: &str) -> &str {
     word.rsplit(['/', '\\']).next().unwrap_or(word)
 }
 
-/// A step as an exemption pins it.
-fn shape(step: &Value) -> String {
-    if let Some(uses) = step.get("uses").and_then(Value::as_str) {
-        match step
-            .get("with")
-            .and_then(|with| with.get("install_args"))
-            .and_then(Value::as_str)
-        {
-            Some(tools) => format!("uses {uses} install_args {tools}"),
-            None => format!("uses {uses}"),
-        }
-    } else {
-        let run = step.get("run").and_then(Value::as_str).unwrap_or_default();
-        format!("run {run}")
+/// A job as an exemption pins it: the canonical YAML of the parsed job
+/// beside the workflow `env` and `defaults` it inherits. Comments and
+/// formatting are not part of it; every value, key and key order is.
+fn reviewed(workflow: &Value, job: &Value) -> String {
+    let mut pinned = Mapping::new();
+    for key in ["env", "defaults"] {
+        pinned.insert(key.into(), workflow.get(key).cloned().unwrap_or_default());
     }
+    pinned.insert("job".into(), job.clone());
+    // An unserializable job yields an empty text, whose digest matches no
+    // reviewed job.
+    let text = serde_yaml_ng::to_string(&Value::Mapping(pinned)).unwrap_or_default();
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// What one job's steps do, read before any rule applies.
@@ -212,6 +251,11 @@ fn rules(name: &str, workflow: &Value, errors: &mut BTreeSet<String>) {
         .collect();
     let uses_mise = jobs.iter().any(|(_, _, facts)| facts.uses_mise);
     let workflow_env = workflow.get("env");
+    if names(workflow_env, APT_CONFIG) {
+        errors.insert(format!(
+            "{name}: sets {APT_CONFIG} at workflow level; apt must read only the lists each fetch names"
+        ));
+    }
     for variable in AUTO_INSTALL {
         match EXEMPTIONS
             .iter()
@@ -231,7 +275,7 @@ fn rules(name: &str, workflow: &Value, errors: &mut BTreeSet<String>) {
                     ));
                 }
             }
-            Some(exemption) => exempted(name, workflow_env, &jobs, exemption, errors),
+            Some(exemption) => exempted(name, workflow, &jobs, exemption, errors),
         }
     }
     for (id, job, facts) in &jobs {
@@ -239,11 +283,11 @@ fn rules(name: &str, workflow: &Value, errors: &mut BTreeSet<String>) {
     }
 }
 
-/// An exempted workflow: the named jobs keep their reviewed shape and every
+/// An exempted workflow: the named jobs stay exactly as reviewed and every
 /// other job that uses mise opts out itself.
 fn exempted(
     name: &str,
-    workflow_env: Option<&Value>,
+    workflow: &Value,
     jobs: &[(&str, &Value, Job)],
     exemption: &Exemption,
     errors: &mut BTreeSet<String>,
@@ -251,27 +295,21 @@ fn exempted(
     let variable = exemption.variable;
     let reason = exemption.reason;
     let exempt: Vec<&str> = exemption.jobs.iter().map(|(id, _)| *id).collect();
-    if names(workflow_env, variable) {
+    if names(workflow.get("env"), variable) {
         errors.insert(format!(
             "{name}: sets {variable} at workflow level, so the exemption for jobs {} is stale; remove it ({reason})",
             exempt.join(", ")
         ));
+        return;
     }
-    for (id, steps) in exemption.jobs {
-        let found = jobs.iter().find(|(job_id, _, _)| job_id == id);
-        let reviewed = found.is_some_and(|(_, job, _)| {
-            let actual: Vec<String> = job
-                .get("steps")
-                .and_then(Value::as_sequence)
-                .into_iter()
-                .flatten()
-                .map(shape)
-                .collect();
-            !names(job.get("env"), variable) && actual == *steps
-        });
-        if !reviewed {
+    for (id, digest) in exemption.jobs {
+        let actual = jobs.iter().find(|(job_id, _, _)| job_id == id).map_or_else(
+            || "missing".to_owned(),
+            |(_, job, _)| format!("SHA-256 {}", reviewed(workflow, job)),
+        );
+        if actual != format!("SHA-256 {digest}") {
             errors.insert(format!(
-                "{name}: job {id} is exempted from {variable} only in its reviewed shape and no longer has it; scope its tool installation and remove the exemption, or review the new shape ({reason})"
+                "{name}: job {id} is exempted from {variable} only as reviewed (SHA-256 {digest} of the job with the workflow env and defaults it inherits), and it is now {actual}; re-review the exemption: scope the job's tool installation and remove the exemption, or review the whole changed job and record its new digest ({reason})"
             ));
         }
     }
@@ -281,7 +319,7 @@ fn exempted(
         }
         if !is(job.get("env").and_then(|env| env.get(variable)), false) {
             errors.insert(format!(
-                "{name}: job {id} uses mise and is not exempted, so its job env must set {variable}: \"false\" while the workflow level does not"
+                "{name}: job {id} uses mise and is not exempted, so its job env must set {variable}: \"false\" while the workflow level does not ({reason})"
             ));
         }
     }
@@ -302,6 +340,11 @@ fn job_rules(
         .and_then(|strategy| strategy.get("matrix"))
         .is_some_and(|matrix| facts.runs_partition || matrix.get("partition").is_some());
     let job_env = job.get("env");
+    if names(job_env, APT_CONFIG) {
+        errors.insert(format!(
+            "{name}: job {id} sets {APT_CONFIG}; apt must read only the lists each fetch names"
+        ));
+    }
     let offline = if names(job_env, BUNDLE_OFFLINE) {
         is(job_env.and_then(|env| env.get(BUNDLE_OFFLINE)), true)
     } else {
@@ -328,24 +371,36 @@ fn job_rules(
                 ));
             }
         }
+        if names(step.get("env"), APT_CONFIG) || step_script(step).contains(APT_CONFIG) {
+            errors.insert(format!(
+                "{at} sets {APT_CONFIG}; apt must read only the lists each fetch names"
+            ));
+        }
         if partitioned && names(step.get("env"), BUNDLE_OFFLINE) {
             errors.insert(format!("{at} overrides the partition's {BUNDLE_OFFLINE}"));
         }
         if uses.is_some_and(|uses| uses.starts_with(MISE_ACTION)) {
+            // mise-action runs `mise install <install_args>`, so its
+            // arguments must name a tool, as a run step's must.
             let selected = step
                 .get("with")
                 .and_then(|with| with.get("install_args"))
                 .and_then(Value::as_str)
-                .is_some_and(|tools| !tools.trim().is_empty());
+                .is_some_and(|arguments| {
+                    let words: Vec<String> =
+                        arguments.split_whitespace().map(str::to_owned).collect();
+                    !operands(&words).is_empty()
+                });
             if !selected {
                 errors.insert(format!(
                     "{at} uses jdx/mise-action without explicit install_args naming the tools the job uses"
                 ));
             }
         }
-        let Some(script) = step.get("run").and_then(Value::as_str) else {
+        let script = step_script(step);
+        if script.is_empty() {
             continue;
-        };
+        }
         for variable in AUTO_INSTALL {
             if script.contains(variable) {
                 errors.insert(format!(
@@ -364,6 +419,10 @@ fn job_rules(
     }
 }
 
+fn step_script(step: &Value) -> &str {
+    step.get("run").and_then(Value::as_str).unwrap_or_default()
+}
+
 fn command_rules(at: &str, words: &[String], errors: &mut BTreeSet<String>) {
     let Some(first) = words.first() else {
         return;
@@ -371,9 +430,13 @@ fn command_rules(at: &str, words: &[String], errors: &mut BTreeSet<String>) {
     match basename(first) {
         "mise" | "mise.exe" => {
             let operands = operands(&words[1..]);
-            if matches!(operands.as_slice(), ["install" | "i"]) {
+            if let [subcommand] = operands.as_slice()
+                && let Some((name, _)) = MISE_INSTALLS
+                    .iter()
+                    .find(|(name, alias)| subcommand == name || subcommand == alias)
+            {
                 errors.insert(format!(
-                    "{at} runs `mise install` without naming the tools to install"
+                    "{at} runs `mise {name}` without naming the tools to install"
                 ));
             }
         }
@@ -382,14 +445,9 @@ fn command_rules(at: &str, words: &[String], errors: &mut BTreeSet<String>) {
                 .iter()
                 .any(|word| APT_FETCHES.contains(&word.as_str())) =>
         {
-            let option = |prefix: &str| {
-                words
-                    .iter()
-                    .any(|word| word.trim_start_matches("-o").starts_with(prefix))
-            };
-            if !option(APT_SOURCE_LIST) || !option(APT_NO_SOURCE_PARTS) {
+            if !apt_restricted(&words[1..]) {
                 errors.insert(format!(
-                    "{at} runs `{}` over every configured apt source; name the needed list with -o {APT_SOURCE_LIST}... and -o {APT_NO_SOURCE_PARTS}",
+                    "{at} runs `{}` over every configured apt source; name the needed list with one -o Dir::Etc::sourcelist=/..., make the last -o Dir::Etc::sourceparts=/dev/null, and pass no -c",
                     words.join(" ")
                 ));
             }
@@ -414,6 +472,69 @@ fn command_rules(at: &str, words: &[String], errors: &mut BTreeSet<String>) {
         }
         _ => {}
     }
+}
+
+/// Whether an apt command reads only the list it names. apt applies `-o`
+/// settings in order, so the last parts setting wins, and a `-c` file is
+/// read where it appears (apt-get(8), apt.conf(5)). Each word of a short
+/// cluster before `o` or `c` is a flag.
+fn apt_restricted(arguments: &[String]) -> bool {
+    let mut settings = Vec::new();
+    let mut config_file = false;
+    let mut words = arguments.iter();
+    while let Some(word) = words.next() {
+        let (option, attached) = if let Some(long) = word.strip_prefix("--") {
+            match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            }
+        } else if let Some(short) = word.strip_prefix('-') {
+            match short.find(['o', 'c']) {
+                Some(position) => {
+                    let value = &short[position + 1..];
+                    (
+                        if short[position..].starts_with('o') {
+                            "option"
+                        } else {
+                            "config-file"
+                        },
+                        (!value.is_empty()).then_some(value),
+                    )
+                }
+                None => continue,
+            }
+        } else {
+            continue;
+        };
+        let value = |words: &mut std::slice::Iter<'_, String>| {
+            attached
+                .map(str::to_owned)
+                .or_else(|| words.next().cloned())
+        };
+        match option {
+            "option" => {
+                if let Some(setting) = value(&mut words) {
+                    settings.push(setting);
+                }
+            }
+            "config-file" => config_file = true,
+            _ => {}
+        }
+    }
+    let values = |key: &str| -> Vec<String> {
+        settings
+            .iter()
+            .filter_map(|setting| setting.split_once('='))
+            .filter(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.to_owned())
+            .collect()
+    };
+    let lists = values(APT_SOURCE_LIST);
+    !config_file
+        && matches!(lists.as_slice(), [list] if list.starts_with('/'))
+        && values(APT_SOURCE_PARTS)
+            .last()
+            .is_some_and(|parts| parts == "/dev/null")
 }
 
 /// Whether a mise option takes the next word as its value.
@@ -473,19 +594,49 @@ fn commands(script: &str) -> Vec<Vec<String>> {
     commands
 }
 
-/// The program and its arguments, after leading prefixes, their options
-/// (such as `sudo -E`) and assignments. A shell's `-c` string is read as the
-/// command it runs; [`commands`] has already removed its quotes.
-fn program(words: &[String]) -> &[String] {
-    let start = words
+/// Whether a prefix option takes the next word as its value. In a short
+/// cluster the first value option takes the rest of the cluster, or the next
+/// word when it ends the cluster.
+fn prefix_value(word: &str, (_, short, long): &Prefix) -> bool {
+    if word.starts_with("--") {
+        return long.contains(&word);
+    }
+    let flags: Vec<char> = word.chars().skip(1).collect();
+    flags
         .iter()
-        .position(|word| {
-            !PREFIXES.contains(&basename(word))
-                && !word.starts_with('-')
-                && !(word.contains('=') && !word.starts_with('/'))
-        })
-        .unwrap_or(words.len());
-    let words = &words[start..];
+        .position(|flag| short.contains(flag))
+        .is_some_and(|position| position + 1 == flags.len())
+}
+
+/// The program and its arguments, after leading prefixes, their options
+/// (such as `sudo -E` or `sudo -u runner`), timeout's duration and
+/// assignments. A shell's `-c` string is read as the command it runs;
+/// [`commands`] has already removed its quotes.
+fn program(words: &[String]) -> &[String] {
+    let mut start = 0;
+    let mut prefix: Option<&Prefix> = None;
+    let mut duration = false;
+    while let Some(word) = words.get(start) {
+        start += if let Some(found) = PREFIXES.iter().find(|(name, _, _)| *name == basename(word)) {
+            prefix = Some(found);
+            duration = found.0 == "timeout";
+            1
+        } else if word.starts_with('-') {
+            if prefix.is_some_and(|prefix| prefix_value(word, prefix)) {
+                2
+            } else {
+                1
+            }
+        } else if word.contains('=') && !word.starts_with('/') {
+            1
+        } else if duration {
+            duration = false;
+            1
+        } else {
+            break;
+        };
+    }
+    let words = &words[start.min(words.len())..];
     if words
         .first()
         .is_some_and(|shell| SHELLS.contains(&basename(shell)))
