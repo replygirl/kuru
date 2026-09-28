@@ -14,6 +14,12 @@ run = "cargo check -p kuru-connectors --all-targets --all-features --locked"
 [tasks."lint"]
 run = "cargo clippy -p kuru-connectors --all-targets --all-features --locked -- -D warnings"
 
+[tasks."lint:windows"]
+description = "Lint Windows-only Rust for x86_64-pc-windows-msvc; off Windows the delivery stand-in C toolchain lets build scripts finish without compiling C"
+env.CARGO_BUILD_TARGET = false
+run = "CC_x86_64_pc_windows_msvc='{{config_root}}/../kuru-delivery/support/windows-lint-cc.sh' AR_x86_64_pc_windows_msvc='{{config_root}}/../kuru-delivery/support/windows-lint-ar.sh' cargo clippy -p kuru-connectors --target x86_64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings"
+run_windows = "cargo clippy -p kuru-connectors --target x86_64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings"
+
 [tasks."format:fixture:check"]
 description = "Check the shared native protocol fixture explicitly"
 run = "rustfmt --edition 2024 --check tests/fixtures/stdio_peer.rs"

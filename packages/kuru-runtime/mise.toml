@@ -40,5 +40,17 @@ run = "cargo check -p kuru-runtime --all-targets --all-features --locked"
 [tasks."lint"]
 depends = ["//packages/kuru-memory:bundle:prepare"]
 run = "cargo clippy -p kuru-runtime --all-targets --all-features --locked -- -D warnings"
+
+[tasks."lint:windows"]
+description = "Lint Windows-only Rust for x86_64-pc-windows-msvc; off Windows the delivery stand-in C toolchain lets build scripts finish without compiling C"
+depends = [
+  { task = "//packages/kuru-memory:bundle:prepare", args = [
+    "--target",
+    "x86_64-pc-windows-msvc",
+  ] },
+]
+env.CARGO_BUILD_TARGET = false
+run = "CC_x86_64_pc_windows_msvc='{{config_root}}/../kuru-delivery/support/windows-lint-cc.sh' AR_x86_64_pc_windows_msvc='{{config_root}}/../kuru-delivery/support/windows-lint-ar.sh' cargo clippy -p kuru-runtime --target x86_64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings"
+run_windows = "cargo clippy -p kuru-runtime --target x86_64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings"
 [env]
 RUST_TEST_THREADS = "2"

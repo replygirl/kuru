@@ -62,6 +62,10 @@ pub(crate) fn install(
         debug,
         next_span: AtomicU64::new(1),
     };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the application's one global subscriber, installed once at startup; tests return above and never reach it"
+    )]
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
         .context("cannot install project diagnostics for this process")?;
     Ok(Some(DiagnosticsGuard {
@@ -502,6 +506,10 @@ mod tests {
             debug: true,
             next_span: AtomicU64::new(1),
         });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "every callsite this capture observes is a macro in this closure, registered on this thread under this subscriber, and each new Dispatch rebuilds interest; no subscriber-less thread can cache it `never` first"
+        )]
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(target: "foreign.library", detail = %SECRET, "foreign payload");
             for _ in 0..3000 {
@@ -529,6 +537,10 @@ mod tests {
             debug: true,
             next_span: AtomicU64::new(1),
         });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "every callsite this capture observes is a macro in this closure, registered on this thread under this subscriber, and each new Dispatch rebuilds interest; no subscriber-less thread can cache it `never` first"
+        )]
         tracing::subscriber::with_default(subscriber, || {
             let turn = tracing::info_span!(target: "kuru.runtime", "turn", session = "session-1", turn = "digest-1", operation = "turn");
             let _entered = turn.enter();
@@ -571,6 +583,10 @@ mod tests {
             debug: false,
             next_span: AtomicU64::new(1),
         });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "every callsite this capture observes is a macro in this closure, registered on this thread under this subscriber, and each new Dispatch rebuilds interest; no subscriber-less thread can cache it `never` first"
+        )]
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(
                 target: "kuru.memory",
@@ -646,6 +662,10 @@ mod tests {
             debug: false,
             next_span: AtomicU64::new(1),
         });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "every callsite this capture observes is a macro in this closure, registered on this thread under this subscriber, and each new Dispatch rebuilds interest; no subscriber-less thread can cache it `never` first"
+        )]
         tracing::subscriber::with_default(subscriber, || {
             let turn = tracing::info_span!(target: "kuru.runtime", "turn", session = "session-2", turn = "digest-2");
             let _entered = turn.enter();
@@ -681,6 +701,10 @@ mod tests {
             debug: false,
             next_span: AtomicU64::new(1),
         });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "every callsite this capture observes is a macro in this closure, registered on this thread under this subscriber, and each new Dispatch rebuilds interest; no subscriber-less thread can cache it `never` first"
+        )]
         tracing::subscriber::with_default(subscriber, emit);
         ring.finish().unwrap();
         let records = std::fs::read_to_string(root.join("trace-0.jsonl")).unwrap_or_default();
@@ -698,6 +722,10 @@ mod tests {
             debug: true,
             next_span: AtomicU64::new(1),
         });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "every callsite this capture observes is a macro in this closure, registered on this thread under this subscriber, and each new Dispatch rebuilds interest; no subscriber-less thread can cache it `never` first"
+        )]
         tracing::subscriber::with_default(subscriber, emit);
         ring.finish().unwrap();
         let records = (0..FILE_COUNT)
@@ -735,6 +763,10 @@ mod tests {
             debug: true,
             next_span: AtomicU64::new(1),
         });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "every callsite this capture observes is a macro in this closure, registered on this thread under this subscriber, and each new Dispatch rebuilds interest; no subscriber-less thread can cache it `never` first"
+        )]
         tracing::subscriber::with_default(subscriber, || {
             tracing::debug!(
                 target: "kuru.provider",

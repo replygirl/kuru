@@ -51,7 +51,7 @@ pub async fn warm_up_stock_powershell_engine() -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         let outcome = WARMED.get_or_init(run_once).await;
-        return outcome.clone().map_err(|message| anyhow::anyhow!(message));
+        outcome.clone().map_err(|message| anyhow::anyhow!(message))
     }
     #[cfg(not(windows))]
     Ok(())
@@ -111,7 +111,7 @@ pub async fn warm_up_stock_powershell_hook_launch() -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         let outcome = HOOK_WARMED.get_or_init(run_hook_once).await;
-        return outcome.clone().map_err(|message| anyhow::anyhow!(message));
+        outcome.clone().map_err(|message| anyhow::anyhow!(message))
     }
     #[cfg(not(windows))]
     Ok(())

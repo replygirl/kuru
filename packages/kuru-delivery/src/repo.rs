@@ -9,6 +9,8 @@ use std::{
 use anyhow::{Context, Result};
 use toml::Value;
 
+#[path = "repo/lints.rs"]
+mod lints;
 #[path = "repo/workflows.rs"]
 mod workflows;
 
@@ -302,6 +304,7 @@ pub fn check(root: &Path) -> Result<Vec<String>> {
             }
         }
     }
+    lints::check(root, &mut errors)?;
     workflows::check(root, &mut errors)?;
     Ok(errors.into_iter().collect())
 }

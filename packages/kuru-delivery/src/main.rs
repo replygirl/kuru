@@ -161,6 +161,13 @@ enum BundleCommand {
 }
 
 #[derive(Subcommand)]
+#[cfg_attr(
+    windows,
+    expect(
+        clippy::large_enum_variant,
+        reason = "Windows' wider PathBuf pushes this CLI enum past the size threshold; it is parsed once per process, so its size has no cost"
+    )
+)]
 enum CoverageCommand {
     /// Dispatch one Cargo-selected test executable: list its tests and run
     /// this partition's share with exact selections (the Cargo runner).

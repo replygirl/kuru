@@ -295,6 +295,13 @@ enum Operation<T> {
     CallerLost,
 }
 
+#[cfg_attr(
+    windows,
+    expect(
+        clippy::large_enum_variant,
+        reason = "one startup result per MCP session, moved once into its owner; Windows' larger process handles cross the size threshold"
+    )
+)]
 enum Startup {
     Ready(Session),
     Rejected,

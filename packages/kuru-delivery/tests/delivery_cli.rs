@@ -375,6 +375,12 @@ fn repo_cli_checks_actual_owned_manifests_and_reports_drift() {
         "# Kuru\nCanonical instructions.\n",
     );
     write(fixture.root.path(), "CLAUDE.md", "@AGENTS.md\n");
+    // The repository's actual shared lint configuration.
+    write(
+        fixture.root.path(),
+        "clippy.toml",
+        include_str!("../../../clippy.toml"),
+    );
     write(
         fixture.root.path(),
         "apps/example/Cargo.toml",

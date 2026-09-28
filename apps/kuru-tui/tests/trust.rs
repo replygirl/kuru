@@ -337,6 +337,7 @@ impl NativeMcpFixture {
         self.markers("done")
     }
 
+    #[cfg(unix)]
     fn conversations(&self) -> Vec<Vec<Value>> {
         let mut files: Vec<_> = std::fs::read_dir(self.directory.path())
             .unwrap()

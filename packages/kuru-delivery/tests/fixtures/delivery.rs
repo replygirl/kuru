@@ -267,7 +267,7 @@ async fn main() -> io::Result<()> {
                 // started the bounded production receiver on the actual pipe.
                 let mut byte = [0];
                 io::stdin().read_exact(&mut byte)?;
-                if byte != [b'r'] {
+                if byte != *b"r" {
                     return Err(io::Error::other("invalid frame resume byte"));
                 }
                 io::stdout().write_all(&[2])?;

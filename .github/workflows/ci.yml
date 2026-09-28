@@ -31,6 +31,72 @@ jobs:
       ref: ${{ github.sha }}
       artifact-prefix: ci
 
+  windows-lint:
+    # Rust compiles `cfg(windows)` items only for a Windows target, so the
+    # Ubuntu Lint job never sees them. This static job lints them by
+    # cross-target Clippy on Ubuntu: the delivery package's stand-in C
+    # toolchain lets build scripts finish without compiling C, and Clippy
+    # never links. The native-tests Windows jobs still prove that the code
+    # compiles, links and behaves on Windows.
+    name: Lint (x86_64-pc-windows-msvc)
+    needs: bundle-inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      # Import the run's verified bundle inputs; never download them here.
+      KURU_DOLT_BUNDLE_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Select private bundle build inputs
+        shell: bash
+        # Leave the leaf absent so the preparer creates this runner's private ACLs.
+        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Install the Windows standard library and Clippy
+        run: |
+          rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1
+          rustup component add clippy --toolchain 1.98.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: windows-lint
+          # Restrict saves to main so PR runs never thrash the shared cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Download the run's verified bundle inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci-bundle-inputs-ubuntu-latest
+          path: ${{ runner.temp }}/bundle-inputs
+      - name: Import the run's verified bundle inputs
+        shell: bash
+        run: |
+          # bundle:prepare checks each archive against its committed pin again.
+          cd -- "$RUNNER_TEMP/bundle-inputs"
+          shopt -s nullglob
+          archives=(*.archive)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo 'The verified bundle input artifact holds no archive' >&2
+            exit 1
+          fi
+          cd -- "$GITHUB_WORKSPACE"
+          for archive in "${archives[@]}"; do
+            mise run //packages/kuru-memory:bundle:prepare -- --target "${archive%.archive}" --archive "$RUNNER_TEMP/bundle-inputs/$archive" --offline
+          done
+      - name: Lint Windows-only Rust
+        run: mise run lint:windows
+      - name: Require unchanged dependency locks
+        run: git diff --exit-code -- mise.lock Cargo.lock
+
   bundle-inputs:
     # Partitions never download engine archives: this job prepares each
     # pinned upstream archive once, through the same checksum-verifying
@@ -475,7 +541,7 @@ jobs:
 
   ci-gate:
     if: always()
-    needs: [bundle-inputs, quality, native-tests, native-build, native-memory, native-memory-merge, native-platform]
+    needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform]
     runs-on: ubuntu-latest
     steps:
       - name: Require every static and native check

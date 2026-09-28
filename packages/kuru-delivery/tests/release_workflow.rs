@@ -10,7 +10,6 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use kuru_delivery::release::{self, GitHub, Version};
 use kuru_delivery::{
     archive::digest,
-    command,
     coverage::{Mode, OS_TARGETS, WORKSPACE_PACKAGES, os_target, partition_count},
     shell_support,
 };
@@ -21,7 +20,6 @@ use std::{
     fs::{self, File},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
 };
 use tempfile::TempDir;
 
@@ -2002,7 +2000,7 @@ fn arm64_memory_suite_runs_as_gated_uninstrumented_partitions() {
             .starts_with("      - name: Require every memory partition job to have succeeded\n")
     );
     assert!(ci.contains(
-        "needs: [bundle-inputs, quality, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
+        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
     ));
 }
 
@@ -2058,8 +2056,96 @@ fn native_platform_runs_windows_on_arm_as_separately_named_behavioral_evidence()
     );
     assert!(!job.contains("KURU_COVERAGE_"));
     assert!(ci.contains(
-        "needs: [bundle-inputs, quality, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
+        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
     ));
+}
+
+/// Rust compiles `cfg(windows)` items only for a Windows target, so the
+/// Ubuntu Lint job cannot see them. One static CI job lints every package
+/// that has such code for the Windows target, offline, and the gate needs it.
+#[test]
+fn windows_only_rust_is_linted_by_a_required_static_job() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let job = workflow_job(&ci, "windows-lint", "bundle-inputs");
+    for required in [
+        "    name: Lint (x86_64-pc-windows-msvc)\n",
+        "    needs: bundle-inputs\n",
+        "    runs-on: ubuntu-latest\n",
+        "      KURU_DOLT_BUNDLE_OFFLINE: \"true\"\n",
+        "          install_args: rust\n",
+        "          shared-key: windows-lint\n",
+    ] {
+        assert!(job.contains(required), "windows-lint lost {required}");
+    }
+    let steps = workflow_steps(job);
+    let position = |name: &str| {
+        steps
+            .iter()
+            .position(|step| step.contains(&format!("name: {name}\n")))
+            .unwrap_or_else(|| panic!("missing step {name}"))
+    };
+    let fetched = position("Download the run's verified bundle inputs");
+    let imported = position("Import the run's verified bundle inputs");
+    let linted = position("Lint Windows-only Rust");
+    assert!(steps[fetched].contains("          name: ci-bundle-inputs-ubuntu-latest\n"));
+    assert!(
+        steps[imported].contains("--archive \"$RUNNER_TEMP/bundle-inputs/$archive\" --offline\n")
+    );
+    assert!(fetched < imported && imported < linted);
+    assert!(steps[linted].ends_with("run: mise run lint:windows"));
+    assert!(
+        named_step(&steps, "Install the Windows standard library and Clippy")
+            .contains("rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1\n")
+    );
+    assert!(ci.contains(
+        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
+    ));
+
+    // The root task aggregates package-owned tasks, and every package with
+    // Windows-only Rust owns one for the MSVC target with warnings denied.
+    let mise = fs::read_to_string(root.join("mise.toml")).unwrap();
+    assert!(mise.contains(
+        "[tasks.\"lint:windows\"]\ndescription = \"Lint Windows-only Rust for x86_64-pc-windows-msvc in every package that owns the task\"\ndepends = [\"//apps/kuru-tui:lint:windows\", \"//packages/*:lint:windows\"]\n"
+    ));
+    for member in ["apps/kuru-tui"].into_iter().map(str::to_owned).chain(
+        WORKSPACE_PACKAGES
+            .iter()
+            .filter(|package| **package != "kuru")
+            .map(|package| format!("packages/{package}")),
+    ) {
+        let directory = root.join(&member);
+        let mut pending = vec![directory.join("src"), directory.join("tests")];
+        let mut windows = false;
+        while let Some(path) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    windows |= fs::read_to_string(&path).unwrap().contains("cfg(windows)");
+                }
+            }
+        }
+        let tasks = fs::read_to_string(directory.join("mise.toml")).unwrap();
+        let task = tasks.split("[tasks.\"lint:windows\"]\n").nth(1);
+        assert_eq!(task.is_some(), windows, "{member}: lint:windows ownership");
+        if let Some(task) = task {
+            let task = task.split("\n[").next().unwrap();
+            let package = if member == "apps/kuru-tui" {
+                "kuru"
+            } else {
+                member.trim_start_matches("packages/")
+            };
+            let command = format!(
+                "cargo clippy -p {package} --target x86_64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings"
+            );
+            assert!(task.contains(&command), "{member}: {task}");
+        }
+    }
 }
 
 #[test]
@@ -2301,6 +2387,8 @@ fn native_build_input_check_reuses_the_installed_shipping_build() {
 #[cfg(unix)]
 #[tokio::test]
 async fn native_workflow_gate_rejects_incomplete_results() {
+    use kuru_delivery::command;
+    use std::time::Duration;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let workflow = native_workflow();
     let gate = workflow

@@ -272,6 +272,10 @@ impl AuthManager {
                         .enable_all()
                         .build()
                         .context("create authentication refresh runtime")?;
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "propagates the caller's existing dispatch into this owned worker thread so its refresh events reach the same subscriber; no new subscriber is installed"
+                    )]
                     tracing::dispatcher::with_default(&dispatch, || {
                         runtime.block_on(
                             async {

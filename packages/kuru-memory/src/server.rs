@@ -282,7 +282,7 @@ impl Server {
     /// Test-only observation after the retained child has actually reaped.
     /// Unlike acquiring the lifecycle lease, this can fire while a slow pool
     /// drain correctly keeps store ownership held.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn observe_next_owner_reap(&self) -> Result<oneshot::Receiver<()>> {
         let mut owner = self.0.owner.lock().await;
         let owner = owner.as_mut().context("memory server has no owned child")?;

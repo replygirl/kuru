@@ -1,0 +1,23 @@
+# Shared Clippy configuration for every workspace crate. Clippy reads the first
+# clippy.toml or .clippy.toml found walking up from each package directory, so
+# no package may add its own; `mise run lint:tooling` rejects one, and rejects
+# any crate- or module-level allowance of `clippy::disallowed_methods`. Allow a
+# reviewed call site individually with
+# `#[expect(clippy::disallowed_methods, reason = "...")]` on its statement.
+
+disallowed-methods = [
+  # A thread-scoped subscriber cannot observe a callsite that another thread,
+  # holding no subscriber, registered first: tracing-core caches callsite
+  # interest for the whole process (PR #126, run 36424722859).
+  { path = "tracing::subscriber::set_default", reason = "thread-scoped capture misses callsites cached `never` by other threads; observe through one process-wide recorder installed once, as kuru-memory's provision/native_tests.rs RetainedStageRecorder does" },
+  { path = "tracing::subscriber::with_default", reason = "thread-scoped capture misses callsites cached `never` by other threads; observe through one process-wide recorder installed once, as kuru-memory's provision/native_tests.rs RetainedStageRecorder does" },
+  { path = "tracing::dispatcher::set_default", reason = "thread-scoped capture misses callsites cached `never` by other threads; observe through one process-wide recorder installed once, as kuru-memory's provision/native_tests.rs RetainedStageRecorder does" },
+  { path = "tracing::dispatcher::with_default", reason = "thread-scoped capture misses callsites cached `never` by other threads; observe through one process-wide recorder installed once, as kuru-memory's provision/native_tests.rs RetainedStageRecorder does" },
+  { path = "tracing_subscriber::util::SubscriberInitExt::set_default", reason = "thread-scoped capture misses callsites cached `never` by other threads; observe through one process-wide recorder installed once, as kuru-memory's provision/native_tests.rs RetainedStageRecorder does" },
+  # A process has one global subscriber. The application installs it at
+  # startup; a second, ad hoc installation fails or silently loses events.
+  { path = "tracing::subscriber::set_global_default", reason = "the process's one global subscriber is installed at startup by apps/kuru-tui diagnostics::install; tests share one process-wide recorder installed once behind a OnceLock" },
+  { path = "tracing::dispatcher::set_global_default", reason = "the process's one global subscriber is installed at startup by apps/kuru-tui diagnostics::install; tests share one process-wide recorder installed once behind a OnceLock" },
+  { path = "tracing_subscriber::util::SubscriberInitExt::try_init", reason = "the process's one global subscriber is installed at startup by apps/kuru-tui diagnostics::install; tests share one process-wide recorder installed once behind a OnceLock" },
+  { path = "tracing_subscriber::util::SubscriberInitExt::init", reason = "the process's one global subscriber is installed at startup by apps/kuru-tui diagnostics::install; tests share one process-wide recorder installed once behind a OnceLock" },
+]
