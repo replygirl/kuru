@@ -1033,12 +1033,6 @@ async fn activate_staged_with(
                 }
                 Ok(files::DirectoryMove::ProvenNoMove(error)) => {
                     observer(true);
-                    // Every checked no-move is a cancellation point, before
-                    // any decision to retry or stop: a caller cancelled here
-                    // gets its lease's teardown, never a failure completed
-                    // after the cancellation. A timer whose deadline already
-                    // passed completes without yielding, so yield explicitly.
-                    tokio::task::yield_now().await;
                     if error
                         .downcast_ref::<kuru_platform::fs::PublicationError>()
                         .is_none_or(|publication| publication.error().raw_os_error() != Some(5))

@@ -1036,6 +1036,16 @@ async fn cancelling_checked_activation_recovery_drops_stage_before_cache_lock() 
     let abort_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<tokio::task::AbortHandle>));
     let observer_abort_slot = abort_slot.clone();
     let task_destination = destination.clone();
+    // The native move and reconciliation are synchronous and have no product
+    // time bound, and recovery's only await point is its retry-spacing wait,
+    // taken only while the tokio clock is inside the recovery window. Keep the
+    // real probe above, then isolate this cancellation from runner wall-clock
+    // load exactly as `held_descendant_releases_after_checked_no_move_and_activation_recovers`
+    // isolates its retry: a slow first move cannot close the window before the
+    // cancellation reaches that wait. Stage teardown on drop keeps its own
+    // wall-clock bound (`std::time::Instant` in `files.rs`), which pausing
+    // tokio time does not touch.
+    tokio::time::pause();
     let task = tokio::spawn(async move {
         let mut blocker = Some(blocker);
         activate_staged_observed(
@@ -1059,6 +1069,7 @@ async fn cancelling_checked_activation_recovery_drops_stage_before_cache_lock() 
     });
     *abort_slot.lock().unwrap() = Some(task.abort_handle());
     assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::resume();
     assert!(!destination.exists());
     assert!(
         !stage_path.exists(),
@@ -1259,50 +1270,97 @@ async fn first_checked_no_move_after_the_window_reports_stopped_recovery() {
     assert_cache_lock_released(&lock_path, lock_identity).await;
 }
 
+/// A caller cancelled as a late first checked no-move is observed (job
+/// 108878373677): the recovery window has already closed, so the loop reaches
+/// no await point before its terminal decision. The cancellation is honoured
+/// only at recovery's existing await (the retry-spacing wait, covered by
+/// `cancelling_checked_activation_recovery_drops_stage_before_cache_lock`);
+/// here the operation completes with stopped recovery, names the preserved
+/// stage, and releases the cache lock only after that stage is kept.
 #[cfg(windows)]
 #[tokio::test]
-async fn cancellation_at_a_late_first_checked_no_move_is_cancelled() {
+async fn cancellation_at_a_late_first_checked_no_move_completes_with_stopped_recovery() {
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("cache café 東京");
     let (stage, lock, lock_identity, candidate) = fixture_activation_stage(&cache).await;
     let stage_path = stage.path().to_owned();
+    let source_identity = files::directory(&candidate).unwrap().identity();
     let held = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
     let destination = cache.join("active");
     let lock_path = cache.join(".install.lock");
     let abort_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<tokio::task::AbortHandle>));
     let observer_abort_slot = abort_slot.clone();
     let task_destination = destination.clone();
+    let task_candidate = candidate.clone();
+    let observer_lock_path = lock_path.clone();
+    let checked_denials = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let observer_denials = checked_denials.clone();
     let task = tokio::spawn(async move {
         let mut held = Some(held);
         activate_staged_observed(
             stage,
             lock,
-            &candidate,
+            &task_candidate,
             &task_destination,
             move |proven_no_move| {
-                if proven_no_move {
-                    // Fixture delay, not a product one: the first result
-                    // arrives after the recovery window (job 108878373677).
-                    thread::sleep(ACTIVATION_RETRY_LIMIT);
-                    drop(held.take());
-                    observer_abort_slot
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .expect("abort handle is installed before the task runs")
-                        .abort();
-                }
+                assert!(proven_no_move, "only checked no-move may enter recovery");
+                observer_denials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Fixture delay, not a product one: the first result arrives
+                // after the recovery window (job 108878373677).
+                thread::sleep(ACTIVATION_RETRY_LIMIT);
+                let contender = open_regular(&observer_lock_path).unwrap();
+                assert_eq!(
+                    regular_file_info(&contender).unwrap().identity,
+                    lock_identity
+                );
+                assert!(matches!(
+                    contender.try_lock(),
+                    Err(TryLockError::WouldBlock)
+                ));
+                drop(held.take());
+                observer_abort_slot
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .expect("abort handle is installed before the task runs")
+                    .abort();
             },
         )
         .await
     });
     *abort_slot.lock().unwrap() = Some(task.abort_handle());
-    assert!(task.await.unwrap_err().is_cancelled());
-    assert!(!destination.exists());
-    assert!(
-        !stage_path.exists(),
-        "cancellation drops the private stage before releasing the cache lock"
+    let error = task
+        .await
+        .expect("no await point follows a late terminal no-move, so the task completes")
+        .unwrap_err();
+    assert_eq!(
+        checked_denials.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "no native move starts after the recovery window"
     );
+    let publication = error
+        .downcast_ref::<kuru_platform::fs::PublicationError>()
+        .unwrap();
+    assert_eq!(
+        publication.phase,
+        kuru_platform::fs::PublicationPhase::Rejected
+    );
+    assert_eq!(publication.error().raw_os_error(), Some(5));
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains("runtime activation recovery stopped"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("preserved private stage at"),
+        "{diagnostic}"
+    );
+    assert!(stage_path.is_dir());
+    assert_eq!(
+        files::directory(&candidate).unwrap().identity(),
+        source_identity
+    );
+    assert!(!destination.exists());
     assert_cache_lock_released(&lock_path, lock_identity).await;
 }
 
