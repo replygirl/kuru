@@ -10,6 +10,8 @@ pub mod command;
 pub mod coverage;
 #[cfg(feature = "tooling")]
 pub mod docs;
+#[cfg(any(feature = "tooling", windows))]
+mod lease;
 #[cfg(feature = "tooling")]
 pub mod mise_isolation;
 #[cfg(feature = "tooling")]

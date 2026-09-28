@@ -233,6 +233,7 @@ async fn concurrent_cli_imports_converge_on_one_verified_file_and_stable_lock() 
     let before = identity(&lock);
     let held = File::options().read(true).write(true).open(&lock).unwrap();
     held.try_lock().unwrap();
+    held.unlock().unwrap();
     drop(held);
     bundle::prepare(&fixture.options()).await.unwrap();
     assert_eq!(before, identity(&lock));

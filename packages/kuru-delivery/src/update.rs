@@ -1,6 +1,7 @@
 //! Windows loaded-image replacement. The trusted, retained current-image helper
 //! owns publication and its durable receipt; downloaded bytes are never run.
 
+use crate::lease::HeldLock;
 use anyhow::{Context, Result, ensure};
 use kuru_platform::fs::{
     Directory, NameRetention, Privacy, Publication, regular_file_info, seal_private,
@@ -315,18 +316,19 @@ fn state(parent: &Directory) -> Result<Directory> {
     }
 }
 
-fn lock(directory: &Directory) -> Result<File> {
+fn lock(directory: &Directory) -> Result<HeldLock> {
     let pinned = Directory::open(directory.path(), Privacy::OwnerOnly, NameRetention::Pinned)?;
     let file = pinned.lock_file(OsStr::new(LOCK))?;
     // Busy is a real unresolved operation, not a reason to overwrite its receipt.
     file.try_lock()
         .context("another update or recovery owns the installation")?;
-    pinned.verify(OsStr::new(LOCK), &file)?;
-    Ok(file)
+    let lease = HeldLock::acquired(file);
+    pinned.verify(OsStr::new(LOCK), &lease)?;
+    Ok(lease)
 }
 
 /// All trusted native installation paths share the same Windows lease.
-pub(crate) fn installation_guard(parent: &Directory) -> Result<File> {
+pub(crate) fn installation_guard(parent: &Directory) -> Result<HeldLock> {
     let directory = state(parent)?;
     let lease = lock(&directory)?;
     if let Some(mut receipt) = load(&directory)? {
