@@ -89,7 +89,8 @@ None. The living specs already require the corrected behaviour; only the impleme
 - `packages/kuru-runtime/src/dream.rs` and the other managed-store fixtures the invariant identifies.
 - `apps/kuru-tui/src/ui/runtime_tests.rs`: a store fixture found by the round-2 Dolt traces (its root was a plain `tempfile` directory the invariant does not check).
 - New regression tests in kuru-memory. The branch's existing measurement support (`store/lifecycle_measurement_tests.rs`, `test_support/lifecycle_trace.rs`) is retained as ignored measurement code.
-- `docs/development.md`: the fixture teardown invariant.
+- `packages/kuru-memory/src/service/rpc.rs` (the test-only paused exchange), `spawn_gate.rs`, `test_support/served_owner.rs`, and the lost-reply and owner-restart tests in `facade.rs`, `service.rs`, `store.rs` and `store/migrations.rs`, plus kuru-runtime `hook_tests.rs`: two fixture ordering rules (design D7, D8). Test support and tests only.
+- `docs/development.md`: the fixture teardown invariant and the two fixture ordering rules.
 - No public API, configuration, protocol, schema or user-visible behaviour change. No workflow change.
 
 ## Surfaces

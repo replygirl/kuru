@@ -423,6 +423,35 @@ When the teardown cannot retire the owner, for example because an aborted
 request still holds a client attachment, the guard still fails the test and its
 panic replaces the returned error; the printed body error remains.
 
+A kuru-memory fixture that releases a lock and takes it again at once through a
+one-shot acquisition, such as a successor `ServiceOwner::open` after its
+predecessor retired or closed, holds the exclusive spawn gate from before the
+release until that acquisition returns. The shared spawn guard does not exclude
+a sibling test's spawn, and that sibling's child can hold a duplicate of the
+just-released lock description until its `exec`, so the successor would see a
+busy lock although no owner exists. `ServedOwner::restart` retires, opens and
+serves a successor this way, and `spawn_gate::excluding_spawns` covers any other
+sequence; both take the caller's shared guard and hand the exclusive guard
+back down to it atomically, because a successor served inside the restart
+starts its idle timer at once and must not wait for the gate afterwards.
+`ServiceOwner::open` stays one-shot and a fixture never retries it. The gate is
+fair, so a restart waits for every running spawner to drop its shared guard,
+within the fixture's own deadline, and code under the exclusive guard must not
+take a shared one.
+
+A lost-reply test that pauses a request with the fixture reply pause
+(`ReplyPause`, or `test_support::ReplyBarrier` outside kuru-memory), cancels it
+and then expects one `reconcile` or recovery call to return a definite answer
+awaits the reply signal (`ReplyPause::replied`, `ReplyBarrier::wait_replied`)
+before it cancels. The owner answers an outcome query from its in-process
+receipt registry, which settles only when the original request's handler
+returns, and a sibling can read the committed row before then. A sibling's read
+therefore proves the commit but does not order the reconcile, which may still
+be answered `InFlight` and fail as uncertain. The paused client reads and holds
+the owner's reply frame, which the owner writes only after the receipt settled,
+and a released call returns that frame unchanged. Tests that poll `reconcile`
+until the outcome is definite do not need the signal.
+
 A record is keyed by the store directory's native identity and birth time, so
 it follows a rename, and releasing a root forgets the records beneath it, so a
 directory that recycles a removed store's Linux inode does not inherit its
