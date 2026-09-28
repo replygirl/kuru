@@ -4,27 +4,36 @@
 //! owner before its root drops, or the root's guard ([`super::TempDir`])
 //! fails the test. When the retirement ran only at the end of the block that
 //! also owned the root, an early `?`, `bail!` or `ensure!` detached the
-//! served task and dropped the root under a live engine. The guard then
-//! correctly failed the test, but its panic replaced the fixture's own error.
+//! served task and dropped the root under a live engine; and when the root
+//! and the owner lived inside the future its fixture deadline drops, an
+//! elapsed deadline did the same. The guard then correctly failed the test,
+//! but its panic replaced the fixture's own error.
 //!
-//! So such a fixture keeps its root, its options and its [`ServedOwner`]
-//! outside the body being judged. It captures the body's `Result` while the
-//! root lives and passes that result to [`settle`], with the success tail's
-//! own retirement as the teardown. [`settle`] writes a body error to the
-//! test's captured output before the teardown starts, then runs the teardown
-//! on every path, with the same calls and bounds as the success path. If the
-//! teardown cannot retire the owner (a client task aborted mid-request can
-//! legitimately keep the owner busy), the guard still fails the test when the
-//! root drops, and its panic replaces the returned error. The printed body
-//! error survives in the captured output.
+//! So such a fixture keeps its root and its options outside its
+//! [`FixtureDeadline`], and serves its owner through
+//! [`FixtureDeadline::serve`], which holds the [`ServedOwner`] outside the
+//! timed future. The fixture's stage opens and serves the owner and returns
+//! the body's `Result`; its teardown is the success tail's own retirement.
+//! Within the deadline, [`settle`] writes a body error to the test's captured
+//! output before the teardown starts, then runs the teardown with the same
+//! calls and bounds as the success path. When the deadline elapses, the timed
+//! stage is dropped (its clients with it), the deadline's own error is
+//! written first, and then the same teardown runs, bounded by its own calls
+//! (the maintenance permit by the startup budget, the reap by its bound). The
+//! returned error is the body's or the deadline's, with any teardown failure
+//! attached. The fixture then releases its root with [`super::TempDir::release`],
+//! which attaches the guard's verdict to that error when the teardown could
+//! not retire the owner (a client task aborted mid-request can legitimately
+//! keep the owner busy): on every exit path the owner is retired or the
+//! verdict is reported, and neither replaces the fixture's error.
 
 use crate::{
     OpenOptions,
     service::{ServiceOwner, acquire_maintenance_permit},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Error, Result, anyhow, ensure};
 use std::{future::Future, path::Path, time::Duration};
-use tokio::{sync::RwLockReadGuard, task::JoinHandle};
+use tokio::{sync::RwLockReadGuard, task::JoinHandle, time::Instant};
 
 /// The owner task a fixture is serving, or nothing once that task has ended.
 ///
@@ -35,15 +44,9 @@ pub(crate) struct ServedOwner {
 }
 
 impl ServedOwner {
-    /// Serve `owner` on a new task.
-    pub(crate) fn spawn(owner: ServiceOwner) -> Self {
-        Self {
-            task: Some(tokio::spawn(owner.serve())),
-        }
-    }
-
-    /// Serve a successor after the previous owner has been reaped.
-    pub(crate) fn serve_successor(&mut self, owner: ServiceOwner) -> Result<()> {
+    /// Serve `owner` on a new task: the fixture's first owner, or a successor
+    /// after the previous owner has been reaped.
+    pub(crate) fn serve(&mut self, owner: ServiceOwner) -> Result<()> {
         ensure!(
             self.task.is_none(),
             "a fixture owner is still being served; reap it before its successor"
@@ -120,11 +123,107 @@ impl ServedOwner {
             let successor = ServiceOwner::open(options.clone(), project)
                 .await
                 .with_context(|| format!("{context}: its successor did not open"))?;
-            self.serve_successor(successor)
+            self.serve(successor)
         })
         .await?;
         Ok(gate)
     }
+}
+
+/// A fixture's outer hang backstop: one absolute instant, started once and
+/// shared by every stage and iteration of the fixture, so a stage that runs
+/// outside [`Self::serve`] or a later iteration never gets a fresh budget.
+pub(crate) struct FixtureDeadline {
+    budget: Duration,
+    at: Instant,
+    fixture: &'static str,
+}
+
+impl FixtureDeadline {
+    /// Start `budget` now for the fixture named `fixture` in its error.
+    pub(crate) fn start(budget: Duration, fixture: &'static str) -> Self {
+        Self {
+            budget,
+            at: Instant::now() + budget,
+            fixture,
+        }
+    }
+
+    /// The error an elapsed deadline reports.
+    fn elapsed(&self) -> Error {
+        anyhow!("{} exceeded its {:?} deadline", self.fixture, self.budget)
+    }
+
+    /// Run a stage that serves no owner before the deadline.
+    pub(crate) async fn run<T>(&self, stage: impl Future<Output = Result<T>>) -> Result<T> {
+        tokio::time::timeout_at(self.at, stage)
+            .await
+            .unwrap_or_else(|_| Err(self.elapsed()))
+    }
+
+    /// Run `stage`, which serves its owner through the [`ServedOwner`] it is
+    /// given, and then `teardown` on every exit path: after the stage
+    /// returns, within the deadline, as [`settle`] does, and after the
+    /// deadline elapses, once the stage has been dropped. The owner lives
+    /// here, outside the timed future, so an elapsed deadline cannot detach
+    /// it before its teardown.
+    pub(crate) async fn serve<T>(
+        &self,
+        stage: impl AsyncFnOnce(&mut ServedOwner) -> Result<T>,
+        teardown: impl AsyncFn(&mut ServedOwner) -> Result<()>,
+    ) -> Result<T> {
+        serve_until(
+            tokio::time::sleep_until(self.at),
+            || self.elapsed(),
+            stage,
+            teardown,
+        )
+        .await
+    }
+}
+
+/// [`FixtureDeadline::serve`] for a fixture that has no outer deadline: the
+/// same stage and teardown, with the teardown run after the stage returns.
+pub(crate) async fn serve_without_deadline<T>(
+    stage: impl AsyncFnOnce(&mut ServedOwner) -> Result<T>,
+    teardown: impl AsyncFn(&mut ServedOwner) -> Result<()>,
+) -> Result<T> {
+    serve_until(
+        std::future::pending(),
+        || anyhow!("a fixture without a deadline cannot expire"),
+        stage,
+        teardown,
+    )
+    .await
+}
+
+/// [`FixtureDeadline::serve`] with the deadline as any future, so a test can
+/// expire it at a chosen point of the stage.
+async fn serve_until<T>(
+    expired: impl Future<Output = ()>,
+    elapsed: impl FnOnce() -> Error,
+    stage: impl AsyncFnOnce(&mut ServedOwner) -> Result<T>,
+    teardown: impl AsyncFn(&mut ServedOwner) -> Result<()>,
+) -> Result<T> {
+    let mut served = ServedOwner { task: None };
+    let finished = {
+        let timed = async {
+            let body = stage(&mut served).await;
+            settle(body, teardown(&mut served)).await
+        };
+        tokio::select! {
+            biased;
+            result = timed => Some(result),
+            () = expired => None,
+        }
+    };
+    if let Some(result) = finished {
+        return result;
+    }
+    let error = elapsed();
+    eprintln!("{error:#}; retiring its service owner before the root is released");
+    let teardown = teardown(&mut served).await;
+    combine(Err(error), teardown)
 }
 
 /// Finish a fixture whose `body` ran while its root and served owner lived:
@@ -141,7 +240,10 @@ pub(crate) async fn settle<T>(
              {error:?}"
         );
     }
-    let teardown = teardown.await;
+    combine(body, teardown.await)
+}
+
+fn combine<T>(body: Result<T>, teardown: Result<()>) -> Result<T> {
     match (body, teardown) {
         (Ok(value), Ok(())) => Ok(value),
         (Ok(_), Err(teardown)) => Err(teardown),
@@ -155,7 +257,6 @@ pub(crate) async fn settle<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::anyhow;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
@@ -177,6 +278,18 @@ mod tests {
         );
         let options = super::super::open_options(root.path().join("private"), scope)?;
         Ok((root, project, options))
+    }
+
+    /// A stopped store with no quiescence record: the guard's verdict for it
+    /// is a violation, and no engine ever ran.
+    fn unrecorded_store(root: &Path) -> Result<PathBuf> {
+        let store = root.join("memory").join("abcdef");
+        for directory in [root.join("memory"), store.clone()] {
+            crate::files::private_dir(&directory)?;
+        }
+        crate::files::write(&store.join("server.log"), b"Kuru engine shutdown: Ok")?;
+        crate::files::write(&store.join("lifecycle.lock"), b"")?;
+        Ok(store)
     }
 
     #[tokio::test]
@@ -208,84 +321,183 @@ mod tests {
     async fn a_failed_body_retires_its_live_owner_before_the_root_is_released() -> Result<()> {
         super::super::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner.
-        let deadline = super::super::fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let (root, project, options) = fixture()?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = ServiceOwner::open(options.clone(), &project).await?;
-            let mut served = ServedOwner::spawn(owner);
-            let body: Result<()> = async {
-                let _client = crate::MemoryStore::open_managed_observed(
-                    options.clone(),
-                    project.clone(),
-                    std::env::current_exe()?,
-                )
-                .1
-                .await?;
-                Err(anyhow!(
-                    "injected fixture body failure with an attached client"
-                ))
-            }
-            .await;
-            let settled = settle(
-                body,
-                served.retire(&options, None, REAP, "served fixture owner did not reap"),
+        let deadline =
+            FixtureDeadline::start(super::super::fixture_deadline(1, 0), "served owner fixture");
+        let (root, project, options) = fixture()?;
+        let path = root.path().to_path_buf();
+        let settled = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    let _client = crate::MemoryStore::open_managed_observed(
+                        options.clone(),
+                        project.clone(),
+                        std::env::current_exe()?,
+                    )
+                    .1
+                    .await?;
+                    Err::<(), _>(anyhow!(
+                        "injected fixture body failure with an attached client"
+                    ))
+                },
+                async |served| {
+                    served
+                        .retire(&options, None, REAP, "served fixture owner did not reap")
+                        .await
+                },
             )
             .await;
-            let error = settled.expect_err("the injected body failure was not returned");
-            ensure!(
-                format!("{error:#}") == "injected fixture body failure with an attached client",
-                "the fixture returned another error than its body's: {error:#}"
-            );
-            ensure!(
-                served.task.is_none(),
-                "the failed body's owner was not reaped"
-            );
-            // The guard fails this test if the owner's engine outlived it.
-            drop(root);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| format!("served owner fixture exceeded its {deadline:?} deadline"))?
+        // The guard attaches its verdict if the owner's engine outlived it.
+        let error = root
+            .release(settled)
+            .expect_err("the injected body failure was not returned");
+        ensure!(
+            format!("{error:#}") == "injected fixture body failure with an attached client",
+            "the fixture returned another error than its body's: {error:#}"
+        );
+        ensure!(!path.exists(), "the failed body's owner was not reaped");
+        Ok(())
     }
 
     #[tokio::test]
     async fn a_body_that_reaped_its_owner_is_settled_without_polling_it_again() -> Result<()> {
         super::super::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner.
-        let deadline = super::super::fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let (root, project, options) = fixture()?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = ServiceOwner::open(options.clone(), &project).await?;
-            let mut served = ServedOwner::spawn(owner);
-            let body: Result<()> = async {
-                served
-                    .retire(&options, None, REAP, "served fixture owner did not reap")
-                    .await?;
-                Err(anyhow!(
-                    "injected fixture body failure after its owner was reaped"
-                ))
-            }
-            .await;
-            let settled = settle(
-                body,
-                served.retire(&options, None, REAP, "served fixture owner did not reap"),
+        let deadline =
+            FixtureDeadline::start(super::super::fixture_deadline(1, 0), "served owner fixture");
+        let (root, project, options) = fixture()?;
+        let settled = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    served
+                        .retire(&options, None, REAP, "served fixture owner did not reap")
+                        .await?;
+                    ensure!(
+                        served.reap(REAP, "no owner").await.is_err(),
+                        "a reaped owner could be awaited again"
+                    );
+                    Err::<(), _>(anyhow!(
+                        "injected fixture body failure after its owner was reaped"
+                    ))
+                },
+                async |served| {
+                    ensure!(served.task.is_none(), "the reaped owner is still held");
+                    served
+                        .retire(&options, None, REAP, "served fixture owner did not reap")
+                        .await
+                },
             )
             .await;
-            let error = settled.expect_err("the injected body failure was not returned");
-            ensure!(
-                format!("{error:#}") == "injected fixture body failure after its owner was reaped",
-                "the fixture returned another error than its body's: {error:#}"
-            );
-            ensure!(
-                served.reap(REAP, "no owner").await.is_err(),
-                "a reaped owner could be awaited again"
-            );
-            drop(root);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| format!("served owner fixture exceeded its {deadline:?} deadline"))?
+        let error = root
+            .release(settled)
+            .expect_err("the injected body failure was not returned");
+        ensure!(
+            format!("{error:#}") == "injected fixture body failure after its owner was reaped",
+            "the fixture returned another error than its body's: {error:#}"
+        );
+        Ok(())
+    }
+
+    /// The fixture deadline elapses while the body holds a client of a live
+    /// served owner. The deadline's own error is returned, and the owner is
+    /// retired before the root is released: the guard removes the root. The
+    /// deadline is expired by the body's signal, once the owner is served
+    /// and the client attached, so the test does not depend on timing.
+    #[tokio::test]
+    async fn an_elapsed_deadline_reports_its_own_error_and_retires_the_live_owner() -> Result<()> {
+        super::super::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let backstop = FixtureDeadline::start(
+            super::super::fixture_deadline(1, 0),
+            "expiring served fixture's backstop",
+        );
+        let (root, project, options) = fixture()?;
+        let path = root.path().to_path_buf();
+        let (expire, expired) = tokio::sync::oneshot::channel::<()>();
+        let outcome = backstop
+            .run(async {
+                Ok(serve_until(
+                    async {
+                        let _ = expired.await;
+                    },
+                    || anyhow!("expiring served fixture exceeded its deadline"),
+                    async |served| {
+                        let _gate = crate::spawn_gate::spawning().await;
+                        let owner = ServiceOwner::open(options.clone(), &project).await?;
+                        served.serve(owner)?;
+                        let _client = crate::MemoryStore::open_managed_observed(
+                            options.clone(),
+                            project.clone(),
+                            std::env::current_exe()?,
+                        )
+                        .1
+                        .await?;
+                        let _ = expire.send(());
+                        std::future::pending::<Result<()>>().await
+                    },
+                    async |served| {
+                        served
+                            .retire(&options, None, REAP, "served fixture owner did not reap")
+                            .await
+                    },
+                )
+                .await)
+            })
+            .await?;
+        let error = root
+            .release(outcome)
+            .expect_err("the fixture body never finishes");
+        ensure!(
+            format!("{error:#}") == "expiring served fixture exceeded its deadline",
+            "the fixture returned another error than its deadline's: {error:#}"
+        );
+        ensure!(
+            !path.exists(),
+            "the live owner was not retired after the deadline elapsed"
+        );
+        Ok(())
+    }
+
+    /// When the root cannot be released after an elapsed deadline, the
+    /// guard's verdict is attached to the deadline's error and the root is
+    /// kept; nothing panics. An unrecorded store stands for an owner the
+    /// teardown could not retire, without starting an engine.
+    #[tokio::test]
+    async fn an_elapsed_deadline_attaches_the_guard_verdict_instead_of_panicking() -> Result<()> {
+        let root = super::super::tempdir()?;
+        let kept = root.path().to_path_buf();
+        let (expire, expired) = tokio::sync::oneshot::channel::<()>();
+        let outcome = serve_until(
+            async {
+                let _ = expired.await;
+            },
+            || anyhow!("verdict fixture exceeded its deadline"),
+            async |_served| {
+                unrecorded_store(&kept)?;
+                let _ = expire.send(());
+                std::future::pending::<Result<()>>().await
+            },
+            async |served: &mut ServedOwner| {
+                ensure!(served.task.is_none(), "this fixture serves no owner");
+                Ok(())
+            },
+        )
+        .await;
+        let error = root
+            .release(outcome)
+            .expect_err("the fixture body never finishes");
+        ensure!(
+            error.root_cause().to_string() == "verdict fixture exceeded its deadline"
+                && format!("{error:#}").contains("has no quiescence record"),
+            "the deadline error did not carry the guard's verdict: {error:#}"
+        );
+        ensure!(kept.exists(), "an unexplained root must be kept");
+        std::fs::remove_dir_all(kept.parent().context("kept root parent")?)?;
+        Ok(())
     }
 }

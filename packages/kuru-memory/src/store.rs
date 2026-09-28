@@ -9727,96 +9727,115 @@ mod tests {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: a fresh owner, then a reopened local store, successor owner and final
         // local store.
-        let deadline = crate::test_support::fixture_deadline(1, 3);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = sha2::Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let mut served = crate::test_support::ServedOwner::spawn(owner);
-            let body = async {
-                let mut client = service::attach_existing(&options, &project)
-                    .await?
-                    .context("service endpoint did not admit a candidate client")?;
-                let ServiceValue::CandidateStarted { handle, .. } = client
-                    .call(ServiceCall::BeginCandidate {
-                        label: "disconnect-dream".into(),
-                    })
-                    .await?
-                else {
-                    bail!("service did not return the candidate identity");
-                };
-                ensure!(
-                    matches!(
-                        client
-                            .call(ServiceCall::View {
-                                candidate: Some(handle),
-                                operation: Box::new(ViewOperation::PutMany {
-                                    values: vec![("dream-private".into(), json!("retained"))],
-                                }),
+        let deadline = crate::test_support::FixtureDeadline::start(
+            crate::test_support::fixture_deadline(1, 3),
+            "candidate disconnect/restart fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = sha2::Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = async {
+            let (candidate_refs, successor, _gate) = deadline
+                .serve(
+                    async |served| {
+                        let _gate = crate::spawn_gate::spawning().await;
+                        let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                        served.serve(owner)?;
+                        let mut client = service::attach_existing(&options, &project)
+                            .await?
+                            .context("service endpoint did not admit a candidate client")?;
+                        let ServiceValue::CandidateStarted { handle, .. } = client
+                            .call(ServiceCall::BeginCandidate {
+                                label: "disconnect-dream".into(),
                             })
-                            .await?,
-                        ServiceValue::Unit
-                    ),
-                    "service did not accept the candidate write"
-                );
-                drop(client);
-                Ok::<(), anyhow::Error>(())
-            }
-            .await;
-            // The teardown's retirement releases the owner lock that the
-            // one-shot successor open below takes again; see
-            // `crate::spawn_gate::excluding_spawns`.
-            let ((candidate_refs, successor), _gate) =
-                crate::spawn_gate::excluding_spawns(_gate, async {
-                    crate::test_support::settle(
-                        body,
-                        served.retire(
-                            &options,
-                            None,
-                            Duration::from_secs(10),
-                            "first owner did not reap after candidate client disconnected",
-                        ),
-                    )
-                    .await?;
+                            .await?
+                        else {
+                            bail!("service did not return the candidate identity");
+                        };
+                        ensure!(
+                            matches!(
+                                client
+                                    .call(ServiceCall::View {
+                                        candidate: Some(handle),
+                                        operation: Box::new(ViewOperation::PutMany {
+                                            values: vec![(
+                                                "dream-private".into(),
+                                                json!("retained")
+                                            )],
+                                        }),
+                                    })
+                                    .await?,
+                                ServiceValue::Unit
+                            ),
+                            "service did not accept the candidate write"
+                        );
+                        drop(client);
+                        // The owner's retirement releases the owner lock that the
+                        // one-shot successor open below takes again; see
+                        // `crate::spawn_gate::excluding_spawns`.
+                        let ((candidate_refs, successor), gate) =
+                            crate::spawn_gate::excluding_spawns(_gate, async {
+                                served
+                                    .retire(
+                                        &options,
+                                        None,
+                                        Duration::from_secs(10),
+                                        "first owner did not reap after candidate client \
+                                         disconnected",
+                                    )
+                                    .await?;
 
-                    let first = MemoryStore::open(options.clone()).await?;
-                    let candidate_refs = candidate_refs_with_value(&first).await?;
-                    ensure!(
-                        candidate_refs.len() == 1,
-                        "candidate ref was deleted on disconnect"
-                    );
-                    first.close().await?;
+                                let first = MemoryStore::open(options.clone()).await?;
+                                let candidate_refs = candidate_refs_with_value(&first).await?;
+                                ensure!(
+                                    candidate_refs.len() == 1,
+                                    "candidate ref was deleted on disconnect"
+                                );
+                                first.close().await?;
 
-                    let successor = service::ServiceOwner::open(options.clone(), &project).await?;
-                    Ok((candidate_refs, successor))
-                })
+                                let successor =
+                                    service::ServiceOwner::open(options.clone(), &project).await?;
+                                Ok((candidate_refs, successor))
+                            })
+                            .await?;
+                        Ok((candidate_refs, successor, gate))
+                    },
+                    async |served| {
+                        served
+                            .retire(
+                                &options,
+                                None,
+                                Duration::from_secs(10),
+                                "first owner did not reap after candidate client disconnected",
+                            )
+                            .await
+                    },
+                )
                 .await?;
-            successor.close().await?;
-            let reopened = MemoryStore::open(options).await?;
-            ensure!(
-                candidate_refs_with_value(&reopened).await? == candidate_refs,
-                "owner restart changed the unresolved candidate ref, head or private rows"
-            );
-            reopened.close().await?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("candidate disconnect/restart fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
+            deadline
+                .run(async {
+                    successor.close().await?;
+                    let reopened = MemoryStore::open(options.clone()).await?;
+                    ensure!(
+                        candidate_refs_with_value(&reopened).await? == candidate_refs,
+                        "owner restart changed the unresolved candidate ref, head or private rows"
+                    );
+                    reopened.close().await
+                })
+                .await
+        }
+        .await;
+        root.release(outcome)
     }
 
     async fn candidate_refs_with_value(

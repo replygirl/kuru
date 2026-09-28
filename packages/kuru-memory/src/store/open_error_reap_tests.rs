@@ -24,10 +24,10 @@ fn lifecycle_root(options: &OpenOptions) -> Option<PathBuf> {
 /// attempt, far shorter than any Dolt stop. A violation panics here, before
 /// the fixture root drops, so the report names this contract.
 ///
-/// The lease is a real lifecycle flock taken in this process. Since round 3
-/// the fixture root's teardown reads process-local quiescence records rather
-/// than probing this lock; the attempt and the release both hold the lock
-/// gate only to serialize against each other; see `crate::spawn_gate`.
+/// The lease is a real lifecycle flock taken in this process, so the attempt
+/// and the release both hold the lock gate: no sibling test's child inherits
+/// the lease's description in between; see `crate::spawn_gate`. The fixture
+/// root's teardown reads quiescence records and never probes this lock.
 async fn assert_reaped(options: &OpenOptions, directory: &Path) -> Result<()> {
     let root = lifecycle_root(options);
     let _gate = crate::spawn_gate::locking_async().await;

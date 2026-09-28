@@ -1838,10 +1838,10 @@ mod tests {
 
     #[tokio::test]
     async fn inspection_waits_for_a_booting_owner_without_starting_dolt() -> Result<()> {
-        // Held for the whole test: it takes a real owner flock and never spawns.
-        // Since round 3 the fixture root's teardown reads process-local
-        // quiescence records rather than probing this lock; the gate here is
-        // only to keep this test's own owner flock held; see `crate::spawn_gate`.
+        // Held for the whole test: it takes and releases a real owner flock and
+        // never spawns, so no sibling test's child inherits that lock's
+        // description; see `crate::spawn_gate`. The fixture root's teardown
+        // reads quiescence records and never probes this lock.
         let _gate = crate::spawn_gate::locking_async().await;
         let root = crate::test_support::tempdir()?;
         let project = root.path().join("project");
@@ -1940,10 +1940,10 @@ mod tests {
 
     #[tokio::test]
     async fn purge_refuses_a_live_service_owner_before_writing_intent() -> Result<()> {
-        // Held for the whole test: it takes a real owner flock and never spawns.
-        // Since round 3 the fixture root's teardown reads process-local
-        // quiescence records rather than probing this lock; the gate here is
-        // only to keep this test's own owner flock held; see `crate::spawn_gate`.
+        // Held for the whole test: it takes and releases a real owner flock and
+        // never spawns, so no sibling test's child inherits that lock's
+        // description; see `crate::spawn_gate`. The fixture root's teardown
+        // reads quiescence records and never probes this lock.
         let _gate = crate::spawn_gate::locking_async().await;
         let data = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "a".repeat(64));
@@ -1976,104 +1976,111 @@ mod tests {
     async fn maintenance_retires_only_an_idle_owner_and_holds_election() -> Result<()> {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner, retired by maintenance.
-        let deadline = crate::test_support::fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let data = root.path().join("private");
-            let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
-            options.config.cache_dir = Some(crate::store::test_cache());
-            options.config.offline = true;
-            options.supervisor = Some(crate::store::test_supervisor()?);
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = ServiceOwner::open(options.clone(), &project).await?;
-            let mut served = crate::test_support::ServedOwner::spawn(owner);
-            let body = async {
-                let mut client = try_attach(&data, &scope, &project)
-                    .await?
-                    .context("fixture owner did not accept a client")?;
+        let deadline = crate::test_support::FixtureDeadline::start(
+            crate::test_support::fixture_deadline(1, 0),
+            "idle-owner maintenance fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let data = root.path().join("private");
+        let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+        options.config.cache_dir = Some(crate::store::test_cache());
+        options.config.offline = true;
+        options.supervisor = Some(crate::store::test_supervisor()?);
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let mut client = try_attach(&data, &scope, &project)
+                            .await?
+                            .context("fixture owner did not accept a client")?;
 
-                let refused = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    crate::MemoryStore::purge(options.clone()),
-                )
-                .await
-                .context("busy owner maintenance refusal exceeded five seconds")?
-                .expect_err("maintenance admitted another live client");
-                ensure!(
-                    format!("{refused:#}").contains("active clients"),
-                    "busy owner refusal lacked client context: {refused:#}"
-                );
-                ensure!(
-                    !data
-                        .join("memory/controls")
-                        .join(format!("{}.json", &scope["project/".len()..]))
-                        .exists(),
-                    "refused purge wrote durable intent"
-                );
-                ensure!(
-                    matches!(
-                        client.call(ServiceCall::Revision).await?,
-                        ServiceValue::Revision(_)
-                    ),
-                    "refused maintenance disturbed the live client"
-                );
-                client.close();
+                        let refused = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            crate::MemoryStore::purge(options.clone()),
+                        )
+                        .await
+                        .context("busy owner maintenance refusal exceeded five seconds")?
+                        .expect_err("maintenance admitted another live client");
+                        ensure!(
+                            format!("{refused:#}").contains("active clients"),
+                            "busy owner refusal lacked client context: {refused:#}"
+                        );
+                        ensure!(
+                            !data
+                                .join("memory/controls")
+                                .join(format!("{}.json", &scope["project/".len()..]))
+                                .exists(),
+                            "refused purge wrote durable intent"
+                        );
+                        ensure!(
+                            matches!(
+                                client.call(ServiceCall::Revision).await?,
+                                ServiceValue::Revision(_)
+                            ),
+                            "refused maintenance disturbed the live client"
+                        );
+                        client.close();
 
-                let permit = tokio::time::timeout(
-                    Duration::from_secs(20),
-                    acquire_maintenance_permit(&options),
-                )
-                .await
-                .context("idle owner was not retired before its 30-second grace period")??;
-                ensure!(
-                    ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?.is_none(),
-                    "maintenance did not retain the starter election gate"
-                );
-                ensure!(
-                    EndpointRecord::read(&data, &scope)?.is_none(),
-                    "retired owner still published an endpoint"
-                );
-                served
-                    .reap(
-                        Duration::from_secs(5),
-                        "retired owner did not finish reaping",
-                    )
-                    .await?;
-                drop(permit);
-                ensure!(
-                    ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?.is_some(),
-                    "maintenance did not release the election gate"
-                );
-                Ok::<(), anyhow::Error>(())
-            }
-            .await;
-            crate::test_support::settle(
-                body,
-                served.retire(
-                    &options,
-                    Some(Duration::from_secs(20)),
-                    Duration::from_secs(5),
-                    "retired owner did not finish reaping",
-                ),
+                        let permit = tokio::time::timeout(
+                            Duration::from_secs(20),
+                            acquire_maintenance_permit(&options),
+                        )
+                        .await
+                        .context(
+                            "idle owner was not retired before its 30-second grace period",
+                        )??;
+                        ensure!(
+                            ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?
+                                .is_none(),
+                            "maintenance did not retain the starter election gate"
+                        );
+                        ensure!(
+                            EndpointRecord::read(&data, &scope)?.is_none(),
+                            "retired owner still published an endpoint"
+                        );
+                        served
+                            .reap(
+                                Duration::from_secs(5),
+                                "retired owner did not finish reaping",
+                            )
+                            .await?;
+                        drop(permit);
+                        ensure!(
+                            ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?
+                                .is_some(),
+                            "maintenance did not release the election gate"
+                        );
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            Some(Duration::from_secs(20)),
+                            Duration::from_secs(5),
+                            "retired owner did not finish reaping",
+                        )
+                        .await
+                },
             )
-            .await
-        })
-        .await
-        .with_context(|| {
-            format!("idle-owner maintenance fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
+            .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
@@ -3645,19 +3652,28 @@ mod tests {
 
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh owner, then its reopened successor.
-        let deadline = crate::test_support::fixture_deadline(1, 1);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!("project/{}", digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let deadline = crate::test_support::FixtureDeadline::start(
+            crate::test_support::fixture_deadline(1, 1),
+            "lost candidate promotion fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = deadline.serve(async |served| {
             let _gate = crate::spawn_gate::spawning().await;
             let owner = ServiceOwner::open(options.clone(), &project).await?;
-            let mut served = crate::test_support::ServedOwner::spawn(owner);
-            let body = async {
+            served.serve(owner)?;
+            async {
                 let mut client = attach_existing(&options, &project).await?.context("missing service attachment")?;
                 let generation = client.generation().to_owned();
                 let ServiceValue::CandidateStarted { handle, base, branch } = client
@@ -3790,18 +3806,16 @@ mod tests {
                 }).await?, ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Abandoned)));
                 drop(observer);
                 Ok::<(), anyhow::Error>(())
-            }.await;
-            crate::test_support::settle(
-                body,
-                served.retire(
-                    &options,
-                    None,
-                    Duration::from_secs(10),
-                    "transition fixture's current owner did not reap",
-                ),
+            }.await
+        }, async |served| {
+            served.retire(
+                &options,
+                None,
+                Duration::from_secs(10),
+                "transition fixture's current owner did not reap",
             ).await
-        }).await.with_context(|| format!("lost candidate promotion fixture exceeded its {deadline:?} deadline"))??;
-        Ok(())
+        }).await;
+        root.release(outcome)
     }
 
     #[tokio::test]

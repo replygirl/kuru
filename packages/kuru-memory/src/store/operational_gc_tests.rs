@@ -1296,157 +1296,202 @@ async fn active_lingering_session(store: &MemoryStore, branch: &str) -> Result<L
 /// `candidate_deletion_refuses_a_session_that_outlives_retirement` does: an
 /// abandonment interrupted after its durable rename. The managed client then
 /// drives the remaining cleanup through the service with its exact target.
+///
+/// The owner's handler is the 30 s wait plus further steps, and the client's
+/// reply bound is 35 s, so the reply can arrive complete (`StorageFailed`) or
+/// be lost to the client's own deadline. The test names the shape that
+/// arrived and asserts the fence, the unchanged refs and the unchanged main
+/// on either. That the wait ran for its full bound rests on a server-side
+/// event, not on the client's elapsed time: the owner holds the status ref's
+/// admission across its wait, and a second admission, queued only once the
+/// owner has observed the live session, is granted only when the owner
+/// releases it.
 #[tokio::test]
 async fn slow_30s_managed_abandon_cleanup_bound_fences_client_and_keeps_status_ref() -> Result<()> {
     crate::test_support::warm_runtime_cache().await?;
     // Real lifecycles: one fresh service owner, then one local reopen. The
     // fixture's single-stall term is this test's one `QUERY_TIMEOUT` stall.
-    let deadline = crate::test_support::fixture_deadline(1, 1);
-    tokio::time::timeout(deadline, async {
-        let root = crate::test_support::tempdir()?;
-        let project = root.path().join("project");
-        std::fs::create_dir(&project)?;
-        let project = project.canonicalize()?;
-        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-        let scope = format!(
-            "project/{}",
-            digest
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-        // Hold the shared spawn guard only across calls that can start a
-        // process, never across the bounded wait below.
-        // From the owner's spawn on, everything that can fail before it
-        // retires is judged in `body` while the root lives.
-        let (owner_store, mut served, memory) = {
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = crate::service::ServiceOwner::open(options.clone(), &project).await?;
-            let owner_store = owner.inspection_store_for_test();
-            let served = crate::test_support::ServedOwner::spawn(owner);
-            let memory = async {
-                crate::MemoryStore::open_managed_observed(
-                    options.clone(),
-                    project.clone(),
-                    std::env::current_exe()?,
-                )
-                .1
-                .await
-            }
-            .await;
-            (owner_store, served, memory)
-        };
-        let body = async {
-            let memory = memory?;
-            let candidate = memory.begin_candidate("bounded managed abandon").await?;
-            candidate.view().put("private", &json!(1)).await?;
-            let target = candidate.view().revision().await?;
-            let base = candidate.base().to_owned();
-            ensure!(target != base);
-            let page = owner_store.candidate_inventory(None, 16).await?;
-            let [status] = page.candidates.as_slice() else {
-                bail!("expected exactly one candidate ref, found {page:?}");
-            };
-            ensure!(status.state == CandidateRefState::OpenUnchanged);
-            ensure!(status.head.as_deref() == Some(target.as_str()));
-            let names = CandidateNames::from_open(&status.branch)?;
-            transition_candidate(&owner_store, &names.open, &names.abandoned, &target).await?;
-            let session = active_lingering_session(&owner_store, &names.abandoned).await?;
+    let deadline = crate::test_support::FixtureDeadline::start(
+        crate::test_support::fixture_deadline(1, 1),
+        "bounded managed abandon fixture",
+    );
+    let root = crate::test_support::tempdir()?;
+    let project = root.path().join("project");
+    std::fs::create_dir(&project)?;
+    let project = project.canonicalize()?;
+    let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+    let scope = format!(
+        "project/{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+    let outcome = async {
+        let names = deadline
+            .serve(
+                async |served| {
+                    // Hold the shared spawn guard only across calls that can
+                    // start a process, never across the bounded wait below.
+                    let (owner_store, memory) = {
+                        let _gate = crate::spawn_gate::spawning().await;
+                        let owner =
+                            crate::service::ServiceOwner::open(options.clone(), &project).await?;
+                        let owner_store = owner.inspection_store_for_test();
+                        served.serve(owner)?;
+                        let memory = crate::MemoryStore::open_managed_observed(
+                            options.clone(),
+                            project.clone(),
+                            std::env::current_exe()?,
+                        )
+                        .1
+                        .await?;
+                        (owner_store, memory)
+                    };
+                    let candidate = memory.begin_candidate("bounded managed abandon").await?;
+                    candidate.view().put("private", &json!(1)).await?;
+                    let target = candidate.view().revision().await?;
+                    let base = candidate.base().to_owned();
+                    ensure!(target != base);
+                    let page = owner_store.candidate_inventory(None, 16).await?;
+                    let [status] = page.candidates.as_slice() else {
+                        bail!("expected exactly one candidate ref, found {page:?}");
+                    };
+                    ensure!(status.state == CandidateRefState::OpenUnchanged);
+                    ensure!(status.head.as_deref() == Some(target.as_str()));
+                    let names = CandidateNames::from_open(&status.branch)?;
+                    transition_candidate(&owner_store, &names.open, &names.abandoned, &target)
+                        .await?;
+                    let session = active_lingering_session(&owner_store, &names.abandoned).await?;
 
-            let started = Instant::now();
-            let error = candidate
-                .abandon_exact(&target)
-                .await
-                .expect_err("managed abandonment deleted a ref under a live server session");
-            let elapsed = started.elapsed();
-            eprintln!("managed abandon returned after {elapsed:?}: {error:#}");
-            ensure!(
-                elapsed >= QUERY_TIMEOUT,
-                "managed cleanup returned in {elapsed:?}, before its {QUERY_TIMEOUT:?} session bound"
-            );
-            let message = format!("{error:#}");
-            // Only `ServiceFault::StorageFailed` resolves to this client message:
-            // a complete reply, not a lost one.
-            ensure!(
-                message.contains("memory service storage operation failed"),
-                "the owner did not reply StorageFailed: {message}"
-            );
-            ensure!(
-                message.contains(
-                    "memory service write outcome is uncertain; further client mutations are blocked"
-                ),
-                "the client did not fence the StorageFailed transition: {message}"
-            );
-            let blocked = memory
-                .put("blocked", &json!(true))
-                .await
-                .expect_err("a fenced client issued another mutation");
-            ensure!(
-                format!("{blocked:#}").contains(
-                    "memory service write outcome is uncertain; this client cannot issue another mutation"
-                ),
-                "the second mutation failed for another reason: {blocked:#}"
-            );
+                    let server = &owner_store.shared.server;
+                    let wait_started = server.observe_next_candidate_wait().await;
+                    let started = Instant::now();
+                    let (abandoned, released) =
+                        tokio::join!(candidate.abandon_exact(&target), async {
+                            tokio::time::timeout(TEST_DEADLINE, wait_started)
+                                .await
+                                .context("the owner did not observe the lingering session")?
+                                .context("the owner's session-wait observer was dropped")?;
+                            // Queued only now, while the owner holds the
+                            // status ref's admission across its wait; granted
+                            // when the owner releases it.
+                            let admission = server.fence_pool(&names.abandoned).await?;
+                            let released = started.elapsed();
+                            drop(admission);
+                            Ok::<_, anyhow::Error>(released)
+                        });
+                    let elapsed = started.elapsed();
+                    let released = released?;
+                    let error = abandoned.expect_err(
+                        "managed abandonment deleted a ref under a live server session",
+                    );
+                    let message = format!("{error:#}");
+                    // `ServiceFault::StorageFailed` resolves to the first
+                    // message (a complete reply); the client's own reply
+                    // deadline to the second (a lost reply).
+                    let shape = if message.contains("memory service storage operation failed") {
+                        "a complete StorageFailed reply"
+                    } else if message.contains("memory service frame read deadline exceeded") {
+                        "a reply lost to the client's reply deadline"
+                    } else {
+                        bail!("managed abandonment failed with neither reply shape: {message}")
+                    };
+                    eprintln!(
+                        "managed abandon returned {shape} after {elapsed:?}; the owner released \
+                         the status ref's admission after {released:?}: {error:#}"
+                    );
+                    ensure!(
+                        released >= QUERY_TIMEOUT,
+                        "the owner released the status ref's admission after {released:?}, before \
+                         its {QUERY_TIMEOUT:?} session bound"
+                    );
+                    ensure!(
+                        message.contains(
+                            "memory service write outcome is uncertain; further client mutations \
+                             are blocked"
+                        ),
+                        "the client did not fence {shape}: {message}"
+                    );
+                    let blocked = memory
+                        .put("blocked", &json!(true))
+                        .await
+                        .expect_err("a fenced client issued another mutation");
+                    ensure!(
+                        format!("{blocked:#}").contains(
+                            "memory service write outcome is uncertain; this client cannot issue \
+                             another mutation"
+                        ),
+                        "the second mutation failed for another reason: {blocked:#}"
+                    );
 
-            // Nothing was decided from the ambiguous wait: the session is still
-            // live, the status ref keeps its exact head, main never moved and no
-            // branch procedure was dispatched (it is recorded only after the wait).
-            ensure!(session_count(&owner_store, session.id, &session.database).await? == 1);
-            let heads = candidate_heads(&owner_store.pool, &names).await?;
-            ensure!(
-                heads == BTreeMap::from([(names.abandoned.clone(), target.clone())]),
-                "the bounded cleanup changed candidate refs: {heads:?}"
-            );
-            ensure!(owner_store.revision().await? == base);
-            ensure!(
-                owner_store
-                    .shared
-                    .uncertain
-                    .lock()
-                    .expect("uncertain lock")
-                    .is_none(),
-                "the bounded cleanup dispatched a branch procedure"
-            );
+                    // Nothing was decided from the ambiguous wait: the session is
+                    // still live, the status ref keeps its exact head, main never
+                    // moved and no branch procedure was dispatched (it is recorded
+                    // only after the wait). Read after the owner released the
+                    // admission, on either reply shape.
+                    ensure!(session_count(&owner_store, session.id, &session.database).await? == 1);
+                    let heads = candidate_heads(&owner_store.pool, &names).await?;
+                    ensure!(
+                        heads == BTreeMap::from([(names.abandoned.clone(), target.clone())]),
+                        "the bounded cleanup changed candidate refs: {heads:?}"
+                    );
+                    ensure!(owner_store.revision().await? == base);
+                    ensure!(
+                        owner_store
+                            .shared
+                            .uncertain
+                            .lock()
+                            .expect("uncertain lock")
+                            .is_none(),
+                        "the bounded cleanup dispatched a branch procedure"
+                    );
 
-            session.end(&owner_store).await?;
-            let recovered = {
-                let _gate = crate::spawn_gate::spawning().await;
-                memory
-                    .recover_candidate_transition()
-                    .await?
-                    .context("the fenced client had no pending transition")?
-            };
-            ensure!(recovered.resolution == crate::CandidateTransitionResolution::Abandoned);
-            ensure!(recovered.candidate.is_none());
-            memory.put("after-proof", &json!(true)).await?;
-            ensure!(memory.get("private").await?.is_none());
-            drop(candidate);
-            memory.close().await?;
-            Ok::<_, anyhow::Error>(names)
-        }
-        .await;
-        let names = crate::test_support::settle(
-            body,
-            served.retire(
-                &options,
-                None,
-                Duration::from_secs(10),
-                "bounded abandon owner did not reap",
-            ),
-        )
-        .await?;
-        drop(owner_store);
+                    session.end(&owner_store).await?;
+                    let recovered = {
+                        let _gate = crate::spawn_gate::spawning().await;
+                        memory
+                            .recover_candidate_transition()
+                            .await?
+                            .context("the fenced client had no pending transition")?
+                    };
+                    ensure!(
+                        recovered.resolution == crate::CandidateTransitionResolution::Abandoned
+                    );
+                    ensure!(recovered.candidate.is_none());
+                    memory.put("after-proof", &json!(true)).await?;
+                    ensure!(memory.get("private").await?.is_none());
+                    drop(candidate);
+                    memory.close().await?;
+                    Ok(names)
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "bounded abandon owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await?;
 
         // The retained status authority is resolved state: the next open
         // reclaims it without promoting or reviving the candidate.
-        let _gate = crate::spawn_gate::spawning().await;
-        let reopened = MemoryStore::open(options).await?;
-        ensure!(candidate_heads(&reopened.pool, &names).await?.is_empty());
-        ensure!(reopened.get("private").await?.is_none());
-        ensure!(reopened.get("after-proof").await? == Some(json!(true)));
-        reopened.close().await
-    })
-    .await
-    .with_context(|| format!("bounded managed abandon fixture exceeded its {deadline:?} deadline"))?
+        deadline
+            .run(async {
+                let _gate = crate::spawn_gate::spawning().await;
+                let reopened = MemoryStore::open(options.clone()).await?;
+                ensure!(candidate_heads(&reopened.pool, &names).await?.is_empty());
+                ensure!(reopened.get("private").await?.is_none());
+                ensure!(reopened.get("after-proof").await? == Some(json!(true)));
+                reopened.close().await
+            })
+            .await
+    }
+    .await;
+    root.release(outcome)
 }

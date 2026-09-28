@@ -20,6 +20,13 @@
 //!
 //! Both lease forms are recognised on every platform.
 //!
+//! The scan reads at most 8 directory levels and 4096 entries beneath the
+//! root, and does not descend into `.dolt`, Dolt's own repository directory,
+//! which never holds any of those files. Whatever it cannot read is itself a
+//! violation: a directory past the depth budget, an entry past the entry
+//! budget, an unreadable directory or entry, and a store whose identity
+//! cannot be taken. A truncated scan never passes.
+//!
 //! Each store must then be explained by the process-local ledger
 //! ([`super::engine_ledger`]):
 //!
@@ -34,7 +41,9 @@
 //! If any store is unexplained, teardown keeps the whole root, so a live
 //! engine can finish, and fails the test with the fixture, the test and each
 //! store. A thread that is already unwinding keeps the root without a second
-//! panic. The check never waits and writes nothing to stdout or stderr. The
+//! panic. A fixture that already has an outcome releases its root with
+//! [`TempDir::release`] instead of dropping it, so a failing verdict is
+//! attached to the fixture's own error rather than replacing it with a panic. The check never waits and writes nothing to stdout or stderr. The
 //! whole scan runs inside the ledger's critical section
 //! ([`engine_ledger::with`]), and in the same section the teardown forgets
 //! the records beneath its root, so no owner is registered, reaped or
@@ -96,6 +105,56 @@ impl TempDir {
     }
 }
 
+impl TempDir {
+    /// Release the root after a fixture's `outcome`, on the calling thread,
+    /// with the same check as its drop. When a store is unexplained the root
+    /// is kept, and the verdict is attached to `outcome`'s error as context,
+    /// or returned as the error of a successful outcome: it never replaces
+    /// the fixture's own error. The drop's panic remains the check for every
+    /// root that is not released this way.
+    #[must_use = "the guard's verdict is returned, not raised"]
+    pub fn release<T>(mut self, outcome: anyhow::Result<T>) -> anyhow::Result<T> {
+        let Some(inner) = self.inner.take() else {
+            return outcome;
+        };
+        let Some(verdict) = check(inner, &self.label) else {
+            return outcome;
+        };
+        match outcome {
+            Ok(_) => Err(anyhow::anyhow!(verdict)),
+            Err(error) => Err(error.context(format!(
+                "the fixture failed, and its root was then kept: {verdict}"
+            ))),
+        }
+    }
+}
+
+/// Scan and forget the records beneath `inner`'s root, then remove it, or
+/// keep it and describe why.
+fn check(inner: PrivateTemp, label: &str) -> Option<String> {
+    // The records beneath the root go with it, kept or removed, so no
+    // later directory that recycles a native identity inherits one.
+    let violations = engine_ledger::with(|ledger| {
+        let violations = scan(ledger, inner.path());
+        ledger.forget_under(&canonical(inner.path()));
+        violations
+    });
+    if violations.is_empty() {
+        return None;
+    }
+    // Never delete the tree under a possibly live engine.
+    let kept = inner.keep();
+    Some(format!(
+        "fixture root {} (created by test {label}) was released without awaited memory \
+         quiescence, so it is kept in place. Close every store, and await \
+         test_support::await_managed_quiescence (managed services) or \
+         test_support::await_store_quiescence (engines run by another process) before \
+         the root drops. Unexplained stores: {}",
+        kept.display(),
+        violations.join("; ")
+    ))
+}
+
 impl std::fmt::Debug for TempDir {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -110,32 +169,13 @@ impl Drop for TempDir {
         let Some(inner) = self.inner.take() else {
             return;
         };
-        // The records beneath the root go with it, kept or removed, so no
-        // later directory that recycles a native identity inherits one.
-        let violations = engine_ledger::with(|ledger| {
-            let violations = scan(ledger, inner.path());
-            ledger.forget_under(&canonical(inner.path()));
-            violations
-        });
-        if violations.is_empty() {
-            return;
+        // The root is kept on a violation even while this test is already
+        // failing; only a thread that is not unwinding reports.
+        if let Some(verdict) = check(inner, &self.label)
+            && !std::thread::panicking()
+        {
+            panic!("{verdict}");
         }
-        // Never delete the tree under a possibly live engine, even while this
-        // test is already failing; only a thread that is not unwinding reports.
-        let kept = inner.keep();
-        if std::thread::panicking() {
-            return;
-        }
-        panic!(
-            "fixture root {} (created by test {}) was released without awaited memory \
-             quiescence, so it is kept in place. Close every store, and await \
-             test_support::await_managed_quiescence (managed services) or \
-             test_support::await_store_quiescence (engines run by another process) before \
-             the root drops. Unexplained stores: {}",
-            kept.display(),
-            self.label,
-            violations.join("; ")
-        );
     }
 }
 
@@ -214,18 +254,32 @@ fn scan(ledger: &Ledger, root: &Path) -> Vec<String> {
     let mut found = Found::default();
     let mut budget = MAX_ENTRIES;
     collect(root, 0, &mut budget, &mut found);
+    if found.exhausted {
+        found.unscanned.push(format!(
+            "the scan of {} reached its {MAX_ENTRIES}-entry budget before it finished, so the \
+             stores beyond it were not checked",
+            root.display()
+        ));
+    }
     let mut violations = ledger.live_under(&canonical);
+    violations.append(&mut found.unscanned);
     let mut stores = BTreeMap::new();
     for store in found.leased {
-        if let Some(key) = engine_ledger::key(&store) {
-            stores.entry(store).or_insert(key);
+        match engine_ledger::key(&store) {
+            Some(key) => {
+                stores.entry(store).or_insert(key);
+            }
+            None => violations.push(unkeyed(&store)),
         }
     }
     for store in found.identified {
-        if let Some(key) = engine_ledger::key(&store)
-            && key
-                .lease_name()
-                .is_some_and(|name| found.leases.contains(OsStr::new(&name)))
+        let Some(key) = engine_ledger::key(&store) else {
+            violations.push(unkeyed(&store));
+            continue;
+        };
+        if key
+            .lease_name()
+            .is_some_and(|name| found.leases.contains(OsStr::new(&name)))
         {
             stores.entry(store).or_insert(key);
         }
@@ -236,6 +290,13 @@ fn scan(ledger: &Ledger, root: &Path) -> Vec<String> {
             .filter_map(|(store, key)| unexplained(ledger, &store, &key)),
     );
     violations
+}
+
+fn unkeyed(store: &Path) -> String {
+    format!(
+        "the identity of store {} could not be taken, so it was not checked",
+        store.display()
+    )
 }
 
 fn unexplained(ledger: &Ledger, store: &Path, key: &Key) -> Option<String> {
@@ -263,6 +324,10 @@ struct Found {
     identified: Vec<PathBuf>,
     /// File names beneath every `lifecycles` directory.
     leases: BTreeSet<OsString>,
+    /// What the scan could not read: each is a violation, never a pass.
+    unscanned: Vec<String>,
+    /// An entry was left unread when the entry budget ran out.
+    exhausted: bool,
 }
 
 impl Found {
@@ -295,27 +360,66 @@ fn store_of(path: &Path) -> Option<PathBuf> {
         .filter(|store| store.is_dir())
 }
 
+/// Dolt's own repository directory. Kuru never places a store, a lock file
+/// or `identity.json` inside it, and a real store's repository nests past the
+/// depth budget (`data/kuru/.dolt/stats/.dolt/noms/oldgen`), so the scan does
+/// not descend into it. It is the only directory the scan skips.
+const DOLT_REPOSITORY: &str = ".dolt";
+
+/// Read `directory` into `found`. Anything left unread (a directory past the
+/// depth budget, an unreadable directory or entry, an entry past the entry
+/// budget) is recorded as a violation, so a truncated scan never passes.
 fn collect(directory: &Path, depth: usize, budget: &mut usize, found: &mut Found) {
     if depth > MAX_DEPTH {
+        found.unscanned.push(format!(
+            "directory {} is deeper than the scan's {MAX_DEPTH}-level depth budget, so the \
+             stores beneath it were not checked",
+            directory.display()
+        ));
         return;
     }
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            found.unscanned.push(format!(
+                "directory {} could not be read ({error}), so the stores beneath it were not \
+                 checked",
+                directory.display()
+            ));
+            return;
+        }
     };
     for entry in entries {
         if *budget == 0 {
+            found.exhausted = true;
             return;
         }
         *budget -= 1;
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let Ok(kind) = entry.file_type() else {
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                found.unscanned.push(format!(
+                    "an entry of directory {} could not be read ({error}), so it was not checked",
+                    directory.display()
+                ));
+                continue;
+            }
         };
         let path = entry.path();
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) => {
+                found.unscanned.push(format!(
+                    "the type of {} could not be read ({error}), so it was not checked",
+                    path.display()
+                ));
+                continue;
+            }
+        };
         if kind.is_dir() {
-            collect(&path, depth + 1, budget, found);
+            if entry.file_name() != DOLT_REPOSITORY {
+                collect(&path, depth + 1, budget, found);
+            }
         } else if kind.is_file() {
             found.file(directory, &path);
         }
@@ -742,6 +846,126 @@ mod tests {
         );
         let path = receiver.recv().unwrap();
         assert!(path.exists(), "an unexplained root is kept while unwinding");
+        remove_kept(&path);
+    }
+
+    /// A directory below the depth budget was never read, so a store in it
+    /// could not be checked: the scan reports it instead of passing.
+    #[test]
+    fn a_directory_beyond_the_depth_budget_is_a_violation() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let mut deep = root.path().to_path_buf();
+        for level in 0..=MAX_DEPTH {
+            deep.push(format!("level-{level}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        let found = violations(root.path());
+        assert!(
+            found
+                .iter()
+                .any(|violation| violation.contains("depth budget")
+                    && violation.contains(&deep.display().to_string())),
+            "{found:?}"
+        );
+        let path = root.path().to_path_buf();
+        let message = panic_message(root);
+        assert!(message.contains("depth budget"), "{message}");
+        remove_kept(&path);
+    }
+
+    /// Entries past the entry budget were never read: the scan reports the
+    /// exhausted budget instead of passing.
+    #[test]
+    fn an_exhausted_entry_budget_is_a_violation() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        for index in 0..=MAX_ENTRIES {
+            fs::write(root.path().join(format!("entry-{index}")), b"").unwrap();
+        }
+        let found = violations(root.path());
+        assert!(
+            found
+                .iter()
+                .any(|violation| violation.contains("entry budget")),
+            "{found:?}"
+        );
+        let path = root.path().to_path_buf();
+        let message = panic_message(root);
+        assert!(message.contains("entry budget"), "{message}");
+        remove_kept(&path);
+    }
+
+    /// A directory the scan cannot read may hold a store: it is reported.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_is_a_violation() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let sealed = root.path().join("sealed");
+        fs::create_dir(&sealed).unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).unwrap();
+        let found = violations(root.path());
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|violation| violation.contains("could not be read")
+                    && violation.contains(&sealed.display().to_string())),
+            "{found:?}"
+        );
+    }
+
+    /// A real store's Dolt repository nests past the depth budget
+    /// (`data/kuru/.dolt/stats/.dolt/noms/oldgen`). The scan does not descend
+    /// into a `.dolt` directory, so a recorded store with a deep repository
+    /// still passes, within both budgets.
+    #[test]
+    fn a_recorded_store_with_a_deep_dolt_repository_passes() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let store = stopped_store(root.path());
+        let mut deep = store.join("data").join("kuru").join(".dolt");
+        for name in ["stats", ".dolt", "noms", "oldgen", "a", "b", "c", "d"] {
+            deep.push(name);
+        }
+        fs::create_dir_all(&deep).unwrap();
+        for index in 0..=MAX_ENTRIES {
+            fs::write(deep.join(format!("table-{index}")), b"").unwrap();
+        }
+        engine_ledger::record(&store);
+        assert_eq!(violations(root.path()), Vec::<String>::new());
+        let path = root.path().to_path_buf();
+        drop(root);
+        assert!(!path.exists(), "a recorded root is removed");
+    }
+
+    /// `release` returns the guard's verdict instead of panicking: a
+    /// successful outcome becomes the verdict, a failed one keeps its own
+    /// error with the verdict attached, and a clean root is removed.
+    #[test]
+    fn release_attaches_the_verdict_to_the_fixture_outcome() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let path = root.path().to_path_buf();
+        assert_eq!(root.release(Ok(7)).unwrap(), 7);
+        assert!(!path.exists(), "a clean root is removed");
+
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let store = stopped_store(root.path());
+        let path = root.path().to_path_buf();
+        let verdict = root.release(Ok(())).unwrap_err().to_string();
+        let expected = format!("store {} has no quiescence record", store.display());
+        assert!(verdict.contains(&expected), "{verdict}");
+        assert!(path.exists(), "an unexplained root is kept");
+        remove_kept(&path);
+
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let store = stopped_store(root.path());
+        let path = root.path().to_path_buf();
+        let error = root
+            .release::<()>(Err(anyhow::anyhow!("fixture failure")))
+            .unwrap_err();
+        let expected = format!("store {} has no quiescence record", store.display());
+        assert_eq!(error.root_cause().to_string(), "fixture failure");
+        assert!(format!("{error:#}").contains(&expected), "{error:#}");
+        assert!(path.exists(), "an unexplained root is kept");
         remove_kept(&path);
     }
 }
