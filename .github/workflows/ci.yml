@@ -18,6 +18,11 @@ env:
   MISE_NO_HOOKS: "1"
   # CI and release builds stay outside the maintainer mr-boxington cache.
   KURU_MBX: "0"
+  # Jobs install only their mise-action install_args. Windows exe shims run
+  # `mise x`, which would otherwise download every other configured tool.
+  MISE_EXEC_AUTO_INSTALL: "false"
+  # `mise run` would otherwise install every missing configured tool first.
+  MISE_TASK_RUN_AUTO_INSTALL: "false"
 
 jobs:
   quality:
@@ -26,7 +31,110 @@ jobs:
       ref: ${{ github.sha }}
       artifact-prefix: ci
 
+  bundle-inputs:
+    # Partitions never download engine archives: this job prepares each
+    # pinned upstream archive once, through the same checksum-verifying
+    # bundle:prepare, and publishes one set per partition runner label. Each
+    # partition imports its set with --archive --offline into its own private
+    # bundle directory, where bundle:prepare checks the committed pin again.
+    # Windows on Arm's engine is built from source by bundle-build instead.
+    name: Verified bundle inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Select private bundle build inputs
+        shell: bash
+        # Leave the leaf absent so the preparer creates this runner's private ACLs.
+        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: bundle-inputs
+          # Restrict saves to main so PR runs never thrash the shared cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Prepare each pinned upstream archive once
+        shell: bash
+        run: |
+          manifest=packages/kuru-memory/support/dolt-assets.json
+          inputs="$RUNNER_TEMP/kuru-bundle-inputs"
+          # Each label's partitions need their host engine and the Windows x64
+          # archive that the host-independent decoder tests read.
+          fixture=x86_64-pc-windows-msvc
+          declare -A sets=(
+            [ubuntu-latest]="x86_64-unknown-linux-gnu $fixture"
+            [ubuntu-24.04-arm]="aarch64-unknown-linux-gnu $fixture"
+            [macos-latest]="aarch64-apple-darwin $fixture"
+            [windows-latest]="$fixture"
+            [windows-11-arm]="$fixture"
+          )
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin "$fixture"; do
+            mise run //packages/kuru-memory:bundle:prepare -- --target "$target"
+          done
+          for label in "${!sets[@]}"; do
+            mkdir -p "$inputs/$label"
+            for target in ${sets[$label]}; do
+              sha=$(jq -er --arg target "$target" '.assets[] | select(.target == $target) | .archive_sha256' "$manifest")
+              cp -- "$KURU_DOLT_BUNDLE_DIR/$sha.archive" "$inputs/$label/$target.archive"
+            done
+          done
+      # One artifact per label, named without the attempt so that rerun
+      # partitions import the set this run already verified.
+      - name: Publish the ubuntu-latest bundle inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-bundle-inputs-ubuntu-latest
+          path: ${{ runner.temp }}/kuru-bundle-inputs/ubuntu-latest
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+      - name: Publish the ubuntu-24.04-arm bundle inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-bundle-inputs-ubuntu-24.04-arm
+          path: ${{ runner.temp }}/kuru-bundle-inputs/ubuntu-24.04-arm
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+      - name: Publish the macos-latest bundle inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-bundle-inputs-macos-latest
+          path: ${{ runner.temp }}/kuru-bundle-inputs/macos-latest
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+      - name: Publish the windows-latest bundle inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-bundle-inputs-windows-latest
+          path: ${{ runner.temp }}/kuru-bundle-inputs/windows-latest
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+      - name: Publish the windows-11-arm bundle inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-bundle-inputs-windows-11-arm
+          path: ${{ runner.temp }}/kuru-bundle-inputs/windows-11-arm
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
   native-tests:
+    needs: bundle-inputs
     strategy:
       fail-fast: false
       matrix:
@@ -42,6 +150,7 @@ jobs:
       os: ${{ matrix.os }}
       install: true
       artifact-prefix: ci
+      bundle-inputs: ci-bundle-inputs
 
   native-build:
     strategy:
@@ -53,7 +162,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       MISE_LOCKED: "1"
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       # Native archive and memory tests need only the pinned Rust toolchain.
       MISE_NO_HOOKS: "1"
       CARGO_INCREMENTAL: "0"
@@ -102,6 +210,7 @@ jobs:
     # the kuru-memory test inventory into a fresh target, lists each test
     # executable and runs only its assigned tests by exact name.
     name: Native memory partition (ubuntu-24.04-arm, ${{ matrix.partition }})
+    needs: bundle-inputs
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     strategy:
@@ -111,9 +220,10 @@ jobs:
         partition: [1, 2, 3]
     env:
       MISE_LOCKED: "1"
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       MISE_NO_HOOKS: "1"
       CARGO_INCREMENTAL: "0"
+      # Import the run's verified bundle inputs; never download them here.
+      KURU_DOLT_BUNDLE_OFFLINE: "true"
     steps:
       - name: Record the job start for the inner test deadline
         shell: bash
@@ -160,6 +270,26 @@ jobs:
         shell: bash
         # Absent everywhere else, so only this partition exports after its receipt.
         run: printf 'KURU_COVERAGE_SEED_EXPORT=%s/kuru-coverage-seed-export\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Download the run's verified bundle inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci-bundle-inputs-ubuntu-24.04-arm
+          path: ${{ runner.temp }}/bundle-inputs
+      - name: Import the run's verified bundle inputs
+        shell: bash
+        run: |
+          # bundle:prepare checks each archive against its committed pin again.
+          cd -- "$RUNNER_TEMP/bundle-inputs"
+          shopt -s nullglob
+          archives=(*.archive)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo 'The verified bundle input artifact holds no archive' >&2
+            exit 1
+          fi
+          cd -- "$GITHUB_WORKSPACE"
+          for archive in "${archives[@]}"; do
+            mise run //packages/kuru-memory:bundle:prepare -- --target "${archive%.archive}" --archive "$RUNNER_TEMP/bundle-inputs/$archive" --offline
+          done
       - name: Run one checked memory partition
         shell: bash
         env:
@@ -223,7 +353,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       CARGO_INCREMENTAL: "0"
     steps:
       - name: Require every memory partition job to have succeeded
@@ -302,7 +431,6 @@ jobs:
             mode: behavior
     env:
       MISE_LOCKED: "1"
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       MISE_NO_HOOKS: "1"
       CARGO_BUILD_TARGET: ${{ matrix.target }}
       CARGO_INCREMENTAL: "0"
@@ -347,7 +475,7 @@ jobs:
 
   ci-gate:
     if: always()
-    needs: [quality, native-tests, native-build, native-memory, native-memory-merge, native-platform]
+    needs: [bundle-inputs, quality, native-tests, native-build, native-memory, native-memory-merge, native-platform]
     runs-on: ubuntu-latest
     steps:
       - name: Require every static and native check

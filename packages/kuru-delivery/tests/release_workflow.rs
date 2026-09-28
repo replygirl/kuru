@@ -11,7 +11,7 @@ use kuru_delivery::release::{self, GitHub, Version};
 use kuru_delivery::{
     archive::digest,
     command,
-    coverage::{Mode, WORKSPACE_PACKAGES, os_target, partition_count},
+    coverage::{Mode, OS_TARGETS, WORKSPACE_PACKAGES, os_target, partition_count},
     shell_support,
 };
 use kuru_platform::fs::make_executable;
@@ -614,15 +614,16 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
             < position("Stage the exported dependency seed")
     );
     // The merge downloads every partition's attempts in one pattern step;
-    // the only other downloads are the Windows on Arm engine imports of the
-    // partitions and the install job.
+    // the only other downloads are the partitions' run-verified bundle
+    // inputs and the Windows on Arm engine imports of the partitions and the
+    // install job.
     assert_eq!(
         workflow
             .matches("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c")
             .count(),
-        3
+        4
     );
-    assert_eq!(workflow.matches("actions/download-artifact@").count(), 3);
+    assert_eq!(workflow.matches("actions/download-artifact@").count(), 4);
     assert_eq!(merge.matches("actions/download-artifact@").count(), 1);
     assert!(merge.contains(
         "          pattern: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-partition-*\n          merge-multiple: false\n          path: ${{ runner.temp }}/kuru-coverage-inputs\n"
@@ -805,6 +806,143 @@ fn windows_on_arm_partitions_are_uninstrumented_behavioral_evidence_with_an_impo
         assert!(tools < fetched);
     }
     assert_eq!(workflow.matches(import).count(), 2);
+}
+
+/// The target set each partition label imports: its host engine unless that
+/// engine is built from source (imported from bundle-build instead), plus
+/// the Windows x64 archive that the decoder tests read on every host.
+fn expected_bundle_inputs(label: &str) -> Vec<String> {
+    const FIXTURE: &str = "x86_64-pc-windows-msvc";
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("packages/kuru-memory/support/dolt-assets.json")).unwrap(),
+    )
+    .unwrap();
+    let host = os_target(label).unwrap();
+    let provenance = manifest["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|asset| asset["target"] == host)
+        .unwrap_or_else(|| panic!("no manifest asset for {host}"))["provenance"]
+        .clone();
+    let mut targets = vec![FIXTURE.to_owned()];
+    if provenance == "upstream" && host != FIXTURE {
+        targets.insert(0, host.to_owned());
+    }
+    targets
+}
+
+#[test]
+fn partitions_import_bundle_inputs_one_job_of_the_run_fetched_and_verified() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let job = |name: &str, next: &str| {
+        ci.split(&format!("\n  {name}:\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing CI job {name}"))
+            .split(&format!("\n  {next}:\n"))
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    // One job prepares every upstream archive once through the verifying
+    // package task and publishes one set per partition label.
+    let fetch = job("bundle-inputs", "native-tests");
+    assert!(fetch.contains("    runs-on: ubuntu-latest\n"));
+    assert!(
+        !fetch.contains("strategy:"),
+        "the fetch job must not fan out"
+    );
+    assert!(fetch.contains(
+        "            mise run //packages/kuru-memory:bundle:prepare -- --target \"$target\"\n"
+    ));
+    assert!(!fetch.contains("KURU_DOLT_BUNDLE_OFFLINE"));
+    let sets: Vec<(String, Vec<String>)> = fetch
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix('['))
+        .filter_map(|line| line.split_once("]=\""))
+        .map(|(label, targets)| {
+            let targets = targets
+                .trim_end_matches('"')
+                .split_whitespace()
+                .map(|target| target.replace("$fixture", "x86_64-pc-windows-msvc"))
+                .collect();
+            (label.to_owned(), targets)
+        })
+        .collect();
+    assert_eq!(sets.len(), OS_TARGETS.len());
+    for (label, _) in OS_TARGETS {
+        let (_, targets) = sets
+            .iter()
+            .find(|(name, _)| name == label)
+            .unwrap_or_else(|| panic!("no bundle input set for {label}"));
+        assert_eq!(targets, &expected_bundle_inputs(label), "{label}");
+        assert!(fetch.contains(&format!(
+            "          name: ci-bundle-inputs-{label}\n          path: ${{{{ runner.temp }}}}/kuru-bundle-inputs/{label}\n          if-no-files-found: error\n"
+        )));
+    }
+    assert_eq!(
+        fetch
+            .matches("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+            .count(),
+        OS_TARGETS.len()
+    );
+    assert!(
+        !fetch.contains("run_attempt"),
+        "reruns import the run's inputs"
+    );
+
+    // Every partition job waits for that job, imports its label's set with
+    // --archive --offline before anything builds, and cannot download.
+    let import = "        run: |\n          # bundle:prepare checks each archive against its committed pin again.\n";
+    let command = "mise run //packages/kuru-memory:bundle:prepare -- --target \"${archive%.archive}\" --archive \"$RUNNER_TEMP/bundle-inputs/$archive\" --offline\n";
+    let native = job("native-tests", "native-build");
+    assert!(native.starts_with("    needs: bundle-inputs\n"));
+    assert!(native.contains("      bundle-inputs: ci-bundle-inputs\n"));
+    let memory = job("native-memory", "native-memory-merge");
+    assert!(memory.contains("    needs: bundle-inputs\n"));
+    let workflow = native_workflow();
+    let shards = workflow_job(&workflow, "shard", "merge");
+    for (partitions, name, first_build) in [
+        (
+            shards,
+            "${{ inputs.bundle-inputs }}-${{ inputs.os }}",
+            "Run one checked coverage partition",
+        ),
+        (
+            memory.as_str(),
+            "ci-bundle-inputs-ubuntu-24.04-arm",
+            "Run one checked memory partition",
+        ),
+    ] {
+        assert!(partitions.contains("      KURU_DOLT_BUNDLE_OFFLINE: \"true\"\n"));
+        let steps = workflow_steps(partitions);
+        let position = |step: &str| {
+            steps
+                .iter()
+                .position(|body| body.starts_with(&format!("name: {step}\n")))
+                .unwrap_or_else(|| panic!("missing step {step}"))
+        };
+        let fetched = position("Download the run's verified bundle inputs");
+        let imported = position("Import the run's verified bundle inputs");
+        assert!(steps[fetched].contains(&format!(
+            "          name: {name}\n          path: ${{{{ runner.temp }}}}/bundle-inputs"
+        )));
+        assert!(!steps[fetched].contains("if:"), "every partition imports");
+        assert!(steps[imported].contains(import));
+        assert!(steps[imported].contains(command));
+        assert!(!steps[imported].contains("if:"));
+        assert_eq!(fetched + 1, imported);
+        assert!(imported < position(first_build));
+        let tools = steps
+            .iter()
+            .position(|step| step.starts_with("uses: jdx/mise-action@"))
+            .unwrap();
+        assert!(tools < fetched);
+    }
+    let native_inputs = workflow.split("\n      bundle-inputs:\n").nth(1).unwrap();
+    assert!(native_inputs.contains("        required: true\n"));
 }
 
 /// Splits workflow text into whole step blocks (the same `\n      - `
@@ -1021,7 +1159,7 @@ fn arm64_memory_suite_runs_as_gated_uninstrumented_partitions() {
             .starts_with("      - name: Require every memory partition job to have succeeded\n")
     );
     assert!(ci.contains(
-        "needs: [quality, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
+        "needs: [bundle-inputs, quality, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
     ));
 }
 
@@ -1077,7 +1215,7 @@ fn native_platform_runs_windows_on_arm_as_separately_named_behavioral_evidence()
     );
     assert!(!job.contains("KURU_COVERAGE_"));
     assert!(ci.contains(
-        "needs: [quality, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
+        "needs: [bundle-inputs, quality, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
     ));
 }
 

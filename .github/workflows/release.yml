@@ -17,6 +17,9 @@ env:
   MISE_LOCKED: "1"
   # CI and release builds stay outside the maintainer mr-boxington cache.
   KURU_MBX: "0"
+  # Jobs install only their mise-action install_args. Windows exe shims run
+  # `mise x`, which would otherwise download every other configured tool.
+  MISE_EXEC_AUTO_INSTALL: "false"
 
 concurrency:
   group: release
@@ -80,8 +83,17 @@ jobs:
       - name: Install Ubuntu native secret-store fixture tools
         shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dbus gnome-keyring libsecret-tools
+          # These packages come from the Ubuntu archive. apt reads only its deb822
+          # list and no other sources.list.d entry, so an outage of a third-party
+          # repository on the runner image cannot fail this step; errors from the
+          # archive still fail it.
+          if [ ! -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            echo 'The runner image has no Ubuntu archive list at /etc/apt/sources.list.d/ubuntu.sources' >&2
+            exit 1
+          fi
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null update
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null \
+            install -y --no-install-recommends dbus gnome-keyring libsecret-tools
       - name: Run Ubuntu native tests with the OS secret store
         shell: bash
         run: |

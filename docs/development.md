@@ -280,6 +280,60 @@ run already executes the behavioral tests, so CI does not first run a duplicate
 ordinary suite; hk runs neither before a push. Keep only one coverage writer
 active per target directory, and preserve the instrumented child fixtures.
 
+CI jobs do not fetch what they do not use or what the run has already
+verified: each such download is one more outage that can fail a job needing
+nothing from it. The repository check in `lint:tooling` (`kuru-delivery repo`)
+enforces the checkable part on every workflow. A workflow that runs mise sets
+`MISE_EXEC_AUTO_INSTALL: "false"` and `MISE_TASK_RUN_AUTO_INSTALL: "false"` at
+workflow level and never overrides them in a job, step or script
+([why](#shared-build-cache)). Every `jdx/mise-action` step's `install_args`
+names at least one tool, not only options, and no step runs `mise install`,
+`mise upgrade` or `mise bootstrap` without tool arguments, whatever mise
+options come before or after the subcommand and whatever `sudo`, `env`,
+`timeout`, `nice`, `nohup`, `exec` or `time` prefix, with its option values,
+precedes it. Every `apt-get` or `apt` fetch, including one inside a `sh -c`
+string, names exactly one list with `-o Dir::Etc::sourcelist=/...`, ends its
+parts settings with `-o Dir::Etc::sourceparts=/dev/null`, and reads no `-c`
+file; no workflow, job or step sets `APT_CONFIG`, and `add-apt-repository`
+runs with `-n`, so the runner image's third-party repositories are never
+refreshed. Every matrix job that runs a partition task (`coverage:shard` or
+`test:partition`) or has a `partition` axis runs with
+`KURU_DOLT_BUNDLE_OFFLINE: "true"` and imports the archives that the CI
+`bundle-inputs` job fetched and verified once for the run
+([import](#bundled-engine-build-inputs)).
+
+One exemption is live. The release workflow's `notes` and `build-docs` jobs
+still run `mise run` with task auto-install on, so they download configured
+tools they do not use, and `notes` runs the delivery `setup` task, a bare
+`mise install --include-task-tools`. The check exempts exactly those two jobs
+and pins each by the SHA-256 of its whole parsed job together with the
+workflow `env` and `defaults` it inherits. Any change to them, such as another
+mise-action input or version, an env entry, a step, `shell`,
+`working-directory` or `if`, fails the check until someone re-reviews the job
+and records its new digest; comments and formatting are not part of the pin.
+Every other release job that uses mise must opt out in its job env. The
+follow-up, `release-notes-docs-tool-scope`, scopes those jobs' tool
+installation; it changes release workflow steps, so the maintainer decides it.
+
+The check reads workflow text only, so these remain outside it:
+
+- downloads inside the mise tasks a step runs, and settings in a task's own
+  `env`;
+- the tools a job does select, the single `bundle-inputs` fetch and the one
+  engine download of each installation or native build job;
+- a launcher that clears the environment, such as `env -i` or `sudo`'s
+  default `env_reset`, which drops the workflow-level opt-outs before mise
+  runs;
+- spellings assembled at run time: a variable name split by quotes and
+  written to `$GITHUB_ENV`, a task name split by quotes or passed through a
+  variable, an `install_args` expression that evaluates to nothing, and a
+  quoted `;` or `|` inside a command;
+- whether a named apt list is the one a step needs, and an engine fetched
+  with `curl` then imported with `--archive`;
+- `mise bootstrap` with a subcommand, such as `bootstrap packages apply`: it
+  runs a single part, not the tool phase, but a package part may run a system
+  package manager the check does not see.
+
 Coverage prepares the verified engine archives and uses the supervisor from its
 single instrumented workspace build. Its fixtures initialize the engine cache
 when needed. Ordinary package tests still prepare a private supervisor snapshot
@@ -392,6 +446,21 @@ in `mise.local.toml` has no effect. CI workflows, the source installers and
 `kuru update --source` set it, so published and user-built executables never
 depend on a maintainer cache. Instrumented coverage never reads or writes the
 cache: cargo-llvm-cov supplies its own `RUSTC_WRAPPER`, which mbx defers to.
+
+`KURU_MBX=0` does not remove mr-boxington from the configured tool set, so CI
+also keeps it from being downloaded. Every workflow that installs tools sets
+`MISE_EXEC_AUTO_INSTALL=false` at workflow level. On Windows, mise's executable
+shims run `mise x`, which would otherwise install every missing configured tool,
+mr-boxington included, on the first shim call such as `rustup` or `cargo`.
+`MISE_TASK_RUN_AUTO_INSTALL=false` stops `mise run` doing the same before a
+task. Every workflow sets it at workflow level except the release workflow,
+which sets it in every job that uses mise except `notes` and `build-docs`.
+Those two jobs still download tools they do not use until
+[their exempted follow-up](#commands) scopes them. Every other job installs
+only its `mise-action` `install_args` and the tools its named install tasks
+select. A job that needs another tool must name it in `install_args`; the
+source installers already install only `rust` and pass it
+explicitly to `mise exec`.
 
 mbx restores outputs by copy-on-write clone on APFS, Btrfs, XFS with reflink,
 and ReFS. On filesystems without cloning, such as ext4, it hard-links the
