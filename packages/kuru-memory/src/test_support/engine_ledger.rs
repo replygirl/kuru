@@ -22,11 +22,15 @@
 //!
 //! A native identity names a directory only while it exists: Linux recycles a
 //! removed directory's inode at once, so a new store can carry the `(device,
-//! inode)` of a recorded store that was since removed. A key therefore also
-//! holds the directory's birth time, which a rename preserves and a recycled
-//! identity does not. Where the filesystem reports no birth time the key is
-//! the identity alone, and a record for a removed directory can again stand
-//! for a new one with the same snapshot.
+//! inode)` of a recorded store that was since removed. Two measures keep a
+//! removed store's record from standing for a new one. Releasing a fixture
+//! root forgets every record taken beneath it ([`Ledger::forget_under`]), so
+//! the stores removed with a root leave nothing behind. For a store removed
+//! some other way while the process runs, the key also holds the directory's
+//! birth time, which a rename preserves; Linux stamps it at clock-tick
+//! granularity, and such a removal follows an engine run far longer than a
+//! tick. Where the filesystem reports no birth time the key is the identity
+//! alone.
 //!
 //! Every read and write of the ledger, and the fixture guard's whole scan,
 //! runs inside one critical section ([`with`]). Its work is then never
@@ -96,10 +100,26 @@ struct LiveOwner {
     label: String,
 }
 
+/// A quiescence record: the snapshot, and the canonical directory it was
+/// taken in.
+struct Record {
+    directory: PathBuf,
+    snapshot: Snapshot,
+}
+
+impl Record {
+    fn of(directory: &Path) -> Self {
+        Self {
+            directory: fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf()),
+            snapshot: snapshot(directory),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Ledger {
     live: HashMap<u64, LiveOwner>,
-    records: HashMap<Key, Snapshot>,
+    records: HashMap<Key, Record>,
 }
 
 static LEDGER: Mutex<Option<Ledger>> = Mutex::new(None);
@@ -153,7 +173,7 @@ pub(crate) fn snapshot(directory: &Path) -> Snapshot {
 pub(crate) fn record(directory: &Path) {
     with(|ledger| {
         if let Some(key) = key(directory) {
-            ledger.records.insert(key, snapshot(directory));
+            ledger.records.insert(key, Record::of(directory));
         }
     });
 }
@@ -161,7 +181,14 @@ pub(crate) fn record(directory: &Path) {
 impl Ledger {
     /// The current record for a store, if any.
     pub(crate) fn recorded(&self, key: &Key) -> Option<&Snapshot> {
-        self.records.get(key)
+        self.records.get(key).map(|record| &record.snapshot)
+    }
+
+    /// Forget every record taken beneath `root` (canonical), whose tree is
+    /// being released.
+    pub(crate) fn forget_under(&mut self, root: &Path) {
+        self.records
+            .retain(|_, record| !record.directory.starts_with(root));
     }
 
     /// Live owners whose store lies beneath `root` (canonical), for a failure
@@ -218,7 +245,7 @@ impl Drop for LiveEngine {
                 ..
             }) = ledger.live.remove(&self.id)
             {
-                ledger.records.insert(key, snapshot(&directory));
+                ledger.records.insert(key, Record::of(&directory));
             }
         });
     }

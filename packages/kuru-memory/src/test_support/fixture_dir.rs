@@ -36,7 +36,9 @@
 //! store. A thread that is already unwinding keeps the root without a second
 //! panic. The check never waits and writes nothing to stdout or stderr. The
 //! whole scan runs inside the ledger's critical section
-//! ([`engine_ledger::with`]), so no two teardowns execute it concurrently.
+//! ([`engine_ledger::with`]), so no two teardowns execute it concurrently,
+//! and in the same section the teardown forgets the records beneath its
+//! root.
 
 use super::engine_ledger::{self, Key, Ledger};
 use crate::files::PrivateTemp;
@@ -96,7 +98,13 @@ impl Drop for TempDir {
         let Some(inner) = self.inner.take() else {
             return;
         };
-        let violations = violations(inner.path());
+        // The records beneath the root go with it, kept or removed, so no
+        // later directory that recycles a native identity inherits one.
+        let violations = engine_ledger::with(|ledger| {
+            let violations = scan(ledger, inner.path());
+            ledger.forget_under(&canonical(inner.path()));
+            violations
+        });
         if violations.is_empty() {
             return;
         }
@@ -120,13 +128,19 @@ impl Drop for TempDir {
 }
 
 /// Every store beneath `root` that no quiescence record explains, described
-/// for a failure message.
-pub(crate) fn violations(root: &Path) -> Vec<String> {
+/// for a failure message, without forgetting any record: the teardown's scan
+/// as the guard's own tests observe it mid-fixture.
+#[cfg(test)]
+fn violations(root: &Path) -> Vec<String> {
     engine_ledger::with(|ledger| scan(ledger, root))
 }
 
+fn canonical(root: &Path) -> PathBuf {
+    fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
 fn scan(ledger: &Ledger, root: &Path) -> Vec<String> {
-    let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canonical = canonical(root);
     let mut found = Found::default();
     let mut budget = MAX_ENTRIES;
     collect(root, 0, &mut budget, &mut found);
@@ -340,6 +354,25 @@ mod tests {
             );
         }
         remove_kept(&path);
+    }
+
+    /// A released root's records go with it, so a later directory that
+    /// recycles one of its stores' native identities, even within the
+    /// filesystem's birth-time granularity, finds no record.
+    #[test]
+    fn releasing_a_root_forgets_the_records_beneath_it() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let store = stopped_store(root.path());
+        engine_ledger::record(&store);
+        let key = engine_ledger::with(|_| engine_ledger::key(&store)).unwrap();
+        assert!(engine_ledger::with(|ledger| ledger
+            .recorded(&key)
+            .is_some()));
+        drop(root);
+        assert!(
+            engine_ledger::with(|ledger| ledger.recorded(&key).is_none()),
+            "a released root's records must not outlive it"
+        );
     }
 
     /// A record describes the directory it was taken for, not whichever
