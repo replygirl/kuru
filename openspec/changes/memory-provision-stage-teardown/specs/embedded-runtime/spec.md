@@ -8,7 +8,7 @@ Once runtime provisioning has created a private install stage under the exclusiv
 
 #### Scenario: Held stage on a cancelled or failed installation
 - **WHEN** an installation is cancelled or fails before publication while a handle inside its private stage refuses removal
-- **THEN** the stage stays on disk, its retention is reported and receipted with `published: false` while the installation lock is still held, an error return names the retained stage, and the lock is released afterwards
+- **THEN** the stage stays on disk, its retention is reported and receipted with `published: false` while the installation lock is still held, the receipt and diagnostic name the retained stage, an error returned through the lease names it, and the lock is released afterwards
 
 #### Scenario: Retained stage after publication
 - **WHEN** a verified engine is published but its private stage cannot be removed

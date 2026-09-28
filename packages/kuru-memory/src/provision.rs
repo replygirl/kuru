@@ -196,10 +196,12 @@ async fn provision_with_extractor_observed(
 /// Receipts naming the retained install stages of one engine version.
 const LEFTOVER_STAGE_RECEIPTS: &str = ".leftovers";
 
-/// What was retained after a published and verified engine could not remove its
-/// own private stage: where it is, why it stayed, and which publication it
-/// belongs to. `attempts` and `elapsed` describe the bounded recovery window
-/// that actually ran, and are absent when the cause is not that exhaustion.
+/// What was retained when an installation could not remove its own private
+/// stage: where it is, why it stayed, and which engine it belongs to.
+/// `published` distinguishes a published and verified engine from an
+/// installation that failed, was cancelled or unwound before publication.
+/// `attempts` and `elapsed` describe the bounded recovery window that actually
+/// ran, and are absent when the cause is not that exhaustion.
 #[derive(Debug)]
 pub(crate) struct StageCleanupReport {
     pub stage: PathBuf,
