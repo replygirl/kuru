@@ -387,6 +387,24 @@ project must explicitly retire that idle service before removing their fixture
 directory. The application still holds the project conversation-driver lease,
 so this service boundary does not make simultaneous conversation tests valid.
 
+Dolt panics at close when its data directory disappears before it exits, so a
+fixture root from `kuru_memory::test_support::tempdir()` checks, without
+waiting, that no lifecycle lease or service owner lock beneath it is still
+held when it drops. A live owner always keeps the directory; outside an
+existing failure it also fails the test, naming the test and each live owner. Close every in-process store before the root
+drops; managed fixtures close their clients and then call
+`test_support::await_managed_quiescence(&options)`, which retires the idle
+owner and confirms its Dolt was reaped.
+
+The lifecycle-ordering measurements are ignored tests, and their Dolt trace is
+inert unless `KURU_TEST_DOLT_LOG_DIR` names a directory, so neither runs in
+`test`, coverage or CI partitions. Run them on demand with
+`mise run //packages/kuru-memory:measure:lifecycle`. Optional
+`KURU_TEST_LIFECYCLE_MEASURE_DIR` (default:
+`kuru-lifecycle-measurements/m1` under the system temporary directory)
+receives their CSV rows, and
+`KURU_TEST_LIFECYCLE_MEASURE_ITERATIONS` (default 300) sets the loop count.
+
 Development and test builds optimize only the pinned SHA-2 0.11.0 dependency to
 keep repeated full-executable update verification responsive. Cargo requires
 this version-specific profile override in the workspace root. Workspace code,
