@@ -101,7 +101,6 @@ On those paths the server is handed to `Owner::drop`'s background reaper and the
 - Remove the H1 trigger: no candidate ref is deleted, renamed or self-rename-probed while the server still counts a session on it.
 - Make `MemoryStore::open` returning `Err` imply that the engine is closed within the existing bounded-close contract.
 - Make fixtures release a store directory only after its Dolt has been reaped, and make any violation fail the offending test.
-- Give the Windows cancelled activation a checked teardown, stage before lock, with no swallowed removal failure.
 - Disposition every catalogue entry.
 
 **Non-Goals (OUT OF SCOPE, with reasons):**
@@ -111,6 +110,7 @@ On those paths the server is handed to `Owner::drop`'s background reaper and the
 - **The kuru-delivery bundle lock `WouldBlock`** (items 7a and 9). This is a different package and mechanism (flock held or inherited across concurrent tests or spawned children). It will be the second, small change after this one.
 - **Upstream Dolt changes** (making #10971's close-time `Fatalf` non-fatal). Kuru must not remove a live directory in the first place.
 - **Raising `RUST_TEST_THREADS`.** It stays 2 on every OS.
+- **The Windows cancelled-activation teardown** (items 1 and 6). Split into its own change, branch `fix/memory-provision-stage-teardown` (see D6). Implementer decision pending maintainer confirmation.
 
 ## Decisions
 
@@ -119,6 +119,7 @@ On those paths the server is handed to `Owner::drop`'s background reaper and the
 - Every candidate ref delete, rename and exclusion probe is preceded by pool retirement plus `await_branch_sessions_end` on `kuru/<branch>`, the processlist predicate the rename already uses.
 - Preferred placement: inside the retirement primitive, so that `Server::retire_pool`'s existing canary assertion (`active_after_close == 0`) becomes a guarantee rather than a race.
 - If `Server` cannot perform the processlist observation without new authority, use a single store-level `retire_candidate_sessions(store, branch, deadline)` at every product site, and point the canary at that same product step with its assertion unchanged.
+- Outcome: the fallback was taken. The step is the store-level `retire_branch_sessions(store, branch, deadline)`, used before every rename, delete and exclusion probe. The canary `candidate_pool_retirement_observes_exact_server_sessions_before_rename` now calls that step (with `QUERY_TIMEOUT`) instead of `Server::retire_pool`; every assertion line is byte-identical.
 - Alternatives rejected:
   - Retrying the delete on 1105: forbidden, and it masks a live session.
   - `--force`/`-D` as force: skips the check and leaves other sessions on a missing ref (dolthub/dolt#9598, #6100).
@@ -129,7 +130,6 @@ On those paths the server is handed to `Owner::drop`'s background reaper and the
 
 - The session wait uses `QUERY_TIMEOUT`, the rename's existing retirement deadline. It keeps a deadline parameter so a test can prove the never-ending-session failure without new product timing.
 - Close uses `CLOSE_GRACE` and `SUPERVISOR_REAP_ALLOWANCE` (`close_budget()`).
-- The Windows stage uses the existing `CLEANUP_RETRY_LIMIT` bound inside `PrivateTemp::close`.
 - No constant is added or raised.
 
 **D3. The fence is unchanged.** A session that outlives the deadline fails the step as `PoolRetirement`. The service still returns `StorageFailed` and the client still fences. A genuinely uncertain outcome still trips the fence.
@@ -144,13 +144,15 @@ On those paths the server is handed to `Owner::drop`'s background reaper and the
 - Managed fixtures call a test-support helper, `await_managed_quiescence(&options)`: `retire_idle_service`, then `Server::quiescence_at` on the store directory within `SUPERVISOR_REAP_ALLOWANCE`. This runs before their data root is released.
 - The fixture root returned by `test_support::tempdir()` gets a checked teardown. For each store directory beneath it, it makes a non-waiting attempt on the lifecycle lease. If a Dolt is still alive, it FAILS the test, keeps the directory and names the directory and the owner. The invariant never waits, so it cannot hide a missing retirement.
 - While the thread is already panicking, it only keeps the directory. It does not panic, because a panic during unwinding would abort the process.
+- The helper's reap bound is `server::SUPERVISOR_REAP_ALLOWANCE` itself (exposed `pub(crate)`), not a copied literal; the value is unchanged (13 s).
+- **Known spurious-failure class.** The probe treats `flock` `WouldBlock` as a live owner. A lock released in-process while a sibling thread's child is between `posix_spawn` and `exec` stays held by that child's transient descriptor (`spawn_gate.rs`). Inside kuru-memory every in-process lease acquisition that precedes a guarded root's teardown holds `spawn_gate::locking_async` across acquire and release, and every real-engine open in those tests goes through `spawn_gated_open`. `spawn_gate` is `cfg(test)`-only, so in kuru-runtime and kuru-tui (feature `test-support`) the lease in `await_managed_quiescence` and every product spawn are ungated. That exposure is an **accepted residual** with the measured bound recorded in verification (Residual invariant exposure), pending maintainer confirmation. Extending the gate would require gating the spawn side in product code under `test-support` or at every consumer call site; it is not done here. The probe stays non-waiting: no wait, retry or PID check was added.
 
-**D6. Windows: a checked cancellation teardown.**
+**D6. Windows: split out of this change.**
 
-- `StagedActivation` gets a `Drop` for the unconsumed case: drop `source` and `probe`, run `staging.close_or_keep()`, then release `lock`.
-- A `StageCleanupFailure` is surfaced as a retained, reported stage. It is not swallowed.
-- No new retry and no test retry: the only bound is the existing checked removal's `CLEANUP_RETRY_LIMIT`, already used on publication. The test assertion stays `!stage_path.exists()`.
-- Item 1's diagnostic assertion is re-examined from its CI log under the Windows task. If it has a separate cause, it is recorded and routed, not folded in.
+- The intended design (a checked `StageLease` teardown, stage before lock, a refused removal reported rather than swallowed by `TempDir::drop`, bounded only by the existing `CLEANUP_RETRY_LIMIT`) is drafted on branch `fix/memory-provision-stage-teardown`, unmerged and unverified on Windows.
+- It is not in this change because, by static reading, it makes `cancelling_checked_activation_recovery_drops_stage_before_cache_lock` fail deterministically on Windows: the test's own `_parent` directory handle keeps `runtime` delete-pending under kuru-platform's legacy delete disposition, so the checked removal correctly retains the stage and `!stage_path.exists()` fails. The fixture handle needs a maintainer decision that does not weaken that assertion.
+- Open in the draft: `close_published` releases the cache lock before the caller writes the retained-stage receipt, and `StageLease::drop` blocks the dropping thread for the bounded Windows recovery window on cancellation.
+- Item 1's diagnostic assertion is re-examined from its CI log under that change.
 
 ## Catalogue dispositions
 
@@ -158,12 +160,12 @@ These entries are from `tmp/roadmap/phase2-handoff-2026-09-26-sources/flakes/fla
 
 | # | Run / job | Test (short) | Disposition |
 |---|---|---|---|
-| 1 | 36270828072 (Windows memory) | `provision::native_tests::persistent_held_descendant_exhausts_checked_recovery_and_preserves_stage` | Windows stage family, D6. The cause of its own diagnostic assertion is not established; re-examined in task 4.3 |
+| 1 | 36270828072 (Windows memory) | `provision::native_tests::persistent_held_descendant_exhausts_checked_recovery_and_preserves_stage` | Not fixed here: routed to the split Windows stage change (D6, branch `fix/memory-provision-stage-teardown`). The cause of its own diagnostic assertion is not established; re-examined there |
 | 2 | 36276330774 (macOS) | runtime `dream::cancellation_tests::managed_lost_promotion_reply_…` (uncertain write) | H1, probable (no stage record) |
 | 3 | 36278540871 (macOS) | tui `cli.rs` `dream` (uncertain write) | H1, probable (no stage record) |
 | 4 | 36276764569, job 108500921447 (macOS) | two kuru-memory tests (uncertain write) | H1, probable (names only in drill logs) |
 | 5 | 36285656438, job 108527295649 (macOS) | `facade::tests::preserved_candidate_conflict_reattaches_…` | H1, confirmed (`stage=cleanup … vendor=1105 reason=other`) |
-| 6 | 36292320870, job 108544879759 (Windows) | `provision::native_tests::cancelling_checked_activation_recovery_drops_stage_before_cache_lock` | Windows stage teardown, D6 |
+| 6 | 36292320870, job 108544879759 (Windows) | `provision::native_tests::cancelling_checked_activation_recovery_drops_stage_before_cache_lock` | Not fixed here: routed to the split Windows stage change (D6, branch `fix/memory-provision-stage-teardown`) |
 | 7a | 36294245109, job 108550021448 (Ubuntu p7) | kuru-delivery `bundle::recovery_tests::cancellation_after_dropping_error_headers_…` | Out of scope: kuru-delivery bundle lock, second change |
 | 8a | 36296066873, job 108555025490 (macOS p3) | `store::usage_ledger::tests::permanent_branch_keeps_usage_out_of_main_…` | H1, confirmed (1105 in-use text at cleanup) |
 | 7b | 36297681851 (macOS p1) | `service::tests::candidate_transition_query_preserves_open_conflict_…` | H1, probable (candidate path; no text recorded) |
@@ -172,7 +174,7 @@ These entries are from `tmp/roadmap/phase2-handoff-2026-09-26-sources/flakes/fla
 | 10 | 36310434585 attempt 1 (threads=4) | `inspection_owned_old_schema_blocks_writer_…` (jobs 108595181969, 108595181994), `cleanup_observation_error_keeps_actual_lifecycle_lease_…` (108595181983, 108595181996) | Deadline sub-items routed to the first-launch budget item. Threads stay 2 |
 | 10 | same, job 108595182046 (macOS p1) | runtime `dolt_tests::canonical_dream_additions_survive_…` (cleanup 1105) | H1, confirmed |
 | 11 | 36310434585 attempt 2 (threads=4) | `cleanup_observation_error_…` (108598442436, 108598442572), `inspection_owned_old_schema_…` (108598442477), runtime `ordinary_context_refuses_…` (108598442537), `managed_lost_promotion_reply_…` (108598442539): readiness or deadline | Routed to the first-launch budget item |
-| 11 | same, job 108598442544 (macOS p2) | `facade::tests::managed_public_turn_lost_reply_…` (cleanup 1105); the canary `candidate_pool_retirement_observes_exact_server_sessions_before_rename`; runtime `hook_tests::cancelled_dream_abandons_candidate_…` | H1: confirmed, canary (D1), probable (abandon path) |
+| 11 | same, job 108598442544 (macOS p2) | `facade::tests::managed_public_turn_lost_reply_…` (cleanup 1105); the canary `candidate_pool_retirement_observes_exact_server_sessions_before_rename`; runtime `hook_tests::cancelled_dream_abandons_candidate_…` | H1: confirmed; canary re-pointed at the product step `retire_branch_sessions` with assertions unchanged (D1 fallback); probable (abandon path) |
 | 12 | PR #115 head 0c468e4e, job 108615291670 (macOS p2) | `facade::tests::managed_session_lifecycle_is_reversible_…` | H1, confirmed (v2.3.4; 92.63 s partition) |
 | 13 | PR #115 head d7275608, job 108642168357 (macOS install) | `embedded_runtime.rs:1526` first launch timed out | Routed to the first-launch budget item |
 | 14 | same run, job 108642168329 (Windows p1) | `managed_lost_promotion_reply_…` readiness deadline | Routed to the first-launch budget item |
@@ -182,6 +184,6 @@ These entries are from `tmp/roadmap/phase2-handoff-2026-09-26-sources/flakes/fla
 - **The wait adds latency to every cleanup.** It is one processlist poll, which normally returns 0 immediately: first poll p50 0.4 ms idle, 0.8 ms under saturation. It is bounded by an existing deadline.
 - **The processlist predicate sees only branch-qualified sessions.** Kuru's branch pools connect to `kuru/<branch>`, the same predicate the gated rename already relies on. A session on the unqualified `kuru` database would not be seen. Mitigation: the regression test injects a session through the same pool path the product uses.
 - **Placing the wait in `Server::retire_pool` widens its effect.** Non-candidate callers also wait. This is acceptable, because they then gain the same guarantee under the same bound. D1's fallback keeps it store-level if an implementation finds a conflict.
-- **A synchronous checked Windows removal inside `Drop`** blocks the dropping thread for up to `CLEANUP_RETRY_LIMIT` on cancellation. The lock must still be held through it, as publication already requires.
+- **The fixture invariant has an accepted residual outside kuru-memory.** See D5: in kuru-runtime and kuru-tui an ungated spawn can make the non-waiting probe report a released lease as live. Bound in verification; a hit fails the test and keeps the root, it never deletes under a live engine.
 - **The invariant will find more Class A/B sites than those listed.** The full suites showed 4-5 directory-removed-before-exit hits each. All must be fixed by ordering, never by excluding a test.
 - **CI evidence of the natural trigger is statistical.** The observed CI rate was about 1 in 3-5 macOS runs, so a green set is weak evidence on its own. The deterministic regression test is the primary proof.

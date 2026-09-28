@@ -31,6 +31,7 @@ The memory service lets two lifecycle steps run before the state they depend on 
 - `StagedActivation` has explicit, checked teardowns for publication (`finish_published`) and failure (`retain`).
 - A cancelled activation has no such teardown. It drops field by field, so its `PrivateTemp` is removed through `tempfile::TempDir::drop`, which swallows a failed `remove_dir_all`.
 - A transient Windows handle hold therefore leaves the stage present, and the stage was never reported.
+- **Not fixed by this change.** The teardown is split into its own change (branch `fix/memory-provision-stage-teardown`); see What Changes.
 
 ## What Changes
 
@@ -56,10 +57,11 @@ The memory service lets two lifecycle steps run before the state they depend on 
 - Fixtures that own a managed service's directory retire the service before they release that directory. The mechanism is the existing `test_support::retire_idle_service`, then lifecycle quiescence.
 - A test-support fixture invariant FAILS any test whose store directory is removed while its Dolt server is still alive, instead of silently deleting it.
 
-**Windows `StagedActivation`.**
+**Windows `StagedActivation`: split out, not in this change.**
 
-- The cancellation path gets an explicit, checked teardown: the stage is closed through the existing checked `PrivateTemp::close_or_keep` before the cache lock is released.
-- A failed removal is surfaced as a retained stage with its cause. It is no longer swallowed by `TempDir::drop`.
+- This change has three parts (H1, H2-A, H2-B). The Windows cancelled-activation teardown (catalogue items 1 and 6) was drafted but never type-checked or run on Windows, and by static reading it makes the frozen test `cancelling_checked_activation_recovery_drops_stage_before_cache_lock` fail deterministically: that test's own `_parent` handle keeps `runtime` delete-pending under kuru-platform's legacy delete disposition. Resolving that fixture handle without weakening its assertion needs a maintainer decision.
+- The draft is parked, unmerged, as one commit on branch `fix/memory-provision-stage-teardown` (worktree `tmp/worktrees/fix-memory-provision-stage-teardown`, cut from origin/main c986f4ff) and needs its own cospec change. Items 1 and 6 stay open until that change lands.
+- Splitting is an implementer decision taken pending maintainer confirmation; the alternative is to fold the parked commit back in once the fixture-handle question is settled.
 
 **Diagnostics only.** `candidate_branch_rename_reason` also labels the exact upstream in-use message as `branch_in_use` at `Cleanup`. This changes only the test/test-support failure record. It does not change what the client is told.
 
@@ -82,10 +84,10 @@ None. The living specs already require the corrected behaviour; only the impleme
   - the candidate cleanup ordering (`delete_candidate_ref`, `confirm_no_live_candidate_session`, the retirement step)
   - `MemoryStore::open` error paths
   - the `candidate_branch_rename_reason` diagnostic label
-- `packages/kuru-memory/src/server.rs`: only if the retirement wait is placed on `Server::retire_pool` (see design).
-- `packages/kuru-memory/src/provision.rs`: `StagedActivation` cancellation teardown.
+- `packages/kuru-memory/src/server.rs`: test/test-support lifecycle trace instrumentation, and `SUPERVISOR_REAP_ALLOWANCE` exposed `pub(crate)` so test support reuses it instead of a copy.
 - `packages/kuru-memory/src/test_support.rs` and `src/test_support/*`: the fixture-directory invariant, and a managed-quiescence helper built on `retire_idle_service`.
 - `packages/kuru-runtime/src/dream.rs` and the other managed-store fixtures the invariant identifies.
+- `apps/kuru-tui/src/ui/runtime_tests.rs`: a store fixture found by the round-2 Dolt traces (its root was a plain `tempfile` directory the invariant does not check).
 - New regression tests in kuru-memory. The branch's existing measurement support (`store/lifecycle_measurement_tests.rs`, `test_support/lifecycle_trace.rs`) is retained as ignored measurement code.
 - `docs/development.md`: the fixture teardown invariant.
 - No public API, configuration, protocol, schema or user-visible behaviour change. No workflow change.

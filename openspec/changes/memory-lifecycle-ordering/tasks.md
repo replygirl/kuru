@@ -18,15 +18,23 @@
 - [x] 3.2 Add `test_support::await_managed_quiescence` (`retire_idle_service`, then `Server::quiescence_at` within `SUPERVISOR_REAP_ALLOWANCE`). Use it in `kuru-runtime/src/dream.rs` and in every managed fixture that task 1.3 reported. Verify the invariant passes across the full kuru-memory and kuru-runtime suites with no test excluded. Landed in f5ec9c1b; fixtures lane reports the kuru-runtime suite green at 220/220 (`--test-threads=2`). The kuru-memory suite was not yet rerun after 34a1a9b4 landed alongside it — full-suite confirmation: round 1 passed 325/0 at 220997cf, after fixing an invariant false positive in two ungated owner-lock tests.
 - [x] 3.3 Re-run the 0.2 baseline loop and suites with tracing. Record the after-counts (verification 2.3). Round 1: 0 panics, 0 directories removed before exit and 0 unsuccessful supervisor exits across both loops and all traced suites (verification.md round 1 table).
 
-## 4. Windows cancelled activation
+## 4. Windows cancelled activation (split out of this change)
 
-- [ ] 4.1 Give `StagedActivation` an explicit teardown for the unconsumed case: drop source and probe, run `staging.close_or_keep()`, surface a `StageCleanupFailure`, then release the lock. No new retry; the bound is the existing `CLEANUP_RETRY_LIMIT`. Verify with a forced cleanup failure (verification 3.2). BLOCKED, uncommitted: the windows lane's draft (`provision.rs`, `provision/native_tests.rs`, `provision/tests.rs` in the worktree) expects this to break the frozen assertion `!stage_path.exists()` in `cancelling_checked_activation_recovery_drops_stage_before_cache_lock` (native_tests.rs:967), because Windows deletion stays pending while the test's own `_parent` handle (native_tests.rs:985) keeps the `runtime` directory open — see the lane's report for the full mechanism. Needs a maintainer decision (weaken no frozen assertion per the hard constraints) before it can commit.
-- [ ] 4.2 Verify the provision native tests on windows-latest native CI with unchanged assertions, and record the run and job ids (verification 3.1). Not run; blocked on 4.1.
-- [ ] 4.3 Re-examine item 1's CI log and record its disposition (verification 3.3). Not run; blocked on 4.1.
+Not part of this change. The draft teardown was never type-checked or run on Windows and, by static reading, makes the frozen test `cancelling_checked_activation_recovery_drops_stage_before_cache_lock` fail deterministically (its own `_parent` handle keeps `runtime` delete-pending under kuru-platform's legacy delete disposition). It is parked, unmerged, as commit dbef9588 on branch `fix/memory-provision-stage-teardown` (worktree `tmp/worktrees/fix-memory-provision-stage-teardown`) and needs its own cospec change after a maintainer decision on that fixture handle. Catalogue items 1 and 6 are routed there, not fixed here. Implementer decision pending maintainer confirmation (review M1).
 
 ## 5. Documentation and verification
 
 - [x] 5.1 Document the fixture teardown invariant and `await_managed_quiescence` in `docs/development.md`, and verify the docs checks pass. Landed in 171b1903 with the opt-in `measure:lifecycle` task; `docs:check` passed.
-- [ ] 5.2 Run the repository gates and the coverage gate, and record the results (verification 4.3, 4.4). Round 1: local repository gates and all four package suites pass (verification 4.3); coverage not yet run.
+- [x] 5.2 Run the repository gates and the coverage gate, and record the results (verification 4.3, 4.4). Round 1: local repository gates and all four package suites pass (verification 4.3). Round 2: gates and suites pass again and local coverage is 94.30% (verification 4.4, round 2 table); the CI half stays with 5.3.
 - [ ] 5.3 After push, collect the named macOS evidence set and the Ubuntu/Windows runs, and record every run and job id (verification 4.1, 4.2).
 - [ ] 5.4 Update `tmp/roadmap` dx-followons §16 as superseded, and route items 13 and 14 plus the 10/11 deadline sub-items to the first-launch budget item (untracked notes, not part of the commit).
+
+## 6. Review round 1 findings
+
+- [x] 6.1 Hold `spawn_gate::locking_async` across the in-process lifecycle lease acquire and release in `open_error_reap_tests::assert_reaped`, and open every store in those tests through `spawn_gated_open`; no assertion changed and the fixture probe still never waits (review M2a). Landed in 545b0dc4.
+- [x] 6.2 Decide the kuru-runtime/kuru-tui invariant exposure (review M2b): recorded as an accepted residual with a measured bound (verification 2.5, design D5), pending maintainer confirmation; no gate added outside kuru-memory.
+- [x] 6.3 Point the canary at `retire_branch_sessions` with its assertions byte-identical (review S6, design D1 fallback). Landed in cc17e7a3.
+- [x] 6.4 Replace the copied `MANAGED_REAP_ALLOWANCE` with `server::SUPERVISOR_REAP_ALLOWANCE` (review S2; value unchanged, 13 s). Landed in 0f944821.
+- [x] 6.5 Add a test that a failing close is attached to the original open error, and cover the final-validation open arm (review S1, verification 2.4). Landed in 545b0dc4.
+- [x] 6.6 Park the uncommitted Windows draft on its own branch and restore this worktree to the verified head (review S4).
+- [x] 6.7 Fix the Class B kuru-tui fixture the round-2 traces found (`notice_text_never_reaches_the_provider_request_for_a_real_tui_turn`) by closing its store before the root drops, and guard its root (verification 2.6). Landed in 13e81e31.
