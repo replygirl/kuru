@@ -15,4 +15,4 @@
 
 - [x] 3.1 Verify the regression test passes, `bundle::` 20 times at default threads and the partition-3 trio 20 times show 0 failures
 - [x] 3.2 Run `//packages/kuru-delivery:test`, `format:check`, `lint`, `typecheck`, `lint:tooling`, `docs:check` and strict cospec validation and record observed evidence
-- [x] 3.3 Record the workspace audit of release-by-close locks with follow-ons (file:line) in the build notes
+- [x] 3.3 Record the workspace audit of release-by-close locks with follow-ons (file:line) in the proposal's Impact section

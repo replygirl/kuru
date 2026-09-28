@@ -1,6 +1,6 @@
 ## Why
 
-`kuru-delivery` bundle preparation holds a stable advisory lock (`.bundle.lock`, `Directory::lock` in `packages/kuru-delivery/src/bundle.rs`) and releases it only by closing its descriptor when the returned `File` drops. On Unix a `flock` belongs to the open file description and is released on close only when every descriptor referring to that description is closed; a child that any thread of the process is spawning holds a copy of every descriptor from its fork/`posix_spawn` until its exec closes the close-on-exec ones. A preparation that returns or is cancelled while another thread spawns a child therefore leaves the lock held past its owner's drop, so an immediate contender (another preparation, or a test's release assertion) observes `WouldBlock`. On Windows, closing a handle with outstanding byte-range locks unlocks them at a time the system documents as dependent on available resources, so release-by-close is not prompt there either.
+`kuru-delivery` bundle preparation holds a stable advisory lock (`.prepare.lock`, `LOCK_NAME` at `bundle.rs:24`, `Directory::lock` in `packages/kuru-delivery/src/bundle.rs`) and releases it only by closing its descriptor when the returned `File` drops. On Unix a `flock` belongs to the open file description and is released on close only when every descriptor referring to that description is closed; a child that any thread of the process is spawning holds a copy of every descriptor from its fork/`posix_spawn` until its exec closes the close-on-exec ones. A preparation that returns or is cancelled while another thread spawns a child therefore leaves the lock held past its owner's drop, so an immediate contender (another preparation, or a test's release assertion) observes `WouldBlock`. On Windows, closing a handle with outstanding byte-range locks unlocks them at a time the system documents as dependent on available resources, so release-by-close is not prompt there either.
 
 It surfaced as flaky-test catalogue items 7 and 9 (`tmp/roadmap/phase2-handoff-2026-09-26-sources/flakes/flaky-tests.md`; this change's 7a): `bundle::recovery_tests::cancellation_after_dropping_error_headers_releases_stage_and_stable_lock` failed at `assert_clean` → `lock.try_lock()` = `WouldBlock` in PR #118 run 36294245109 job 108550021448 (ubuntu-latest partition 7) and in run 36304624151 on both attempts, jobs 108578990024 and 108582217193 (macos-latest partition 3, deterministic for that selection). Locally on macOS the `bundle::` tests failed 13/20 at default test threads on 9def614b and 0/10 at `--test-threads=1`. #118 (archived `2026-09-26-coverage-partitions`) classified it as a test isolation defect and re-executed ten release-asserting tests alone in a child test process (`isolate_lock_release!`). That hides the product fault: the tests are right to expect prompt release, and the same race applies to any process that spawns while it prepares a bundle.
 
@@ -30,7 +30,30 @@ None. The living specs do not describe the lock release mechanism; only the impl
 - `packages/kuru-delivery/src/bundle/recovery_tests.rs`: `retained_lock` unlocks explicitly; `isolate_lock_release!` uses removed.
 - `packages/kuru-delivery/src/update.rs` (Windows only): `lock`/`installation_guard` return `HeldLock`; `archive.rs` discards it as `_lease` unchanged.
 - `packages/kuru-delivery/src/lib.rs`: module declaration.
-- Audit of other advisory locks released by close (follow-ons, not edited here; `kuru-memory` has another change in flight): `kuru-memory` `provision.rs` cache lock, `server.rs` lifecycle lease, `service.rs`, `store.rs` writer lease; `kuru-tui` `trust.rs` lock and `cli.rs` lease; `kuru-connectors` `auth/store.rs`, `mcp_cache.rs`, `mcp_credentials.rs`. `kuru-memory` and `kuru-tui` carry test-only `spawn_gate.rs` mitigations for the same mechanism, which do not fix the product path. Promoting the guard to `kuru-platform` is the suggested vehicle.
+- `packages/kuru-delivery/tests/bundle_prepare.rs`: the retained CLI lock unlocks explicitly before its re-prepare.
+- Prior art: `kuru-connectors` `src/file_edits.rs:177-185` `CheckpointLease` already unlocks explicitly in `Drop`, for the same reason (its comment names the concurrent-child duplicate), but only under `#[cfg(unix)]`.
+- Audit of advisory file locks released by close (line numbers at 93a2267e; files outside `kuru-delivery` are unchanged from base c986f4ff; follow-ons are not edited here, and `kuru-memory` has another change in flight):
+
+| Site | Release | Defeatable the same way? | Disposition |
+|---|---|---|---|
+| `kuru-delivery` `src/bundle.rs:920` `Directory::lock` | explicit (`HeldLock`) | was yes | fixed here |
+| `kuru-delivery` `src/update.rs:319` `lock`, `:331` `installation_guard` (Windows) | explicit (`HeldLock`) | Windows close-release timing is unbounded; handles are non-inheritable | fixed here |
+| `kuru-delivery` `src/bundle.rs` test helpers, `tests/bundle_prepare.rs:235` | explicit | was yes (`assert_clean`, then `retained_lock`) | fixed here |
+| `kuru-delivery` `src/published_windows.rs:1546` (test holder child) | process exit | no (intentional holder process) | none |
+| `kuru-connectors` `src/file_edits.rs:177-185` `CheckpointLease` | explicit on Unix; close on Windows | Windows: yes (close-release timing unbounded) | Windows follow-on (drop the `cfg(unix)` gate or adopt the shared guard) |
+| `kuru-connectors` `src/auth/store.rs:165` auth `Lease` | close | yes | follow-on |
+| `kuru-connectors` `src/mcp_cache.rs:88`, `:138` | close | yes | follow-on |
+| `kuru-connectors` `src/mcp_credentials.rs:86` `McpCredentialLease` | close | yes | follow-on |
+| `kuru-tui` `apps/kuru-tui/src/trust.rs:545` `lock` | close | yes (`spawn_gate.rs` mitigates tests only) | follow-on |
+| `kuru-tui` `apps/kuru-tui/src/cli.rs:2214` `ProjectLease` writer lease | close | yes | follow-on |
+| `kuru-memory` `src/provision.rs:1150`, `:1181` `CacheLock` | close | yes (`spawn_gate.rs` is test-only) | follow-on |
+| `kuru-memory` `src/server.rs:325`, `:1659` `LifecycleLease` | close | yes, but first confirm the supervisor child does not intentionally inherit it | follow-on |
+| `kuru-memory` `src/service.rs:1252` `ServiceLock` | close | yes | follow-on |
+| `kuru-memory` `src/store.rs:7535` `acquire_lock` (callers `store.rs:1652`, `store/purge.rs:71`) | close | yes | follow-on |
+| `kuru-memory` `src/test_support/template.rs:196` | explicit | no | already correct |
+| `kuru-memory` `src/test_support.rs:612` `prepare.lock` | close | yes (test support) | follow-on |
+
+  `kuru-memory` and `kuru-tui` carry test-only `spawn_gate.rs` mitigations for the same mechanism, which do not fix the product path. Promoting the guard to `kuru-platform` next to `lock_file` is the suggested vehicle; then migrate the consumers (including the Windows half of `CheckpointLease`) and retire the test-only spawn gates.
 - No public API, configuration, documentation or schema change.
 
 ## Surfaces
