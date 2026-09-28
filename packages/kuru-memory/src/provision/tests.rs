@@ -1357,7 +1357,7 @@ fn a_receipt_that_cannot_be_written_is_recorded_on_the_report() {
         cause: anyhow::Error::msg("fixture cleanup failure"),
     };
 
-    let report = record_retained_stage(&versions, VALID_FIXTURE.spec(), failure);
+    let report = record_retained_stage(&versions, VALID_FIXTURE.spec(), failure, true);
 
     assert!(
         report.receipt_error.is_some(),
@@ -1736,4 +1736,164 @@ fn a_report_without_the_bounded_exhaustion_records_no_attempts() {
     assert_eq!(report.attempts, None);
     assert_eq!(report.elapsed, None);
     assert_eq!(report.os_error, Some(13));
+}
+
+/// Make `directory` refuse its own removal on any non-root Unix host: a file
+/// under a directory without write permission cannot be unlinked.
+fn seal_unremovable(directory: &Path) -> Result<()> {
+    private_directory(directory)?;
+    files::write(&directory.join("held"), b"fixture-only held entry")?;
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o500))?;
+    Ok(())
+}
+
+fn unseal(directory: &Path) {
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn only_leftover_receipt(versions: &Path) -> serde_json::Value {
+    let written = leftover_receipt_files(&versions.join(LEFTOVER_STAGE_RECEIPTS));
+    assert_eq!(written.len(), 1, "exactly one retained stage is receipted");
+    serde_json::from_slice(&fs::read(&written[0]).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn failed_extraction_receipts_a_refused_stage_before_releasing_the_lock() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    private_directory(&cache).unwrap();
+    let (capture, observed) =
+        super::native_tests::capture_retained_stages(&cache.join(".install.lock"));
+    let (staged, received) = tokio::sync::oneshot::channel();
+    let error = provision_with_extractor(
+        &MemoryConfig::default(),
+        &cache,
+        VALID_FIXTURE.spec(),
+        Cow::Borrowed(&VALID_FIXTURE.bytes),
+        move |_, candidate, _| {
+            seal_unremovable(candidate)?;
+            staged.send(candidate.to_owned()).unwrap();
+            bail!("fixture extraction failure")
+        },
+    )
+    .await
+    .unwrap_err();
+    drop(capture);
+    let candidate = received.await.unwrap();
+    let stage = candidate.parent().unwrap().parent().unwrap().to_owned();
+    let detail = format!("{error:#}");
+    assert!(
+        detail.contains("fixture extraction failure"),
+        "the original failure still reaches the caller: {detail}"
+    );
+    assert!(
+        detail.contains(&format!(
+            "retained private install stage at {}",
+            stage.display()
+        )),
+        "a refused stage removal is named, never swallowed: {detail}"
+    );
+    let observed = std::mem::take(&mut *observed.lock().unwrap());
+    assert_eq!(observed.len(), 1, "one retention report: {observed:?}");
+    assert_eq!(observed[0].stage, stage);
+    assert_eq!(observed[0].published, Some(false));
+    assert!(
+        observed[0].receipted && observed[0].lock_held,
+        "the retention is receipted and reported while the lock is held: {observed:?}"
+    );
+    let receipt = only_leftover_receipt(stage.parent().unwrap());
+    assert_eq!(receipt["published"], false);
+    assert_eq!(
+        receipt["stage"],
+        stage.file_name().unwrap().to_string_lossy().as_ref()
+    );
+    assert!(
+        candidate.join("held").exists(),
+        "a refused removal keeps the stage instead of guessing"
+    );
+    drop(cache_lock(&cache, Duration::from_secs(1)).await.unwrap());
+    unseal(&candidate);
+}
+
+#[tokio::test]
+async fn cancelled_extraction_receipts_a_refused_stage_before_releasing_the_lock() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    let directory = cache.clone();
+    let (started, received) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let task = tokio::spawn(async move {
+        provision_with_extractor(
+            &MemoryConfig {
+                offline: true,
+                ..Default::default()
+            },
+            &directory,
+            VALID_FIXTURE.spec(),
+            Cow::Borrowed(&VALID_FIXTURE.bytes),
+            move |_, candidate, _| {
+                seal_unremovable(candidate)?;
+                started.send(candidate.to_path_buf()).unwrap();
+                wait.recv_timeout(Duration::from_secs(10))
+                    .context("release extraction fixture")?;
+                Ok(())
+            },
+        )
+        .await
+    });
+    let candidate = tokio::time::timeout(Duration::from_secs(5), received)
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    // The worker releases the lock only after resolving its stage, so the
+    // moment this contender holds it the retention must already be recorded.
+    let lock = cache_lock(&cache, Duration::from_secs(10)).await.unwrap();
+    let versions = cache.canonicalize().unwrap().join(DOLT_VERSION);
+    let receipt = only_leftover_receipt(&versions);
+    assert_eq!(receipt["published"], false);
+    assert!(
+        candidate.join("held").exists(),
+        "a refused removal keeps the stage instead of guessing"
+    );
+    drop(lock);
+    unseal(&candidate);
+}
+
+#[tokio::test]
+async fn published_stage_retention_is_receipted_before_the_lock_is_released() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    private_directory(&cache).unwrap();
+    let fixture = &*VALID_FIXTURE;
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+    let (capture, observed) =
+        super::native_tests::capture_retained_stages(&cache.join(".install.lock"));
+    let binary = {
+        let _forced = crate::files::ForcedStageCleanupFailure::new();
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+        )
+        .await
+        .expect("a published engine must not fail its open because a stage stayed behind")
+    };
+    drop(capture);
+    assert_eq!(fs::read(&binary).unwrap(), SCRIPT);
+    let observed = std::mem::take(&mut *observed.lock().unwrap());
+    assert_eq!(observed.len(), 1, "one retention report: {observed:?}");
+    assert_eq!(observed[0].published, Some(true));
+    assert!(
+        observed[0].receipted && observed[0].lock_held,
+        "the published stage is receipted and reported while the lock is held: {observed:?}"
+    );
+    let versions = cache.canonicalize().unwrap().join(DOLT_VERSION);
+    assert_eq!(only_leftover_receipt(&versions)["published"], true);
 }

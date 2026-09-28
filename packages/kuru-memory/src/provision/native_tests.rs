@@ -27,6 +27,113 @@ async fn gated_verify_version(binary: &Path, private_home: &Path) -> Result<()> 
     verify_version(binary, private_home).await
 }
 
+/// What was true at the instant a retained install stage was reported.
+#[derive(Debug)]
+pub(super) struct RetainedStageObservation {
+    pub published: Option<bool>,
+    pub stage: PathBuf,
+    /// A fresh handle could not take the installation lock.
+    pub lock_held: bool,
+    /// The stage's `.leftovers` receipt already existed.
+    pub receipted: bool,
+}
+
+#[derive(Default)]
+struct RetainedStageFields {
+    message: String,
+    stage: String,
+    published: Option<bool>,
+}
+
+impl tracing::field::Visit for RetainedStageFields {
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        if field.name() == "published" {
+            self.published = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "stage" => self.stage = format!("{value:?}"),
+            _ => {}
+        }
+    }
+}
+
+/// Observes each retained-stage diagnostic synchronously, at the moment it is
+/// emitted, so a test can prove what the installation still held then.
+struct RetainedStageCapture {
+    lock_path: PathBuf,
+    observed: std::sync::Arc<std::sync::Mutex<Vec<RetainedStageObservation>>>,
+}
+
+impl tracing::Subscriber for RetainedStageCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "kuru.memory"
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = RetainedStageFields::default();
+        event.record(&mut fields);
+        if !fields.message.starts_with("retained private install stage") {
+            return;
+        }
+        let stage = PathBuf::from(fields.stage);
+        let receipted = match (stage.parent(), stage.file_name()) {
+            (Some(versions), Some(name)) => versions
+                .join(LEFTOVER_STAGE_RECEIPTS)
+                .join(format!("{}.json", name.to_string_lossy()))
+                .is_file(),
+            _ => false,
+        };
+        let contender = open_regular(&self.lock_path).unwrap();
+        let lock_held = match contender.try_lock() {
+            Ok(()) => false,
+            Err(TryLockError::WouldBlock) => true,
+            Err(error) => panic!("inspect the installation lock: {error}"),
+        };
+        drop(contender);
+        self.observed
+            .lock()
+            .unwrap()
+            .push(RetainedStageObservation {
+                published: fields.published,
+                stage,
+                lock_held,
+                receipted,
+            });
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Capture, on this thread only, every retained-stage report together with the
+/// installation lock and receipt state at the instant it is emitted.
+pub(super) fn capture_retained_stages(
+    lock_path: &Path,
+) -> (
+    tracing::subscriber::DefaultGuard,
+    std::sync::Arc<std::sync::Mutex<Vec<RetainedStageObservation>>>,
+) {
+    let observed = std::sync::Arc::default();
+    let guard = tracing::subscriber::set_default(RetainedStageCapture {
+        lock_path: lock_path.to_owned(),
+        observed: std::sync::Arc::clone(&observed),
+    });
+    (guard, observed)
+}
+
 /// Bound both the removal retry below and the post-removal absence wait: the
 /// fixture deletes a cache binary the warm probes just executed, so Windows
 /// may refuse the delete-capable open, refuse the disposition itself, or
@@ -578,7 +685,7 @@ async fn published_engine_retains_its_failed_stage_cleanup_and_releases_cache_le
         .unwrap()
         .expect("a published engine reports its retained stage instead of failing");
     assert_eq!(failure.stage, stage_container);
-    let detail = format!("{:#}", failure.cause);
+    let detail = failure.first_cause.clone();
     assert!(detail.contains("Dolt engine publication succeeded, but private stage cleanup failed"));
     assert!(detail.contains(&stage_container.display().to_string()));
     assert!(
@@ -676,14 +783,17 @@ async fn held_cold_probe_copy_does_not_block_candidate_activation() {
     assert!(probe_binary.is_file());
     assert!(!renamed_probe.exists());
 
-    let (probe, (stage, lock)) = probe.probe((stage, lock)).await.unwrap();
+    let (probe, lease) = probe
+        .probe(StageLease::new(stage, lock, BUNDLED_ASSET))
+        .await
+        .unwrap();
     let destination = cache.join("active");
-    let failure = activate_staged_after_probe(stage, lock, probe, &candidate, &destination)
+    let failure = activate_staged_after_probe(lease, probe, &candidate, &destination)
         .await
         .unwrap()
         .expect("a published engine reports its retained stage instead of failing");
     assert_eq!(failure.stage, stage_container);
-    let detail = format!("{:#}", failure.cause);
+    let detail = failure.first_cause.clone();
     assert!(detail.contains("Dolt engine publication succeeded, but private stage cleanup failed"));
     assert!(detail.contains(&stage_path.display().to_string()));
     assert!(
@@ -916,7 +1026,11 @@ async fn cancelling_checked_activation_recovery_drops_stage_before_cache_lock() 
     )
     .await
     .unwrap();
-    let (_parent, blocker) = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
+    // The `runtime` directory handle `files::read` returns is released with
+    // its blocker: under the checked (legacy-disposition) stage removal a
+    // still-open handle keeps `runtime` delete-pending, which the unchecked
+    // POSIX removal this test was written against had bypassed.
+    let blocker = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
     let destination = cache.join("active");
     let lock_path = cache.join(".install.lock");
     let abort_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<tokio::task::AbortHandle>));
@@ -961,6 +1075,235 @@ async fn cancelling_checked_activation_recovery_drops_stage_before_cache_lock() 
         let _gate = crate::spawn_gate::locking_async().await;
         contender.try_lock().unwrap();
     }
+}
+
+/// A zip-fixture stage under `cache` with its `runtime` candidate extracted,
+/// the checked installation lock held, and that lock's identity.
+#[cfg(windows)]
+async fn fixture_activation_stage(
+    cache: &Path,
+) -> (
+    PrivateTemp,
+    CacheLock,
+    kuru_platform::fs::FileIdentity,
+    PathBuf,
+) {
+    private_directory(cache).unwrap();
+    let lock = gated_cache_lock(cache, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let lock_identity = regular_file_info(&lock).unwrap().identity;
+    let stage = PrivateTemp::new(".install-", Some(cache)).unwrap();
+    let candidate = stage.path().join("runtime");
+    let bytes = zip();
+    with_asset(&bytes, |asset| extract(&bytes, &candidate, asset)).unwrap();
+    (stage, lock, lock_identity, candidate)
+}
+
+#[cfg(windows)]
+async fn assert_cache_lock_released(
+    lock_path: &Path,
+    lock_identity: kuru_platform::fs::FileIdentity,
+) {
+    let contender = open_regular(lock_path).unwrap();
+    assert_eq!(
+        regular_file_info(&contender).unwrap().identity,
+        lock_identity
+    );
+    // Held across the actual flock acquisition this assertion proves
+    // succeeds; see `crate::spawn_gate`.
+    let _gate = crate::spawn_gate::locking_async().await;
+    contender.try_lock().unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn cancelled_activation_recovery_receipts_a_held_stage_before_releasing_the_lock() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache café 東京");
+    let (stage, lock, lock_identity, candidate) = fixture_activation_stage(&cache).await;
+    let stage_path = stage.path().to_owned();
+    let stage_container = stage_path.parent().unwrap().to_owned();
+    let stage_identity = files::directory(&stage_path).unwrap().identity();
+    let holder_path = stage_path.join("teardown-holder");
+    files::write(&holder_path, b"fixture-only teardown holder").unwrap();
+    // A sibling of the candidate does not block its checked move. Denying
+    // delete sharing refuses the stage's checked removal for the whole bounded
+    // window, as a scanner's handle would for part of it.
+    let holder = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x3)
+        .open(&holder_path)
+        .unwrap();
+    let held = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
+    let destination = cache.join("active");
+    let lock_path = cache.join(".install.lock");
+    let (capture, observed) = capture_retained_stages(&lock_path);
+    let abort_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<tokio::task::AbortHandle>));
+    let observer_abort_slot = abort_slot.clone();
+    let task_destination = destination.clone();
+    let task = tokio::spawn(async move {
+        let mut held = Some(held);
+        activate_staged_observed(
+            stage,
+            lock,
+            &candidate,
+            &task_destination,
+            move |proven_no_move| {
+                if proven_no_move {
+                    drop(held.take());
+                    observer_abort_slot
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .expect("abort handle is installed before the task runs")
+                        .abort();
+                }
+            },
+        )
+        .await
+    });
+    *abort_slot.lock().unwrap() = Some(task.abort_handle());
+    assert!(task.await.unwrap_err().is_cancelled());
+    drop(capture);
+    assert!(!destination.exists());
+    let observed = std::mem::take(&mut *observed.lock().unwrap());
+    assert_eq!(observed.len(), 1, "one retention report: {observed:?}");
+    assert_eq!(observed[0].stage, stage_container);
+    assert_eq!(observed[0].published, Some(false));
+    assert!(
+        observed[0].receipted && observed[0].lock_held,
+        "the held stage is receipted and reported before the cache lock is released: {observed:?}"
+    );
+    let receipts: Vec<PathBuf> = fs::read_dir(cache.join(LEFTOVER_STAGE_RECEIPTS))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(receipts.len(), 1);
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipts[0]).unwrap()).unwrap();
+    assert_eq!(receipt["published"], false);
+    let cause = receipt["first_cause"].as_str().unwrap();
+    assert!(
+        cause.contains("exhausted its bounded recovery"),
+        "the persistent holder exhausts the bounded stage removal: {cause}"
+    );
+    assert!(
+        receipt["os_error"].is_i64(),
+        "the refusal's native cause is retained: {receipt}"
+    );
+    assert!(holder_path.exists());
+    assert_eq!(
+        files::directory(&stage_path).unwrap().identity(),
+        stage_identity,
+        "a refused teardown preserves the original private stage"
+    );
+    assert_cache_lock_released(&lock_path, lock_identity).await;
+    drop(holder);
+    fs::remove_dir_all(&stage_container).unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn first_checked_no_move_after_the_window_reports_stopped_recovery() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache café 東京");
+    let (stage, lock, lock_identity, candidate) = fixture_activation_stage(&cache).await;
+    let stage_path = stage.path().to_owned();
+    let source_identity = files::directory(&candidate).unwrap().identity();
+    let (_parent, _blocker) = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
+    let destination = cache.join("active");
+    let lock_path = cache.join(".install.lock");
+    let mut checked_denials = 0_u32;
+    let error = activate_staged_observed(stage, lock, &candidate, &destination, |proven_no_move| {
+        assert!(proven_no_move, "only checked no-move may enter recovery");
+        checked_denials += 1;
+        if checked_denials == 1 {
+            // Fixture delay, not a product one: the first native attempt's
+            // result arrives only after the whole recovery window, as a
+            // slow first move under a loaded runner did in CI.
+            thread::sleep(ACTIVATION_RETRY_LIMIT);
+        }
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(
+        checked_denials, 1,
+        "no native move starts after the recovery window"
+    );
+    let publication = error
+        .downcast_ref::<kuru_platform::fs::PublicationError>()
+        .unwrap();
+    assert_eq!(
+        publication.phase,
+        kuru_platform::fs::PublicationPhase::Rejected
+    );
+    assert_eq!(publication.error().raw_os_error(), Some(5));
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains("runtime activation recovery stopped"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("preserved private stage at"),
+        "{diagnostic}"
+    );
+    assert!(stage_path.is_dir());
+    assert_eq!(
+        files::directory(&candidate).unwrap().identity(),
+        source_identity
+    );
+    assert!(!destination.exists());
+    assert_cache_lock_released(&lock_path, lock_identity).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn cancellation_at_a_late_first_checked_no_move_is_cancelled() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache café 東京");
+    let (stage, lock, lock_identity, candidate) = fixture_activation_stage(&cache).await;
+    let stage_path = stage.path().to_owned();
+    let held = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
+    let destination = cache.join("active");
+    let lock_path = cache.join(".install.lock");
+    let abort_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<tokio::task::AbortHandle>));
+    let observer_abort_slot = abort_slot.clone();
+    let task_destination = destination.clone();
+    let task = tokio::spawn(async move {
+        let mut held = Some(held);
+        activate_staged_observed(
+            stage,
+            lock,
+            &candidate,
+            &task_destination,
+            move |proven_no_move| {
+                if proven_no_move {
+                    // Fixture delay, not a product one: the first result
+                    // arrives after the recovery window (job 108878373677).
+                    thread::sleep(ACTIVATION_RETRY_LIMIT);
+                    drop(held.take());
+                    observer_abort_slot
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .expect("abort handle is installed before the task runs")
+                        .abort();
+                }
+            },
+        )
+        .await
+    });
+    *abort_slot.lock().unwrap() = Some(task.abort_handle());
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(!destination.exists());
+    assert!(
+        !stage_path.exists(),
+        "cancellation drops the private stage before releasing the cache lock"
+    );
+    assert_cache_lock_released(&lock_path, lock_identity).await;
 }
 
 #[test]
