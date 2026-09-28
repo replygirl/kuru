@@ -21,6 +21,8 @@ env:
   # Jobs install only their mise-action install_args. Windows exe shims run
   # `mise x`, which would otherwise download every other configured tool.
   MISE_EXEC_AUTO_INSTALL: "false"
+  # `mise run` would otherwise install every missing configured tool first.
+  MISE_TASK_RUN_AUTO_INSTALL: "false"
 
 jobs:
   quality:
@@ -40,7 +42,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -161,7 +162,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       MISE_LOCKED: "1"
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       # Native archive and memory tests need only the pinned Rust toolchain.
       MISE_NO_HOOKS: "1"
       CARGO_INCREMENTAL: "0"
@@ -220,7 +220,6 @@ jobs:
         partition: [1, 2, 3]
     env:
       MISE_LOCKED: "1"
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       MISE_NO_HOOKS: "1"
       CARGO_INCREMENTAL: "0"
       # Import the run's verified bundle inputs; never download them here.
@@ -354,7 +353,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       CARGO_INCREMENTAL: "0"
     steps:
       - name: Require every memory partition job to have succeeded
@@ -433,7 +431,6 @@ jobs:
             mode: behavior
     env:
       MISE_LOCKED: "1"
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       MISE_NO_HOOKS: "1"
       CARGO_BUILD_TARGET: ${{ matrix.target }}
       CARGO_INCREMENTAL: "0"
