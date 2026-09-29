@@ -410,26 +410,39 @@ and written only on evidence this process observed itself:
   `kuru` executable.
 
 A kuru-memory fixture that serves an in-process `ServiceOwner` on a task must
-retire it on every exit path the body itself returns through (an early `?`,
-`bail!` or `ensure!`), not only at the end of its success path. It keeps
-the root, the options and a `test_support::ServedOwner` outside the body it
-judges, captures the body's `Result` while the root lives, and passes it to
-`test_support::settle` with `ServedOwner::retire` (the maintenance permit, then
-the owner's reap, with the bounds of the fixture's success path) as the
-teardown. An early `?`, `bail!` or `ensure!` then still retires the owner before
-the root drops. `settle` writes a body error to the test's captured output
-before the teardown starts and returns it as the root cause, with any teardown
-failure attached as context.
-When the teardown cannot retire the owner, for example because an aborted
-request still holds a client attachment, the guard still fails the test and its
-panic replaces the returned error; the printed body error remains.
-Open should-fix (final review S1): a fixture that creates its guarded root
-inside the future passed to `tokio::time::timeout(deadline, ...)` does not go
-through this teardown if the deadline elapses first — the future is dropped
-before `settle` runs, so the root can drop under a still-live served owner and
-the fixture guard panics in place of the deadline's own error. The rule above
-covers every exit the body's own control flow reaches; a dropped future is not
-one of those exits. Not yet fixed.
+retire it on every exit path: an early `?`, `bail!` or `ensure!`, the end of
+its success path, and an elapsed fixture deadline. It creates its root and
+options outside its deadline, starts one `test_support::FixtureDeadline` for
+the whole fixture (shared by every stage and loop iteration), and serves the
+owner through `FixtureDeadline::serve`. The stage it passes opens the owner,
+serves it through the `ServedOwner` it is given and returns the body's
+`Result`; the teardown it passes is `ServedOwner::retire` (the maintenance
+permit, then the owner's reap, with the bounds of the fixture's success path).
+The helper holds the served owner outside the timed future. Within the
+deadline it writes a body error to the test's captured output before the
+teardown starts, and returns the body's error as the root cause with any
+teardown failure attached. When the deadline elapses, the stage and its
+clients are dropped, the deadline's own error (`<fixture> exceeded its <budget>
+deadline`) is written first, and the same teardown then runs, bounded by its
+own permit and reap bounds. Stages that serve no owner run through
+`FixtureDeadline::run`. The fixture releases its root with
+`TempDir::release(outcome)`: when the teardown could not retire the owner, for
+example because an aborted request still holds a client attachment, the root
+is kept and the guard's verdict is attached to the fixture's error instead of
+replacing it with a panic. A root that is dropped rather than released still
+panics on a violation. Guarded roots that other fixtures create inside a
+`tokio::time::timeout` future still report an elapsed deadline through the
+guard's panic; converting them to `FixtureDeadline` is a recorded follow-on.
+
+The guard's scan reads at most 8 directory levels and 4096 entries beneath its
+root and does not descend into `.dolt`, Dolt's own repository directory, which
+never holds a lock file or `identity.json` and nests past the depth budget in
+every real store. Whatever the scan cannot read fails the teardown like an
+unexplained store: a directory past the depth budget, an entry past the entry
+budget, an unreadable directory or entry, and a store whose identity cannot be
+taken. A fixture whose root outgrows either budget must scan a narrower root
+or be given an explicit, named budget visible at its own call site (no fixture
+needs one today); the budgets are never raised globally.
 
 A kuru-memory fixture that releases a lock and takes it again at once through a
 one-shot acquisition, such as a successor `ServiceOwner::open` after its
@@ -499,8 +512,9 @@ closes the pool the same way; it only cannot produce a proof.
 `server::branch_procedure_tests` is a textual backstop for raw SQL. It rejects
 a quoted rename, delete or force flag (in either quote style, inline, bound,
 assigned or on another line) in any non-test source outside
-`impl SessionsEnded`, but it cannot see a flag or procedure name assembled at
-run time.
+`impl SessionsEnded`, and requires `server.rs` to construct the proof exactly
+once, where the session wait returned, but it cannot see a flag or procedure
+name assembled at run time.
 
 The lifecycle-ordering measurements are ignored tests, and their Dolt trace is
 inert unless `KURU_TEST_DOLT_LOG_DIR` names a directory, so neither runs in
