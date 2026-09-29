@@ -682,7 +682,11 @@ file. `dolt_binary` is an optional development override that must report the
 supported exact version. Corrupt existing caches fail without automatic repair.
 If activating a verified engine fails, the error reports the retained private
 staging directory for inspection; Kuru does not automatically retry that move.
-The startup timeout is 1–300 seconds. See [memory storage](memory.md) for
+The startup timeout is 1–300 seconds. If a newly started memory service is not
+ready in time, the error `memory service readiness deadline exceeded` also
+reports how that wait was split: election, owner probe, spawn and readiness
+polling in milliseconds, the number of readiness polls, and what the last poll
+found. See [memory storage](memory.md) for
 migration, revision inspection and backups, or
 [development](development.md#bundled-engine-build-inputs) for build-input settings.
 
