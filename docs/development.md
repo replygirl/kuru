@@ -1262,7 +1262,7 @@ distorts the numbers; the recorded load shows by how much.
 Phase 2 turns this job into the budget check by adding a comparison step after
 the measurement: probe-normalised medians of the pull request's head against
 its base, and an absolute ceiling well under `startup_timeout_secs`, using
-margins taken from the spread this job has recorded. Only then do it
+margins taken from the spread this job has recorded. Only then does it
 drop `continue-on-error` and join `ci-gate`'s needs. Until then, nothing reads
 these numbers automatically.
 
