@@ -687,6 +687,74 @@ jobs:
             ${{ runner.temp }}/kuru-usage-scan/fixture.json
             ${{ runner.temp }}/kuru-usage-scan/age-*.json
             ${{ runner.temp }}/kuru-usage-scan/create-*.log
+
+  open-time:
+    # Report-only open-time measurement, phase 1 of the startup-regression
+    # work: the release binary each OS's installation job built is measured
+    # from outside, and no time is compared with a budget. It is absent from
+    # ci-gate's needs, and job-level continue-on-error keeps even its own
+    # infrastructure failures out of the run's result. Phase 2 adds a budget
+    # comparison to this job and only then makes it gate; see
+    # docs/development.md#open-time-report.
+    name: Open-time report (${{ matrix.os }})
+    needs: native-tests
+    # Measure whatever binary this run published, even after an unrelated
+    # native failure.
+    if: ${{ !cancelled() }}
+    continue-on-error: true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest, windows-11-arm]
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      # Only the delivery tool is compiled here; it does not depend on
+      # kuru-memory, so no engine bundle input is needed. The measured
+      # executable embeds the engine its installation job verified.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: open-time-${{ matrix.os }}
+          # Restrict saves to main so PR runs never thrash the shared cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Download this run's installed release binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci-release-binary-${{ matrix.os }}
+          path: ${{ runner.temp }}/kuru-release
+      - name: Measure open time (report only)
+        shell: bash
+        env:
+          KURU_OPEN_TIME_BINARY: ${{ runner.temp }}/kuru-release/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
+          KURU_OPEN_TIME_OUTPUT: ${{ runner.temp }}/kuru-open-time
+          KURU_OPEN_TIME_SCRATCH: ${{ runner.temp }}/kuru-open-time-scratch
+          KURU_OPEN_TIME_LABEL: ${{ matrix.os }}
+        run: |
+          # Artifacts do not keep the executable mode.
+          chmod +x "$KURU_OPEN_TIME_BINARY"
+          mise run //packages/kuru-delivery:measure:open-time
+      - name: Require unchanged dependency locks
+        run: git diff --exit-code -- mise.lock Cargo.lock
+      - name: Upload the open-time records
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-open-time-${{ matrix.os }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kuru-open-time
           if-no-files-found: warn
 
   ci-gate:
