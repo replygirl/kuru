@@ -690,12 +690,14 @@ jobs:
 
   open-time:
     # Report-only open-time measurement, phase 1 of the startup-regression
-    # work: the release binary each OS's installation job built is measured
-    # from outside, and no time is compared with a budget. It is absent from
-    # ci-gate's needs, and job-level continue-on-error keeps even its own
-    # infrastructure failures out of the run's result. Phase 2 adds a budget
-    # comparison to this job and only then makes it gate; see
-    # docs/development.md#open-time-report.
+    # work: the release binary the ubuntu-latest installation job built is
+    # measured from outside, and no time is compared with a budget. It is
+    # absent from ci-gate's needs, and job-level continue-on-error keeps even
+    # its own infrastructure failures out of the run's result. Phase 2 adds a
+    # budget comparison to this job and only then makes it gate; see
+    # docs/development.md#open-time-report. Measured on ubuntu-latest only;
+    # macOS numbers come from one-off local runs, and Windows open time is
+    # not measured here.
     name: Open-time report (${{ matrix.os }})
     needs: native-tests
     # Measure whatever binary this run published, even after an unrelated
@@ -707,7 +709,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest, windows-11-arm]
+        os: [ubuntu-latest]
     env:
       CARGO_INCREMENTAL: "0"
     steps:
@@ -745,7 +747,7 @@ jobs:
       - name: Measure open time (report only)
         shell: bash
         env:
-          KURU_OPEN_TIME_BINARY: ${{ runner.temp }}/kuru-release/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
+          KURU_OPEN_TIME_BINARY: ${{ runner.temp }}/kuru-release/kuru
           KURU_OPEN_TIME_OUTPUT: ${{ runner.temp }}/kuru-open-time/main
           KURU_OPEN_TIME_SCRATCH: ${{ runner.temp }}/kuru-open-time-scratch
           KURU_OPEN_TIME_LABEL: ${{ matrix.os }}
@@ -757,7 +759,7 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         env:
-          KURU_OPEN_TIME_BINARY: ${{ runner.temp }}/kuru-release/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
+          KURU_OPEN_TIME_BINARY: ${{ runner.temp }}/kuru-release/kuru
           KURU_OPEN_TIME_OUTPUT: ${{ runner.temp }}/kuru-open-time/control-no-files
           KURU_OPEN_TIME_SCRATCH: ${{ runner.temp }}/kuru-open-time-scratch
           KURU_OPEN_TIME_LABEL: ${{ matrix.os }} control, processes only
@@ -768,7 +770,7 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         env:
-          KURU_OPEN_TIME_BINARY: ${{ runner.temp }}/kuru-release/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
+          KURU_OPEN_TIME_BINARY: ${{ runner.temp }}/kuru-release/kuru
           KURU_OPEN_TIME_OUTPUT: ${{ runner.temp }}/kuru-open-time/coarse-200ms
           KURU_OPEN_TIME_SCRATCH: ${{ runner.temp }}/kuru-open-time-scratch
           KURU_OPEN_TIME_LABEL: ${{ matrix.os }} coarse, 200 ms period
@@ -779,7 +781,7 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         env:
-          KURU_OPEN_TIME_BINARY: ${{ runner.temp }}/kuru-release/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
+          KURU_OPEN_TIME_BINARY: ${{ runner.temp }}/kuru-release/kuru
           KURU_OPEN_TIME_OUTPUT: ${{ runner.temp }}/kuru-open-time/ramp
           KURU_OPEN_TIME_SCRATCH: ${{ runner.temp }}/kuru-open-time-scratch
           KURU_OPEN_TIME_LABEL: ${{ matrix.os }} ramp, no retirement wait

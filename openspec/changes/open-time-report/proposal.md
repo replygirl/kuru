@@ -2,7 +2,7 @@
 
 ## Why
 
-Phase 1 of the startup regression needs Windows and Linux open times for the release binary a user runs; no record has any, and nothing times the owner's open from inside a release build. This change adds a report-only measurement, from outside the binary, inside `ci.yml`, shaped as the first form of the open-time budget check that phase 2 will turn into a gate.
+Phase 1 of the startup regression needs open times for the release binary a user runs on ubuntu-latest, measured in CI; no record has any, and nothing times the owner's open from inside a release build. This change adds a report-only measurement, from outside the binary, inside `ci.yml`, shaped as the first form of the open-time budget check that phase 2 will turn into a gate. macOS numbers come from one-off local runs of the same harness, not from a CI job; Windows open time is not measured or documented here.
 
 ## What Changes
 
@@ -10,13 +10,13 @@ Phase 1 of the startup regression needs Windows and Linux open times for the rel
 - `packages/kuru-delivery/tests/fixtures/delivery.rs`, `tests/open_time.rs`: a live-subprocess fixture that stands in for `kuru` and drives the harness end to end.
 - `packages/kuru-delivery/mise.toml`: `measure:open-time` task.
 - `Cargo.toml`, `packages/kuru-delivery/Cargo.toml`, `Cargo.lock`: `sysinfo =0.39.6` (feature `system` only), optional under `tooling`. The shipping `kuru` dependency tree is unchanged on every target.
-- `.github/workflows/native-tests.yml`: the install job publishes its installed release binary as an artifact (step-level `continue-on-error`).
-- `.github/workflows/ci.yml`: an `open-time` job over ubuntu-latest, macos-latest, windows-latest and windows-11-arm that downloads that binary, runs the task as four series (main, control without file observation, a coarse 200 ms sampling period, and a ramp without retirement waits) and uploads the records. Job-level `continue-on-error`; not in `ci-gate.needs`; no `workflow_dispatch`, no new workflow file.
+- `.github/workflows/native-tests.yml`: the ubuntu-latest install job publishes its installed release binary as an artifact (step-level `continue-on-error`); the other install jobs (macOS, Windows, Windows on Arm) do not.
+- `.github/workflows/ci.yml`: an `open-time` job on ubuntu-latest only that downloads that binary, runs the task as four series (main, control without file observation, a coarse 200 ms sampling period, and a ramp without retirement waits) and uploads the records. Job-level `continue-on-error`; not in `ci-gate.needs`; no `workflow_dispatch`, no new workflow file.
 - `docs/development.md`: what the job measures, that it is report-only, the stages and their error bounds, the census and modes, which build profile the packaged embedded-runtime test runs in coverage partitions, how to read it, and the phase 2 step that would make it a gate.
 
 ## Impact
 
-One new non-gating job per OS in `ci.yml`, which starts after `native-tests` finishes. One extra upload step in each install job; that upload runs inside the gating install job, so its time is on `ci-gate`'s critical path. No product code, no product dependency, no secrets, no permissions, no required checks and no action pins change. The job builds only `kuru-delivery`, which does not depend on `kuru-memory`, so it needs no engine bundle input.
+One new non-gating job on ubuntu-latest in `ci.yml`, which starts after `native-tests` finishes. One extra upload step in the ubuntu-latest install job; that upload runs inside the gating install job, so its time is on `ci-gate`'s critical path. No product code, no product dependency, no secrets, no permissions, no required checks and no action pins change. The job builds only `kuru-delivery`, which does not depend on `kuru-memory`, so it needs no engine bundle input.
 
 ## Surfaces
 

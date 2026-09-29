@@ -1335,20 +1335,21 @@ dependency seed directory to import (below); leave it unset locally.
 
 ## Open-time report
 
-`ci.yml`'s `Open-time report (<os>)` job measures how long the release `kuru`
-takes to open project memory, as a user would see it, on ubuntu-latest,
-macos-latest, windows-latest and windows-11-arm. It is **report only**: it never
-compares a time with a budget, `ci-gate` does not need it, and job-level
-`continue-on-error` keeps even its own failures (a missing artifact, a runner
-problem) out of the run's result. It is the first form of the open-time budget
-check, not a check yet.
+`ci.yml`'s `Open-time report (ubuntu-latest)` job measures how long the release
+`kuru` takes to open project memory, as a user would see it, on ubuntu-latest
+only. It is **report only**: it never compares a time with a budget, `ci-gate`
+does not need it, and job-level `continue-on-error` keeps even its own failures
+(a missing artifact, a runner problem) out of the run's result. It is the first
+form of the open-time budget check, not a check yet. This CI job is the way to
+measure open time in CI; to measure it on a developer machine, run the harness
+locally (see below).
 
-Each OS's installation job publishes the release executable it has just
-installed as `ci-release-binary-<os>` (a step that cannot fail that job). That
-upload (about 71 MB) runs inside the gating installation job, so its few
-seconds are on `ci-gate`'s critical path; the measurement itself is not. The
-open-time job starts after `native-tests`, downloads that exact binary, builds
-only the delivery tool (which needs no engine bundle input) and runs
+The ubuntu-latest installation job publishes the release executable it has just
+installed as `ci-release-binary-ubuntu-latest` (a step that cannot fail that
+job). That upload (about 71 MB) runs inside the gating installation job, so its
+few seconds are on `ci-gate`'s critical path; the measurement itself is not.
+The open-time job starts after `native-tests`, downloads that exact binary,
+builds only the delivery tool (which needs no engine bundle input) and runs
 `mise run //packages/kuru-delivery:measure:open-time` four times: the main
 series (10 iterations), a control series with file observation off (5), a
 series with a coarse 200 ms sampling period (3) that shows the observer's own
@@ -1378,11 +1379,10 @@ samples, on a fixed period (20 ms by default; the thread sleeps for the rest of
 each period), the Kuru and Dolt processes running from the scratch root (owner,
 supervisors, `dolt sql-server`, `dolt version`) and the names in the data and
 cache directories. It enumerates directories and never opens a file. Enumerating
-a directory opens a handle to it for the length of that one listing, and on
-Windows an open handle inside a directory's tree can make renaming or removing
-that directory fail. So the observer never enters an engine install stage
-(`.install-*`), a store staging directory (`*.staging-*`) or `interrupted`, the
-directories an open renames or removes; their appearance and disappearance are
+a directory opens a handle to it for the length of that one listing, so the
+observer never enters an engine install stage (`.install-*`), a store staging
+directory (`*.staging-*`) or `interrupted`, the directories an open renames or
+removes; that rule holds on every OS. Their appearance and disappearance are
 timed from the parent listing, and it skips Dolt's chunk store, statistics and
 temporary directories. Each listing's names are collected and its handle closed
 before any child is listed. The directories it still lists (`cache`, the
@@ -1420,7 +1420,10 @@ after both ends. Each sampled milestone is stamped at the end of the tick that
 first showed it, so a stage between two sampled milestones is off by less than
 the recorded bracket either way; each stage keeps its bounds, and a small
 negative stage means two milestones fell within one bracket, seen in the other
-order. Spans that contain several stages are reported separately as totals,
+order. A derived stage whose value is below minus its recorded bracket is not
+an interval reversed by sampling noise: it means the fixed milestone order this
+harness assumes is wrong on that OS, and any total containing that stage is
+mis-attributed. Spans that contain several stages are reported separately as totals,
 each with the milestones it passes through: engine provisioning (the install
 stage's lifetime), staged store creation, each staging supervisor's lifetime,
 the active open (active supervisor to service endpoint) and the owner's whole
@@ -1440,13 +1443,12 @@ and the owner records none, so tracing cannot split them either.
 Before and after each run the harness takes a census: this user's Kuru and Dolt
 processes anywhere on the host, by image name and role (never a command line),
 split into those from the scratch root and any others; the open file descriptor
-count (handle count on Windows) and listening TCP ports of the processes from the
-scratch root (from `/proc` on Linux, `lsof` on macOS and `NETSTAT.EXE` on
-Windows, recorded as unavailable if the query fails); and the `*.staging-*` and
-`interrupted` directories under the scratch data directories. Each record also
-keeps the retirement wait after it and the part of that wait until the owner
-process was gone. It records the load average before and after (not available on
-Windows) and a calibration probe: SHA-256 over 256 MiB repeated five times (the
+count and listening TCP ports of the processes from the scratch root (from
+`/proc` on Linux and `lsof` on macOS, recorded as unavailable if the query
+fails); and the `*.staging-*` and `interrupted` directories under the scratch
+data directories. Each record also keeps the retirement wait after it and the
+part of that wait until the owner process was gone. It records the load average
+before and after and a calibration probe: SHA-256 over 256 MiB repeated five times (the
 median is kept) and a 64 MiB write, fsync and read in the scratch root. Use the
 `open / CPU probe` ratio to compare runs of one runner label, such as a pull
 request's head against its base, not runners of different kinds.
@@ -1472,7 +1474,7 @@ of the open per case (n, median, minimum, maximum and spread of each stage), the
 totals with the milestones they pass through, other times (exit, lifetimes,
 probes, the recorded bracket), every open sample in run order, and per-case
 engine starts, owner path, load and census. Download the
-`ci-open-time-<os>-attempt-<n>` artifact for each series' `records.jsonl`, one
+`ci-open-time-ubuntu-latest-attempt-<n>` artifact for each series' `records.jsonl`, one
 `kuru.open-time.v2` JSON object per run, and `summary.md`. Records hold no path,
 credential or memory content.
 
@@ -1485,13 +1487,15 @@ test (`CARGO_BIN_EXE_kuru`). The coverage partitions run `cargo test` without
 `--release` and do not set that variable, so there the test runs the
 instrumented test-profile (unoptimized) build, copied privately because
 `LLVM_PROFILE_FILE` is set. In `ci.yml`, only each installation job's `Verify
-installed offline runtime` step (the one release-build run on Windows) and the
-Linux arm64 `native-build` job run it against a release build; `release.yml`
+installed offline runtime` step and the Linux arm64 `native-build` job run it
+against a release build; `release.yml`
 runs it against its release and staged binaries. A readiness
 deadline in a coverage partition is therefore a result for a debug build, not
 a release one.
 
-Locally, measure a release build with the same task:
+This CI job only runs on ubuntu-latest; to measure open time on any other
+developer machine (macOS included), run the harness locally with the same
+task, against a release build:
 
 ```sh
 mise run build:release
