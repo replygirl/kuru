@@ -964,6 +964,29 @@ once, fails unless the bytes match the committed pin, and uploads the
 `bundle:prepare -- --target <target> --archive <file> --offline` into their own
 private `KURU_DOLT_BUNDLE_DIR`, which checks the pin again.
 
+The cache key is the target, the pinned digest and a hash of the recipe inputs
+that decide the archive bytes. A recipe change therefore rebuilds once and
+proves the recipe still reproduces the pin. The inputs are:
+
+- the asset manifest `packages/kuru-memory/support/dolt-assets.json`. It pins
+  the sources and the Go and llvm-mingw toolchains. `packages/kuru-memory/mise.toml`
+  and `mise.lock` stay out of the key: a test requires every `bundle:build` tool
+  to be locked with the manifest's URL and digest, so the manifest covers them;
+- the helper's `main.rs`, `bundle.rs` and `bundle/build.rs`. The helper's test
+  modules never reach the binary;
+- the ZIP writer, `packages/kuru-archive/src/zip.rs`;
+- the `Cargo.lock` records of kuru-archive's locked dependency closure, which
+  holds the ZIP and deflate crates. The job's `ENGINE_ARCHIVE_CRATES` names them.
+  Other `Cargo.lock` changes do not rotate the key.
+
+`cargo test -p kuru-delivery --features tooling --test bundle_build` derives
+these inputs from the `bundle:build` task, the helper's module declarations, its
+default manifest and `Cargo.lock`. It fails when the key misses one or hashes
+anything else, so a new input must join the key in the same change. The key
+only decides when to rebuild. A restored or rebuilt archive is used only after
+it matches the pinned size and SHA-256. A restored mismatch is discarded and
+rebuilt, and a rebuilt mismatch fails the job. Only `main` saves the cache.
+
 `KURU_BUNDLE_BUILD_HOST_OVERRIDE=1` lets `bundle build` run on another host for
 local iteration on the recipe. Its output is **not authoritative**: it requires
 `--print-pins`, never verifies or replaces committed pins, and is labelled as an
