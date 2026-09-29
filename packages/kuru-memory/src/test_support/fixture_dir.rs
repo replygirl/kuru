@@ -21,11 +21,14 @@
 //! Both lease forms are recognised on every platform.
 //!
 //! The scan reads at most 8 directory levels and 4096 entries beneath the
-//! root, and does not descend into `.dolt`, Dolt's own repository directory,
-//! which never holds any of those files. Whatever it cannot read is itself a
-//! violation: a directory past the depth budget, an entry past the entry
-//! budget, an unreadable directory or entry, and a store whose identity
-//! cannot be taken. A truncated scan never passes.
+//! root. It skips one directory per store: the database repository
+//! `data/kuru/.dolt` of a store it has recognised, which holds none of those
+//! files and is covered by that store's quiescence record instead (see
+//! [`DOLT_REPOSITORY`]). Every other directory, including every other `.dolt`,
+//! is scanned. Whatever the scan cannot read is itself a violation: a
+//! directory past the depth budget, an entry past the entry budget, an
+//! unreadable directory or entry, and a store whose identity cannot be
+//! taken. A truncated scan never passes.
 //!
 //! Each store must then be explained by the process-local ledger
 //! ([`super::engine_ledger`]):
@@ -68,6 +71,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The default depth budget. [`TempDir::with_depth_budget`] names a larger
+/// one at a fixture's own call site.
 const MAX_DEPTH: usize = 8;
 const MAX_ENTRIES: usize = 4096;
 /// How often [`release_after_creator_exit`] queries its creator.
@@ -78,6 +83,7 @@ const CREATOR_POLL: Duration = Duration::from_millis(20);
 pub struct TempDir {
     inner: Option<PrivateTemp>,
     label: String,
+    depth: usize,
 }
 
 impl TempDir {
@@ -85,7 +91,22 @@ impl TempDir {
         Ok(Self {
             inner: Some(PrivateTemp::new(prefix, parent)?),
             label: super::lifecycle_trace::label(),
+            depth: MAX_DEPTH,
         })
+    }
+
+    /// Scan this root to `depth` directory levels instead of the default 8,
+    /// for a fixture that deliberately keeps store directories no lease
+    /// recognises (a template or an unopened copy), whose repositories the
+    /// scan reads in full. Named at the fixture's own call site; a budget
+    /// can only be raised, never lowered.
+    pub fn with_depth_budget(mut self, depth: usize) -> Self {
+        assert!(
+            depth >= MAX_DEPTH,
+            "a fixture depth budget can only raise the default {MAX_DEPTH}"
+        );
+        self.depth = depth;
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -117,7 +138,7 @@ impl TempDir {
         let Some(inner) = self.inner.take() else {
             return outcome;
         };
-        let Some(verdict) = check(inner, &self.label) else {
+        let Some(verdict) = check(inner, &self.label, self.depth) else {
             return outcome;
         };
         match outcome {
@@ -131,11 +152,11 @@ impl TempDir {
 
 /// Scan and forget the records beneath `inner`'s root, then remove it, or
 /// keep it and describe why.
-fn check(inner: PrivateTemp, label: &str) -> Option<String> {
+fn check(inner: PrivateTemp, label: &str, depth: usize) -> Option<String> {
     // The records beneath the root go with it, kept or removed, so no
     // later directory that recycles a native identity inherits one.
     let violations = engine_ledger::with(|ledger| {
-        let violations = scan(ledger, inner.path());
+        let violations = scan(ledger, inner.path(), depth);
         ledger.forget_under(&canonical(inner.path()));
         violations
     });
@@ -171,7 +192,7 @@ impl Drop for TempDir {
         };
         // The root is kept on a violation even while this test is already
         // failing; only a thread that is not unwinding reports.
-        if let Some(verdict) = check(inner, &self.label)
+        if let Some(verdict) = check(inner, &self.label, self.depth)
             && !std::thread::panicking()
         {
             panic!("{verdict}");
@@ -242,18 +263,37 @@ pub fn await_creator_exit<S>(
 /// as the guard's own tests observe it mid-fixture.
 #[cfg(test)]
 fn violations(root: &Path) -> Vec<String> {
-    engine_ledger::with(|ledger| scan(ledger, root))
+    engine_ledger::with(|ledger| scan(ledger, root, MAX_DEPTH))
 }
 
 fn canonical(root: &Path) -> PathBuf {
     fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
-fn scan(ledger: &Ledger, root: &Path) -> Vec<String> {
+fn scan(ledger: &Ledger, root: &Path, depth: usize) -> Vec<String> {
     let canonical = canonical(root);
     let mut found = Found::default();
-    let mut budget = MAX_ENTRIES;
+    let mut budget = Budget {
+        depth,
+        entries: MAX_ENTRIES,
+    };
     collect(root, 0, &mut budget, &mut found);
+    // A deferred repository is skipped only once its store is recognised.
+    // Every other one is scanned, and what it holds may recognise further
+    // stores. Recognition only grows, so a skipped repository stays skipped.
+    loop {
+        let recognised = stores(&found).0;
+        let unrecognised: Vec<_> = std::mem::take(&mut found.repositories)
+            .into_iter()
+            .filter(|repository| !recognised.contains_key(&repository.store))
+            .collect();
+        if unrecognised.is_empty() {
+            break;
+        }
+        for repository in unrecognised {
+            collect(&repository.path, repository.depth, &mut budget, &mut found);
+        }
+    }
     if found.exhausted {
         found.unscanned.push(format!(
             "the scan of {} reached its {MAX_ENTRIES}-entry budget before it finished, so the \
@@ -263,33 +303,42 @@ fn scan(ledger: &Ledger, root: &Path) -> Vec<String> {
     }
     let mut violations = ledger.live_under(&canonical);
     violations.append(&mut found.unscanned);
-    let mut stores = BTreeMap::new();
-    for store in found.leased {
-        match engine_ledger::key(&store) {
-            Some(key) => {
-                stores.entry(store).or_insert(key);
-            }
-            None => violations.push(unkeyed(&store)),
-        }
-    }
-    for store in found.identified {
-        let Some(key) = engine_ledger::key(&store) else {
-            violations.push(unkeyed(&store));
-            continue;
-        };
-        if key
-            .lease_name()
-            .is_some_and(|name| found.leases.contains(OsStr::new(&name)))
-        {
-            stores.entry(store).or_insert(key);
-        }
-    }
+    let (stores, mut unkeyed) = stores(&found);
+    violations.append(&mut unkeyed);
     violations.extend(
         stores
             .into_iter()
             .filter_map(|(store, key)| unexplained(ledger, &store, &key)),
     );
     violations
+}
+
+/// The stores `found` recognises, keyed, and a violation for each candidate
+/// whose identity could not be taken.
+fn stores(found: &Found) -> (BTreeMap<PathBuf, Key>, Vec<String>) {
+    let mut stores = BTreeMap::new();
+    let mut violations = Vec::new();
+    for store in &found.leased {
+        match engine_ledger::key(store) {
+            Some(key) => {
+                stores.entry(store.clone()).or_insert(key);
+            }
+            None => violations.push(unkeyed(store)),
+        }
+    }
+    for store in &found.identified {
+        let Some(key) = engine_ledger::key(store) else {
+            violations.push(unkeyed(store));
+            continue;
+        };
+        if key
+            .lease_name()
+            .is_some_and(|name| found.leases.contains(OsStr::new(&name)))
+        {
+            stores.entry(store.clone()).or_insert(key);
+        }
+    }
+    (stores, violations)
 }
 
 fn unkeyed(store: &Path) -> String {
@@ -315,6 +364,13 @@ fn unexplained(ledger: &Ledger, store: &Path, key: &Key) -> Option<String> {
     })
 }
 
+/// One scan's limits: the deepest directory level it reads, and the entries
+/// it may still read.
+struct Budget {
+    depth: usize,
+    entries: usize,
+}
+
 /// The lease files and store candidates one scan finds.
 #[derive(Default)]
 struct Found {
@@ -328,6 +384,17 @@ struct Found {
     unscanned: Vec<String>,
     /// An entry was left unread when the entry budget ran out.
     exhausted: bool,
+    /// Database repositories not yet read, each skipped only once its store
+    /// is recognised.
+    repositories: Vec<Repository>,
+}
+
+/// A directory in the position of a store's database repository,
+/// `<store>/data/kuru/.dolt`, held back until the scan knows its stores.
+struct Repository {
+    store: PathBuf,
+    path: PathBuf,
+    depth: usize,
 }
 
 impl Found {
@@ -360,21 +427,59 @@ fn store_of(path: &Path) -> Option<PathBuf> {
         .filter(|store| store.is_dir())
 }
 
-/// Dolt's own repository directory. Kuru never places a store, a lock file
-/// or `identity.json` inside it, and a real store's repository nests past the
-/// depth budget (`data/kuru/.dolt/stats/.dolt/noms/oldgen`), so the scan does
-/// not descend into it. It is the only directory the scan skips.
+/// The name of Dolt's repository directory.
+///
+/// The one directory the scan skips is the repository of a store it has
+/// recognised, in the layout the product creates. A store directory is
+/// `<data>/memory/<hash>` (`store.rs:7585`). Its supervisor runs Dolt with
+/// `data_dir` `<store>/data` (`server.rs:2161`, checked at `:1665` and
+/// `:2267`) and creates the one database `kuru` (`server.rs:2273`), whose
+/// repository is `<store>/data/kuru/.dolt`. That repository nests past the
+/// depth budget in every real store (`.dolt/stats/.dolt/noms/oldgen`).
+///
+/// Skipping it loses nothing the scan looks for. Kuru writes every store
+/// marker, lock file and identity record outside it: `lifecycle.lock`
+/// (`server.rs:1181`), `identity.json` (`server.rs:1898`, `:2319`),
+/// `endpoint.json` (`server.rs:1979`) and `server.log` (`server.rs:2032`) in
+/// the store directory, whose entries the supervisor admits by name
+/// (`server.rs:1293-1303`); the service owner lock in `<data>/memory/locks`
+/// (`service.rs:1252-1257`); and the Windows lifecycle lease in
+/// `<data>/memory/lifecycles` outside the store (`store/purge.rs:231`, taken
+/// at `server.rs:1183-1195`). The engine's own files in the repository are
+/// covered by that store's quiescence record, which a recognised store must
+/// have and which must still match (see [`unexplained`]), not by the scan.
+///
+/// Every other directory named `.dolt` is scanned and subject to both
+/// budgets: one outside any store, the repository of a directory that is not
+/// a recognised store (a template or an unopened copy), and any other `.dolt`
+/// beneath a recognised store, such as `data/.dolt` or `home/root/.dolt`.
 const DOLT_REPOSITORY: &str = ".dolt";
+/// The one database a store's supervisor creates (`server.rs:2273`).
+const DATABASE: &str = "kuru";
+/// The data directory a store's supervisor hands Dolt (`server.rs:2161`).
+const DATA: &str = "data";
+
+/// The store whose database repository `path` would be, by position alone.
+fn repository_store(path: &Path) -> Option<PathBuf> {
+    let database = path.parent()?;
+    let data = database.parent()?;
+    (path.file_name()? == DOLT_REPOSITORY
+        && database.file_name()? == DATABASE
+        && data.file_name()? == DATA)
+        .then(|| data.parent().map(Path::to_path_buf))
+        .flatten()
+}
 
 /// Read `directory` into `found`. Anything left unread (a directory past the
 /// depth budget, an unreadable directory or entry, an entry past the entry
 /// budget) is recorded as a violation, so a truncated scan never passes.
-fn collect(directory: &Path, depth: usize, budget: &mut usize, found: &mut Found) {
-    if depth > MAX_DEPTH {
+fn collect(directory: &Path, depth: usize, budget: &mut Budget, found: &mut Found) {
+    if depth > budget.depth {
         found.unscanned.push(format!(
-            "directory {} is deeper than the scan's {MAX_DEPTH}-level depth budget, so the \
-             stores beneath it were not checked",
-            directory.display()
+            "directory {} is deeper than the scan's {}-level depth budget, so the stores \
+             beneath it were not checked",
+            directory.display(),
+            budget.depth
         ));
         return;
     }
@@ -390,11 +495,11 @@ fn collect(directory: &Path, depth: usize, budget: &mut usize, found: &mut Found
         }
     };
     for entry in entries {
-        if *budget == 0 {
+        if budget.entries == 0 {
             found.exhausted = true;
             return;
         }
-        *budget -= 1;
+        budget.entries -= 1;
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -417,8 +522,13 @@ fn collect(directory: &Path, depth: usize, budget: &mut usize, found: &mut Found
             }
         };
         if kind.is_dir() {
-            if entry.file_name() != DOLT_REPOSITORY {
-                collect(&path, depth + 1, budget, found);
+            match repository_store(&path) {
+                Some(store) => found.repositories.push(Repository {
+                    store,
+                    path,
+                    depth: depth + 1,
+                }),
+                None => collect(&path, depth + 1, budget, found),
             }
         } else if kind.is_file() {
             found.file(directory, &path);
@@ -916,8 +1026,8 @@ mod tests {
 
     /// A real store's Dolt repository nests past the depth budget
     /// (`data/kuru/.dolt/stats/.dolt/noms/oldgen`). The scan does not descend
-    /// into a `.dolt` directory, so a recorded store with a deep repository
-    /// still passes, within both budgets.
+    /// into a recognised store's database repository, so a recorded store
+    /// with a deep repository still passes, within both budgets.
     #[test]
     fn a_recorded_store_with_a_deep_dolt_repository_passes() {
         let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
@@ -935,6 +1045,173 @@ mod tests {
         let path = root.path().to_path_buf();
         drop(root);
         assert!(!path.exists(), "a recorded root is removed");
+    }
+
+    /// The depth-budget violations `violations` reports for `root`.
+    fn depth_violations(root: &Path) -> Vec<String> {
+        violations(root)
+            .into_iter()
+            .filter(|violation| violation.contains("depth budget"))
+            .collect()
+    }
+
+    /// A `.dolt` directory that is not a recognised store's database
+    /// repository is scanned like any other directory: a tree below it that
+    /// outgrows the depth budget is a violation.
+    #[test]
+    fn a_dolt_directory_outside_a_store_is_subject_to_the_depth_budget() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let mut deep = root.path().join(DOLT_REPOSITORY);
+        for level in 0..MAX_DEPTH {
+            deep.push(format!("level-{level}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        let found = depth_violations(root.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains(&deep.display().to_string()), "{found:?}");
+        let path = root.path().to_path_buf();
+        let message = panic_message(root);
+        assert!(message.contains("depth budget"), "{message}");
+        remove_kept(&path);
+    }
+
+    /// A store marker hidden below a `.dolt` directory that is not a
+    /// recognised store's repository is found, and its store checked.
+    #[test]
+    fn a_store_marker_under_an_unrecognised_dolt_directory_is_found() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let hidden = root.path().join("data").join("kuru").join(DOLT_REPOSITORY);
+        fs::create_dir_all(&hidden).unwrap();
+        let store = stopped_store(&hidden);
+        assert_eq!(
+            violations(root.path()),
+            [format!(
+                "store {} has no quiescence record",
+                store.display()
+            )]
+        );
+        engine_ledger::record(&store);
+        assert_eq!(violations(root.path()), Vec::<String>::new());
+    }
+
+    /// The repository of a directory holding `identity.json` is skipped only
+    /// once the directory is a recognised store. A template or an unopened
+    /// copy, which has no lease, is scanned in full; once its external lease
+    /// names it, its repository is skipped and the store itself is checked.
+    #[test]
+    fn an_unleased_store_repository_is_scanned_until_its_lease_names_it() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let memory = root.path().join("memory");
+        let store = memory.join("0123");
+        for directory in [&memory, &store] {
+            files::private_dir(directory).unwrap();
+        }
+        files::write(&store.join("identity.json"), b"{}").unwrap();
+        let mut deep = store.join("data").join("kuru").join(DOLT_REPOSITORY);
+        for name in ["stats", ".dolt", "noms", "oldgen"] {
+            deep.push(name);
+        }
+        fs::create_dir_all(&deep).unwrap();
+        let found = violations(root.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("depth budget") && found[0].contains(&deep.display().to_string()),
+            "{found:?}"
+        );
+        let lease = engine_ledger::with(|_| engine_ledger::key(&store))
+            .and_then(|key| key.lease_name())
+            .expect("a private store directory has a native identity");
+        let lifecycles = memory.join("lifecycles");
+        files::private_dir(&lifecycles).unwrap();
+        files::write(&lifecycles.join(lease), b"").unwrap();
+        assert_eq!(
+            violations(root.path()),
+            [format!(
+                "store {} has no quiescence record",
+                store.display()
+            )]
+        );
+        engine_ledger::record(&store);
+        assert_eq!(violations(root.path()), Vec::<String>::new());
+    }
+
+    /// Only the database repository of a recognised store is skipped. Every
+    /// other `.dolt` beneath the same store, including one directly in its
+    /// data directory, is scanned.
+    #[test]
+    fn only_a_recognised_store_database_repository_is_skipped() {
+        let root = TempDir::new("kuru-fixture-invariant-", None).unwrap();
+        let store = stopped_store(root.path());
+        let data = store.join("data");
+        let mut skipped = data.join("kuru").join(DOLT_REPOSITORY);
+        let mut scanned = data.join(DOLT_REPOSITORY);
+        // Both trees reach past the depth budget.
+        for level in 0..MAX_DEPTH {
+            skipped.push(format!("level-{level}"));
+            scanned.push(format!("level-{level}"));
+        }
+        for deep in [&skipped, &scanned] {
+            fs::create_dir_all(deep).unwrap();
+        }
+        engine_ledger::record(&store);
+        let found = violations(root.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("depth budget")
+                && found[0].contains(&data.join(DOLT_REPOSITORY).display().to_string()),
+            "{found:?}"
+        );
+        let path = root.path().to_path_buf();
+        let message = panic_message(root);
+        assert!(message.contains("depth budget"), "{message}");
+        remove_kept(&path);
+    }
+
+    /// A budget named at a fixture's call site reads deeper than the
+    /// default, still reports a directory beyond it, and cannot lower it.
+    #[test]
+    fn a_named_depth_budget_reads_deeper_and_still_reports_beyond_it() {
+        let depth = MAX_DEPTH + 2;
+        let deep_tree = |root: &Path, levels: usize| {
+            let mut deep = root.to_path_buf();
+            for level in 0..levels {
+                deep.push(format!("level-{level}"));
+            }
+            fs::create_dir_all(&deep).unwrap();
+            deep
+        };
+        let root = TempDir::new("kuru-fixture-invariant-", None)
+            .unwrap()
+            .with_depth_budget(depth);
+        deep_tree(root.path(), depth);
+        let path = root.path().to_path_buf();
+        drop(root);
+        assert!(!path.exists(), "a tree within the named budget is removed");
+
+        let root = TempDir::new("kuru-fixture-invariant-", None)
+            .unwrap()
+            .with_depth_budget(depth);
+        let deep = deep_tree(root.path(), depth + 1);
+        let path = root.path().to_path_buf();
+        let message = panic_message(root);
+        assert!(
+            message.contains(&format!(
+                "directory {} is deeper than the scan's {depth}-level depth budget",
+                deep.display()
+            )),
+            "{message}"
+        );
+        remove_kept(&path);
+
+        let lowered = std::panic::catch_unwind(|| {
+            TempDir::new("kuru-fixture-invariant-", None)
+                .unwrap()
+                .with_depth_budget(MAX_DEPTH - 1)
+        });
+        assert!(
+            lowered.is_err(),
+            "a depth budget below the default is refused"
+        );
     }
 
     /// `release` returns the guard's verdict instead of panicking: a

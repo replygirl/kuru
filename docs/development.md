@@ -435,14 +435,22 @@ panics on a violation. Guarded roots that other fixtures create inside a
 guard's panic; converting them to `FixtureDeadline` is a recorded follow-on.
 
 The guard's scan reads at most 8 directory levels and 4096 entries beneath its
-root and does not descend into `.dolt`, Dolt's own repository directory, which
-never holds a lock file or `identity.json` and nests past the depth budget in
-every real store. Whatever the scan cannot read fails the teardown like an
-unexplained store: a directory past the depth budget, an entry past the entry
-budget, an unreadable directory or entry, and a store whose identity cannot be
-taken. A fixture whose root outgrows either budget must scan a narrower root
-or be given an explicit, named budget visible at its own call site (no fixture
-needs one today); the budgets are never raised globally.
+root. It skips exactly one directory per store: the database repository
+`<store>/data/kuru/.dolt` of a store it has recognised from its lease files.
+That repository nests past the depth budget in every real store, Kuru writes
+no store marker, lock file or identity record inside it, and the engine's own
+files there are covered by that store's quiescence record, not by the scan.
+Every other directory named `.dolt` is scanned and subject to both budgets:
+one outside any store, the repository of a directory no lease recognises (a
+template or an unopened copy), and any other `.dolt` beneath a store, such as
+`data/.dolt` or `home/root/.dolt`. Whatever the scan cannot read fails the
+teardown like an unexplained store: a directory past the depth budget, an
+entry past the entry budget, an unreadable directory or entry, and a store
+whose identity cannot be taken. A fixture whose root outgrows either budget
+must scan a narrower root or name a larger budget at its own call site with
+`TempDir::with_depth_budget`, which can only raise the default; the budgets
+are never raised globally. The two template fixtures, which keep a template
+and unopened copies, name an 11-level budget this way.
 
 A kuru-memory fixture that releases a lock and takes it again at once through a
 one-shot acquisition, such as a successor `ServiceOwner::open` after its
