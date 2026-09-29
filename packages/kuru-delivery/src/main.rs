@@ -120,9 +120,16 @@ enum Command {
         /// Also append the summary to this file (a CI job summary).
         #[arg(long, env = "GITHUB_STEP_SUMMARY")]
         summary: Option<PathBuf>,
-        /// Sampling interval of the process and file observer, in milliseconds.
-        #[arg(long, default_value_t = 20)]
+        /// Sampling period of the process and file observer, in milliseconds.
+        #[arg(long, env = "KURU_OPEN_TIME_INTERVAL_MS", default_value_t = 20)]
         interval_ms: u64,
+        /// `off` runs the control series: processes only, no file listing.
+        #[arg(long, env = "KURU_OPEN_TIME_FILES", default_value = "on", value_parser = ["on", "off"])]
+        files: String,
+        /// `off` runs the ramp series: no wait for owner retirement between
+        /// runs, one wait after the last.
+        #[arg(long, env = "KURU_OPEN_TIME_RETIRE_WAIT", default_value = "on", value_parser = ["on", "off"])]
+        retire_wait: String,
     },
 }
 
@@ -451,6 +458,8 @@ async fn main() -> Result<()> {
             label,
             summary,
             interval_ms,
+            files,
+            retire_wait,
         } => {
             let mut options = open_time::Options::new(binary, output);
             options.scratch = scratch;
@@ -460,11 +469,13 @@ async fn main() -> Result<()> {
             }
             options.summary = summary.filter(|path| !path.as_os_str().is_empty());
             options.interval = std::time::Duration::from_millis(interval_ms);
+            options.files = files == "on";
+            options.retire_wait = retire_wait == "on";
             let report = open_time::run(&options).await?;
             println!("{}", report.summary);
             println!(
-                "Recorded {} runs ({} failed to open); no budget is applied.",
-                report.records, report.failed_opens
+                "Recorded {} runs ({} failed to open, {} failed after opening); no budget is applied.",
+                report.records, report.failed_opens, report.failed_after_open
             );
         }
         Command::Repo { root } => {

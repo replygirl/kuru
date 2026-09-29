@@ -52,7 +52,7 @@ async fn every_run_of_a_live_command_is_recorded_and_summarised() {
         ]
     );
     for record in &records {
-        assert_eq!(record["schema"], "kuru.open-time.v1");
+        assert_eq!(record["schema"], "kuru.open-time.v2");
         assert_eq!(record["binary"]["version"], "native fixture 0.2.0");
         assert_eq!(record["outcome"]["success"], true);
         assert_eq!(record["outcome"]["json_stdout"], true);
@@ -63,6 +63,29 @@ async fn every_run_of_a_live_command_is_recorded_and_summarised() {
         assert!(record["probe"]["cpu_ms"].as_f64().unwrap() > 0.0);
         assert!(record["probe"]["io_ms"].as_f64().unwrap() > 0.0);
         assert!(record["observation"]["ticks"].as_u64().unwrap() >= 1);
+        assert_eq!(record["observation"]["files_observed"], true);
+        assert_eq!(record["mode"]["files"], true);
+        // Five repeats of the CPU probe, and their median.
+        assert_eq!(
+            record["probe"]["cpu_samples_ms"].as_array().unwrap().len(),
+            5
+        );
+        // The census before and after: the fixture has exited by then, and
+        // its store directory is not a staging one.
+        for census in [&record["census_before"], &record["census_after"]] {
+            assert_eq!(census["ours"], serde_json::json!({}), "{record}");
+            assert_eq!(census["staging_directories"], 0);
+            assert_eq!(census["interrupted_directories"], 0);
+            assert!(census["cost_ms"].as_f64().unwrap() >= 0.0);
+        }
+        // The stages partition the open.
+        let sum: f64 = record["stages"]["partition"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stage| stage["ms"].as_f64().unwrap())
+            .sum();
+        assert!((sum - ready).abs() < 0.05, "{record}");
         // Only progress lines are kept, never paths or other output.
         for line in record["stderr"].as_array().unwrap() {
             assert!(line["text"].as_str().unwrap().starts_with("Memory: "));
@@ -75,6 +98,8 @@ async fn every_run_of_a_live_command_is_recorded_and_summarised() {
     assert!(records[0]["retire_wait_ms"].is_number());
     assert!(records[1]["retire_wait_ms"].is_null());
     assert!(records[2]["retire_wait_ms"].is_number());
+    assert!(records[0]["owner_retired_ms"].is_number());
+    assert_eq!(report.final_retire_wait_ms, None);
     assert!(records[1]["gap_since_previous_ms"].is_number());
     let summary = fs::read_to_string(root.path().join("output/summary.md")).unwrap();
     assert_eq!(summary, report.summary);
@@ -184,5 +209,58 @@ async fn a_process_still_running_from_the_root_is_a_bounded_failure() {
     )
     .await
     .unwrap();
-    assert!(waited >= 0.0);
+    assert!(waited.wait_ms >= 0.0);
+    assert!(waited.owner_retired_ms <= waited.wait_ms);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_control_series_lists_no_files_and_the_ramp_waits_once() {
+    let root = tempfile::tempdir().unwrap();
+    let mut control = options(root.path(), 1, "measure");
+    control.files = false;
+    control.interval = Duration::from_millis(200);
+    let report = open_time::run(&control).await.unwrap();
+    assert_eq!((report.records, report.failed_opens), (3, 0));
+    for record in records(root.path()) {
+        assert_eq!(record["observation"]["files_observed"], false);
+        assert_eq!(record["observation"]["files"], serde_json::json!([]));
+        assert_eq!(record["observation"]["interval_ms"], 200.0);
+        assert_eq!(record["mode"]["files"], false);
+    }
+    assert!(
+        report.summary.contains("control series"),
+        "{}",
+        report.summary
+    );
+    assert!(
+        report.summary.contains("sampled every 200 ms"),
+        "{}",
+        report.summary
+    );
+
+    let ramp_root = tempfile::tempdir().unwrap();
+    let mut ramp = options(ramp_root.path(), 2, "measure");
+    ramp.retire_wait = false;
+    let report = open_time::run(&ramp).await.unwrap();
+    assert_eq!((report.records, report.failed_opens), (6, 0));
+    for record in records(ramp_root.path()) {
+        assert!(record["retire_wait_ms"].is_null(), "{record}");
+        assert_eq!(record["mode"]["retire_wait"], false);
+    }
+    assert!(report.final_retire_wait_ms.is_some());
+    assert!(report.summary.contains("Ramp series"), "{}", report.summary);
+    assert!(
+        report
+            .summary
+            .contains("Final wait for every owner of the ramp to retire"),
+        "{}",
+        report.summary
+    );
+    // Every iteration directory is removed after the final wait.
+    assert_eq!(
+        fs::read_dir(ramp_root.path().join("scratch"))
+            .unwrap()
+            .count(),
+        0
+    );
 }
