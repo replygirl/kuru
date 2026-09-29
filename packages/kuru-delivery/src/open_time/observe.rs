@@ -10,9 +10,10 @@
 //! the directories the product renames or removes during an open: their
 //! appearance and disappearance are timed from the parent listing only. Each
 //! listing's names are collected and its handle closed before any child is
-//! listed. The directories still listed (`cache`, a version directory, the
+//! listed, and Dolt's chunk store, statistics and temporary directories are
+//! skipped. The directories still listed (`cache`, a version directory, the
 //! activated engine directory, `data`, `data/memory`, the active store,
-//! `services`, `locks`) are not renamed by a successful open.
+//! `services`, `locks`) are not renamed or removed by a successful open.
 //!
 //! Sampling has a fixed period: the sampler thread sleeps for the rest of each
 //! interval. Every tick stamps its start, before the process listing, and its
@@ -37,9 +38,17 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, Uid, UpdateKind};
 
-/// Names never listed: Dolt's chunk store and statistics, and Kuru's
-/// diagnostics ring, change on every write and carry no stage.
-const SKIPPED: [&str; 5] = ["noms", "stats", "temptf", "eventsData", "diagnostics"];
+/// Names never listed: Dolt's chunk store, statistics and temporary
+/// directories, and Kuru's diagnostics ring, change on every write and carry
+/// no stage; Dolt removes its temporary directories during a run.
+const SKIPPED: [&str; 6] = [
+    "noms",
+    "stats",
+    "temptf",
+    "tmp",
+    "eventsData",
+    "diagnostics",
+];
 /// Deep enough for `data/memory/<store>/data/.dolt/sql-server.info` and
 /// `cache/<version>/<target>/dolt`.
 const DEPTH: usize = 4;

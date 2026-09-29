@@ -185,6 +185,17 @@ async fn a_process_still_running_from_the_root_is_a_bounded_failure() {
         error.contains(&format!("cli {}", child.id().unwrap())),
         "{error}"
     );
+    // The census sees the live process from the root, reads its open files
+    // and queries its listening ports through this platform's listing.
+    let census = open_time::census::take(&mut processes, &root_path).await;
+    assert_eq!(census.ours.get("cli"), Some(&1), "{census:?}");
+    assert_eq!(census.open_files_unread, 0, "{census:?}");
+    assert!(census.open_files_total() > 0, "{census:?}");
+    assert_eq!(
+        census.listening_tcp,
+        Some(std::collections::BTreeMap::new()),
+        "{census:?}"
+    );
     drop(input);
     assert!(child.wait().await.unwrap().success());
     // A published service endpoint alone also keeps the wait going.
