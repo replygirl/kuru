@@ -234,28 +234,26 @@ impl Processes {
                 .with_exe(UpdateKind::OnlyIfNotSet)
                 .with_cmd(UpdateKind::OnlyIfNotSet),
         );
-        // A process first listed between fork and exec kept its parent's
-        // image and arguments, and they are read only once: read them again
-        // for any Kuru or Dolt process whose name no longer matches its image
-        // or whose arguments were not yet readable.
-        let stale: Vec<Pid> = self
+        // An image and its arguments are otherwise read once, and a process
+        // first listed between fork and exec (or whose name the platform
+        // caches) would keep its parent's. Read them again on every sample
+        // for the few Kuru and Dolt processes.
+        let candidates: Vec<Pid> = self
             .system
             .processes()
             .iter()
             .filter(|(_, process)| {
-                let name = stem(process.name());
-                (name == "kuru" || name == "dolt")
-                    && (process.cmd().is_empty()
-                        || process
-                            .exe()
-                            .and_then(Path::file_name)
-                            .is_none_or(|image| stem(image) != name))
+                is_kuru_or_dolt(&stem(process.name()))
+                    || process
+                        .exe()
+                        .and_then(Path::file_name)
+                        .is_some_and(|image| is_kuru_or_dolt(&stem(image)))
             })
             .map(|(pid, _)| *pid)
             .collect();
-        if !stale.is_empty() {
+        if !candidates.is_empty() {
             self.system.refresh_processes_specifics(
-                ProcessesToUpdate::Some(&stale),
+                ProcessesToUpdate::Some(&candidates),
                 false,
                 ProcessRefreshKind::nothing()
                     .without_tasks()
@@ -264,12 +262,23 @@ impl Processes {
             );
         }
         let mut seen = Vec::new();
-        for (pid, process) in self.system.processes() {
-            let name = stem(process.name());
-            let stem = name.as_str();
-            if stem != "kuru" && stem != "dolt" {
+        for pid in candidates {
+            let Some(process) = self.system.process(pid) else {
+                continue;
+            };
+            // The image, not the process name, which may be stale or truncated.
+            let image = process
+                .exe()
+                .map(Path::to_path_buf)
+                .or_else(|| process.cmd().first().map(PathBuf::from));
+            let stem = image
+                .as_deref()
+                .and_then(Path::file_name)
+                .map_or_else(|| stem(process.name()), stem);
+            if !is_kuru_or_dolt(&stem) {
                 continue;
             }
+            let stem = stem.as_str();
             let cmd: Vec<String> = process
                 .cmd()
                 .iter()
@@ -279,13 +288,9 @@ impl Processes {
             let Some(role) = classify(stem, arguments) else {
                 continue;
             };
-            let image = process
-                .exe()
-                .map(Path::to_path_buf)
-                .or_else(|| process.cmd().first().map(PathBuf::from));
             let ours = image.is_some_and(|image| comparable(&image).starts_with(&self.root));
             seen.push(Seen {
-                pid: pid_number(*pid),
+                pid: pid_number(pid),
                 role,
                 store: (role == Role::SqlServer)
                     .then(|| Store::of(arguments))
@@ -296,6 +301,10 @@ impl Processes {
         seen.sort_by_key(|seen| seen.pid);
         seen
     }
+}
+
+fn is_kuru_or_dolt(stem: &str) -> bool {
+    stem == "kuru" || stem == "dolt"
 }
 
 /// An image or process name, case-folded and without `.exe`.
