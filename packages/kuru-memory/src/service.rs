@@ -2260,10 +2260,11 @@ mod tests {
     }
 
     /// Time spent waiting for a busy owner lock after election is reported
-    /// as owner-probe, not election. The clock is paused so the hold and the
-    /// client's own polls advance virtual time only; no wall-clock wait.
+    /// as owner-probe, not election. The hold runs on the real clock, so the
+    /// stalled owner reaches its fifo read within the remaining budget and
+    /// the fixture's release token reaches it, as in the unheld variant.
     #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn readiness_split_attributes_a_held_owner_lock_to_owner_probe() -> Result<()> {
         let failure =
             stalled_owner_failure(Some((ServiceLockKind::Owner, Duration::from_millis(300))))
@@ -2282,7 +2283,7 @@ mod tests {
 
     /// Time spent waiting for a busy start lock is reported as election.
     #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn readiness_split_attributes_a_held_start_lock_to_election() -> Result<()> {
         let failure =
             stalled_owner_failure(Some((ServiceLockKind::Start, Duration::from_millis(300))))
