@@ -34,3 +34,38 @@ narrowed.
 - [x] 5.2 @unit (agent) `mise run //packages/kuru-delivery:test` -> exit 0: lib 189 passed, including 6 `repo::lints` tests; `repo_validation` 28 passed, including the 2 new rule tests and the actual-repository test; 1 existing ignored test. `//packages/kuru-delivery:lint` and `:typecheck` -> exit 0.
 - [x] 5.3 @integration (agent) Root `mise run lint` -> exit 0 (`lint.log`). Its first attempt failed on the cmux `NODE_OPTIONS` preload, and the second on two of this round's own `clippy::question_mark` findings, since fixed. Root `mise run lint:windows` -> exit 0 for all six package tasks (`lint-windows.log`); the stand-ins built `aws-lc-sys` and `libsqlite3-sys`. No existing call site needed a changed attribute: every guarded allowance was already a statement-level `expect` with a reason.
 - [x] 5.4 @integration (agent) Each -> exit 0: `lint:tooling`, `format:check`, `docs:check`, `cospec validate workspace-lint-rules-windows-target --strict` and `cospec:managed:check` (`gate*.log`). `mise.lock` is unchanged versus `origin/main`.
+
+## 6. First CI run (PR #131, 2026-09-29): two failing checks, both unrelated to this change
+
+7 of 67 checks failed on the first run at head `010eed5f`/`e1231137` (before this rebase); 5
+were pure dependency/gate failures downstream of the 2 leaves below, with no work of their own
+(`Coverage merge (macos-latest)`, `Coverage merge (windows-latest)`, `Require native coverage
+and installation checks` x2, `ci-gate`). Read-only triage (session scratchpad
+`flake/ci/triage-0929/triage.md`) confirmed both leaves by diffing this PR's changed files
+against each failing test's code path; this change's diff touches only
+`packages/kuru-memory/{mise.toml,files.rs,provision.rs,provision/native_tests.rs,server.rs,
+spawn_gate.rs}` (cfg-attribute/lint-only edits plus one behavior-preserving `take_if` refactor in
+`provision.rs`'s retry loop, none on the failing tests' code paths) and this PR's own
+`apps/kuru-tui/tests/cli.rs` hunk only moves an import behind `#[cfg(unix)]`, untouched at the
+panic site.
+
+- **Leaf 1**: `native-tests (macos-latest) / Coverage partition (macos-latest, 2)`, job
+  109469266473. Test `cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming`
+  (`apps/kuru-tui/tests/cli.rs:83`) panics with "memory service write outcome is uncertain;
+  further client mutations are blocked". Not caused by this PR: the catalogued uncertain-write /
+  Dolt lifecycle-ordering family (class B, F2), the same family `fix/memory-lifecycle-ordering`
+  (PR #125) targets at its root cause.
+- **Leaf 2**: `native-tests (windows-latest) / Coverage partition (windows-latest, 2)`, job
+  109469267257. Test `packaged_install_and_update_preserve_complete_offline_memory`
+  (`apps/kuru-tui/tests/embedded_runtime.rs:1526`) times out reading native stdout/stderr after
+  100 s with no output. Not caused by this PR: `embedded_runtime.rs` is absent from this PR's
+  diff; this is the catalogued "install timeout" / unmodelled-host-stall family (flaky-tests.md
+  catalogue item 13, and the same shape recurring elsewhere in this triage round).
+
+Full per-job evidence, log line citations and the file-by-file diff check are in
+`flake/ci/triage-0929/triage.md`.
+
+- [ ] 6.1 @runtime (agent) The rebased head (onto `origin/main` 8450c555, after merging main's
+  release-workflow-tools check and this branch's lint rules) has not yet had its own CI run.
+  Before merge, confirm on that run: no new leaf failures, and that only the two known-unrelated
+  families above (or their tracked recurrences) may still appear as flakes.
