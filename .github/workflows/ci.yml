@@ -587,18 +587,58 @@ jobs:
         with:
           name: ci-release-binary-${{ matrix.os }}
           path: ${{ runner.temp }}/kuru-release
+      # Four series of the same cases, each in its own output directory and
+      # job-summary section. Estimated at 25-35 minutes in all, within the
+      # timeout: the main series (10 iterations, about 70-90 s each with two
+      # 30 s retirement waits), the control without file observation (5),
+      # a coarse 200 ms sampling period measuring the observer's own effect
+      # (3), and a ramp of consecutive opens without retirement waits (6).
       - name: Measure open time (report only)
         shell: bash
         env:
           KURU_OPEN_TIME_BINARY: ${{ runner.temp }}/kuru-release/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
-          KURU_OPEN_TIME_OUTPUT: ${{ runner.temp }}/kuru-open-time
+          KURU_OPEN_TIME_OUTPUT: ${{ runner.temp }}/kuru-open-time/main
           KURU_OPEN_TIME_SCRATCH: ${{ runner.temp }}/kuru-open-time-scratch
           KURU_OPEN_TIME_LABEL: ${{ matrix.os }}
         run: |
           # Artifacts do not keep the executable mode.
           chmod +x "$KURU_OPEN_TIME_BINARY"
           mise run //packages/kuru-delivery:measure:open-time
+      - name: Measure open time without file observation (control)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          KURU_OPEN_TIME_BINARY: ${{ runner.temp }}/kuru-release/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
+          KURU_OPEN_TIME_OUTPUT: ${{ runner.temp }}/kuru-open-time/control-no-files
+          KURU_OPEN_TIME_SCRATCH: ${{ runner.temp }}/kuru-open-time-scratch
+          KURU_OPEN_TIME_LABEL: ${{ matrix.os }} control, processes only
+          KURU_OPEN_TIME_ITERATIONS: "5"
+          KURU_OPEN_TIME_FILES: "off"
+        run: mise run //packages/kuru-delivery:measure:open-time
+      - name: Measure open time with a coarse sampling period
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          KURU_OPEN_TIME_BINARY: ${{ runner.temp }}/kuru-release/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
+          KURU_OPEN_TIME_OUTPUT: ${{ runner.temp }}/kuru-open-time/coarse-200ms
+          KURU_OPEN_TIME_SCRATCH: ${{ runner.temp }}/kuru-open-time-scratch
+          KURU_OPEN_TIME_LABEL: ${{ matrix.os }} coarse, 200 ms period
+          KURU_OPEN_TIME_ITERATIONS: "3"
+          KURU_OPEN_TIME_INTERVAL_MS: "200"
+        run: mise run //packages/kuru-delivery:measure:open-time
+      - name: Measure consecutive opens without retirement waits (ramp)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          KURU_OPEN_TIME_BINARY: ${{ runner.temp }}/kuru-release/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
+          KURU_OPEN_TIME_OUTPUT: ${{ runner.temp }}/kuru-open-time/ramp
+          KURU_OPEN_TIME_SCRATCH: ${{ runner.temp }}/kuru-open-time-scratch
+          KURU_OPEN_TIME_LABEL: ${{ matrix.os }} ramp, no retirement wait
+          KURU_OPEN_TIME_ITERATIONS: "6"
+          KURU_OPEN_TIME_RETIRE_WAIT: "off"
+        run: mise run //packages/kuru-delivery:measure:open-time
       - name: Require unchanged dependency locks
+        if: ${{ !cancelled() }}
         run: git diff --exit-code -- mise.lock Cargo.lock
       - name: Upload the open-time records
         if: ${{ !cancelled() }}
