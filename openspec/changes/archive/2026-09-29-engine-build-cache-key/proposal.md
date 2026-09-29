@@ -22,12 +22,17 @@ those edits cannot change the engine bytes.
   key. Restore verification, the rebuild path, the build pin check and the
   main-only save are unchanged.
 - `packages/kuru-delivery/tests/bundle_build.rs`: a test derives the build's
-  inputs from the `bundle:build` task, the helper's CLI default manifest, the
-  helper's module declarations and `Cargo.lock`, and requires the key to cover
+  inputs from the helper's CLI default manifest, its module declarations, the
+  modules its keyed files use and `Cargo.lock`. It requires the key to cover
   exactly those inputs and the determinism job's `pull_request.paths` to include
-  them. The toolchain test derives its tools from the task instead of a fixed
-  pair.
-- `docs/development.md`: the engine input cache and its key.
+  them. Because `mise.toml` and `mise.lock` leave the key, the test also fails
+  closed on any change to the `bundle:build` and `setup:build-tools` tasks, the
+  mise configuration the task loads, the input job's environment and steps, and
+  the compression crates' Cargo features. Named exemptions stay outside both the
+  key and the test, as on main, and the pin check backs them. The toolchain test
+  derives its tools from the task instead of a fixed pair.
+- `docs/development.md`: the engine input cache, its key, what the test
+  enforces and what only the pin check covers.
 
 ## Impact
 
