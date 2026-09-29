@@ -17,3 +17,4 @@
 - [x] 2.4 Pin the compression crates' Cargo features statically (workspace specifications, member use and features, `[patch]`/`[replace]`, resolver, registry dependents in `Cargo.lock`), and verify a `zlib-rs` feature and a new registry dependent are rejected
 - [x] 2.5 Correct `docs/development.md` and the PR body to what the test enforces, and list the inputs outside both key and test with the checks behind them
 - [x] 2.6 Record the pull request's CI run of the input job and the merge-commit keying in the verification ledger
+- [x] 2.7 Reject a tracked `.cargo/config` or `.cargo/config.toml` in the root, `packages/`, the helper's package and the memory package, document it with the other test checks, and verify each case with a mutation

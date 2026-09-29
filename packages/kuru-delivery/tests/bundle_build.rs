@@ -289,6 +289,21 @@ const ROOT_MISE_EXACT: &[(&str, &str)] = &[
 const ROOT_MISE_HOOKS: &[&str] = &["postinstall"];
 /// Directories whose mise configuration the task loads.
 const MISE_CONFIG_DIRECTORIES: &[&str] = &["", "packages/", "packages/kuru-memory/"];
+/// Directories whose Cargo configuration could reach the helper's build.
+/// Cargo reads `.cargo/config{,.toml}` in its working directory and each
+/// ancestor. The task's pinned directory is the repository root, so only the
+/// root one applies today; the ancestors are on the runner, outside the
+/// repository. The others are rejected too, so a configuration beside the
+/// task or the helper cannot apply unreviewed if that directory ever moves.
+/// Its `[env]` (including a forced `PATH`, which the recipe passes to the
+/// ICU build), `build.rustflags` and target `runner` would change the build
+/// without changing the key.
+const CARGO_CONFIG_DIRECTORIES: &[&str] = &[
+    "",
+    "packages/",
+    "packages/kuru-delivery/",
+    "packages/kuru-memory/",
+];
 
 /// The input job's exact toolchain installation and build steps.
 const SETUP_STEP_RUN: &str = "mise run //packages/kuru-memory:setup:build-tools";
@@ -436,6 +451,16 @@ fn key_findings(root: &Path, help: &str, tracked: &BTreeSet<String>) -> Vec<Stri
     let tasks: toml::Value = toml::from_str(&read(TASKS)).unwrap();
     let root_tasks: toml::Value = toml::from_str(&read(ROOT_TASKS)).unwrap();
     findings.extend(mise_findings(&tasks, &root_tasks, tracked));
+    for directory in CARGO_CONFIG_DIRECTORIES {
+        for name in ["config", "config.toml"] {
+            let path = format!("{directory}.cargo/{name}");
+            if tracked.contains(&path) {
+                findings.push(format!(
+                    "{path} is Cargo configuration the bundle:build task would load"
+                ));
+            }
+        }
+    }
     let words: Vec<_> = BUNDLE_BUILD_RUN.split_whitespace().collect();
     let value = |flag: &str| {
         words
@@ -1567,6 +1592,42 @@ fn an_unkeyed_build_input_or_a_non_input_in_the_key_is_rejected() {
         &|root, tracked| add(root, tracked, ".tool-versions", "make 4.4\n"),
         HELP,
         ".tool-versions is mise configuration",
+    );
+    expect(
+        &|root, tracked| {
+            add(
+                root,
+                tracked,
+                ".cargo/config.toml",
+                "[env]\nPATH = { value = \"/opt/tweak/bin\", force = true }\n",
+            );
+        },
+        HELP,
+        ".cargo/config.toml is Cargo configuration",
+    );
+    expect(
+        &|root, tracked| {
+            add(
+                root,
+                tracked,
+                ".cargo/config",
+                "[target.x86_64-unknown-linux-gnu]\nrunner = \"sh support/tweak.sh\"\n",
+            );
+        },
+        HELP,
+        ".cargo/config is Cargo configuration",
+    );
+    expect(
+        &|root, tracked| {
+            add(
+                root,
+                tracked,
+                "packages/kuru-delivery/.cargo/config.toml",
+                "[build]\nrustflags = [\"-Copt-level=0\"]\n",
+            );
+        },
+        HELP,
+        "packages/kuru-delivery/.cargo/config.toml is Cargo configuration",
     );
     expect(
         &|root, _| replace(root, ROOT_TASKS, "[env]\n", "[env]\nCC = \"gcc-13\"\n"),

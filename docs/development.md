@@ -996,6 +996,12 @@ rather than reusing a stale archive. It checks:
   No other tracked mise config file (`mise.local.toml`, `mise.<env>.toml`,
   `.mise.toml`, `mise/`, `.mise/`, `.config/mise*`, `.tool-versions`) may exist
   in the root, `packages/` or the memory package;
+- the Cargo configuration the helper's build loads. No tracked
+  `.cargo/config` or `.cargo/config.toml` may exist in the root, where the task
+  runs Cargo, nor in `packages/`, the helper's package or the memory package.
+  Its `[env]` (including a forced `PATH`, which reaches the ICU build),
+  `build.rustflags` or a target `runner` would change the build without
+  changing the key;
 - the input job: the workflow environment, its keys and `ubuntu-latest` runner,
   its actions, step environments, no `GITHUB_ENV` or `GITHUB_PATH` writes, and
   the exact toolchain and build steps;
