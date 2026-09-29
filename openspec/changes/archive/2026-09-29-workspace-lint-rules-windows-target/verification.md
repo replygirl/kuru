@@ -37,17 +37,22 @@ narrowed.
 
 ## 6. First CI run (PR #131, 2026-09-29): two failing checks, both unrelated to this change
 
-7 of 67 checks failed on the first run at head `010eed5f`/`e1231137` (before this rebase); 5
-were pure dependency/gate failures downstream of the 2 leaves below, with no work of their own
-(`Coverage merge (macos-latest)`, `Coverage merge (windows-latest)`, `Require native coverage
-and installation checks` x2, `ci-gate`). Read-only triage (session scratchpad
-`flake/ci/triage-0929/triage.md`) confirmed both leaves by diffing this PR's changed files
-against each failing test's code path; this change's diff touches only
-`packages/kuru-memory/{mise.toml,files.rs,provision.rs,provision/native_tests.rs,server.rs,
-spawn_gate.rs}` (cfg-attribute/lint-only edits plus one behavior-preserving `take_if` refactor in
-`provision.rs`'s retry loop, none on the failing tests' code paths) and this PR's own
+7 of 67 checks failed on the first run at head `7aa6cb9f8d14056cbfe342e96e4989437586e52a`
+(before this rebase; confirmed via `gh api repos/replygirl/kuru/actions/jobs/<job-id>
+--jq .head_sha` on both leaf jobs below). 5 were pure dependency/gate failures downstream of the
+2 leaves below, with no work of their own (`Coverage merge (macos-latest)`, `Coverage merge
+(windows-latest)`, `Require native coverage and installation checks` x2, `ci-gate`). Read-only
+triage (session scratchpad `flake/ci/triage-0929/triage.md`) confirmed both leaves by diffing
+this PR's changed files against each failing test's code path: the failing tests' own files
+(`apps/kuru-tui/tests/embedded_runtime.rs`, and `kuru-memory`'s `facade.rs`/`store.rs`/dream-write
+path) are absent from this PR's diff. This PR's only touches inside `packages/kuru-memory` are
+cfg-attribute edits (`mise.toml`, `files.rs`, `provision.rs`, `provision/native_tests.rs`,
+`server.rs`, `spawn_gate.rs`) plus one behavior-preserving `take_if` refactor of `provision.rs`'s
+retry loop, none on either failing test's code path; the PR's own
 `apps/kuru-tui/tests/cli.rs` hunk only moves an import behind `#[cfg(unix)]`, untouched at the
-panic site.
+panic site. (The bulk of this PR's diff — `kuru-delivery/src/repo/lints.rs`, its registration in
+`repo.rs`, `ci.yml`, `docs/development.md`, `AGENTS.md` — is unrelated to memory or install
+paths entirely.)
 
 - **Leaf 1**: `native-tests (macos-latest) / Coverage partition (macos-latest, 2)`, job
   109469266473. Test `cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming`
@@ -65,7 +70,7 @@ panic site.
 Full per-job evidence, log line citations and the file-by-file diff check are in
 `flake/ci/triage-0929/triage.md`.
 
-- [ ] 6.1 @runtime (agent) The rebased head (onto `origin/main` 8450c555, after merging main's
+- [~] 6.1 @runtime (agent) -> defer: The rebased head (onto `origin/main` 8450c555, after merging main's
   release-workflow-tools check and this branch's lint rules) has not yet had its own CI run.
   Before merge, confirm on that run: no new leaf failures, and that only the two known-unrelated
   families above (or their tracked recurrences) may still appear as flakes.
