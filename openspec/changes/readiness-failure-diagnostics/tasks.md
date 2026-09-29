@@ -18,6 +18,14 @@
 - [x] 3.2 Rerun the regression tests after the change and record them green
 - [x] 3.3 Run `//packages/kuru-memory:test`, `lint`, `lint:windows`, `typecheck`, `format:check`, `lint:tooling`, `docs:check` and `cospec validate --strict`, and record observed results
 
+## 4. Review round
+
+- [x] 4.1 Correct the refactor type name in `proposal.md` to `AttachMiss`, and verify no stale name remains in the change or docs
+- [x] 4.2 Add owner-lock and start-lock hold variants of the readiness test on a paused clock through one shared stalled-owner fixture, keeping every assertion of the unheld test, and verify that swapping `elected` and `probed`, anchoring both at `started`, or anchoring only `elected` at `started` each fails at least one of them
+- [x] 4.3 Open each starter child's stderr file append-only with a separate parent read handle, and verify the Unix and Windows starter tests use it
+- [x] 4.4 Synchronise the stalled half of `starter_wait_surfaces_the_exited_child_stderr` on a first-write marker within its existing 2 s bound, adding no sleep, and verify it passes
+- [x] 4.5 Rebase onto `origin/main` `a8ce468b`, and rerun the memory suite and static checks
+
 ## Audit: fixtures that launch a memory service or starter child
 
 - `service.rs` `windows_starter_fixture` (held-client starter): stderr was the platform default null. Fixed in this change.

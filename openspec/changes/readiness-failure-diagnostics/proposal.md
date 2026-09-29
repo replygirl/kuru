@@ -45,7 +45,7 @@ discarded and exit code 1 matches any failure (seen once, main run 36601116359).
 ## Impact
 
 - `packages/kuru-memory/src/service.rs`: `attach_or_start` readiness error text
-  (appended only), an internal `try_attach_observed`/`AttachOutcome` split of
+  (appended only), an internal `try_attach_observed`/`AttachMiss` split of
   `try_attach`, and test-only fixture and test changes.
 - `docs/configuration.md`, `apps/kuru-docs/reference/configuration.md`: one
   sentence on the deadline error.

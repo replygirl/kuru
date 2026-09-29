@@ -1832,6 +1832,17 @@ mod tests {
 
     const STARTER_STDERR_LABEL: &str = "contained memory starter";
 
+    /// Opens a starter's private stderr file twice: an append-only handle
+    /// for the child, so each of its writes lands at the end, and a separate
+    /// read handle whose offset only the parent's bounded tail read moves.
+    /// Neither description shares an offset with the other.
+    fn open_starter_stderr(root: &Path, name: &str) -> Result<(File, File)> {
+        let path = root.join(name);
+        let child = File::options().create_new(true).append(true).open(&path)?;
+        let parent = File::open(&path)?;
+        Ok((child, parent))
+    }
+
     fn fixture_readiness_error(
         options: &crate::store::OpenOptions,
         diagnostic: &mut File,
@@ -1955,7 +1966,7 @@ mod tests {
     #[tokio::test]
     async fn starter_wait_surfaces_the_exited_child_stderr() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let mut stderr = tempfile::tempfile_in(root.path())?;
+        let (child_stderr, mut stderr) = open_starter_stderr(root.path(), "exited-starter")?;
         let mut child = {
             let _gate = crate::spawn_gate::spawning().await;
             std::process::Command::new("/bin/sh")
@@ -1965,7 +1976,7 @@ mod tests {
                 ])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(stderr.try_clone()?)
+                .stderr(child_stderr)
                 .spawn()?
         };
         let error = await_starter_ready(
@@ -1988,27 +1999,47 @@ mod tests {
             "starter exit discarded the child's stderr: {rendered}"
         );
 
-        let mut stalled_stderr = tempfile::tempfile_in(root.path())?;
+        let (stalled_child_stderr, mut stalled_stderr) =
+            open_starter_stderr(root.path(), "stalled-starter")?;
+        let written = root.path().join("first-write");
         let mut running = {
             let _gate = crate::spawn_gate::spawning().await;
             std::process::Command::new("/bin/sh")
-                .args(["-c", "printf 'still starting\\n' >&2; exec /bin/sleep 10"])
+                .args([
+                    "-c",
+                    "printf 'still starting\\n' >&2; : > \"$1\"; exec /bin/sleep 10",
+                    "stalled-starter",
+                ])
+                .arg(&written)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(stalled_stderr.try_clone()?)
+                .stderr(stalled_child_stderr)
                 .spawn()?
         };
-        // The ready marker never appears; wait past the child's first write.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        let stalled = await_starter_ready(
+        // The child creates this marker only after its stderr write returned,
+        // so the tail read below cannot precede that write. The helper's own
+        // poll and the half's existing 2 s bound synchronise on it.
+        let first_write = await_starter_ready(
             || running.try_wait(),
-            &root.path().join("never-ready"),
-            deadline,
+            &written,
+            tokio::time::Instant::now() + Duration::from_secs(2),
             &mut stalled_stderr,
         )
         .await
-        .err()
-        .context("a stalled starter was reported ready");
+        .context("a stalled starter did not complete its first stderr write");
+        // The ready marker never appears; an elapsed deadline reports at once.
+        let stalled = match first_write {
+            Ok(()) => await_starter_ready(
+                || running.try_wait(),
+                &root.path().join("never-ready"),
+                tokio::time::Instant::now(),
+                &mut stalled_stderr,
+            )
+            .await
+            .err()
+            .context("a stalled starter was reported ready"),
+            Err(error) => Err(error),
+        };
         running.kill()?;
         running.wait()?;
         let rendered = format!("{:#}", stalled?);
@@ -2045,12 +2076,89 @@ mod tests {
         assert_eq!(AttachMiss::PeerClosed.as_str(), "peer-closed");
     }
 
-    /// A launched owner that stays alive without publishing an endpoint
-    /// exhausts the lowered startup bound in the readiness loop.
+    /// The failure of a launched owner that stays alive without publishing
+    /// an endpoint until the lowered startup bound expires in the readiness
+    /// loop, with its parsed client phase split.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn readiness_deadline_reports_the_client_phase_split() -> Result<()> {
+    struct StalledOwnerFailure {
+        rendered: String,
+        fields: std::collections::BTreeMap<String, String>,
+        observed_ms: u128,
+        held_ms: Option<u128>,
+    }
+
+    #[cfg(unix)]
+    impl StalledOwnerFailure {
+        fn millis(&self, name: &str) -> Result<u128> {
+            let rendered = &self.rendered;
+            self.fields
+                .get(name)
+                .and_then(|value| value.strip_suffix("ms"))
+                .with_context(|| format!("split lacks {name}: {rendered}"))?
+                .parse()
+                .with_context(|| format!("split {name} is not a millisecond count: {rendered}"))
+        }
+
+        /// Checks shared by every stalled-owner variant: the leading text,
+        /// the whole-wait sum, a plausible poll count and the last
+        /// observation. Returns the four phases in order.
+        fn common_phases(&self) -> Result<[u128; 4]> {
+            let Self {
+                rendered,
+                fields,
+                observed_ms,
+                ..
+            } = self;
+            ensure!(
+                rendered.starts_with("memory service readiness deadline exceeded"),
+                "readiness failure lost its leading text: {rendered}"
+            );
+            let phases = [
+                self.millis("election")?,
+                self.millis("owner-probe")?,
+                self.millis("spawn")?,
+                self.millis("readiness")?,
+            ];
+            let readiness = phases[3];
+            let polls: u128 = fields
+                .get("polls")
+                .with_context(|| format!("split lacks polls: {rendered}"))?
+                .parse()?;
+            let total: u128 = phases.iter().sum();
+            ensure!(
+                (1000..=*observed_ms).contains(&total),
+                "phases sum to {total} ms outside the 1 s bound and the {observed_ms} ms observed: {rendered}"
+            );
+            // Each poll after the first follows a sleep of at least 100 ms.
+            ensure!(
+                polls >= 2 && (polls - 1) * 100 <= readiness,
+                "poll count {polls} is implausible for {readiness} ms of readiness: {rendered}"
+            );
+            ensure!(
+                fields.get("child").map(String::as_str) == Some("running")
+                    && fields.get("last-attach").map(String::as_str) == Some("no-endpoint"),
+                "readiness failure lost its last observation: {rendered}"
+            );
+            Ok(phases)
+        }
+    }
+
+    /// Runs `attach_or_start` against a stalled owner. With `hold`, the
+    /// fixture first takes that real service lock and releases it the given
+    /// duration after the attempt began, measuring the release it made.
+    #[cfg(unix)]
+    async fn stalled_owner_failure(
+        hold: Option<(ServiceLockKind, Duration)>,
+    ) -> Result<StalledOwnerFailure> {
         use std::os::unix::fs::PermissionsExt as _;
+        // A held real flock is released while this attempt runs, so every
+        // sibling spawn is excluded for the whole fixture; that exclusive
+        // guard also covers the attempt's own owner spawn. See
+        // `crate::spawn_gate`. Without a hold only the spawn is guarded.
+        let _exclusive = match hold {
+            Some(_) => Some(crate::spawn_gate::locking_async().await),
+            None => None,
+        };
         let root = crate::test_support::tempdir()?;
         let project = root.path().join("project");
         std::fs::create_dir(&project)?;
@@ -2081,16 +2189,34 @@ mod tests {
             format!("#!/bin/sh\nIFS= read -r token < '{}'\n", fifo.display()),
         )?;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+        let held = hold
+            .map(|(kind, duration)| -> Result<_> {
+                let lock =
+                    ServiceLock::try_acquire(&options.data_dir, &options.project_scope, kind)?
+                        .context("fixture did not acquire the held service lock")?;
+                Ok((lock, duration))
+            })
+            .transpose()?;
 
         let started = tokio::time::Instant::now();
-        let outcome = {
+        let (outcome, released) = {
             // Held across the owner spawn; see `crate::spawn_gate`.
-            let _gate = crate::spawn_gate::spawning().await;
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                attach_or_start(&options, &project, &script),
+            let _gate = match hold {
+                Some(_) => None,
+                None => Some(crate::spawn_gate::spawning().await),
+            };
+            tokio::join!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    attach_or_start(&options, &project, &script),
+                ),
+                async {
+                    let (lock, duration) = held?;
+                    tokio::time::sleep_until(started + duration).await;
+                    drop(lock);
+                    Some(tokio::time::Instant::now())
+                },
             )
-            .await
         };
         let observed_ms = started.elapsed().as_millis();
         nix::unistd::write(&release, b"finish\n")?;
@@ -2099,56 +2225,76 @@ mod tests {
             .err()
             .context("a stalled owner was reported ready")?;
         let rendered = format!("{error:#}");
-        ensure!(
-            rendered.starts_with("memory service readiness deadline exceeded"),
-            "readiness failure lost its leading text: {rendered}"
-        );
         let split = rendered
             .split_once("client phases: ")
             .map(|(_, split)| split)
             .with_context(|| {
                 format!("readiness failure lacks the client phase split: {rendered}")
             })?;
-        let fields: std::collections::BTreeMap<&str, &str> = split
+        let fields = split
             .split("; ")
             .filter_map(|field| field.split_once('='))
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
             .collect();
-        let millis = |name: &str| -> Result<u128> {
-            fields
-                .get(name)
-                .and_then(|value| value.strip_suffix("ms"))
-                .with_context(|| format!("split lacks {name}: {rendered}"))?
-                .parse()
-                .with_context(|| format!("split {name} is not a millisecond count: {rendered}"))
-        };
-        let (election, probe, spawn, readiness) = (
-            millis("election")?,
-            millis("owner-probe")?,
-            millis("spawn")?,
-            millis("readiness")?,
-        );
-        let polls: u128 = fields
-            .get("polls")
-            .with_context(|| format!("split lacks polls: {rendered}"))?
-            .parse()?;
-        let total = election + probe + spawn + readiness;
-        ensure!(
-            (1000..=observed_ms).contains(&total),
-            "phases sum to {total} ms outside the 1 s bound and the {observed_ms} ms observed: {rendered}"
-        );
+        Ok(StalledOwnerFailure {
+            rendered,
+            fields,
+            observed_ms,
+            held_ms: released.map(|instant| instant.duration_since(started).as_millis()),
+        })
+    }
+
+    /// A launched owner that stays alive without publishing an endpoint
+    /// exhausts the lowered startup bound in the readiness loop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_deadline_reports_the_client_phase_split() -> Result<()> {
+        let failure = stalled_owner_failure(None).await?;
+        let [election, probe, spawn, readiness] = failure.common_phases()?;
         ensure!(
             readiness > election + probe + spawn,
-            "a stalled owner's wait was not attributed to the readiness loop: {rendered}"
+            "a stalled owner's wait was not attributed to the readiness loop: {}",
+            failure.rendered
         );
-        // Each poll after the first follows a sleep of at least 100 ms.
+        Ok(())
+    }
+
+    /// Time spent waiting for a busy owner lock after election is reported
+    /// as owner-probe, not election. The clock is paused so the hold and the
+    /// client's own polls advance virtual time only; no wall-clock wait.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn readiness_split_attributes_a_held_owner_lock_to_owner_probe() -> Result<()> {
+        let failure =
+            stalled_owner_failure(Some((ServiceLockKind::Owner, Duration::from_millis(300))))
+                .await?;
+        let [election, probe, _, _] = failure.common_phases()?;
+        let held = failure
+            .held_ms
+            .context("owner lock hold was not measured")?;
         ensure!(
-            polls >= 2 && (polls - 1) * 100 <= readiness,
-            "poll count {polls} is implausible for {readiness} ms of readiness: {rendered}"
+            probe * 4 >= held * 3 && election < held,
+            "a {held} ms owner lock hold was not attributed to owner-probe: {}",
+            failure.rendered
         );
+        Ok(())
+    }
+
+    /// Time spent waiting for a busy start lock is reported as election.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn readiness_split_attributes_a_held_start_lock_to_election() -> Result<()> {
+        let failure =
+            stalled_owner_failure(Some((ServiceLockKind::Start, Duration::from_millis(300))))
+                .await?;
+        let [election, probe, _, _] = failure.common_phases()?;
+        let held = failure
+            .held_ms
+            .context("start lock hold was not measured")?;
         ensure!(
-            fields.get("child") == Some(&"running")
-                && fields.get("last-attach") == Some(&"no-endpoint"),
-            "readiness failure lost its last observation: {rendered}"
+            election * 4 >= held * 3 && probe < held,
+            "a {held} ms start lock hold was not attributed to election: {}",
+            failure.rendered
         );
         Ok(())
     }
@@ -2546,7 +2692,8 @@ mod tests {
         options.supervisor = Some(PathBuf::from("relative-supervisor.exe"));
         let ready = root.path().join("starter-ready");
         let release = root.path().join("starter-release");
-        let mut starter_stderr = tempfile::tempfile_in(root.path())?;
+        let (child_stderr, mut starter_stderr) =
+            open_starter_stderr(root.path(), "starter-stderr")?;
         let _gate = crate::spawn_gate::spawning().await;
         let mut starter = windows_starter_fixture(
             &project,
@@ -2555,7 +2702,7 @@ mod tests {
             &ready,
             &release,
             Lifetime::OwnedJob,
-            starter_stderr.try_clone()?,
+            child_stderr,
         )
         .spawn()
         .await?;
@@ -2593,7 +2740,8 @@ mod tests {
             let (root, project, options, executable) = windows_service_fixture()?;
             let ready = root.path().join("starter-ready");
             let release = root.path().join("starter-release");
-            let mut starter_stderr = tempfile::tempfile_in(root.path())?;
+            let (child_stderr, mut starter_stderr) =
+                open_starter_stderr(root.path(), "starter-stderr")?;
             let _gate = crate::spawn_gate::spawning().await;
             let mut starter = windows_starter_fixture(
                 &project,
@@ -2602,7 +2750,7 @@ mod tests {
                 &ready,
                 &release,
                 Lifetime::FixtureBreakawayJob,
-                starter_stderr.try_clone()?,
+                child_stderr,
             )
             .spawn()
             .await?;
@@ -2698,7 +2846,8 @@ mod tests {
             let (root, project, options, executable) = windows_service_fixture()?;
             let ready = root.path().join("contained-ready");
             let release = root.path().join("contained-release");
-            let mut starter_stderr = tempfile::tempfile_in(root.path())?;
+            let (child_stderr, mut starter_stderr) =
+                open_starter_stderr(root.path(), "starter-stderr")?;
             let _gate = crate::spawn_gate::spawning().await;
             let mut starter = windows_starter_fixture(
                 &project,
@@ -2707,7 +2856,7 @@ mod tests {
                 &ready,
                 &release,
                 Lifetime::OwnedJob,
-                starter_stderr.try_clone()?,
+                child_stderr,
             )
             .spawn()
             .await?;
