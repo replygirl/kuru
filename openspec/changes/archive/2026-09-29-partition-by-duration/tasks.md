@@ -25,4 +25,4 @@
 - [x] 5.1 Refuse partial or mixed evidence in `coverage timings` (one source and tree, one partition count and every partition index per measured label), and verify with the extended evidence test (verification 2.1)
 - [x] 5.2 Bound each recorded completion by the invocation's recorded run time plus one second, and verify with the ledger tamper test (verification 1.3)
 - [x] 5.3 Label the replayed "after" figures as a prediction that assumes additive attribution, naming its known limit (verification 3.1)
-- [ ] 5.4 Run the branch on every hosted OS label and record the measured slowest partition jobs and merge results (verification 5.1)
+- [x] 5.4 Run the branch on every hosted OS label and record the measured slowest partition jobs and merge results (verification 5.1)
