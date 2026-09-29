@@ -1488,7 +1488,7 @@ async fn unavailable_mcp_status_stays_out_of_provider_input_and_memory() {
         },
     );
     let workspace = TempDir::new().unwrap();
-    let data = TempDir::new().unwrap();
+    let data = kuru_memory::test_support::tempdir().unwrap();
     let options = kuru_memory::test_support::open_options(
         data.path().join("private"),
         crate::project_scope(workspace.path()).unwrap(),

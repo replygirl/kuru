@@ -58,6 +58,16 @@ env.KURU_TEST_SUPERVISOR_PREPARED = "1"
 depends = ["prefetch", "bundle:test-fixtures"]
 run = "cargo test -p kuru-memory --all-targets --all-features --locked --no-fail-fast"
 
+# Opt-in measurements, never part of `test`, coverage or CI partitions: the
+# harnesses are #[ignore]d and the Dolt trace is inert unless
+# KURU_TEST_DOLT_LOG_DIR is set. See docs/development.md.
+[tasks."measure:lifecycle"]
+description = "Run the ignored candidate-cleanup and close-time lifecycle measurements on demand"
+env.RUST_TEST_THREADS = "2"
+env.KURU_TEST_SUPERVISOR_PREPARED = "1"
+depends = ["prefetch"]
+run = "cargo test -p kuru-memory --lib --all-features --locked lifecycle_measurement_tests -- --ignored --test-threads=2"
+
 [tasks."bundle:test-fixtures"]
 description = "Prepare the actual upstream Windows ZIP for host-independent decoder tests"
 depends = [{ task = "bundle:prepare", args = ["--target", "x86_64-pc-windows-msvc"] }]

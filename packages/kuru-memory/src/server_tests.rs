@@ -151,6 +151,8 @@ fn owner_drop_transfers_installed_reap_guard_until_real_child_reaps() -> Result<
             retained: Some(root.clone()),
             reap_guard,
             reaped_observer: None,
+            trace_directory: PathBuf::new(),
+            ledger: None,
         });
     }
     let held_before_release =
@@ -365,7 +367,7 @@ async fn framing_is_bounded_and_diagnostics_keep_only_a_tail() -> Result<()> {
     let mut data = vec![b'a'; LOG_LIMIT];
     data.extend(vec![b'b'; LOG_LIMIT]);
     let log = Arc::new(Mutex::new(Vec::new()));
-    drain(data.as_slice(), log.clone()).await;
+    drain(data.as_slice(), log.clone(), None).await;
     assert_eq!(*log.lock().await, vec![b'b'; LOG_LIMIT]);
     Ok(())
 }

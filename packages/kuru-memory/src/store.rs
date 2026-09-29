@@ -26,7 +26,7 @@ use crate::{
     migration::{self, LegacyImport, MigrationReceipt},
     progress::ProgressReporter,
     provision,
-    server::{LifecycleLease, Server, ServerOptions},
+    server::{BranchAdmission, LifecycleLease, Server, ServerOptions, SessionsEnded},
 };
 
 #[cfg(test)]
@@ -34,8 +34,14 @@ use crate::{
 mod recovery_tests;
 
 #[cfg(test)]
+#[path = "store/lifecycle_measurement_tests.rs"]
+mod lifecycle_measurement_tests;
+#[cfg(test)]
 #[path = "store/migration_lifecycle_tests.rs"]
 mod migration_lifecycle_tests;
+#[cfg(test)]
+#[path = "store/open_error_reap_tests.rs"]
+mod open_error_reap_tests;
 #[cfg(test)]
 #[path = "store/open_pool_budget_tests.rs"]
 mod open_pool_budget_tests;
@@ -762,11 +768,14 @@ fn candidate_branch_rename_reason(
     vendor: u16,
     message: &str,
 ) -> &'static str {
-    // Dolt 2.3.3's branch procedure returns this fixed message only when an
-    // active session prevents the checked rename. Keep its text private.
+    // Dolt's branch procedure returns this fixed message only when another
+    // session holds the branch, for the checked status rename and equally for
+    // cleanup's checked delete and exclusion probe. Keep its text private.
     const BRANCH_IN_USE: &str = "unsafe to delete or rename branches in use in other sessions; use --force to force the change";
-    if matches!(stage, CandidateFailureStage::BranchRename)
-        && sqlstate == "HY000"
+    if matches!(
+        stage,
+        CandidateFailureStage::BranchRename | CandidateFailureStage::Cleanup
+    ) && sqlstate == "HY000"
         && vendor == 1105
         && message == BRANCH_IN_USE
     {
@@ -900,7 +909,7 @@ impl Candidate {
                 fail_candidate_cleanup_once(&live)?;
                 live.shared
                     .server
-                    .retire_pool(&names.open)
+                    .close_pool_without_session_end(&names.open)
                     .await
                     .context(CandidateFailureStage::PoolRetirement)?;
                 cleanup_promoted_candidate(&live, &names, &target)
@@ -945,7 +954,7 @@ impl Candidate {
             fail_candidate_cleanup_once(&live)?;
             live.shared
                 .server
-                .retire_pool(&names.open)
+                .close_pool_without_session_end(&names.open)
                 .await
                 .context(CandidateFailureStage::PoolRetirement)?;
             cleanup_promoted_candidate(&live, &names, &target)
@@ -1001,7 +1010,7 @@ impl Candidate {
             }
             live.shared
                 .server
-                .retire_pool(&names.open)
+                .close_pool_without_session_end(&names.open)
                 .await
                 .context(CandidateFailureStage::PoolRetirement)?;
             abandon_candidate(&live, &names).await
@@ -1111,7 +1120,7 @@ async fn candidate_branch_is_clean(store: &MemoryStore, branch: &str) -> Result<
     let cleanup = store
         .shared
         .server
-        .retire_pool(branch)
+        .close_pool_without_session_end(branch)
         .await
         .context(CandidateFailureStage::PoolRetirement);
     match (result, cleanup) {
@@ -1162,6 +1171,25 @@ async fn preserve_resolved_cleanup(
     Ok(())
 }
 
+/// Retire Kuru's pool for the fenced branch, then wait until the server
+/// itself no longer lists a session on it ([`Server::retire_branch_sessions`],
+/// observed through this store's own pool). The returned proof is the only
+/// way to build a rename, delete or exclusion probe of the branch.
+///
+/// [`Server::retire_branch_sessions`]: crate::server::Server::retire_branch_sessions
+async fn retire_branch_sessions<'a>(
+    store: &MemoryStore,
+    admission: &'a BranchAdmission,
+    retirement_deadline: Duration,
+) -> Result<SessionsEnded<'a>> {
+    store
+        .shared
+        .server
+        .retire_branch_sessions(admission, store.pool.as_ref(), retirement_deadline)
+        .await
+        .context(CandidateFailureStage::PoolRetirement)
+}
+
 async fn transition_candidate(
     store: &MemoryStore,
     source: &str,
@@ -1185,15 +1213,7 @@ async fn transition_candidate_with_retirement_deadline(
         .fence_pool(source)
         .await
         .context(CandidateFailureStage::PoolRetirement)?;
-    store
-        .shared
-        .server
-        .retire_pool(source)
-        .await
-        .context(CandidateFailureStage::PoolRetirement)?;
-    await_branch_sessions_end(store, source, retirement_deadline)
-        .await
-        .context(CandidateFailureStage::PoolRetirement)?;
+    let sessions = retire_branch_sessions(store, &source_admission, retirement_deadline).await?;
     let (mut connection, id) = owned_connection(&store.pool).await?;
     *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
         pool: store.pool.clone(),
@@ -1206,10 +1226,7 @@ async fn transition_candidate_with_retirement_deadline(
     });
     let result = tokio::time::timeout(
         QUERY_TIMEOUT,
-        sqlx::query("CALL DOLT_BRANCH('-m', ?, ?)")
-            .bind(source)
-            .bind(status)
-            .fetch_all(&mut connection),
+        sessions.rename(status).fetch_all(&mut connection),
     )
     .await;
     drop(connection);
@@ -1252,6 +1269,7 @@ async fn delete_candidate_ref(
     branch: &str,
     expected: &str,
     force: bool,
+    retirement_deadline: Duration,
 ) -> Result<()> {
     let before =
         candidate_heads(&store.pool, &CandidateNames::from_status_or_open(branch)?).await?;
@@ -1262,9 +1280,30 @@ async fn delete_candidate_ref(
         head == expected,
         "candidate cleanup found an unexpected ref head"
     );
-    store.shared.server.retire_pool(branch).await?;
+    // The probe and delete run on owned connections from this store's pool,
+    // whose session selects `kuru/<store branch>`; it must never be the
+    // branch being deleted, or the caller would hold it itself.
+    ensure!(
+        store.branch != branch,
+        "candidate cleanup cannot delete the branch its own session selects"
+    );
+    // Order exactly as the status rename: fence admission, retire the pool,
+    // and wait for server-observed session end after the last Kuru session
+    // on the branch (including cleanup's working-set inspection) closed.
+    // Admission stays fenced through the branch procedure and its settlement.
+    let admission = store
+        .shared
+        .server
+        .fence_pool(branch)
+        .await
+        .context(CandidateFailureStage::PoolRetirement)?;
+    let sessions = retire_branch_sessions(store, &admission, retirement_deadline).await?;
     if force {
-        confirm_no_live_candidate_session(store, branch, expected).await?;
+        // `-D` skips Dolt's in-use check, so this checked self-rename remains
+        // the server's own confirmation that no session holds the branch. It
+        // also sees sessions whose processlist database is not branch
+        // qualified, which the wait above cannot.
+        confirm_no_live_candidate_session(store, &sessions, expected).await?;
     }
     let (mut connection, id) = owned_connection(&store.pool).await?;
     *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
@@ -1275,13 +1314,9 @@ async fn delete_candidate_ref(
             expected: expected.to_owned(),
         },
     });
-    let flag = if force { "-D" } else { "-d" };
     let result = tokio::time::timeout(
         QUERY_TIMEOUT,
-        sqlx::query("CALL DOLT_BRANCH(?, ?)")
-            .bind(flag)
-            .bind(branch)
-            .fetch_all(&mut connection),
+        sessions.delete(force).fetch_all(&mut connection),
     )
     .await;
     drop(connection);
@@ -1300,9 +1335,10 @@ async fn delete_candidate_ref(
 
 async fn confirm_no_live_candidate_session(
     store: &MemoryStore,
-    branch: &str,
+    sessions: &SessionsEnded<'_>,
     expected: &str,
 ) -> Result<()> {
+    let branch = sessions.branch();
     let (mut connection, id) = owned_connection(&store.pool).await?;
     *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
         pool: store.pool.clone(),
@@ -1314,10 +1350,7 @@ async fn confirm_no_live_candidate_session(
     });
     let result = tokio::time::timeout(
         QUERY_TIMEOUT,
-        sqlx::query("CALL DOLT_BRANCH('-m', ?, ?)")
-            .bind(branch)
-            .bind(branch)
-            .fetch_all(&mut connection),
+        sessions.exclusion_probe().fetch_all(&mut connection),
     )
     .await;
     drop(connection);
@@ -1349,9 +1382,9 @@ async fn cleanup_promoted_candidate(
         }
     }
     if heads.contains_key(&names.open) {
-        delete_candidate_ref(store, &names.open, target, false).await?;
+        delete_candidate_ref(store, &names.open, target, false, QUERY_TIMEOUT).await?;
     }
-    delete_candidate_ref(store, &names.promoting, target, false).await
+    delete_candidate_ref(store, &names.promoting, target, false, QUERY_TIMEOUT).await
 }
 
 async fn cleanup_abandoned_candidate(
@@ -1376,7 +1409,7 @@ async fn cleanup_abandoned_candidate(
     // remains explicitly recoverable.
     for branch in [&names.open, &names.promoting, &names.abandoned] {
         if heads.contains_key(branch) {
-            delete_candidate_ref(store, branch, target, true).await?;
+            delete_candidate_ref(store, branch, target, true, QUERY_TIMEOUT).await?;
         }
     }
     Ok(())
@@ -1721,7 +1754,10 @@ impl MemoryStore {
                 )
                 .await
                 .context("open staged memory server")?;
-                let pool = server.pool("main").await.context("open staged main pool")?;
+                let pool = match server.pool("main").await.context("open staged main pool") {
+                    Ok(pool) => pool,
+                    Err(error) => return Err(close_failed_open(&server, error).await),
+                };
                 let initialized = async {
                     initialize(&pool).await?;
                     if let Some(legacy) = &legacy {
@@ -1767,7 +1803,10 @@ impl MemoryStore {
                 )
                 .await
                 .context("reopen staged memory server for migration")?;
-                let pool = server.pool("main").await.context("open staged main pool")?;
+                let pool = match server.pool("main").await.context("open staged main pool") {
+                    Ok(pool) => pool,
+                    Err(error) => return Err(close_failed_open(&server, error).await),
+                };
                 #[cfg(test)]
                 let (returned_lock, migrated) =
                     run_migration_worker(server, pool, options.migration_hooks.clone()).await?;
@@ -1797,10 +1836,14 @@ impl MemoryStore {
                 if let Some((delay, entered)) = options.migrated_stage_pool_delay.clone() {
                     server.delay_next_pool_authentication(delay, entered);
                 }
-                let pool = server
+                let pool = match server
                     .pool("main")
                     .await
-                    .context("open migrated staged main pool")?;
+                    .context("open migrated staged main pool")
+                {
+                    Ok(pool) => pool,
+                    Err(error) => return Err(close_failed_open(&server, error).await),
+                };
                 let activated = async {
                     migrations::validate_active(&server, &pool).await?;
                     let initial_revision = revision(&pool).await?;
@@ -1874,20 +1917,35 @@ impl MemoryStore {
         )
         .await
         .context("open active memory server")?;
-        let pool = server.pool("main").await.context("open active main pool")?;
-        let found = migrations::version(&pool).await?;
+        let pool = match server.pool("main").await.context("open active main pool") {
+            Ok(pool) => pool,
+            Err(error) => return Err(close_failed_open(&server, error).await),
+        };
+        let inspected = async {
+            let found = migrations::version(&pool).await?;
+            if (options.read_only && found < migrations::CURRENT_VERSION)
+                || found > migrations::CURRENT_VERSION
+            {
+                migrations::validate_supported(&pool).await?;
+            }
+            ensure!(
+                found <= migrations::CURRENT_VERSION,
+                "unsupported Dolt memory schema version {found}"
+            );
+            Ok::<_, anyhow::Error>(found)
+        }
+        .await;
+        let found = match inspected {
+            Ok(found) => found,
+            Err(error) => return Err(close_failed_open(&server, error).await),
+        };
         if options.read_only && found < migrations::CURRENT_VERSION {
-            migrations::validate_supported(&pool).await?;
             let lock: File = server.close_installed_guard().await?;
             drop(lock);
             bail!(
                 "memory schema version {found} requires writable upgrade to {}",
                 migrations::CURRENT_VERSION
             );
-        }
-        if found > migrations::CURRENT_VERSION {
-            migrations::validate_supported(&pool).await?;
-            bail!("unsupported Dolt memory schema version {found}");
         }
         let (server, pool) = if found < migrations::CURRENT_VERSION {
             #[cfg(test)]
@@ -1900,18 +1958,21 @@ impl MemoryStore {
             let server = Server::open_with_guard(make_options(directory.clone(), false), lock)
                 .await
                 .context("reopen migrated memory server")?;
-            let pool = server
-                .pool("main")
-                .await
-                .context("open migrated main pool")?;
+            let pool = match server.pool("main").await.context("open migrated main pool") {
+                Ok(pool) => pool,
+                Err(error) => return Err(close_failed_open(&server, error).await),
+            };
             (server, pool)
         } else {
             (server, pool)
         };
-        if options.read_only {
-            migrations::validate_inspection(&server, &pool).await?;
+        let validated = if options.read_only {
+            migrations::validate_inspection(&server, &pool).await
         } else {
-            migrations::validate_active(&server, &pool).await?;
+            migrations::validate_active(&server, &pool).await
+        };
+        if let Err(error) = validated {
+            return Err(close_failed_open(&server, error).await);
         }
         let shared = Arc::new(Shared {
             server,
@@ -1936,8 +1997,14 @@ impl MemoryStore {
             logical_receipt: None,
         };
         if !options.read_only {
+            // The recovery worker closes its server before reporting failure.
             run_candidate_recovery_worker(&store).await?;
-            usage_ledger::establish(&store).await?;
+            if let Err(error) = usage_ledger::establish(&store).await {
+                // Recovery already released the startup guard to this store,
+                // so close the server itself rather than its installed guard.
+                let closed = store.shared.server.close().await;
+                return Err(with_close_failure(error, closed));
+            }
         } else {
             let lock: File = store.shared.server.take_reap_guard();
             drop(lock);
@@ -4372,6 +4439,27 @@ async fn close_candidate_recovery_worker(store: MemoryStore) -> Result<()> {
     let lock = stopped?;
     drop(lock);
     Ok(())
+}
+
+/// Keep the error that required a close, noting a close that also failed.
+fn with_close_failure(error: anyhow::Error, closed: Result<()>) -> anyhow::Error {
+    match closed {
+        Ok(()) => error,
+        Err(cleanup) => error.context(format!(
+            "memory server close after the failed open also failed: {cleanup:#}"
+        )),
+    }
+}
+
+/// An open that fails after starting its server returns only after that
+/// server's owned, bounded close (`close_pools_and_owner`: pool drain, then
+/// the supervisor reap allowance) and only then releases the startup guard.
+/// `Err` from `MemoryStore::open` therefore means Dolt is reaped, and a caller
+/// may release or remove the directory. A close that exceeds its bound keeps
+/// the guard with the supervisor observer and is attached to `error`.
+async fn close_failed_open(server: &Server, error: anyhow::Error) -> anyhow::Error {
+    let closed = server.close_installed_guard().await.map(drop);
+    with_close_failure(error, closed)
 }
 
 async fn close_migration_worker(server: Server, _pool: Arc<MySqlPool>) -> Result<File> {
@@ -7150,30 +7238,19 @@ async fn await_session_end(pool: &MySqlPool, id: u64, duration: Duration) -> Res
     .context("memory SQL session teardown deadline exceeded")?
 }
 
+/// Observe server-side session end on `kuru/<branch>` through this store's
+/// own pool, without retiring anything or granting a branch procedure.
+#[cfg(test)]
 async fn await_branch_sessions_end(
     store: &MemoryStore,
     branch: &str,
     duration: Duration,
 ) -> Result<()> {
-    let database = format!("kuru/{branch}");
-    tokio::time::timeout(duration, async {
-        loop {
-            let active: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM information_schema.processlist WHERE BINARY DB = BINARY ?",
-            )
-            .bind(&database)
-            .fetch_one(store.pool.as_ref())
-            .await?;
-            if active == 0 {
-                return Ok::<_, anyhow::Error>(());
-            }
-            #[cfg(test)]
-            store.shared.server.notify_candidate_wait().await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .context("candidate source session retirement deadline exceeded")?
+    store
+        .shared
+        .server
+        .await_branch_sessions_end(store.pool.as_ref(), branch, duration)
+        .await
 }
 
 async fn operation_exists(pool: &MySqlPool, operation: &str) -> Result<bool> {
@@ -7376,7 +7453,10 @@ async fn recover_staging(
             )
             .await?;
             let pool = if inspection {
-                Some(server.pool("main").await?)
+                match server.pool("main").await {
+                    Ok(pool) => Some(pool),
+                    Err(error) => return Err(close_failed_open(&server, error).await),
+                }
             } else {
                 None
             };
@@ -9647,79 +9727,115 @@ mod tests {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: a fresh owner, then a reopened local store, successor owner and final
         // local store.
-        let deadline = crate::test_support::fixture_deadline(1, 3);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = sha2::Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let mut client = service::attach_existing(&options, &project)
-                .await?
-                .context("service endpoint did not admit a candidate client")?;
-            let ServiceValue::CandidateStarted { handle, .. } = client
-                .call(ServiceCall::BeginCandidate {
-                    label: "disconnect-dream".into(),
+        let deadline = crate::test_support::FixtureDeadline::start(
+            crate::test_support::fixture_deadline(1, 3),
+            "candidate disconnect/restart fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = sha2::Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = async {
+            let (candidate_refs, successor, _gate) = deadline
+                .serve(
+                    async |served| {
+                        let _gate = crate::spawn_gate::spawning().await;
+                        let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                        served.serve(owner)?;
+                        let mut client = service::attach_existing(&options, &project)
+                            .await?
+                            .context("service endpoint did not admit a candidate client")?;
+                        let ServiceValue::CandidateStarted { handle, .. } = client
+                            .call(ServiceCall::BeginCandidate {
+                                label: "disconnect-dream".into(),
+                            })
+                            .await?
+                        else {
+                            bail!("service did not return the candidate identity");
+                        };
+                        ensure!(
+                            matches!(
+                                client
+                                    .call(ServiceCall::View {
+                                        candidate: Some(handle),
+                                        operation: Box::new(ViewOperation::PutMany {
+                                            values: vec![(
+                                                "dream-private".into(),
+                                                json!("retained")
+                                            )],
+                                        }),
+                                    })
+                                    .await?,
+                                ServiceValue::Unit
+                            ),
+                            "service did not accept the candidate write"
+                        );
+                        drop(client);
+                        // The owner's retirement releases the owner lock that the
+                        // one-shot successor open below takes again; see
+                        // `crate::spawn_gate::excluding_spawns`.
+                        let ((candidate_refs, successor), gate) =
+                            crate::spawn_gate::excluding_spawns(_gate, async {
+                                served
+                                    .retire(
+                                        &options,
+                                        None,
+                                        Duration::from_secs(10),
+                                        "first owner did not reap after candidate client \
+                                         disconnected",
+                                    )
+                                    .await?;
+
+                                let first = MemoryStore::open(options.clone()).await?;
+                                let candidate_refs = candidate_refs_with_value(&first).await?;
+                                ensure!(
+                                    candidate_refs.len() == 1,
+                                    "candidate ref was deleted on disconnect"
+                                );
+                                first.close().await?;
+
+                                let successor =
+                                    service::ServiceOwner::open(options.clone(), &project).await?;
+                                Ok((candidate_refs, successor))
+                            })
+                            .await?;
+                        Ok((candidate_refs, successor, gate))
+                    },
+                    async |served| {
+                        served
+                            .retire(
+                                &options,
+                                None,
+                                Duration::from_secs(10),
+                                "first owner did not reap after candidate client disconnected",
+                            )
+                            .await
+                    },
+                )
+                .await?;
+            deadline
+                .run(async {
+                    successor.close().await?;
+                    let reopened = MemoryStore::open(options.clone()).await?;
+                    ensure!(
+                        candidate_refs_with_value(&reopened).await? == candidate_refs,
+                        "owner restart changed the unresolved candidate ref, head or private rows"
+                    );
+                    reopened.close().await
                 })
-                .await?
-            else {
-                bail!("service did not return the candidate identity");
-            };
-            ensure!(
-                matches!(
-                    client
-                        .call(ServiceCall::View {
-                            candidate: Some(handle),
-                            operation: Box::new(ViewOperation::PutMany {
-                                values: vec![("dream-private".into(), json!("retained"))],
-                            }),
-                        })
-                        .await?,
-                    ServiceValue::Unit
-                ),
-                "service did not accept the candidate write"
-            );
-            drop(client);
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
                 .await
-                .context("first owner did not reap after candidate client disconnected")???;
-            drop(permit);
-
-            let first = MemoryStore::open(options.clone()).await?;
-            let candidate_refs = candidate_refs_with_value(&first).await?;
-            ensure!(
-                candidate_refs.len() == 1,
-                "candidate ref was deleted on disconnect"
-            );
-            first.close().await?;
-
-            let successor = service::ServiceOwner::open(options.clone(), &project).await?;
-            successor.close().await?;
-            let reopened = MemoryStore::open(options).await?;
-            ensure!(
-                candidate_refs_with_value(&reopened).await? == candidate_refs,
-                "owner restart changed the unresolved candidate ref, head or private rows"
-            );
-            reopened.close().await?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("candidate disconnect/restart fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
+        }
+        .await;
+        root.release(outcome)
     }
 
     async fn candidate_refs_with_value(
@@ -12406,6 +12522,12 @@ mod tests {
         // The supervisor creates its stable lock before writing store identity.
         #[cfg(unix)]
         private_file(&incomplete.join("lifecycle.lock")).unwrap();
+        // No engine ever starts under this stage: record that for the fixture
+        // root's teardown, which follows it to `interrupted`.
+        #[cfg(unix)]
+        crate::test_support::await_store_quiescence(&incomplete, None)
+            .await
+            .unwrap();
         let store = MemoryStore::open(options.clone()).await.unwrap();
         assert_eq!(
             store.revision().await.unwrap(),

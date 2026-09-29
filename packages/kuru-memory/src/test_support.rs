@@ -21,7 +21,19 @@
 //! migration, legacy import or activation, and for any test that compares
 //! instance identity, credentials or migration receipts, or that needs
 //! migrations to run. When in doubt, use the cold constructor.
-pub use crate::files::PrivateTemp as TempDir;
+/// Fixture roots whose teardown refuses to release a live memory owner.
+mod fixture_dir;
+pub use fixture_dir::{CreatorTeardown, TempDir, release_after_creator_exit};
+/// In-process service owners a fixture retires, or reports, on every exit
+/// path, including an elapsed fixture deadline.
+#[cfg(test)]
+mod served_owner;
+#[cfg(test)]
+pub(crate) use served_owner::{FixtureDeadline, serve_without_deadline};
+/// Process-local live-owner and quiescence records the fixture guard reads.
+pub(crate) mod engine_ledger;
+/// Env-gated lifecycle ordering measurement trace (inert unless enabled).
+pub mod lifecycle_trace;
 pub(crate) mod template;
 #[cfg(windows)]
 pub mod windows;
@@ -40,7 +52,8 @@ use std::{
 };
 
 /// A one-shot test barrier after a complete typed service request frame and
-/// before the client reads its reply. The owner continues independently.
+/// before the call returns its reply. The owner continues independently; the
+/// client reads and holds the reply frame until [`ReplyBarrier::release`].
 #[derive(Clone, Default)]
 pub struct ReplyBarrier {
     pub(crate) inner: Arc<crate::service::rpc::ReplyPause>,
@@ -49,6 +62,14 @@ pub struct ReplyBarrier {
 impl ReplyBarrier {
     pub async fn wait_sent(&self) {
         self.inner.sent.notified().await;
+    }
+
+    /// Wait until the owner's reply frame has arrived and is held. The owner
+    /// writes it only after its handler returned and the request's receipt
+    /// settled, so a test that cancels the paused call and then expects one
+    /// reconcile to be definite awaits this first, not a sibling's read.
+    pub async fn wait_replied(&self) {
+        self.inner.replied.notified().await;
     }
 
     pub fn promotion_sent(&self) -> bool {
@@ -292,6 +313,162 @@ pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
     Ok(())
 }
 
+/// Wait until a managed fixture's store has no live Dolt, and record that on
+/// its fixture root, before the root is released.
+///
+/// The managed service deliberately outlives its last client by an idle
+/// grace, so closing every client does not stop its engine. Call this after
+/// every client handle for `options` has closed (an attached client makes
+/// [`retire_idle_service`] fail with "active clients"). It retires the idle
+/// owner, whose owner lock is released only after its Dolt is reaped, then
+/// awaits [`await_store_quiescence`] for the project store, each of its
+/// remaining staging directories and each stage preserved under
+/// `interrupted/`. The product's asynchronous idle close is unchanged; only
+/// fixtures wait for it. A fixture that does not know its projects finds
+/// them with [`managed_store_scopes`].
+pub async fn await_managed_quiescence(options: &OpenOptions) -> Result<()> {
+    retire_idle_service(options).await?;
+    let directory = crate::store::project_directory(&options.data_dir, &options.project_scope)?;
+    #[cfg(unix)]
+    let lifecycle_root: Option<PathBuf> = None;
+    #[cfg(windows)]
+    let lifecycle_root = Some(options.data_dir.join("memory/lifecycles"));
+    for store in project_store_directories(&directory)? {
+        await_store_quiescence(&store, lifecycle_root.as_deref())
+            .await
+            .with_context(|| {
+                format!(
+                    "managed fixture store {} kept a live Dolt after its owner retired",
+                    store.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// The project store, its `.staging-*` siblings and its stages preserved
+/// under `interrupted/` that exist now: every directory in which a managed
+/// open of this project may have run an engine.
+fn project_store_directories(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut stores = Vec::new();
+    if lifecycle_trace::exists(directory) {
+        stores.push(directory.to_path_buf());
+    }
+    let (Some(parent), Some(name)) = (
+        directory.parent(),
+        directory.file_name().and_then(OsStr::to_str),
+    ) else {
+        return Ok(stores);
+    };
+    let prefix = format!("{name}.staging-");
+    for location in [parent.to_path_buf(), parent.join("interrupted")] {
+        let entries = match fs::read_dir(&location) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for (index, entry) in entries.enumerate() {
+            ensure!(
+                index < MAX_STAGE_ENTRIES,
+                "too many entries beside managed fixture store {}",
+                directory.display()
+            );
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|entry| entry.starts_with(&prefix))
+                && entry.file_type()?.is_dir()
+            {
+                stores.push(entry.path());
+            }
+        }
+    }
+    Ok(stores)
+}
+
+/// The project scopes that have a store directory under `data_dir` now, for
+/// a fixture that must await [`await_managed_quiescence`] for every project a
+/// managed service may have served, without knowing its projects.
+///
+/// A fresh open runs its engines in a `<hash>.staging-<uuid>` directory and
+/// renames it only once activation is validated, so a store an owner in
+/// another process is still opening, or left unactivated, exists only under
+/// that name. A scope is included exactly when
+/// [`await_managed_quiescence`]'s own recognition finds a store for it, so
+/// the two cannot drift: an entry names a candidate scope by its text before
+/// the first `.`, which the product's project directory rule must accept.
+/// A missing memory root has no scopes; any other unreadable root is an error.
+pub fn managed_store_scopes(data_dir: &Path) -> Result<Vec<String>> {
+    let memory = data_dir.join("memory");
+    let mut candidates = std::collections::BTreeSet::new();
+    for location in [memory.clone(), memory.join("interrupted")] {
+        let entries = match fs::read_dir(&location) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect fixture memory root {}", location.display())
+                });
+            }
+        };
+        for (index, entry) in entries.enumerate() {
+            ensure!(
+                index < MAX_STAGE_ENTRIES,
+                "too many entries in fixture memory root {}",
+                location.display()
+            );
+            let name = entry?.file_name();
+            if let Some(candidate) = name.to_str().and_then(|name| name.split('.').next()) {
+                candidates.insert(format!("project/{candidate}"));
+            }
+        }
+    }
+    let mut scopes = Vec::new();
+    for scope in candidates {
+        let Ok(directory) = crate::store::project_directory(data_dir, &scope) else {
+            continue;
+        };
+        if !project_store_directories(&directory)?.is_empty() {
+            scopes.push(scope);
+        }
+    }
+    Ok(scopes)
+}
+
+/// Await the lifecycle lease of one store directory, bounded by the
+/// supervisor's own reap allowance, and record on the fixture ledger, while
+/// the lease is held, that no engine is live there.
+///
+/// This is the record [`TempDir`]'s teardown requires for any store whose
+/// engine this process did not reap itself: a store served by a managed
+/// service process, by a spawned `kuru` process, or a lease-only directory.
+/// A timeout is returned as an error, so the fixture fails.
+pub async fn await_store_quiescence(directory: &Path, lifecycle_root: Option<&Path>) -> Result<()> {
+    await_store_quiescence_observed(directory, lifecycle_root, |_| ()).await
+}
+
+pub(crate) async fn await_store_quiescence_observed(
+    directory: &Path,
+    lifecycle_root: Option<&Path>,
+    while_held: impl FnOnce(&crate::server::LifecycleLease),
+) -> Result<()> {
+    // A waiting acquisition, not a probe: a descriptor a sibling's child
+    // inherited only delays it, and the fixture guard reads the record, not
+    // this lock. It takes no spawn gate, so callers may hold `spawning()`.
+    let lease = crate::server::Server::quiescence_at(
+        directory,
+        lifecycle_root,
+        crate::server::SUPERVISOR_REAP_ALLOWANCE,
+    )
+    .await
+    .with_context(|| format!("memory store {} did not quiesce", directory.display()))?;
+    engine_ledger::record(lease.directory.path());
+    while_held(&lease);
+    drop(lease);
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) async fn open_local_fixture(options: OpenOptions) -> Result<crate::store::MemoryStore> {
     let fixture_options = options.clone();
@@ -520,6 +697,68 @@ mod fixture_diagnostic_tests {
         let error = error.context("ordinary fixture open unexpectedly succeeded")?;
         assert!(format!("{error:#}").contains("memory project scope must start with project/"));
         assert!(!format!("{error:#}").contains("fixture Dolt server log tail"));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod managed_store_scope_tests {
+    use super::*;
+
+    fn hash(digit: char) -> String {
+        digit.to_string().repeat(64)
+    }
+
+    #[test]
+    fn scopes_cover_active_staging_and_preserved_stores_only() -> Result<()> {
+        let root = tempdir()?;
+        let data = root.path().join("private");
+        assert!(managed_store_scopes(&data)?.is_empty(), "no memory root");
+        let memory = data.join("memory");
+        for directory in ["locks", "lifecycles", "interrupted"] {
+            files::private_dir(&memory.join(directory))?;
+        }
+        let uuid = uuid::Uuid::new_v4();
+        // Active, staging-only (an open another process had not activated)
+        // and preserved-only stores each name their scope.
+        files::private_dir(&memory.join(hash('1')))?;
+        files::private_dir(&memory.join(format!("{}.staging-{uuid}", hash('2'))))?;
+        files::private_dir(&memory.join(format!("interrupted/{}.staging-{uuid}", hash('3'))))?;
+        // Neither an invalid project digest, nor a staging-named file, nor
+        // another suffix of a digest with no store names a scope.
+        files::private_dir(&memory.join("F".repeat(64)))?;
+        files::write(
+            &memory.join(format!("{}.staging-{uuid}", hash('4'))),
+            b"not a store",
+        )?;
+        files::private_dir(&memory.join(format!("{}.purge-{uuid}-0", hash('5'))))?;
+        assert_eq!(
+            managed_store_scopes(&data)?,
+            ['1', '2', '3']
+                .map(|digit| format!("project/{}", hash(digit)))
+                .to_vec()
+        );
+        // The staging-only and preserved-only stores are exactly what
+        // `await_managed_quiescence` awaits for their scopes.
+        let staged = crate::store::project_directory(&data, &format!("project/{}", hash('2')))?;
+        assert_eq!(
+            project_store_directories(&staged)?,
+            vec![memory.join(format!("{}.staging-{uuid}", hash('2')))]
+        );
+        let preserved = crate::store::project_directory(&data, &format!("project/{}", hash('3')))?;
+        assert_eq!(
+            project_store_directories(&preserved)?,
+            vec![memory.join(format!("interrupted/{}.staging-{uuid}", hash('3')))]
+        );
+
+        let unreadable = root.path().join("unreadable");
+        files::private_dir(&unreadable)?;
+        files::write(&unreadable.join("memory"), b"not a memory root")?;
+        let error = managed_store_scopes(&unreadable).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("inspect fixture memory root"),
+            "{error:#}"
+        );
         Ok(())
     }
 }

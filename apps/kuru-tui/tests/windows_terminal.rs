@@ -76,7 +76,7 @@ fn composer_coordinates_use_physical_rows_after_conpty_autowrap() {
 }
 
 struct Sandbox {
-    _temporary: memory::ServiceCleanup,
+    temporary: memory::ServiceCleanup,
     root: PathBuf,
     project: PathBuf,
     data: PathBuf,
@@ -86,7 +86,7 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Result<Self> {
-        let temporary = tempfile::tempdir()?;
+        let temporary = kuru_memory::test_support::tempdir()?;
         let parent = Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable)?;
         let root = parent
             .create_private_directory("terminal 日本語".as_ref())?
@@ -150,13 +150,20 @@ impl Sandbox {
         let startup =
             Duration::from_secs((configuration.memory.startup_timeout_secs + 5) * 2 + 13) + READY;
         Ok(Self {
-            _temporary: memory::ServiceCleanup::new(temporary, &data),
+            temporary: memory::ServiceCleanup::new(temporary, &data),
             root,
             project,
             data,
             environment,
             startup,
         })
+    }
+
+    /// Release the fixture after the test's own `outcome`, so a cleanup
+    /// failure or guard verdict is attached to that outcome instead of
+    /// replacing it with a drop panic.
+    fn release<T>(self, outcome: Result<T>) -> Result<T> {
+        self.temporary.release(outcome)
     }
 
     fn args(&self, provider: &str) -> Vec<String> {
@@ -571,12 +578,17 @@ impl Drop for ProviderServer {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_conpty_cancels_provider_work_without_losing_the_next_draft() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let sandbox = Sandbox::new()?;
+    let outcome = cancel_provider_work_and_keep_the_next_draft(&sandbox).await;
+    sandbox.release(outcome)
+}
+
+async fn cancel_provider_work_and_keep_the_next_draft(sandbox: &Sandbox) -> Result<()> {
     use axum::{
         Json, Router,
         routing::{get, post},
     };
-    let _serial = SERIAL.lock().await;
-    let sandbox = Sandbox::new()?;
     let (release, receiver) = tokio::sync::watch::channel(false);
     let started = Arc::new(AtomicBool::new(false));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

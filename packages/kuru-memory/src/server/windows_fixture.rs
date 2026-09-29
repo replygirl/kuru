@@ -28,6 +28,10 @@ pub(crate) async fn unconfigured(
         reap_guard: Arc::new(StdMutex::new(None)),
         #[cfg(test)]
         reaped_observer: None,
+        #[cfg(any(test, feature = "test-support"))]
+        trace_directory: PathBuf::new(),
+        #[cfg(any(test, feature = "test-support"))]
+        ledger: Some(crate::test_support::engine_ledger::register(directory)),
     };
     let result = async {
         owner.lifetime = Some(
@@ -85,6 +89,10 @@ pub(crate) async fn partial_readiness(
         reap_guard: Arc::new(StdMutex::new(None)),
         #[cfg(test)]
         reaped_observer: None,
+        #[cfg(any(test, feature = "test-support"))]
+        trace_directory: PathBuf::new(),
+        #[cfg(any(test, feature = "test-support"))]
+        ledger: Some(crate::test_support::engine_ledger::register(&directory)),
     };
     let result = async {
         owner.lifetime = Some(

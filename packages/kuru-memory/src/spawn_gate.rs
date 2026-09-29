@@ -60,6 +60,17 @@ impl Gate {
     fn spawning_blocking(&self) -> RwLockReadGuard<'_, ()> {
         self.0.blocking_read()
     }
+
+    async fn excluding<'a, T>(
+        &'a self,
+        held: RwLockReadGuard<'a, ()>,
+        restart: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<(T, RwLockReadGuard<'a, ()>)> {
+        drop(held);
+        let exclusive = self.locking_async().await;
+        let value = restart.await?;
+        Ok((value, exclusive.downgrade()))
+    }
 }
 
 static GATE: Gate = Gate::new();
@@ -85,6 +96,28 @@ pub(crate) async fn spawning() -> RwLockReadGuard<'static, ()> {
 #[cfg(unix)]
 pub(crate) fn spawning_blocking() -> RwLockReadGuard<'static, ()> {
     GATE.spawning_blocking()
+}
+
+/// Release a lock and acquire it again with every other in-binary spawn
+/// excluded: give up the caller's shared guard, run `restart` under the
+/// exclusive guard, then downgrade that guard atomically to the shared guard
+/// the rest of the test holds. The caller never waits after `restart`: a
+/// successor owner served inside it starts its 30 s idle timer at once, and a
+/// writer queued meanwhile can wait for other tests far longer than that.
+///
+/// A one-shot acquisition right after a release (for example a successor
+/// `ServiceOwner::open` after its predecessor closed) needs this. A shared
+/// guard does not exclude a sibling test's spawn, and that sibling's child can
+/// hold a duplicate of the just-released description until its exec. `restart`
+/// must span the release as well as the reacquisition, and the caller must not
+/// hold another shared guard: the gate is fair, so a nested shared acquisition
+/// would wait behind this writer forever. On an error the caller keeps no
+/// guard, which is harmless for a fixture that only tears down afterwards.
+pub(crate) async fn excluding_spawns<T>(
+    held: RwLockReadGuard<'static, ()>,
+    restart: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<(T, RwLockReadGuard<'static, ()>)> {
+    GATE.excluding(held, restart).await
 }
 
 #[cfg(test)]
@@ -119,6 +152,40 @@ mod tests {
         drop(spawning);
         waiter.join().unwrap();
         observed.recv().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_restart_returns_its_shared_guard_without_waiting_behind_a_queued_writer() {
+        // A fixture serves its successor inside the restart; the successor's
+        // idle timer then runs. A writer that queued meanwhile (another
+        // fixture's restart, itself waiting for other tests) must not delay
+        // the caller's shared guard.
+        static GATE: Gate = Gate::new();
+        let (queued, queued_seen) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let held = GATE.spawning().await;
+        let restarted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            GATE.excluding(held, async {
+                let writer = tokio::spawn(async move {
+                    queued.send(()).unwrap();
+                    let _exclusive = GATE.locking_async().await;
+                    let _ = released.await;
+                });
+                // On this current-thread runtime the writer has registered
+                // its wait before this receiver can resume.
+                queued_seen.await?;
+                Ok(writer)
+            }),
+        )
+        .await;
+        let (writer, shared) = restarted
+            .expect("the restart's shared guard waited behind a writer queued during it")
+            .unwrap();
+        assert!(GATE.0.try_write().is_err());
+        drop(shared);
+        release.send(()).unwrap();
+        writer.await.unwrap();
     }
 
     #[test]

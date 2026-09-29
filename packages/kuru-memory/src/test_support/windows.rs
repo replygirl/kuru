@@ -147,18 +147,19 @@ impl Drop for EngineOwner {
         };
         let directory = self.directory.take();
         let _ = child.kill();
-        std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(8);
-            let mut warned = false;
-            while !matches!(child.try_wait(), Ok(Some(_))) {
-                if !warned && std::time::Instant::now() >= deadline {
-                    eprintln!("engine fixture cleanup delayed; retaining its tree and directory");
-                    warned = true;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+        // Wait on the dropping thread, never a detached one (see
+        // `fixture_dir`): the directory is released, or kept, before this
+        // fixture process can return and write its coverage counters.
+        if super::fixture_dir::await_creator_exit(Duration::from_secs(8), || child.try_wait()) {
             drop(directory);
-        });
+        } else {
+            eprintln!("engine fixture cleanup delayed; retaining its tree and directory");
+            // Retain the process handle, its Job and the directory handle
+            // until this process exits; a status query or deadline grants
+            // nothing.
+            std::mem::forget(child);
+            std::mem::forget(directory);
+        }
     }
 }
 

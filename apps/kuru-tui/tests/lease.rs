@@ -35,7 +35,7 @@ fn command() -> Command {
 
 #[test]
 fn writer_lease_rejects_a_second_process_and_releases_on_close() {
-    let root = TempDir::new().unwrap();
+    let root = kuru_memory::test_support::tempdir().unwrap();
     let project = root.path().join("project");
     let data = root.path().join("data");
     std::fs::create_dir_all(&project).unwrap();
@@ -86,7 +86,7 @@ fn writer_lease_rejects_a_second_process_and_releases_on_close() {
 
 #[test]
 fn listing_sessions_does_not_create_new_sessions() {
-    let root = TempDir::new().unwrap();
+    let root = kuru_memory::test_support::tempdir().unwrap();
     let project = root.path().join("project");
     let data = root.path().join("data");
     std::fs::create_dir_all(&project).unwrap();
@@ -139,7 +139,7 @@ fn config_does_not_print_mcp_environment_credentials() {
 #[cfg(unix)]
 #[test]
 fn symlink_lock_directory_cannot_redirect_project_locks() {
-    let root = TempDir::new().unwrap();
+    let root = kuru_memory::test_support::tempdir().unwrap();
     let project = root.path().join("project");
     let data = root.path().join("data");
     let outside = root.path().join("outside");

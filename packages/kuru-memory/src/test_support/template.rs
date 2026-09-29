@@ -599,6 +599,11 @@ mod tests {
     const CHILD_TEST: &str =
         "test_support::template::tests::child_process_instantiates_the_named_template";
     const CHILD_DEADLINE: Duration = Duration::from_secs(360);
+    /// The fixture guard's depth budget for a container that keeps a
+    /// template and unopened copies: the deepest is a copy's
+    /// `<name>/private/memory/<hash>/data/kuru/.dolt/stats/.dolt/noms/oldgen`,
+    /// 11 levels below the container.
+    const TEMPLATE_FIXTURE_DEPTH: usize = 11;
 
     fn scope() -> String {
         crate::store::temporary_scope()
@@ -716,7 +721,9 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_templates_are_rejected_and_rebuilt() -> Result<()> {
-        let container = crate::test_support::tempdir()?;
+        // Keeps a template and unopened copies, which no lease recognises,
+        // so their Dolt repositories are scanned in full (11 levels deep).
+        let container = crate::test_support::tempdir()?.with_depth_budget(TEMPLATE_FIXTURE_DEPTH);
         let root = container.path().join("templates");
         let data = |name: &str| container.path().join(name).join("private");
         assert_eq!(
@@ -846,6 +853,9 @@ mod tests {
                 command.env(name, value);
             }
         }
+        for (name, value) in crate::test_support::lifecycle_trace::forwarded() {
+            command.env(name, value);
+        }
         // Held across the spawn; see `crate::spawn_gate`.
         let _gate = crate::spawn_gate::spawning().await;
         Ok(command.spawn()?)
@@ -902,6 +912,9 @@ mod tests {
                 command.environment.push((name.into(), value));
             }
         }
+        command
+            .environment
+            .extend(crate::test_support::lifecycle_trace::forwarded());
         let stdout: std::os::windows::io::OwnedHandle = File::create(log)?.into();
         let stderr: std::os::windows::io::OwnedHandle =
             File::create(log.with_extension("stderr"))?.into();
@@ -922,7 +935,9 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_processes_create_one_template() -> Result<()> {
-        let container = crate::test_support::tempdir()?;
+        // Keeps a template and unopened copies, which no lease recognises,
+        // so their Dolt repositories are scanned in full (11 levels deep).
+        let container = crate::test_support::tempdir()?.with_depth_budget(TEMPLATE_FIXTURE_DEPTH);
         let root = container.path().join("templates");
         let child_data = container.path().join("child").join("private");
         let outcome = container.path().join("child-outcome");

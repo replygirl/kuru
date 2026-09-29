@@ -67,7 +67,7 @@ const KILL_GRACE: Duration = Duration::from_secs(3);
 pub(crate) const SUPERVISOR_TRANSPORT_ALLOWANCE: Duration = Duration::from_secs(2);
 /// Bound for the supervisor to stop Dolt gracefully, kill it, and report its
 /// own exit after its lifetime closes. `finish_owner` enforces it.
-const SUPERVISOR_REAP_ALLOWANCE: Duration = CLOSE_GRACE
+pub(crate) const SUPERVISOR_REAP_ALLOWANCE: Duration = CLOSE_GRACE
     .saturating_add(KILL_GRACE)
     .saturating_add(SUPERVISOR_TRANSPORT_ALLOWANCE);
 /// A dropped owner's background observer warns only once the supervisor has
@@ -123,6 +123,63 @@ struct ServerInner {
     closed: AtomicBool,
 }
 
+/// One branch's pool admission fence: while it lives, [`Server::pool`] cannot
+/// open a Kuru session on the branch.
+pub(crate) struct BranchAdmission {
+    branch: String,
+    _gate: OwnedMutexGuard<()>,
+}
+
+/// A checked Dolt branch procedure, built with the SQLx lifetime of the
+/// admission it was proven under.
+pub(crate) type BranchProcedure<'a> =
+    sqlx::query::Query<'a, sqlx::MySql, sqlx::mysql::MySqlArguments>;
+
+/// Proof that the server has ended every session on one fenced branch.
+///
+/// Only [`Server::retire_branch_sessions`] constructs it (its field is private
+/// to this module), and the only rename, delete and exclusion-probe
+/// procedures for a branch are built from it. A call site therefore cannot
+/// rename or delete a branch without first retiring its pool and awaiting
+/// server-observed session end. It borrows the admission fence, and each
+/// procedure it builds carries that borrow, so the fence cannot be released
+/// before the procedure has run. Not `Clone`: rename and delete consume it.
+#[must_use = "a branch's sessions were retired to run a branch procedure"]
+pub(crate) struct SessionsEnded<'a> {
+    admission: &'a BranchAdmission,
+}
+
+impl<'a> SessionsEnded<'a> {
+    /// The branch whose sessions ended.
+    pub(crate) fn branch(&self) -> &'a str {
+        &self.admission.branch
+    }
+
+    /// The checked rename of this branch to `to`.
+    pub(crate) fn rename(self, to: &str) -> BranchProcedure<'a> {
+        sqlx::query("CALL DOLT_BRANCH('-m', ?, ?)")
+            .bind(self.admission.branch.as_str())
+            .bind(to.to_owned())
+    }
+
+    /// The checked self-rename that asks the server itself to confirm no
+    /// session holds this branch; it leaves the ref unchanged on success.
+    pub(crate) fn exclusion_probe(&self) -> BranchProcedure<'a> {
+        sqlx::query("CALL DOLT_BRANCH('-m', ?, ?)")
+            .bind(self.admission.branch.as_str())
+            .bind(self.admission.branch.as_str())
+    }
+
+    /// Delete this branch: checked (`-d`), or `-D` when `force`, which skips
+    /// Dolt's in-use check and so needs a prior [`Self::exclusion_probe`].
+    pub(crate) fn delete(self, force: bool) -> BranchProcedure<'a> {
+        let flag = if force { "-D" } else { "-d" };
+        sqlx::query("CALL DOLT_BRANCH(?, ?)")
+            .bind(flag)
+            .bind(self.admission.branch.as_str())
+    }
+}
+
 impl fmt::Debug for Server {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Server")
@@ -143,6 +200,13 @@ struct Owner {
     reap_guard: Arc<StdMutex<Option<File>>>,
     #[cfg(test)]
     reaped_observer: Option<oneshot::Sender<()>>,
+    /// Test-support measurement only: the data directory this owner serves.
+    #[cfg(any(test, feature = "test-support"))]
+    trace_directory: PathBuf,
+    /// Test-support only: this owner stays live in the fixture ledger until
+    /// this process has reaped its supervisor.
+    #[cfg(any(test, feature = "test-support"))]
+    ledger: Option<crate::test_support::engine_ledger::LiveEngine>,
 }
 
 impl Drop for Owner {
@@ -157,6 +221,19 @@ impl Drop for Owner {
             .lock()
             .expect("memory reap guard lock")
             .take();
+        // Test-support only: the fixture ledger now waits for this reaper's
+        // report instead of recording when the owner drops.
+        #[cfg(any(test, feature = "test-support"))]
+        let reaper = crate::test_support::engine_ledger::Reaper::handoff(self.ledger.take());
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_support::lifecycle_trace::event(
+            "owner_dropped_live",
+            format_args!(
+                "retained={} directory={}",
+                retained.is_some(),
+                self.trace_directory.display()
+            ),
+        );
         // Independent of Tokio: tests and CLI shutdown may destroy the runtime
         // immediately after the last store handle. Keep fixture files until the
         // supervisor has confirmed that Dolt is reaped.
@@ -167,7 +244,12 @@ impl Drop for Owner {
                 retained,
                 SUPERVISOR_REAP_ALLOWANCE + DROPPED_REAP_WARNING_MARGIN,
                 SupervisorChild::try_wait,
-            )
+            );
+            // Test-support only. This thread may still run while the test
+            // process exits, so it runs no ledger code: it reports the reap,
+            // and the ledger records it on the next thread that reads it.
+            #[cfg(any(test, feature = "test-support"))]
+            reaper.report();
         });
     }
 }
@@ -455,6 +537,11 @@ impl Server {
             if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
                 command.env("LLVM_PROFILE_FILE", profile);
             }
+            // Test-support measurement only: forward the inert-by-default trace.
+            #[cfg(any(test, feature = "test-support"))]
+            for (name, value) in crate::test_support::lifecycle_trace::forwarded() {
+                command.env(name, value);
+            }
             let child = command
                 .spawn()
                 .context("start memory lifetime supervisor")?;
@@ -468,6 +555,10 @@ impl Server {
                 reap_guard: reap_guard.clone(),
                 #[cfg(test)]
                 reaped_observer: None,
+                #[cfg(any(test, feature = "test-support"))]
+                trace_directory: directory.clone(),
+                #[cfg(any(test, feature = "test-support"))]
+                ledger: Some(crate::test_support::engine_ledger::register(&directory)),
             };
             let child = owner
                 .child
@@ -520,6 +611,11 @@ impl Server {
                     .environment
                     .push(("LLVM_PROFILE_FILE".into(), profile));
             }
+            // Test-support measurement only: forward the inert-by-default trace.
+            #[cfg(any(test, feature = "test-support"))]
+            command
+                .environment
+                .extend(crate::test_support::lifecycle_trace::forwarded());
             let child = command
                 .spawn()
                 .await
@@ -536,6 +632,10 @@ impl Server {
                 reap_guard: reap_guard.clone(),
                 #[cfg(test)]
                 reaped_observer: None,
+                #[cfg(any(test, feature = "test-support"))]
+                trace_directory: directory.clone(),
+                #[cfg(any(test, feature = "test-support"))]
+                ledger: Some(crate::test_support::engine_ledger::register(&directory)),
             };
             let response = timeout_at(startup_deadline, async {
                 owner.lifetime = Some(
@@ -780,7 +880,7 @@ impl Server {
     /// Prevent a new pool for one branch while its checked status transition
     /// retires server sessions and observes the resulting ref. The short map
     /// lookup never holds a global lock across Dolt work.
-    pub(crate) async fn fence_pool(&self, branch: &str) -> Result<OwnedMutexGuard<()>> {
+    pub(crate) async fn fence_pool(&self, branch: &str) -> Result<BranchAdmission> {
         validate_branch(branch)?;
         let gate = {
             let mut gates = self.0.pool_admission.lock().await;
@@ -793,7 +893,10 @@ impl Server {
                 gate
             }
         };
-        Ok(gate.lock_owned().await)
+        Ok(BranchAdmission {
+            branch: branch.to_owned(),
+            _gate: gate.lock_owned().await,
+        })
     }
 
     #[cfg(test)]
@@ -814,7 +917,68 @@ impl Server {
         }
     }
 
-    pub(crate) async fn retire_pool(&self, branch: &str) -> Result<()> {
+    /// Close Kuru's pool for `branch` without waiting for the server to end
+    /// its sessions. It releases the pool early and nothing more: a branch
+    /// rename or delete still requires [`Self::retire_branch_sessions`], whose
+    /// [`SessionsEnded`] the branch procedures take.
+    pub(crate) async fn close_pool_without_session_end(&self, branch: &str) -> Result<()> {
+        self.retire_pool(branch).await
+    }
+
+    /// Retire Kuru's pool for the fenced branch, then wait until the server
+    /// itself no longer lists a session on it. Closing the client pool is not
+    /// enough: Dolt removes a session only when its per-connection loop
+    /// observes the close, and until then a checked rename, delete or
+    /// exclusion probe of the branch is refused as in use. The admission
+    /// fence keeps any Kuru session from reopening the branch, and the
+    /// returned proof borrows it, so the fence outlives every procedure the
+    /// proof builds. `observer` must select a different branch.
+    pub(crate) async fn retire_branch_sessions<'a>(
+        &self,
+        admission: &'a BranchAdmission,
+        observer: &MySqlPool,
+        deadline: Duration,
+    ) -> Result<SessionsEnded<'a>> {
+        self.retire_pool(&admission.branch).await?;
+        self.await_branch_sessions_end(observer, &admission.branch, deadline)
+            .await?;
+        Ok(SessionsEnded { admission })
+    }
+
+    /// Wait, within `duration`, until the server lists no session on
+    /// `kuru/<branch>`. Observation alone; it grants no branch procedure.
+    pub(crate) async fn await_branch_sessions_end(
+        &self,
+        observer: &MySqlPool,
+        branch: &str,
+        duration: Duration,
+    ) -> Result<()> {
+        let database = format!("kuru/{branch}");
+        timeout(duration, async {
+            loop {
+                let active: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM information_schema.processlist WHERE BINARY DB = BINARY ?",
+                )
+                .bind(&database)
+                .fetch_one(observer)
+                .await?;
+                if active == 0 {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                #[cfg(test)]
+                self.notify_candidate_wait().await;
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("candidate source session retirement deadline exceeded")?
+    }
+
+    /// The raw pool close. Private: outside this module a pool is released
+    /// only through [`Self::close_pool_without_session_end`], whose name
+    /// states what it does not guarantee, or through the ordered
+    /// [`Self::retire_branch_sessions`].
+    async fn retire_pool(&self, branch: &str) -> Result<()> {
         validate_branch(branch)?;
         let pool = self
             .0
@@ -911,6 +1075,16 @@ async fn finish_owner(owner: &mut Owner) -> Result<()> {
         sleep(Duration::from_millis(20)).await;
     };
     owner.child.take();
+    #[cfg(any(test, feature = "test-support"))]
+    crate::test_support::lifecycle_trace::event(
+        "owner_finished",
+        format_args!(
+            "success={} dir_exists={} directory={}",
+            status.success(),
+            crate::test_support::lifecycle_trace::exists(&owner.trace_directory),
+            owner.trace_directory.display()
+        ),
+    );
     ensure!(
         status.success(),
         "memory supervisor exited unsuccessfully ({status})"
@@ -1046,6 +1220,15 @@ impl LifecycleLease {
 
     pub(crate) fn move_to(&mut self, destination: &Path) -> Result<()> {
         self.verify()?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_support::lifecycle_trace::event(
+            "lease_move",
+            format_args!(
+                "from={} to={}",
+                self.directory.path().display(),
+                destination.display()
+            ),
+        );
         self.directory = files::move_directory(&self.directory, destination)?;
         #[cfg(unix)]
         {
@@ -1060,6 +1243,11 @@ impl LifecycleLease {
     /// quarantine identity for a later explicit reconciliation attempt.
     pub(crate) fn remove_tree(self) -> Result<()> {
         self.verify()?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_support::lifecycle_trace::event(
+            "lease_remove_tree",
+            format_args!("directory={}", self.directory.path().display()),
+        );
         let Self {
             directory,
             lock_directory,
@@ -1761,13 +1949,26 @@ async fn supervise_with_port_hook<
         )
         .await?;
         let log = Arc::new(Mutex::new(Vec::new()));
+        // Test-support measurement only: a live mirror outliving the fixture.
+        #[cfg(any(test, feature = "test-support"))]
+        let (mirror, stdout_mirror, stderr_mirror) = {
+            let mirror = crate::test_support::lifecycle_trace::DoltMirror::open(
+                &request.directory,
+                vec![identity.password.clone(), identity.reader_password.clone()],
+            );
+            (mirror.clone(), mirror.clone(), mirror)
+        };
+        #[cfg(not(any(test, feature = "test-support")))]
+        let (stdout_mirror, stderr_mirror): (LogMirror, LogMirror) = ((), ());
         let stdout = tokio::spawn(drain(
             child.stdout().context("Dolt stdout missing")?,
             log.clone(),
+            stdout_mirror,
         ));
         let stderr = tokio::spawn(drain(
             child.stderr().context("Dolt stderr missing")?,
             log.clone(),
+            stderr_mirror,
         ));
         let run_result = async {
         tokio::select! {
@@ -1783,7 +1984,29 @@ async fn supervise_with_port_hook<
             _ = signals.recv() => Ok(()),
         }
         }.await;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(mirror) = &mirror {
+            mirror.note(
+                "stop_begin",
+                format_args!(
+                    "run_ok={} dir_exists={}",
+                    run_result.is_ok(),
+                    crate::test_support::lifecycle_trace::exists(&request.directory)
+                ),
+            );
+        }
         let stopped = stop_child(&mut child).await;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(mirror) = &mirror {
+            mirror.note(
+                "child_exit",
+                format_args!(
+                    "stopped={:?} dir_exists={}",
+                    stopped.as_ref().map_err(|error| format!("{error:#}")),
+                    crate::test_support::lifecycle_trace::exists(&request.directory)
+                ),
+            );
+        }
         if stopped.is_err() {
             // The parent has its own bounded close deadline. A failure to reap
             // cannot make the directory safe to move: retain this supervisor and
@@ -1806,7 +2029,12 @@ async fn supervise_with_port_hook<
             }
             Err(_) => diagnostic.push_str("\nKuru engine shutdown: observed after cleanup error\n"),
         }
-        write_private(&request.directory.join("server.log"), diagnostic.as_bytes())?;
+        let written = write_private(&request.directory.join("server.log"), diagnostic.as_bytes());
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(mirror) = &mirror {
+            mirror.note("server_log_write", format_args!("ok={}", written.is_ok()));
+        }
+        written?;
         if let Some(published) = read_record::<Endpoint>(&request.directory.join("endpoint.json"))?
             && published.instance == endpoint.instance
             && published.port == endpoint.port
@@ -1943,11 +2171,22 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     files::write(path, bytes)
 }
 
-async fn drain<R: AsyncRead + Unpin>(mut reader: R, log: Arc<Mutex<Vec<u8>>>) {
+#[cfg(any(test, feature = "test-support"))]
+type LogMirror = Option<Arc<crate::test_support::lifecycle_trace::DoltMirror>>;
+#[cfg(not(any(test, feature = "test-support")))]
+type LogMirror = ();
+
+async fn drain<R: AsyncRead + Unpin>(mut reader: R, log: Arc<Mutex<Vec<u8>>>, mirror: LogMirror) {
+    #[cfg(not(any(test, feature = "test-support")))]
+    let () = mirror;
     let mut bytes = [0; 4096];
     while let Ok(length) = reader.read(&mut bytes).await {
         if length == 0 {
             break;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(mirror) = &mirror {
+            mirror.write(&bytes[..length]);
         }
         let mut log = log.lock().await;
         log.extend_from_slice(&bytes[..length]);
@@ -2136,6 +2375,9 @@ mod stale_endpoint_tests {
     }
 }
 
+#[cfg(test)]
+#[path = "server/branch_procedure_tests.rs"]
+mod branch_procedure_tests;
 #[cfg(test)]
 #[path = "server/startup_budget_tests.rs"]
 mod startup_budget_tests;

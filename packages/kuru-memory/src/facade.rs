@@ -2850,144 +2850,161 @@ mod tests {
     async fn managed_public_transcript_pages_preserve_main_and_candidate_views() -> Result<()> {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: a fresh local seed open, then the owner reopens it.
-        let deadline = fixture_deadline(1, 1);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-            let mut turns = Vec::with_capacity(1025);
-            let mut predecessor = None;
-            for index in 0..1025 {
-                let turn_id = format!("turn-{index:04}");
-                let turn = store::PublicTurnRecord {
-                    node_id: store::public_turn_node_id("managed-session", &turn_id)?,
-                    origin_session_id: "managed-session".into(),
-                    turn_id,
-                    kind: store::PublicTurnKind::Primary,
-                    continuation_of_node_id: None,
-                    predecessor_node_id: predecessor,
-                    settlement: store::PublicTurnSettlement::Completed,
-                    user_entry: Some(Message::text(
-                        "user",
-                        format!("managed question {index:04}"),
-                    )),
-                    speaker_id: Some("managed-speaker".into()),
-                    terminal_entries: vec![Message::text(
-                        "assistant",
-                        format!("managed answer {index:04}"),
-                    )],
-                    record_format: store::PUBLIC_TURN_RECORD_FORMAT.into(),
-                };
-                predecessor = Some(turn.node_id.clone());
-                turns.push(turn);
-            }
-            let turn = turns.last().context("managed transcript is empty")?.clone();
-            let catalog = store::SessionCatalogRecord {
-                session_id: "managed-session".into(),
-                mode: kuru_core::Mode::Ifs,
-                label: "managed label".into(),
-                created_order: 1,
-                updated_order: 1,
-                lifecycle_generation: 0,
-                lifecycle_state: store::SessionLifecycleState::Active,
-                head_node_id: Some(turn.node_id.clone()),
-                pending_node_id: None,
-                legacy_prefix: None,
-                fork_provenance: None,
-                record_format: store::SESSION_CATALOG_RECORD_FORMAT.into(),
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 1),
+            "managed public transcript fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let mut turns = Vec::with_capacity(1025);
+        let mut predecessor = None;
+        for index in 0..1025 {
+            let turn_id = format!("turn-{index:04}");
+            let turn = store::PublicTurnRecord {
+                node_id: store::public_turn_node_id("managed-session", &turn_id)?,
+                origin_session_id: "managed-session".into(),
+                turn_id,
+                kind: store::PublicTurnKind::Primary,
+                continuation_of_node_id: None,
+                predecessor_node_id: predecessor,
+                settlement: store::PublicTurnSettlement::Completed,
+                user_entry: Some(Message::text(
+                    "user",
+                    format!("managed question {index:04}"),
+                )),
+                speaker_id: Some("managed-speaker".into()),
+                terminal_entries: vec![Message::text(
+                    "assistant",
+                    format!("managed answer {index:04}"),
+                )],
+                record_format: store::PUBLIC_TURN_RECORD_FORMAT.into(),
             };
-            let seed = store::MemoryStore::open(options.clone()).await?;
-            seed.fixture_insert_public_session(&catalog, &turns)
+            predecessor = Some(turn.node_id.clone());
+            turns.push(turn);
+        }
+        let turn = turns.last().context("managed transcript is empty")?.clone();
+        let catalog = store::SessionCatalogRecord {
+            session_id: "managed-session".into(),
+            mode: kuru_core::Mode::Ifs,
+            label: "managed label".into(),
+            created_order: 1,
+            updated_order: 1,
+            lifecycle_generation: 0,
+            lifecycle_state: store::SessionLifecycleState::Active,
+            head_node_id: Some(turn.node_id.clone()),
+            pending_node_id: None,
+            legacy_prefix: None,
+            fork_provenance: None,
+            record_format: store::SESSION_CATALOG_RECORD_FORMAT.into(),
+        };
+        let outcome = async {
+            deadline
+                .run(async {
+                    let seed = store::MemoryStore::open(options.clone()).await?;
+                    seed.fixture_insert_public_session(&catalog, &turns)
+                        .await?;
+                    seed.close().await
+                })
                 .await?;
-            seed.close().await?;
+        deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let executable = std::env::current_exe()?;
+                        let memory = MemoryStore::open_managed_observed(
+                            options.clone(),
+                            project.clone(),
+                            executable,
+                        )
+                        .1
+                        .await?;
+                        let catalog_page = memory.session_catalog_page(None, None, None, 16).await?;
+                        ensure!(
+                            catalog_page.view == "main"
+                                && catalog_page.records.as_slice() == [catalog.clone()],
+                            "managed catalog projection changed its pinned main coordinates"
+                        );
+                        let main_page = memory
+                            .public_transcript_page("managed-session", None, 128)
+                            .await?;
+                        ensure!(
+                            main_page.view == "main"
+                                && main_page.total_rows == 1025
+                                && matches!(main_page.records.first(), Some(store::PublicTranscriptEntry::Turn { record }) if record == &turn),
+                            "managed main transcript projection changed its newest public turn"
+                        );
+                        let revision = main_page.revision.clone();
+                        let mut cursor = main_page.next.clone();
+                        let mut rows = main_page.records.len();
+                        while let Some(current) = cursor {
+                            let page = memory
+                                .public_transcript_page("managed-session", Some(&current), 128)
+                                .await?;
+                            ensure!(
+                                page.view == "main"
+                                    && page.revision == revision
+                                    && page.total_rows == 1025,
+                                "managed transcript continuation changed its pinned coordinates"
+                            );
+                            rows += page.records.len();
+                            cursor = page.next;
+                        }
+                        ensure!(rows == 1025, "managed transcript paging omitted or repeated rows");
 
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let executable = std::env::current_exe()?;
-            let memory = MemoryStore::open_managed_observed(
-                options.clone(),
-                project.clone(),
-                executable,
+                        let candidate = memory.begin_candidate("public transcript candidate").await?;
+                        let candidate_page = candidate
+                            .view()
+                            .public_transcript_page("managed-session", None, 16)
+                            .await?;
+                        ensure!(
+                            candidate_page.view == candidate.branch()
+                                && candidate_page.total_rows == 1025
+                                && matches!(candidate_page.records.first(), Some(store::PublicTranscriptEntry::Turn { record }) if record == &turn),
+                            "candidate transcript projection lost its pinned view or newest inherited turn"
+                        );
+                        ensure!(
+                            memory
+                                .public_transcript_page("managed-session", None, 16)
+                                .await?
+                                .view
+                                == "main",
+                            "candidate transcript view leaked into main"
+                        );
+                        candidate.abandon().await?;
+                        memory.close().await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "public transcript fixture owner did not reap",
+                        )
+                        .await
+                },
             )
-            .1
-            .await?;
-            let catalog_page = memory.session_catalog_page(None, None, None, 16).await?;
-            ensure!(
-                catalog_page.view == "main"
-                    && catalog_page.records.as_slice() == [catalog.clone()],
-                "managed catalog projection changed its pinned main coordinates"
-            );
-            let main_page = memory
-                .public_transcript_page("managed-session", None, 128)
-                .await?;
-            ensure!(
-                main_page.view == "main"
-                    && main_page.total_rows == 1025
-                    && matches!(main_page.records.first(), Some(store::PublicTranscriptEntry::Turn { record }) if record == &turn),
-                "managed main transcript projection changed its newest public turn"
-            );
-            let revision = main_page.revision.clone();
-            let mut cursor = main_page.next.clone();
-            let mut rows = main_page.records.len();
-            while let Some(current) = cursor {
-                let page = memory
-                    .public_transcript_page("managed-session", Some(&current), 128)
-                    .await?;
-                ensure!(
-                    page.view == "main"
-                        && page.revision == revision
-                        && page.total_rows == 1025,
-                    "managed transcript continuation changed its pinned coordinates"
-                );
-                rows += page.records.len();
-                cursor = page.next;
-            }
-            ensure!(rows == 1025, "managed transcript paging omitted or repeated rows");
-
-            let candidate = memory.begin_candidate("public transcript candidate").await?;
-            let candidate_page = candidate
-                .view()
-                .public_transcript_page("managed-session", None, 16)
-                .await?;
-            ensure!(
-                candidate_page.view == candidate.branch()
-                    && candidate_page.total_rows == 1025
-                    && matches!(candidate_page.records.first(), Some(store::PublicTranscriptEntry::Turn { record }) if record == &turn),
-                "candidate transcript projection lost its pinned view or newest inherited turn"
-            );
-            ensure!(
-                memory
-                    .public_transcript_page("managed-session", None, 16)
-                    .await?
-                    .view
-                    == "main",
-                "candidate transcript view leaked into main"
-            );
-            candidate.abandon().await?;
-            memory.close().await?;
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
-                .await
-                .context("public transcript fixture owner did not reap")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("managed public transcript fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
+            .await
+        }
+        .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
@@ -2995,452 +3012,475 @@ mod tests {
     {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner.
-        let deadline = fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let executable = std::env::current_exe()?;
-            let open = || {
-                MemoryStore::open_managed_observed(
-                    options.clone(),
-                    project.clone(),
-                    executable.clone(),
-                )
-                .1
-            };
-            let memory = open().await?;
-            let sibling = open().await?;
-            let Backend::Remote(remote) = &memory.backend else {
-                bail!("managed lifecycle fixture did not attach to the service")
-            };
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "managed lifecycle fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let executable = std::env::current_exe()?;
+                        let open = || {
+                            MemoryStore::open_managed_observed(
+                                options.clone(),
+                                project.clone(),
+                                executable.clone(),
+                            )
+                            .1
+                        };
+                        let memory = open().await?;
+                        let sibling = open().await?;
+                        let Backend::Remote(remote) = &memory.backend else {
+                            bail!("managed lifecycle fixture did not attach to the service")
+                        };
 
-            let before_create = sibling.revision().await?;
-            cancel_before_session_acceptance(
-                remote,
-                memory.create_session("managed-lifecycle", Mode::Jungian, "first label"),
-            )
-            .await?;
-            ensure!(
-                sibling.revision().await? == before_create
-                    && sibling
-                        .session_catalog_record("managed-lifecycle")
-                        .await?
-                        .is_none(),
-                "pre-acceptance create cancellation published a session"
-            );
-
-            let create_pause = Arc::new(service::rpc::ReplyPause::default());
-            remote
-                .attachment
-                .lock()
-                .await
-                .pause_after_next_send(create_pause.clone());
-            let create = tokio::spawn({
-                let memory = memory.clone();
-                async move {
-                    memory
-                        .create_session("managed-lifecycle", Mode::Jungian, "first label")
-                        .await
-                }
-            });
-            let _create_cleanup = AbortOnDrop(create.abort_handle());
-            tokio::time::timeout(Duration::from_secs(5), create_pause.sent.notified())
-                .await
-                .context("accepted create frame was not flushed")?;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if sibling
-                        .session_catalog_record("managed-lifecycle")
-                        .await?
-                        .is_some()
-                    {
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .context("owner did not commit paused create")??;
-            create.abort();
-            ensure!(
-                tokio::time::timeout(Duration::from_secs(5), create)
-                    .await
-                    .context("cancelled create did not end")?
-                    .is_err_and(|error| error.is_cancelled()),
-                "accepted create completed instead of being cancelled"
-            );
-            ensure!(memory.reconcile().await? == Some(true));
-            let created = memory
-                .session_catalog_record("managed-lifecycle")
-                .await?
-                .context("accepted create lost its catalog row")?;
-            ensure!(
-                created.lifecycle_generation == 0
-                    && created.lifecycle_state == store::SessionLifecycleState::Active,
-                "managed create returned the wrong lifecycle coordinates"
-            );
-
-            let before_rename = sibling.revision().await?;
-            cancel_before_session_acceptance(
-                remote,
-                memory.rename_session("managed-lifecycle", 0, "renamed"),
-            )
-            .await?;
-            ensure!(
-                sibling.revision().await? == before_rename,
-                "pre-acceptance rename cancellation changed the catalog"
-            );
-            let pause = Arc::new(service::rpc::ReplyPause::default());
-            remote
-                .attachment
-                .lock()
-                .await
-                .pause_after_next_send(pause.clone());
-            let rename = tokio::spawn({
-                let memory = memory.clone();
-                async move {
-                    memory
-                        .rename_session("managed-lifecycle", 0, "renamed")
-                        .await
-                }
-            });
-            let _rename_cleanup = AbortOnDrop(rename.abort_handle());
-            tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
-                .await
-                .context("accepted lifecycle frame was not flushed")?;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let page = sibling.session_catalog_page(None, None, None, 16).await?;
-                    if matches!(page.records.as_slice(), [record] if record.label == "renamed" && record.lifecycle_generation == 1)
-                    {
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .context("owner did not commit the paused lifecycle write")??;
-            // A sibling's stale request races the first client's held reply.
-            // It must receive a definite typed refusal without changing the
-            // accepted rename or consuming its retained receipt.
-            let before_stale = sibling.revision().await?;
-            let stale = sibling
-                .rename_session("managed-lifecycle", 0, "stale")
-                .await
-                .unwrap_err();
-            ensure!(
-                stale
-                    .downcast_ref::<store::SessionLifecycleRejected>()
-                    .is_some_and(|rejected| {
-                        rejected.0 == store::SessionLifecycleRefusal::GenerationChanged
-                    }),
-                "managed stale generation lost its typed refusal"
-            );
-            ensure!(
-                sibling.revision().await? == before_stale,
-                "definite lifecycle refusal changed the view"
-            );
-            rename.abort();
-            let stopped = tokio::time::timeout(Duration::from_secs(5), rename)
-                .await
-                .context("cancelled lifecycle future did not end")?;
-            ensure!(
-                stopped.is_err_and(|error| error.is_cancelled()),
-                "accepted lifecycle future completed instead of being cancelled"
-            );
-            ensure!(
-                memory
-                    .remove_session("managed-lifecycle", 1)
-                    .await
-                    .is_err(),
-                "uncertain lifecycle receipt failed to fence later mutation"
-            );
-            ensure!(memory.reconcile().await? == Some(true));
-
-            let before_remove = sibling.revision().await?;
-            cancel_before_session_acceptance(
-                remote,
-                memory.remove_session("managed-lifecycle", 1),
-            )
-            .await?;
-            ensure!(
-                sibling.revision().await? == before_remove,
-                "pre-acceptance remove cancellation changed the catalog"
-            );
-            let remove_pause = Arc::new(service::rpc::ReplyPause::default());
-            {
-                let mut attachment = remote.attachment.lock().await;
-                if !attachment.has_complete_exchange() {
-                    *attachment = remote.session.factory.connect().await?;
-                }
-                attachment.pause_after_next_send(remove_pause.clone());
-            }
-            let mut remove = tokio::spawn({
-                let memory = memory.clone();
-                async move { memory.remove_session("managed-lifecycle", 1).await }
-            });
-            let _remove_cleanup = AbortOnDrop(remove.abort_handle());
-            tokio::time::timeout(Duration::from_secs(5), async {
-                tokio::select! {
-                    _ = remove_pause.sent.notified() => Ok(()),
-                    outcome = &mut remove => bail!("remove finished before paused reply: {outcome:?}"),
-                }
-            })
-            .await
-            .context("accepted remove frame was not flushed")??;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let record = sibling.session_catalog_record("managed-lifecycle").await?;
-                    if record.as_ref().is_some_and(|record| {
-                        record.lifecycle_state == store::SessionLifecycleState::Removed
-                            && record.lifecycle_generation == 2
-                    }) {
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .context("owner did not commit paused remove")??;
-            remove.abort();
-            ensure!(
-                tokio::time::timeout(Duration::from_secs(5), remove)
-                    .await
-                    .context("cancelled remove did not end")?
-                    .is_err_and(|error| error.is_cancelled()),
-                "accepted remove completed instead of being cancelled"
-            );
-            ensure!(memory.reconcile().await? == Some(true));
-            let removed = memory
-                .session_catalog_record("managed-lifecycle")
-                .await?
-                .context("accepted remove lost its catalog row")?;
-            ensure!(
-                removed.lifecycle_state == store::SessionLifecycleState::Removed
-                    && removed.lifecycle_generation == 2,
-                "managed remove returned the wrong retained state"
-            );
-            ensure!(
-                memory
-                    .session_catalog_page(
-                        Some(store::SessionLifecycleState::Active),
-                        None,
-                        None,
-                        16,
-                    )
-                    .await?
-                    .records
-                    .is_empty(),
-                "removed session remained in the active catalog"
-            );
-            let before_restore = sibling.revision().await?;
-            cancel_before_session_acceptance(
-                remote,
-                memory.restore_session("managed-lifecycle", 2),
-            )
-            .await?;
-            ensure!(
-                sibling.revision().await? == before_restore,
-                "pre-acceptance restore cancellation changed the catalog"
-            );
-            let restore_pause = Arc::new(service::rpc::ReplyPause::default());
-            {
-                let mut attachment = remote.attachment.lock().await;
-                if !attachment.has_complete_exchange() {
-                    *attachment = remote.session.factory.connect().await?;
-                }
-                attachment.pause_after_next_send(restore_pause.clone());
-            }
-            let mut restore = tokio::spawn({
-                let memory = memory.clone();
-                async move { memory.restore_session("managed-lifecycle", 2).await }
-            });
-            let _restore_cleanup = AbortOnDrop(restore.abort_handle());
-            tokio::time::timeout(Duration::from_secs(5), async {
-                tokio::select! {
-                    _ = restore_pause.sent.notified() => Ok(()),
-                    outcome = &mut restore => bail!("restore finished before paused reply: {outcome:?}"),
-                }
-            })
-            .await
-            .context("accepted restore frame was not flushed")??;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let record = sibling.session_catalog_record("managed-lifecycle").await?;
-                    if record.as_ref().is_some_and(|record| {
-                        record.lifecycle_state == store::SessionLifecycleState::Active
-                            && record.lifecycle_generation == 3
-                    }) {
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .context("owner did not commit paused restore")??;
-            restore.abort();
-            ensure!(
-                tokio::time::timeout(Duration::from_secs(5), restore)
-                    .await
-                    .context("cancelled restore did not end")?
-                    .is_err_and(|error| error.is_cancelled()),
-                "accepted restore completed instead of being cancelled"
-            );
-            ensure!(memory.reconcile().await? == Some(true));
-            let restored = memory
-                .session_catalog_record("managed-lifecycle")
-                .await?
-                .context("accepted restore lost its catalog row")?;
-            ensure!(
-                restored.lifecycle_state == store::SessionLifecycleState::Active
-                    && restored.lifecycle_generation == 3,
-                "managed restore changed retained session metadata"
-            );
-            ensure!(
-                matches!(
-                    memory
-                        .session_catalog_page(None, None, None, 16)
-                        .await?
-                        .records
-                        .as_slice(),
-                    [record] if record.label == "renamed" && record.updated_order == restored.updated_order
-                ),
-                "managed restore lost the retained session record"
-            );
-
-            let exact_id = Uuid::new_v4();
-            let exact = {
-                let _mutation = remote.session.mutations.lock().await;
-                let mut attachment = remote.attachment.lock().await;
-                session_lifecycle_outcome(
-                    remote
-                        .checked_call_locked_with_id(
-                            &mut attachment,
-                            ServiceCall::View {
-                                candidate: remote.candidate,
-                                operation: Box::new(ViewOperation::RenameSession {
-                                    session_id: "managed-lifecycle".into(),
-                                    expected_generation: 3,
-                                    label: "exact receipt".into(),
-                                }),
-                            },
-                            exact_id,
+                        let before_create = sibling.revision().await?;
+                        cancel_before_session_acceptance(
+                            remote,
+                            memory.create_session("managed-lifecycle", Mode::Jungian, "first label"),
                         )
-                        .await?,
-                )?
-            };
-            ensure!(
-                exact.lifecycle_generation == 4
-                    && exact.lifecycle_state == store::SessionLifecycleState::Active,
-                "managed exact receipt returned the wrong original outcome"
-            );
-            let later = sibling.remove_session("managed-lifecycle", 4).await?;
-            ensure!(later.lifecycle_generation == 5);
-            let later_revision = sibling.revision().await?;
-            let replayed = {
-                let _mutation = remote.session.mutations.lock().await;
-                let mut attachment = remote.attachment.lock().await;
-                session_lifecycle_outcome(
-                    remote
-                        .checked_call_locked_with_id(
-                            &mut attachment,
-                            ServiceCall::View {
-                                candidate: remote.candidate,
-                                operation: Box::new(ViewOperation::RenameSession {
-                                    session_id: "managed-lifecycle".into(),
-                                    expected_generation: 3,
-                                    label: "exact receipt".into(),
-                                }),
-                            },
-                            exact_id,
+                        .await?;
+                        ensure!(
+                            sibling.revision().await? == before_create
+                                && sibling
+                                    .session_catalog_record("managed-lifecycle")
+                                    .await?
+                                    .is_none(),
+                            "pre-acceptance create cancellation published a session"
+                        );
+
+                        let create_pause = Arc::new(service::rpc::ReplyPause::default());
+                        remote
+                            .attachment
+                            .lock()
+                            .await
+                            .pause_after_next_send(create_pause.clone());
+                        let create = tokio::spawn({
+                            let memory = memory.clone();
+                            async move {
+                                memory
+                                    .create_session("managed-lifecycle", Mode::Jungian, "first label")
+                                    .await
+                            }
+                        });
+                        let _create_cleanup = AbortOnDrop(create.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), create_pause.sent.notified())
+                            .await
+                            .context("accepted create frame was not flushed")?;
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                if sibling
+                                    .session_catalog_record("managed-lifecycle")
+                                    .await?
+                                    .is_some()
+                                {
+                                    break Ok::<(), anyhow::Error>(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .context("owner did not commit paused create")??;
+                        tokio::time::timeout(Duration::from_secs(10), create_pause.replied.notified())
+                            .await
+                            .context("owner did not settle and reply to the paused create")?;
+                        create.abort();
+                        ensure!(
+                            tokio::time::timeout(Duration::from_secs(5), create)
+                                .await
+                                .context("cancelled create did not end")?
+                                .is_err_and(|error| error.is_cancelled()),
+                            "accepted create completed instead of being cancelled"
+                        );
+                        ensure!(memory.reconcile().await? == Some(true));
+                        let created = memory
+                            .session_catalog_record("managed-lifecycle")
+                            .await?
+                            .context("accepted create lost its catalog row")?;
+                        ensure!(
+                            created.lifecycle_generation == 0
+                                && created.lifecycle_state == store::SessionLifecycleState::Active,
+                            "managed create returned the wrong lifecycle coordinates"
+                        );
+
+                        let before_rename = sibling.revision().await?;
+                        cancel_before_session_acceptance(
+                            remote,
+                            memory.rename_session("managed-lifecycle", 0, "renamed"),
                         )
-                        .await?,
-                )?
-            };
-            ensure!(
-                replayed == exact && sibling.revision().await? == later_revision,
-                "managed exact retry changed or replaced its original receipt outcome"
-            );
-            let changed = {
-                let _mutation = remote.session.mutations.lock().await;
-                let mut attachment = remote.attachment.lock().await;
-                remote
-                    .checked_call_locked_with_id(
-                        &mut attachment,
-                        ServiceCall::View {
-                            candidate: remote.candidate,
-                            operation: Box::new(ViewOperation::RenameSession {
-                                session_id: "managed-lifecycle".into(),
-                                expected_generation: 3,
-                                label: "changed receipt".into(),
-                            }),
-                        },
-                        exact_id,
-                    )
+                        .await?;
+                        ensure!(
+                            sibling.revision().await? == before_rename,
+                            "pre-acceptance rename cancellation changed the catalog"
+                        );
+                        let pause = Arc::new(service::rpc::ReplyPause::default());
+                        remote
+                            .attachment
+                            .lock()
+                            .await
+                            .pause_after_next_send(pause.clone());
+                        let rename = tokio::spawn({
+                            let memory = memory.clone();
+                            async move {
+                                memory
+                                    .rename_session("managed-lifecycle", 0, "renamed")
+                                    .await
+                            }
+                        });
+                        let _rename_cleanup = AbortOnDrop(rename.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                            .await
+                            .context("accepted lifecycle frame was not flushed")?;
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                let page = sibling.session_catalog_page(None, None, None, 16).await?;
+                                if matches!(page.records.as_slice(), [record] if record.label == "renamed" && record.lifecycle_generation == 1)
+                                {
+                                    break Ok::<(), anyhow::Error>(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .context("owner did not commit the paused lifecycle write")??;
+                        // A sibling's stale request races the first client's held reply.
+                        // It must receive a definite typed refusal without changing the
+                        // accepted rename or consuming its retained receipt.
+                        let before_stale = sibling.revision().await?;
+                        let stale = sibling
+                            .rename_session("managed-lifecycle", 0, "stale")
+                            .await
+                            .unwrap_err();
+                        ensure!(
+                            stale
+                                .downcast_ref::<store::SessionLifecycleRejected>()
+                                .is_some_and(|rejected| {
+                                    rejected.0 == store::SessionLifecycleRefusal::GenerationChanged
+                                }),
+                            "managed stale generation lost its typed refusal"
+                        );
+                        ensure!(
+                            sibling.revision().await? == before_stale,
+                            "definite lifecycle refusal changed the view"
+                        );
+                        tokio::time::timeout(Duration::from_secs(10), pause.replied.notified())
+                            .await
+                            .context("owner did not settle and reply to the paused rename")?;
+                        rename.abort();
+                        let stopped = tokio::time::timeout(Duration::from_secs(5), rename)
+                            .await
+                            .context("cancelled lifecycle future did not end")?;
+                        ensure!(
+                            stopped.is_err_and(|error| error.is_cancelled()),
+                            "accepted lifecycle future completed instead of being cancelled"
+                        );
+                        ensure!(
+                            memory
+                                .remove_session("managed-lifecycle", 1)
+                                .await
+                                .is_err(),
+                            "uncertain lifecycle receipt failed to fence later mutation"
+                        );
+                        ensure!(memory.reconcile().await? == Some(true));
+
+                        let before_remove = sibling.revision().await?;
+                        cancel_before_session_acceptance(
+                            remote,
+                            memory.remove_session("managed-lifecycle", 1),
+                        )
+                        .await?;
+                        ensure!(
+                            sibling.revision().await? == before_remove,
+                            "pre-acceptance remove cancellation changed the catalog"
+                        );
+                        let remove_pause = Arc::new(service::rpc::ReplyPause::default());
+                        {
+                            let mut attachment = remote.attachment.lock().await;
+                            if !attachment.has_complete_exchange() {
+                                *attachment = remote.session.factory.connect().await?;
+                            }
+                            attachment.pause_after_next_send(remove_pause.clone());
+                        }
+                        let mut remove = tokio::spawn({
+                            let memory = memory.clone();
+                            async move { memory.remove_session("managed-lifecycle", 1).await }
+                        });
+                        let _remove_cleanup = AbortOnDrop(remove.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            tokio::select! {
+                                _ = remove_pause.sent.notified() => Ok(()),
+                                outcome = &mut remove => bail!("remove finished before paused reply: {outcome:?}"),
+                            }
+                        })
+                        .await
+                        .context("accepted remove frame was not flushed")??;
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                let record = sibling.session_catalog_record("managed-lifecycle").await?;
+                                if record.as_ref().is_some_and(|record| {
+                                    record.lifecycle_state == store::SessionLifecycleState::Removed
+                                        && record.lifecycle_generation == 2
+                                }) {
+                                    break Ok::<(), anyhow::Error>(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .context("owner did not commit paused remove")??;
+                        tokio::time::timeout(Duration::from_secs(10), remove_pause.replied.notified())
+                            .await
+                            .context("owner did not settle and reply to the paused remove")?;
+                        remove.abort();
+                        ensure!(
+                            tokio::time::timeout(Duration::from_secs(5), remove)
+                                .await
+                                .context("cancelled remove did not end")?
+                                .is_err_and(|error| error.is_cancelled()),
+                            "accepted remove completed instead of being cancelled"
+                        );
+                        ensure!(memory.reconcile().await? == Some(true));
+                        let removed = memory
+                            .session_catalog_record("managed-lifecycle")
+                            .await?
+                            .context("accepted remove lost its catalog row")?;
+                        ensure!(
+                            removed.lifecycle_state == store::SessionLifecycleState::Removed
+                                && removed.lifecycle_generation == 2,
+                            "managed remove returned the wrong retained state"
+                        );
+                        ensure!(
+                            memory
+                                .session_catalog_page(
+                                    Some(store::SessionLifecycleState::Active),
+                                    None,
+                                    None,
+                                    16,
+                                )
+                                .await?
+                                .records
+                                .is_empty(),
+                            "removed session remained in the active catalog"
+                        );
+                        let before_restore = sibling.revision().await?;
+                        cancel_before_session_acceptance(
+                            remote,
+                            memory.restore_session("managed-lifecycle", 2),
+                        )
+                        .await?;
+                        ensure!(
+                            sibling.revision().await? == before_restore,
+                            "pre-acceptance restore cancellation changed the catalog"
+                        );
+                        let restore_pause = Arc::new(service::rpc::ReplyPause::default());
+                        {
+                            let mut attachment = remote.attachment.lock().await;
+                            if !attachment.has_complete_exchange() {
+                                *attachment = remote.session.factory.connect().await?;
+                            }
+                            attachment.pause_after_next_send(restore_pause.clone());
+                        }
+                        let mut restore = tokio::spawn({
+                            let memory = memory.clone();
+                            async move { memory.restore_session("managed-lifecycle", 2).await }
+                        });
+                        let _restore_cleanup = AbortOnDrop(restore.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            tokio::select! {
+                                _ = restore_pause.sent.notified() => Ok(()),
+                                outcome = &mut restore => bail!("restore finished before paused reply: {outcome:?}"),
+                            }
+                        })
+                        .await
+                        .context("accepted restore frame was not flushed")??;
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                let record = sibling.session_catalog_record("managed-lifecycle").await?;
+                                if record.as_ref().is_some_and(|record| {
+                                    record.lifecycle_state == store::SessionLifecycleState::Active
+                                        && record.lifecycle_generation == 3
+                                }) {
+                                    break Ok::<(), anyhow::Error>(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .context("owner did not commit paused restore")??;
+                        tokio::time::timeout(Duration::from_secs(10), restore_pause.replied.notified())
+                            .await
+                            .context("owner did not settle and reply to the paused restore")?;
+                        restore.abort();
+                        ensure!(
+                            tokio::time::timeout(Duration::from_secs(5), restore)
+                                .await
+                                .context("cancelled restore did not end")?
+                                .is_err_and(|error| error.is_cancelled()),
+                            "accepted restore completed instead of being cancelled"
+                        );
+                        ensure!(memory.reconcile().await? == Some(true));
+                        let restored = memory
+                            .session_catalog_record("managed-lifecycle")
+                            .await?
+                            .context("accepted restore lost its catalog row")?;
+                        ensure!(
+                            restored.lifecycle_state == store::SessionLifecycleState::Active
+                                && restored.lifecycle_generation == 3,
+                            "managed restore changed retained session metadata"
+                        );
+                        ensure!(
+                            matches!(
+                                memory
+                                    .session_catalog_page(None, None, None, 16)
+                                    .await?
+                                    .records
+                                    .as_slice(),
+                                [record] if record.label == "renamed" && record.updated_order == restored.updated_order
+                            ),
+                            "managed restore lost the retained session record"
+                        );
+
+                        let exact_id = Uuid::new_v4();
+                        let exact = {
+                            let _mutation = remote.session.mutations.lock().await;
+                            let mut attachment = remote.attachment.lock().await;
+                            session_lifecycle_outcome(
+                                remote
+                                    .checked_call_locked_with_id(
+                                        &mut attachment,
+                                        ServiceCall::View {
+                                            candidate: remote.candidate,
+                                            operation: Box::new(ViewOperation::RenameSession {
+                                                session_id: "managed-lifecycle".into(),
+                                                expected_generation: 3,
+                                                label: "exact receipt".into(),
+                                            }),
+                                        },
+                                        exact_id,
+                                    )
+                                    .await?,
+                            )?
+                        };
+                        ensure!(
+                            exact.lifecycle_generation == 4
+                                && exact.lifecycle_state == store::SessionLifecycleState::Active,
+                            "managed exact receipt returned the wrong original outcome"
+                        );
+                        let later = sibling.remove_session("managed-lifecycle", 4).await?;
+                        ensure!(later.lifecycle_generation == 5);
+                        let later_revision = sibling.revision().await?;
+                        let replayed = {
+                            let _mutation = remote.session.mutations.lock().await;
+                            let mut attachment = remote.attachment.lock().await;
+                            session_lifecycle_outcome(
+                                remote
+                                    .checked_call_locked_with_id(
+                                        &mut attachment,
+                                        ServiceCall::View {
+                                            candidate: remote.candidate,
+                                            operation: Box::new(ViewOperation::RenameSession {
+                                                session_id: "managed-lifecycle".into(),
+                                                expected_generation: 3,
+                                                label: "exact receipt".into(),
+                                            }),
+                                        },
+                                        exact_id,
+                                    )
+                                    .await?,
+                            )?
+                        };
+                        ensure!(
+                            replayed == exact && sibling.revision().await? == later_revision,
+                            "managed exact retry changed or replaced its original receipt outcome"
+                        );
+                        let changed = {
+                            let _mutation = remote.session.mutations.lock().await;
+                            let mut attachment = remote.attachment.lock().await;
+                            remote
+                                .checked_call_locked_with_id(
+                                    &mut attachment,
+                                    ServiceCall::View {
+                                        candidate: remote.candidate,
+                                        operation: Box::new(ViewOperation::RenameSession {
+                                            session_id: "managed-lifecycle".into(),
+                                            expected_generation: 3,
+                                            label: "changed receipt".into(),
+                                        }),
+                                    },
+                                    exact_id,
+                                )
+                                .await
+                                .unwrap_err()
+                        };
+                        ensure!(
+                            changed.to_string().contains("different operation")
+                                && sibling.revision().await? == later_revision,
+                            "managed changed-payload retry did not remain a no-effect receipt conflict"
+                        );
+
+                        let candidate = memory.begin_candidate("session lifecycle candidate").await?;
+                        let candidate_record = candidate
+                            .view()
+                            .create_session("candidate-only", Mode::Ifs, "candidate label")
+                            .await?;
+                        ensure!(
+                            candidate_record.session_id == "candidate-only"
+                                && candidate
+                                    .view()
+                                    .session_catalog_page(None, None, None, 16)
+                                    .await?
+                                    .records
+                                    .iter()
+                                    .any(|record| record.session_id == "candidate-only"),
+                            "candidate lifecycle mutation did not remain readable on its branch"
+                        );
+                        ensure!(
+                            !memory
+                                .session_catalog_page(None, None, None, 16)
+                                .await?
+                                .records
+                                .iter()
+                                .any(|record| record.session_id == "candidate-only"),
+                            "candidate lifecycle mutation leaked into main"
+                        );
+                        candidate.abandon().await?;
+
+                        memory.close().await?;
+                        sibling.close().await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
                     .await
-                    .unwrap_err()
-            };
-            ensure!(
-                changed.to_string().contains("different operation")
-                    && sibling.revision().await? == later_revision,
-                "managed changed-payload retry did not remain a no-effect receipt conflict"
-            );
-
-            let candidate = memory.begin_candidate("session lifecycle candidate").await?;
-            let candidate_record = candidate
-                .view()
-                .create_session("candidate-only", Mode::Ifs, "candidate label")
-                .await?;
-            ensure!(
-                candidate_record.session_id == "candidate-only"
-                    && candidate
-                        .view()
-                        .session_catalog_page(None, None, None, 16)
-                        .await?
-                        .records
-                        .iter()
-                        .any(|record| record.session_id == "candidate-only"),
-                "candidate lifecycle mutation did not remain readable on its branch"
-            );
-            ensure!(
-                !memory
-                    .session_catalog_page(None, None, None, 16)
-                    .await?
-                    .records
-                    .iter()
-                    .any(|record| record.session_id == "candidate-only"),
-                "candidate lifecycle mutation leaked into main"
-            );
-            candidate.abandon().await?;
-
-            memory.close().await?;
-            sibling.close().await?;
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
-                .await
-                .context("managed lifecycle fixture owner did not reap")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("managed lifecycle fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "managed lifecycle fixture owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
@@ -3448,342 +3488,304 @@ mod tests {
     -> Result<()> {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner.
-        let deadline = fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let executable = std::env::current_exe()?;
-            let open = || {
-                MemoryStore::open_managed_observed(
-                    options.clone(),
-                    project.clone(),
-                    executable.clone(),
-                )
-                .1
-            };
-            let memory = open().await?;
-            let sibling = open().await?;
-            let session = "managed-fork-parent";
-            let namespace = format!("{}/transcript/managed-fork-parent", options.project_scope);
-            memory
-                .create_session(session, Mode::Ifs, "fork parent")
-                .await?;
-            memory
-                .checkpoint_session_turn(
-                    &namespace,
-                    session,
-                    &[Message::text("user", "shared question")],
-                    &[("managed-fork-journal".into(), json!({"state": "started"}))],
-                    &store::SessionTurnCheckpoint::Admit {
-                        expected_generation: 0,
-                        turn_id: "shared-turn".into(),
-                        label: None,
-                        expected_transcript_rows: None,
-                    },
-                )
-                .await?;
-            memory
-                .checkpoint_session_turn(
-                    &namespace,
-                    session,
-                    &[Message::text("assistant", "shared answer")],
-                    &[("managed-fork-journal".into(), json!({"state": "ended"}))],
-                    &store::SessionTurnCheckpoint::Settle {
-                        expected_generation: 0,
-                        turn_id: "shared-turn".into(),
-                        settlement: store::PublicTurnSettlement::Completed,
-                        speaker_id: "part-a".into(),
-                    },
-                )
-                .await?;
-            let parent_page = memory.public_transcript_page(session, None, 16).await?;
-            let selected = match parent_page.records.as_slice() {
-                [store::PublicTranscriptEntry::Turn { record }] => record.clone(),
-                _ => bail!("managed fork parent has the wrong settled prefix"),
-            };
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "managed fork fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let executable = std::env::current_exe()?;
+                        let open = || {
+                            MemoryStore::open_managed_observed(
+                                options.clone(),
+                                project.clone(),
+                                executable.clone(),
+                            )
+                            .1
+                        };
+                        let memory = open().await?;
+                        let sibling = open().await?;
+                        let session = "managed-fork-parent";
+                        let namespace =
+                            format!("{}/transcript/managed-fork-parent", options.project_scope);
+                        memory
+                            .create_session(session, Mode::Ifs, "fork parent")
+                            .await?;
+                        memory
+                            .checkpoint_session_turn(
+                                &namespace,
+                                session,
+                                &[Message::text("user", "shared question")],
+                                &[("managed-fork-journal".into(), json!({"state": "started"}))],
+                                &store::SessionTurnCheckpoint::Admit {
+                                    expected_generation: 0,
+                                    turn_id: "shared-turn".into(),
+                                    label: None,
+                                    expected_transcript_rows: None,
+                                },
+                            )
+                            .await?;
+                        memory
+                            .checkpoint_session_turn(
+                                &namespace,
+                                session,
+                                &[Message::text("assistant", "shared answer")],
+                                &[("managed-fork-journal".into(), json!({"state": "ended"}))],
+                                &store::SessionTurnCheckpoint::Settle {
+                                    expected_generation: 0,
+                                    turn_id: "shared-turn".into(),
+                                    settlement: store::PublicTurnSettlement::Completed,
+                                    speaker_id: "part-a".into(),
+                                },
+                            )
+                            .await?;
+                        let parent_page = memory.public_transcript_page(session, None, 16).await?;
+                        let selected = match parent_page.records.as_slice() {
+                            [store::PublicTranscriptEntry::Turn { record }] => record.clone(),
+                            _ => bail!("managed fork parent has the wrong settled prefix"),
+                        };
 
-            let Backend::Remote(remote) = &memory.backend else {
-                bail!("managed fork fixture did not attach to the service")
-            };
-            let before_fork = sibling.revision().await?;
-            cancel_before_session_acceptance(
-                remote,
-                memory.fork_session(
-                    session,
-                    0,
-                    &selected.node_id,
-                    "pre-acceptance-fork-child",
-                    "cancelled fork",
-                ),
-            )
-            .await?;
-            ensure!(
-                sibling.revision().await? == before_fork
-                    && sibling
-                        .session_catalog_record("pre-acceptance-fork-child")
-                        .await?
-                        .is_none(),
-                "pre-acceptance fork cancellation published a child"
-            );
-            let pause = Arc::new(service::rpc::ReplyPause::default());
-            remote
-                .attachment
-                .lock()
-                .await
-                .pause_after_next_send(pause.clone());
-            let fork = tokio::spawn({
-                let memory = memory.clone();
-                let node_id = selected.node_id.clone();
-                async move {
-                    memory
-                        .fork_session(
-                            session,
-                            0,
-                            &node_id,
-                            "managed-fork-child",
-                            "lost reply child",
+                        let Backend::Remote(remote) = &memory.backend else {
+                            bail!("managed fork fixture did not attach to the service")
+                        };
+                        let before_fork = sibling.revision().await?;
+                        cancel_before_session_acceptance(
+                            remote,
+                            memory.fork_session(
+                                session,
+                                0,
+                                &selected.node_id,
+                                "pre-acceptance-fork-child",
+                                "cancelled fork",
+                            ),
+                        )
+                        .await?;
+                        ensure!(
+                            sibling.revision().await? == before_fork
+                                && sibling
+                                    .session_catalog_record("pre-acceptance-fork-child")
+                                    .await?
+                                    .is_none(),
+                            "pre-acceptance fork cancellation published a child"
+                        );
+                        let pause = Arc::new(service::rpc::ReplyPause::default());
+                        remote
+                            .attachment
+                            .lock()
+                            .await
+                            .pause_after_next_send(pause.clone());
+                        let fork = tokio::spawn({
+                            let memory = memory.clone();
+                            let node_id = selected.node_id.clone();
+                            async move {
+                                memory
+                                    .fork_session(
+                                        session,
+                                        0,
+                                        &node_id,
+                                        "managed-fork-child",
+                                        "lost reply child",
+                                    )
+                                    .await
+                            }
+                        });
+                        let _fork_cleanup = AbortOnDrop(fork.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                            .await
+                            .context("accepted fork frame was not flushed")?;
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                let page =
+                                    sibling.session_catalog_page(None, None, None, 16).await?;
+                                if page
+                                    .records
+                                    .iter()
+                                    .any(|record| record.session_id == "managed-fork-child")
+                                {
+                                    break Ok::<(), anyhow::Error>(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .context("owner did not commit the paused fork publication")??;
+                        tokio::time::timeout(Duration::from_secs(10), pause.replied.notified())
+                            .await
+                            .context("owner did not settle and reply to the paused fork")?;
+                        fork.abort();
+                        let stopped = tokio::time::timeout(Duration::from_secs(5), fork)
+                            .await
+                            .context("cancelled fork future did not end")?;
+                        ensure!(
+                            stopped.is_err_and(|error| error.is_cancelled()),
+                            "accepted fork future completed instead of being cancelled"
+                        );
+                        ensure!(
+                            memory
+                                .rename_session(session, 0, "must remain fenced")
+                                .await
+                                .is_err(),
+                            "uncertain fork receipt failed to fence later mutation"
+                        );
+                        ensure!(memory.reconcile().await? == Some(true));
+
+                        let catalog = memory.session_catalog_page(None, None, None, 16).await?;
+                        let children: Vec<_> = catalog
+                            .records
+                            .iter()
+                            .filter(|record| record.session_id == "managed-fork-child")
+                            .collect();
+                        ensure!(children.len() == 1, "lost fork reply duplicated its child");
+                        let child = children[0];
+                        ensure!(
+                            child.head_node_id.as_deref() == Some(selected.node_id.as_str())
+                                && child.fork_provenance.as_ref().is_some_and(|fork| {
+                                    fork.source_session_id == session
+                                        && fork.source_node_id == selected.node_id
+                                        && fork.source_turn_id == selected.turn_id
+                                        && fork.source_label == "fork parent"
+                                        && fork.shares_current_project_memory
+                                }),
+                            "recovered fork lost its immutable source provenance"
+                        );
+                        let child_page = memory
+                            .public_transcript_page("managed-fork-child", None, 16)
+                            .await?;
+                        ensure!(
+                            child_page.head_node_id.as_deref() == Some(selected.node_id.as_str())
+                                && child_page.records == parent_page.records,
+                            "recovered child lost its selected settled prefix"
+                        );
+
+                        let candidate = memory.begin_candidate("isolated session fork").await?;
+                        candidate
+                            .view()
+                            .fork_session(
+                                session,
+                                0,
+                                &selected.node_id,
+                                "candidate-fork-child",
+                                "candidate child",
+                            )
+                            .await?;
+                        ensure!(
+                            candidate
+                                .view()
+                                .session_catalog_page(None, None, None, 16)
+                                .await?
+                                .records
+                                .iter()
+                                .any(|record| record.session_id == "candidate-fork-child"),
+                            "candidate fork was not readable on its branch"
+                        );
+                        ensure!(
+                            !memory
+                                .session_catalog_page(None, None, None, 16)
+                                .await?
+                                .records
+                                .iter()
+                                .any(|record| record.session_id == "candidate-fork-child"),
+                            "candidate fork leaked into main"
+                        );
+                        candidate.abandon().await?;
+
+                        memory.close().await?;
+                        sibling.close().await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "managed fork fixture owner did not reap",
                         )
                         .await
-                }
-            });
-            let _fork_cleanup = AbortOnDrop(fork.abort_handle());
-            tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
-                .await
-                .context("accepted fork frame was not flushed")?;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let page = sibling.session_catalog_page(None, None, None, 16).await?;
-                    if page
-                        .records
-                        .iter()
-                        .any(|record| record.session_id == "managed-fork-child")
-                    {
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .context("owner did not commit the paused fork publication")??;
-            fork.abort();
-            let stopped = tokio::time::timeout(Duration::from_secs(5), fork)
-                .await
-                .context("cancelled fork future did not end")?;
-            ensure!(
-                stopped.is_err_and(|error| error.is_cancelled()),
-                "accepted fork future completed instead of being cancelled"
-            );
-            ensure!(
-                memory
-                    .rename_session(session, 0, "must remain fenced")
-                    .await
-                    .is_err(),
-                "uncertain fork receipt failed to fence later mutation"
-            );
-            ensure!(memory.reconcile().await? == Some(true));
-
-            let catalog = memory.session_catalog_page(None, None, None, 16).await?;
-            let children: Vec<_> = catalog
-                .records
-                .iter()
-                .filter(|record| record.session_id == "managed-fork-child")
-                .collect();
-            ensure!(children.len() == 1, "lost fork reply duplicated its child");
-            let child = children[0];
-            ensure!(
-                child.head_node_id.as_deref() == Some(selected.node_id.as_str())
-                    && child.fork_provenance.as_ref().is_some_and(|fork| {
-                        fork.source_session_id == session
-                            && fork.source_node_id == selected.node_id
-                            && fork.source_turn_id == selected.turn_id
-                            && fork.source_label == "fork parent"
-                            && fork.shares_current_project_memory
-                    }),
-                "recovered fork lost its immutable source provenance"
-            );
-            let child_page = memory
-                .public_transcript_page("managed-fork-child", None, 16)
-                .await?;
-            ensure!(
-                child_page.head_node_id.as_deref() == Some(selected.node_id.as_str())
-                    && child_page.records == parent_page.records,
-                "recovered child lost its selected settled prefix"
-            );
-
-            let candidate = memory.begin_candidate("isolated session fork").await?;
-            candidate
-                .view()
-                .fork_session(
-                    session,
-                    0,
-                    &selected.node_id,
-                    "candidate-fork-child",
-                    "candidate child",
-                )
-                .await?;
-            ensure!(
-                candidate
-                    .view()
-                    .session_catalog_page(None, None, None, 16)
-                    .await?
-                    .records
-                    .iter()
-                    .any(|record| record.session_id == "candidate-fork-child"),
-                "candidate fork was not readable on its branch"
-            );
-            ensure!(
-                !memory
-                    .session_catalog_page(None, None, None, 16)
-                    .await?
-                    .records
-                    .iter()
-                    .any(|record| record.session_id == "candidate-fork-child"),
-                "candidate fork leaked into main"
-            );
-            candidate.abandon().await?;
-
-            memory.close().await?;
-            sibling.close().await?;
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
-                .await
-                .context("managed fork fixture owner did not reap")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| format!("managed fork fixture exceeded its {deadline:?} deadline"))??;
-        Ok(())
+                },
+            )
+            .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
     async fn managed_mode_checkpoint_lost_reply_reconciles_catalog_and_state_once() -> Result<()> {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner.
-        let deadline = fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options =
-                crate::test_support::open_options(root.path().join("private"), scope.clone())?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let executable = std::env::current_exe()?;
-            let open = || {
-                MemoryStore::open_managed_observed(
-                    options.clone(),
-                    project.clone(),
-                    executable.clone(),
-                )
-                .1
-            };
-            let memory = open().await?;
-            let sibling = open().await?;
-            let session = "managed-mode";
-            memory.create_session(session, Mode::Ifs, "").await?;
-            let before = memory.revision().await?;
-            let namespace = format!("{scope}/transcript/{session}");
-            let state_key = format!("{scope}/session/{session}");
-            let state = json!({"id": session, "mode": Mode::Jungian, "lifecycle_generation": 0});
-            let updates = vec![(state_key.clone(), state.clone())];
-            let wrong_scope = "project/foreign";
-            let wrong_namespace = format!("{wrong_scope}/transcript/{session}");
-            let wrong_updates = vec![(format!("{wrong_scope}/session/{session}"), state.clone())];
-            ensure!(
-                memory
-                    .checkpoint_session_mode(
-                        &wrong_namespace,
-                        session,
-                        &wrong_updates,
-                        &store::SessionModeCheckpoint {
-                            expected_generation: 0,
-                            expected_mode: Mode::Ifs,
-                            mode: Mode::Jungian,
-                        },
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "managed mode fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options =
+            crate::test_support::open_options(root.path().join("private"), scope.clone())?;
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                let executable = std::env::current_exe()?;
+                let open = || {
+                    MemoryStore::open_managed_observed(
+                        options.clone(),
+                        project.clone(),
+                        executable.clone(),
                     )
-                    .await
-                    .is_err(),
-                "foreign-scope mode checkpoint was accepted"
-            );
-            ensure!(
-                memory.revision().await? == before,
-                "foreign-scope mode checkpoint changed the project"
-            );
-            ensure!(
-                memory.reconcile().await? == Some(false),
-                "foreign-scope mode checkpoint did not reconcile as a no-effect request"
-            );
-            let Backend::Remote(remote) = &memory.backend else {
-                bail!("managed mode fixture did not attach to the service")
-            };
-            let malformed = remote
-                .call(ViewOperation::CheckpointSession {
-                    namespace: namespace.clone(),
-                    session_id: session.into(),
-                    messages: vec![Message::text("user", "forged")],
-                    values: updates.clone(),
-                    public_turn: Some(store::SessionTurnCheckpoint::Admit {
-                        expected_generation: 0,
-                        turn_id: "forged".into(),
-                        label: None,
-                        expected_transcript_rows: None,
-                    }),
-                    mode: Some(store::SessionModeCheckpoint {
-                        expected_generation: 0,
-                        expected_mode: Mode::Ifs,
-                        mode: Mode::Jungian,
-                    }),
-                })
-                .await;
-            ensure!(
-                malformed.is_err(),
-                "server accepted combined mode and public turn checkpoint"
-            );
-            ensure!(
-                memory.revision().await? == before,
-                "malformed mode checkpoint changed the project"
-            );
-            ensure!(
-                memory.reconcile().await? == Some(false),
-                "malformed mode checkpoint did not reconcile as a no-effect request"
-            );
-            let _ = memory.revision().await?;
-            let barrier = crate::test_support::ReplyBarrier::default();
-            memory.fixture_pause_next_service_reply(&barrier).await?;
-            let change = tokio::spawn({
-                let memory = memory.clone();
-                let namespace = namespace.clone();
-                async move {
+                    .1
+                };
+                let memory = open().await?;
+                let sibling = open().await?;
+                let session = "managed-mode";
+                memory.create_session(session, Mode::Ifs, "").await?;
+                let before = memory.revision().await?;
+                let namespace = format!("{scope}/transcript/{session}");
+                let state_key = format!("{scope}/session/{session}");
+                let state =
+                    json!({"id": session, "mode": Mode::Jungian, "lifecycle_generation": 0});
+                let updates = vec![(state_key.clone(), state.clone())];
+                let wrong_scope = "project/foreign";
+                let wrong_namespace = format!("{wrong_scope}/transcript/{session}");
+                let wrong_updates =
+                    vec![(format!("{wrong_scope}/session/{session}"), state.clone())];
+                ensure!(
                     memory
                         .checkpoint_session_mode(
-                            &namespace,
+                            &wrong_namespace,
                             session,
-                            &updates,
+                            &wrong_updates,
                             &store::SessionModeCheckpoint {
                                 expected_generation: 0,
                                 expected_mode: Mode::Ifs,
@@ -3791,63 +3793,137 @@ mod tests {
                             },
                         )
                         .await
-                }
-            });
-            let _cleanup = AbortOnDrop(change.abort_handle());
-            tokio::time::timeout(Duration::from_secs(5), barrier.wait_sent())
-                .await
-                .context("mode checkpoint request was not sent")?;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let catalog = sibling
-                        .session_catalog_record(session)
-                        .await?
-                        .context("mode catalog disappeared")?;
-                    let saved = sibling.get(&state_key).await?;
-                    if catalog.mode == Mode::Jungian && saved.as_ref() == Some(&state) {
-                        break Ok::<(), anyhow::Error>(());
+                        .is_err(),
+                    "foreign-scope mode checkpoint was accepted"
+                );
+                ensure!(
+                    memory.revision().await? == before,
+                    "foreign-scope mode checkpoint changed the project"
+                );
+                ensure!(
+                    memory.reconcile().await? == Some(false),
+                    "foreign-scope mode checkpoint did not reconcile as a no-effect request"
+                );
+                let Backend::Remote(remote) = &memory.backend else {
+                    bail!("managed mode fixture did not attach to the service")
+                };
+                let malformed = remote
+                    .call(ViewOperation::CheckpointSession {
+                        namespace: namespace.clone(),
+                        session_id: session.into(),
+                        messages: vec![Message::text("user", "forged")],
+                        values: updates.clone(),
+                        public_turn: Some(store::SessionTurnCheckpoint::Admit {
+                            expected_generation: 0,
+                            turn_id: "forged".into(),
+                            label: None,
+                            expected_transcript_rows: None,
+                        }),
+                        mode: Some(store::SessionModeCheckpoint {
+                            expected_generation: 0,
+                            expected_mode: Mode::Ifs,
+                            mode: Mode::Jungian,
+                        }),
+                    })
+                    .await;
+                ensure!(
+                    malformed.is_err(),
+                    "server accepted combined mode and public turn checkpoint"
+                );
+                ensure!(
+                    memory.revision().await? == before,
+                    "malformed mode checkpoint changed the project"
+                );
+                ensure!(
+                    memory.reconcile().await? == Some(false),
+                    "malformed mode checkpoint did not reconcile as a no-effect request"
+                );
+                let _ = memory.revision().await?;
+                let barrier = crate::test_support::ReplyBarrier::default();
+                memory.fixture_pause_next_service_reply(&barrier).await?;
+                let change = tokio::spawn({
+                    let memory = memory.clone();
+                    let namespace = namespace.clone();
+                    async move {
+                        memory
+                            .checkpoint_session_mode(
+                                &namespace,
+                                session,
+                                &updates,
+                                &store::SessionModeCheckpoint {
+                                    expected_generation: 0,
+                                    expected_mode: Mode::Ifs,
+                                    mode: Mode::Jungian,
+                                },
+                            )
+                            .await
                     }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .context("owner did not commit paused mode and state")??;
-            change.abort();
-            ensure!(
-                tokio::time::timeout(Duration::from_secs(5), change)
+                });
+                let _cleanup = AbortOnDrop(change.abort_handle());
+                tokio::time::timeout(Duration::from_secs(5), barrier.wait_sent())
                     .await
-                    .context("cancelled mode checkpoint did not end")?
-                    .is_err_and(|error| error.is_cancelled()),
-                "mode checkpoint reply was not cancelled"
-            );
-            ensure!(
-                memory.reconcile().await? == Some(true),
-                "accepted mode checkpoint lost its exact receipt"
-            );
-            ensure!(
-                memory.revision().await? != before,
-                "accepted mode checkpoint did not commit"
-            );
-            ensure!(
-                memory
-                    .public_transcript_page(session, None, 16)
-                    .await?
-                    .records
-                    .is_empty(),
-                "mode checkpoint fabricated a public turn"
-            );
-            memory.close().await?;
-            sibling.close().await?;
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
+                    .context("mode checkpoint request was not sent")?;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let catalog = sibling
+                            .session_catalog_record(session)
+                            .await?
+                            .context("mode catalog disappeared")?;
+                        let saved = sibling.get(&state_key).await?;
+                        if catalog.mode == Mode::Jungian && saved.as_ref() == Some(&state) {
+                            break Ok::<(), anyhow::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
                 .await
-                .context("managed mode fixture owner did not reap")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| format!("managed mode fixture exceeded its {deadline:?} deadline"))??;
-        Ok(())
+                .context("owner did not commit paused mode and state")??;
+                tokio::time::timeout(Duration::from_secs(10), barrier.wait_replied())
+                    .await
+                    .context("owner did not settle and reply to the paused mode checkpoint")?;
+                change.abort();
+                ensure!(
+                    tokio::time::timeout(Duration::from_secs(5), change)
+                        .await
+                        .context("cancelled mode checkpoint did not end")?
+                        .is_err_and(|error| error.is_cancelled()),
+                    "mode checkpoint reply was not cancelled"
+                );
+                ensure!(
+                    memory.reconcile().await? == Some(true),
+                    "accepted mode checkpoint lost its exact receipt"
+                );
+                ensure!(
+                    memory.revision().await? != before,
+                    "accepted mode checkpoint did not commit"
+                );
+                ensure!(
+                    memory
+                        .public_transcript_page(session, None, 16)
+                        .await?
+                        .records
+                        .is_empty(),
+                    "mode checkpoint fabricated a public turn"
+                );
+                memory.close().await?;
+                sibling.close().await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "managed mode fixture owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
@@ -3855,472 +3931,493 @@ mod tests {
     {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner.
-        let deadline = fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-            let namespace = format!("{}/transcript/managed-turn", options.project_scope);
-            let candidate_namespace =
-                format!("{}/transcript/candidate-turn", options.project_scope);
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let executable = std::env::current_exe()?;
-            let open = || {
-                MemoryStore::open_managed_observed(
-                    options.clone(),
-                    project.clone(),
-                    executable.clone(),
-                )
-                .1
-            };
-            let memory = open().await?;
-            let sibling = open().await?;
-            memory
-                .create_session("managed-turn", Mode::Ifs, "")
-                .await?;
-            let Backend::Remote(remote) = &memory.backend else {
-                bail!("managed turn fixture did not attach to the service")
-            };
-            let pause = Arc::new(service::rpc::ReplyPause::default());
-            remote
-                .attachment
-                .lock()
-                .await
-                .pause_after_next_send(pause.clone());
-            let admission = tokio::spawn({
-                let memory = memory.clone();
-                let namespace = namespace.clone();
-                async move {
-                    memory
-                        .checkpoint_session_turn(
-                            &namespace,
-                            "managed-turn",
-                            &[Message::text("user", "question")],
-                            &[("managed-turn-journal".into(), json!("started"))],
-                            &store::SessionTurnCheckpoint::Admit {
-                                expected_generation: 0,
-                                turn_id: "turn-1".into(),
-                                label: Some("question".into()),
-                                expected_transcript_rows: None,
-                            },
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "managed public-turn fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let namespace = format!("{}/transcript/managed-turn", options.project_scope);
+        let candidate_namespace = format!("{}/transcript/candidate-turn", options.project_scope);
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let executable = std::env::current_exe()?;
+                        let open = || {
+                            MemoryStore::open_managed_observed(
+                                options.clone(),
+                                project.clone(),
+                                executable.clone(),
+                            )
+                            .1
+                        };
+                        let memory = open().await?;
+                        let sibling = open().await?;
+                        memory
+                            .create_session("managed-turn", Mode::Ifs, "")
+                            .await?;
+                        let Backend::Remote(remote) = &memory.backend else {
+                            bail!("managed turn fixture did not attach to the service")
+                        };
+                        let pause = Arc::new(service::rpc::ReplyPause::default());
+                        remote
+                            .attachment
+                            .lock()
+                            .await
+                            .pause_after_next_send(pause.clone());
+                        let admission = tokio::spawn({
+                            let memory = memory.clone();
+                            let namespace = namespace.clone();
+                            async move {
+                                memory
+                                    .checkpoint_session_turn(
+                                        &namespace,
+                                        "managed-turn",
+                                        &[Message::text("user", "question")],
+                                        &[("managed-turn-journal".into(), json!("started"))],
+                                        &store::SessionTurnCheckpoint::Admit {
+                                            expected_generation: 0,
+                                            turn_id: "turn-1".into(),
+                                            label: Some("question".into()),
+                                            expected_transcript_rows: None,
+                                        },
+                                    )
+                                    .await
+                            }
+                        });
+                        let _admission_cleanup = AbortOnDrop(admission.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                            .await
+                            .context("accepted public-turn admission frame was not flushed")?;
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                let page = sibling
+                                    .public_transcript_page("managed-turn", None, 16)
+                                    .await?;
+                                if matches!(page.pending.as_ref(), Some(record) if record.turn_id == "turn-1") {
+                                    break Ok::<(), anyhow::Error>(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .context("owner did not commit the paused public-turn admission")??;
+                        tokio::time::timeout(Duration::from_secs(10), pause.replied.notified())
+                            .await
+                            .context("owner did not settle and reply to the paused public-turn admission")?;
+                        admission.abort();
+                        ensure!(
+                            tokio::time::timeout(Duration::from_secs(5), admission)
+                                .await
+                                .context("cancelled public-turn admission did not end")?
+                                .is_err_and(|error| error.is_cancelled()),
+                            "accepted public-turn admission completed instead of being cancelled"
+                        );
+                        ensure!(
+                            memory
+                                .checkpoint_session_turn(
+                                    &namespace,
+                                    "managed-turn",
+                                    &[Message::text("assistant", "answer")],
+                                    &[("managed-turn-journal".into(), json!("ended"))],
+                                    &store::SessionTurnCheckpoint::Settle {
+                                        expected_generation: 0,
+                                        turn_id: "turn-1".into(),
+                                        settlement: store::PublicTurnSettlement::Completed,
+                                        speaker_id: "part-a".into(),
+                                    },
+                                )
+                                .await
+                                .is_err(),
+                            "uncertain public-turn admission failed to fence settlement"
+                        );
+                        ensure!(memory.reconcile().await? == Some(true));
+                        // The cancelled admission left its attachment incomplete. A read
+                        // reattaches it before the next reply barrier is installed.
+                        let _ = memory.revision().await?;
+                        let settlement_barrier = crate::test_support::ReplyBarrier::default();
+                        memory
+                            .fixture_pause_next_service_reply(&settlement_barrier)
+                            .await?;
+                        let mut settlement = tokio::spawn({
+                            let memory = memory.clone();
+                            let namespace = namespace.clone();
+                            async move {
+                                memory
+                                    .checkpoint_session_turn(
+                                        &namespace,
+                                        "managed-turn",
+                                        &[Message::text("assistant", "answer")],
+                                        &[("managed-turn-journal".into(), json!("ended"))],
+                                        &store::SessionTurnCheckpoint::Settle {
+                                            expected_generation: 0,
+                                            turn_id: "turn-1".into(),
+                                            settlement: store::PublicTurnSettlement::Completed,
+                                            speaker_id: "part-a".into(),
+                                        },
+                                    )
+                                    .await
+                            }
+                        });
+                        let _settlement_cleanup = AbortOnDrop(settlement.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            tokio::select! {
+                                () = settlement_barrier.wait_sent() => Ok(()),
+                                result = &mut settlement => bail!("settlement completed before pause: {result:?}"),
+                            }
+                        })
+                        .await
+                        .context("accepted public-turn settlement frame was not flushed")??;
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                let page = sibling.public_transcript_page("managed-turn", None, 16).await?;
+                                if matches!(page.records.as_slice(), [store::PublicTranscriptEntry::Turn { record }]
+                                    if record.turn_id == "turn-1"
+                                        && record.settlement == store::PublicTurnSettlement::Completed)
+                                {
+                                    break Ok::<(), anyhow::Error>(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .context("owner did not commit the paused public-turn settlement")??;
+                        tokio::time::timeout(Duration::from_secs(10), settlement_barrier.wait_replied())
+                            .await
+                            .context("owner did not settle and reply to the paused public-turn settlement")?;
+                        settlement.abort();
+                        ensure!(
+                            tokio::time::timeout(Duration::from_secs(5), settlement)
+                                .await
+                                .context("cancelled public-turn settlement did not end")?
+                                .is_err_and(|error| error.is_cancelled()),
+                            "accepted public-turn settlement completed instead of being cancelled"
+                        );
+                        ensure!(memory.reconcile().await? == Some(true));
+                        let page = sibling
+                            .public_transcript_page("managed-turn", None, 16)
+                            .await?;
+                        ensure!(
+                            page.pending.is_none()
+                                && matches!(page.records.as_slice(), [store::PublicTranscriptEntry::Turn { record }] if record.turn_id == "turn-1" && record.settlement == store::PublicTurnSettlement::Completed),
+                            "managed public turn did not settle exactly once"
+                        );
+                        ensure!(
+                            sibling
+                                .history(&namespace, 16)
+                                .await?
+                                == [
+                                    Message::text("user", "question"),
+                                    Message::text("assistant", "answer")
+                                ],
+                            "managed public turn duplicated its raw transcript"
+                        );
+
+                        let candidate = memory.begin_candidate("public turn candidate").await?;
+                        candidate
+                            .view()
+                            .create_session("candidate-turn", Mode::Ifs, "candidate")
+                            .await?;
+                        candidate
+                            .view()
+                            .checkpoint_session_turn(
+                                &candidate_namespace,
+                                "candidate-turn",
+                                &[Message::text("user", "candidate question")],
+                                &[("candidate-journal".into(), json!("started"))],
+                                &store::SessionTurnCheckpoint::Admit {
+                                    expected_generation: 0,
+                                    turn_id: "candidate-turn-1".into(),
+                                    label: None,
+                                    expected_transcript_rows: None,
+                                },
+                            )
+                            .await?;
+                        ensure!(
+                            candidate
+                                .view()
+                                .public_transcript_page("candidate-turn", None, 16)
+                                .await?
+                                .pending
+                                .is_some()
+                                && memory
+                                    .session_catalog_page(None, None, None, 16)
+                                    .await?
+                                    .records
+                                    .iter()
+                                    .all(|record| record.session_id != "candidate-turn"),
+                            "candidate public-turn admission leaked into main"
+                        );
+                        candidate.abandon().await?;
+
+                        memory
+                            .checkpoint_session_turn(
+                                &namespace,
+                                "managed-turn",
+                                &[Message::text("user", "older question")],
+                                &[("older-journal".into(), json!("started"))],
+                                &store::SessionTurnCheckpoint::Admit {
+                                    expected_generation: 0,
+                                    turn_id: "older-turn".into(),
+                                    label: None,
+                                    expected_transcript_rows: None,
+                                },
+                            )
+                            .await?;
+                        memory
+                            .checkpoint_session_turn(
+                                &namespace,
+                                "managed-turn",
+                                &[Message::text("kuru-interruption", "retryable")],
+                                &[("older-journal".into(), json!("interrupted"))],
+                                &store::SessionTurnCheckpoint::MarkRetryableInterruption {
+                                    expected_generation: 0,
+                                    turn_id: "older-turn".into(),
+                                    speaker_id: "kuru-interruption".into(),
+                                },
+                            )
+                            .await?;
+                        memory
+                            .checkpoint_session_turn(
+                                &namespace,
+                                "managed-turn",
+                                &[Message::text("user", "later question")],
+                                &[("later-journal".into(), json!("started"))],
+                                &store::SessionTurnCheckpoint::Admit {
+                                    expected_generation: 0,
+                                    turn_id: "later-turn".into(),
+                                    label: None,
+                                    expected_transcript_rows: None,
+                                },
+                            )
+                            .await?;
+                        memory
+                            .checkpoint_session_turn(
+                                &namespace,
+                                "managed-turn",
+                                &[Message::text("assistant", "later answer")],
+                                &[("later-journal".into(), json!("ended"))],
+                                &store::SessionTurnCheckpoint::Settle {
+                                    expected_generation: 0,
+                                    turn_id: "later-turn".into(),
+                                    settlement: store::PublicTurnSettlement::Completed,
+                                    speaker_id: "part-later".into(),
+                                },
+                            )
+                            .await?;
+                        let predecessor = sibling
+                            .public_transcript_page("managed-turn", None, 16)
+                            .await?
+                            .head_node_id;
+                        let older_node = store::public_turn_node_id("managed-turn", "older-turn")?;
+                        memory
+                            .fork_session(
+                                "managed-turn",
+                                0,
+                                &older_node,
+                                "older-boundary-fork",
+                                "older boundary",
+                            )
+                            .await?;
+                        let fork_before = sibling
+                            .public_transcript_page("older-boundary-fork", None, 16)
+                            .await?;
+                        ensure!(
+                            fork_before.head_node_id.as_deref() == Some(older_node.as_str()),
+                            "older retry fork did not capture its interrupted boundary"
+                        );
+                        let _ = memory.revision().await?;
+                        let continuation_barrier = crate::test_support::ReplyBarrier::default();
+                        memory
+                            .fixture_pause_next_service_reply(&continuation_barrier)
+                            .await?;
+                        let mut continuation = tokio::spawn({
+                            let memory = memory.clone();
+                            let namespace = namespace.clone();
+                            async move {
+                                memory
+                                    .checkpoint_session_turn(
+                                        &namespace,
+                                        "managed-turn",
+                                        &[],
+                                        &[("older-journal".into(), json!("resumed"))],
+                                        &store::SessionTurnCheckpoint::Resume {
+                                            expected_generation: 0,
+                                            turn_id: "older-turn".into(),
+                                            legacy: None,
+                                        },
+                                    )
+                                    .await
+                            }
+                        });
+                        let _continuation_cleanup = AbortOnDrop(continuation.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            tokio::select! {
+                                () = continuation_barrier.wait_sent() => Ok(()),
+                                result = &mut continuation => bail!("older continuation completed before paused reply: {result:?}"),
+                            }
+                        })
+                        .await
+                        .context("accepted older continuation frame was not flushed")??;
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                let page = sibling.public_transcript_page("managed-turn", None, 16).await?;
+                                if matches!(page.pending.as_ref(), Some(record)
+                                    if record.turn_id == "older-turn"
+                                        && record.kind == store::PublicTurnKind::Continuation
+                                        && record.predecessor_node_id == predecessor)
+                                {
+                                    break Ok::<(), anyhow::Error>(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .context("owner did not commit older continuation before reply loss")??;
+                        tokio::time::timeout(Duration::from_secs(10), continuation_barrier.wait_replied())
+                            .await
+                            .context("owner did not settle and reply to the paused older continuation")?;
+                        continuation.abort();
+                        ensure!(
+                            tokio::time::timeout(Duration::from_secs(5), continuation)
+                                .await
+                                .context("cancelled older continuation did not end")?
+                                .is_err_and(|error| error.is_cancelled()),
+                            "accepted older continuation completed before cancellation"
+                        );
+                        ensure!(memory.reconcile().await? == Some(true));
+                        let pending = sibling
+                            .public_transcript_page("managed-turn", None, 16)
+                            .await?
+                            .pending
+                            .context("reconciled older continuation is not pending")?;
+                        ensure!(
+                            pending.turn_id == "older-turn"
+                                && pending.kind == store::PublicTurnKind::Continuation
+                                && pending.user_entry.is_none()
+                                && pending.continuation_of_node_id
+                                    == Some(store::public_turn_node_id("managed-turn", "older-turn")?),
+                            "older continuation lost its exact assistant-only identity"
+                        );
+                        memory
+                            .checkpoint_session_turn(
+                                &namespace,
+                                "managed-turn",
+                                &[Message::text("assistant", "older answer")],
+                                &[("older-journal".into(), json!("ended"))],
+                                &store::SessionTurnCheckpoint::Settle {
+                                    expected_generation: 0,
+                                    turn_id: "older-turn".into(),
+                                    settlement: store::PublicTurnSettlement::Completed,
+                                    speaker_id: "part-older".into(),
+                                },
+                            )
+                            .await?;
+                        ensure!(
+                            sibling.history(&namespace, 16).await?
+                                == [
+                                    Message::text("user", "question"),
+                                    Message::text("assistant", "answer"),
+                                    Message::text("user", "older question"),
+                                    Message::text("kuru-interruption", "retryable"),
+                                    Message::text("user", "later question"),
+                                    Message::text("assistant", "later answer"),
+                                    Message::text("assistant", "older answer"),
+                                ],
+                            "older continuation duplicated a user or interruption row"
+                        );
+                        let fork_after = sibling
+                            .public_transcript_page("older-boundary-fork", None, 16)
+                            .await?;
+                        ensure!(
+                            fork_after.head_node_id == fork_before.head_node_id
+                                && fork_after.records == fork_before.records,
+                            "older continuation changed the fork's settled prefix"
+                        );
+
+                        memory.close().await?;
+                        sibling.close().await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "managed public-turn fixture owner did not reap",
                         )
                         .await
-                }
-            });
-            let _admission_cleanup = AbortOnDrop(admission.abort_handle());
-            tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
-                .await
-                .context("accepted public-turn admission frame was not flushed")?;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let page = sibling
-                        .public_transcript_page("managed-turn", None, 16)
-                        .await?;
-                    if matches!(page.pending.as_ref(), Some(record) if record.turn_id == "turn-1") {
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .context("owner did not commit the paused public-turn admission")??;
-            admission.abort();
-            ensure!(
-                tokio::time::timeout(Duration::from_secs(5), admission)
-                    .await
-                    .context("cancelled public-turn admission did not end")?
-                    .is_err_and(|error| error.is_cancelled()),
-                "accepted public-turn admission completed instead of being cancelled"
-            );
-            ensure!(
-                memory
-                    .checkpoint_session_turn(
-                        &namespace,
-                        "managed-turn",
-                        &[Message::text("assistant", "answer")],
-                        &[("managed-turn-journal".into(), json!("ended"))],
-                        &store::SessionTurnCheckpoint::Settle {
-                            expected_generation: 0,
-                            turn_id: "turn-1".into(),
-                            settlement: store::PublicTurnSettlement::Completed,
-                            speaker_id: "part-a".into(),
-                        },
-                    )
-                    .await
-                    .is_err(),
-                "uncertain public-turn admission failed to fence settlement"
-            );
-            ensure!(memory.reconcile().await? == Some(true));
-            // The cancelled admission left its attachment incomplete. A read
-            // reattaches it before the next reply barrier is installed.
-            let _ = memory.revision().await?;
-            let settlement_barrier = crate::test_support::ReplyBarrier::default();
-            memory
-                .fixture_pause_next_service_reply(&settlement_barrier)
-                .await?;
-            let mut settlement = tokio::spawn({
-                let memory = memory.clone();
-                let namespace = namespace.clone();
-                async move {
-                    memory
-                        .checkpoint_session_turn(
-                            &namespace,
-                            "managed-turn",
-                            &[Message::text("assistant", "answer")],
-                            &[("managed-turn-journal".into(), json!("ended"))],
-                            &store::SessionTurnCheckpoint::Settle {
-                                expected_generation: 0,
-                                turn_id: "turn-1".into(),
-                                settlement: store::PublicTurnSettlement::Completed,
-                                speaker_id: "part-a".into(),
-                            },
-                        )
-                        .await
-                }
-            });
-            let _settlement_cleanup = AbortOnDrop(settlement.abort_handle());
-            tokio::time::timeout(Duration::from_secs(5), async {
-                tokio::select! {
-                    () = settlement_barrier.wait_sent() => Ok(()),
-                    result = &mut settlement => bail!("settlement completed before pause: {result:?}"),
-                }
-            })
-            .await
-            .context("accepted public-turn settlement frame was not flushed")??;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let page = sibling.public_transcript_page("managed-turn", None, 16).await?;
-                    if matches!(page.records.as_slice(), [store::PublicTranscriptEntry::Turn { record }]
-                        if record.turn_id == "turn-1"
-                            && record.settlement == store::PublicTurnSettlement::Completed)
-                    {
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .context("owner did not commit the paused public-turn settlement")??;
-            settlement.abort();
-            ensure!(
-                tokio::time::timeout(Duration::from_secs(5), settlement)
-                    .await
-                    .context("cancelled public-turn settlement did not end")?
-                    .is_err_and(|error| error.is_cancelled()),
-                "accepted public-turn settlement completed instead of being cancelled"
-            );
-            ensure!(memory.reconcile().await? == Some(true));
-            let page = sibling
-                .public_transcript_page("managed-turn", None, 16)
-                .await?;
-            ensure!(
-                page.pending.is_none()
-                    && matches!(page.records.as_slice(), [store::PublicTranscriptEntry::Turn { record }] if record.turn_id == "turn-1" && record.settlement == store::PublicTurnSettlement::Completed),
-                "managed public turn did not settle exactly once"
-            );
-            ensure!(
-                sibling
-                    .history(&namespace, 16)
-                    .await?
-                    == [
-                        Message::text("user", "question"),
-                        Message::text("assistant", "answer")
-                    ],
-                "managed public turn duplicated its raw transcript"
-            );
-
-            let candidate = memory.begin_candidate("public turn candidate").await?;
-            candidate
-                .view()
-                .create_session("candidate-turn", Mode::Ifs, "candidate")
-                .await?;
-            candidate
-                .view()
-                .checkpoint_session_turn(
-                    &candidate_namespace,
-                    "candidate-turn",
-                    &[Message::text("user", "candidate question")],
-                    &[("candidate-journal".into(), json!("started"))],
-                    &store::SessionTurnCheckpoint::Admit {
-                        expected_generation: 0,
-                        turn_id: "candidate-turn-1".into(),
-                        label: None,
-                        expected_transcript_rows: None,
-                    },
-                )
-                .await?;
-            ensure!(
-                candidate
-                    .view()
-                    .public_transcript_page("candidate-turn", None, 16)
-                    .await?
-                    .pending
-                    .is_some()
-                    && memory
-                        .session_catalog_page(None, None, None, 16)
-                        .await?
-                        .records
-                        .iter()
-                        .all(|record| record.session_id != "candidate-turn"),
-                "candidate public-turn admission leaked into main"
-            );
-            candidate.abandon().await?;
-
-            memory
-                .checkpoint_session_turn(
-                    &namespace,
-                    "managed-turn",
-                    &[Message::text("user", "older question")],
-                    &[("older-journal".into(), json!("started"))],
-                    &store::SessionTurnCheckpoint::Admit {
-                        expected_generation: 0,
-                        turn_id: "older-turn".into(),
-                        label: None,
-                        expected_transcript_rows: None,
-                    },
-                )
-                .await?;
-            memory
-                .checkpoint_session_turn(
-                    &namespace,
-                    "managed-turn",
-                    &[Message::text("kuru-interruption", "retryable")],
-                    &[("older-journal".into(), json!("interrupted"))],
-                    &store::SessionTurnCheckpoint::MarkRetryableInterruption {
-                        expected_generation: 0,
-                        turn_id: "older-turn".into(),
-                        speaker_id: "kuru-interruption".into(),
-                    },
-                )
-                .await?;
-            memory
-                .checkpoint_session_turn(
-                    &namespace,
-                    "managed-turn",
-                    &[Message::text("user", "later question")],
-                    &[("later-journal".into(), json!("started"))],
-                    &store::SessionTurnCheckpoint::Admit {
-                        expected_generation: 0,
-                        turn_id: "later-turn".into(),
-                        label: None,
-                        expected_transcript_rows: None,
-                    },
-                )
-                .await?;
-            memory
-                .checkpoint_session_turn(
-                    &namespace,
-                    "managed-turn",
-                    &[Message::text("assistant", "later answer")],
-                    &[("later-journal".into(), json!("ended"))],
-                    &store::SessionTurnCheckpoint::Settle {
-                        expected_generation: 0,
-                        turn_id: "later-turn".into(),
-                        settlement: store::PublicTurnSettlement::Completed,
-                        speaker_id: "part-later".into(),
-                    },
-                )
-                .await?;
-            let predecessor = sibling
-                .public_transcript_page("managed-turn", None, 16)
-                .await?
-                .head_node_id;
-            let older_node = store::public_turn_node_id("managed-turn", "older-turn")?;
-            memory
-                .fork_session(
-                    "managed-turn",
-                    0,
-                    &older_node,
-                    "older-boundary-fork",
-                    "older boundary",
-                )
-                .await?;
-            let fork_before = sibling
-                .public_transcript_page("older-boundary-fork", None, 16)
-                .await?;
-            ensure!(
-                fork_before.head_node_id.as_deref() == Some(older_node.as_str()),
-                "older retry fork did not capture its interrupted boundary"
-            );
-            let _ = memory.revision().await?;
-            let continuation_barrier = crate::test_support::ReplyBarrier::default();
-            memory
-                .fixture_pause_next_service_reply(&continuation_barrier)
-                .await?;
-            let mut continuation = tokio::spawn({
-                let memory = memory.clone();
-                let namespace = namespace.clone();
-                async move {
-                    memory
-                        .checkpoint_session_turn(
-                            &namespace,
-                            "managed-turn",
-                            &[],
-                            &[("older-journal".into(), json!("resumed"))],
-                            &store::SessionTurnCheckpoint::Resume {
-                                expected_generation: 0,
-                                turn_id: "older-turn".into(),
-                                legacy: None,
-                            },
-                        )
-                        .await
-                }
-            });
-            let _continuation_cleanup = AbortOnDrop(continuation.abort_handle());
-            tokio::time::timeout(Duration::from_secs(5), async {
-                tokio::select! {
-                    () = continuation_barrier.wait_sent() => Ok(()),
-                    result = &mut continuation => bail!("older continuation completed before paused reply: {result:?}"),
-                }
-            })
-            .await
-            .context("accepted older continuation frame was not flushed")??;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let page = sibling.public_transcript_page("managed-turn", None, 16).await?;
-                    if matches!(page.pending.as_ref(), Some(record)
-                        if record.turn_id == "older-turn"
-                            && record.kind == store::PublicTurnKind::Continuation
-                            && record.predecessor_node_id == predecessor)
-                    {
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .context("owner did not commit older continuation before reply loss")??;
-            continuation.abort();
-            ensure!(
-                tokio::time::timeout(Duration::from_secs(5), continuation)
-                    .await
-                    .context("cancelled older continuation did not end")?
-                    .is_err_and(|error| error.is_cancelled()),
-                "accepted older continuation completed before cancellation"
-            );
-            ensure!(memory.reconcile().await? == Some(true));
-            let pending = sibling
-                .public_transcript_page("managed-turn", None, 16)
-                .await?
-                .pending
-                .context("reconciled older continuation is not pending")?;
-            ensure!(
-                pending.turn_id == "older-turn"
-                    && pending.kind == store::PublicTurnKind::Continuation
-                    && pending.user_entry.is_none()
-                    && pending.continuation_of_node_id
-                        == Some(store::public_turn_node_id("managed-turn", "older-turn")?),
-                "older continuation lost its exact assistant-only identity"
-            );
-            memory
-                .checkpoint_session_turn(
-                    &namespace,
-                    "managed-turn",
-                    &[Message::text("assistant", "older answer")],
-                    &[("older-journal".into(), json!("ended"))],
-                    &store::SessionTurnCheckpoint::Settle {
-                        expected_generation: 0,
-                        turn_id: "older-turn".into(),
-                        settlement: store::PublicTurnSettlement::Completed,
-                        speaker_id: "part-older".into(),
-                    },
-                )
-                .await?;
-            ensure!(
-                sibling.history(&namespace, 16).await?
-                    == [
-                        Message::text("user", "question"),
-                        Message::text("assistant", "answer"),
-                        Message::text("user", "older question"),
-                        Message::text("kuru-interruption", "retryable"),
-                        Message::text("user", "later question"),
-                        Message::text("assistant", "later answer"),
-                        Message::text("assistant", "older answer"),
-                    ],
-                "older continuation duplicated a user or interruption row"
-            );
-            let fork_after = sibling
-                .public_transcript_page("older-boundary-fork", None, 16)
-                .await?;
-            ensure!(
-                fork_after.head_node_id == fork_before.head_node_id
-                    && fork_after.records == fork_before.records,
-                "older continuation changed the fork's settled prefix"
-            );
-
-            memory.close().await?;
-            sibling.close().await?;
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
-                .await
-                .context("managed public-turn fixture owner did not reap")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("managed public-turn fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
+                },
+            )
+            .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
     async fn managed_legacy_continuation_lost_reply_reconciles_without_a_user_row() -> Result<()> {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: a fresh local seed open, then the owner reopens it.
-        let deadline = fixture_deadline(1, 1);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options =
-                crate::test_support::open_options(root.path().join("private"), scope.clone())?;
-            let namespace = format!("{scope}/transcript/legacy-managed");
-            let journal_key = format!(
-                "{scope}/session/legacy-managed/turn/{}",
-                "b".repeat(64)
-            );
-            let expected_journal = json!({
-                "format": 2,
-                "id": "legacy-managed-turn",
-                "prompt": "legacy question",
-                "target": null,
-                "transitions": ["Started", "Interrupted"],
-                "possible_dispatch": false,
-                "interruption_marker": true,
-                "output": null
-            });
-            let resumed_journal = json!({
-                "format": 2,
-                "id": "legacy-managed-turn",
-                "prompt": "legacy question",
-                "target": null,
-                "transitions": ["Started", "Interrupted", "Resumed"],
-                "possible_dispatch": false,
-                "interruption_marker": true,
-                "output": null
-            });
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 1),
+            "managed legacy continuation fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options =
+            crate::test_support::open_options(root.path().join("private"), scope.clone())?;
+        let namespace = format!("{scope}/transcript/legacy-managed");
+        let journal_key = format!("{scope}/session/legacy-managed/turn/{}", "b".repeat(64));
+        let expected_journal = json!({
+            "format": 2,
+            "id": "legacy-managed-turn",
+            "prompt": "legacy question",
+            "target": null,
+            "transitions": ["Started", "Interrupted"],
+            "possible_dispatch": false,
+            "interruption_marker": true,
+            "output": null
+        });
+        let resumed_journal = json!({
+            "format": 2,
+            "id": "legacy-managed-turn",
+            "prompt": "legacy question",
+            "target": null,
+            "transitions": ["Started", "Interrupted", "Resumed"],
+            "possible_dispatch": false,
+            "interruption_marker": true,
+            "output": null
+        });
+        let outcome = async {
+            let prefix = deadline
+                .run(async {
             let seed = store::MemoryStore::open(options.clone()).await?;
             seed.append_session_message(
                 &namespace,
@@ -4364,106 +4461,122 @@ mod tests {
             )
             .await?;
             seed.close().await?;
+            Ok(prefix)
+                })
+                .await?;
+        deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let executable = std::env::current_exe()?;
+                        let open = || {
+                            MemoryStore::open_managed_observed(
+                                options.clone(),
+                                project.clone(),
+                                executable.clone(),
+                            )
+                            .1
+                        };
+                        let memory = open().await?;
+                        let sibling = open().await?;
+                        let barrier = crate::test_support::ReplyBarrier::default();
+                        memory.fixture_pause_next_service_reply(&barrier).await?;
+                        let resume = tokio::spawn({
+                            let memory = memory.clone();
+                            let namespace = namespace.clone();
+                            let journal_key = journal_key.clone();
+                            let prefix = prefix.clone();
+                            let expected_journal = expected_journal.clone();
+                            let resumed_journal = resumed_journal.clone();
+                            async move {
+                                memory
+                                    .checkpoint_session_turn(
+                                        &namespace,
+                                        "legacy-managed",
+                                        &[],
+                                        &[(journal_key.clone(), resumed_journal)],
+                                        &store::SessionTurnCheckpoint::Resume {
+                                            expected_generation: 0,
+                                            turn_id: "legacy-managed-turn".into(),
+                                            legacy: Some(store::LegacySessionTurnResume {
+                                                legacy_prefix: prefix,
+                                                journal_key,
+                                                expected_journal,
+                                            }),
+                                        },
+                                    )
+                                    .await
+                            }
+                        });
+                        let _resume_cleanup = AbortOnDrop(resume.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), barrier.wait_sent())
+                            .await
+                            .context("accepted legacy continuation frame was not flushed")?;
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                let page = sibling
+                                    .public_transcript_page("legacy-managed", None, 16)
+                                    .await?;
+                                if matches!(page.pending.as_ref(), Some(record) if record.kind == store::PublicTurnKind::LegacyContinuation) {
+                                    break Ok::<(), anyhow::Error>(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .context("owner did not commit the paused legacy continuation")??;
+                        tokio::time::timeout(Duration::from_secs(10), barrier.wait_replied())
+                            .await
+                            .context("owner did not settle and reply to the paused legacy continuation")?;
+                        resume.abort();
+                        ensure!(
+                            tokio::time::timeout(Duration::from_secs(5), resume)
+                                .await
+                                .context("cancelled legacy continuation did not end")?
+                                .is_err_and(|error| error.is_cancelled()),
+                            "accepted legacy continuation completed instead of being cancelled"
+                        );
+                        ensure!(memory.reconcile().await? == Some(true));
+                        let page = sibling
+                            .public_transcript_page("legacy-managed", None, 16)
+                            .await?;
+                        ensure!(
+                            matches!(page.pending.as_ref(), Some(record)
+                                if record.kind == store::PublicTurnKind::LegacyContinuation
+                                    && record.user_entry.is_none()
+                                    && record.continuation_of_node_id.is_none()),
+                            "reconciled legacy continuation changed its honest projection"
+                        );
+                        ensure!(
+                            sibling.history(&namespace, 16).await?
+                                == [Message::text("user", "legacy question")],
+                            "legacy continuation duplicated its retained user row"
+                        );
 
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let executable = std::env::current_exe()?;
-            let open = || {
-                MemoryStore::open_managed_observed(
-                    options.clone(),
-                    project.clone(),
-                    executable.clone(),
-                )
-                .1
-            };
-            let memory = open().await?;
-            let sibling = open().await?;
-            let barrier = crate::test_support::ReplyBarrier::default();
-            memory.fixture_pause_next_service_reply(&barrier).await?;
-            let resume = tokio::spawn({
-                let memory = memory.clone();
-                let namespace = namespace.clone();
-                let journal_key = journal_key.clone();
-                let prefix = prefix.clone();
-                let expected_journal = expected_journal.clone();
-                let resumed_journal = resumed_journal.clone();
-                async move {
-                    memory
-                        .checkpoint_session_turn(
-                            &namespace,
-                            "legacy-managed",
-                            &[],
-                            &[(journal_key.clone(), resumed_journal)],
-                            &store::SessionTurnCheckpoint::Resume {
-                                expected_generation: 0,
-                                turn_id: "legacy-managed-turn".into(),
-                                legacy: Some(store::LegacySessionTurnResume {
-                                    legacy_prefix: prefix,
-                                    journal_key,
-                                    expected_journal,
-                                }),
-                            },
+                        memory.close().await?;
+                        sibling.close().await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "managed legacy continuation owner did not reap",
                         )
                         .await
-                }
-            });
-            let _resume_cleanup = AbortOnDrop(resume.abort_handle());
-            tokio::time::timeout(Duration::from_secs(5), barrier.wait_sent())
-                .await
-                .context("accepted legacy continuation frame was not flushed")?;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let page = sibling
-                        .public_transcript_page("legacy-managed", None, 16)
-                        .await?;
-                    if matches!(page.pending.as_ref(), Some(record) if record.kind == store::PublicTurnKind::LegacyContinuation) {
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
+                },
+            )
             .await
-            .context("owner did not commit the paused legacy continuation")??;
-            resume.abort();
-            ensure!(
-                tokio::time::timeout(Duration::from_secs(5), resume)
-                    .await
-                    .context("cancelled legacy continuation did not end")?
-                    .is_err_and(|error| error.is_cancelled()),
-                "accepted legacy continuation completed instead of being cancelled"
-            );
-            ensure!(memory.reconcile().await? == Some(true));
-            let page = sibling
-                .public_transcript_page("legacy-managed", None, 16)
-                .await?;
-            ensure!(
-                matches!(page.pending.as_ref(), Some(record)
-                    if record.kind == store::PublicTurnKind::LegacyContinuation
-                        && record.user_entry.is_none()
-                        && record.continuation_of_node_id.is_none()),
-                "reconciled legacy continuation changed its honest projection"
-            );
-            ensure!(
-                sibling.history(&namespace, 16).await?
-                    == [Message::text("user", "legacy question")],
-                "legacy continuation duplicated its retained user row"
-            );
-
-            memory.close().await?;
-            sibling.close().await?;
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
-                .await
-                .context("managed legacy continuation owner did not reap")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("managed legacy continuation fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
+        }
+        .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
@@ -4471,643 +4584,144 @@ mod tests {
     {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner.
-        let deadline = fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let executable = std::env::current_exe()?;
-            let open = || {
-                MemoryStore::open_managed_observed(
-                    options.clone(),
-                    project.clone(),
-                    executable.clone(),
-                )
-                .1
-            };
-            let memory = open().await?;
-            let sibling = open().await?;
-            let Backend::Remote(remote) = &memory.backend else {
-                bail!("managed cancellation fixture did not attach to the service")
-            };
-            let pause = Arc::new(service::rpc::ReplyPause::default());
-            remote
-                .attachment
-                .lock()
-                .await
-                .pause_after_next_send(pause.clone());
-            let writer = tokio::spawn({
-                let memory = memory.clone();
-                async move { memory.put("accepted-lost-reply", &json!(1)).await }
-            });
-            let _writer_cleanup = AbortOnDrop(writer.abort_handle());
-            tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
-                .await
-                .context("accepted write frame was not flushed")?;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if sibling.get("accepted-lost-reply").await? == Some(json!(1)) {
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .context("owner did not commit the paused write")??;
-            writer.abort();
-            let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
-                .await
-                .context("cancelled write future did not end")?;
-            ensure!(
-                stopped.is_err_and(|error| error.is_cancelled()),
-                "accepted write future completed instead of being cancelled"
-            );
-            ensure!(memory.clone().put("blocked", &json!(true)).await.is_err());
-            sibling.put("later-sibling", &json!(2)).await?;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    match memory.reconcile().await {
-                        Ok(Some(true)) => break Ok::<(), anyhow::Error>(()),
-                        Err(error) if error.to_string().contains("remains uncertain") => {
-                            tokio::time::sleep(Duration::from_millis(20)).await;
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "accepted cancelled write fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let executable = std::env::current_exe()?;
+                        let open = || {
+                            MemoryStore::open_managed_observed(
+                                options.clone(),
+                                project.clone(),
+                                executable.clone(),
+                            )
+                            .1
+                        };
+                        let memory = open().await?;
+                        let sibling = open().await?;
+                        let Backend::Remote(remote) = &memory.backend else {
+                            bail!("managed cancellation fixture did not attach to the service")
+                        };
+                        let pause = Arc::new(service::rpc::ReplyPause::default());
+                        remote
+                            .attachment
+                            .lock()
+                            .await
+                            .pause_after_next_send(pause.clone());
+                        let writer = tokio::spawn({
+                            let memory = memory.clone();
+                            async move { memory.put("accepted-lost-reply", &json!(1)).await }
+                        });
+                        let _writer_cleanup = AbortOnDrop(writer.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                            .await
+                            .context("accepted write frame was not flushed")?;
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                if sibling.get("accepted-lost-reply").await? == Some(json!(1)) {
+                                    break Ok::<(), anyhow::Error>(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .context("owner did not commit the paused write")??;
+                        writer.abort();
+                        let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
+                            .await
+                            .context("cancelled write future did not end")?;
+                        ensure!(
+                            stopped.is_err_and(|error| error.is_cancelled()),
+                            "accepted write future completed instead of being cancelled"
+                        );
+                        ensure!(memory.clone().put("blocked", &json!(true)).await.is_err());
+                        sibling.put("later-sibling", &json!(2)).await?;
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        match memory.reconcile().await {
+                            Ok(Some(true)) => break Ok::<(), anyhow::Error>(()),
+                            Err(error) if error.to_string().contains("remains uncertain") => {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            other => {
+                                bail!("accepted cancelled write had unexpected outcome: {other:?}")
+                            }
                         }
-                        other => {
-                            bail!("accepted cancelled write had unexpected outcome: {other:?}")
-                        }
                     }
-                }
-            })
-            .await
-            .context("cancelled write indexed-outcome deadline")??;
-            ensure!(memory.get("accepted-lost-reply").await? == Some(json!(1)));
-            memory.put("after-proof", &json!(3)).await?;
-            memory.close().await?;
-            sibling.close().await?;
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
+                })
                 .await
-                .context("cancelled write fixture owner did not reap")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("accepted cancelled write fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
+                .context("cancelled write indexed-outcome deadline")??;
+                        ensure!(memory.get("accepted-lost-reply").await? == Some(json!(1)));
+                        memory.put("after-proof", &json!(3)).await?;
+                        memory.close().await?;
+                        sibling.close().await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "cancelled write fixture owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
     async fn remote_reasoning_summary_lost_reply_reconciles_one_atomic_receipt() -> Result<()> {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner.
-        let deadline = fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let executable = std::env::current_exe()?;
-            let open = || {
-                MemoryStore::open_managed_observed(
-                    options.clone(),
-                    project.clone(),
-                    executable.clone(),
-                )
-                .1
-            };
-            let memory = open().await?;
-            let sibling = open().await?;
-            let Backend::Remote(remote) = &memory.backend else {
-                bail!("reasoning summary fixture did not attach to the managed service")
-            };
-            let record = crate::ReasoningSummaryRecord {
-                session_id: "session".into(),
-                turn_id: Some("turn".into()),
-                operation_id: None,
-                actor_id: "actor".into(),
-                invocation_id: "invocation".into(),
-                item_id: Some("item".into()),
-                output_index: Some(0),
-                summary_index: 0,
-                text: "settled private summary".into(),
-            };
-            let expected = serde_json::to_value(&record)?;
-            let key = store::reasoning_summary_key(&record)?;
-            let pause = Arc::new(service::rpc::ReplyPause::default());
-            remote
-                .attachment
-                .lock()
-                .await
-                .pause_after_next_send(pause.clone());
-            let writer = tokio::spawn({
-                let memory = memory.clone();
-                let record = record.clone();
-                async move { memory.put_reasoning_summaries(&[record]).await }
-            });
-            let _writer_cleanup = AbortOnDrop(writer.abort_handle());
-            tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
-                .await
-                .context("reasoning summary reply frame was not flushed")?;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if sibling.get(&key).await? == Some(expected.clone()) {
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .context("owner did not durably commit the paused reasoning summary batch")??;
-            writer.abort();
-            let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
-                .await
-                .context("cancelled reasoning summary write did not end")?;
-            ensure!(
-                stopped.is_err_and(|error| error.is_cancelled()),
-                "paused reasoning summary write completed instead of being cancelled"
-            );
-            ensure!(
-                memory
-                    .put_reasoning_summaries(std::slice::from_ref(&record))
-                    .await
-                    .is_err(),
-                "a cancelled summary receipt failed to fence further mutations"
-            );
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    match memory.reconcile().await {
-                        Ok(Some(true)) => break Ok::<(), anyhow::Error>(()),
-                        Err(error) if error.to_string().contains("remains uncertain") => {
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                        }
-                        other => {
-                            bail!("paused reasoning summary had unexpected outcome: {other:?}")
-                        }
-                    }
-                }
-            })
-            .await
-            .context("reasoning summary indexed-outcome deadline")??;
-            memory
-                .put_reasoning_summaries(std::slice::from_ref(&record))
-                .await?;
-            let mut conflicting = record.clone();
-            conflicting.text = "conflicting payload".into();
-            let error = memory
-                .put_reasoning_summaries(&[conflicting])
-                .await
-                .unwrap_err();
-            ensure!(
-                error
-                    .downcast_ref::<store::ReasoningSummaryConflict>()
-                    .is_some(),
-                "managed settled-identity conflict was not typed definite rejection: {error:#}"
-            );
-            let mut later = record;
-            later.summary_index = 1;
-            later.text = "later settled private summary".into();
-            memory.put_reasoning_summaries(&[later]).await?;
-            memory.close().await?;
-            sibling.close().await?;
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
-                .await
-                .context("reasoning summary fixture owner did not reap")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "remote reasoning summary lost-reply fixture exceeded its {deadline:?} deadline"
-            )
-        })??;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn remote_session_checkpoint_lost_reply_preserves_pinned_provenance() -> Result<()> {
-        crate::test_support::warm_runtime_cache().await?;
-        // Real lifecycles: one fresh service owner.
-        let deadline = fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let executable = std::env::current_exe()?;
-            let open = || {
-                MemoryStore::open_managed_observed(
-                    options.clone(),
-                    project.clone(),
-                    executable.clone(),
-                )
-                .1
-            };
-            let memory = open().await?;
-            let inspector = open().await?;
-            let actor = "project/example/ifs/identity/actor";
-            memory
-                .append_message(actor, &Message::text("user", "legacy"))
-                .await?;
-            memory
-                .append_session_message(actor, "session-a", &Message::text("user", "source"))
-                .await?;
-            let session_window = memory
-                .session_history_window(actor, "session-a", 16)
-                .await?;
-            ensure!(
-                session_window.total_rows == 1
-                    && session_window.messages[0].plain_text() == Some("source"),
-                "managed session history included legacy or another-session rows"
-            );
-            let session_suffix = memory
-                .session_history_window_after(actor, "session-a", 0, 16)
-                .await?;
-            ensure!(
-                session_suffix.view == "main"
-                    && session_suffix.total_rows == 1
-                    && session_suffix.rows.len() == 1
-                    && session_suffix.rows[0].message.plain_text() == Some("source"),
-                "managed session cursor history returned the wrong source suffix"
-            );
-            let snapshot = memory
-                .session_source_snapshot(actor, "session-a", actor, 0, 16)
-                .await?;
-            ensure!(
-                snapshot.rows.len() == 1,
-                "session snapshot leaked another row"
-            );
-            let through = snapshot
-                .through_inclusive
-                .context("session snapshot omitted its inclusive boundary")?;
-            let record = store::ContextSummaryRecord {
-                actor_namespace: actor.into(),
-                session_id: "session-a".into(),
-                source_namespace: actor.into(),
-                summary_namespace: format!("{actor}/session/session-a/summaries"),
-                source_view: snapshot.view,
-                source_revision: snapshot.revision,
-                after_sequence: snapshot.after_exclusive,
-                through_sequence: through,
-                turn_id: None,
-                operation_id: Some("compact-a".into()),
-                producer_actor_id: Some("producer-a".into()),
-                invocation_id: "invocation-a".into(),
-                summary: "managed summary".into(),
-            };
-            let private = crate::ReasoningSummaryRecord {
-                session_id: "session-a".into(),
-                turn_id: None,
-                operation_id: Some("compact-a".into()),
-                actor_id: "producer-a".into(),
-                invocation_id: "invocation-a".into(),
-                item_id: Some("item-a".into()),
-                output_index: Some(0),
-                summary_index: 0,
-                text: "private compact reasoning".into(),
-            };
-            let private_key = store::reasoning_summary_key(&private)?;
-            let checkpoint = store::ContextSummaryCheckpoint {
-                record: record.clone(),
-                private_reasoning: vec![private.clone()],
-            };
-            let Backend::Remote(remote) = &memory.backend else {
-                bail!("session checkpoint fixture did not attach to the service")
-            };
-            let pause = Arc::new(service::rpc::ReplyPause::default());
-            remote
-                .attachment
-                .lock()
-                .await
-                .pause_after_next_send(pause.clone());
-            let mut invalid = checkpoint.clone();
-            invalid.private_reasoning[0].actor_id = "wrong-producer".into();
-            let rejected = memory
-                .checkpoint_context_summary(&invalid)
-                .await
-                .expect_err("mismatched private producer reached the managed service");
-            ensure!(
-                rejected
-                    .to_string()
-                    .contains("private compact reasoning provenance does not match"),
-                "checkpoint rejected the wrong invalid field: {rejected:#}"
-            );
-            ensure!(
-                tokio::time::timeout(Duration::from_millis(100), pause.sent.notified())
-                    .await
-                    .is_err(),
-                "invalid checkpoint acquired a mutating attachment and sent an RPC frame"
-            );
-            let mut oversized = checkpoint.clone();
-            oversized.record.summary = "\u{0001}".repeat(16 * 1024 * 1024);
-            let rejected = memory
-                .checkpoint_context_summary(&oversized)
-                .await
-                .expect_err("oversized checkpoint reached the managed service");
-            ensure!(
-                rejected
-                    .to_string()
-                    .contains("context summary checkpoint exceeds 64 MiB"),
-                "checkpoint rejected the wrong oversized field: {rejected:#}"
-            );
-            ensure!(
-                tokio::time::timeout(Duration::from_millis(100), pause.sent.notified())
-                    .await
-                    .is_err(),
-                "oversized checkpoint acquired a mutating attachment and sent an RPC frame"
-            );
-            drop(oversized);
-            let request_id = Uuid::new_v4();
-            let writer = tokio::spawn({
-                let remote = remote.clone();
-                let checkpoint = checkpoint.clone();
-                async move {
-                    let _mutation = remote.session.mutations.lock().await;
-                    let mut attachment = remote.attachment.lock().await;
-                    unit(
-                        remote
-                            .checked_call_locked_with_id(
-                                &mut attachment,
-                                ServiceCall::View {
-                                    candidate: remote.candidate,
-                                    operation: Box::new(ViewOperation::CheckpointContextSummary {
-                                        record: checkpoint.record,
-                                        private_reasoning: checkpoint.private_reasoning,
-                                    }),
-                                },
-                                request_id,
-                            )
-                            .await?,
-                    )
-                }
-            });
-            let _writer_cleanup = AbortOnDrop(writer.abort_handle());
-            tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
-                .await
-                .context("context checkpoint frame was not flushed")?;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if inspector
-                        .context_summary_cursor(actor, "session-a", actor)
-                        .await?
-                        .is_some()
-                    {
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .context("owner did not atomically publish the context checkpoint")??;
-            writer.abort();
-            let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
-                .await
-                .context("cancelled context checkpoint did not end")?;
-            ensure!(
-                stopped.is_err_and(|error| error.is_cancelled()),
-                "paused context checkpoint completed instead of being cancelled"
-            );
-            ensure!(
-                memory
-                    .append_session_message(actor, "session-a", &Message::text("user", "blocked"),)
-                    .await
-                    .is_err(),
-                "lost checkpoint reply did not fence its session"
-            );
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    match memory.reconcile().await {
-                        Ok(Some(true)) => break Ok::<(), anyhow::Error>(()),
-                        Err(error) if error.to_string().contains("remains uncertain") => {
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                        }
-                        other => bail!("context checkpoint had unexpected outcome: {other:?}"),
-                    }
-                }
-            })
-            .await
-            .context("context checkpoint indexed-outcome deadline")??;
-            {
-                let _mutation = remote.session.mutations.lock().await;
-                let mut attachment = remote.attachment.lock().await;
-                unit(
-                    remote
-                        .checked_call_locked_with_id(
-                            &mut attachment,
-                            ServiceCall::View {
-                                candidate: remote.candidate,
-                                operation: Box::new(ViewOperation::CheckpointContextSummary {
-                                    record: checkpoint.record.clone(),
-                                    private_reasoning: checkpoint.private_reasoning.clone(),
-                                }),
-                            },
-                            request_id,
-                        )
-                        .await?,
-                )?;
-            }
-            let summaries = inspector
-                .context_summary_window(
-                    actor,
-                    &record.summary_namespace,
-                    Some("session-a"),
-                    Some(actor),
-                    16,
-                )
-                .await?;
-            ensure!(
-                summaries.total_rows == 1
-                    && summaries.records.len() == 1
-                    && summaries.records[0].record == record,
-                "managed summary projection did not return the cursor-selected record"
-            );
-            ensure!(
-                inspector.get(&private_key).await? == Some(serde_json::to_value(&private)?),
-                "managed checkpoint did not atomically retain its private sidecar"
-            );
-            let stale = memory
-                .checkpoint_context_summary(&checkpoint)
-                .await
-                .expect_err("moved context cursor accepted a duplicate checkpoint");
-            ensure!(
-                stale.downcast_ref::<store::ContextSummaryStale>().is_some(),
-                "stale context checkpoint was not a typed definite refusal: {stale:#}"
-            );
-            memory
-                .append_session_message(
-                    actor,
-                    "session-a",
-                    &Message::text("assistant", "after proof"),
-                )
-                .await?;
-
-            let candidate = memory.begin_candidate("session candidate").await?;
-            candidate
-                .view()
-                .append_session_message(
-                    actor,
-                    "session-a",
-                    &Message::text("assistant", "candidate only"),
-                )
-                .await?;
-            let candidate_page = candidate
-                .view()
-                .session_source_snapshot(actor, "session-a", actor, through, 16)
-                .await?;
-            ensure!(
-                candidate_page
-                    .rows
-                    .iter()
-                    .any(|row| row.message.plain_text() == Some("candidate only")),
-                "candidate-pinned source snapshot omitted its private row"
-            );
-            let candidate_suffix = candidate
-                .view()
-                .session_history_window_after(actor, "session-a", through, 16)
-                .await?;
-            ensure!(
-                candidate_suffix.view == candidate.branch()
-                    && candidate_suffix.total_rows == 2
-                    && candidate_suffix
-                        .rows
-                        .iter()
-                        .any(|row| row.message.plain_text() == Some("candidate only")),
-                "candidate-pinned cursor history omitted its private row"
-            );
-            ensure!(
-                candidate
-                    .view()
-                    .session_history_window(actor, "session-a", 16)
-                    .await?
-                    .messages
-                    .iter()
-                    .any(|message| message.plain_text() == Some("candidate only")),
-                "candidate-pinned session history omitted its private row"
-            );
-            ensure!(
-                memory
-                    .session_source_snapshot(actor, "session-a", actor, through, 16)
-                    .await?
-                    .rows
-                    .iter()
-                    .all(|row| row.message.plain_text() != Some("candidate only")),
-                "candidate row leaked into the main session snapshot"
-            );
-            let main_suffix = memory
-                .session_history_window_after(actor, "session-a", through, 16)
-                .await?;
-            ensure!(
-                main_suffix.view == "main"
-                    && main_suffix.total_rows == 1
-                    && main_suffix
-                        .rows
-                        .iter()
-                        .all(|row| row.message.plain_text() != Some("candidate only")),
-                "candidate row leaked into main cursor history"
-            );
-            ensure!(
-                memory
-                    .session_history_window(actor, "session-a", 16)
-                    .await?
-                    .messages
-                    .iter()
-                    .all(|message| message.plain_text() != Some("candidate only")),
-                "candidate row leaked into main session history"
-            );
-            candidate.abandon().await?;
-            memory.close().await?;
-            inspector.close().await?;
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
-                .await
-                .context("session checkpoint fixture owner did not reap")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("remote session checkpoint fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn selected_abandon_lost_reply_proves_staged_but_not_empty_ref() -> Result<()> {
-        crate::test_support::warm_runtime_cache().await?;
-        // Real lifecycles: each of two iterations opens a fresh local store, then an owner and its
-        // successor reopen it.
-        let deadline = fixture_deadline(2, 4);
-        tokio::time::timeout(deadline, async {
-            for staged in [false, true] {
-                let root = crate::test_support::tempdir()?;
-                let project = root.path().join("project");
-                std::fs::create_dir(&project)?;
-                let project = project.canonicalize()?;
-                let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-                let scope = format!(
-                    "project/{}",
-                    digest
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>()
-                );
-                let options =
-                    crate::test_support::open_options(root.path().join("private"), scope)?;
-                let _gate = crate::spawn_gate::spawning().await;
-                let local = store::MemoryStore::open(options.clone()).await?;
-                let candidate = local.begin_candidate("selected ref").await?;
-                let branch = candidate.view().pinned_view().to_owned();
-                let base = candidate.base().to_owned();
-                if staged {
-                    candidate.view().put("private-staged", &json!(true)).await?;
-                }
-                let target = candidate.view().revision().await?;
-                ensure!((target != base) == staged);
-                drop(candidate);
-                local.close().await?;
-                let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-                let owner_inspection = owner.inspection_store_for_test();
-                let mut served = tokio::spawn(owner.serve());
-                let _owner_cleanup = AbortOnDrop(served.abort_handle());
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "remote reasoning summary lost-reply fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
                 let executable = std::env::current_exe()?;
                 let open = || {
                     MemoryStore::open_managed_observed(
@@ -5118,9 +4732,23 @@ mod tests {
                     .1
                 };
                 let memory = open().await?;
+                let sibling = open().await?;
                 let Backend::Remote(remote) = &memory.backend else {
-                    bail!("selected ref fixture did not attach to the service")
+                    bail!("reasoning summary fixture did not attach to the managed service")
                 };
+                let record = crate::ReasoningSummaryRecord {
+                    session_id: "session".into(),
+                    turn_id: Some("turn".into()),
+                    operation_id: None,
+                    actor_id: "actor".into(),
+                    invocation_id: "invocation".into(),
+                    item_id: Some("item".into()),
+                    output_index: Some(0),
+                    summary_index: 0,
+                    text: "settled private summary".into(),
+                };
+                let expected = serde_json::to_value(&record)?;
+                let key = store::reasoning_summary_key(&record)?;
                 let pause = Arc::new(service::rpc::ReplyPause::default());
                 remote
                     .attachment
@@ -5129,151 +4757,690 @@ mod tests {
                     .pause_after_next_send(pause.clone());
                 let writer = tokio::spawn({
                     let memory = memory.clone();
-                    let branch = branch.clone();
-                    let base = base.clone();
-                    let target = target.clone();
-                    async move { memory.abandon_candidate_ref(&branch, &base, &target).await }
+                    let record = record.clone();
+                    async move { memory.put_reasoning_summaries(&[record]).await }
                 });
                 let _writer_cleanup = AbortOnDrop(writer.abort_handle());
                 tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
                     .await
-                    .context("selected abandon frame was not flushed")?;
-                // The frame-send barrier precedes owner dispatch. Inspect the
-                // already-owned store without adding a sibling attachment;
-                // otherwise that sibling can win the reservation race and
-                // correctly cause selected abandonment to be refused.
-                let mut last_status = None;
+                    .context("reasoning summary reply frame was not flushed")?;
                 tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
-                        if served.is_finished() {
-                            let ended = (&mut served).await;
-                            bail!("selected abandon owner exited before ref cleanup: {ended:?}");
-                        }
-                        let status = owner_inspection.candidate_ref_status(&branch).await?;
-                        let reclaimed = status.state == store::CandidateRefState::Missing;
-                        last_status = Some(status);
-                        if reclaimed {
+                        if sibling.get(&key).await? == Some(expected.clone()) {
                             break Ok::<(), anyhow::Error>(());
                         }
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 })
                 .await
-                .with_context(|| format!("selected ref was not reclaimed: {last_status:?}"))??;
-                drop(owner_inspection);
-                // Now retain an authenticated sibling in the original
-                // generation before cancelling the held client reply.
-                let mut original_generation =
-                    tokio::time::timeout(Duration::from_secs(10), async {
-                        loop {
-                            match remote.session.factory.connect().await {
-                                Ok(attachment) => break Ok::<_, anyhow::Error>(attachment),
-                                Err(error) if service::is_peer_closed(&error) => {
-                                    tokio::time::sleep(Duration::from_millis(20)).await;
-                                }
-                                Err(error) => return Err(error),
-                            }
-                        }
-                    })
-                    .await
-                    .context("selected abandon reservation did not release")??;
+                .context("owner did not durably commit the paused reasoning summary batch")??;
                 writer.abort();
                 let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
                     .await
-                    .context("cancelled selected abandon did not end")?;
-                ensure!(stopped.is_err_and(|error| error.is_cancelled()));
+                    .context("cancelled reasoning summary write did not end")?;
                 ensure!(
-                    matches!(
-                        original_generation
-                            .call(ServiceCall::CandidateRefStatus {
-                                branch: branch.clone(),
-                            })
-                            .await?,
-                        ServiceValue::CandidateRefStatus(status)
-                            if status.state == store::CandidateRefState::Missing
-                    ),
-                    "sibling did not observe the reclaimed selected ref"
+                    stopped.is_err_and(|error| error.is_cancelled()),
+                    "paused reasoning summary write completed instead of being cancelled"
                 );
-                if staged {
-                    // A newly invented same-generation request ID cannot
-                    // turn a reclaimed ref into proof that it ran.
-                    let generation = original_generation.generation().to_owned();
-                    let unregistered = original_generation
-                        .call(ServiceCall::SelectedAbandonOutcome {
-                            original_id: Uuid::new_v4(),
-                            original_generation: generation,
-                            branch: branch.clone(),
-                            base: base.clone(),
-                            target: target.clone(),
-                        })
-                        .await?;
-                    ensure!(matches!(
-                        unregistered,
-                        ServiceValue::CandidateTransitionOutcome(
-                            service::rpc::CandidateTransitionResult::StillUncertain
-                        )
-                    ));
-                }
-                original_generation.close();
-                // Force exact old-owner/Dolt retirement, then expose the
-                // retained request only to a verified successor generation.
-                let permit = service::acquire_maintenance_permit(&options).await?;
-                tokio::time::timeout(Duration::from_secs(10), &mut served)
-                    .await
-                    .context("selected ref old owner did not reap")???;
-                drop(permit);
-                let successor = service::ServiceOwner::open(options.clone(), &project).await?;
-                let successor_served = tokio::spawn(successor.serve());
-                let _successor_cleanup = AbortOnDrop(successor_served.abort_handle());
-                if staged {
-                    ensure!(
-                        memory.recover_selected_candidate_abandon().await?
-                            == Some(SelectedAbandonResolution::Abandoned),
-                        "staged selected abandonment lost its typed result"
-                    );
-                    let rebound = memory
-                        .reopen_after_checked_recovery()
-                        .await?
-                        .context("settled selected abandonment did not rebind main")?;
-                    ensure!(
-                        memory
-                            .put("old-main-remains-closed", &json!(true))
-                            .await
-                            .is_err(),
-                        "checked rebind revived the retired main view"
-                    );
-                    rebound.put("after-proof", &json!(true)).await?;
-                    rebound.close().await?;
-                } else {
-                    let error = memory
-                        .recover_selected_candidate_abandon()
+                ensure!(
+                    memory
+                        .put_reasoning_summaries(std::slice::from_ref(&record))
                         .await
-                        .unwrap_err();
-                    ensure!(
-                        error.is::<SelectedAbandonUncertain>(),
-                        "missing no-op ref falsely proved the selected request: {error:#}"
-                    );
-                    ensure!(memory.put("blocked", &json!(true)).await.is_err());
-                }
-                memory.close().await?;
-                let inspector = open().await?;
-                ensure!(
-                    inspector.candidate_ref_status(&branch).await?.state
-                        == store::CandidateRefState::Missing
+                        .is_err(),
+                    "a cancelled summary receipt failed to fence further mutations"
                 );
-                inspector.close().await?;
-                let permit = service::acquire_maintenance_permit(&options).await?;
-                tokio::time::timeout(Duration::from_secs(10), successor_served)
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        match memory.reconcile().await {
+                            Ok(Some(true)) => break Ok::<(), anyhow::Error>(()),
+                            Err(error) if error.to_string().contains("remains uncertain") => {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            other => {
+                                bail!("paused reasoning summary had unexpected outcome: {other:?}")
+                            }
+                        }
+                    }
+                })
+                .await
+                .context("reasoning summary indexed-outcome deadline")??;
+                memory
+                    .put_reasoning_summaries(std::slice::from_ref(&record))
+                    .await?;
+                let mut conflicting = record.clone();
+                conflicting.text = "conflicting payload".into();
+                let error = memory
+                    .put_reasoning_summaries(&[conflicting])
                     .await
-                    .context("selected ref successor owner did not reap")???;
-                drop(permit);
+                    .unwrap_err();
+                ensure!(
+                    error
+                        .downcast_ref::<store::ReasoningSummaryConflict>()
+                        .is_some(),
+                    "managed settled-identity conflict was not typed definite rejection: {error:#}"
+                );
+                let mut later = record;
+                later.summary_index = 1;
+                later.text = "later settled private summary".into();
+                memory.put_reasoning_summaries(&[later]).await?;
+                memory.close().await?;
+                sibling.close().await?;
+                Ok::<(), anyhow::Error>(())
             }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("selected abandonment fixture exceeded its {deadline:?} deadline")
-        })??;
+            .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "reasoning summary fixture owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(outcome)
+    }
+
+    #[tokio::test]
+    async fn remote_session_checkpoint_lost_reply_preserves_pinned_provenance() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "remote session checkpoint fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                let executable = std::env::current_exe()?;
+                let open = || {
+                    MemoryStore::open_managed_observed(
+                        options.clone(),
+                        project.clone(),
+                        executable.clone(),
+                    )
+                    .1
+                };
+                let memory = open().await?;
+                let inspector = open().await?;
+                let actor = "project/example/ifs/identity/actor";
+                memory
+                    .append_message(actor, &Message::text("user", "legacy"))
+                    .await?;
+                memory
+                    .append_session_message(actor, "session-a", &Message::text("user", "source"))
+                    .await?;
+                let session_window = memory
+                    .session_history_window(actor, "session-a", 16)
+                    .await?;
+                ensure!(
+                    session_window.total_rows == 1
+                        && session_window.messages[0].plain_text() == Some("source"),
+                    "managed session history included legacy or another-session rows"
+                );
+                let session_suffix = memory
+                    .session_history_window_after(actor, "session-a", 0, 16)
+                    .await?;
+                ensure!(
+                    session_suffix.view == "main"
+                        && session_suffix.total_rows == 1
+                        && session_suffix.rows.len() == 1
+                        && session_suffix.rows[0].message.plain_text() == Some("source"),
+                    "managed session cursor history returned the wrong source suffix"
+                );
+                let snapshot = memory
+                    .session_source_snapshot(actor, "session-a", actor, 0, 16)
+                    .await?;
+                ensure!(
+                    snapshot.rows.len() == 1,
+                    "session snapshot leaked another row"
+                );
+                let through = snapshot
+                    .through_inclusive
+                    .context("session snapshot omitted its inclusive boundary")?;
+                let record = store::ContextSummaryRecord {
+                    actor_namespace: actor.into(),
+                    session_id: "session-a".into(),
+                    source_namespace: actor.into(),
+                    summary_namespace: format!("{actor}/session/session-a/summaries"),
+                    source_view: snapshot.view,
+                    source_revision: snapshot.revision,
+                    after_sequence: snapshot.after_exclusive,
+                    through_sequence: through,
+                    turn_id: None,
+                    operation_id: Some("compact-a".into()),
+                    producer_actor_id: Some("producer-a".into()),
+                    invocation_id: "invocation-a".into(),
+                    summary: "managed summary".into(),
+                };
+                let private = crate::ReasoningSummaryRecord {
+                    session_id: "session-a".into(),
+                    turn_id: None,
+                    operation_id: Some("compact-a".into()),
+                    actor_id: "producer-a".into(),
+                    invocation_id: "invocation-a".into(),
+                    item_id: Some("item-a".into()),
+                    output_index: Some(0),
+                    summary_index: 0,
+                    text: "private compact reasoning".into(),
+                };
+                let private_key = store::reasoning_summary_key(&private)?;
+                let checkpoint = store::ContextSummaryCheckpoint {
+                    record: record.clone(),
+                    private_reasoning: vec![private.clone()],
+                };
+                let Backend::Remote(remote) = &memory.backend else {
+                    bail!("session checkpoint fixture did not attach to the service")
+                };
+                let pause = Arc::new(service::rpc::ReplyPause::default());
+                remote
+                    .attachment
+                    .lock()
+                    .await
+                    .pause_after_next_send(pause.clone());
+                let mut invalid = checkpoint.clone();
+                invalid.private_reasoning[0].actor_id = "wrong-producer".into();
+                let rejected = memory
+                    .checkpoint_context_summary(&invalid)
+                    .await
+                    .expect_err("mismatched private producer reached the managed service");
+                ensure!(
+                    rejected
+                        .to_string()
+                        .contains("private compact reasoning provenance does not match"),
+                    "checkpoint rejected the wrong invalid field: {rejected:#}"
+                );
+                ensure!(
+                    tokio::time::timeout(Duration::from_millis(100), pause.sent.notified())
+                        .await
+                        .is_err(),
+                    "invalid checkpoint acquired a mutating attachment and sent an RPC frame"
+                );
+                let mut oversized = checkpoint.clone();
+                oversized.record.summary = "\u{0001}".repeat(16 * 1024 * 1024);
+                let rejected = memory
+                    .checkpoint_context_summary(&oversized)
+                    .await
+                    .expect_err("oversized checkpoint reached the managed service");
+                ensure!(
+                    rejected
+                        .to_string()
+                        .contains("context summary checkpoint exceeds 64 MiB"),
+                    "checkpoint rejected the wrong oversized field: {rejected:#}"
+                );
+                ensure!(
+                    tokio::time::timeout(Duration::from_millis(100), pause.sent.notified())
+                        .await
+                        .is_err(),
+                    "oversized checkpoint acquired a mutating attachment and sent an RPC frame"
+                );
+                drop(oversized);
+                let request_id = Uuid::new_v4();
+                let writer = tokio::spawn({
+                    let remote = remote.clone();
+                    let checkpoint = checkpoint.clone();
+                    async move {
+                        let _mutation = remote.session.mutations.lock().await;
+                        let mut attachment = remote.attachment.lock().await;
+                        unit(
+                            remote
+                                .checked_call_locked_with_id(
+                                    &mut attachment,
+                                    ServiceCall::View {
+                                        candidate: remote.candidate,
+                                        operation: Box::new(
+                                            ViewOperation::CheckpointContextSummary {
+                                                record: checkpoint.record,
+                                                private_reasoning: checkpoint.private_reasoning,
+                                            },
+                                        ),
+                                    },
+                                    request_id,
+                                )
+                                .await?,
+                        )
+                    }
+                });
+                let _writer_cleanup = AbortOnDrop(writer.abort_handle());
+                tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                    .await
+                    .context("context checkpoint frame was not flushed")?;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if inspector
+                            .context_summary_cursor(actor, "session-a", actor)
+                            .await?
+                            .is_some()
+                        {
+                            break Ok::<(), anyhow::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .context("owner did not atomically publish the context checkpoint")??;
+                writer.abort();
+                let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
+                    .await
+                    .context("cancelled context checkpoint did not end")?;
+                ensure!(
+                    stopped.is_err_and(|error| error.is_cancelled()),
+                    "paused context checkpoint completed instead of being cancelled"
+                );
+                ensure!(
+                    memory
+                        .append_session_message(
+                            actor,
+                            "session-a",
+                            &Message::text("user", "blocked"),
+                        )
+                        .await
+                        .is_err(),
+                    "lost checkpoint reply did not fence its session"
+                );
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        match memory.reconcile().await {
+                            Ok(Some(true)) => break Ok::<(), anyhow::Error>(()),
+                            Err(error) if error.to_string().contains("remains uncertain") => {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            other => bail!("context checkpoint had unexpected outcome: {other:?}"),
+                        }
+                    }
+                })
+                .await
+                .context("context checkpoint indexed-outcome deadline")??;
+                {
+                    let _mutation = remote.session.mutations.lock().await;
+                    let mut attachment = remote.attachment.lock().await;
+                    unit(
+                        remote
+                            .checked_call_locked_with_id(
+                                &mut attachment,
+                                ServiceCall::View {
+                                    candidate: remote.candidate,
+                                    operation: Box::new(ViewOperation::CheckpointContextSummary {
+                                        record: checkpoint.record.clone(),
+                                        private_reasoning: checkpoint.private_reasoning.clone(),
+                                    }),
+                                },
+                                request_id,
+                            )
+                            .await?,
+                    )?;
+                }
+                let summaries = inspector
+                    .context_summary_window(
+                        actor,
+                        &record.summary_namespace,
+                        Some("session-a"),
+                        Some(actor),
+                        16,
+                    )
+                    .await?;
+                ensure!(
+                    summaries.total_rows == 1
+                        && summaries.records.len() == 1
+                        && summaries.records[0].record == record,
+                    "managed summary projection did not return the cursor-selected record"
+                );
+                ensure!(
+                    inspector.get(&private_key).await? == Some(serde_json::to_value(&private)?),
+                    "managed checkpoint did not atomically retain its private sidecar"
+                );
+                let stale = memory
+                    .checkpoint_context_summary(&checkpoint)
+                    .await
+                    .expect_err("moved context cursor accepted a duplicate checkpoint");
+                ensure!(
+                    stale.downcast_ref::<store::ContextSummaryStale>().is_some(),
+                    "stale context checkpoint was not a typed definite refusal: {stale:#}"
+                );
+                memory
+                    .append_session_message(
+                        actor,
+                        "session-a",
+                        &Message::text("assistant", "after proof"),
+                    )
+                    .await?;
+
+                let candidate = memory.begin_candidate("session candidate").await?;
+                candidate
+                    .view()
+                    .append_session_message(
+                        actor,
+                        "session-a",
+                        &Message::text("assistant", "candidate only"),
+                    )
+                    .await?;
+                let candidate_page = candidate
+                    .view()
+                    .session_source_snapshot(actor, "session-a", actor, through, 16)
+                    .await?;
+                ensure!(
+                    candidate_page
+                        .rows
+                        .iter()
+                        .any(|row| row.message.plain_text() == Some("candidate only")),
+                    "candidate-pinned source snapshot omitted its private row"
+                );
+                let candidate_suffix = candidate
+                    .view()
+                    .session_history_window_after(actor, "session-a", through, 16)
+                    .await?;
+                ensure!(
+                    candidate_suffix.view == candidate.branch()
+                        && candidate_suffix.total_rows == 2
+                        && candidate_suffix
+                            .rows
+                            .iter()
+                            .any(|row| row.message.plain_text() == Some("candidate only")),
+                    "candidate-pinned cursor history omitted its private row"
+                );
+                ensure!(
+                    candidate
+                        .view()
+                        .session_history_window(actor, "session-a", 16)
+                        .await?
+                        .messages
+                        .iter()
+                        .any(|message| message.plain_text() == Some("candidate only")),
+                    "candidate-pinned session history omitted its private row"
+                );
+                ensure!(
+                    memory
+                        .session_source_snapshot(actor, "session-a", actor, through, 16)
+                        .await?
+                        .rows
+                        .iter()
+                        .all(|row| row.message.plain_text() != Some("candidate only")),
+                    "candidate row leaked into the main session snapshot"
+                );
+                let main_suffix = memory
+                    .session_history_window_after(actor, "session-a", through, 16)
+                    .await?;
+                ensure!(
+                    main_suffix.view == "main"
+                        && main_suffix.total_rows == 1
+                        && main_suffix
+                            .rows
+                            .iter()
+                            .all(|row| row.message.plain_text() != Some("candidate only")),
+                    "candidate row leaked into main cursor history"
+                );
+                ensure!(
+                    memory
+                        .session_history_window(actor, "session-a", 16)
+                        .await?
+                        .messages
+                        .iter()
+                        .all(|message| message.plain_text() != Some("candidate only")),
+                    "candidate row leaked into main session history"
+                );
+                candidate.abandon().await?;
+                memory.close().await?;
+                inspector.close().await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "session checkpoint fixture owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(outcome)
+    }
+
+    #[tokio::test]
+    async fn selected_abandon_lost_reply_proves_staged_but_not_empty_ref() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: each of two iterations opens a fresh local store, then an owner and its
+        // successor reopen it.
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(2, 4),
+            "selected abandonment fixture",
+        );
+        for staged in [false, true] {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+            let outcome = deadline
+                .serve(
+                    async |served| {
+                        let _gate = crate::spawn_gate::spawning().await;
+                        let local = store::MemoryStore::open(options.clone()).await?;
+                        let candidate = local.begin_candidate("selected ref").await?;
+                        let branch = candidate.view().pinned_view().to_owned();
+                        let base = candidate.base().to_owned();
+                        if staged {
+                            candidate.view().put("private-staged", &json!(true)).await?;
+                        }
+                        let target = candidate.view().revision().await?;
+                        ensure!((target != base) == staged);
+                        drop(candidate);
+                        local.close().await?;
+                        let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                        let owner_inspection = owner.inspection_store_for_test();
+                        served.serve(owner)?;
+                        async {
+                    let executable = std::env::current_exe()?;
+                    let open = || {
+                        MemoryStore::open_managed_observed(
+                            options.clone(),
+                            project.clone(),
+                            executable.clone(),
+                        )
+                        .1
+                    };
+                    let memory = open().await?;
+                    let Backend::Remote(remote) = &memory.backend else {
+                        bail!("selected ref fixture did not attach to the service")
+                    };
+                    let pause = Arc::new(service::rpc::ReplyPause::default());
+                    remote
+                        .attachment
+                        .lock()
+                        .await
+                        .pause_after_next_send(pause.clone());
+                    let writer = tokio::spawn({
+                        let memory = memory.clone();
+                        let branch = branch.clone();
+                        let base = base.clone();
+                        let target = target.clone();
+                        async move { memory.abandon_candidate_ref(&branch, &base, &target).await }
+                    });
+                    let _writer_cleanup = AbortOnDrop(writer.abort_handle());
+                    tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                        .await
+                        .context("selected abandon frame was not flushed")?;
+                    // The frame-send barrier precedes owner dispatch. Inspect the
+                    // already-owned store without adding a sibling attachment;
+                    // otherwise that sibling can win the reservation race and
+                    // correctly cause selected abandonment to be refused.
+                    let mut last_status = None;
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            if served.is_finished() {
+                                let ended = served
+                                    .reap(Duration::from_secs(10), "selected abandon owner exit")
+                                    .await;
+                                bail!(
+                                    "selected abandon owner exited before ref cleanup: {ended:?}"
+                                );
+                            }
+                            let status = owner_inspection.candidate_ref_status(&branch).await?;
+                            let reclaimed = status.state == store::CandidateRefState::Missing;
+                            last_status = Some(status);
+                            if reclaimed {
+                                break Ok::<(), anyhow::Error>(());
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .with_context(|| {
+                        format!("selected ref was not reclaimed: {last_status:?}")
+                    })??;
+                    drop(owner_inspection);
+                    // Now retain an authenticated sibling in the original
+                    // generation before cancelling the held client reply.
+                    let mut original_generation =
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                match remote.session.factory.connect().await {
+                                    Ok(attachment) => break Ok::<_, anyhow::Error>(attachment),
+                                    Err(error) if service::is_peer_closed(&error) => {
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                        })
+                        .await
+                        .context("selected abandon reservation did not release")??;
+                    writer.abort();
+                    let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
+                        .await
+                        .context("cancelled selected abandon did not end")?;
+                    ensure!(stopped.is_err_and(|error| error.is_cancelled()));
+                    ensure!(
+                        matches!(
+                            original_generation
+                                .call(ServiceCall::CandidateRefStatus {
+                                    branch: branch.clone(),
+                                })
+                                .await?,
+                            ServiceValue::CandidateRefStatus(status)
+                                if status.state == store::CandidateRefState::Missing
+                        ),
+                        "sibling did not observe the reclaimed selected ref"
+                    );
+                    if staged {
+                        // A newly invented same-generation request ID cannot
+                        // turn a reclaimed ref into proof that it ran.
+                        let generation = original_generation.generation().to_owned();
+                        let unregistered = original_generation
+                            .call(ServiceCall::SelectedAbandonOutcome {
+                                original_id: Uuid::new_v4(),
+                                original_generation: generation,
+                                branch: branch.clone(),
+                                base: base.clone(),
+                                target: target.clone(),
+                            })
+                            .await?;
+                        ensure!(matches!(
+                            unregistered,
+                            ServiceValue::CandidateTransitionOutcome(
+                                service::rpc::CandidateTransitionResult::StillUncertain
+                            )
+                        ));
+                    }
+                    original_generation.close();
+                    // Force exact old-owner/Dolt retirement, then expose the
+                    // retained request only to a verified successor generation.
+                    let _gate = served
+                        .restart(
+                            _gate,
+                            &options,
+                            &project,
+                            Duration::from_secs(10),
+                            "selected ref old owner did not reap",
+                        )
+                        .await?;
+                    if staged {
+                        ensure!(
+                            memory.recover_selected_candidate_abandon().await?
+                                == Some(SelectedAbandonResolution::Abandoned),
+                            "staged selected abandonment lost its typed result"
+                        );
+                        let rebound = memory
+                            .reopen_after_checked_recovery()
+                            .await?
+                            .context("settled selected abandonment did not rebind main")?;
+                        ensure!(
+                            memory
+                                .put("old-main-remains-closed", &json!(true))
+                                .await
+                                .is_err(),
+                            "checked rebind revived the retired main view"
+                        );
+                        rebound.put("after-proof", &json!(true)).await?;
+                        rebound.close().await?;
+                    } else {
+                        let error = memory
+                            .recover_selected_candidate_abandon()
+                            .await
+                            .unwrap_err();
+                        ensure!(
+                            error.is::<SelectedAbandonUncertain>(),
+                            "missing no-op ref falsely proved the selected request: {error:#}"
+                        );
+                        ensure!(memory.put("blocked", &json!(true)).await.is_err());
+                    }
+                    memory.close().await?;
+                    let inspector = open().await?;
+                    ensure!(
+                        inspector.candidate_ref_status(&branch).await?.state
+                            == store::CandidateRefState::Missing
+                    );
+                    inspector.close().await?;
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await
+                    },
+                    async |served| {
+                        served
+                            .retire(
+                                &options,
+                                None,
+                                Duration::from_secs(10),
+                                "selected ref fixture's current owner did not reap",
+                            )
+                            .await
+                    },
+                )
+                .await;
+            root.release(outcome)?;
+        }
         Ok(())
     }
 
@@ -5281,217 +5448,238 @@ mod tests {
     async fn lost_candidate_unit_reply_reattaches_before_read_write_and_promotion() -> Result<()> {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: two fresh owners, the second followed by its reopened successor.
-        let deadline = fixture_deadline(2, 1);
-        tokio::time::timeout(deadline, async {
-            for restart_owner in [false, true] {
-                let root = crate::test_support::tempdir()?;
-                let project = root.path().join("project");
-                std::fs::create_dir(&project)?;
-                let project = project.canonicalize()?;
-                let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-                let scope = format!(
-                    "project/{}",
-                    digest
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>()
-                );
-                let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-                let _gate = crate::spawn_gate::spawning().await;
-                let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-                let mut served = tokio::spawn(owner.serve());
-                let executable = std::env::current_exe()?;
-                let memory = MemoryStore::open_managed_observed(
-                    options.clone(),
-                    project.clone(),
-                    executable.clone(),
-                )
-                .1
-                .await?;
-                let old_main_clone = memory.clone();
-                let candidate = memory.begin_candidate("accepted private write").await?;
-                let private = candidate.view();
-                let Backend::Remote(remote) = &private.backend else {
-                    bail!("candidate unit fixture did not attach to the service")
-                };
-                let creation_id = remote
-                    .candidate_creation_id
-                    .context("candidate creation identity was not retained")?;
-                let generation = remote.attachment.lock().await.generation().to_owned();
-                let pause = Arc::new(service::rpc::ReplyPause::default());
-                remote
-                    .attachment
-                    .lock()
-                    .await
-                    .pause_after_next_send(pause.clone());
-                let writer = tokio::spawn({
-                    let private = private.clone();
-                    async move { private.put("accepted-private", &json!(1)).await }
-                });
-                let _writer_cleanup = AbortOnDrop(writer.abort_handle());
-                tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
-                    .await
-                    .context("candidate unit frame was not flushed")?;
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(2, 1),
+            "candidate unit recovery fixture",
+        );
+        for restart_owner in [false, true] {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+            let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let executable = std::env::current_exe()?;
+                        let memory = MemoryStore::open_managed_observed(
+                            options.clone(),
+                            project.clone(),
+                            executable.clone(),
+                        )
+                        .1
+                        .await?;
+                        let old_main_clone = memory.clone();
+                        let candidate = memory.begin_candidate("accepted private write").await?;
+                        let private = candidate.view();
+                        let Backend::Remote(remote) = &private.backend else {
+                            bail!("candidate unit fixture did not attach to the service")
+                        };
+                        let creation_id = remote
+                            .candidate_creation_id
+                            .context("candidate creation identity was not retained")?;
+                        let generation = remote.attachment.lock().await.generation().to_owned();
+                        let pause = Arc::new(service::rpc::ReplyPause::default());
+                        remote
+                            .attachment
+                            .lock()
+                            .await
+                            .pause_after_next_send(pause.clone());
+                        let writer = tokio::spawn({
+                            let private = private.clone();
+                            async move { private.put("accepted-private", &json!(1)).await }
+                        });
+                        let _writer_cleanup = AbortOnDrop(writer.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                            .await
+                            .context("candidate unit frame was not flushed")?;
 
-                // A separate checked attachment proves the native owner committed
-                // the private write before cancellation drops its actual reply.
-                let mut witness = service::attach_or_start(&options, &project, &executable).await?;
-                let ServiceValue::CandidateOutcome(service::rpc::CandidateCreationOutcome::Open {
-                    handle,
-                    branch,
-                    ..
-                }) = witness
-                    .call(ServiceCall::CandidateOutcome {
-                        original_id: creation_id,
-                        original_generation: generation,
-                    })
-                    .await?
-                else {
-                    bail!("witness could not open the exact candidate ref")
-                };
-                ensure!(branch == remote.pinned_view);
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    loop {
-                        let value = witness
-                            .call(ServiceCall::View {
-                                candidate: Some(handle),
-                                operation: Box::new(ViewOperation::Get {
-                                    key: "accepted-private".into(),
-                                }),
+                        // A separate checked attachment proves the native owner committed
+                        // the private write before cancellation drops its actual reply.
+                        let mut witness = service::attach_or_start(&options, &project, &executable).await?;
+                        let ServiceValue::CandidateOutcome(service::rpc::CandidateCreationOutcome::Open {
+                            handle,
+                            branch,
+                            ..
+                        }) = witness
+                            .call(ServiceCall::CandidateOutcome {
+                                original_id: creation_id,
+                                original_generation: generation,
+                            })
+                            .await?
+                        else {
+                            bail!("witness could not open the exact candidate ref")
+                        };
+                        ensure!(branch == remote.pinned_view);
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                let value = witness
+                                    .call(ServiceCall::View {
+                                        candidate: Some(handle),
+                                        operation: Box::new(ViewOperation::Get {
+                                            key: "accepted-private".into(),
+                                        }),
+                                    })
+                                    .await?;
+                                if matches!(value, ServiceValue::StoredValue(Some(ref stored)) if stored == &json!(1)) {
+                                    break Ok::<(), anyhow::Error>(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .context("owner did not commit the paused candidate write")??;
+                        witness.close();
+                        tokio::time::timeout(Duration::from_secs(10), pause.replied.notified())
+                            .await
+                            .context("owner did not settle and reply to the paused candidate unit write")?;
+                        writer.abort();
+                        let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
+                            .await
+                            .context("cancelled candidate writer did not end")?;
+                        ensure!(stopped.is_err_and(|error| error.is_cancelled()));
+                        ensure!(memory.put("fenced", &json!(true)).await.is_err());
+                        ensure!(
+                            private
+                                .reconcile()
+                                .await
+                                .unwrap_err()
+                                .to_string()
+                                .contains("typed candidate recovery")
+                        );
+                        let _gate = if restart_owner {
+                            // The logical client keeps its pending receipt and fence, but
+                            // releases old transports so the owner can reap before a
+                            // successor performs the read-only proof and reattachment.
+                            let Backend::Remote(main_remote) = &memory.backend else {
+                                bail!("candidate fixture lost its managed main view")
+                            };
+                            main_remote.attachment.lock().await.close();
+                            remote.attachment.lock().await.close();
+                            // A one-shot successor open; see
+                            // `crate::spawn_gate::excluding_spawns`.
+                            let ((), gate) = crate::spawn_gate::excluding_spawns(_gate, async {
+                                let permit = tokio::time::timeout(Duration::from_secs(10), async {
+                                    loop {
+                                        match service::acquire_maintenance_permit(&options).await {
+                                            Ok(permit) => break Ok::<_, anyhow::Error>(permit),
+                                            Err(error)
+                                                if error
+                                                    .to_string()
+                                                    .contains("memory service has active clients") =>
+                                            {
+                                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                            }
+                                            Err(error) => break Err(error),
+                                        }
+                                    }
+                                })
+                                .await
+                                .context("closed candidate transports did not drain before owner retirement")??;
+                                served
+                                    .reap(Duration::from_secs(10), "candidate unit old owner did not reap")
+                                    .await?;
+                                drop(permit);
+                                let successor = service::ServiceOwner::open(options.clone(), &project).await?;
+                                served.serve(successor)
                             })
                             .await?;
-                        if matches!(value, ServiceValue::StoredValue(Some(ref stored)) if stored == &json!(1)) {
-                            break Ok::<(), anyhow::Error>(());
+                            gate
+                        } else {
+                            _gate
+                        };
+                        let recovered = private
+                            .recover_candidate_unit()
+                            .await?
+                            .context("settled private unit write had no candidate recovery")?;
+                        ensure!(recovered.committed);
+                        ensure!(private.get("accepted-private").await.is_err());
+                        let candidate = recovered.candidate;
+                        let (rebound_main, rebound_clone) = if restart_owner {
+                            // The first close completes the main attachment, then
+                            // waits on this held old candidate attachment. Cancelling
+                            // there must retain both weak registry entries so either
+                            // old main clone can retry checked successor rebind.
+                            let held = remote.attachment.lock().await;
+                            ensure!(
+                                tokio::time::timeout(
+                                    Duration::from_millis(50),
+                                    memory.reopen_after_checked_recovery(),
+                                )
+                                .await
+                                .is_err(),
+                                "retired attachment drain escaped its held candidate"
+                            );
+                            ensure!(
+                                remote.session.extra_connections.is_closed(),
+                                "cancelled rebind did not enter retired-session drain"
+                            );
+                            drop(held);
+                            let rebound_clone = old_main_clone
+                                .reopen_after_checked_recovery()
+                                .await?
+                                .context("old clone could not independently rebind")?;
+                            let rebound_main = memory
+                                .reopen_after_checked_recovery()
+                                .await?
+                                .context("cancelled main rebind could not retry")?;
+                            ensure!(memory.get("accepted-private").await.is_err());
+                            ensure!(old_main_clone.get("accepted-private").await.is_err());
+                            (Some(rebound_main), Some(rebound_clone))
+                        } else {
+                            (None, None)
+                        };
+                        ensure!(candidate.view().get("accepted-private").await? == Some(json!(1)));
+                        candidate.view().put("after-proof", &json!(2)).await?;
+                        candidate.promote().await?;
+                        let observer = if restart_owner {
+                            rebound_main.context("missing checked successor main view")?
+                        } else {
+                            memory.clone()
+                        };
+                        ensure!(observer.get("accepted-private").await? == Some(json!(1)));
+                        ensure!(observer.get("after-proof").await? == Some(json!(2)));
+                        observer.close().await?;
+                        if restart_owner {
+                            rebound_clone
+                                .context("missing independently rebound clone")?
+                                .close()
+                                .await?;
+                            // The recovered candidate owns a new logical session; the
+                            // old main close below cannot release its attachment.
+                            candidate.view().close().await?;
                         }
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        memory.close().await?;
+                        Ok::<(), anyhow::Error>(())
                     }
-                })
-                .await
-                .context("owner did not commit the paused candidate write")??;
-                witness.close();
-                writer.abort();
-                let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
                     .await
-                    .context("cancelled candidate writer did not end")?;
-                ensure!(stopped.is_err_and(|error| error.is_cancelled()));
-                ensure!(memory.put("fenced", &json!(true)).await.is_err());
-                ensure!(
-                    private
-                        .reconcile()
-                        .await
-                        .unwrap_err()
-                        .to_string()
-                        .contains("typed candidate recovery")
-                );
-                if restart_owner {
-                    // The logical client keeps its pending receipt and fence, but
-                    // releases old transports so the owner can reap before a
-                    // successor performs the read-only proof and reattachment.
-                    let Backend::Remote(main_remote) = &memory.backend else {
-                        bail!("candidate fixture lost its managed main view")
-                    };
-                    main_remote.attachment.lock().await.close();
-                    remote.attachment.lock().await.close();
-                    let permit = tokio::time::timeout(Duration::from_secs(10), async {
-                        loop {
-                            match service::acquire_maintenance_permit(&options).await {
-                                Ok(permit) => break Ok::<_, anyhow::Error>(permit),
-                                Err(error)
-                                    if error
-                                        .to_string()
-                                        .contains("memory service has active clients") =>
-                                {
-                                    tokio::time::sleep(Duration::from_millis(20)).await;
-                                }
-                                Err(error) => break Err(error),
-                            }
-                        }
-                    })
-                    .await
-                    .context("closed candidate transports did not drain before owner retirement")??;
-                    tokio::time::timeout(Duration::from_secs(10), &mut served)
-                        .await
-                        .context("candidate unit old owner did not reap")???;
-                    drop(permit);
-                    let successor = service::ServiceOwner::open(options.clone(), &project).await?;
-                    served = tokio::spawn(successor.serve());
-                }
-                let recovered = private
-                    .recover_candidate_unit()
-                    .await?
-                    .context("settled private unit write had no candidate recovery")?;
-                ensure!(recovered.committed);
-                ensure!(private.get("accepted-private").await.is_err());
-                let candidate = recovered.candidate;
-                let (rebound_main, rebound_clone) = if restart_owner {
-                    // The first close completes the main attachment, then
-                    // waits on this held old candidate attachment. Cancelling
-                    // there must retain both weak registry entries so either
-                    // old main clone can retry checked successor rebind.
-                    let held = remote.attachment.lock().await;
-                    ensure!(
-                        tokio::time::timeout(
-                            Duration::from_millis(50),
-                            memory.reopen_after_checked_recovery(),
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "candidate unit fixture owner did not reap",
                         )
                         .await
-                        .is_err(),
-                        "retired attachment drain escaped its held candidate"
-                    );
-                    ensure!(
-                        remote.session.extra_connections.is_closed(),
-                        "cancelled rebind did not enter retired-session drain"
-                    );
-                    drop(held);
-                    let rebound_clone = old_main_clone
-                        .reopen_after_checked_recovery()
-                        .await?
-                        .context("old clone could not independently rebind")?;
-                    let rebound_main = memory
-                        .reopen_after_checked_recovery()
-                        .await?
-                        .context("cancelled main rebind could not retry")?;
-                    ensure!(memory.get("accepted-private").await.is_err());
-                    ensure!(old_main_clone.get("accepted-private").await.is_err());
-                    (Some(rebound_main), Some(rebound_clone))
-                } else {
-                    (None, None)
-                };
-                ensure!(candidate.view().get("accepted-private").await? == Some(json!(1)));
-                candidate.view().put("after-proof", &json!(2)).await?;
-                candidate.promote().await?;
-                let observer = if restart_owner {
-                    rebound_main.context("missing checked successor main view")?
-                } else {
-                    memory.clone()
-                };
-                ensure!(observer.get("accepted-private").await? == Some(json!(1)));
-                ensure!(observer.get("after-proof").await? == Some(json!(2)));
-                observer.close().await?;
-                if restart_owner {
-                    rebound_clone
-                        .context("missing independently rebound clone")?
-                        .close()
-                        .await?;
-                    // The recovered candidate owns a new logical session; the
-                    // old main close below cannot release its attachment.
-                    candidate.view().close().await?;
-                }
-                memory.close().await?;
-                let permit = service::acquire_maintenance_permit(&options)
-                    .await
-                    .context("candidate unit fixture final owner remained busy")?;
-                tokio::time::timeout(Duration::from_secs(10), served)
-                    .await
-                    .context("candidate unit fixture owner did not reap")???;
-                drop(permit);
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("candidate unit recovery fixture exceeded its {deadline:?} deadline")
-        })??;
+                },
+            )
+            .await;
+            root.release(outcome)?;
+        }
         Ok(())
     }
 
@@ -5500,116 +5688,129 @@ mod tests {
     {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner.
-        let deadline = fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let (_, opening) = MemoryStore::open_managed_observed(
-                options.clone(),
-                project,
-                std::env::current_exe()?,
-            );
-            let memory = opening.await?;
-            let Backend::Remote(remote) = &memory.backend else {
-                bail!("managed promotion fixture did not attach to the service")
-            };
-            let candidate = memory.begin_candidate("lost promotion reply").await?;
-            let CandidateBackend::Remote(ref remote_candidate) = candidate.backend else {
-                bail!("managed promotion fixture did not return a remote candidate")
-            };
-            candidate.view().put("private", &json!(1)).await?;
-            let target = candidate.view().revision().await?;
-            let branch = remote_candidate.view.pinned_view.clone();
-            let base = candidate.base().to_owned();
-            let generation = remote_candidate
-                .view
-                .attachment
-                .lock()
-                .await
-                .generation()
-                .to_owned();
-            let creation_id = remote_candidate
-                .view
-                .candidate_creation_id
-                .context("candidate fixture lost its creation ID")?;
-            ensure!(candidate.promote().await? == target);
-            memory.put("later-main", &json!(true)).await?;
-            // The typed IPC fixture checks exact refs. Here the owner has
-            // settled promotion, but the logical client models losing its
-            // reply before it could release the shared mutation fence.
-            *remote.session.pending_transition.lock().unwrap() = Some(PendingTransition {
-                id: Uuid::new_v4(),
-                generation: generation.clone(),
-                kind: CandidateTransitionKind::Promote,
-                branch: branch.clone(),
-                base: base.clone(),
-                target: target.clone(),
-                creation_id,
-            });
-            remote
-                .session
-                .uncertain_write
-                .store(true, Ordering::Release);
-            ensure!(memory.clone().put("blocked", &json!(true)).await.is_err());
-            ensure!(
-                memory
-                    .recover_candidate_transition()
-                    .await?
-                    .is_some_and(|recovery| {
-                        recovery.resolution
-                            == CandidateTransitionResolution::Promoted(target.clone())
-                            && recovery.candidate.is_none()
-                    })
-            );
-            // An inverse transition against this already-promoted ref is a
-            // resolved conflict, not an open candidate requiring reattach.
-            *remote.session.pending_transition.lock().unwrap() = Some(PendingTransition {
-                id: Uuid::new_v4(),
-                generation,
-                kind: CandidateTransitionKind::Abandon,
-                branch,
-                base,
-                target,
-                creation_id,
-            });
-            remote
-                .session
-                .uncertain_write
-                .store(true, Ordering::Release);
-            let inverse = memory
-                .recover_candidate_transition()
-                .await?
-                .context("missing inverse transition outcome")?;
-            ensure!(inverse.resolution == CandidateTransitionResolution::PreservedConflict);
-            ensure!(inverse.candidate.is_none());
-            memory.put("after-proof", &json!(true)).await?;
-            memory.close().await?;
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
-                .await
-                .context("promotion facade fixture owner did not reap")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("candidate promotion facade fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "candidate promotion facade fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let (_, opening) = MemoryStore::open_managed_observed(
+                            options.clone(),
+                            project,
+                            std::env::current_exe()?,
+                        );
+                        let memory = opening.await?;
+                        let Backend::Remote(remote) = &memory.backend else {
+                            bail!("managed promotion fixture did not attach to the service")
+                        };
+                        let candidate = memory.begin_candidate("lost promotion reply").await?;
+                        let CandidateBackend::Remote(ref remote_candidate) = candidate.backend
+                        else {
+                            bail!("managed promotion fixture did not return a remote candidate")
+                        };
+                        candidate.view().put("private", &json!(1)).await?;
+                        let target = candidate.view().revision().await?;
+                        let branch = remote_candidate.view.pinned_view.clone();
+                        let base = candidate.base().to_owned();
+                        let generation = remote_candidate
+                            .view
+                            .attachment
+                            .lock()
+                            .await
+                            .generation()
+                            .to_owned();
+                        let creation_id = remote_candidate
+                            .view
+                            .candidate_creation_id
+                            .context("candidate fixture lost its creation ID")?;
+                        ensure!(candidate.promote().await? == target);
+                        memory.put("later-main", &json!(true)).await?;
+                        // The typed IPC fixture checks exact refs. Here the owner has
+                        // settled promotion, but the logical client models losing its
+                        // reply before it could release the shared mutation fence.
+                        *remote.session.pending_transition.lock().unwrap() =
+                            Some(PendingTransition {
+                                id: Uuid::new_v4(),
+                                generation: generation.clone(),
+                                kind: CandidateTransitionKind::Promote,
+                                branch: branch.clone(),
+                                base: base.clone(),
+                                target: target.clone(),
+                                creation_id,
+                            });
+                        remote
+                            .session
+                            .uncertain_write
+                            .store(true, Ordering::Release);
+                        ensure!(memory.clone().put("blocked", &json!(true)).await.is_err());
+                        ensure!(memory.recover_candidate_transition().await?.is_some_and(
+                            |recovery| {
+                                recovery.resolution
+                                    == CandidateTransitionResolution::Promoted(target.clone())
+                                    && recovery.candidate.is_none()
+                            }
+                        ));
+                        // An inverse transition against this already-promoted ref is a
+                        // resolved conflict, not an open candidate requiring reattach.
+                        *remote.session.pending_transition.lock().unwrap() =
+                            Some(PendingTransition {
+                                id: Uuid::new_v4(),
+                                generation,
+                                kind: CandidateTransitionKind::Abandon,
+                                branch,
+                                base,
+                                target,
+                                creation_id,
+                            });
+                        remote
+                            .session
+                            .uncertain_write
+                            .store(true, Ordering::Release);
+                        let inverse = memory
+                            .recover_candidate_transition()
+                            .await?
+                            .context("missing inverse transition outcome")?;
+                        ensure!(
+                            inverse.resolution == CandidateTransitionResolution::PreservedConflict
+                        );
+                        ensure!(inverse.candidate.is_none());
+                        memory.put("after-proof", &json!(true)).await?;
+                        memory.close().await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "promotion facade fixture owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
@@ -5617,168 +5818,193 @@ mod tests {
     {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner.
-        let deadline = fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let (_, opening) = MemoryStore::open_managed_observed(
-                options.clone(),
-                project,
-                std::env::current_exe()?,
-            );
-            let memory = opening.await?;
-            let Backend::Remote(remote) = &memory.backend else {
-                bail!("managed conflict fixture did not attach to the service")
-            };
-            let candidate = memory.begin_candidate("preserved conflict").await?;
-            let CandidateBackend::Remote(ref original) = candidate.backend else {
-                bail!("managed conflict fixture did not return a remote candidate")
-            };
-            candidate.view().put("private", &json!(1)).await?;
-            let target = candidate.view().revision().await?;
-            memory.put("sibling", &json!(true)).await?;
-            let id = Uuid::new_v4();
-            let mut attachment = original.view.attachment.lock().await;
-            let generation = attachment.generation().to_owned();
-            ensure!(
-                attachment
-                    .call_with_id(
-                        id,
-                        ServiceCall::PromoteCandidate {
-                            handle: original.handle,
-                            branch: original.view.pinned_view.clone(),
-                            base: original.base.clone(),
-                            target: target.clone(),
-                        }
-                    )
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "candidate conflict reattachment fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let (_, opening) = MemoryStore::open_managed_observed(
+                            options.clone(),
+                            project,
+                            std::env::current_exe()?,
+                        );
+                        let memory = opening.await?;
+                        let Backend::Remote(remote) = &memory.backend else {
+                            bail!("managed conflict fixture did not attach to the service")
+                        };
+                        let candidate = memory.begin_candidate("preserved conflict").await?;
+                        let CandidateBackend::Remote(ref original) = candidate.backend else {
+                            bail!("managed conflict fixture did not return a remote candidate")
+                        };
+                        candidate.view().put("private", &json!(1)).await?;
+                        let target = candidate.view().revision().await?;
+                        memory.put("sibling", &json!(true)).await?;
+                        let id = Uuid::new_v4();
+                        let mut attachment = original.view.attachment.lock().await;
+                        let generation = attachment.generation().to_owned();
+                        ensure!(
+                            attachment
+                                .call_with_id(
+                                    id,
+                                    ServiceCall::PromoteCandidate {
+                                        handle: original.handle,
+                                        branch: original.view.pinned_view.clone(),
+                                        base: original.base.clone(),
+                                        target: target.clone(),
+                                    }
+                                )
+                                .await
+                                .is_err()
+                        );
+                        // Model a lost rejection reply after the owner recorded that this
+                        // request completed; the original candidate connection is gone.
+                        attachment.close();
+                        drop(attachment);
+                        *remote.session.pending_transition.lock().unwrap() =
+                            Some(PendingTransition {
+                                id,
+                                generation,
+                                kind: CandidateTransitionKind::Promote,
+                                branch: original.view.pinned_view.clone(),
+                                base: original.base.clone(),
+                                target,
+                                creation_id: original
+                                    .view
+                                    .candidate_creation_id
+                                    .context("conflict fixture lost candidate creation identity")?,
+                            });
+                        remote
+                            .session
+                            .uncertain_write
+                            .store(true, Ordering::Release);
+                        ensure!(memory.clone().put("blocked", &json!(true)).await.is_err());
+                        let recovered = memory
+                            .recover_candidate_transition()
+                            .await?
+                            .context("missing pending candidate transition")?;
+                        ensure!(
+                            recovered.resolution == CandidateTransitionResolution::OpenConflict
+                        );
+                        let candidate = recovered
+                            .candidate
+                            .context("preserved ref had no checked handle")?;
+                        ensure!(candidate.view().get("private").await? == Some(json!(1)));
+                        candidate.abandon().await?;
+                        memory.put("after-proof", &json!(true)).await?;
+                        memory.close().await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
                     .await
-                    .is_err()
-            );
-            // Model a lost rejection reply after the owner recorded that this
-            // request completed; the original candidate connection is gone.
-            attachment.close();
-            drop(attachment);
-            *remote.session.pending_transition.lock().unwrap() = Some(PendingTransition {
-                id,
-                generation,
-                kind: CandidateTransitionKind::Promote,
-                branch: original.view.pinned_view.clone(),
-                base: original.base.clone(),
-                target,
-                creation_id: original
-                    .view
-                    .candidate_creation_id
-                    .context("conflict fixture lost candidate creation identity")?,
-            });
-            remote
-                .session
-                .uncertain_write
-                .store(true, Ordering::Release);
-            ensure!(memory.clone().put("blocked", &json!(true)).await.is_err());
-            let recovered = memory
-                .recover_candidate_transition()
-                .await?
-                .context("missing pending candidate transition")?;
-            ensure!(recovered.resolution == CandidateTransitionResolution::OpenConflict);
-            let candidate = recovered
-                .candidate
-                .context("preserved ref had no checked handle")?;
-            ensure!(candidate.view().get("private").await? == Some(json!(1)));
-            candidate.abandon().await?;
-            memory.put("after-proof", &json!(true)).await?;
-            memory.close().await?;
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
-                .await
-                .context("candidate conflict fixture owner did not reap")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("candidate conflict reattachment fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "candidate conflict fixture owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
     async fn usage_reply_recovery_fences_clones_until_natural_key_is_proven() -> Result<()> {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner.
-        let deadline = fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let (_, opening) = MemoryStore::open_managed_observed(
-                options.clone(),
-                project,
-                std::env::current_exe()?,
-            );
-            let memory = opening.await?;
-            let Backend::Remote(remote) = &memory.backend else {
-                bail!("managed usage fixture did not attach to the service")
-            };
-            let ledger = memory.usage_ledger()?;
-            ledger.mark_new_session("lost-usage-session").await?;
-            let generation = remote.attachment.lock().await.generation().to_owned();
-            // Model an accepted ledger mutation whose reply was lost after the
-            // owner committed it. The direct IPC fixture covers that transport
-            // boundary; this one proves the shared facade fence and release.
-            *remote.session.pending_ledger.lock().unwrap() = Some(PendingLedger {
-                id: Uuid::new_v4(),
-                generation,
-                proof: store::UsageProof::new_session("lost-usage-session"),
-            });
-            remote
-                .session
-                .uncertain_write
-                .store(true, Ordering::Release);
-            ensure!(ledger.clone().mark_new_session("blocked").await.is_err());
-            ensure!(memory.clone().put("blocked", &json!(true)).await.is_err());
-            ensure!(memory.reconcile().await? == Some(true));
-            ledger.mark_new_session("after-proof").await?;
-            ensure!(ledger.session("after-proof").await?.historical_complete);
-            memory.close().await?;
-            let permit = service::acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
-                .await
-                .context("usage facade fixture owner did not reap")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("usage facade recovery fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "usage facade recovery fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let (_, opening) = MemoryStore::open_managed_observed(
+                            options.clone(),
+                            project,
+                            std::env::current_exe()?,
+                        );
+                        let memory = opening.await?;
+                        let Backend::Remote(remote) = &memory.backend else {
+                            bail!("managed usage fixture did not attach to the service")
+                        };
+                        let ledger = memory.usage_ledger()?;
+                        ledger.mark_new_session("lost-usage-session").await?;
+                        let generation = remote.attachment.lock().await.generation().to_owned();
+                        // Model an accepted ledger mutation whose reply was lost after the
+                        // owner committed it. The direct IPC fixture covers that transport
+                        // boundary; this one proves the shared facade fence and release.
+                        *remote.session.pending_ledger.lock().unwrap() = Some(PendingLedger {
+                            id: Uuid::new_v4(),
+                            generation,
+                            proof: store::UsageProof::new_session("lost-usage-session"),
+                        });
+                        remote
+                            .session
+                            .uncertain_write
+                            .store(true, Ordering::Release);
+                        ensure!(ledger.clone().mark_new_session("blocked").await.is_err());
+                        ensure!(memory.clone().put("blocked", &json!(true)).await.is_err());
+                        ensure!(memory.reconcile().await? == Some(true));
+                        ledger.mark_new_session("after-proof").await?;
+                        ensure!(ledger.session("after-proof").await?.historical_complete);
+                        memory.close().await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "usage facade fixture owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
@@ -5786,167 +6012,182 @@ mod tests {
     {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: two fresh owners, the second followed by its reopened successor.
-        let deadline = fixture_deadline(2, 1);
-        tokio::time::timeout(deadline, async {
-            for restart_owner in [false, true] {
-                let root = crate::test_support::tempdir()?;
-                let project = root.path().join("project");
-                std::fs::create_dir(&project)?;
-                let project = project.canonicalize()?;
-                let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-                let scope = format!(
-                    "project/{}",
-                    digest
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>()
-                );
-                let options =
-                    crate::test_support::open_options(root.path().join("private"), scope)?;
-                let _gate = crate::spawn_gate::spawning().await;
-                let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-                let mut served = tokio::spawn(owner.serve());
-                let (_, opening) = MemoryStore::open_managed_observed(
-                    options.clone(),
-                    project.clone(),
-                    std::env::current_exe()?,
-                );
-                let memory = opening.await?;
-                let Backend::Remote(remote) = &memory.backend else {
-                    bail!("managed candidate fixture did not attach to the service")
-                };
-                let dedicated = remote.fork().await?;
-                let id = Uuid::new_v4();
-                let generation;
-                {
-                    let mut attachment = dedicated.attachment.lock().await;
-                    generation = attachment.generation().to_owned();
-                    ensure!(matches!(
-                        attachment
-                            .call_with_id(
-                                id,
-                                ServiceCall::BeginCandidate {
-                                    label: "unread Begin reply".into(),
-                                },
-                            )
-                            .await?,
-                        ServiceValue::CandidateStarted { .. }
-                    ));
-                    attachment.close();
-                }
-                drop(dedicated);
-                // The native service accepted Begin, but this logical caller lost
-                // the reply before it could retain the generation-local handle.
-                *remote.session.pending_candidate.lock().unwrap() =
-                    Some(PendingCandidate { id, generation });
-                remote
-                    .session
-                    .uncertain_write
-                    .store(true, Ordering::Release);
-                ensure!(
-                    memory
-                        .clone()
-                        .put("blocked", &json!(true))
-                        .await
-                        .unwrap_err()
-                        .to_string()
-                        .contains("outcome is uncertain")
-                );
-                ensure!(memory.reconcile().await.is_err());
-                if restart_owner {
-                    // Keep the caller's pending UUID and fence, but release its
-                    // old transport so the owner can retire and reap Dolt. The
-                    // successor must reattach the ref without replaying Begin.
-                    remote.attachment.lock().await.close();
-                    let permit = service::acquire_maintenance_permit(&options).await?;
-                    tokio::time::timeout(Duration::from_secs(10), &mut served)
-                        .await
-                        .context("candidate fixture old owner did not reap")???;
-                    drop(permit);
-                    let successor = service::ServiceOwner::open(options.clone(), &project).await?;
-                    served = tokio::spawn(successor.serve());
-                }
-                let candidate = memory
-                    .recover_candidate_begin()
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "recover exact candidate ref (restart_owner={restart_owner})"
-                        )
-                    })?
-                    .with_context(|| {
-                        format!(
-                            "exact candidate ref was not recovered (restart_owner={restart_owner})"
-                        )
-                    })?;
-                candidate
-                    .view()
-                    .put("private", &json!("retained"))
-                    .await
-                    .with_context(|| {
-                        format!("write recovered candidate (restart_owner={restart_owner})")
-                    })?;
-                ensure!(
-                    candidate
-                        .view()
-                        .get("private")
-                        .await
-                        .with_context(|| {
-                            format!("read recovered candidate (restart_owner={restart_owner})")
-                        })?
-                        == Some(json!("retained")),
-                    "recovered candidate returned the wrong value (restart_owner={restart_owner})"
-                );
-                if restart_owner {
-                    ensure!(
-                        memory
-                            .clone()
-                            .put("retired", &json!(true))
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(2, 1),
+            "candidate facade recovery fixture",
+        );
+        for restart_owner in [false, true] {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+            let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let (_, opening) = MemoryStore::open_managed_observed(
+                            options.clone(),
+                            project.clone(),
+                            std::env::current_exe()?,
+                        );
+                        let memory = opening.await?;
+                        let Backend::Remote(remote) = &memory.backend else {
+                            bail!("managed candidate fixture did not attach to the service")
+                        };
+                        let dedicated = remote.fork().await?;
+                        let id = Uuid::new_v4();
+                        let generation;
+                        {
+                            let mut attachment = dedicated.attachment.lock().await;
+                            generation = attachment.generation().to_owned();
+                            ensure!(matches!(
+                                attachment
+                                    .call_with_id(
+                                        id,
+                                        ServiceCall::BeginCandidate {
+                                            label: "unread Begin reply".into(),
+                                        },
+                                    )
+                                    .await?,
+                                ServiceValue::CandidateStarted { .. }
+                            ));
+                            attachment.close();
+                        }
+                        drop(dedicated);
+                        // The native service accepted Begin, but this logical caller lost
+                        // the reply before it could retain the generation-local handle.
+                        *remote.session.pending_candidate.lock().unwrap() =
+                            Some(PendingCandidate { id, generation });
+                        remote
+                            .session
+                            .uncertain_write
+                            .store(true, Ordering::Release);
+                        ensure!(
+                            memory
+                                .clone()
+                                .put("blocked", &json!(true))
+                                .await
+                                .unwrap_err()
+                                .to_string()
+                                .contains("outcome is uncertain")
+                        );
+                        ensure!(memory.reconcile().await.is_err());
+                        let _gate = if restart_owner {
+                            // Keep the caller's pending UUID and fence, but release its
+                            // old transport so the owner can retire and reap Dolt. The
+                            // successor must reattach the ref without replaying Begin.
+                            remote.attachment.lock().await.close();
+                            served
+                                .restart(
+                                    _gate,
+                                    &options,
+                                    &project,
+                                    Duration::from_secs(10),
+                                    "candidate fixture old owner did not reap",
+                                )
+                                .await?
+                        } else {
+                            _gate
+                        };
+                        let candidate = memory
+                            .recover_candidate_begin()
                             .await
-                            .unwrap_err()
-                            .to_string()
-                            .contains("closed"),
-                        "a retired-generation clone remained writable"
-                    );
-                } else {
-                    memory
-                        .put("unblocked", &json!(true))
+                            .with_context(|| {
+                                format!(
+                                    "recover exact candidate ref (restart_owner={restart_owner})"
+                                )
+                            })?
+                            .with_context(|| {
+                                format!(
+                                    "exact candidate ref was not recovered (restart_owner={restart_owner})"
+                                )
+                            })?;
+                        candidate
+                            .view()
+                            .put("private", &json!("retained"))
+                            .await
+                            .with_context(|| {
+                                format!("write recovered candidate (restart_owner={restart_owner})")
+                            })?;
+                        ensure!(
+                            candidate
+                                .view()
+                                .get("private")
+                                .await
+                                .with_context(|| {
+                                    format!("read recovered candidate (restart_owner={restart_owner})")
+                                })?
+                                == Some(json!("retained")),
+                            "recovered candidate returned the wrong value (restart_owner={restart_owner})"
+                        );
+                        if restart_owner {
+                            ensure!(
+                                memory
+                                    .clone()
+                                    .put("retired", &json!(true))
+                                    .await
+                                    .unwrap_err()
+                                    .to_string()
+                                    .contains("closed"),
+                                "a retired-generation clone remained writable"
+                            );
+                        } else {
+                            memory
+                                .put("unblocked", &json!(true))
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "write main after candidate recovery (restart_owner={restart_owner})"
+                                    )
+                                })?;
+                        }
+                        candidate
+                            .abandon()
+                            .await
+                            .with_context(|| {
+                                format!("abandon recovered candidate (restart_owner={restart_owner})")
+                            })?;
+                        candidate
+                            .view()
+                            .close()
+                            .await
+                            .with_context(|| {
+                                format!("close recovered candidate view (restart_owner={restart_owner})")
+                            })?;
+                        memory
+                            .close()
+                            .await
+                            .with_context(|| format!("close main view (restart_owner={restart_owner})"))?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "candidate facade fixture owner did not reap",
+                        )
                         .await
-                        .with_context(|| {
-                            format!(
-                                "write main after candidate recovery (restart_owner={restart_owner})"
-                            )
-                        })?;
-                }
-                candidate
-                    .abandon()
-                    .await
-                    .with_context(|| {
-                        format!("abandon recovered candidate (restart_owner={restart_owner})")
-                    })?;
-                candidate
-                    .view()
-                    .close()
-                    .await
-                    .with_context(|| {
-                        format!("close recovered candidate view (restart_owner={restart_owner})")
-                    })?;
-                memory
-                    .close()
-                    .await
-                    .with_context(|| format!("close main view (restart_owner={restart_owner})"))?;
-                let permit = service::acquire_maintenance_permit(&options).await?;
-                tokio::time::timeout(Duration::from_secs(10), served)
-                    .await
-                    .context("candidate facade fixture owner did not reap")???;
-                drop(permit);
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("candidate facade recovery fixture exceeded its {deadline:?} deadline")
-        })??;
+                },
+            )
+            .await;
+            root.release(outcome)?;
+        }
         Ok(())
     }
 
@@ -5955,108 +6196,118 @@ mod tests {
     {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner.
-        let deadline = fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let _owner_cleanup = AbortOnDrop(served.abort_handle());
-            let executable = std::env::current_exe()?;
-            let open = || {
-                MemoryStore::open_managed_observed(
-                    options.clone(),
-                    project.clone(),
-                    executable.clone(),
-                )
-                .1
-            };
-            let first = open().await?;
-            let second = open().await?;
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "managed dream-lease fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let executable = std::env::current_exe()?;
+                        let open = || {
+                            MemoryStore::open_managed_observed(
+                                options.clone(),
+                                project.clone(),
+                                executable.clone(),
+                            )
+                            .1
+                        };
+                        let first = open().await?;
+                        let second = open().await?;
 
-            let first_lease = first.acquire_dream_lease().await?;
-            let mut waiting = tokio::spawn({
-                let second = second.clone();
-                async move { second.acquire_dream_lease().await }
-            });
-            let waiting_cleanup = AbortOnDrop(waiting.abort_handle());
-            ensure!(
-                tokio::time::timeout(Duration::from_millis(250), &mut waiting)
+                        let first_lease = first.acquire_dream_lease().await?;
+                        let mut waiting = tokio::spawn({
+                            let second = second.clone();
+                            async move { second.acquire_dream_lease().await }
+                        });
+                        let waiting_cleanup = AbortOnDrop(waiting.abort_handle());
+                        ensure!(
+                            tokio::time::timeout(Duration::from_millis(250), &mut waiting)
+                                .await
+                                .is_err(),
+                            "a second managed dream acquired the project lease concurrently"
+                        );
+                        second
+                            .append("private/actor", "user", "ordinary write while dreaming")
+                            .await?;
+                        ensure!(
+                            second.history("private/actor", 10).await?.len() == 1,
+                            "the dream lease blocked an ordinary memory write"
+                        );
+
+                        drop(first_lease);
+                        let second_lease =
+                            tokio::time::timeout(Duration::from_secs(10), &mut waiting)
+                                .await
+                                .context(
+                                    "the waiting dream did not acquire after lease release",
+                                )???;
+                        drop(waiting_cleanup);
+
+                        let mut cancelled = tokio::spawn({
+                            let first = first.clone();
+                            async move { first.acquire_dream_lease().await }
+                        });
+                        ensure!(
+                            tokio::time::timeout(Duration::from_millis(250), &mut cancelled)
+                                .await
+                                .is_err(),
+                            "the cancellation probe acquired while another dream held the lease"
+                        );
+                        cancelled.abort();
+                        let cancelled = tokio::time::timeout(Duration::from_secs(5), cancelled)
+                            .await
+                            .context("the cancelled dream-lease acquisition did not end")?;
+                        ensure!(
+                            cancelled.is_err_and(|error| error.is_cancelled()),
+                            "the dream-lease acquisition completed instead of being cancelled"
+                        );
+                        drop(second_lease);
+
+                        let final_lease = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            first.acquire_dream_lease(),
+                        )
+                        .await
+                        .context("cancelled dream-lease acquisition retained owner authority")??;
+                        drop(final_lease);
+
+                        first.close().await?;
+                        second.close().await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
                     .await
-                    .is_err(),
-                "a second managed dream acquired the project lease concurrently"
-            );
-            second
-                .append("private/actor", "user", "ordinary write while dreaming")
-                .await?;
-            ensure!(
-                second.history("private/actor", 10).await?.len() == 1,
-                "the dream lease blocked an ordinary memory write"
-            );
-
-            drop(first_lease);
-            let second_lease = tokio::time::timeout(Duration::from_secs(10), &mut waiting)
-                .await
-                .context("the waiting dream did not acquire after lease release")???;
-            drop(waiting_cleanup);
-
-            let mut cancelled = tokio::spawn({
-                let first = first.clone();
-                async move { first.acquire_dream_lease().await }
-            });
-            ensure!(
-                tokio::time::timeout(Duration::from_millis(250), &mut cancelled)
-                    .await
-                    .is_err(),
-                "the cancellation probe acquired while another dream held the lease"
-            );
-            cancelled.abort();
-            let cancelled = tokio::time::timeout(Duration::from_secs(5), cancelled)
-                .await
-                .context("the cancelled dream-lease acquisition did not end")?;
-            ensure!(
-                cancelled.is_err_and(|error| error.is_cancelled()),
-                "the dream-lease acquisition completed instead of being cancelled"
-            );
-            drop(second_lease);
-
-            let final_lease =
-                tokio::time::timeout(Duration::from_secs(10), first.acquire_dream_lease())
-                    .await
-                    .context("cancelled dream-lease acquisition retained owner authority")??;
-            drop(final_lease);
-
-            first.close().await?;
-            second.close().await?;
-            let permit = tokio::time::timeout(
-                Duration::from_secs(20),
-                service::acquire_maintenance_permit(&options),
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            Some(Duration::from_secs(20)),
+                            Duration::from_secs(5),
+                            "managed dream owner did not finish reaping",
+                        )
+                        .await
+                },
             )
-            .await
-            .context("managed owner did not retire after dream clients closed")??;
-            tokio::time::timeout(Duration::from_secs(5), served)
-                .await
-                .context("managed dream owner did not finish reaping")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("managed dream-lease fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
+            .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
@@ -6064,193 +6315,214 @@ mod tests {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner. The competing local open is refused by the
         // owner's store lease under its own inner bound.
-        let deadline = fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let data = root.path().join("private");
-            let mut options = OpenOptions::new(data, scope);
-            options.config.cache_dir = Some(store::test_cache());
-            options.config.offline = true;
-            options.supervisor = Some(store::test_supervisor()?);
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let executable = std::env::current_exe()?;
-            let (_, opening) = MemoryStore::open_managed_observed(
-                options.clone(),
-                project.clone(),
-                executable.clone(),
-            );
-            let first = opening.await?;
-            let Backend::Remote(remote) = &first.backend else {
-                bail!("managed facade unexpectedly opened local storage")
-            };
-            let owner_generation = remote.attachment.lock().await.generation().to_owned();
-            let mut competing_local = options.clone();
-            competing_local.config.startup_timeout_secs = 1;
-            let denied =
-                tokio::time::timeout(Duration::from_secs(5), MemoryStore::open(competing_local))
-                    .await
-                    .context("direct local open did not resolve against the live owner")?;
-            ensure!(
-                denied.is_err(),
-                "direct local open bypassed the owner's exclusive store lease"
-            );
-            ensure!(
-                service::EndpointRecord::read(&options.data_dir, &options.project_scope)?
-                    .is_some_and(|record| record.authority.service_generation == owner_generation),
-                "losing local open changed the live owner publication"
-            );
-            let held = remote.attachment.lock().await;
-            let concurrent_revision =
-                tokio::time::timeout(Duration::from_secs(5), first.revision())
-                    .await
-                    .context("a busy client connection serialized an independent read")??;
-            ensure!(!concurrent_revision.is_empty());
-            drop(held);
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "managed facade fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let data = root.path().join("private");
+        let mut options = OpenOptions::new(data, scope);
+        options.config.cache_dir = Some(store::test_cache());
+        options.config.offline = true;
+        options.supervisor = Some(store::test_supervisor()?);
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let executable = std::env::current_exe()?;
+                        let (_, opening) = MemoryStore::open_managed_observed(
+                            options.clone(),
+                            project.clone(),
+                            executable.clone(),
+                        );
+                        let first = opening.await?;
+                        let Backend::Remote(remote) = &first.backend else {
+                            bail!("managed facade unexpectedly opened local storage")
+                        };
+                        let owner_generation =
+                            remote.attachment.lock().await.generation().to_owned();
+                        let mut competing_local = options.clone();
+                        competing_local.config.startup_timeout_secs = 1;
+                        let denied = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            MemoryStore::open(competing_local),
+                        )
+                        .await
+                        .context("direct local open did not resolve against the live owner")?;
+                        ensure!(
+                            denied.is_err(),
+                            "direct local open bypassed the owner's exclusive store lease"
+                        );
+                        ensure!(
+                            service::EndpointRecord::read(
+                                &options.data_dir,
+                                &options.project_scope
+                            )?
+                            .is_some_and(
+                                |record| record.authority.service_generation == owner_generation
+                            ),
+                            "losing local open changed the live owner publication"
+                        );
+                        let held = remote.attachment.lock().await;
+                        let concurrent_revision =
+                            tokio::time::timeout(Duration::from_secs(5), first.revision())
+                                .await
+                                .context(
+                                    "a busy client connection serialized an independent read",
+                                )??;
+                        ensure!(!concurrent_revision.is_empty());
+                        drop(held);
 
-            first.append("private/actor", "user", "first").await?;
-            first.put_many(&[("shared".into(), json!(1))]).await?;
-            let ledger = first.usage_ledger()?;
-            ledger.mark_new_session("session-1").await?;
-            ledger.session("session-1").await?;
-            let (_, opening) =
-                MemoryStore::open_managed_observed(options.clone(), project.clone(), executable);
-            let second = opening.await?;
-            ensure!(
-                second.history("private/actor", 10).await?.len() == 1,
-                "second client did not read the first client's committed history"
-            );
-            let candidate = second.begin_candidate("private-dream").await?;
-            candidate.view().put("shared", &json!(2)).await?;
-            ensure!(second.get("shared").await? == Some(json!(1)));
-            candidate.promote().await?;
-            ensure!(second.get("shared").await? == Some(json!(2)));
+                        first.append("private/actor", "user", "first").await?;
+                        first.put_many(&[("shared".into(), json!(1))]).await?;
+                        let ledger = first.usage_ledger()?;
+                        ledger.mark_new_session("session-1").await?;
+                        ledger.session("session-1").await?;
+                        let (_, opening) = MemoryStore::open_managed_observed(
+                            options.clone(),
+                            project.clone(),
+                            executable,
+                        );
+                        let second = opening.await?;
+                        ensure!(
+                            second.history("private/actor", 10).await?.len() == 1,
+                            "second client did not read the first client's committed history"
+                        );
+                        let candidate = second.begin_candidate("private-dream").await?;
+                        candidate.view().put("shared", &json!(2)).await?;
+                        ensure!(second.get("shared").await? == Some(json!(1)));
+                        candidate.promote().await?;
+                        ensure!(second.get("shared").await? == Some(json!(2)));
 
-            let stale = second.begin_candidate("stale-dream").await?;
-            stale.view().put("shared", &json!(3)).await?;
-            second
-                .append("private/actor", "assistant", "moved live base")
-                .await?;
-            let conflict = stale.promote().await.unwrap_err();
-            ensure!(
-                format!("{conflict:#}").contains("stale"),
-                "candidate conflict lost its typed meaning: {conflict:#}"
-            );
-            ensure!(stale.view().get("shared").await? == Some(json!(3)));
-            stale.abandon().await?;
+                        let stale = second.begin_candidate("stale-dream").await?;
+                        stale.view().put("shared", &json!(3)).await?;
+                        second
+                            .append("private/actor", "assistant", "moved live base")
+                            .await?;
+                        let conflict = stale.promote().await.unwrap_err();
+                        ensure!(
+                            format!("{conflict:#}").contains("stale"),
+                            "candidate conflict lost its typed meaning: {conflict:#}"
+                        );
+                        ensure!(stale.view().get("shared").await? == Some(json!(3)));
+                        stale.abandon().await?;
 
-            let export = second.begin_active_export().await?;
-            let mut cursor = None;
-            let mut messages = 0;
-            let mut state = 0;
-            let mut context_summaries = 0;
-            let mut context_cursors = 0;
-            let mut session_catalog = 0;
-            let mut public_turns = 0;
-            loop {
-                let page = export.page(cursor).await?;
-                for record in page.records {
-                    match record {
-                        StorageRecord::Message { .. } => messages += 1,
-                        StorageRecord::State { .. } => state += 1,
-                        StorageRecord::ContextSummary { .. } => context_summaries += 1,
-                        StorageRecord::ContextCursor { .. } => context_cursors += 1,
-                        StorageRecord::SessionCatalog { .. } => session_catalog += 1,
-                        StorageRecord::PublicTurn { .. } => public_turns += 1,
+                        let export = second.begin_active_export().await?;
+                        let mut cursor = None;
+                        let mut messages = 0;
+                        let mut state = 0;
+                        let mut context_summaries = 0;
+                        let mut context_cursors = 0;
+                        let mut session_catalog = 0;
+                        let mut public_turns = 0;
+                        loop {
+                            let page = export.page(cursor).await?;
+                            for record in page.records {
+                                match record {
+                                    StorageRecord::Message { .. } => messages += 1,
+                                    StorageRecord::State { .. } => state += 1,
+                                    StorageRecord::ContextSummary { .. } => context_summaries += 1,
+                                    StorageRecord::ContextCursor { .. } => context_cursors += 1,
+                                    StorageRecord::SessionCatalog { .. } => session_catalog += 1,
+                                    StorageRecord::PublicTurn { .. } => public_turns += 1,
+                                }
+                            }
+                            cursor = page.next;
+                            if cursor.is_none() {
+                                break;
+                            }
+                        }
+                        export.verify_counts(
+                            messages,
+                            state,
+                            context_summaries,
+                            context_cursors,
+                            session_catalog,
+                            public_turns,
+                        )?;
+                        drop(export);
+                        // A connection explicitly closed before transmission is a known
+                        // pre-write loss. Reattach and send normally; only an incomplete
+                        // request/reply after dispatch must fence the logical session.
+                        remote.attachment.lock().await.close();
+                        first
+                            .append("private/actor", "user", "after safe reconnect")
+                            .await?;
+                        ensure!(first.history("private/actor", 10).await?.len() == 3);
+                        first.clone().close().await?;
+                        ensure!(
+                            first
+                                .revision()
+                                .await
+                                .unwrap_err()
+                                .to_string()
+                                .contains("closed"),
+                            "closing one client's clone left its original handle usable"
+                        );
+                        ensure!(second.history("private/actor", 10).await?.len() == 3);
+                        let CandidateBackend::Remote(candidate_remote) = &candidate.backend else {
+                            bail!("managed fixture candidate lost its remote attachment")
+                        };
+                        let held_candidate = candidate_remote.view.attachment.lock().await;
+                        ensure!(
+                            tokio::time::timeout(Duration::from_millis(50), second.clone().close())
+                                .await
+                                .is_err(),
+                            "session close did not wait for its held candidate attachment"
+                        );
+                        drop(held_candidate);
+                        // A cancelled close cannot take and lose the remaining weak
+                        // attachment registry; this retry must close the candidate too.
+                        second.close().await?;
+                        ensure!(
+                            !candidate_remote
+                                .view
+                                .attachment
+                                .lock()
+                                .await
+                                .has_complete_exchange(),
+                            "retry left the previously held candidate transport alive"
+                        );
+                        ensure!(
+                            candidate
+                                .view()
+                                .revision()
+                                .await
+                                .unwrap_err()
+                                .to_string()
+                                .contains("closed"),
+                            "closing the second client left its candidate handle usable"
+                        );
+                        Ok::<(), anyhow::Error>(())
                     }
-                }
-                cursor = page.next;
-                if cursor.is_none() {
-                    break;
-                }
-            }
-            export.verify_counts(
-                messages,
-                state,
-                context_summaries,
-                context_cursors,
-                session_catalog,
-                public_turns,
-            )?;
-            drop(export);
-            // A connection explicitly closed before transmission is a known
-            // pre-write loss. Reattach and send normally; only an incomplete
-            // request/reply after dispatch must fence the logical session.
-            remote.attachment.lock().await.close();
-            first
-                .append("private/actor", "user", "after safe reconnect")
-                .await?;
-            ensure!(first.history("private/actor", 10).await?.len() == 3);
-            first.clone().close().await?;
-            ensure!(
-                first
-                    .revision()
                     .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("closed"),
-                "closing one client's clone left its original handle usable"
-            );
-            ensure!(second.history("private/actor", 10).await?.len() == 3);
-            let CandidateBackend::Remote(candidate_remote) = &candidate.backend else {
-                bail!("managed fixture candidate lost its remote attachment")
-            };
-            let held_candidate = candidate_remote.view.attachment.lock().await;
-            ensure!(
-                tokio::time::timeout(Duration::from_millis(50), second.clone().close())
-                    .await
-                    .is_err(),
-                "session close did not wait for its held candidate attachment"
-            );
-            drop(held_candidate);
-            // A cancelled close cannot take and lose the remaining weak
-            // attachment registry; this retry must close the candidate too.
-            second.close().await?;
-            ensure!(
-                !candidate_remote
-                    .view
-                    .attachment
-                    .lock()
-                    .await
-                    .has_complete_exchange(),
-                "retry left the previously held candidate transport alive"
-            );
-            ensure!(
-                candidate
-                    .view()
-                    .revision()
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("closed"),
-                "closing the second client left its candidate handle usable"
-            );
-            let permit = tokio::time::timeout(
-                Duration::from_secs(20),
-                service::acquire_maintenance_permit(&options),
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            Some(Duration::from_secs(20)),
+                            Duration::from_secs(5),
+                            "managed owner did not finish reaping",
+                        )
+                        .await
+                },
             )
-            .await
-            .context("managed owner did not retire after clients closed")??;
-            tokio::time::timeout(Duration::from_secs(5), served)
-                .await
-                .context("managed owner did not finish reaping")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| format!("managed facade fixture exceeded its {deadline:?} deadline"))??;
-        Ok(())
+            .await;
+        root.release(outcome)
     }
 }

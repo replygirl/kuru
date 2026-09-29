@@ -620,6 +620,11 @@ async fn spawn_service(
     command.stdout(std::process::Stdio::null());
     command.stderr(stderr.map_or_else(std::process::Stdio::null, std::process::Stdio::from));
     command.process_group(0);
+    // Test-support measurement only: name the originating test in the trace.
+    #[cfg(any(test, feature = "test-support"))]
+    for (name, value) in crate::test_support::lifecycle_trace::forwarded() {
+        command.env(name, value);
+    }
     command.spawn().context("start project memory service")
 }
 
@@ -656,6 +661,11 @@ async fn spawn_service(
             .environment
             .push((STARTUP_STAGE_DIAGNOSTIC_ENV.into(), OsString::from("1")));
     }
+    // Test-support measurement only: forward the inert-by-default trace.
+    #[cfg(any(test, feature = "test-support"))]
+    command
+        .environment
+        .extend(crate::test_support::lifecycle_trace::forwarded());
     command
         .spawn()
         .await
@@ -1828,6 +1838,11 @@ mod tests {
 
     #[tokio::test]
     async fn inspection_waits_for_a_booting_owner_without_starting_dolt() -> Result<()> {
+        // Held for the whole test: it takes and releases a real owner flock and
+        // never spawns, so no sibling test's child inherits that lock's
+        // description; see `crate::spawn_gate`. The fixture root's teardown
+        // reads quiescence records and never probes this lock.
+        let _gate = crate::spawn_gate::locking_async().await;
         let root = crate::test_support::tempdir()?;
         let project = root.path().join("project");
         std::fs::create_dir(&project)?;
@@ -1925,6 +1940,11 @@ mod tests {
 
     #[tokio::test]
     async fn purge_refuses_a_live_service_owner_before_writing_intent() -> Result<()> {
+        // Held for the whole test: it takes and releases a real owner flock and
+        // never spawns, so no sibling test's child inherits that lock's
+        // description; see `crate::spawn_gate`. The fixture root's teardown
+        // reads quiescence records and never probes this lock.
+        let _gate = crate::spawn_gate::locking_async().await;
         let data = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "a".repeat(64));
         let mut options = crate::OpenOptions::new(data.path().to_owned(), scope.clone());
@@ -1956,88 +1976,111 @@ mod tests {
     async fn maintenance_retires_only_an_idle_owner_and_holds_election() -> Result<()> {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner, retired by maintenance.
-        let deadline = crate::test_support::fixture_deadline(1, 0);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let data = root.path().join("private");
-            let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
-            options.config.cache_dir = Some(crate::store::test_cache());
-            options.config.offline = true;
-            options.supervisor = Some(crate::store::test_supervisor()?);
-            let _gate = crate::spawn_gate::spawning().await;
-            let owner = ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let mut client = try_attach(&data, &scope, &project)
-                .await?
-                .context("fixture owner did not accept a client")?;
+        let deadline = crate::test_support::FixtureDeadline::start(
+            crate::test_support::fixture_deadline(1, 0),
+            "idle-owner maintenance fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let data = root.path().join("private");
+        let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+        options.config.cache_dir = Some(crate::store::test_cache());
+        options.config.offline = true;
+        options.supervisor = Some(crate::store::test_supervisor()?);
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let mut client = try_attach(&data, &scope, &project)
+                            .await?
+                            .context("fixture owner did not accept a client")?;
 
-            let refused = tokio::time::timeout(
-                Duration::from_secs(5),
-                crate::MemoryStore::purge(options.clone()),
-            )
-            .await
-            .context("busy owner maintenance refusal exceeded five seconds")?
-            .expect_err("maintenance admitted another live client");
-            ensure!(
-                format!("{refused:#}").contains("active clients"),
-                "busy owner refusal lacked client context: {refused:#}"
-            );
-            ensure!(
-                !data
-                    .join("memory/controls")
-                    .join(format!("{}.json", &scope["project/".len()..]))
-                    .exists(),
-                "refused purge wrote durable intent"
-            );
-            ensure!(
-                matches!(
-                    client.call(ServiceCall::Revision).await?,
-                    ServiceValue::Revision(_)
-                ),
-                "refused maintenance disturbed the live client"
-            );
-            client.close();
+                        let refused = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            crate::MemoryStore::purge(options.clone()),
+                        )
+                        .await
+                        .context("busy owner maintenance refusal exceeded five seconds")?
+                        .expect_err("maintenance admitted another live client");
+                        ensure!(
+                            format!("{refused:#}").contains("active clients"),
+                            "busy owner refusal lacked client context: {refused:#}"
+                        );
+                        ensure!(
+                            !data
+                                .join("memory/controls")
+                                .join(format!("{}.json", &scope["project/".len()..]))
+                                .exists(),
+                            "refused purge wrote durable intent"
+                        );
+                        ensure!(
+                            matches!(
+                                client.call(ServiceCall::Revision).await?,
+                                ServiceValue::Revision(_)
+                            ),
+                            "refused maintenance disturbed the live client"
+                        );
+                        client.close();
 
-            let permit = tokio::time::timeout(
-                Duration::from_secs(20),
-                acquire_maintenance_permit(&options),
+                        let permit = tokio::time::timeout(
+                            Duration::from_secs(20),
+                            acquire_maintenance_permit(&options),
+                        )
+                        .await
+                        .context(
+                            "idle owner was not retired before its 30-second grace period",
+                        )??;
+                        ensure!(
+                            ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?
+                                .is_none(),
+                            "maintenance did not retain the starter election gate"
+                        );
+                        ensure!(
+                            EndpointRecord::read(&data, &scope)?.is_none(),
+                            "retired owner still published an endpoint"
+                        );
+                        served
+                            .reap(
+                                Duration::from_secs(5),
+                                "retired owner did not finish reaping",
+                            )
+                            .await?;
+                        drop(permit);
+                        ensure!(
+                            ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?
+                                .is_some(),
+                            "maintenance did not release the election gate"
+                        );
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            Some(Duration::from_secs(20)),
+                            Duration::from_secs(5),
+                            "retired owner did not finish reaping",
+                        )
+                        .await
+                },
             )
-            .await
-            .context("idle owner was not retired before its 30-second grace period")??;
-            ensure!(
-                ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?.is_none(),
-                "maintenance did not retain the starter election gate"
-            );
-            ensure!(
-                EndpointRecord::read(&data, &scope)?.is_none(),
-                "retired owner still published an endpoint"
-            );
-            tokio::time::timeout(Duration::from_secs(5), served)
-                .await
-                .context("retired owner did not finish reaping")???;
-            drop(permit);
-            ensure!(
-                ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?.is_some(),
-                "maintenance did not release the election gate"
-            );
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("idle-owner maintenance fixture exceeded its {deadline:?} deadline")
-        })??;
-        Ok(())
+            .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
@@ -2265,6 +2308,9 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
+            // The owner ran in another process: record its store's quiescence
+            // for the fixture root's teardown.
+            crate::test_support::await_managed_quiescence(&options).await?;
             Ok::<(), anyhow::Error>(())
         })
         .await
@@ -2354,6 +2400,9 @@ mod tests {
             );
             recovered.close();
             drop(acquire_maintenance_permit(&options).await?);
+            // Both owners ran in other processes: record their store's
+            // quiescence for the fixture root's teardown.
+            crate::test_support::await_managed_quiescence(&options).await?;
             Ok::<(), anyhow::Error>(())
         })
         .await
@@ -2866,9 +2915,12 @@ mod tests {
                 drop(outcome_server);
                 drop(outcome);
             }
-            owner.close().await?;
-
-            let mut successor = ServiceOwner::open(options, &project).await?;
+            // A one-shot successor open; see `crate::spawn_gate::excluding_spawns`.
+            let (mut successor, _gate) = crate::spawn_gate::excluding_spawns(_gate, async {
+                owner.close().await?;
+                ServiceOwner::open(options, &project).await
+            })
+            .await?;
             ensure!(
                 successor.authority().service_generation != original.service_generation,
                 "owner restart retained its prior generation"
@@ -3306,6 +3358,9 @@ mod tests {
                 .await
                 .context("successor did not retire for fixture maintenance")?;
             drop(permit);
+            // Both owners ran in other processes; record their store's
+            // quiescence before the guarded root drops.
+            crate::test_support::await_managed_quiescence(&options).await?;
             Ok::<(), anyhow::Error>(())
         })
         .await
@@ -3554,9 +3609,12 @@ mod tests {
                 CandidateTransitionResult::StillUncertain
             ));
             drop(candidate);
-            owner.close().await?;
-
-            let mut successor = ServiceOwner::open(options, &project).await?;
+            // A one-shot successor open; see `crate::spawn_gate::excluding_spawns`.
+            let (mut successor, _gate) = crate::spawn_gate::excluding_spawns(_gate, async {
+                owner.close().await?;
+                ServiceOwner::open(options, &project).await
+            })
+            .await?;
             let current = successor.authority().clone();
             ensure!(matches!(
                 inspect(&mut successor, &current, &data, &scope, &original.service_generation, CandidateTransitionKind::Promote, (&branch, &base, &target)).await?,
@@ -3594,161 +3652,170 @@ mod tests {
 
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh owner, then its reopened successor.
-        let deadline = crate::test_support::fixture_deadline(1, 1);
-        tokio::time::timeout(deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!("project/{}", digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let deadline = crate::test_support::FixtureDeadline::start(
+            crate::test_support::fixture_deadline(1, 1),
+            "lost candidate promotion fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = deadline.serve(async |served| {
             let _gate = crate::spawn_gate::spawning().await;
             let owner = ServiceOwner::open(options.clone(), &project).await?;
-            let served = tokio::spawn(owner.serve());
-            let mut client = attach_existing(&options, &project).await?.context("missing service attachment")?;
-            let generation = client.generation().to_owned();
-            let ServiceValue::CandidateStarted { handle, base, branch } = client
-                .call(ServiceCall::BeginCandidate { label: "lost promotion".into() })
-                .await? else { bail!("service did not start the candidate") };
-            ensure!(matches!(client.call(ServiceCall::View {
-                candidate: Some(handle),
-                operation: Box::new(ViewOperation::PutMany { values: vec![("private".into(), serde_json::json!(1))] }),
-            }).await?, ServiceValue::Unit));
-            let ServiceValue::Revision(target) = client.call(ServiceCall::View {
-                candidate: Some(handle), operation: Box::new(ViewOperation::Revision),
-            }).await? else { bail!("service did not report candidate target") };
-            let id = uuid::Uuid::new_v4();
-            let request = rpc::ServiceRequest::with_id(&generation, id,
-                ServiceCall::PromoteCandidate {
-                    handle, branch: branch.clone(), base: base.clone(), target: target.clone(),
-                });
-            let body = serde_json::to_vec(&request)?;
-            let mut stream = client.stream.take().context("missing live candidate stream")?;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
-                stream.write_all(&body).await?;
-                stream.flush().await
-            }).await.context("candidate promotion frame send deadline")??;
-            drop(stream); // the accepted request may complete; its reply is lost
-            drop(client);
+            served.serve(owner)?;
+            async {
+                let mut client = attach_existing(&options, &project).await?.context("missing service attachment")?;
+                let generation = client.generation().to_owned();
+                let ServiceValue::CandidateStarted { handle, base, branch } = client
+                    .call(ServiceCall::BeginCandidate { label: "lost promotion".into() })
+                    .await? else { bail!("service did not start the candidate") };
+                ensure!(matches!(client.call(ServiceCall::View {
+                    candidate: Some(handle),
+                    operation: Box::new(ViewOperation::PutMany { values: vec![("private".into(), serde_json::json!(1))] }),
+                }).await?, ServiceValue::Unit));
+                let ServiceValue::Revision(target) = client.call(ServiceCall::View {
+                    candidate: Some(handle), operation: Box::new(ViewOperation::Revision),
+                }).await? else { bail!("service did not report candidate target") };
+                let id = uuid::Uuid::new_v4();
+                let request = rpc::ServiceRequest::with_id(&generation, id,
+                    ServiceCall::PromoteCandidate {
+                        handle, branch: branch.clone(), base: base.clone(), target: target.clone(),
+                    });
+                let body = serde_json::to_vec(&request)?;
+                let mut stream = client.stream.take().context("missing live candidate stream")?;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
+                    stream.write_all(&body).await?;
+                    stream.flush().await
+                }).await.context("candidate promotion frame send deadline")??;
+                drop(stream); // the accepted request may complete; its reply is lost
+                drop(client);
 
-            let query = || ServiceCall::CandidateTransitionOutcome {
-                original_id: id, original_generation: generation.clone(),
-                transition: CandidateTransitionKind::Promote,
-                branch: branch.clone(), base: base.clone(), target: target.clone(),
-            };
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let mut observer = attach_existing(&options, &project).await?
-                        .context("owner disappeared before promotion proof")?;
-                    match observer.call(query()).await? {
-                        ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Promoted { revision })
-                            if revision == target => break Ok::<(), anyhow::Error>(()),
-                        ServiceValue::CandidateTransitionOutcome(
-                            CandidateTransitionResult::InFlight | CandidateTransitionResult::StillUncertain,
-                        ) => tokio::time::sleep(Duration::from_millis(20)).await,
-                        other => bail!("candidate promotion returned unexpected outcome: {other:?}"),
+                let query = || ServiceCall::CandidateTransitionOutcome {
+                    original_id: id, original_generation: generation.clone(),
+                    transition: CandidateTransitionKind::Promote,
+                    branch: branch.clone(), base: base.clone(), target: target.clone(),
+                };
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let mut observer = attach_existing(&options, &project).await?
+                            .context("owner disappeared before promotion proof")?;
+                        match observer.call(query()).await? {
+                            ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Promoted { revision })
+                                if revision == target => break Ok::<(), anyhow::Error>(()),
+                            ServiceValue::CandidateTransitionOutcome(
+                                CandidateTransitionResult::InFlight | CandidateTransitionResult::StillUncertain,
+                            ) => tokio::time::sleep(Duration::from_millis(20)).await,
+                            other => bail!("candidate promotion returned unexpected outcome: {other:?}"),
+                        }
                     }
-                }
-            }).await.context("accepted promotion proof deadline")??;
-            let mut sibling = attach_existing(&options, &project).await?
-                .context("missing service for sibling write")?;
-            ensure!(matches!(sibling.call(ServiceCall::PutMany {
-                values: vec![("later-main".into(), serde_json::json!(true))],
-            }).await?, ServiceValue::Unit));
-            drop(sibling);
-            let mut observer = attach_existing(&options, &project).await?
-                .context("missing service after sibling write")?;
-            ensure!(matches!(observer.call(query()).await?,
-                ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Promoted { revision })
-                    if revision == target));
-            drop(observer);
-            let mut abandoner = attach_existing(&options, &project).await?
-                .context("missing service for accepted abandonment")?;
-            let abandon_generation = abandoner.generation().to_owned();
-            let ServiceValue::CandidateStarted {
-                handle: abandon_handle,
-                base: abandon_base,
-                branch: abandon_branch,
-            } = abandoner.call(ServiceCall::BeginCandidate {
-                label: "lost abandonment".into(),
-            }).await? else { bail!("service did not start the abandonment candidate") };
-            ensure!(matches!(abandoner.call(ServiceCall::View {
-                candidate: Some(abandon_handle),
-                operation: Box::new(ViewOperation::PutMany {
-                    values: vec![("abandoned-private".into(), serde_json::json!(1))],
-                }),
-            }).await?, ServiceValue::Unit));
-            let ServiceValue::Revision(abandon_target) = abandoner.call(ServiceCall::View {
-                candidate: Some(abandon_handle), operation: Box::new(ViewOperation::Revision),
-            }).await? else { bail!("service did not report the abandonment target") };
-            let abandon_id = uuid::Uuid::new_v4();
-            let request = rpc::ServiceRequest::with_id(&abandon_generation, abandon_id,
-                ServiceCall::AbandonCandidate {
+                }).await.context("accepted promotion proof deadline")??;
+                let mut sibling = attach_existing(&options, &project).await?
+                    .context("missing service for sibling write")?;
+                ensure!(matches!(sibling.call(ServiceCall::PutMany {
+                    values: vec![("later-main".into(), serde_json::json!(true))],
+                }).await?, ServiceValue::Unit));
+                drop(sibling);
+                let mut observer = attach_existing(&options, &project).await?
+                    .context("missing service after sibling write")?;
+                ensure!(matches!(observer.call(query()).await?,
+                    ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Promoted { revision })
+                        if revision == target));
+                drop(observer);
+                let mut abandoner = attach_existing(&options, &project).await?
+                    .context("missing service for accepted abandonment")?;
+                let abandon_generation = abandoner.generation().to_owned();
+                let ServiceValue::CandidateStarted {
                     handle: abandon_handle,
-                    branch: abandon_branch.clone(),
-                    base: abandon_base.clone(),
-                    target: abandon_target.clone(),
-                });
-            let body = serde_json::to_vec(&request)?;
-            let mut stream = abandoner.stream.take().context("missing abandonment stream")?;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
-                stream.write_all(&body).await?;
-                stream.flush().await
-            }).await.context("candidate abandonment frame send deadline")??;
-            drop(stream);
-            drop(abandoner);
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let mut observer = attach_existing(&options, &project).await?
-                        .context("owner disappeared before abandonment proof")?;
-                    match observer.call(ServiceCall::CandidateTransitionOutcome {
-                        original_id: abandon_id,
-                        original_generation: abandon_generation.clone(),
-                        transition: CandidateTransitionKind::Abandon,
+                    base: abandon_base,
+                    branch: abandon_branch,
+                } = abandoner.call(ServiceCall::BeginCandidate {
+                    label: "lost abandonment".into(),
+                }).await? else { bail!("service did not start the abandonment candidate") };
+                ensure!(matches!(abandoner.call(ServiceCall::View {
+                    candidate: Some(abandon_handle),
+                    operation: Box::new(ViewOperation::PutMany {
+                        values: vec![("abandoned-private".into(), serde_json::json!(1))],
+                    }),
+                }).await?, ServiceValue::Unit));
+                let ServiceValue::Revision(abandon_target) = abandoner.call(ServiceCall::View {
+                    candidate: Some(abandon_handle), operation: Box::new(ViewOperation::Revision),
+                }).await? else { bail!("service did not report the abandonment target") };
+                let abandon_id = uuid::Uuid::new_v4();
+                let request = rpc::ServiceRequest::with_id(&abandon_generation, abandon_id,
+                    ServiceCall::AbandonCandidate {
+                        handle: abandon_handle,
                         branch: abandon_branch.clone(),
                         base: abandon_base.clone(),
                         target: abandon_target.clone(),
-                    }).await? {
-                        ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Abandoned) =>
-                            break Ok::<(), anyhow::Error>(()),
-                        ServiceValue::CandidateTransitionOutcome(
-                            CandidateTransitionResult::InFlight | CandidateTransitionResult::StillUncertain,
-                        ) => tokio::time::sleep(Duration::from_millis(20)).await,
-                        other => bail!("candidate abandonment returned unexpected outcome: {other:?}"),
+                    });
+                let body = serde_json::to_vec(&request)?;
+                let mut stream = abandoner.stream.take().context("missing abandonment stream")?;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
+                    stream.write_all(&body).await?;
+                    stream.flush().await
+                }).await.context("candidate abandonment frame send deadline")??;
+                drop(stream);
+                drop(abandoner);
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let mut observer = attach_existing(&options, &project).await?
+                            .context("owner disappeared before abandonment proof")?;
+                        match observer.call(ServiceCall::CandidateTransitionOutcome {
+                            original_id: abandon_id,
+                            original_generation: abandon_generation.clone(),
+                            transition: CandidateTransitionKind::Abandon,
+                            branch: abandon_branch.clone(),
+                            base: abandon_base.clone(),
+                            target: abandon_target.clone(),
+                        }).await? {
+                            ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Abandoned) =>
+                                break Ok::<(), anyhow::Error>(()),
+                            ServiceValue::CandidateTransitionOutcome(
+                                CandidateTransitionResult::InFlight | CandidateTransitionResult::StillUncertain,
+                            ) => tokio::time::sleep(Duration::from_millis(20)).await,
+                            other => bail!("candidate abandonment returned unexpected outcome: {other:?}"),
+                        }
                     }
-                }
-            }).await.context("accepted abandonment proof deadline")??;
-            let permit = acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), served)
-                .await.context("promotion fixture owner did not reap")???;
-            drop(permit);
-            let successor = ServiceOwner::open(options.clone(), &project).await?;
-            let successor_served = tokio::spawn(successor.serve());
-            let mut observer = attach_existing(&options, &project).await?
-                .context("successor did not publish its endpoint")?;
-            ensure!(observer.generation() != generation);
-            ensure!(matches!(observer.call(query()).await?,
-                ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Promoted { revision })
-                    if revision == target));
-            ensure!(matches!(observer.call(ServiceCall::CandidateTransitionOutcome {
-                original_id: abandon_id,
-                original_generation: abandon_generation,
-                transition: CandidateTransitionKind::Abandon,
-                branch: abandon_branch,
-                base: abandon_base,
-                target: abandon_target,
-            }).await?, ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Abandoned)));
-            drop(observer);
-            let permit = acquire_maintenance_permit(&options).await?;
-            tokio::time::timeout(Duration::from_secs(10), successor_served)
-                .await.context("transition fixture successor did not reap")???;
-            drop(permit);
-            Ok::<(), anyhow::Error>(())
-        }).await.with_context(|| format!("lost candidate promotion fixture exceeded its {deadline:?} deadline"))??;
-        Ok(())
+                }).await.context("accepted abandonment proof deadline")??;
+                let _gate = served.restart(_gate, &options, &project, Duration::from_secs(10), "promotion fixture owner did not reap").await?;
+                let mut observer = attach_existing(&options, &project).await?
+                    .context("successor did not publish its endpoint")?;
+                ensure!(observer.generation() != generation);
+                ensure!(matches!(observer.call(query()).await?,
+                    ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Promoted { revision })
+                        if revision == target));
+                ensure!(matches!(observer.call(ServiceCall::CandidateTransitionOutcome {
+                    original_id: abandon_id,
+                    original_generation: abandon_generation,
+                    transition: CandidateTransitionKind::Abandon,
+                    branch: abandon_branch,
+                    base: abandon_base,
+                    target: abandon_target,
+                }).await?, ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Abandoned)));
+                drop(observer);
+                Ok::<(), anyhow::Error>(())
+            }.await
+        }, async |served| {
+            served.retire(
+                &options,
+                None,
+                Duration::from_secs(10),
+                "transition fixture's current owner did not reap",
+            ).await
+        }).await;
+        root.release(outcome)
     }
 
     #[tokio::test]
@@ -3881,9 +3948,12 @@ mod tests {
                 .store
                 .put("later/main", &serde_json::json!("sibling"))
                 .await?;
-            owner.close().await?;
-
-            let mut successor = ServiceOwner::open(options.clone(), &project).await?;
+            // A one-shot successor open; see `crate::spawn_gate::excluding_spawns`.
+            let (mut successor, _gate) = crate::spawn_gate::excluding_spawns(_gate, async {
+                owner.close().await?;
+                ServiceOwner::open(options.clone(), &project).await
+            })
+            .await?;
             let next = successor.authority().clone();
             ensure!(next.service_generation != original_generation);
             let CandidateCreationOutcome::Open {
@@ -3917,16 +3987,21 @@ mod tests {
                 "candidate private rows disappeared across owner restart"
             );
             drop(retained);
-            successor.close().await?;
+            // The owner lock released by this close is next taken by the final
+            // one-shot open; see `crate::spawn_gate::excluding_spawns`.
+            let (mut final_owner, _gate) = crate::spawn_gate::excluding_spawns(_gate, async {
+                successor.close().await?;
 
-            let local = crate::store::MemoryStore::open(options.clone()).await?;
-            let CandidateLookup::Open(candidate) = local.candidate_for_id(id).await? else {
-                bail!("exact candidate was missing before explicit abandonment")
-            };
-            candidate.abandon().await?;
-            drop(candidate);
-            local.close().await?;
-            let mut final_owner = ServiceOwner::open(options, &project).await?;
+                let local = crate::store::MemoryStore::open(options.clone()).await?;
+                let CandidateLookup::Open(candidate) = local.candidate_for_id(id).await? else {
+                    bail!("exact candidate was missing before explicit abandonment")
+                };
+                candidate.abandon().await?;
+                drop(candidate);
+                local.close().await?;
+                ServiceOwner::open(options, &project).await
+            })
+            .await?;
             let final_authority = final_owner.authority().clone();
             ensure!(matches!(
                 inspect(
@@ -4097,17 +4172,22 @@ mod tests {
                 std::fs::write(&path, b"not a directory")?;
                 path
             };
-            ensure!(
-                ServiceOwner::open(options.clone(), &project).await.is_err(),
-                "blocked native publication unexpectedly published an owner"
-            );
-            std::fs::remove_file(obstruction)?;
-            ensure!(
-                EndpointRecord::read(&data, &scope)?.is_none(),
-                "failed publication left a discoverable endpoint"
-            );
-            let reopened = ServiceOwner::open(options, &project).await?;
-            reopened.close().await?;
+            // The rejected open releases the owner lock that the one-shot reopen
+            // takes again; see `crate::spawn_gate::excluding_spawns`.
+            let ((), _gate) = crate::spawn_gate::excluding_spawns(_gate, async {
+                ensure!(
+                    ServiceOwner::open(options.clone(), &project).await.is_err(),
+                    "blocked native publication unexpectedly published an owner"
+                );
+                std::fs::remove_file(obstruction)?;
+                ensure!(
+                    EndpointRecord::read(&data, &scope)?.is_none(),
+                    "failed publication left a discoverable endpoint"
+                );
+                let reopened = ServiceOwner::open(options, &project).await?;
+                reopened.close().await
+            })
+            .await?;
             Ok::<(), anyhow::Error>(())
         })
         .await

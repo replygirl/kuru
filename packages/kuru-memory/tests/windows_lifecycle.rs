@@ -76,34 +76,33 @@ impl Drop for Fixture {
         let Some(mut child) = self.child.take() else {
             return;
         };
-        let descendants_stopped = self.descendants_stopped;
-        std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(40);
-            let mut warned = false;
-            loop {
-                let status = child.try_wait();
-                if matches!(status, Ok(Some(_))) {
-                    break;
-                }
-                if !warned && (status.is_err() || std::time::Instant::now() >= deadline) {
-                    eprintln!(
-                        "native memory fixture cleanup is delayed; retaining creator and {}",
-                        root.path().display()
-                    );
-                    warned = true;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if !descendants_stopped {
+        // Wait on this test thread, never a detached one: the root is released
+        // through the guard, or kept, before the test function returns.
+        match test_support::release_after_creator_exit(
+            root,
+            Duration::from_secs(40),
+            self.descendants_stopped,
+            || child.try_wait(),
+        ) {
+            test_support::CreatorTeardown::Released => {}
+            test_support::CreatorTeardown::Unproven(root) => {
                 // Creator exit alone is not proof about its trusted supervisor.
                 // Keep failure evidence and data until separately reconciled.
                 eprintln!(
                     "native memory fixture descendant cleanup is unproven; preserved {}",
-                    root.path().display()
+                    root.display()
                 );
-                std::mem::forget(root);
             }
-        });
+            test_support::CreatorTeardown::Delayed(root) => {
+                eprintln!(
+                    "native memory fixture cleanup is delayed; retaining creator and {}",
+                    root.display()
+                );
+                // Retain the process handle and any owned Job until this
+                // process exits; a status query or deadline grants nothing.
+                std::mem::forget(child);
+            }
+        }
     }
 }
 

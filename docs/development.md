@@ -387,6 +387,171 @@ project must explicitly retire that idle service before removing their fixture
 directory. The application still holds the project conversation-driver lease,
 so this service boundary does not make simultaneous conversation tests valid.
 
+Dolt panics at close when its data directory disappears before it exits, so a
+fixture root from `kuru_memory::test_support::tempdir()` requires, when it
+drops, a quiescence record for every memory store beneath it: a directory
+holding the Unix `lifecycle.lock`, a directory holding `identity.json` whose
+Windows lease `lifecycles/<identity>.lock` exists, or the store a service owner
+lock names. A template or an unopened copy has no lease and is not a store. It
+never probes a lock: on Unix a lock released in-process can stay held by a
+sibling thread's child between `posix_spawn` and `exec`, so a lock's state
+cannot tell a live owner from a released one. The records are process-local
+and written only on evidence this process observed itself:
+
+- Closing a store records it. Every Dolt supervisor the test process spawns
+  stays live in the ledger until the process reaps that supervisor, and the
+  reap records the store.
+- `test_support::await_managed_quiescence(&options)` retires the idle managed
+  owner, then waits for the lifecycle lease of the project store, of each of
+  its `<hash>.staging-<uuid>` siblings and of each stage preserved under
+  `interrupted/` (bounded by the supervisor's reap allowance; a timeout fails
+  the test) and records each while its lease is held. Managed fixtures call it
+  after their clients close. A fixture that does not know its projects, such as
+  the application's `ServiceCleanup`, finds them with
+  `test_support::managed_store_scopes(&data)`, which uses the same recognition:
+  a fresh open runs its engines under the staging name and renames the store
+  only once activation is validated, so a project whose owner in another
+  process has not activated it has no store under its plain digest. Never
+  enumerate stores by a hand-written name pattern. A fixture that already has
+  an outcome releases through `ServiceCleanup::release(outcome)`, which
+  attaches a cleanup failure or the guard's verdict to that outcome.
+- `test_support::await_store_quiescence(&directory, lifecycle_root)` does the
+  same for one store whose engine ran in another process, such as a spawned
+  `kuru` executable.
+
+A kuru-memory fixture that serves an in-process `ServiceOwner` on a task must
+retire it on every exit path: an early `?`, `bail!` or `ensure!`, the end of
+its success path, and an elapsed fixture deadline. It creates its root and
+options outside its deadline, starts one `test_support::FixtureDeadline` for
+the whole fixture (shared by every stage and loop iteration), and serves the
+owner through `FixtureDeadline::serve`. The stage it passes opens the owner,
+serves it through the `ServedOwner` it is given and returns the body's
+`Result`; the teardown it passes is `ServedOwner::retire` (the maintenance
+permit, then the owner's reap, with the bounds of the fixture's success path).
+The helper holds the served owner outside the timed future. Within the
+deadline it writes a body error to the test's captured output before the
+teardown starts, and returns the body's error as the root cause with any
+teardown failure attached. When the deadline elapses, the stage and its
+clients are dropped, the deadline's own error (`<fixture> exceeded its <budget>
+deadline`) is written first, and the same teardown then runs, bounded by its
+own permit and reap bounds. Stages that serve no owner run through
+`FixtureDeadline::run`. The fixture releases its root with
+`TempDir::release(outcome)`: when the teardown could not retire the owner, for
+example because an aborted request still holds a client attachment, the root
+is kept and the guard's verdict is attached to the fixture's error instead of
+replacing it with a panic. A root that is dropped rather than released still
+panics on a violation. Guarded roots that other fixtures create inside a
+`tokio::time::timeout` future still report an elapsed deadline through the
+guard's panic; converting them to `FixtureDeadline` is a recorded follow-on.
+
+The guard's scan reads at most 8 directory levels and 4096 entries beneath its
+root. It skips exactly one directory per store: the database repository
+`<store>/data/kuru/.dolt` of a store it has recognised from its lease files.
+That repository nests past the depth budget in every real store, Kuru writes
+no store marker, lock file or identity record inside it, and the engine's own
+files there are covered by that store's quiescence record, not by the scan.
+Every other directory named `.dolt` is scanned and subject to both budgets:
+one outside any store, the repository of a directory no lease recognises (a
+template or an unopened copy), and any other `.dolt` beneath a store, such as
+`data/.dolt` or `home/root/.dolt`. Whatever the scan cannot read fails the
+teardown like an unexplained store: a directory past the depth budget, an
+entry past the entry budget, an unreadable directory or entry, and a store
+whose identity cannot be taken. A fixture whose root outgrows either budget
+must scan a narrower root or name a larger budget at its own call site with
+`TempDir::with_depth_budget`, which can only raise the default; the budgets
+are never raised globally. Every store carries directories the scan reads
+four levels below it: its supervisor runs Dolt with `DOLT_ROOT_PATH`
+`<store>/home/root`, where Kuru stages Dolt's global config in
+`.dolt/staging` and Dolt creates `.dolt/eventsData`. A fixture whose data
+directory lies three or more levels below its root exceeds the default 8
+levels at `home/root/.dolt/eventsData`. The two template fixtures, which keep
+a template and unopened copies, name an 11-level budget at their call sites.
+The packaged install and update acceptance in
+`apps/kuru-tui/tests/embedded_runtime.rs`, whose data directories are three
+levels down and whose empty engine cache holds a provisioning probe with the
+same Dolt root, names a 10-level budget.
+
+A kuru-memory fixture that releases a lock and takes it again at once through a
+one-shot acquisition, such as a successor `ServiceOwner::open` after its
+predecessor retired or closed, holds the exclusive spawn gate from before the
+release until that acquisition returns. The shared spawn guard does not exclude
+a sibling test's spawn, and that sibling's child can hold a duplicate of the
+just-released lock description until its `exec`, so the successor would see a
+busy lock although no owner exists. `ServedOwner::restart` retires, opens and
+serves a successor this way, and `spawn_gate::excluding_spawns` covers any other
+sequence; both take the caller's shared guard and hand the exclusive guard
+back down to it atomically, because a successor served inside the restart
+starts its idle timer at once and must not wait for the gate afterwards.
+`ServiceOwner::open` stays one-shot and a fixture never retries it. The gate is
+fair, so a restart waits for every running spawner to drop its shared guard,
+within the fixture's own deadline, and code under the exclusive guard must not
+take a shared one.
+
+A lost-reply test that pauses a request with the fixture reply pause
+(`ReplyPause`, or `test_support::ReplyBarrier` outside kuru-memory), cancels it
+and then expects one `reconcile` or recovery call to return a definite answer
+awaits the reply signal (`ReplyPause::replied`, `ReplyBarrier::wait_replied`)
+before it cancels. The owner answers an outcome query from its in-process
+receipt registry, which settles only when the original request's handler
+returns, and a sibling can read the committed row before then. A sibling's read
+therefore proves the commit but does not order the reconcile, which may still
+be answered `InFlight` and fail as uncertain. The paused client reads and holds
+the owner's reply frame, which the owner writes only after the receipt settled,
+and a released call returns that frame unchanged. Tests that poll `reconcile`
+until the outcome is definite do not need the signal.
+
+A record is keyed by the store directory's native identity and birth time, so
+it follows a rename, and releasing a root forgets the records beneath it, so a
+directory that recycles a removed store's Linux inode does not inherit its
+record. A record snapshots the engine-written `server.log` and `endpoint.json`; an engine that starts later in
+any process changes them and makes the record stale. The ledger and the
+teardown scan run in one critical section, so a teardown's verdict and its
+forgetting of the records beneath its root see one consistent ledger. A store that is unreaped, unrecorded or stale keeps the whole root and,
+outside an existing failure, fails the test, naming the root, the test and
+each store. A test that is already panicking only keeps the root.
+
+Ledger and guard code must finish before its test function returns. Coverage
+writes each process's profile at exit, and a thread still inside an
+instrumented function then can have its entry counter written without a later
+one, leaving a counter expression negative, which the coverage line export
+refuses. So a fixture never drops a guarded root on a detached thread: one
+that must first wait for a creator process uses
+`test_support::release_after_creator_exit`, which waits on the calling thread
+and releases or keeps the root before it returns. A fixture that holds
+something other than a guarded root until a child exits, such as the Windows
+engine fixture's directory handle, waits with `await_creator_exit` on the
+dropping thread and keeps both the child and the handle when the wait ends
+without an exit. A dropped store owner's reaper thread, which outlives its
+owner by design, only sends a report of the reap built from standard-library
+calls, and the ledger records it on the next thread that reads the ledger.
+
+A Dolt branch rename or delete must follow server-observed end of every
+session on that branch, not only Kuru's pool close; otherwise Dolt refuses the
+checked procedure as in use (error 1105). The caller first fences the
+branch's pool admission with `Server::fence_pool`; `Server::retire_branch_sessions`
+takes that admission, retires the branch's pool, awaits that session end and
+returns a `SessionsEnded` proof. The rename, exclusion-probe and delete
+procedures are built only from that proof, and each borrows the admission
+fence until it has run. The compiler-checked proof is the enforcement: it
+cannot be forged outside `server.rs` or reused. Keeping the raw pool close
+private is not: `close_pool_without_session_end` is visible to the crate and
+closes the pool the same way; it only cannot produce a proof.
+`server::branch_procedure_tests` is a textual backstop for raw SQL. It rejects
+a quoted rename, delete or force flag (in either quote style, inline, bound,
+assigned or on another line) in any non-test source outside
+`impl SessionsEnded`, and requires `server.rs` to construct the proof exactly
+once, where the session wait returned, but it cannot see a flag or procedure
+name assembled at run time.
+
+The lifecycle-ordering measurements are ignored tests, and their Dolt trace is
+inert unless `KURU_TEST_DOLT_LOG_DIR` names a directory, so neither runs in
+`test`, coverage or CI partitions. Run them on demand with
+`mise run //packages/kuru-memory:measure:lifecycle`. Optional
+`KURU_TEST_LIFECYCLE_MEASURE_DIR` (default:
+`kuru-lifecycle-measurements/m1` under the system temporary directory)
+receives their CSV rows, and
+`KURU_TEST_LIFECYCLE_MEASURE_ITERATIONS` (default 300) sets the loop count.
+
 Development and test builds optimize only the pinned SHA-2 0.11.0 dependency to
 keep repeated full-executable update verification responsive. Cargo requires
 this version-specific profile override in the workspace root. Workspace code,

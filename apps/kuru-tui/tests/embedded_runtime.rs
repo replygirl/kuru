@@ -604,7 +604,9 @@ impl Installation {
         let mut options = OpenOptions::new(self.data.clone(), scope);
         options.config = self.memory.clone();
         options.supervisor = Some(self.binary.clone());
-        kuru_memory::test_support::retire_idle_service(&options).await
+        // Retire the owner and record its store's quiescence on the guarded
+        // fixture root.
+        kuru_memory::test_support::await_managed_quiescence(&options).await
     }
     async fn native_auth_status(&self) -> Result<()> {
         let output = execute(self.command().arg("auth")).await?;
@@ -1182,6 +1184,31 @@ async fn verify_installed_powershell_activation(root: &Path, installed: &Path) -
 // before the install invocation's own fresh COMMAND_TIMEOUT begins.
 #[cfg(windows)]
 const ENGINE_WARM_UP_TIMEOUT: Duration = Duration::from_secs(100);
+/// The fixture guard's depth budget for this root, above its default 8.
+///
+/// Each installation keeps its data at `private/<label>/data`, three levels
+/// down, so a store is `private/<label>/data/memory/<hash>`, five levels
+/// down. Every store's supervisor runs Dolt with `DOLT_ROOT_PATH`
+/// `<store>/home/root` (kuru-memory `engine.rs`), and in that root's `.dolt`
+/// Kuru stages Dolt's global config in `staging` (`provision.rs`
+/// `prepare_private_home`, `files.rs` `write_in`) while Dolt v2.3.5 creates
+/// `eventsData` on every start and `creds` when it keys credentials
+/// (`go/cmd/dolt/dolt.go:464`, `go/libraries/events/file_backed_proc.go:95`,
+/// `go/libraries/doltcore/env/paths.go:70`): directories 9 levels down. The
+/// empty offline engine cache `private/<label>/empty-engine-cache` holds a
+/// provisioning stage, `<version>/.install-*/private/probe`, whose probe runs
+/// Dolt with the same root layout, so its `root/.dolt/eventsData` and
+/// `staging` are 10 levels down while the stage exists, and a stage whose
+/// cleanup failed after publication is retained (kuru-memory
+/// `provision.rs`). Dolt's only deeper root directory, `git-remote-cache`
+/// (`go/libraries/doltcore/env/remotes.go:116`), serves git remotes, which
+/// this offline fixture never configures. The 38 roots earlier runs of this
+/// test retained on a macOS host measured at most 9 levels for complete stores and 10 for an
+/// unfinished stage, at most 95 of the 4096-entry budget; CI's violations on
+/// Linux, macOS and Windows named the same 9-level `staging` and
+/// `eventsData`. A store's database repository, `data/kuru/.dolt`, is
+/// skipped once its store is recognised and needs no budget here.
+const FIXTURE_DEPTH_BUDGET: usize = 10;
 
 #[cfg(windows)]
 async fn warm_up_powershell_engine(
@@ -1513,11 +1540,9 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
 
 #[tokio::test]
 async fn packaged_install_and_update_preserve_complete_offline_memory() {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("kuru-embedded-acceptance-");
-    #[cfg(unix)]
-    builder.permissions(fs::Permissions::from_mode(0o700));
-    let root = builder.tempdir().unwrap();
+    let root = kuru_memory::test_support::TempDir::new("kuru-embedded-acceptance-", None)
+        .unwrap()
+        .with_depth_budget(FIXTURE_DEPTH_BUDGET);
     let private = Directory::ensure_private(&root.path().join("private")).unwrap();
     if let Err(error) = packaged_roundtrip(private.path()).await {
         // Keep private diagnostics on failure; a timeout must never remove a

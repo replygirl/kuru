@@ -19,10 +19,17 @@ fn candidate_failure_record_exposes_only_fixed_stage_and_sql_class() {
 #[test]
 fn branch_rename_reason_requires_the_exact_pinned_dolt_error() {
     const MESSAGE: &str = "unsafe to delete or rename branches in use in other sessions; use --force to force the change";
-    assert_eq!(
-        candidate_branch_rename_reason(CandidateFailureStage::BranchRename, "HY000", 1105, MESSAGE),
-        "branch_in_use"
-    );
+    // A checked cleanup delete or exclusion probe meets the same Dolt check as
+    // the status rename, so both stages name it; the message stays private.
+    for stage in [
+        CandidateFailureStage::BranchRename,
+        CandidateFailureStage::Cleanup,
+    ] {
+        assert_eq!(
+            candidate_branch_rename_reason(stage, "HY000", 1105, MESSAGE),
+            "branch_in_use"
+        );
+    }
     for (stage, state, vendor, message) in [
         (
             CandidateFailureStage::BranchRename,
@@ -30,7 +37,22 @@ fn branch_rename_reason_requires_the_exact_pinned_dolt_error() {
             1105,
             "another Dolt error",
         ),
+        (
+            CandidateFailureStage::Cleanup,
+            "HY000",
+            1105,
+            "another Dolt error",
+        ),
+        (CandidateFailureStage::Cleanup, "HY001", 1105, MESSAGE),
+        (CandidateFailureStage::Cleanup, "HY000", 1106, MESSAGE),
         (CandidateFailureStage::RefInspection, "HY000", 1105, MESSAGE),
+        (
+            CandidateFailureStage::PoolRetirement,
+            "HY000",
+            1105,
+            MESSAGE,
+        ),
+        (CandidateFailureStage::MainMerge, "HY000", 1105, MESSAGE),
         (CandidateFailureStage::BranchRename, "HY001", 1105, MESSAGE),
         (CandidateFailureStage::BranchRename, "HY000", 1106, MESSAGE),
         (
@@ -566,7 +588,13 @@ async fn candidate_pool_retirement_observes_exact_server_sessions_before_rename(
         assert_eq!(ids.len(), 4);
         drop(connections);
 
-        store.shared.server.retire_pool(&names.open).await?;
+        // The product's own retirement step before every candidate rename and
+        // delete; its session wait makes the count below a guarantee. Its
+        // admission fence ends here, before the transition below fences again.
+        {
+            let admission = store.shared.server.fence_pool(&names.open).await?;
+            let _sessions = retire_branch_sessions(&store, &admission, QUERY_TIMEOUT).await?;
+        }
         let mut active_after_close = 0;
         for id in ids {
             let active: i64 = sqlx::query_scalar(
@@ -897,4 +925,573 @@ async fn full_gc_preserves_live_candidate_historical_and_export_views() -> Resul
     );
     candidate.abandon().await?;
     store.close().await
+}
+
+/// One real server session on `branch` that Kuru's pool bookkeeping no longer
+/// owns: it stands in for a session the server still counts after the client
+/// released it. It ends only when the test sends on the returned channel.
+struct LingeringSession {
+    id: u64,
+    database: String,
+    release: tokio::sync::oneshot::Sender<()>,
+    closed: tokio::task::JoinHandle<Result<()>>,
+}
+
+async fn lingering_session(store: &MemoryStore, branch: &str) -> Result<LingeringSession> {
+    let pool = store.shared.server.pool(branch).await?;
+    let mut connection = pool.acquire().await?.detach();
+    drop(pool);
+    let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(&mut connection)
+        .await?;
+    let database: String = sqlx::query_scalar("SELECT DATABASE()")
+        .fetch_one(&mut connection)
+        .await?;
+    assert_eq!(database, format!("kuru/{branch}"));
+    assert_eq!(session_count(store, id, &database).await?, 1);
+    let (release, released) = tokio::sync::oneshot::channel();
+    let closed = tokio::spawn(async move {
+        let _ = released.await;
+        sqlx::Connection::close(connection).await?;
+        Ok(())
+    });
+    Ok(LingeringSession {
+        id,
+        database,
+        release,
+        closed,
+    })
+}
+
+impl LingeringSession {
+    async fn end(self, store: &MemoryStore) -> Result<()> {
+        let _ = self.release.send(());
+        tokio::time::timeout(TEST_DEADLINE, self.closed).await???;
+        await_session_end(&store.pool, self.id, TEST_DEADLINE).await
+    }
+}
+
+async fn session_count(store: &MemoryStore, id: u64, database: &str) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.processlist WHERE ID = ? AND BINARY DB = BINARY ?",
+    )
+    .bind(id)
+    .bind(database)
+    .fetch_one(store.pool.as_ref())
+    .await?)
+}
+
+/// Reach promotion's committed state without its cleanup: the checked status
+/// rename, then the same fast-forward merge on main that `promote_checked`
+/// issues. `promote()` then takes its already-merged arm straight to cleanup.
+async fn merged_promoting_candidate(
+    store: &MemoryStore,
+    label: &str,
+) -> Result<(Arc<Candidate>, CandidateNames, String)> {
+    let candidate = store.begin_candidate(label).await?;
+    candidate.view().put(label, &json!(true)).await?;
+    let names = CandidateNames::from_open(&candidate.view.branch)?;
+    let target = candidate.view().revision().await?;
+    transition_candidate(store, &names.open, &names.promoting, &target).await?;
+    let (mut main, _) = owned_connection(&store.pool).await?;
+    // The owned connections that issue checked branch procedures come from
+    // this pool; its session must never hold a candidate branch itself.
+    let main_database: String = sqlx::query_scalar("SELECT DATABASE()")
+        .fetch_one(&mut main)
+        .await?;
+    assert_eq!(main_database, format!("kuru/{}", store.branch));
+    assert_ne!(store.branch, names.promoting);
+    tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query("CALL DOLT_MERGE(?, '--ff-only')")
+            .bind(&names.promoting)
+            .fetch_all(&mut main),
+    )
+    .await??;
+    sqlx::Connection::close(main).await?;
+    assert_eq!(store.revision().await?, target);
+    Ok((Arc::new(candidate), names, target))
+}
+
+/// Race the spawned cleanup against the product's session-wait observation.
+/// Before the wait existed the checked branch procedure met the lingering
+/// session at once; report exactly the fixed diagnostic record it produced.
+async fn await_session_wait<T: std::fmt::Debug>(
+    wait_started: tokio::sync::oneshot::Receiver<()>,
+    operation: &mut tokio::task::JoinHandle<Result<T>>,
+    path: &str,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        observed = tokio::time::timeout(TEST_DEADLINE, wait_started) => {
+            observed.with_context(|| format!("{path} did not observe its lingering session"))??;
+            Ok(())
+        }
+        finished = &mut *operation => {
+            let result = finished?;
+            let record = result.as_ref().err().and_then(candidate_failure_record);
+            bail!(
+                "{path} ran its checked branch procedure while a server session still held \
+                 the branch: ok={} record={record:?}",
+                result.is_ok()
+            )
+        }
+    }
+}
+
+#[tokio::test]
+async fn promoted_cleanup_deletes_status_ref_only_after_its_lingering_session_ends() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let (candidate, names, target) =
+        merged_promoting_candidate(&store, "promoted cleanup linger").await?;
+    let session = lingering_session(&store, &names.promoting).await?;
+
+    let wait_started = store.shared.server.observe_next_candidate_wait().await;
+    let promoting = candidate.clone();
+    let mut promotion = tokio::spawn(async move { promoting.promote().await });
+    await_session_wait(wait_started, &mut promotion, "promoted cleanup").await?;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), &mut promotion)
+            .await
+            .is_err(),
+        "promoted cleanup finished while its status session remained active"
+    );
+    assert_eq!(
+        session_count(&store, session.id, &session.database).await?,
+        1
+    );
+    let heads = candidate_heads(&store.pool, &names).await?;
+    assert_eq!(heads.get(&names.promoting), Some(&target));
+    assert!(
+        store
+            .shared
+            .uncertain
+            .lock()
+            .expect("uncertain lock")
+            .is_none(),
+        "the checked delete was issued before the session wait ended"
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(80),
+            store.shared.server.fence_pool(&names.promoting),
+        )
+        .await
+        .is_err(),
+        "status admission was not fenced during the session wait"
+    );
+
+    session.end(&store).await?;
+    let promoted = tokio::time::timeout(TEST_DEADLINE, promotion).await???;
+    assert_eq!(promoted, target);
+    assert!(candidate_heads(&store.pool, &names).await?.is_empty());
+    assert_eq!(store.revision().await?, target);
+    assert_eq!(
+        store.get("promoted cleanup linger").await?,
+        Some(json!(true))
+    );
+    drop(candidate);
+    store.close().await
+}
+
+#[tokio::test]
+async fn abandoned_cleanup_probes_and_deletes_only_after_its_lingering_session_ends() -> Result<()>
+{
+    let store = MemoryStore::temporary().await?;
+    let base = store.revision().await?;
+    let candidate = Arc::new(store.begin_candidate("abandoned cleanup linger").await?);
+    candidate
+        .view()
+        .put("abandoned cleanup linger", &json!(true))
+        .await?;
+    let names = CandidateNames::from_open(&candidate.view.branch)?;
+    let target = candidate.view().revision().await?;
+    transition_candidate(&store, &names.open, &names.abandoned, &target).await?;
+    let session = lingering_session(&store, &names.abandoned).await?;
+
+    let wait_started = store.shared.server.observe_next_candidate_wait().await;
+    let abandoning = candidate.clone();
+    let mut abandonment = tokio::spawn(async move { abandoning.abandon().await });
+    await_session_wait(wait_started, &mut abandonment, "abandoned cleanup").await?;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), &mut abandonment)
+            .await
+            .is_err(),
+        "abandoned cleanup finished while its status session remained active"
+    );
+    assert_eq!(
+        session_count(&store, session.id, &session.database).await?,
+        1
+    );
+    let heads = candidate_heads(&store.pool, &names).await?;
+    assert_eq!(heads.get(&names.abandoned), Some(&target));
+    assert!(
+        store
+            .shared
+            .uncertain
+            .lock()
+            .expect("uncertain lock")
+            .is_none(),
+        "the exclusion probe or forced delete was issued before the session wait ended"
+    );
+
+    session.end(&store).await?;
+    tokio::time::timeout(TEST_DEADLINE, abandonment).await???;
+    assert!(candidate_heads(&store.pool, &names).await?.is_empty());
+    assert_eq!(store.revision().await?, base);
+    assert_eq!(store.get("abandoned cleanup linger").await?, None);
+    drop(candidate);
+    store.close().await
+}
+
+/// A session that outlives the retirement bound fails the step before any
+/// branch procedure: no ref changes, no forced or repeated delete, and the
+/// fixed record names pool retirement, exactly as the gated rename does.
+#[tokio::test]
+async fn candidate_deletion_refuses_a_session_that_outlives_retirement() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let (promoted, promoted_names, promoted_target) =
+        merged_promoting_candidate(&store, "promoted retirement bound").await?;
+    let abandoned = Arc::new(store.begin_candidate("abandoned retirement bound").await?);
+    abandoned
+        .view()
+        .put("abandoned retirement bound", &json!(true))
+        .await?;
+    let abandoned_names = CandidateNames::from_open(&abandoned.view.branch)?;
+    let abandoned_target = abandoned.view().revision().await?;
+    transition_candidate(
+        &store,
+        &abandoned_names.open,
+        &abandoned_names.abandoned,
+        &abandoned_target,
+    )
+    .await?;
+
+    for (names, branch, target, force) in [
+        (
+            &promoted_names,
+            &promoted_names.promoting,
+            &promoted_target,
+            false,
+        ),
+        (
+            &abandoned_names,
+            &abandoned_names.abandoned,
+            &abandoned_target,
+            true,
+        ),
+    ] {
+        let session = lingering_session(&store, branch).await?;
+        let error = tokio::time::timeout(
+            TEST_DEADLINE,
+            delete_candidate_ref(&store, branch, target, force, Duration::from_millis(500)),
+        )
+        .await?
+        .expect_err("a checked candidate delete crossed a live server session");
+        assert_eq!(
+            candidate_failure_record(&error).as_deref(),
+            Some(
+                "candidate_owner stage=pool_retirement class=non_sql sqlstate=none vendor=0 reason=other"
+            ),
+            "force={force}: the refusal was not the bounded session wait"
+        );
+        assert!(
+            format!("{error:#}").contains("candidate source session retirement deadline exceeded")
+        );
+        assert_eq!(
+            session_count(&store, session.id, &session.database).await?,
+            1
+        );
+        let heads = candidate_heads(&store.pool, names).await?;
+        assert_eq!(heads.get(branch.as_str()), Some(target));
+        assert!(
+            store
+                .shared
+                .uncertain
+                .lock()
+                .expect("uncertain lock")
+                .is_none()
+        );
+        session.end(&store).await?;
+    }
+    assert!(
+        promoted
+            .promoted
+            .lock()
+            .expect("candidate result lock")
+            .is_none(),
+        "a refused cleanup recorded the promotion as complete"
+    );
+
+    // Nothing was lost: once the sessions end, the ordinary product paths finish.
+    assert_eq!(
+        tokio::time::timeout(TEST_DEADLINE, promoted.promote()).await??,
+        promoted_target
+    );
+    tokio::time::timeout(TEST_DEADLINE, abandoned.abandon()).await??;
+    assert!(
+        candidate_heads(&store.pool, &promoted_names)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        candidate_heads(&store.pool, &abandoned_names)
+            .await?
+            .is_empty()
+    );
+    assert_eq!(store.revision().await?, promoted_target);
+    drop(promoted);
+    drop(abandoned);
+    store.close().await
+}
+
+/// A branch session that outlives any bound until the test releases it. The
+/// server closes a session idle for its listener `read_timeout_millis`, which
+/// `server_yaml` sets to `QUERY_TIMEOUT`, so an idle session would race the
+/// retirement bound; this one issues a trivial statement every second until
+/// the release signal.
+async fn active_lingering_session(store: &MemoryStore, branch: &str) -> Result<LingeringSession> {
+    let pool = store.shared.server.pool(branch).await?;
+    let mut connection = pool.acquire().await?.detach();
+    drop(pool);
+    let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(&mut connection)
+        .await?;
+    let database: String = sqlx::query_scalar("SELECT DATABASE()")
+        .fetch_one(&mut connection)
+        .await?;
+    assert_eq!(database, format!("kuru/{branch}"));
+    assert_eq!(session_count(store, id, &database).await?, 1);
+    let (release, mut released) = tokio::sync::oneshot::channel::<()>();
+    let closed = tokio::spawn(async move {
+        let mut activity = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = &mut released => break,
+                _ = activity.tick() => {
+                    sqlx::query("SELECT 1").execute(&mut connection).await?;
+                }
+            }
+        }
+        sqlx::Connection::close(connection).await?;
+        Ok(())
+    });
+    Ok(LingeringSession {
+        id,
+        database,
+        release,
+        closed,
+    })
+}
+
+/// Slow (about 31 s): holds one real server session on the status ref for the
+/// full constant `QUERY_TIMEOUT` that every managed cleanup passes, so the
+/// managed client meets the product bound itself, not a test-supplied one.
+///
+/// A session can only meet the deletion wait on a status ref (a session on
+/// the open ref meets the status rename's wait instead), so the owner's store
+/// first performs the product's own `open -> abandoned` rename, as
+/// `candidate_deletion_refuses_a_session_that_outlives_retirement` does: an
+/// abandonment interrupted after its durable rename. The managed client then
+/// drives the remaining cleanup through the service with its exact target.
+///
+/// The owner's handler is the 30 s wait plus further steps, and the client's
+/// reply bound is 35 s, so the reply can arrive complete (`StorageFailed`) or
+/// be lost to the client's own deadline. The test names the shape that
+/// arrived and asserts the fence, the unchanged refs and the unchanged main
+/// on either. That the wait ran for its full bound rests on a server-side
+/// event, not on the client's elapsed time: the owner holds the status ref's
+/// admission across its wait, and a second admission, queued only once the
+/// owner has observed the live session, is granted only when the owner
+/// releases it.
+#[tokio::test]
+async fn slow_30s_managed_abandon_cleanup_bound_fences_client_and_keeps_status_ref() -> Result<()> {
+    crate::test_support::warm_runtime_cache().await?;
+    // Real lifecycles: one fresh service owner, then one local reopen. The
+    // fixture's single-stall term is this test's one `QUERY_TIMEOUT` stall.
+    let deadline = crate::test_support::FixtureDeadline::start(
+        crate::test_support::fixture_deadline(1, 1),
+        "bounded managed abandon fixture",
+    );
+    let root = crate::test_support::tempdir()?;
+    let project = root.path().join("project");
+    std::fs::create_dir(&project)?;
+    let project = project.canonicalize()?;
+    let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+    let scope = format!(
+        "project/{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+    let outcome = async {
+        let names = deadline
+            .serve(
+                async |served| {
+                    // Hold the shared spawn guard only across calls that can
+                    // start a process, never across the bounded wait below.
+                    let (owner_store, memory) = {
+                        let _gate = crate::spawn_gate::spawning().await;
+                        let owner =
+                            crate::service::ServiceOwner::open(options.clone(), &project).await?;
+                        let owner_store = owner.inspection_store_for_test();
+                        served.serve(owner)?;
+                        let memory = crate::MemoryStore::open_managed_observed(
+                            options.clone(),
+                            project.clone(),
+                            std::env::current_exe()?,
+                        )
+                        .1
+                        .await?;
+                        (owner_store, memory)
+                    };
+                    let candidate = memory.begin_candidate("bounded managed abandon").await?;
+                    candidate.view().put("private", &json!(1)).await?;
+                    let target = candidate.view().revision().await?;
+                    let base = candidate.base().to_owned();
+                    ensure!(target != base);
+                    let page = owner_store.candidate_inventory(None, 16).await?;
+                    let [status] = page.candidates.as_slice() else {
+                        bail!("expected exactly one candidate ref, found {page:?}");
+                    };
+                    ensure!(status.state == CandidateRefState::OpenUnchanged);
+                    ensure!(status.head.as_deref() == Some(target.as_str()));
+                    let names = CandidateNames::from_open(&status.branch)?;
+                    transition_candidate(&owner_store, &names.open, &names.abandoned, &target)
+                        .await?;
+                    let session = active_lingering_session(&owner_store, &names.abandoned).await?;
+
+                    let server = &owner_store.shared.server;
+                    let wait_started = server.observe_next_candidate_wait().await;
+                    let started = Instant::now();
+                    let (abandoned, released) =
+                        tokio::join!(candidate.abandon_exact(&target), async {
+                            tokio::time::timeout(TEST_DEADLINE, wait_started)
+                                .await
+                                .context("the owner did not observe the lingering session")?
+                                .context("the owner's session-wait observer was dropped")?;
+                            // Queued only now, while the owner holds the
+                            // status ref's admission across its wait; granted
+                            // when the owner releases it.
+                            let admission = server.fence_pool(&names.abandoned).await?;
+                            let released = started.elapsed();
+                            drop(admission);
+                            Ok::<_, anyhow::Error>(released)
+                        });
+                    let elapsed = started.elapsed();
+                    let released = released?;
+                    let error = abandoned.expect_err(
+                        "managed abandonment deleted a ref under a live server session",
+                    );
+                    let message = format!("{error:#}");
+                    // `ServiceFault::StorageFailed` resolves to the first
+                    // message (a complete reply); the client's own reply
+                    // deadline to the second (a lost reply).
+                    let shape = if message.contains("memory service storage operation failed") {
+                        "a complete StorageFailed reply"
+                    } else if message.contains("memory service frame read deadline exceeded") {
+                        "a reply lost to the client's reply deadline"
+                    } else {
+                        bail!("managed abandonment failed with neither reply shape: {message}")
+                    };
+                    eprintln!(
+                        "managed abandon returned {shape} after {elapsed:?}; the owner released \
+                         the status ref's admission after {released:?}: {error:#}"
+                    );
+                    ensure!(
+                        released >= QUERY_TIMEOUT,
+                        "the owner released the status ref's admission after {released:?}, before \
+                         its {QUERY_TIMEOUT:?} session bound"
+                    );
+                    ensure!(
+                        message.contains(
+                            "memory service write outcome is uncertain; further client mutations \
+                             are blocked"
+                        ),
+                        "the client did not fence {shape}: {message}"
+                    );
+                    let blocked = memory
+                        .put("blocked", &json!(true))
+                        .await
+                        .expect_err("a fenced client issued another mutation");
+                    ensure!(
+                        format!("{blocked:#}").contains(
+                            "memory service write outcome is uncertain; this client cannot issue \
+                             another mutation"
+                        ),
+                        "the second mutation failed for another reason: {blocked:#}"
+                    );
+
+                    // Nothing was decided from the ambiguous wait: the session is
+                    // still live, the status ref keeps its exact head, main never
+                    // moved and no branch procedure was dispatched (it is recorded
+                    // only after the wait). Read after the owner released the
+                    // admission, on either reply shape.
+                    ensure!(session_count(&owner_store, session.id, &session.database).await? == 1);
+                    let heads = candidate_heads(&owner_store.pool, &names).await?;
+                    ensure!(
+                        heads == BTreeMap::from([(names.abandoned.clone(), target.clone())]),
+                        "the bounded cleanup changed candidate refs: {heads:?}"
+                    );
+                    ensure!(owner_store.revision().await? == base);
+                    ensure!(
+                        owner_store
+                            .shared
+                            .uncertain
+                            .lock()
+                            .expect("uncertain lock")
+                            .is_none(),
+                        "the bounded cleanup dispatched a branch procedure"
+                    );
+
+                    session.end(&owner_store).await?;
+                    let recovered = {
+                        let _gate = crate::spawn_gate::spawning().await;
+                        memory
+                            .recover_candidate_transition()
+                            .await?
+                            .context("the fenced client had no pending transition")?
+                    };
+                    ensure!(
+                        recovered.resolution == crate::CandidateTransitionResolution::Abandoned
+                    );
+                    ensure!(recovered.candidate.is_none());
+                    memory.put("after-proof", &json!(true)).await?;
+                    ensure!(memory.get("private").await?.is_none());
+                    drop(candidate);
+                    memory.close().await?;
+                    Ok(names)
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "bounded abandon owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await?;
+
+        // The retained status authority is resolved state: the next open
+        // reclaims it without promoting or reviving the candidate.
+        deadline
+            .run(async {
+                let _gate = crate::spawn_gate::spawning().await;
+                let reopened = MemoryStore::open(options.clone()).await?;
+                ensure!(candidate_heads(&reopened.pool, &names).await?.is_empty());
+                ensure!(reopened.get("private").await?.is_none());
+                ensure!(reopened.get("after-proof").await? == Some(json!(true)));
+                reopened.close().await
+            })
+            .await
+    }
+    .await;
+    root.release(outcome)
 }
