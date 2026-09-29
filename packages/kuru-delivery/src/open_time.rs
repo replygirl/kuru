@@ -14,13 +14,18 @@
 //! Each run is `kuru --provider demo --no-dream run <prompt> --json` with
 //! offline memory: no network, no login and no credential store. The harness
 //! records wall-clock times of the stderr progress lines and of exit, what
-//! [`observe`] saw, a process census before the run, host load before and
-//! after, and a fixed CPU and IO calibration probe. It writes one
-//! `kuru.open-time.v1` JSON line per run and a Markdown summary. It never
+//! [`observe`] saw, a [`census`] before and after the run, host load before
+//! and after, and a fixed CPU and IO calibration probe. It writes one
+//! `kuru.open-time.v2` JSON line per run and a Markdown summary. It never
 //! compares a time with a budget: a slow or failed open is a result, and only
 //! an infrastructure failure (a missing binary, an unwritable output, a
 //! process that does not retire) makes it fail.
+//!
+//! Two modes serve comparisons: with file observation off (the control) the
+//! observer lists processes only, and with the retirement wait off (the ramp)
+//! consecutive runs start while earlier owners are still alive.
 
+pub mod census;
 mod launch;
 pub mod observe;
 pub mod report;
@@ -39,17 +44,23 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use observe::{Census, Observation, Observer, Processes, millis};
+use census::Census;
+use observe::{Observation, Observer, Processes, millis};
 use report::{Counts, OwnerPath, Stages};
 
-pub const SCHEMA: &str = "kuru.open-time.v1";
+pub const SCHEMA: &str = "kuru.open-time.v2";
 const RECORDS: &str = "records.jsonl";
 const SUMMARY: &str = "summary.md";
 /// The owner idles 30 s after its last client (kuru-memory
 /// `SERVICE_IDLE_TIMEOUT`), then closes its engine and supervisor.
 const RETIRE_BOUND: Duration = Duration::from_secs(120);
+/// The measurement tool's poll for process exit while it waits for
+/// retirement; reported with every summary.
 const RETIRE_POLL: Duration = Duration::from_millis(100);
-/// Calibration: SHA-256 over a fixed buffer and a fixed file round trip.
+/// Calibration: SHA-256 over a fixed buffer, repeated, and a fixed file
+/// round trip.
+const CPU_PROBE_BYTES: usize = 256 * 1024 * 1024;
+const CPU_PROBE_REPEATS: usize = 5;
 const PROBE_BYTES: usize = 64 * 1024 * 1024;
 const PROBE_CHUNK: usize = 1024 * 1024;
 const ERROR_LIMIT: usize = 300;
@@ -70,6 +81,11 @@ pub struct Options {
     /// Also append the summary here (a CI job summary file).
     pub summary: Option<PathBuf>,
     pub interval: Duration,
+    /// List file names as well as processes; off for the control series.
+    pub files: bool,
+    /// Wait for the owner to retire after the first launch and the warm
+    /// reopen; off for the ramp series.
+    pub retire_wait: bool,
     /// Bound on one command; past it the command is stopped and recorded.
     pub run_bound: Duration,
     pub prompt: String,
@@ -85,6 +101,8 @@ impl Options {
             label: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             summary: None,
             interval: Duration::from_millis(20),
+            files: true,
+            retire_wait: true,
             run_bound: Duration::from_secs(180),
             prompt: "measure".into(),
         }
@@ -112,7 +130,7 @@ impl Case {
 }
 
 /// One stderr line and the time it was read, in milliseconds from the epoch.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct Line {
     pub t_ms: f64,
     pub text: String,
@@ -141,8 +159,19 @@ pub struct Load {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Probe {
+    /// Median of `cpu_samples_ms`.
     pub cpu_ms: f64,
+    /// Each repeat of SHA-256 over 256 MiB.
+    pub cpu_samples_ms: Vec<f64>,
     pub io_ms: f64,
+}
+
+/// How the series observed and paced its runs.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct Mode {
+    pub files: bool,
+    pub interval_ms: f64,
+    pub retire_wait: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -163,7 +192,7 @@ pub struct Outcome {
     pub json_stdout: bool,
 }
 
-/// One run: `kuru.open-time.v1`. Times are milliseconds from the moment
+/// One run: `kuru.open-time.v2`. Times are milliseconds from the moment
 /// before the command was started. No path, credential or memory content.
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
@@ -171,6 +200,7 @@ pub struct Record {
     pub label: String,
     pub case: Case,
     pub iteration: usize,
+    pub mode: Mode,
     pub binary: Binary,
     pub host: Host,
     pub started_unix_ms: u128,
@@ -178,6 +208,8 @@ pub struct Record {
     pub load: Load,
     pub probe: Probe,
     pub census_before: Census,
+    /// Taken after the command exited and the observer stopped.
+    pub census_after: Census,
     pub timings: Timings,
     pub stderr: Vec<Line>,
     pub stages: Stages,
@@ -186,7 +218,18 @@ pub struct Record {
     pub observation: Observation,
     /// Wait after this run for every process under the root to retire.
     pub retire_wait_ms: Option<f64>,
+    /// Part of that wait until no memory owner process ran from the root.
+    pub owner_retired_ms: Option<f64>,
     pub outcome: Outcome,
+}
+
+impl Record {
+    /// Whether memory opened: the run printed `Memory: ready.`. The one
+    /// definition of a failed open; a command that fails after that line is
+    /// counted separately.
+    pub fn opened(&self) -> bool {
+        self.stages.ready_ms.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +240,7 @@ impl Record {
             label: "unit".into(),
             case,
             iteration,
+            mode: Mode::default(),
             binary: Binary::default(),
             host: Host::default(),
             started_unix_ms: 0,
@@ -204,6 +248,7 @@ impl Record {
             load: Load::default(),
             probe: Probe::default(),
             census_before: Census::default(),
+            census_after: Census::default(),
             timings: Timings::default(),
             stderr: Vec::new(),
             stages: Stages::default(),
@@ -211,6 +256,7 @@ impl Record {
             path: OwnerPath::default(),
             observation: Observation::default(),
             retire_wait_ms: None,
+            owner_retired_ms: None,
             outcome: Outcome::default(),
         }
     }
@@ -220,7 +266,12 @@ impl Record {
 #[derive(Debug)]
 pub struct Report {
     pub records: usize,
+    /// Runs without `Memory: ready.`.
     pub failed_opens: usize,
+    /// Runs that opened and then failed.
+    pub failed_after_open: usize,
+    /// The ramp series' single wait for every owner to retire.
+    pub final_retire_wait_ms: Option<f64>,
     pub summary: String,
 }
 
@@ -352,17 +403,23 @@ fn digest(path: &Path) -> Result<(String, u64)> {
     ))
 }
 
-/// A fixed CPU task (SHA-256 of 64 MiB) and a fixed IO task (write, fsync,
-/// read back and remove 64 MiB) in the scratch root.
+/// A fixed CPU task (SHA-256 of 256 MiB, five times; its median is kept) and
+/// a fixed IO task (write, fsync, read back and remove 64 MiB) in the scratch
+/// root. For comparing runs of one label, not runners of different kinds.
 fn calibrate(directory: &Path) -> Result<Probe> {
     let buffer = vec![0x5a_u8; PROBE_CHUNK];
-    let started = Instant::now();
-    let mut hasher = Sha256::new();
-    for _ in 0..PROBE_BYTES / PROBE_CHUNK {
-        hasher.update(&buffer);
-    }
-    std::hint::black_box(hasher.finalize());
-    let cpu_ms = millis(started.elapsed());
+    let cpu_samples_ms: Vec<f64> = (0..CPU_PROBE_REPEATS)
+        .map(|_| {
+            let started = Instant::now();
+            let mut hasher = Sha256::new();
+            for _ in 0..CPU_PROBE_BYTES / PROBE_CHUNK {
+                hasher.update(&buffer);
+            }
+            std::hint::black_box(hasher.finalize());
+            millis(started.elapsed())
+        })
+        .collect();
+    let cpu_ms = report::stats(&cpu_samples_ms).map_or(0.0, |stats| stats.median);
     let path = directory.join("calibration.bin");
     let started = Instant::now();
     {
@@ -382,6 +439,7 @@ fn calibrate(directory: &Path) -> Result<Probe> {
     fs::remove_file(&path)?;
     Ok(Probe {
         cpu_ms,
+        cpu_samples_ms,
         io_ms: millis(started.elapsed()),
     })
 }
@@ -424,6 +482,8 @@ fn comparable_text(root: &Path) -> String {
 
 struct Series<'a> {
     options: &'a Options,
+    /// The series' scratch root, holding every iteration directory.
+    root: PathBuf,
     binary: Binary,
     host: Host,
     processes: Processes,
@@ -434,7 +494,7 @@ struct Series<'a> {
 
 impl Series<'_> {
     async fn measure(&mut self, scratch: &Scratch, case: Case, iteration: usize) -> Result<Record> {
-        let census_before = Census::of(&self.processes.list());
+        let census_before = census::take(&mut self.processes, &self.root).await;
         let load_before = load();
         let probe = calibrate(&scratch.root)?;
         let launch = launch::Launch {
@@ -450,19 +510,20 @@ impl Series<'_> {
         let gap_since_previous_ms = self
             .previous_exit
             .map(|exit| millis(epoch.saturating_duration_since(exit)));
-        let observer = Observer::start(
-            &scratch.root,
+        let watched = if self.options.files {
             vec![
                 ("data", scratch.data.clone()),
                 ("cache", scratch.cache.clone()),
-            ],
-            epoch,
-            self.options.interval,
-        );
+            ]
+        } else {
+            Vec::new()
+        };
+        let observer = Observer::start(&scratch.root, watched, epoch, self.options.interval);
         let finished = launch::run(&launch, epoch, self.options.run_bound).await;
         self.previous_exit = Some(Instant::now());
         let observation = observer.finish();
         let finished = finished?;
+        let census_after = census::take(&mut self.processes, &self.root).await;
         let load_after = load();
         let derived = report::derive(&observation, &finished.lines, finished.exit_ms);
         let error = finished
@@ -482,6 +543,11 @@ impl Series<'_> {
             label: self.options.label.clone(),
             case,
             iteration,
+            mode: Mode {
+                files: self.options.files,
+                interval_ms: millis(self.options.interval),
+                retire_wait: self.options.retire_wait,
+            },
             binary: self.binary.clone(),
             host: self.host.clone(),
             started_unix_ms,
@@ -492,6 +558,7 @@ impl Series<'_> {
             },
             probe,
             census_before,
+            census_after,
             timings: Timings {
                 spawn_ms: finished.spawn_ms,
                 first_stderr_ms: finished.lines.first().map(|line| line.t_ms),
@@ -504,6 +571,7 @@ impl Series<'_> {
             path: derived.path,
             observation,
             retire_wait_ms: None,
+            owner_retired_ms: None,
             outcome: Outcome {
                 success: finished.success,
                 exit_code: finished.exit_code,
@@ -515,10 +583,11 @@ impl Series<'_> {
 
     async fn retire(&mut self, scratch: &Scratch, record: &mut Record) -> Result<()> {
         let services = scratch.endpoint_directory();
-        record.retire_wait_ms = Some(
+        let retired =
             observe::wait_retired(&mut self.processes, &services, RETIRE_BOUND, RETIRE_POLL)
-                .await?,
-        );
+                .await?;
+        record.retire_wait_ms = Some(retired.wait_ms);
+        record.owner_retired_ms = Some(retired.owner_retired_ms);
         Ok(())
     }
 
@@ -533,7 +602,7 @@ impl Series<'_> {
     async fn iteration(&mut self, scratch: &Scratch, iteration: usize) -> Result<()> {
         for case in Case::ALL {
             let mut record = self.measure(scratch, case, iteration).await?;
-            let retired = if case == Case::ColdExisting {
+            let retired = if case == Case::ColdExisting || !self.options.retire_wait {
                 Ok(())
             } else {
                 self.retire(scratch, &mut record).await
@@ -601,6 +670,7 @@ pub async fn run(options: &Options) -> Result<Report> {
     let sink = fs::File::create(options.output.join(RECORDS))?;
     let mut series = Series {
         options,
+        root: root.clone(),
         binary: Binary {
             sha256,
             bytes,
@@ -617,6 +687,7 @@ pub async fn run(options: &Options) -> Result<Report> {
         sink,
     };
     let mut failure = None;
+    let mut kept = Vec::new();
     for iteration in 1..=options.iterations {
         let directory = root.join(format!("iteration-{iteration:02}"));
         let result = match Scratch::create(directory.clone(), &binary) {
@@ -627,12 +698,46 @@ pub async fn run(options: &Options) -> Result<Report> {
             failure = Some(error);
             break;
         }
-        // Every process under this directory has retired; remove its engine
-        // cache and store before the next iteration.
-        fs::remove_dir_all(&directory)
-            .with_context(|| format!("remove {}", directory.display()))?;
+        if options.retire_wait {
+            // Every process under this directory has retired; remove its
+            // engine cache and store before the next iteration.
+            fs::remove_dir_all(&directory)
+                .with_context(|| format!("remove {}", directory.display()))?;
+        } else {
+            kept.push(directory);
+        }
     }
-    let summary = report::summary(&series.records, &options.label);
+    // The ramp series waits once, after its last run, for every owner it
+    // started; only then can the iteration directories be removed.
+    let mut final_retire_wait_ms = None;
+    if failure.is_none() && !kept.is_empty() {
+        let started = Instant::now();
+        // Each wait also covers every process under the root, so the first
+        // one outlasts the rest.
+        for directory in &kept {
+            let services = directory.join("data").join("memory").join("services");
+            if let Err(error) =
+                observe::wait_retired(&mut series.processes, &services, RETIRE_BOUND, RETIRE_POLL)
+                    .await
+            {
+                failure = Some(error);
+                break;
+            }
+        }
+        if failure.is_none() {
+            final_retire_wait_ms = Some(millis(started.elapsed()));
+            for directory in &kept {
+                fs::remove_dir_all(directory)
+                    .with_context(|| format!("remove {}", directory.display()))?;
+            }
+        }
+    }
+    let mut summary = report::summary(&series.records, &options.label);
+    if let Some(wait) = final_retire_wait_ms {
+        summary.push_str(&format!(
+            "\nFinal wait for every owner of the ramp to retire: {wait:.0} ms.\n"
+        ));
+    }
     fs::write(options.output.join(SUMMARY), &summary)?;
     if let Some(path) = &options.summary {
         let mut file = fs::OpenOptions::new()
@@ -644,7 +749,12 @@ pub async fn run(options: &Options) -> Result<Report> {
     let failed_opens = series
         .records
         .iter()
-        .filter(|record| !record.outcome.success)
+        .filter(|record| !record.opened())
+        .count();
+    let failed_after_open = series
+        .records
+        .iter()
+        .filter(|record| record.opened() && !record.outcome.success)
         .count();
     let records = series.records.len();
     if let Some(error) = failure {
@@ -659,6 +769,8 @@ pub async fn run(options: &Options) -> Result<Report> {
     Ok(Report {
         records,
         failed_opens,
+        failed_after_open,
+        final_retire_wait_ms,
         summary,
     })
 }
