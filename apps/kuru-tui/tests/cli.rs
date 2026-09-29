@@ -1,13 +1,12 @@
 use kuru_delivery::command::BlockingCommand as Command;
 use serde_json::Value;
+#[cfg(unix)]
+use std::sync::{Arc, atomic::AtomicUsize};
 use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Output,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::Ordering,
 };
 
 #[path = "support/memory.rs"]

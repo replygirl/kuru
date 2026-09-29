@@ -10,9 +10,15 @@ pub(crate) const DIAGNOSTIC_BYTES: usize = 4096;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ShellFailureCategory {
     TimedOut,
+    /// Reported only by the Unix process-group shell.
+    #[cfg(unix)]
     Cancelled,
     CaptureFailed,
+    /// Reported only by the Unix process-group shell.
+    #[cfg(unix)]
     OwnershipLost,
+    /// Reported only by the Unix process-group shell.
+    #[cfg(unix)]
     CleanupUnconfirmed,
     OperationFailed,
 }
@@ -21,9 +27,12 @@ impl ShellFailureCategory {
     fn text(self) -> &'static str {
         match self {
             Self::TimedOut => "shell timed out",
+            #[cfg(unix)]
             Self::Cancelled => "shell cancelled",
             Self::CaptureFailed => "shell capture failed",
+            #[cfg(unix)]
             Self::OwnershipLost => "shell ownership lost",
+            #[cfg(unix)]
             Self::CleanupUnconfirmed => "shell cleanup unconfirmed",
             Self::OperationFailed => "shell operation failed",
         }

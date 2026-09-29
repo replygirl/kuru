@@ -44,6 +44,7 @@ description = "Install app/package tooling and repository hooks"
 depends = ["//apps/kuru-docs:setup", "//packages/kuru-delivery:setup"]
 run = [
   "rustup component add rustfmt clippy llvm-tools-preview --toolchain 1.98.1",
+  "rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1",
   "hk install --mise",
 ]
 
@@ -82,6 +83,10 @@ depends = ["lint:rust", "lint:shell", "//apps/kuru-docs:lint"]
 
 [tasks."lint:rust"]
 depends = ["//apps/kuru-tui:lint", "//packages/*:lint"]
+
+[tasks."lint:windows"]
+description = "Lint Windows-only Rust for x86_64-pc-windows-msvc in every package that owns the task"
+depends = ["//apps/kuru-tui:lint:windows", "//packages/*:lint:windows"]
 
 [tasks."format:check"]
 depends = ["format:code", "//apps/kuru-docs:format:check"]
@@ -170,6 +175,7 @@ description = "Full repository gate, including behavior, docs and 90% Rust cover
 depends = [
   "format:code",
   "lint:rust",
+  "lint:windows",
   "typecheck",
   "coverage",
   "lint:tooling",

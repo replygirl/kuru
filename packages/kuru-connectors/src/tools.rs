@@ -5654,9 +5654,6 @@ if ($failed.Count -eq 0) {{
         }
     }
 
-    #[cfg(windows)]
-    const WINDOWS_SHELL_FIXTURE_CHILD: &str = "KURU_WINDOWS_SHELL_ENVIRONMENT_TEST_CHILD";
-
     fn windows_shell_cleanup_uncertain(stdout: &[u8], stderr: &[u8]) -> bool {
         let marker = b"subprocess cleanup unconfirmed";
         stdout.windows(marker.len()).any(|bytes| bytes == marker)
@@ -6000,7 +5997,7 @@ if ($failed.Count -eq 0) {{
                         "Windows shell fixture output exceeds 2 MiB",
                     ));
                 }
-                Ok::<_, std::io::Error>(status?)
+                status
             })
             .await;
             let status = match outcome {

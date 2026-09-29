@@ -98,9 +98,15 @@ run = "cargo check -p kuru-delivery --all-targets --all-features --locked"
 [tasks."lint"]
 run = "cargo clippy -p kuru-delivery --all-targets --all-features --locked -- -D warnings"
 
+[tasks."lint:windows"]
+description = "Lint Windows-only Rust for x86_64-pc-windows-msvc; off Windows the stand-in C toolchain lets build scripts finish without compiling C"
+env.CARGO_BUILD_TARGET = false
+run = "CC_x86_64_pc_windows_msvc='{{config_root}}/support/windows-lint-cc.sh' AR_x86_64_pc_windows_msvc='{{config_root}}/support/windows-lint-ar.sh' cargo clippy -p kuru-delivery --target x86_64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings"
+run_windows = "cargo clippy -p kuru-delivery --target x86_64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings"
+
 [tasks."lint:shell"]
 description = "Check the compiler-free release bootstrap"
-run = "shellcheck support/install.sh"
+run = "shellcheck support/install.sh support/windows-lint-cc.sh support/windows-lint-ar.sh"
 
 [tasks.tool]
 dir = "{{config_root}}/../.."

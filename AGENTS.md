@@ -108,7 +108,8 @@ Convention priority is: (1) the apps/ and packages/ monorepo structure,
 (2) mise's native monorepo task model, (3) Rust, (4) other tools. Each app or
 package owns its mise.toml and tasks. Root tasks aggregate or forward by mise
 address; they must not grow a parallel task workspace. Cargo's root workspace
-exists for shared Rust dependency resolution and combined coverage. Other
+exists for shared Rust dependency resolution, the shared lint configuration in
+its only `clippy.toml`, and combined coverage. Other
 language manifests belong to their owning app/package only when necessary.
 VitePress's Node/npm dependencies are local to apps/kuru-docs. Do not introduce
 Python, Bun, or a root JavaScript/Python project for delivery helpers.
@@ -188,7 +189,9 @@ Run the relevant granular checks before committing. hk runs independent static
 format, lint, typecheck, tooling, cospec, cospec-managed and docs steps
 concurrently before a push; coverage and its 90% line gate are enforced in CI,
 not in hooks. CI gives static categories separate Ubuntu jobs and runs native
-behavior, installation and updates on their supported platforms. Updating from
+behavior, installation and updates on their supported platforms. Lint runs for
+the Windows target as well as the host, so `cfg(windows)` code is checked; see
+[lint configuration](docs/development.md#lint-configuration-and-windows-target-lint). Updating from
 any installed release must remain possible and succeed; as a floor under that
 policy, previous-release update acceptance runs natively in CI on the
 native-test platforms; see

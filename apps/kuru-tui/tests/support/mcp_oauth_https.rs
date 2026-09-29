@@ -29,6 +29,10 @@ pub(crate) struct HttpsMcpFixture {
         reason = "only the Linux unavailable-store fixture checks static header isolation"
     )]
     pub(crate) static_bad_headers: Arc<AtomicUsize>,
+    #[allow(
+        dead_code,
+        reason = "read only by the Unix CLI callback and PTY device-login tests; the trust binary and non-Unix builds never read the token forms"
+    )]
     token_forms: Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
     pub(crate) revocations: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
@@ -295,6 +299,10 @@ impl HttpsMcpFixture {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "read only by the Unix CLI callback and PTY device-login tests; the trust binary and non-Unix builds never read the token forms"
+    )]
     pub(crate) fn token_forms(&self) -> Vec<std::collections::BTreeMap<String, String>> {
         self.token_forms.lock().unwrap().clone()
     }

@@ -56,6 +56,7 @@ impl Gate {
         self.0.read().await
     }
 
+    #[cfg(unix)]
     fn spawning_blocking(&self) -> RwLockReadGuard<'_, ()> {
         self.0.blocking_read()
     }
@@ -81,6 +82,7 @@ pub(crate) async fn spawning() -> RwLockReadGuard<'static, ()> {
 }
 
 /// [`spawning`] for a synchronous test, which has no runtime to `.await` on.
+#[cfg(unix)]
 pub(crate) fn spawning_blocking() -> RwLockReadGuard<'static, ()> {
     GATE.spawning_blocking()
 }

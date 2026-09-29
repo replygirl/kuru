@@ -157,6 +157,10 @@ impl tracing::Subscriber for RetainedStageRecorder {
 fn install_retained_stage_recorder() {
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     INSTALLED.get_or_init(|| {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "this is the process-wide recorder the ban points to: installed once per test process behind a OnceLock, then every cached callsite interest is rebuilt"
+        )]
         tracing::subscriber::set_global_default(RetainedStageRecorder).expect(
             "the retained-stage recorder is the only global tracing subscriber in kuru-memory's tests",
         );

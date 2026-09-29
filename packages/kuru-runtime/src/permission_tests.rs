@@ -94,6 +94,13 @@ impl Provider for TwoStaleFileCalls {
 async fn newly_activated_instructions_settle_stale_parallel_calls_without_effects() -> Result<()> {
     let project = tempfile::tempdir().unwrap();
     std::fs::create_dir(project.path().join("src")).unwrap();
+    #[cfg_attr(
+        not(unix),
+        expect(
+            unused_mut,
+            reason = "only the Unix pre-tool hook below mutates the configuration"
+        )
+    )]
     let mut config = Config {
         mode: Mode::Freudian,
         provider: "demo".into(),

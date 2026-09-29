@@ -43,8 +43,9 @@ to install only those two exact package-owned pins. Communiqué 1.4.2 provides L
 and arm64, macOS arm64 and Windows x86_64 and arm64 binaries, which cover every supported
 platform for the full maintainer gate.
 
-CI runs format, lint, typecheck, repository/workflow tooling, cospec validation,
-managed-file checks and documentation as separate Ubuntu jobs. Native coverage
+CI runs format, lint, Windows-target lint, typecheck, repository/workflow
+tooling, cospec validation, managed-file checks and documentation as separate
+Ubuntu jobs. Native coverage
 runs the same way on Linux x86_64, macOS arm64 and Windows x86_64: per-test
 partitions in parallel (eight on Ubuntu and Windows, four on macOS, matching
 `PARTITIONS` in `packages/kuru-delivery/src/coverage.rs`) and one merge job per
@@ -251,6 +252,7 @@ bridge before any downloaded application can be trusted.
 | `mise run format:fix` | Rust, TOML and documentation formatting |
 | `mise run format:check` | Rust, TOML and documentation formatting |
 | `mise run lint` | All-target Clippy with warnings as errors |
+| `mise run lint:windows` | The same Clippy for `x86_64-pc-windows-msvc`, so `cfg(windows)` code is linted ([details](#lint-configuration-and-windows-target-lint)) |
 | `mise run typecheck` | Rust compilation checks for all targets/features on the host |
 | `mise run test` | Workspace behavioral and protocol tests |
 | `mise run coverage` | Run the behavioral suite under LLVM instrumentation, minimum 90% workspace line coverage |
@@ -399,6 +401,86 @@ runtime paths or add tautological assertions to inflate the score. Favor tests
 that observe peer routing, context isolation, persistence, bounded failure,
 protocol payloads and real CLI output. Live authenticated-provider checks are
 separate from deterministic fixture tests and must be reported accurately.
+
+## Lint configuration and Windows-target lint
+
+The root `clippy.toml` is the workspace's only Clippy configuration. Clippy
+1.98.1 searches `CLIPPY_CONF_DIR`, else the package directory, and walks up to
+the first directory holding `clippy.toml` or `.clippy.toml`
+([Clippy 1.98.1 configuration](https://github.com/rust-lang/rust/blob/1.98.1/src/tools/clippy/book/src/configuration.md)).
+A package-level file would therefore replace the root file and drop its bans.
+
+The file bans methods through
+[`disallowed-methods`](https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#disallowed_methods).
+Every entry carries a `reason` that names the safe alternative. The first bans
+cover thread-scoped and ad hoc global tracing subscriber installation:
+
+- `tracing::subscriber::set_default` and `with_default`;
+- `tracing::dispatcher::set_default` and `with_default`;
+- `tracing_subscriber::util::SubscriberInitExt::set_default`;
+- the global installers `set_global_default`, `SubscriberInitExt::try_init`
+  and `SubscriberInitExt::init`.
+
+tracing-core caches each callsite's interest for the whole process. A
+subscriber set on one thread can miss a callsite that another thread, holding
+no subscriber, registered first; PR #126's first capture failed that way.
+Observe events through one process-wide recorder installed once, as
+`kuru-memory`'s `RetainedStageRecorder` does. The application's one global
+subscriber is installed at startup by `apps/kuru-tui` `diagnostics::install`.
+
+`disallowed_methods` is a single lint in Clippy's `style` group. An allowance
+of it, of `clippy::style`, of `clippy::all` or of `warnings` switches off every
+ban at once. Allow a reviewed call site only on its own statement, with
+`expect`, which fails once the call is gone, and a reason:
+
+```rust
+#[expect(clippy::disallowed_methods, reason = "why this site is safe")]
+tracing::subscriber::with_default(subscriber, || { /* ... */ });
+```
+
+The repository check in `lint:tooling` rejects:
+
+- a `clippy.toml` or `.clippy.toml` under `apps/` or `packages/`;
+- an inner `allow` or `expect` of those lints anywhere, and one on a `mod`,
+  `fn`, `impl` or `trait` item;
+- an outer `allow` of those lints at any scope, and an `expect` without
+  `reason = "..."`;
+- a `[lints]` or `[workspace.lints]` table that allows or expects them;
+- `CLIPPY_CONF_DIR`, `--cap-lints`, or a command-line `-A` of those lints in
+  mise, Cargo or workflow configuration: the root `mise.toml` and
+  `.cargo/config{,.toml}`, each package's `mise.toml`, any
+  `.cargo/config{,.toml}` under `apps/` or `packages/`, and the workflows.
+  Command words split at `=` as well, so `RUSTFLAGS=-Aclippy::style` inside
+  a command is found;
+- a root entry without a reason, and a missing required ban.
+
+It reads text, so an allowance produced by a macro, or lint flags from outside
+the repository, stay outside it.
+
+Rust compiles `cfg(windows)` items only for a Windows target, so host `lint`
+never sees them. Every package with such code owns a `lint:windows` task. It
+runs Clippy for `x86_64-pc-windows-msvc` with warnings as errors, and the root
+`lint:windows` aggregates those tasks. Install the target first with
+`mise run setup`, or with
+`rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1`.
+
+Off Windows, the tasks point `CC_x86_64_pc_windows_msvc` and
+`AR_x86_64_pc_windows_msvc` at stand-ins in `packages/kuru-delivery/support`.
+The stand-ins write empty objects, so C build scripts such as `aws-lc-sys`,
+`ring` and `libsqlite3-sys` finish. Clippy never links, so no object is
+consumed. The stand-in compiles no C, and every compile and probe succeeds; it
+answers preprocessor probes with `clang`, so a build script that decides by
+probing may set different cfgs than real MSVC would. Only Rust diagnostics are
+checked; the native Windows jobs remain the build proof. On a Windows host the
+tasks use the native MSVC toolchain.
+
+`kuru-memory` and its dependents need the verified Windows engine archive,
+which their tasks prepare first. CI's `Lint (x86_64-pc-windows-msvc)` job runs
+on Ubuntu after `bundle-inputs`. It imports the run's verified archives with
+`--archive --offline`, and `ci-gate` requires it. The job checks Rust
+diagnostics only. The native-tests Windows jobs prove that the code compiles,
+links and behaves on Windows. hk does not run `lint:windows` before a push;
+run it locally when changing Windows code.
 
 ## Running a coverage partition by hand
 
@@ -732,7 +814,7 @@ mise run cospec -- instructions proposal --change example-change
 mise run cospec -- validate example-change --strict
 mise run cospec -- apply example-change
 # Implement, test, and record actual evidence with the full local gate.
-mise run format:code ::: lint:rust ::: typecheck ::: coverage ::: lint:tooling ::: cospec:validate ::: cospec:managed:check ::: docs:check
+mise run format:code ::: lint:rust ::: lint:windows ::: typecheck ::: coverage ::: lint:tooling ::: cospec:validate ::: cospec:managed:check ::: docs:check
 mise run cospec -- archive example-change
 ```
 

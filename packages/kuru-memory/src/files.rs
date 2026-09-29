@@ -337,14 +337,8 @@ impl PrivateTemp {
             drop(outer);
             let child = open_directory(&path, Privacy::OwnerOnly, NameRetention::Movable)?;
             let child_identity = child.identity();
-            return close_windows_private_stage(
-                &outer_path,
-                outer_identity,
-                &path,
-                child_identity,
-                child,
-            )
-            .with_context(|| format!("remove private temporary stage at {}", path.display()));
+            close_windows_private_stage(&outer_path, outer_identity, &path, child_identity, child)
+                .with_context(|| format!("remove private temporary stage at {}", path.display()))
         }
         #[cfg(not(windows))]
         _container

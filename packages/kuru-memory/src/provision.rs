@@ -65,7 +65,7 @@ pub(crate) async fn provision_observed(
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn provision_managed(
     config: &MemoryConfig,
     default_cache: &Path,
@@ -87,7 +87,7 @@ async fn provision_managed_observed(
         .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn provision_with_extractor(
     config: &MemoryConfig,
     default_cache: &Path,
@@ -401,7 +401,7 @@ async fn verify_existing_cache(
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn verified_cache(directory: &Path, asset: Asset<'_>) -> Result<PathBuf> {
     let mut progress = ProgressReporter::silent();
     verified_cache_observed(directory, asset, &mut progress).await
@@ -1020,12 +1020,11 @@ async fn activate_staged_with(
         let mut first_error = None;
         let mut retries = 0_u32;
         loop {
+            // A pending retry whose window has closed ends with its first error.
+            if let Some(error) = first_error.take_if(|_| tokio::time::Instant::now() >= deadline) {
+                return Err(activation.retain(expired_activation_error(error, retries)));
+            }
             if first_error.is_some() {
-                if tokio::time::Instant::now() >= deadline {
-                    let error = first_error
-                        .expect("a pending activation retry retains its first checked error");
-                    return Err(activation.retain(expired_activation_error(error, retries)));
-                }
                 retries += 1;
             }
             match activate_once(source, destination) {

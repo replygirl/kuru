@@ -1201,7 +1201,7 @@ pub mod test_support {
                 let mut byte = [0];
                 std::io::stdin().read_exact(&mut byte)?;
                 ensure!(
-                    resume && byte == [b'r'],
+                    resume && byte == *b"r",
                     "fixture checkpoint was resumed instead of terminated"
                 );
             }

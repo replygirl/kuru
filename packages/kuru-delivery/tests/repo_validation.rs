@@ -7,6 +7,9 @@ mod files;
 
 use kuru_delivery::repo;
 
+/// The actual shared lint configuration, so fixtures start from what passes.
+const ROOT_CLIPPY: &str = include_str!("../../../clippy.toml");
+
 struct Repository(tempfile::TempDir);
 
 impl Repository {
@@ -17,6 +20,7 @@ impl Repository {
         repo.write("rust-toolchain.toml", "[toolchain]\nchannel = \"1.98.1\"\n");
         repo.write("AGENTS.md", "# Kuru\nCanonical instructions.\n");
         repo.write("CLAUDE.md", "@AGENTS.md\n");
+        repo.write("clippy.toml", ROOT_CLIPPY);
         repo.write(
             "apps/kuru-tui/Cargo.toml",
             "[package]\nname = \"kuru\"\n[dependencies]\nserde.workspace = true\n",
@@ -1056,4 +1060,242 @@ fn release_workflow_has_no_task_auto_install_exemption() {
             ".github/workflows/release.yml: job notes step Install package-owned release tools runs `mise install` without naming the tools to install"
         ]
     );
+}
+
+impl Repository {
+    fn lint_errors(&self) -> Vec<String> {
+        self.errors()
+            .into_iter()
+            .filter(|error| !error.starts_with(".github/workflows/"))
+            .collect()
+    }
+}
+
+#[test]
+fn actual_lint_configuration_is_the_only_one_and_is_never_switched_off() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let errors: Vec<String> = repo::check(&root)
+        .unwrap()
+        .into_iter()
+        .filter(|error| error.contains("clippy") || error.contains("disallowed"))
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn package_clippy_configuration_would_shadow_the_root_and_is_rejected() {
+    let repo = Repository::new();
+    repo.write(
+        "packages/kuru-core/clippy.toml",
+        "disallowed-methods = []\n",
+    );
+    repo.write("apps/.clippy.toml", "");
+    repo.write("packages/kuru-core/src/nested/clippy.toml", "");
+    // Build output and installed Node packages are never read.
+    repo.write("packages/kuru-core/target/clippy.toml", "");
+    repo.write("apps/kuru-docs/node_modules/x/clippy.toml", "");
+    assert_eq!(
+        repo.lint_errors(),
+        [
+            "apps/.clippy.toml: Clippy would use this file instead of the root clippy.toml and drop its bans; keep lint configuration in the root file",
+            "packages/kuru-core/clippy.toml: Clippy would use this file instead of the root clippy.toml and drop its bans; keep lint configuration in the root file",
+            "packages/kuru-core/src/nested/clippy.toml: Clippy would use this file instead of the root clippy.toml and drop its bans; keep lint configuration in the root file",
+        ]
+    );
+    // The real CLI fails on it too.
+    let output = Command::new(env!("CARGO_BIN_EXE_kuru-delivery"))
+        .args(["repo", "--root"])
+        .arg(repo.0.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("packages/kuru-core/clippy.toml"));
+}
+
+#[test]
+fn crate_and_module_allowances_of_the_ban_are_rejected_but_statements_are_not() {
+    let repo = Repository::new();
+    repo.write(
+        "packages/kuru-core/src/lib.rs",
+        "#![allow(clippy::disallowed_methods)]\n#[expect(clippy::style, reason = \"x\")]\nmod quiet;\n",
+    );
+    repo.write(
+        "apps/kuru-tui/src/main.rs",
+        "fn main() {\n    #[expect(clippy::disallowed_methods, reason = \"reviewed\")]\n    call();\n    let _ = \"#![allow(clippy::all)]\";\n}\n",
+    );
+    repo.write(
+        "packages/kuru-core/target/debug/build.rs",
+        "#![allow(warnings)]\n",
+    );
+    assert_eq!(
+        repo.lint_errors(),
+        [
+            "packages/kuru-core/src/lib.rs:1: `#![allow(clippy::disallowed_methods)]` switches off every disallowed-methods ban for a whole crate or module; expect clippy::disallowed_methods on the reviewed statement instead",
+            "packages/kuru-core/src/lib.rs:2: `#[expect(clippy::style, reason = \" \")]` switches off every disallowed-methods ban for a whole crate or module; expect clippy::disallowed_methods on the reviewed statement instead",
+        ]
+    );
+}
+
+#[test]
+fn cargo_lint_tables_cannot_lower_the_ban() {
+    let repo = Repository::new();
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"apps/kuru-tui\", \"packages/kuru-core\"]\n[workspace.dependencies]\nserde = \"=1.0.229\"\nkuru-core = { path = \"packages/kuru-core\" }\n[workspace.lints.clippy]\nstyle = { level = \"allow\", priority = -1 }\npedantic = \"allow\"\n",
+    );
+    repo.write(
+        "packages/kuru-core/Cargo.toml",
+        "[package]\nname = \"kuru-core\"\n[lints.clippy]\ndisallowed-methods = \"expect\"\n[lints.rust]\nwarnings = \"allow\"\ndead_code = \"allow\"\n",
+    );
+    assert_eq!(
+        repo.lint_errors(),
+        [
+            "Cargo.toml: [workspace.lints.clippy] style switches off every disallowed-methods ban; expect clippy::disallowed_methods on the reviewed statement instead",
+            "packages/kuru-core/Cargo.toml: [lints.clippy] disallowed-methods switches off every disallowed-methods ban; expect clippy::disallowed_methods on the reviewed statement instead",
+            "packages/kuru-core/Cargo.toml: [lints.rust] warnings switches off every disallowed-methods ban; expect clippy::disallowed_methods on the reviewed statement instead",
+        ]
+    );
+}
+
+#[test]
+fn configuration_cannot_redirect_or_allow_the_ban_from_the_command_line() {
+    let repo = Repository::new();
+    repo.replace(
+        "packages/kuru-core/mise.toml",
+        "run = \"cargo test -p kuru-core\"",
+        "env.CLIPPY_CONF_DIR = \"/elsewhere\"\n[tasks.lint]\nrun = \"cargo clippy -p kuru-core -- -D warnings -A clippy::disallowed_methods\"",
+    );
+    repo.write(
+        ".cargo/config.toml",
+        "[build]\nrustflags = [\"--cap-lints\", \"warn\"]\n",
+    );
+    repo.write(
+        ".github/workflows/lint.yml",
+        "on: push\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo clippy -- -Aclippy::all\n",
+    );
+    let errors = repo.lint_errors();
+    assert_eq!(
+        errors,
+        [
+            ".cargo/config.toml: passes --cap-lints, which lowers every disallowed-methods ban",
+            "packages/kuru-core/mise.toml: allows clippy::disallowed_methods on the command line, which switches off every disallowed-methods ban",
+            "packages/kuru-core/mise.toml: sets CLIPPY_CONF_DIR, which makes Clippy read another configuration instead of the root clippy.toml",
+        ]
+    );
+    assert!(repo.errors().iter().any(|error| error
+        == ".github/workflows/lint.yml: allows clippy::all on the command line, which switches off every disallowed-methods ban"));
+}
+
+#[test]
+fn package_cargo_configuration_and_inline_assignments_cannot_allow_the_ban() {
+    let repo = Repository::new();
+    // Package tasks run in the package directory, and Cargo reads every
+    // `.cargo/config{,.toml}` from there up.
+    repo.write(
+        "packages/kuru-core/.cargo/config.toml",
+        "[build]\nrustflags = [\"-Aclippy::disallowed_methods\"]\n",
+    );
+    repo.write(
+        "apps/.cargo/config",
+        "[target.x86_64-pc-windows-msvc]\nrustflags = [\"--allow\", \"clippy::style\"]\n",
+    );
+    repo.write(
+        "apps/kuru-tui/src/.cargo/config.toml",
+        "[env]\nCLIPPY_CONF_DIR = \"/elsewhere\"\n",
+    );
+    repo.write(
+        "packages/kuru-core/.cargo/notes.toml",
+        "rustflags = [\"-Awarnings\"]\n",
+    );
+    repo.replace(
+        "packages/kuru-core/mise.toml",
+        "run = \"cargo test -p kuru-core\"",
+        "run = \"RUSTFLAGS=-Aclippy::disallowed_methods cargo clippy -p kuru-core\"",
+    );
+    assert_eq!(
+        repo.lint_errors(),
+        [
+            "apps/.cargo/config: allows clippy::style on the command line, which switches off every disallowed-methods ban",
+            "apps/kuru-tui/src/.cargo/config.toml: sets CLIPPY_CONF_DIR, which makes Clippy read another configuration instead of the root clippy.toml",
+            "packages/kuru-core/.cargo/config.toml: allows clippy::disallowed_methods on the command line, which switches off every disallowed-methods ban",
+            "packages/kuru-core/mise.toml: allows clippy::disallowed_methods on the command line, which switches off every disallowed-methods ban",
+        ]
+    );
+}
+
+#[test]
+fn item_allowances_outer_allows_and_unexplained_expectations_are_rejected() {
+    let repo = Repository::new();
+    repo.write(
+        "apps/kuru-tui/src/capture.rs",
+        concat!(
+            "#[allow(clippy::disallowed_methods)]\n",
+            "pub(crate) fn capture<T>(subscriber: Registry, f: impl FnOnce() -> T) -> T {\n",
+            "    tracing::subscriber::with_default(subscriber, f)\n",
+            "}\n",
+            "#[expect(clippy::disallowed_methods, reason = \"reviewed\")]\n",
+            "impl Capture {}\n",
+            "#[cfg_attr(test, expect(clippy::all, reason = \"reviewed\"))]\n",
+            "unsafe trait Quiet {}\n",
+            "fn body() {\n",
+            "    #[allow(clippy::disallowed_methods, reason = \"reviewed\")]\n",
+            "    call();\n",
+            "    #[expect(clippy::disallowed_methods)]\n",
+            "    call();\n",
+            "    #[expect(clippy::disallowed_methods, reason = \"reviewed\")]\n",
+            "    call();\n",
+            "    #[allow(dead_code, reason = \"unrelated\")]\n",
+            "    let unused = 1;\n",
+            "}\n",
+        ),
+    );
+    assert_eq!(
+        repo.lint_errors(),
+        [
+            "apps/kuru-tui/src/capture.rs:10: `#[allow(clippy::disallowed_methods, reason = \" \")]` allows a disallowed-methods ban and stays silent once the call is gone; use `expect` with a reason on the reviewed statement instead",
+            "apps/kuru-tui/src/capture.rs:12: `#[expect(clippy::disallowed_methods)]` expects a disallowed-methods ban without a reason; add `reason = \"...\"` saying why the statement is safe",
+            "apps/kuru-tui/src/capture.rs:1: `#[allow(clippy::disallowed_methods)]` on the `fn` item switches off every disallowed-methods ban for every statement in it; expect clippy::disallowed_methods on the reviewed statement instead",
+            "apps/kuru-tui/src/capture.rs:5: `#[expect(clippy::disallowed_methods, reason = \" \")]` on the `impl` item switches off every disallowed-methods ban for every statement in it; expect clippy::disallowed_methods on the reviewed statement instead",
+            "apps/kuru-tui/src/capture.rs:7: `#[cfg_attr(test, expect(clippy::all, reason = \" \"))]` on the `trait` item switches off every disallowed-methods ban for every statement in it; expect clippy::disallowed_methods on the reviewed statement instead",
+        ]
+    );
+}
+
+#[test]
+fn root_configuration_must_exist_ban_every_required_method_and_give_reasons() {
+    let repo = Repository::new();
+    fs::remove_file(repo.0.path().join("clippy.toml")).unwrap();
+    assert_eq!(
+        repo.lint_errors(),
+        [
+            "clippy.toml: the root Clippy configuration is missing; it holds the workspace's disallowed-methods bans"
+        ]
+    );
+    repo.write(
+        "clippy.toml",
+        &ROOT_CLIPPY.replace(
+            "{ path = \"tracing::subscriber::set_default\", reason = ",
+            "\"tracing::subscriber::set_default\", { path = \"unused\", reason = ",
+        ),
+    );
+    repo.replace(
+        "clippy.toml",
+        "{ path = \"tracing_subscriber::util::SubscriberInitExt::init\", reason = \"",
+        "{ path = \"tracing_subscriber::util::SubscriberInitExt::init\", reason = \"  \", old = \"",
+    );
+    repo.replace(
+        "clippy.toml",
+        "{ path = \"tracing::dispatcher::with_default\"",
+        "{ path = \"tracing::dispatcher::with_defaults\"",
+    );
+    assert_eq!(
+        repo.lint_errors(),
+        [
+            "clippy.toml: disallowed-methods entry 1 needs a `path` and a non-empty `reason` naming the safe alternative",
+            "clippy.toml: disallowed-methods entry 10 needs a `path` and a non-empty `reason` naming the safe alternative",
+            "clippy.toml: disallowed-methods must ban tracing::dispatcher::with_default",
+        ]
+    );
+    repo.write("clippy.toml", "avoid-breaking-exported-api = false\n");
+    assert_eq!(repo.lint_errors().len(), 9);
 }
