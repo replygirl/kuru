@@ -1187,6 +1187,81 @@ fn configuration_cannot_redirect_or_allow_the_ban_from_the_command_line() {
 }
 
 #[test]
+fn package_cargo_configuration_and_inline_assignments_cannot_allow_the_ban() {
+    let repo = Repository::new();
+    // Package tasks run in the package directory, and Cargo reads every
+    // `.cargo/config{,.toml}` from there up.
+    repo.write(
+        "packages/kuru-core/.cargo/config.toml",
+        "[build]\nrustflags = [\"-Aclippy::disallowed_methods\"]\n",
+    );
+    repo.write(
+        "apps/.cargo/config",
+        "[target.x86_64-pc-windows-msvc]\nrustflags = [\"--allow\", \"clippy::style\"]\n",
+    );
+    repo.write(
+        "apps/kuru-tui/src/.cargo/config.toml",
+        "[env]\nCLIPPY_CONF_DIR = \"/elsewhere\"\n",
+    );
+    repo.write(
+        "packages/kuru-core/.cargo/notes.toml",
+        "rustflags = [\"-Awarnings\"]\n",
+    );
+    repo.replace(
+        "packages/kuru-core/mise.toml",
+        "run = \"cargo test -p kuru-core\"",
+        "run = \"RUSTFLAGS=-Aclippy::disallowed_methods cargo clippy -p kuru-core\"",
+    );
+    assert_eq!(
+        repo.lint_errors(),
+        [
+            "apps/.cargo/config: allows clippy::style on the command line, which switches off every disallowed-methods ban",
+            "apps/kuru-tui/src/.cargo/config.toml: sets CLIPPY_CONF_DIR, which makes Clippy read another configuration instead of the root clippy.toml",
+            "packages/kuru-core/.cargo/config.toml: allows clippy::disallowed_methods on the command line, which switches off every disallowed-methods ban",
+            "packages/kuru-core/mise.toml: allows clippy::disallowed_methods on the command line, which switches off every disallowed-methods ban",
+        ]
+    );
+}
+
+#[test]
+fn item_allowances_outer_allows_and_unexplained_expectations_are_rejected() {
+    let repo = Repository::new();
+    repo.write(
+        "apps/kuru-tui/src/capture.rs",
+        concat!(
+            "#[allow(clippy::disallowed_methods)]\n",
+            "pub(crate) fn capture<T>(subscriber: Registry, f: impl FnOnce() -> T) -> T {\n",
+            "    tracing::subscriber::with_default(subscriber, f)\n",
+            "}\n",
+            "#[expect(clippy::disallowed_methods, reason = \"reviewed\")]\n",
+            "impl Capture {}\n",
+            "#[cfg_attr(test, expect(clippy::all, reason = \"reviewed\"))]\n",
+            "unsafe trait Quiet {}\n",
+            "fn body() {\n",
+            "    #[allow(clippy::disallowed_methods, reason = \"reviewed\")]\n",
+            "    call();\n",
+            "    #[expect(clippy::disallowed_methods)]\n",
+            "    call();\n",
+            "    #[expect(clippy::disallowed_methods, reason = \"reviewed\")]\n",
+            "    call();\n",
+            "    #[allow(dead_code, reason = \"unrelated\")]\n",
+            "    let unused = 1;\n",
+            "}\n",
+        ),
+    );
+    assert_eq!(
+        repo.lint_errors(),
+        [
+            "apps/kuru-tui/src/capture.rs:10: `#[allow(clippy::disallowed_methods, reason = \" \")]` allows a disallowed-methods ban and stays silent once the call is gone; use `expect` with a reason on the reviewed statement instead",
+            "apps/kuru-tui/src/capture.rs:12: `#[expect(clippy::disallowed_methods)]` expects a disallowed-methods ban without a reason; add `reason = \"...\"` saying why the statement is safe",
+            "apps/kuru-tui/src/capture.rs:1: `#[allow(clippy::disallowed_methods)]` on the `fn` item switches off every disallowed-methods ban for every statement in it; expect clippy::disallowed_methods on the reviewed statement instead",
+            "apps/kuru-tui/src/capture.rs:5: `#[expect(clippy::disallowed_methods, reason = \" \")]` on the `impl` item switches off every disallowed-methods ban for every statement in it; expect clippy::disallowed_methods on the reviewed statement instead",
+            "apps/kuru-tui/src/capture.rs:7: `#[cfg_attr(test, expect(clippy::all, reason = \" \"))]` on the `trait` item switches off every disallowed-methods ban for every statement in it; expect clippy::disallowed_methods on the reviewed statement instead",
+        ]
+    );
+}
+
+#[test]
 fn root_configuration_must_exist_ban_every_required_method_and_give_reasons() {
     let repo = Repository::new();
     fs::remove_file(repo.0.path().join("clippy.toml")).unwrap();

@@ -10,12 +10,18 @@
 //! off every ban at once. Each rule rejects one of those routes:
 //!
 //! - a `clippy.toml` or `.clippy.toml` under `apps/` or `packages/`;
-//! - a crate- or module-level `allow` or `expect` of those lints: an inner
-//!   attribute anywhere, or an outer attribute on a `mod` item;
+//! - an `allow` or `expect` of those lints wider than one statement: an inner
+//!   attribute anywhere, or an outer attribute on a `mod`, `fn`, `impl` or
+//!   `trait` item;
+//! - an outer `allow` of those lints at any scope, which stays silent once the
+//!   call it covered is gone, where `expect` fails;
+//! - an `expect` of those lints without `reason = "..."`;
 //! - a Cargo `[lints]` or `[workspace.lints]` table that allows or expects
 //!   them;
 //! - `CLIPPY_CONF_DIR`, `--cap-lints`, or a command-line allowance of those
-//!   lints in mise, Cargo or workflow configuration;
+//!   lints in mise, Cargo or workflow configuration, including the root's and
+//!   any `.cargo/config` or `.cargo/config.toml` under `apps/` or `packages/`,
+//!   and a `NAME=-A...` assignment inside a command;
 //! - a root file that is missing, lacks a required ban, or has an entry
 //!   without a reason.
 //!
@@ -176,14 +182,37 @@ fn scan(root: &Path, directory: &Path, errors: &mut BTreeSet<String>) -> Result<
                 relative(root, &path)
             ));
         }
+        // Cargo reads every `.cargo/config{,.toml}` from a task's working
+        // directory up, so a package's or category's file applies to its tasks.
+        let cargo_configuration = ["config", "config.toml"].contains(&name.as_ref())
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|parent| parent == ".cargo");
+        if kind.is_file() && cargo_configuration {
+            let text =
+                fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+            command_line(&relative(root, &path), &text, errors);
+        }
         if kind.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
             let text =
                 fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-            for (line, attribute) in broad_allowances(&text) {
-                errors.insert(format!(
-                    "{}:{line}: `{attribute}` switches off every disallowed-methods ban for a whole crate or module; expect clippy::disallowed_methods on the reviewed statement instead",
-                    relative(root, &path)
-                ));
+            for (line, attribute, fault) in rejected_attributes(&text) {
+                let path = relative(root, &path);
+                errors.insert(match fault {
+                    Fault::Module => format!(
+                        "{path}:{line}: `{attribute}` switches off every disallowed-methods ban for a whole crate or module; expect clippy::disallowed_methods on the reviewed statement instead"
+                    ),
+                    Fault::Item(item) => format!(
+                        "{path}:{line}: `{attribute}` on the `{item}` item switches off every disallowed-methods ban for every statement in it; expect clippy::disallowed_methods on the reviewed statement instead"
+                    ),
+                    Fault::Allow => format!(
+                        "{path}:{line}: `{attribute}` allows a disallowed-methods ban and stays silent once the call is gone; use `expect` with a reason on the reviewed statement instead"
+                    ),
+                    Fault::Unexplained => format!(
+                        "{path}:{line}: `{attribute}` expects a disallowed-methods ban without a reason; add `reason = \"...\"` saying why the statement is safe"
+                    ),
+                });
             }
         }
     }
@@ -196,16 +225,94 @@ fn switches(text: &str) -> bool {
         .any(|word| SWITCHES.contains(&word))
 }
 
-fn suppresses(attribute: &str) -> bool {
-    let words: Vec<&str> = attribute
-        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
-        .collect();
-    (words.contains(&"allow") || words.contains(&"expect")) && switches(attribute)
+/// Why an attribute that allows or expects a lint in [`SWITCHES`] is
+/// rejected. An attribute with several faults reports the first listed here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    /// An inner attribute, or an outer one on a `mod`: a crate or module.
+    Module,
+    /// An outer attribute on a `fn`, `impl` or `trait` item.
+    Item(&'static str),
+    /// `allow`, which stays silent once the call it covered is gone.
+    Allow,
+    /// An `expect` without `reason = "..."`.
+    Unexplained,
 }
 
-/// Inner attributes, and outer attributes on a `mod` item, that allow or
-/// expect a lint in [`SWITCHES`], with the line each starts on.
-fn broad_allowances(source: &str) -> Vec<(usize, String)> {
+/// Each `allow(...)` or `expect(...)` group in an attribute that names a lint
+/// in [`SWITCHES`], as its level and whether it gives a reason.
+fn suppressions(attribute: &str) -> Vec<(&'static str, bool)> {
+    let code: Vec<char> = attribute.chars().collect();
+    let mut found = Vec::new();
+    let mut index = 0;
+    while index < code.len() {
+        let word: String = code[index..]
+            .iter()
+            .take_while(|character| character.is_alphanumeric() || **character == '_')
+            .collect();
+        if word.is_empty() {
+            index += 1;
+            continue;
+        }
+        let preceded = index > 0 && (code[index - 1] == ':' || code[index - 1].is_alphanumeric());
+        index += word.chars().count();
+        let level = match word.as_str() {
+            "allow" => "allow",
+            "expect" => "expect",
+            _ => continue,
+        };
+        let mut open = index;
+        while code
+            .get(open)
+            .is_some_and(|character| character.is_whitespace())
+        {
+            open += 1;
+        }
+        if preceded || code.get(open) != Some(&'(') {
+            continue;
+        }
+        let Some(close) = closing_parenthesis(&code, open) else {
+            break;
+        };
+        let group: String = code[open + 1..close].iter().collect();
+        if switches(&group) {
+            found.push((level, explained(&group)));
+        }
+        index = close + 1;
+    }
+    found
+}
+
+/// Whether lint-attribute arguments carry a `reason = ...` key.
+fn explained(arguments: &str) -> bool {
+    arguments.match_indices("reason").any(|(at, key)| {
+        let before = arguments[..at].chars().next_back();
+        !before.is_some_and(|character| character.is_alphanumeric() || character == '_')
+            && arguments[at + key.len()..].trim_start().starts_with('=')
+    })
+}
+
+/// The index of the `)` that closes the `(` at `open`.
+fn closing_parenthesis(code: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (offset, character) in code[open..].iter().enumerate() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Attributes that allow or expect a lint in [`SWITCHES`] and are rejected,
+/// with the line each starts on and why.
+fn rejected_attributes(source: &str) -> Vec<(usize, String, Fault)> {
     let code: Vec<char> = code_only(source).chars().collect();
     let mut found = Vec::new();
     let mut index = 0;
@@ -235,10 +342,22 @@ fn broad_allowances(source: &str) -> Vec<(usize, String)> {
         };
         let attribute: String = code[start..=end].iter().collect();
         index = end + 1;
-        if !suppresses(&attribute) {
+        let levels = suppressions(&attribute);
+        if levels.is_empty() {
             continue;
         }
-        if inner || annotates_module(&code, index) {
+        let fault = if inner {
+            Some(Fault::Module)
+        } else {
+            match annotated_item(&code, index) {
+                Some("mod") => Some(Fault::Module),
+                Some(item) => Some(Fault::Item(item)),
+                None if levels.iter().any(|(level, _)| *level == "allow") => Some(Fault::Allow),
+                None if levels.iter().any(|(_, reason)| !reason) => Some(Fault::Unexplained),
+                None => None,
+            }
+        };
+        if let Some(fault) = fault {
             let line = code[..start]
                 .iter()
                 .filter(|&&character| character == '\n')
@@ -247,6 +366,7 @@ fn broad_allowances(source: &str) -> Vec<(usize, String)> {
             found.push((
                 line,
                 attribute.split_whitespace().collect::<Vec<_>>().join(" "),
+                fault,
             ));
         }
     }
@@ -271,54 +391,63 @@ fn closing(code: &[char], open: usize) -> Option<usize> {
     None
 }
 
-/// Whether the item after an outer attribute ending before `index` is a
-/// module, past any further outer attributes and a visibility.
-fn annotates_module(code: &[char], mut index: usize) -> bool {
-    loop {
+/// The kind of item after an outer attribute ending before `index`, past
+/// any further outer attributes, a visibility and qualifiers, when it is one
+/// whose attribute covers more than one statement: `mod`, `fn`, `impl` or
+/// `trait`.
+fn annotated_item(code: &[char], mut index: usize) -> Option<&'static str> {
+    let skip_whitespace = |index: &mut usize| {
         while code
-            .get(index)
+            .get(*index)
             .is_some_and(|character| character.is_whitespace())
         {
-            index += 1;
+            *index += 1;
         }
+    };
+    loop {
+        skip_whitespace(&mut index);
         if code.get(index) == Some(&'#') {
             let mut open = index + 1;
-            while code
-                .get(open)
-                .is_some_and(|character| character.is_whitespace())
-            {
-                open += 1;
-            }
+            skip_whitespace(&mut open);
             match (code.get(open), closing(code, open)) {
                 (Some('['), Some(end)) => {
                     index = end + 1;
                     continue;
                 }
-                _ => return false,
+                _ => return None,
             }
         }
         let word: String = code[index..]
             .iter()
             .take_while(|character| character.is_alphanumeric() || **character == '_')
             .collect();
+        index += word.chars().count();
         match word.as_str() {
-            "mod" => return true,
+            "mod" => return Some("mod"),
+            "fn" => return Some("fn"),
+            "impl" => return Some("impl"),
+            "trait" => return Some("trait"),
             "pub" => {
-                index += word.len();
-                while code
-                    .get(index)
-                    .is_some_and(|character| character.is_whitespace())
-                {
-                    index += 1;
-                }
+                skip_whitespace(&mut index);
                 if code.get(index) == Some(&'(') {
-                    match code[index..].iter().position(|character| *character == ')') {
-                        Some(offset) => index += offset + 1,
-                        None => return false,
-                    }
+                    index += code[index..]
+                        .iter()
+                        .position(|character| *character == ')')?
+                        + 1;
                 }
             }
-            _ => return false,
+            "const" | "async" | "unsafe" | "safe" | "default" | "auto" => {}
+            "extern" => {
+                // An ABI string: `extern "C" fn`.
+                skip_whitespace(&mut index);
+                if code.get(index) == Some(&'"') {
+                    index += code[index + 1..]
+                        .iter()
+                        .position(|character| *character == '"')?
+                        + 2;
+                }
+            }
+            _ => return None,
         }
     }
 }
@@ -497,16 +626,14 @@ fn command_line(name: &str, text: &str, errors: &mut BTreeSet<String>) {
         ));
     }
     let words: Vec<&str> = text
-        .split(|character: char| character.is_whitespace() || "\"'`,[]{}".contains(character))
+        // `=` too: `RUSTFLAGS=-Aclippy::style cargo clippy` and `--allow=warnings`.
+        .split(|character: char| character.is_whitespace() || "\"'`,[]{}=".contains(character))
         .filter(|word| !word.is_empty())
         .collect();
     for (index, word) in words.iter().enumerate() {
         let lint = match *word {
             "-A" | "--allow" | "--expect" => words.get(index + 1).copied(),
-            _ => word
-                .strip_prefix("--allow=")
-                .or_else(|| word.strip_prefix("-A"))
-                .filter(|lint| !lint.is_empty()),
+            _ => word.strip_prefix("-A").filter(|lint| !lint.is_empty()),
         };
         if let Some(lint) = lint.map(|lint| lint.replace('-', "_"))
             && SWITCHES.contains(&lint.as_str())
@@ -523,9 +650,9 @@ mod tests {
     use super::*;
 
     fn allowances(source: &str) -> Vec<usize> {
-        broad_allowances(source)
+        rejected_attributes(source)
             .into_iter()
-            .map(|(line, _)| line)
+            .map(|(line, _, _)| line)
             .collect()
     }
 
@@ -539,7 +666,78 @@ mod tests {
             fn body() {\n    #[expect(clippy::disallowed_methods, reason = \"x\")]\n    call();\n}\n\
             #![warn(clippy::disallowed_methods)]\n#![allow(clippy::allow_attributes)]\n\
             #![allow(dead_code)]\n#[allow(clippy::disallowed_method)] mod old;\n";
-        assert_eq!(allowances(source), [1, 2, 3, 6, 17]);
+        assert_eq!(allowances(source), [1, 2, 3, 6, 8, 17]);
+    }
+
+    fn faults(source: &str) -> Vec<(usize, Fault)> {
+        rejected_attributes(source)
+            .into_iter()
+            .map(|(line, _, fault)| (line, fault))
+            .collect()
+    }
+
+    #[test]
+    fn allowances_wider_than_a_statement_outer_allows_and_unexplained_expectations_are_found() {
+        // The review's bypass: every caller of this wrapper escapes the ban.
+        let wrapper = "#[allow(clippy::disallowed_methods)]\n\
+            fn capture<T>(subscriber: S, f: impl FnOnce() -> T) -> T {\n\
+                tracing::subscriber::with_default(subscriber, f)\n\
+            }\n";
+        assert_eq!(faults(wrapper), [(1, Fault::Item("fn"))]);
+        let reviewed = "#[expect(clippy::disallowed_methods, reason = \"x\")]\n";
+        for (item, kind) in [
+            ("fn wrapper() {}", "fn"),
+            ("pub(crate) async fn wrapper() {}", "fn"),
+            ("const unsafe fn wrapper() {}", "fn"),
+            ("pub extern \"C\" fn wrapper() {}", "fn"),
+            ("impl Capture {}", "impl"),
+            ("unsafe impl Send for Capture {}", "impl"),
+            ("default impl<T> Capture for T {}", "impl"),
+            ("#[cfg(test)]\ntrait Capture {}", "trait"),
+            ("pub unsafe auto trait Capture {}", "trait"),
+        ] {
+            assert_eq!(
+                faults(&format!("{reviewed}{item}")),
+                [(1, Fault::Item(kind))],
+                "{item}"
+            );
+        }
+        for statement in [
+            "call();",
+            "let value = call();",
+            "const LIMIT: u8 = 1;",
+            "unsafe { call() }",
+            "async move { call() }",
+            "extern crate tracing;",
+            "extern \"C\" { fn call(); }",
+            "pub struct Capture;",
+        ] {
+            assert!(
+                faults(&format!("{reviewed}{statement}")).is_empty(),
+                "{statement}"
+            );
+        }
+        let source = "fn body() {\n\
+            #[allow(clippy::disallowed_methods, reason = \"x\")]\n    call();\n\
+            #[expect(clippy::disallowed_methods)]\n    call();\n\
+            #[cfg_attr(test, allow(clippy::all))]\n    call();\n\
+            #[expect(warnings, reasons = \"x\")]\n    call();\n\
+            #[cfg_attr(test, allow(dead_code), expect(clippy::style, reason = \"x\"))]\n    call();\n\
+            #[allow(dead_code, reason = \"x\")] #[expect(clippy::disallowed_methods, reason = \"x\")]\n    call();\n\
+            #[allow(clippy::allow_attributes)] #[lint::allow(clippy::all)]\n    call();\n\
+            }\n";
+        assert_eq!(
+            faults(source),
+            [
+                (2, Fault::Allow),
+                (4, Fault::Unexplained),
+                (6, Fault::Allow),
+                (8, Fault::Unexplained),
+            ]
+        );
+        assert!(suppressions("#[expect(clippy::all, reason = \"x\"").is_empty());
+        assert!(faults("#[expect(clippy::all, reason = \"x\")] pub extern \"C").is_empty());
+        assert!(faults("#[expect(clippy::all, reason = \"x\")] pub(crate").is_empty());
     }
 
     #[test]
@@ -555,14 +753,22 @@ mod tests {
     }
 
     #[test]
-    fn malformed_attributes_end_the_scan_without_a_finding() {
+    fn malformed_attributes_end_the_item_scan_but_an_outer_allow_is_still_found() {
         assert!(allowances("#![allow(clippy::all)").is_empty());
         assert!(allowances("# not an attribute\n#![allow(dead_code)]").is_empty());
-        assert!(allowances("#[allow(clippy::all)] #").is_empty());
-        assert!(allowances("#[allow(clippy::all)] pub(crate").is_empty());
-        assert!(allowances("#[allow(clippy::all)] #[cfg(test)").is_empty());
-        assert!(allowances("#[allow(clippy::all)] fn f() {}").is_empty());
+        // An outer `allow` is rejected wherever the item scan stops ...
+        assert_eq!(allowances("#[allow(clippy::all)] #"), [1]);
+        assert_eq!(allowances("#[allow(clippy::all)] pub(crate"), [1]);
+        assert_eq!(allowances("#[allow(clippy::all)] #[cfg(test)"), [1]);
+        assert_eq!(allowances("#[allow(clippy::all)] fn f() {}"), [1]);
         assert_eq!(allowances("#[allow(clippy::all)] #[cfg(test)] mod m;"), [1]);
+        // ... and a reasoned `expect` is not, unless an item follows.
+        let reviewed = "#[expect(clippy::all, reason = \"x\")]";
+        assert!(allowances(&format!("{reviewed} #")).is_empty());
+        assert!(allowances(&format!("{reviewed} pub(crate")).is_empty());
+        assert!(allowances(&format!("{reviewed} #[cfg(test)")).is_empty());
+        assert_eq!(allowances(&format!("{reviewed} fn f() {{}}")), [1]);
+        assert_eq!(allowances(&format!("{reviewed} #[cfg(test)] mod m;")), [1]);
     }
 
     #[test]
@@ -597,6 +803,29 @@ mod tests {
             &mut errors,
         );
         assert!(errors.is_empty(), "{errors:?}");
+        // A command word is split at `=` as well: an environment assignment
+        // inside a command, and `--expect=`.
+        for (text, lint) in [
+            (
+                "run = \"RUSTFLAGS=-Aclippy::disallowed_methods cargo clippy\"",
+                "clippy::disallowed_methods",
+            ),
+            (
+                "run = 'cargo clippy -- --expect=clippy::style'",
+                "clippy::style",
+            ),
+            ("env = \"RUSTFLAGS=--allow=warnings\"", "warnings"),
+        ] {
+            let mut errors = BTreeSet::new();
+            command_line("mise.toml", text, &mut errors);
+            assert_eq!(
+                errors.into_iter().collect::<Vec<_>>(),
+                [format!(
+                    "mise.toml: allows {lint} on the command line, which switches off every disallowed-methods ban"
+                )],
+                "{text}"
+            );
+        }
     }
 
     #[test]

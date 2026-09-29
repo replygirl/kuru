@@ -10,6 +10,7 @@
 
 - [x] 2.1 Add the `kuru-delivery` repository rules and tests. They reject a package-level `clippy.toml`, a crate- or module-level allowance of the lint or of its groups, a `[lints]` table that lowers it, `CLIPPY_CONF_DIR` or `-A` in mise or workflow configuration, and a root entry without a reason. Verify with `mise run //packages/kuru-delivery:test`
 - [x] 2.2 Regression: add a package-level `clippy.toml` in a scratch copy, and verify that `mise run //packages/kuru-delivery:check:repo` (part of `lint:tooling`) fails before removal and passes after
+- [x] 2.3 Review round: tighten the rules instead of narrowing the claims. Split command words at `=`; scan `.cargo/config{,.toml}` anywhere under `apps/` and `packages/`; reject an allowance on a `fn`, `impl` or `trait` item, any outer `allow`, and an `expect` without a reason. Correct the stand-in compiler wording. Verify red before and green after for each rule, then rerun `lint` and `lint:windows`
 
 ## 3. Windows-target lint
 

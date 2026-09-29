@@ -33,9 +33,14 @@ edits, and the call-site expectations and Windows findings need them.
 - The `kuru-delivery` repository check rejects anything that would silently
   switch the ban off:
   - a `clippy.toml` or `.clippy.toml` below the root;
-  - a crate- or module-level allowance of the lint or of a group containing it;
+  - an allowance of the lint or of a group containing it wider than one
+    statement: crate, module, `fn`, `impl` or `trait`;
+  - an outer `allow` of them at any scope, since only `expect` fails when
+    stale, and an `expect` without a reason;
   - a Cargo `[lints]` table that lowers it;
-  - `CLIPPY_CONF_DIR` or a command-line `-A` in mise or workflow configuration;
+  - `CLIPPY_CONF_DIR` or a command-line `-A` in mise, workflow or any
+    `.cargo/config{,.toml}` configuration, including `NAME=-A...` inside a
+    command;
   - a root file entry without a reason.
 - `kuru-memory`, `kuru-delivery` and `apps/kuru-tui` get package-owned
   `lint:windows` tasks. So do `kuru-connectors` and `kuru-runtime`:
@@ -44,7 +49,9 @@ edits, and the call-site expectations and Windows findings need them.
   - owning the task covers the remaining three test-target findings, so every
     package with `cfg(windows)` code is linted. They cross-lint for `x86_64-pc-windows-msvc` with
   `-D warnings`. On non-Windows hosts a delivery-owned stand-in C compiler lets
-  the build scripts finish; C is not compiled by this check. A root
+  the build scripts finish. It compiles no C, and every compile and probe
+  succeeds; only Rust diagnostics are checked, and the native Windows jobs
+  remain the build proof. A root
   `lint:windows` aggregate forwards to every package's task, including
   `kuru-platform`'s existing one.
 - A CI job `Lint (x86_64-pc-windows-msvc)` runs on `ubuntu-latest`. It imports

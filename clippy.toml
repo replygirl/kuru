@@ -1,8 +1,9 @@
 # Shared Clippy configuration for every workspace crate. Clippy reads the first
 # clippy.toml or .clippy.toml found walking up from each package directory, so
 # no package may add its own; `mise run lint:tooling` rejects one, and rejects
-# any crate- or module-level allowance of `clippy::disallowed_methods`. Allow a
-# reviewed call site individually with
+# any allowance of `clippy::disallowed_methods` wider than one statement, any
+# outer `allow` of it and any `expect` without a reason. Allow a reviewed call
+# site individually with
 # `#[expect(clippy::disallowed_methods, reason = "...")]` on its statement.
 
 disallowed-methods = [

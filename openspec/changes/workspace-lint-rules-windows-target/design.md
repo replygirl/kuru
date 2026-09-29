@@ -98,9 +98,12 @@
 
 ## Risks / Trade-offs
 
-- [A future build script consumes compiled C output, or runs a compiled probe]
-  → The Windows lint job fails loudly with the build script's error. Nothing
-  passes falsely. Replace the stand-in or move the job to a native runner then.
+- [A build script decides by probing the C compiler] → The stand-in compiles
+  no C, and every compile and probe succeeds; it answers preprocessor probes
+  with `clang`. Such a script takes its success branch, which may set
+  different cfgs than real MSVC would. Nothing in today's graph is known to do
+  this. Only Rust diagnostics are checked; the native Windows jobs remain the
+  build proof.
 - [The stand-in reports every C flag as supported] → The only effect is on C
   flag probes. Rust `cfg`s come from rustc, not cc.
 - [`release.yml` does not run the Windows lint] → The release workflow runs

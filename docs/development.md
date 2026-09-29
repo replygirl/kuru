@@ -430,7 +430,8 @@ subscriber is installed at startup by `apps/kuru-tui` `diagnostics::install`.
 
 `disallowed_methods` is a single lint in Clippy's `style` group. An allowance
 of it, of `clippy::style`, of `clippy::all` or of `warnings` switches off every
-ban at once. Allow a reviewed call site only on its own statement:
+ban at once. Allow a reviewed call site only on its own statement, with
+`expect`, which fails once the call is gone, and a reason:
 
 ```rust
 #[expect(clippy::disallowed_methods, reason = "why this site is safe")]
@@ -440,11 +441,17 @@ tracing::subscriber::with_default(subscriber, || { /* ... */ });
 The repository check in `lint:tooling` rejects:
 
 - a `clippy.toml` or `.clippy.toml` under `apps/` or `packages/`;
-- an inner `allow` or `expect` of those lints anywhere, and one on a `mod`
-  item;
+- an inner `allow` or `expect` of those lints anywhere, and one on a `mod`,
+  `fn`, `impl` or `trait` item;
+- an outer `allow` of those lints at any scope, and an `expect` without
+  `reason = "..."`;
 - a `[lints]` or `[workspace.lints]` table that allows or expects them;
 - `CLIPPY_CONF_DIR`, `--cap-lints`, or a command-line `-A` of those lints in
-  mise, Cargo or workflow configuration;
+  mise, Cargo or workflow configuration: the root `mise.toml` and
+  `.cargo/config{,.toml}`, each package's `mise.toml`, any
+  `.cargo/config{,.toml}` under `apps/` or `packages/`, and the workflows.
+  Command words split at `=` as well, so `RUSTFLAGS=-Aclippy::style` inside
+  a command is found;
 - a root entry without a reason, and a missing required ban.
 
 It reads text, so an allowance produced by a macro, or lint flags from outside
@@ -460,10 +467,12 @@ runs Clippy for `x86_64-pc-windows-msvc` with warnings as errors, and the root
 Off Windows, the tasks point `CC_x86_64_pc_windows_msvc` and
 `AR_x86_64_pc_windows_msvc` at stand-ins in `packages/kuru-delivery/support`.
 The stand-ins write empty objects, so C build scripts such as `aws-lc-sys`,
-`ring` and `libsqlite3-sys` finish without compiling C. Clippy never links, so
-no object is consumed. A build script that needs real compiler output fails
-the task; it cannot make the lint pass. On a Windows host the tasks use the
-native MSVC toolchain.
+`ring` and `libsqlite3-sys` finish. Clippy never links, so no object is
+consumed. The stand-in compiles no C, and every compile and probe succeeds; it
+answers preprocessor probes with `clang`, so a build script that decides by
+probing may set different cfgs than real MSVC would. Only Rust diagnostics are
+checked; the native Windows jobs remain the build proof. On a Windows host the
+tasks use the native MSVC toolchain.
 
 `kuru-memory` and its dependents need the verified Windows engine archive,
 which their tasks prepare first. CI's `Lint (x86_64-pc-windows-msvc)` job runs

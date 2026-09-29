@@ -2,12 +2,14 @@
 # Stand-in MSVC-target C compiler for `lint:windows` on non-Windows hosts.
 #
 # Clippy never links, so the C objects that build scripts compile for
-# x86_64-pc-windows-msvc are never consumed. This stand-in compiles nothing:
-# it writes each requested object as an empty file and succeeds, so build
-# scripts such as aws-lc-sys, ring and libsqlite3-sys finish and Clippy can
-# check the Rust code gated on `cfg(windows)`. A native Windows host uses its
-# real MSVC toolchain instead (`run_windows`). A build script that needs real
-# compiler output fails loudly here; it cannot make the lint pass falsely.
+# x86_64-pc-windows-msvc are never consumed. This stand-in compiles no C:
+# it writes each requested object as an empty file, so every compile and
+# every probe succeeds, and it answers preprocessor (`-E`) probes with
+# `clang`. A build script that decides by probing therefore takes its success
+# branch, which may set different cfgs than real MSVC would. Only Rust
+# diagnostics are checked here; the native Windows jobs remain the build
+# proof. A native Windows host uses its real MSVC toolchain instead
+# (`run_windows`).
 set -eu
 output=""
 previous=""
