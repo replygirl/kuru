@@ -402,9 +402,19 @@ and written only on evidence this process observed itself:
   stays live in the ledger until the process reaps that supervisor, and the
   reap records the store.
 - `test_support::await_managed_quiescence(&options)` retires the idle managed
-  owner, then waits for each project store's lifecycle lease (bounded by the
-  supervisor's reap allowance; a timeout fails the test) and records it while
-  the lease is held. Managed fixtures call it after their clients close.
+  owner, then waits for the lifecycle lease of the project store, of each of
+  its `<hash>.staging-<uuid>` siblings and of each stage preserved under
+  `interrupted/` (bounded by the supervisor's reap allowance; a timeout fails
+  the test) and records each while its lease is held. Managed fixtures call it
+  after their clients close. A fixture that does not know its projects, such as
+  the application's `ServiceCleanup`, finds them with
+  `test_support::managed_store_scopes(&data)`, which uses the same recognition:
+  a fresh open runs its engines under the staging name and renames the store
+  only once activation is validated, so a project whose owner in another
+  process has not activated it has no store under its plain digest. Never
+  enumerate stores by a hand-written name pattern. A fixture that already has
+  an outcome releases through `ServiceCleanup::release(outcome)`, which
+  attaches a cleanup failure or the guard's verdict to that outcome.
 - `test_support::await_store_quiescence(&directory, lifecycle_root)` does the
   same for one store whose engine ran in another process, such as a spawned
   `kuru` executable.

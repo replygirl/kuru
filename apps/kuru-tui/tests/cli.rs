@@ -878,6 +878,64 @@ fn failed_service_cleanup_retains_the_fixture_at_its_original_path() {
     std::fs::remove_dir_all(original.parent().unwrap()).unwrap();
 }
 
+/// A fresh managed open runs its engines in `<hash>.staging-<uuid>` and
+/// renames that directory only once activation is validated, so a store that
+/// a service in another process has not activated exists only under its
+/// staging name. The fixture must still await that store's quiescence, which
+/// this process cannot record for itself, before its guarded root drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_cleanup_awaits_a_store_that_exists_only_under_its_staging_name() {
+    let env = Sandbox::new();
+    env.success(&["run", "Seed a store another process's engine ran in"]);
+    let scope = kuru_runtime::project_scope(&env.project).unwrap();
+    // Stop the CLI's warm service. This process neither ran nor recorded its
+    // engine, so only an awaited quiescence can explain the store.
+    kuru_memory::test_support::retire_idle_service(&kuru_memory::OpenOptions::new(
+        env.data.clone(),
+        scope.clone(),
+    ))
+    .await
+    .unwrap();
+    let hash = scope.strip_prefix("project/").unwrap();
+    let memory = env.data.join("memory");
+    let stage = memory.join(format!("{hash}.staging-{}", uuid::Uuid::new_v4()));
+    std::fs::rename(memory.join(hash), &stage).unwrap();
+    // The cleanup awaits the staged store, and the guard then releases the root.
+    drop(env);
+    assert!(
+        !stage.exists(),
+        "released fixture root still holds its stage"
+    );
+}
+
+#[test]
+fn service_cleanup_release_attaches_its_failure_to_the_fixture_outcome() {
+    let root = kuru_memory::test_support::tempdir().unwrap();
+    let original = root.path().to_path_buf();
+    let data = original.join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("memory"), b"not a fixture memory directory").unwrap();
+    let error = memory::ServiceCleanup::new(root, &data)
+        .release::<()>(Err(anyhow::anyhow!("original fixture failure")))
+        .unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.starts_with("the fixture failed"), "{rendered}");
+    assert!(rendered.contains("original fixture failure"), "{rendered}");
+    assert!(
+        rendered.contains("fixture root retained in place"),
+        "{rendered}"
+    );
+    assert!(original.is_dir());
+    std::fs::remove_dir_all(original.parent().unwrap()).unwrap();
+
+    let root = kuru_memory::test_support::tempdir().unwrap();
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    memory::ServiceCleanup::new(root, &data)
+        .release(Ok(()))
+        .unwrap();
+}
+
 fn assert_memory_progress(stderr: &str) {
     let lines: Vec<_> = stderr.lines().collect();
     assert_eq!(

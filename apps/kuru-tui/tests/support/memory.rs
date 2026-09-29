@@ -58,32 +58,36 @@ impl ServiceCleanup {
         Ok(())
     }
 
+    /// Finish cleanup after the fixture's own `outcome` and release the
+    /// guarded root with it. A cleanup failure or the guard's verdict is
+    /// attached to the fixture's error, or returned for a successful one; it
+    /// never replaces that error with a drop panic.
+    #[allow(
+        dead_code,
+        reason = "each integration-test crate compiles this shared support module independently"
+    )]
+    pub fn release<T>(mut self, outcome: anyhow::Result<T>) -> anyhow::Result<T> {
+        let outcome = match (outcome, self.finish()) {
+            (outcome, Ok(())) => outcome,
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(error), Err(cleanup)) => Err(error.context(format!(
+                "the fixture failed, and its managed-memory cleanup then failed: {cleanup:#}"
+            ))),
+        };
+        match self.root.take() {
+            Some(root) => root.release(outcome),
+            None => outcome,
+        }
+    }
+
+    /// Retire every project a managed service may have served beneath each
+    /// data root, including one whose store exists only under a staging name
+    /// because an owner in another process had not activated it yet.
     fn retire(&self) -> anyhow::Result<()> {
         let mut projects = Vec::new();
         for data in &self.data {
-            let memory = data.join("memory");
-            let entries = match std::fs::read_dir(&memory) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("inspect fixture memory root {memory:?}"));
-                }
-            };
-            for entry in entries {
-                let entry = entry?;
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else {
-                    continue;
-                };
-                if entry.file_type()?.is_dir()
-                    && name.len() == 64
-                    && name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                {
-                    projects.push((data.clone(), format!("project/{name}")));
-                }
+            for scope in kuru_memory::test_support::managed_store_scopes(data)? {
+                projects.push((data.clone(), scope));
             }
         }
         if projects.is_empty() {

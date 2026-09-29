@@ -321,9 +321,11 @@ pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
 /// every client handle for `options` has closed (an attached client makes
 /// [`retire_idle_service`] fail with "active clients"). It retires the idle
 /// owner, whose owner lock is released only after its Dolt is reaped, then
-/// awaits [`await_store_quiescence`] for the project store and each of its
-/// remaining staging directories. The product's asynchronous idle close is
-/// unchanged; only fixtures wait for it.
+/// awaits [`await_store_quiescence`] for the project store, each of its
+/// remaining staging directories and each stage preserved under
+/// `interrupted/`. The product's asynchronous idle close is unchanged; only
+/// fixtures wait for it. A fixture that does not know its projects finds
+/// them with [`managed_store_scopes`].
 pub async fn await_managed_quiescence(options: &OpenOptions) -> Result<()> {
     retire_idle_service(options).await?;
     let directory = crate::store::project_directory(&options.data_dir, &options.project_scope)?;
@@ -344,7 +346,9 @@ pub async fn await_managed_quiescence(options: &OpenOptions) -> Result<()> {
     Ok(())
 }
 
-/// The project store and its `.staging-*` siblings that exist now.
+/// The project store, its `.staging-*` siblings and its stages preserved
+/// under `interrupted/` that exist now: every directory in which a managed
+/// open of this project may have run an engine.
 fn project_store_directories(directory: &Path) -> Result<Vec<PathBuf>> {
     let mut stores = Vec::new();
     if lifecycle_trace::exists(directory) {
@@ -357,28 +361,79 @@ fn project_store_directories(directory: &Path) -> Result<Vec<PathBuf>> {
         return Ok(stores);
     };
     let prefix = format!("{name}.staging-");
-    let entries = match fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(stores),
-        Err(error) => return Err(error.into()),
-    };
-    for (index, entry) in entries.enumerate() {
-        ensure!(
-            index < MAX_STAGE_ENTRIES,
-            "too many entries beside managed fixture store {}",
-            directory.display()
-        );
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|entry| entry.starts_with(&prefix))
-            && entry.file_type()?.is_dir()
-        {
-            stores.push(entry.path());
+    for location in [parent.to_path_buf(), parent.join("interrupted")] {
+        let entries = match fs::read_dir(&location) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for (index, entry) in entries.enumerate() {
+            ensure!(
+                index < MAX_STAGE_ENTRIES,
+                "too many entries beside managed fixture store {}",
+                directory.display()
+            );
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|entry| entry.starts_with(&prefix))
+                && entry.file_type()?.is_dir()
+            {
+                stores.push(entry.path());
+            }
         }
     }
     Ok(stores)
+}
+
+/// The project scopes that have a store directory under `data_dir` now, for
+/// a fixture that must await [`await_managed_quiescence`] for every project a
+/// managed service may have served, without knowing its projects.
+///
+/// A fresh open runs its engines in a `<hash>.staging-<uuid>` directory and
+/// renames it only once activation is validated, so a store an owner in
+/// another process is still opening, or left unactivated, exists only under
+/// that name. A scope is included exactly when
+/// [`await_managed_quiescence`]'s own recognition finds a store for it, so
+/// the two cannot drift: an entry names a candidate scope by its text before
+/// the first `.`, which the product's project directory rule must accept.
+/// A missing memory root has no scopes; any other unreadable root is an error.
+pub fn managed_store_scopes(data_dir: &Path) -> Result<Vec<String>> {
+    let memory = data_dir.join("memory");
+    let mut candidates = std::collections::BTreeSet::new();
+    for location in [memory.clone(), memory.join("interrupted")] {
+        let entries = match fs::read_dir(&location) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect fixture memory root {}", location.display())
+                });
+            }
+        };
+        for (index, entry) in entries.enumerate() {
+            ensure!(
+                index < MAX_STAGE_ENTRIES,
+                "too many entries in fixture memory root {}",
+                location.display()
+            );
+            let name = entry?.file_name();
+            if let Some(candidate) = name.to_str().and_then(|name| name.split('.').next()) {
+                candidates.insert(format!("project/{candidate}"));
+            }
+        }
+    }
+    let mut scopes = Vec::new();
+    for scope in candidates {
+        let Ok(directory) = crate::store::project_directory(data_dir, &scope) else {
+            continue;
+        };
+        if !project_store_directories(&directory)?.is_empty() {
+            scopes.push(scope);
+        }
+    }
+    Ok(scopes)
 }
 
 /// Await the lifecycle lease of one store directory, bounded by the
@@ -642,6 +697,68 @@ mod fixture_diagnostic_tests {
         let error = error.context("ordinary fixture open unexpectedly succeeded")?;
         assert!(format!("{error:#}").contains("memory project scope must start with project/"));
         assert!(!format!("{error:#}").contains("fixture Dolt server log tail"));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod managed_store_scope_tests {
+    use super::*;
+
+    fn hash(digit: char) -> String {
+        digit.to_string().repeat(64)
+    }
+
+    #[test]
+    fn scopes_cover_active_staging_and_preserved_stores_only() -> Result<()> {
+        let root = tempdir()?;
+        let data = root.path().join("private");
+        assert!(managed_store_scopes(&data)?.is_empty(), "no memory root");
+        let memory = data.join("memory");
+        for directory in ["locks", "lifecycles", "interrupted"] {
+            files::private_dir(&memory.join(directory))?;
+        }
+        let uuid = uuid::Uuid::new_v4();
+        // Active, staging-only (an open another process had not activated)
+        // and preserved-only stores each name their scope.
+        files::private_dir(&memory.join(hash('1')))?;
+        files::private_dir(&memory.join(format!("{}.staging-{uuid}", hash('2'))))?;
+        files::private_dir(&memory.join(format!("interrupted/{}.staging-{uuid}", hash('3'))))?;
+        // Neither an invalid project digest, nor a staging-named file, nor
+        // another suffix of a digest with no store names a scope.
+        files::private_dir(&memory.join("F".repeat(64)))?;
+        files::write(
+            &memory.join(format!("{}.staging-{uuid}", hash('4'))),
+            b"not a store",
+        )?;
+        files::private_dir(&memory.join(format!("{}.purge-{uuid}-0", hash('5'))))?;
+        assert_eq!(
+            managed_store_scopes(&data)?,
+            ['1', '2', '3']
+                .map(|digit| format!("project/{}", hash(digit)))
+                .to_vec()
+        );
+        // The staging-only and preserved-only stores are exactly what
+        // `await_managed_quiescence` awaits for their scopes.
+        let staged = crate::store::project_directory(&data, &format!("project/{}", hash('2')))?;
+        assert_eq!(
+            project_store_directories(&staged)?,
+            vec![memory.join(format!("{}.staging-{uuid}", hash('2')))]
+        );
+        let preserved = crate::store::project_directory(&data, &format!("project/{}", hash('3')))?;
+        assert_eq!(
+            project_store_directories(&preserved)?,
+            vec![memory.join(format!("interrupted/{}.staging-{uuid}", hash('3')))]
+        );
+
+        let unreadable = root.path().join("unreadable");
+        files::private_dir(&unreadable)?;
+        files::write(&unreadable.join("memory"), b"not a memory root")?;
+        let error = managed_store_scopes(&unreadable).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("inspect fixture memory root"),
+            "{error:#}"
+        );
         Ok(())
     }
 }
