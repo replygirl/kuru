@@ -397,3 +397,7 @@ Unverified dependency on Windows: a Unix store is recognised by `lifecycle.lock`
 The green `test_support::` log was built before two comment-only edits to `fixture_dir.rs`; the 22-fixture run and the full suite were compiled from the committed source.
 
 Not run: `//packages/kuru-runtime:test` and `//apps/kuru-tui:test` (disk: only the kuru-memory test target is built), so their fixtures under the narrowed rule rest on CI; `lint` did compile their test targets against the changed `TempDir`. Linux, Windows and coverage-instrumented builds; CI.
+
+## Round 13: closure evidence status at archive time (2026-09-29, same host)
+
+- [~] 13.8 @runtime (agent) CI evidence for the commits after f3e5bc6f (round 11 and round 12: the served-owner deadline/scan-narrowing fixes at 20a75e86/6f9fd8ca, and this round's task/design/verification/roadmap record edits) -> defer: none of these commits has run in CI. The CI evidence closed in round 10 (verification 4.1, 4.2, 4.3) was gathered at f3e5bc6f (run 36481114540) and stands as recorded for the code at that commit; it is not claimed for anything committed after it. Local evidence for the round-11/round-12 commits is in verification round 11, round 12 and `$S/flake/ci/pr125-close/narrow/` (red/green fixture_dir, 22 served-owner fixtures, `//packages/kuru-memory:test`, and the local gates), not CI. The final head that reaches `origin/fix/memory-lifecycle-ordering` after this archive will be observed on its own CI run before merge; no pass is claimed here for that run.
