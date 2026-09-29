@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use kuru_delivery::{
-    advisory, archive, bundle, coverage, docs, published_windows, repo, shell_support,
+    advisory, archive, bundle, coverage, docs, open_time, published_windows, repo, shell_support,
 };
 use std::{ffi::OsString, path::PathBuf};
 
@@ -100,6 +100,29 @@ enum Command {
     Repo {
         #[arg(long, default_value = ".")]
         root: PathBuf,
+    },
+    /// Measure a release kuru executable's memory open time from outside,
+    /// report only: no time is compared with a budget.
+    OpenTime {
+        #[arg(long, env = "KURU_OPEN_TIME_BINARY")]
+        binary: PathBuf,
+        #[arg(long, env = "KURU_OPEN_TIME_OUTPUT")]
+        output: PathBuf,
+        /// Parent of the private scratch root (default: the temporary directory).
+        #[arg(long, env = "KURU_OPEN_TIME_SCRATCH")]
+        scratch: Option<PathBuf>,
+        /// Iterations; each runs the three cases once.
+        #[arg(long, env = "KURU_OPEN_TIME_ITERATIONS", default_value_t = 10)]
+        iterations: usize,
+        /// Host label for the summary, such as the CI runner label.
+        #[arg(long, env = "KURU_OPEN_TIME_LABEL")]
+        label: Option<String>,
+        /// Also append the summary to this file (a CI job summary).
+        #[arg(long, env = "GITHUB_STEP_SUMMARY")]
+        summary: Option<PathBuf>,
+        /// Sampling interval of the process and file observer, in milliseconds.
+        #[arg(long, default_value_t = 20)]
+        interval_ms: u64,
     },
 }
 
@@ -419,6 +442,30 @@ async fn main() -> Result<()> {
             let errors = docs::check(&root, &base)?;
             ensure!(errors.is_empty(), "{}", errors.join("\n"));
             println!("Public docs artifacts, local links and anchors passed ({base}).");
+        }
+        Command::OpenTime {
+            binary,
+            output,
+            scratch,
+            iterations,
+            label,
+            summary,
+            interval_ms,
+        } => {
+            let mut options = open_time::Options::new(binary, output);
+            options.scratch = scratch;
+            options.iterations = iterations;
+            if let Some(label) = label {
+                options.label = label;
+            }
+            options.summary = summary.filter(|path| !path.as_os_str().is_empty());
+            options.interval = std::time::Duration::from_millis(interval_ms);
+            let report = open_time::run(&options).await?;
+            println!("{}", report.summary);
+            println!(
+                "Recorded {} runs ({} failed to open); no budget is applied.",
+                report.records, report.failed_opens
+            );
         }
         Command::Repo { root } => {
             let errors = repo::check(&root)?;

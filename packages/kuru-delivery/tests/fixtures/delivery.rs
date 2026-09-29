@@ -86,6 +86,35 @@ async fn main() -> io::Result<()> {
         .as_deref()
     {
         None | Some("--version") => println!("native fixture 0.2.0"),
+        // Stands in for `kuru -C <project> --data-dir <data> ... run <prompt>
+        // --json` as the open-time harness drives it: the two progress lines,
+        // one store file, and JSON on stdout. The prompt `fail` fails the open.
+        Some("-C") => {
+            let values: Vec<String> = std::env::args().skip(1).collect();
+            let after = |flag: &str| {
+                values
+                    .windows(2)
+                    .find(|pair| pair[0] == flag)
+                    .map(|pair| pair[1].clone())
+            };
+            let data = after("--data-dir").ok_or_else(|| io::Error::other("missing --data-dir"))?;
+            let prompt = after("run").unwrap_or_default();
+            eprintln!("Memory: waiting for project ownership…");
+            let store = std::path::Path::new(&data)
+                .join("memory")
+                .join("a".repeat(64));
+            std::fs::create_dir_all(&store)?;
+            std::fs::write(store.join("ready.json"), b"{}")?;
+            if prompt == "fail" {
+                eprintln!("Error: memory service readiness deadline exceeded");
+                std::process::exit(1);
+            }
+            eprintln!("Memory: ready.");
+            println!(
+                "{}",
+                serde_json::json!({ "text": format!("[fixture] {prompt}") })
+            );
+        }
         Some("echo") => {
             let values: Vec<_> = arguments.collect();
             println!(
