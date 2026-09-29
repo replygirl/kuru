@@ -31,7 +31,8 @@ pub const EXACT: &str = "exact";
 
 /// One selected test's libtest completion: milliseconds from the start of its
 /// exact selection. It is timing input for the timing table; the ledger check
-/// requires only that it names selected tests, once each.
+/// requires only that it names selected tests, once each, within the
+/// invocation's recorded run time.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompletedTest {
@@ -258,6 +259,18 @@ fn check_invocation(
                 .iter()
                 .all(|test| kind == EXACT && names.binary_search(&test.name).is_ok()),
         "{executable} {kind} invocation records completions outside its selection"
+    );
+    // Its start and finish are whole seconds read around the process, so no
+    // completion can come later than one second past their difference.
+    let bound = invocation
+        .finished
+        .saturating_sub(invocation.started)
+        .saturating_add(1)
+        .saturating_mul(1000);
+    ensure!(
+        invocation.completed.iter().all(|test| test.millis <= bound),
+        "{executable} {kind} invocation records a completion after {bound} ms, beyond its {} s run",
+        invocation.finished - invocation.started
     );
     Ok(())
 }

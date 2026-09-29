@@ -28,14 +28,15 @@ changes.
 - `packages/kuru-delivery/src/coverage/plan.rs`, `coverage.rs`: the runner
   records each exact selection's per-test completion offsets in the runner
   ledger. The record is informational. It is checked only for names inside
-  the selection and no repeats.
+  the selection, no repeats, and completions no later than one second past
+  the invocation's recorded run time.
 - `packages/kuru-delivery/src/coverage/merge.rs`, `orchestrate.rs`: the merge
   reports predicted and measured seconds per partition, listed tests without a
   row, and rows without a listed test. It writes them to the job summary and
   warns (never fails) above a stale threshold.
 - `packages/kuru-delivery/src/main.rs`, `mise.toml`: `coverage timings`
   (`coverage:timings`) regenerates the table from downloaded partition
-  evidence. `coverage balance` prints the predicted partition totals of the
+  evidence, refusing evidence that is not one complete run per label. `coverage balance` prints the predicted partition totals of the
   checked-in table for each OS label.
 - `docs/development.md`: partition assignment and table refresh.
 

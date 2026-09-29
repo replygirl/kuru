@@ -467,9 +467,12 @@ fn is_attempt(path: &Path) -> bool {
 }
 
 /// Read the partition evidence of one completed run and attribute every
-/// recorded completion. Only each partition's highest attempt counts. A runner
-/// ledger that differs from its receipt, a host without a hosted label, or a
-/// test measured twice for one label fails.
+/// recorded completion. Only each partition's highest attempt counts. The
+/// evidence must be one run's: every receipt names the same source and tree,
+/// and each measured label has one partition count and every index up to it,
+/// because [`refresh`] replaces a measured label's whole column. A missing
+/// partition, mixed evidence, a runner ledger that differs from its receipt, a
+/// host without a hosted label, or a test measured twice for one label fails.
 pub fn measure(inputs: &Path) -> Result<Measured> {
     let mut latest: BTreeMap<(&'static str, u32), (u64, PathBuf, Receipt)> = BTreeMap::new();
     for directory in evidence_directories(inputs)? {
@@ -500,6 +503,7 @@ pub fn measure(inputs: &Path) -> Result<Measured> {
         "{} holds no partition evidence",
         inputs.display()
     );
+    check_one_run(&latest)?;
     let mut measured = Measured::new();
     for ((label, index), (_, directory, receipt)) in latest {
         let path = directory.join(RUNNER_LEDGER_FILE);
@@ -531,9 +535,62 @@ pub fn measure(inputs: &Path) -> Result<Measured> {
     Ok(measured)
 }
 
+/// Require the latest evidence of every partition to be one complete run:
+/// one source and tree across every receipt, and for each label one partition
+/// count with every index from 1 to it.
+fn check_one_run(latest: &BTreeMap<(&'static str, u32), (u64, PathBuf, Receipt)>) -> Result<()> {
+    let mut receipts = latest
+        .values()
+        .map(|(_, directory, receipt)| (directory, receipt));
+    let Some((first_directory, first)) = receipts.next() else {
+        return Ok(());
+    };
+    for (directory, receipt) in receipts {
+        ensure!(
+            receipt.source == first.source && receipt.tree == first.tree,
+            "{} measures source {} tree {}, but {} measures source {} tree {}; give one run's evidence per --inputs directory",
+            directory.display(),
+            receipt.source,
+            receipt.tree,
+            first_directory.display(),
+            first.source,
+            first.tree
+        );
+    }
+    let mut counts: BTreeMap<&str, (u32, BTreeSet<u32>)> = BTreeMap::new();
+    for ((label, index), (_, directory, receipt)) in latest {
+        let (count, indexes) = counts
+            .entry(*label)
+            .or_insert_with(|| (receipt.partition.count, BTreeSet::new()));
+        ensure!(
+            receipt.partition.count == *count,
+            "{label} evidence names partition counts {count} and {} ({})",
+            receipt.partition.count,
+            directory.display()
+        );
+        ensure!(
+            (1..=*count).contains(index),
+            "{label} evidence names partition {index} of {count} ({})",
+            directory.display()
+        );
+        indexes.insert(*index);
+    }
+    for (label, (count, indexes)) in counts {
+        let missing: Vec<u32> = (1..=count)
+            .filter(|index| !indexes.contains(index))
+            .collect();
+        ensure!(
+            missing.is_empty(),
+            "{label} evidence lacks partitions {missing:?} of {count}; refreshing from it would drop their tests' rows, so download a run whose {label} partitions all uploaded evidence"
+        );
+    }
+    Ok(())
+}
+
 /// Refresh a table from measured runs, newest first. Each label the newest
-/// run measured gets a new column: exactly the tests that run measured, each
-/// the rounded mean of every given run that measured it. Every other label
+/// run measured gets a new column: exactly the tests that run measured in all
+/// of its partitions, which [`measure`] requires, each the rounded mean of
+/// every given run that measured it. Every other label
 /// keeps the base column. Rows left without any weight are dropped.
 pub fn refresh(base: &TimingTable, runs: &[Measured]) -> Result<TimingTable> {
     let (newest, _) = runs.split_first().context("no measured run was given")?;
@@ -1099,10 +1156,10 @@ mod tests {
             .values()
             .map(|text| text.lines().count())
             .sum();
-        // Each scripted completion follows the previous one by 10 ms, so
-        // every selected test is attributed 10 ms, once, across partitions.
+        // Each scripted completion follows the previous one by 1 ms, so
+        // every selected test is attributed 1 ms, once, across partitions.
         assert_eq!(tests.len(), listed);
-        assert!(tests.values().all(|weight| *weight == 10), "{tests:?}");
+        assert!(tests.values().all(|weight| *weight == 1), "{tests:?}");
 
         let table = workspace.temp.path().join("timings.tsv");
         fs::write(&table, "artifact\ttest\twindows-latest\na/lib/a\tt\t5\n").unwrap();
@@ -1137,6 +1194,48 @@ mod tests {
         }
         assert!(format!("{:#}", measure(&inputs).unwrap_err()).contains("appears twice"));
         fs::remove_dir_all(&copy).unwrap();
+
+        // A label missing a partition, or evidence mixing sources, trees,
+        // partition counts or out-of-range indexes, is refused, because the
+        // refresh would replace the whole column with part of a run.
+        let aside = workspace.temp.path().join("aside");
+        fs::rename(name(2, 1), &aside).unwrap();
+        let error = format!("{:#}", measure(&inputs).unwrap_err());
+        assert!(
+            error.contains("ubuntu-latest evidence lacks partitions [2] of 2"),
+            "{error}"
+        );
+        fs::rename(&aside, name(2, 1)).unwrap();
+        let receipt = name(2, 1).join("attempt-1").join(RECEIPT_FILE);
+        let original = fs::read(&receipt).unwrap();
+        type Edit = fn(&mut serde_json::Value);
+        let edits: [(Edit, &str); 4] = [
+            (
+                |value| value["source"] = "0".repeat(40).into(),
+                "give one run's evidence per --inputs directory",
+            ),
+            (
+                |value| value["tree"] = "0".repeat(40).into(),
+                "give one run's evidence per --inputs directory",
+            ),
+            (
+                |value| value["partition"]["count"] = 3.into(),
+                "names partition counts 2 and 3",
+            ),
+            (
+                |value| value["partition"]["index"] = 3.into(),
+                "names partition 3 of 2",
+            ),
+        ];
+        for (edit, message) in edits {
+            let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            edit(&mut value);
+            fs::write(&receipt, serde_json::to_vec(&value).unwrap()).unwrap();
+            let error = format!("{:#}", measure(&inputs).unwrap_err());
+            assert!(error.contains(message), "{message}: {error}");
+        }
+        fs::write(&receipt, &original).unwrap();
+        measure(&inputs).unwrap();
         let ledger = name(2, 1).join("attempt-1").join(RUNNER_LEDGER_FILE);
         let mut bytes = fs::read(&ledger).unwrap();
         bytes.push(b'\n');

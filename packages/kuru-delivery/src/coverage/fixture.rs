@@ -393,12 +393,14 @@ impl Launcher for ScriptedLauncher {
         } else {
             self.status
         };
-        // Each selected name completes 10 ms after the previous one, plus one
-        // unselected name, as a nested libtest run would print it.
+        // Each selected name completes 1 ms after the previous one, plus one
+        // unselected name, as a nested libtest run would print it. A chunk
+        // holds far fewer than 1000 names, so every completion stays within
+        // the ledger's bound of one second past the recorded run time.
         let mut finished: BTreeMap<String, u64> = launch.args[1..]
             .iter()
             .zip(1..)
-            .map(|(name, position)| (name.clone(), 10 * position))
+            .map(|(name, position)| (name.clone(), position))
             .collect();
         finished.insert("nested::unselected".to_owned(), 5);
         Ok(Supervision::Exited(

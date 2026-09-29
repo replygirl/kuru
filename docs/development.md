@@ -678,14 +678,26 @@ refreshes the table.
 Each exact invocation in the runner ledger records the milliseconds from the
 selection's start to each selected test's first completion line. The record
 never decides a partition's result; the ledger check requires only that it
-names selected tests, each once. To refresh the table from a completed run,
+names selected tests, each once, no later than one second past the
+invocation's recorded run time. To refresh the table from a completed run,
 download its partition evidence and run the maintainer task, then review and
 commit the table:
 
 ```sh
-gh run download <run-id> -p '*-coverage-*-partition-*' -D /tmp/kuru-run
+gh run download <run-id> -D /tmp/kuru-run \
+  -p '*-coverage-ubuntu-*-partition-*' \
+  -p '*-coverage-macos-*-partition-*' \
+  -p '*-coverage-windows-*-partition-*'
 mise run //packages/kuru-delivery:coverage:timings -- --inputs /tmp/kuru-run
 ```
+
+The patterns leave out the `*-coverage-diagnostics-*` artifacts, which hold no
+receipt. Give each `--inputs` directory exactly one run's evidence. The task
+refuses receipts that disagree on source or tree, and a measured label with
+more than one partition count or without the evidence of every partition,
+because a refresh replaces that label's whole column. A failed partition
+uploads no evidence, so rerun its failed jobs until they pass, or use another
+run; each partition's highest attempt counts.
 
 Repeat `--inputs` for older runs, newest first. The newest run decides each
 measured label's rows, and each weight is the rounded mean over every run that

@@ -3628,7 +3628,7 @@ mod tests {
                 // Every selected name is timed; the scripted nested name is not.
                 let timed: Vec<u64> = chunks[0].completed.iter().map(|test| test.millis).collect();
                 assert_eq!(timed.len(), record.assigned);
-                assert!(timed.iter().all(|millis| *millis >= 10 && millis % 10 == 0));
+                assert!(timed.iter().all(|millis| *millis >= 1));
                 assert!(
                     chunks[0]
                         .completed
@@ -4074,7 +4074,7 @@ mod tests {
             .position(|record| record.action == plan::RUN)
             .unwrap();
         type Tamper = fn(&mut Vec<RunnerRecord>, usize);
-        let cases: [(Tamper, &str); 19] = [
+        let cases: [(Tamper, &str); 20] = [
             (
                 |records, _| records.push(records[0].clone()),
                 "extra records",
@@ -4157,6 +4157,14 @@ mod tests {
                     records[at].invocations[0].completed.push(first);
                 },
                 "completions outside its selection",
+            ),
+            (
+                |records, at| {
+                    let invocation = &mut records[at].invocations[1];
+                    let seconds = invocation.finished - invocation.started;
+                    invocation.completed[0].millis = (seconds + 1) * 1000 + 1;
+                },
+                "beyond its",
             ),
         ];
         for (tamper, reason) in cases {
