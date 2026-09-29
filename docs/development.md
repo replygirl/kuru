@@ -192,7 +192,9 @@ supported-platform proof of that whole suite; nothing is subset. The Windows
 offline build-input check (`bundle:verify-native-build`) has no test inventory
 to partition and stays in the Windows installation job.
 Windows primitives retain a separate native coverage job for early feedback. The
-required `ci-gate` accepts only success from every branch of this graph.
+required `ci-gate` accepts only success from every branch of this graph. The
+report-only `open-time` job is outside that graph; see
+[open-time report](#open-time-report).
 
 Windows on Arm (`windows-11-arm`) runs the same partitioned workspace suites as
 x64, uninstrumented, as separately named behavioral evidence: `Behavior
@@ -701,6 +703,100 @@ example `kuru-memory`, and runs through
 `KURU_COVERAGE_MODE=uninstrumented` and the same `KURU_COVERAGE_PACKAGES`, which
 the merge requires every receipt's scope to equal. An optional `KURU_COVERAGE_SEED` names a
 dependency seed directory to import (below); leave it unset locally.
+
+## Open-time report
+
+`ci.yml`'s `Open-time report (<os>)` job measures how long the release `kuru`
+takes to open project memory, as a user would see it, on ubuntu-latest,
+macos-latest, windows-latest and windows-11-arm. It is **report only**: it never
+compares a time with a budget, `ci-gate` does not need it, and job-level
+`continue-on-error` keeps even its own failures (a missing artifact, a runner
+problem) out of the run's result. It is the first form of the open-time budget
+check, not a check yet.
+
+Each OS's installation job publishes the release executable it has just
+installed as `ci-release-binary-<os>` (a step that cannot fail that job). The
+open-time job starts after `native-tests`, downloads that exact binary, builds
+only the delivery tool (which needs no engine bundle input) and runs
+`mise run //packages/kuru-delivery:measure:open-time`. Nothing is rebuilt, and
+the measured executable embeds the engine its installation job verified.
+
+The harness drives the binary from outside. Each iteration uses a fresh private
+scratch root with its own HOME, configuration, data directory, engine cache,
+project and copy of the executable, and runs three cases of
+`kuru --provider demo --no-dream run measure --json` with offline memory (no
+network, login or credential store):
+
+1. `first-launch`: empty engine cache and data directory: engine extraction and
+   a new project's staged creation. The harness then waits for the memory owner
+   to retire (30 s idle, then close).
+2. `cold-existing`: the same project with no live owner: one engine start.
+3. `warm-reopen`: immediately afterwards, inside the owner's idle window. The
+   record says whether the command attached to the live owner or had to start
+   one. The harness then waits for retirement again.
+
+Ten iterations run by default. For each run it records wall-clock time from
+process start to each stderr progress line (`Memory: waiting for project
+ownership…`, `Memory: ready.`) and to exit. It also samples every 20 ms
+the Kuru and Dolt processes running from the scratch root (owner, supervisors,
+`dolt sql-server`, `dolt version`), with first and last sightings, and the
+names that appear and vanish in the data and cache directories. Files are
+listed, never opened. From these it derives, per run:
+
+- CLI preamble: start to the first progress line;
+- owner to first engine: provisioning (extraction, or the warm hash and
+  `dolt version` probe) and store preparation;
+- engine extraction: the install stage appearing to the activated executable;
+- each engine's lifetime, its spawn to the store `endpoint.json` the supervisor
+  writes once the engine is ready, and the time that record stays published;
+  a fresh project's three staging engines initialize, migrate and validate;
+- stage `ready.json` to the active store directory (the rename);
+- active engine to the owner's service endpoint (active validation, recovery,
+  usage ledger, publication), then that endpoint to `Memory: ready.`;
+- `Memory: ready.` to exit (the demo turn and the command's close).
+
+Each sighting is bracketed by two samples, so a derived stage carries up to two
+sampling intervals of error; processes shorter than one interval can be missed,
+and one-sample `dolt sql-server` processes are counted separately. Work inside
+one engine cannot be separated from outside: individual migration steps, branch
+classification, session-end waits, and active validation against the usage
+ledger and candidate recovery.
+
+Before each run the harness takes a process census (its own and any other Kuru
+or Dolt processes on the host), the load average (not available on Windows) and
+a fixed calibration probe: SHA-256 over 64 MiB and a 64 MiB write, fsync and
+read in the scratch root. It records the load again afterwards. Compare runners
+by `open / CPU probe` ratios rather than raw milliseconds. A slow or failed open
+is a result, recorded with its exit status and first error line; only an
+infrastructure failure, such as a process that has not retired after 120 s,
+stops the series with a non-zero exit, and that process is never killed.
+
+To read the output, open the job summary, which has one row per case and metric
+with n, median, minimum, maximum and spread, every open sample in run order, and
+per-case engine starts, owner path, foreign processes and load. Download the
+`ci-open-time-<os>-attempt-<n>` artifact for `records.jsonl`, one
+`kuru.open-time.v1` JSON object per run, and `summary.md`. Records hold no path,
+credential or memory content.
+
+Locally, measure a release build with the same task:
+
+```sh
+mise run build:release
+KURU_OPEN_TIME_BINARY="$PWD/target/release/kuru" \
+KURU_OPEN_TIME_OUTPUT="$(mktemp -d)/open-time" \
+  mise run //packages/kuru-delivery:measure:open-time
+```
+
+`KURU_OPEN_TIME_ITERATIONS`, `KURU_OPEN_TIME_SCRATCH` (the parent of the
+private scratch root) and `KURU_OPEN_TIME_LABEL` are optional. A busy machine
+distorts the numbers; the recorded load shows by how much.
+
+Phase 2 turns this job into the budget check by adding a comparison step after
+the measurement: probe-normalised medians of the pull request's head against
+its base, and an absolute ceiling well under `startup_timeout_secs`, using
+margins taken from the spread this job has recorded. Only then do it
+drop `continue-on-error` and join `ci-gate`'s needs. Until then, nothing reads
+these numbers automatically.
 
 ## Shared build cache
 
