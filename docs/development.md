@@ -1222,10 +1222,11 @@ Windows an open handle inside a directory's tree can make renaming or removing
 that directory fail. So the observer never enters an engine install stage
 (`.install-*`), a store staging directory (`*.staging-*`) or `interrupted`, the
 directories an open renames or removes; their appearance and disappearance are
-timed from the parent listing. Each listing's names are collected and its handle
-closed before any child is listed. The directories it still lists (`cache`, the
+timed from the parent listing, and it skips Dolt's chunk store, statistics and
+temporary directories. Each listing's names are collected and its handle closed
+before any child is listed. The directories it still lists (`cache`, the
 version and activated engine directories, `data`, `data/memory`, the active
-store, `services` and `locks`) are not renamed by a successful open. The control
+store, `services` and `locks`) are not renamed or removed by a successful open. The control
 series lists no files at all, so comparing its open times with the main series
 shows any remaining disturbance.
 
@@ -1322,9 +1323,10 @@ credential or memory content.
 test (`CARGO_BIN_EXE_kuru`). The coverage partitions run `cargo test` without
 `--release` and do not set that variable, so there the test runs the
 instrumented test-profile (unoptimized) build, copied privately because
-`LLVM_PROFILE_FILE` is set. Only each installation job's `Verify installed
-offline runtime` step (the one release-build run on Windows) and `ci.yml`'s
-Linux arm64 `native-build` job run it against a release build. A readiness
+`LLVM_PROFILE_FILE` is set. In `ci.yml`, only each installation job's `Verify
+installed offline runtime` step (the one release-build run on Windows) and the
+Linux arm64 `native-build` job run it against a release build; `release.yml`
+runs it against its release and staged binaries. A readiness
 deadline in a coverage partition is therefore a result for a debug build, not
 a release one.
 

@@ -21,4 +21,4 @@
 
 ## 4. Repository checks
 
-- [x] 4.1 @regression (agent) `//packages/kuru-delivery:test`, `lint`, `lint:windows`, `typecheck`, `format:check`, `lint:tooling`, `docs:check`, `cospec:managed:check`, `cospec validate --strict` on macOS arm64 -> all exit 0 (delivery: 356 passed, 1 ignored, the existing opt-in previous-release update); mise.lock unchanged. The 90% workspace line gate was not measured locally
+- [x] 4.1 @regression (agent) on the final tree of this change, rebased onto a8ce468b, macOS arm64: `//packages/kuru-delivery:test` (364 passed, 1 ignored, the existing opt-in previous-release update), `lint`, `lint:windows`, `typecheck`, `format:check`, `lint:tooling`, `docs:check`, `cospec validate --strict` -> all exit 0; mise.lock unchanged. The 90% workspace line gate was not measured locally, and no Linux or Windows execution was possible locally
