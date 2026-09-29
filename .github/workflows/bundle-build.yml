@@ -163,6 +163,16 @@ jobs:
     if: ${{ inputs.ref }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      # Cargo.lock names in kuru-archive's locked dependency closure, which
+      # holds the ZIP writer and its deflate code. The closure follows every
+      # edge the lock records, for any feature; the digest covers every
+      # locked version of each name. bundle_build.rs recomputes the closure
+      # from Cargo.lock and requires exactly this list.
+      ENGINE_ARCHIVE_CRATES: >-
+        adler2 allocator-api2 anyhow cfg-if crc32fast equivalent flate2 foldhash
+        hashbrown indexmap memchr miniz_oxide proc-macro2 quote serde serde_core
+        serde_derive simd-adler32 syn typed-path unicode-ident zip zlib-rs
     outputs:
       artifact: ${{ steps.input.outputs.artifact }}
     steps:
@@ -185,14 +195,46 @@ jobs:
             echo "sha256=$sha"
             echo "bytes=$size"
           } >> "$GITHUB_OUTPUT"
-      # The key names the pinned bytes and every recipe input whose change
-      # re-runs the determinism proof, so a recipe change is rebuilt once.
+      # Cargo.lock records of the writer closure only: other lock edits cannot
+      # change the archive bytes. A missing name fails the job.
+      - name: Digest the locked archive writer crates
+        id: crates
+        run: |
+          set -eu
+          records="$(awk -v wanted="$ENGINE_ARCHIVE_CRATES" '
+            BEGIN {
+              RS = ""
+              count = split(wanted, names, " ")
+              for (i = 1; i <= count; i++) want[names[i]] = 1
+            }
+            $1 == "[[package]]" && $2 == "name" && $3 == "=" {
+              name = $4
+              gsub(/"/, "", name)
+              if (name in want) {
+                print $0 "\n"
+                seen[name] = 1
+              }
+            }
+            END {
+              for (name in want) {
+                if (!(name in seen)) {
+                  print "::error::Cargo.lock has no " name " package" > "/dev/stderr"
+                  missing = 1
+                }
+              }
+              exit missing
+            }
+          ' Cargo.lock)"
+          printf 'sha256=%s\n' "$(printf '%s\n' "$records" | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      # The key names the pinned bytes and every recipe input that decides
+      # them, so a recipe change is rebuilt once. bundle_build.rs derives
+      # those inputs from the bundle:build task and requires exactly these.
       - name: Restore a previously verified archive
         id: restore
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/bundle-input
-          key: bundle-input-${{ env.BUILT_TARGET }}-${{ steps.pin.outputs.sha256 }}-${{ hashFiles('Cargo.lock', 'packages/kuru-archive/src/zip.rs', 'packages/kuru-delivery/src/bundle.rs', 'packages/kuru-delivery/src/bundle/**', 'packages/kuru-delivery/src/main.rs', 'packages/kuru-memory/mise.lock', 'packages/kuru-memory/mise.toml', 'packages/kuru-memory/support/bundle.rs', 'packages/kuru-memory/support/dolt-assets.json') }}
+          key: bundle-input-${{ env.BUILT_TARGET }}-${{ steps.pin.outputs.sha256 }}-${{ hashFiles('packages/kuru-archive/src/zip.rs', 'packages/kuru-delivery/src/bundle.rs', 'packages/kuru-delivery/src/bundle/build.rs', 'packages/kuru-delivery/src/main.rs', 'packages/kuru-memory/support/dolt-assets.json') }}-${{ steps.crates.outputs.sha256 }}
       - name: Verify restored bytes against the pin
         id: restored
         if: steps.restore.outputs.cache-hit == 'true'

@@ -964,6 +964,76 @@ once, fails unless the bytes match the committed pin, and uploads the
 `bundle:prepare -- --target <target> --archive <file> --offline` into their own
 private `KURU_DOLT_BUNDLE_DIR`, which checks the pin again.
 
+The cache key is the target, the pinned digest and a hash of the recipe inputs
+that decide the archive bytes. A recipe change therefore rebuilds once and
+proves the recipe still reproduces the pin. The key hashes:
+
+- the asset manifest `packages/kuru-memory/support/dolt-assets.json`, which pins
+  the sources and the Go and llvm-mingw toolchains;
+- the helper's `main.rs`, `bundle.rs` and `bundle/build.rs`. The helper's test
+  modules never reach the binary;
+- the ZIP writer, `packages/kuru-archive/src/zip.rs`;
+- the `Cargo.lock` records of kuru-archive's locked dependency closure, which
+  holds the ZIP and deflate crates. The job's `ENGINE_ARCHIVE_CRATES` names them.
+  Other `Cargo.lock` changes do not rotate the key.
+
+`packages/kuru-memory/mise.toml` and `mise.lock` are not hashed. Instead,
+`cargo test -p kuru-delivery --features tooling --test bundle_build` requires
+the build configuration to equal what was reviewed, so a change fails the test
+rather than reusing a stale archive. It checks:
+
+- the key: exactly the target, the pin, one `hashFiles` list and the crate
+  digest. The list must equal the inputs derived from the helper's CLI default
+  manifest, its module declarations and the modules its keyed files use, and
+  `ENGINE_ARCHIVE_CRATES` must equal the closure recomputed from `Cargo.lock`;
+- the `bundle:build` task: its exact command and directory, no keys besides
+  `description`, `dir`, `env` (only unset entries), `tools` and `run`, and each
+  tool locked with the manifest's URL and digest. `setup:build-tools` must
+  install exactly those tool assets;
+- the mise configuration the task loads. The memory package's file may hold
+  only `[vars]`, `[tasks]` and a reviewed `[env]`. The root file's `[env]` and
+  `[tools]` names, settings, tool aliases, monorepo roots and hooks are fixed.
+  No other tracked mise config file (`mise.local.toml`, `mise.<env>.toml`,
+  `.mise.toml`, `mise/`, `.mise/`, `.config/mise*`, `.tool-versions`) may exist
+  in the root, `packages/` or the memory package;
+- the Cargo configuration the helper's build loads. No tracked
+  `.cargo/config` or `.cargo/config.toml` may exist in the root, where the task
+  runs Cargo, nor in `packages/`, the helper's package or the memory package.
+  Its `[env]` (including a forced `PATH`, which reaches the ICU build),
+  `build.rustflags` or a target `runner` would change the build without
+  changing the key;
+- the input job: the workflow environment, its keys and `ubuntu-latest` runner,
+  its actions, step environments, no `GITHUB_ENV` or `GITHUB_PATH` writes, and
+  the exact toolchain and build steps;
+- the keyed files: no `include_str!`, `include_bytes!`, `include!` or
+  `super::super`, and no crate or module outside the key except the listed
+  exemptions below;
+- the compression crates' Cargo features: the workspace specifications of
+  `flate2`, `zip` and `crc32fast`, plain `workspace = true` use in every member
+  with no member feature enabling theirs, no `[patch]` or `[replace]`, resolver
+  3, and the registry packages in `Cargo.lock` that depend on them. A feature
+  can switch the deflate backend without changing `Cargo.lock`. The check is
+  static, so it needs no Cargo child process and gives the same answer on every
+  host.
+
+Some inputs are outside both the key and the test:
+
+- the helper's `crate::command`, `crate::archive`, `crate::lease` and
+  `crate::staging` modules, and `kuru-platform`. `command` decides a child's
+  environment; the recipe clears it to `PATH` and `HOME`;
+- the modules `main.rs` dispatches only for other subcommands;
+- the root mise tool versions, including the Rust toolchain that compiles the
+  helper, the pinned mise version, and Cargo profiles;
+- the runner image's own `sh`, `make`, `bash` and host C compiler, which build
+  ICU. Only the Go and clang version strings are checked.
+
+The only required check behind these is the pin check. The determinism job
+(two builds on a pull request that touches a listed recipe path) also catches a
+change, but it is not a required check. The key only decides when to rebuild. A
+restored or rebuilt archive is used only after it matches the pinned size and
+SHA-256. A restored mismatch is discarded and rebuilt, and a rebuilt mismatch
+fails the job. Only `main` saves the cache.
+
 `KURU_BUNDLE_BUILD_HOST_OVERRIDE=1` lets `bundle build` run on another host for
 local iteration on the recipe. Its output is **not authoritative**: it requires
 `--print-pins`, never verifies or replaces committed pins, and is labelled as an
