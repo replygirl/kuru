@@ -366,6 +366,44 @@ impl ServiceAttachment {
     }
 }
 
+/// How the client's one startup deadline was spent, from instants it already
+/// takes on its own path. Offsets are measured from one start instant and then
+/// differenced, so the rounded phases sum to the whole elapsed wait. The owner
+/// reports no stage timing to the client; this covers only what the client
+/// observes itself. It is built only after the child was just seen running.
+struct ReadinessSplit {
+    started: tokio::time::Instant,
+    elected: tokio::time::Instant,
+    probed: tokio::time::Instant,
+    spawned: tokio::time::Instant,
+    expired: tokio::time::Instant,
+    polls: u32,
+    last_attach: AttachMiss,
+}
+
+impl std::fmt::Display for ReadinessSplit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let offset = |instant: tokio::time::Instant| {
+            instant.saturating_duration_since(self.started).as_millis()
+        };
+        let (elected, probed, spawned, expired) = (
+            offset(self.elected),
+            offset(self.probed),
+            offset(self.spawned),
+            offset(self.expired),
+        );
+        write!(
+            formatter,
+            "client phases: election={elected}ms; owner-probe={}ms; spawn={}ms; readiness={}ms; polls={}; child=running; last-attach={}",
+            probed.saturating_sub(elected),
+            spawned.saturating_sub(probed),
+            expired.saturating_sub(spawned),
+            self.polls,
+            self.last_attach.as_str(),
+        )
+    }
+}
+
 /// Attach to a valid owner, or elect and start one while retaining a distinct
 /// short start lock. Endpoint readiness is the authenticated private handshake;
 /// the child holds the owner lock before publishing it.
@@ -380,8 +418,8 @@ pub async fn attach_or_start(
         executable.is_absolute(),
         "service executable must be absolute"
     );
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(options.config.startup_timeout_secs);
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(options.config.startup_timeout_secs);
     if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project)
         .await
         .context("attach before memory service start election")?
@@ -408,6 +446,7 @@ pub async fn attach_or_start(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
+    let elected = tokio::time::Instant::now();
     if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project)
         .await
         .context("attach after acquiring memory service start election")?
@@ -438,6 +477,7 @@ pub async fn attach_or_start(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let probed = tokio::time::Instant::now();
     #[cfg(feature = "test-support")]
     let mut startup_diagnostic = fixture_startup_stages_enabled()
         .then(|| tempfile::tempfile_in(&options.data_dir))
@@ -456,33 +496,50 @@ pub async fn attach_or_start(
             .await
             .context("spawn elected memory service owner")?,
     );
+    let spawned = tokio::time::Instant::now();
+    let mut polls: u32 = 0;
     loop {
-        match try_attach(&options.data_dir, &options.project_scope, project).await {
-            Ok(Some(attached)) => return Ok(attached),
-            Ok(None) => {}
-            Err(error) => {
-                let child_state = match child.try_wait() {
-                    Ok(Some(status)) => format!("exited with {status}"),
-                    Ok(None) => "remained running".into(),
-                    Err(status_error) => {
-                        format!("status observation failed with {status_error}")
-                    }
-                };
-                return Err(error).with_context(|| {
-                    format!("attach after starting the elected memory service; child {child_state}")
-                });
-            }
-        }
+        polls = polls.saturating_add(1);
+        let last_attach =
+            match try_attach_observed(&options.data_dir, &options.project_scope, project).await {
+                Ok(Ok(attached)) => return Ok(attached),
+                Ok(Err(miss)) => miss,
+                Err(error) => {
+                    let child_state = match child.try_wait() {
+                        Ok(Some(status)) => format!("exited with {status}"),
+                        Ok(None) => "remained running".into(),
+                        Err(status_error) => {
+                            format!("status observation failed with {status_error}")
+                        }
+                    };
+                    return Err(error).with_context(|| {
+                        format!(
+                            "attach after starting the elected memory service; child {child_state}"
+                        )
+                    });
+                }
+            };
         if let Some(status) = child.try_wait()? {
             bail!("memory service exited before readiness: {status}");
         }
-        if tokio::time::Instant::now() >= deadline {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            // Taken before any failure-only observation below.
+            let split = ReadinessSplit {
+                started,
+                elected,
+                probed,
+                spawned,
+                expired: now,
+                polls,
+                last_attach,
+            };
             #[cfg(feature = "test-support")]
             if let Some(diagnostic) = &mut startup_diagnostic {
                 let observations = fixture_startup_observations(options, diagnostic);
-                bail!("memory service readiness deadline exceeded; {observations}");
+                bail!("memory service readiness deadline exceeded; {observations}; {split}");
             }
-            bail!("memory service readiness deadline exceeded");
+            bail!("memory service readiness deadline exceeded; {split}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -520,9 +577,37 @@ pub(crate) async fn attach_existing(
     }
 }
 
+/// Why an attach attempt found no usable owner, as that attempt observed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachMiss {
+    NoEndpoint,
+    TransportUnavailable,
+    PeerClosed,
+}
+
+impl AttachMiss {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoEndpoint => "no-endpoint",
+            Self::TransportUnavailable => "transport-unavailable",
+            Self::PeerClosed => "peer-closed",
+        }
+    }
+}
+
 async fn try_attach(data: &Path, scope: &str, project: &Path) -> Result<Option<ServiceAttachment>> {
+    Ok(try_attach_observed(data, scope, project).await?.ok())
+}
+
+/// [`try_attach`] that also names which existing check found no usable
+/// owner. It performs exactly the same reads, connects and handshake.
+async fn try_attach_observed(
+    data: &Path,
+    scope: &str,
+    project: &Path,
+) -> Result<std::result::Result<ServiceAttachment, AttachMiss>> {
     let Some(record) = EndpointRecord::read(data, scope)? else {
-        return Ok(None);
+        return Ok(Err(AttachMiss::NoEndpoint));
     };
     ensure!(
         record.authority.project_path == project_path_bytes(project),
@@ -541,7 +626,7 @@ async fn try_attach(data: &Path, scope: &str, project: &Path) -> Result<Option<S
                     )
                 }) =>
         {
-            return Ok(None);
+            return Ok(Err(AttachMiss::TransportUnavailable));
         }
         Err(error) => return Err(error),
     };
@@ -552,10 +637,10 @@ async fn try_attach(data: &Path, scope: &str, project: &Path) -> Result<Option<S
         // closes it; let the existing election loop re-read discovery and
         // owner authority instead of treating that closed peer as a protocol
         // failure. Decoded rejection replies remain fatal below.
-        Err(error) if is_peer_closed(&error) => return Ok(None),
+        Err(error) if is_peer_closed(&error) => return Ok(Err(AttachMiss::PeerClosed)),
         Err(error) => return Err(error),
     }
-    Ok(Some(ServiceAttachment {
+    Ok(Ok(ServiceAttachment {
         stream: Some(stream),
         authority: record.authority,
         locator: Some(AttachmentLocator {
@@ -1701,7 +1786,10 @@ mod tests {
         }
     }
 
-    fn fixture_diagnostic_tail(file: &mut File) -> Result<String> {
+    /// Reads only the bounded tail of a child's file-backed stderr. A file
+    /// never applies back-pressure to the child, so nothing needs draining
+    /// while the child runs.
+    fn fixture_diagnostic_tail(file: &mut File, label: &str) -> Result<String> {
         let length = file.metadata()?.len();
         file.seek(SeekFrom::Start(
             length.saturating_sub(FIXTURE_DIAGNOSTIC_TAIL_BYTES),
@@ -1710,14 +1798,39 @@ mod tests {
         file.take(FIXTURE_DIAGNOSTIC_TAIL_BYTES)
             .read_to_end(&mut bytes)?;
         if bytes.is_empty() {
-            Ok("fixture service stderr remained empty".into())
+            Ok(format!("{label} stderr remained empty"))
         } else {
             Ok(format!(
-                "fixture service stderr tail: {}",
+                "{label} stderr tail: {}",
                 String::from_utf8_lossy(&bytes)
             ))
         }
     }
+
+    /// Waits for a starter fixture's ready marker with the fixture's existing
+    /// 20 ms poll and caller deadline. Either failure carries the bounded
+    /// tail of the starter's private stderr file.
+    async fn await_starter_ready(
+        mut try_wait: impl FnMut() -> io::Result<Option<std::process::ExitStatus>>,
+        ready: &Path,
+        deadline: tokio::time::Instant,
+        stderr: &mut File,
+    ) -> Result<()> {
+        while !ready.exists() {
+            if let Some(status) = try_wait()? {
+                let tail = fixture_diagnostic_tail(stderr, STARTER_STDERR_LABEL)?;
+                bail!("contained memory starter exited before readiness: {status}; {tail}");
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let tail = fixture_diagnostic_tail(stderr, STARTER_STDERR_LABEL)?;
+                bail!("contained memory starter did not publish readiness; {tail}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(())
+    }
+
+    const STARTER_STDERR_LABEL: &str = "contained memory starter";
 
     fn fixture_readiness_error(
         options: &crate::store::OpenOptions,
@@ -1726,7 +1839,7 @@ mod tests {
         outcome: String,
         observations: &FixtureAttachObservations,
     ) -> Result<anyhow::Error> {
-        let stderr = fixture_diagnostic_tail(diagnostic)?;
+        let stderr = fixture_diagnostic_tail(diagnostic, "fixture service")?;
         let error = anyhow::anyhow!(outcome)
             .context(format!("readiness observations: {observations}; {stderr}"));
         Ok(crate::test_support::fixture_startup_error(options, error).context(stage))
@@ -1826,12 +1939,216 @@ mod tests {
         file.write_all(&vec![b'x'; FIXTURE_DIAGNOSTIC_TAIL_BYTES as usize + 1])?;
         file.write_all(b"terminal fixture cause")?;
         file.flush()?;
-        let tail = fixture_diagnostic_tail(&mut file)?;
+        let tail = fixture_diagnostic_tail(&mut file, "fixture service")?;
         assert!(tail.starts_with("fixture service stderr tail: "));
         assert!(tail.ends_with("terminal fixture cause"));
         assert_eq!(
             tail.len(),
             "fixture service stderr tail: ".len() + FIXTURE_DIAGNOSTIC_TAIL_BYTES as usize
+        );
+        Ok(())
+    }
+
+    /// The starter wait helper is shared with the Windows-only contained
+    /// starter fixtures; a Unix child exercises the same stderr surfacing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn starter_wait_surfaces_the_exited_child_stderr() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let mut stderr = tempfile::tempfile_in(root.path())?;
+        let mut child = {
+            let _gate = crate::spawn_gate::spawning().await;
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "printf 'starter cause: election failed\\n' >&2; exit 1",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(stderr.try_clone()?)
+                .spawn()?
+        };
+        let error = await_starter_ready(
+            || child.try_wait(),
+            &root.path().join("never-ready"),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            &mut stderr,
+        )
+        .await
+        .err()
+        .context("an exited starter was reported ready")?;
+        let rendered = format!("{error:#}");
+        ensure!(
+            rendered.starts_with("contained memory starter exited before readiness: "),
+            "starter exit lost its leading text: {rendered}"
+        );
+        ensure!(
+            rendered
+                .contains("contained memory starter stderr tail: starter cause: election failed"),
+            "starter exit discarded the child's stderr: {rendered}"
+        );
+
+        let mut stalled_stderr = tempfile::tempfile_in(root.path())?;
+        let mut running = {
+            let _gate = crate::spawn_gate::spawning().await;
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "printf 'still starting\\n' >&2; exec /bin/sleep 10"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(stalled_stderr.try_clone()?)
+                .spawn()?
+        };
+        // The ready marker never appears; wait past the child's first write.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let stalled = await_starter_ready(
+            || running.try_wait(),
+            &root.path().join("never-ready"),
+            deadline,
+            &mut stalled_stderr,
+        )
+        .await
+        .err()
+        .context("a stalled starter was reported ready");
+        running.kill()?;
+        running.wait()?;
+        let rendered = format!("{:#}", stalled?);
+        ensure!(
+            rendered.starts_with("contained memory starter did not publish readiness; "),
+            "starter deadline lost its leading text: {rendered}"
+        );
+        ensure!(
+            rendered.contains("contained memory starter stderr tail: still starting"),
+            "starter deadline discarded the child's stderr: {rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_split_text_is_stable() {
+        let started = tokio::time::Instant::now();
+        let at = |micros: u64| started + Duration::from_micros(micros);
+        let split = ReadinessSplit {
+            started,
+            elected: at(12_700),
+            probed: at(15_900),
+            spawned: at(55_200),
+            expired: at(1_000_400),
+            polls: 10,
+            last_attach: AttachMiss::TransportUnavailable,
+        };
+        // Differenced offsets keep the rounded phases summing to 1000 ms.
+        assert_eq!(
+            split.to_string(),
+            "client phases: election=12ms; owner-probe=3ms; spawn=40ms; readiness=945ms; polls=10; child=running; last-attach=transport-unavailable"
+        );
+        assert_eq!(AttachMiss::NoEndpoint.as_str(), "no-endpoint");
+        assert_eq!(AttachMiss::PeerClosed.as_str(), "peer-closed");
+    }
+
+    /// A launched owner that stays alive without publishing an endpoint
+    /// exhausts the lowered startup bound in the readiness loop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_deadline_reports_the_client_phase_split() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let mut options = crate::store::OpenOptions::new(root.path().join("private"), scope);
+        options.config.startup_timeout_secs = 1;
+        let fifo = root.path().join("release");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let release = nix::fcntl::open(
+            &fifo,
+            nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NONBLOCK,
+            nix::sys::stat::Mode::empty(),
+        )?;
+        let script = root.path().join("stalled-owner");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nIFS= read -r token < '{}'\n", fifo.display()),
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+
+        let started = tokio::time::Instant::now();
+        let outcome = {
+            // Held across the owner spawn; see `crate::spawn_gate`.
+            let _gate = crate::spawn_gate::spawning().await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                attach_or_start(&options, &project, &script),
+            )
+            .await
+        };
+        let observed_ms = started.elapsed().as_millis();
+        nix::unistd::write(&release, b"finish\n")?;
+        let error = outcome
+            .context("stalled owner fixture exceeded its outer deadline")?
+            .err()
+            .context("a stalled owner was reported ready")?;
+        let rendered = format!("{error:#}");
+        ensure!(
+            rendered.starts_with("memory service readiness deadline exceeded"),
+            "readiness failure lost its leading text: {rendered}"
+        );
+        let split = rendered
+            .split_once("client phases: ")
+            .map(|(_, split)| split)
+            .with_context(|| {
+                format!("readiness failure lacks the client phase split: {rendered}")
+            })?;
+        let fields: std::collections::BTreeMap<&str, &str> = split
+            .split("; ")
+            .filter_map(|field| field.split_once('='))
+            .collect();
+        let millis = |name: &str| -> Result<u128> {
+            fields
+                .get(name)
+                .and_then(|value| value.strip_suffix("ms"))
+                .with_context(|| format!("split lacks {name}: {rendered}"))?
+                .parse()
+                .with_context(|| format!("split {name} is not a millisecond count: {rendered}"))
+        };
+        let (election, probe, spawn, readiness) = (
+            millis("election")?,
+            millis("owner-probe")?,
+            millis("spawn")?,
+            millis("readiness")?,
+        );
+        let polls: u128 = fields
+            .get("polls")
+            .with_context(|| format!("split lacks polls: {rendered}"))?
+            .parse()?;
+        let total = election + probe + spawn + readiness;
+        ensure!(
+            (1000..=observed_ms).contains(&total),
+            "phases sum to {total} ms outside the 1 s bound and the {observed_ms} ms observed: {rendered}"
+        );
+        ensure!(
+            readiness > election + probe + spawn,
+            "a stalled owner's wait was not attributed to the readiness loop: {rendered}"
+        );
+        // Each poll after the first follows a sleep of at least 100 ms.
+        ensure!(
+            polls >= 2 && (polls - 1) * 100 <= readiness,
+            "poll count {polls} is implausible for {readiness} ms of readiness: {rendered}"
+        );
+        ensure!(
+            fields.get("child") == Some(&"running")
+                && fields.get("last-attach") == Some(&"no-endpoint"),
+            "readiness failure lost its last observation: {rendered}"
         );
         Ok(())
     }
@@ -2137,14 +2454,18 @@ mod tests {
         ready: &Path,
         release: &Path,
         lifetime: kuru_platform::windows::process::Lifetime,
+        stderr: File,
     ) -> kuru_platform::windows::process::NativeSpawnSpec {
-        use kuru_platform::windows::process::NativeSpawnSpec;
+        use kuru_platform::windows::process::{NativeSpawnSpec, Stdio};
         let mut command = NativeSpawnSpec::new(executable.to_owned(), project.to_owned());
         command.args = service_arguments(options, project);
         command.args[0] = "--internal-memory-service-held-client-fixture".into();
         command.args.push(ready.as_os_str().to_owned());
         command.args.push(release.as_os_str().to_owned());
         command.lifetime = lifetime;
+        // A private file, not a pipe: the starter never blocks on it and the
+        // caller reads only its bounded tail after a failure.
+        command.stderr = Stdio::Handle(stderr.into());
         if let Some(root) = std::env::var_os("SystemRoot") {
             command.environment.push(("SystemRoot".into(), root));
         }
@@ -2215,6 +2536,51 @@ mod tests {
         Ok(())
     }
 
+    /// A starter that fails before `attach_or_start` exits with code 1; its
+    /// cause must reach the fixture failure instead of a null stderr.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn contained_starter_failure_reports_its_stderr() -> Result<()> {
+        use kuru_platform::windows::process::Lifetime;
+        let (root, project, mut options, executable) = windows_service_fixture()?;
+        options.supervisor = Some(PathBuf::from("relative-supervisor.exe"));
+        let ready = root.path().join("starter-ready");
+        let release = root.path().join("starter-release");
+        let mut starter_stderr = tempfile::tempfile_in(root.path())?;
+        let _gate = crate::spawn_gate::spawning().await;
+        let mut starter = windows_starter_fixture(
+            &project,
+            &options,
+            &executable,
+            &ready,
+            &release,
+            Lifetime::OwnedJob,
+            starter_stderr.try_clone()?,
+        )
+        .spawn()
+        .await?;
+        let error = await_starter_ready(
+            || starter.try_wait(),
+            &ready,
+            tokio::time::Instant::now() + windows_starter_readiness(),
+            &mut starter_stderr,
+        )
+        .await
+        .err()
+        .context("a starter with an invalid supervisor path published readiness")?;
+        let rendered = format!("{error:#}");
+        ensure!(
+            rendered.starts_with("contained memory starter exited before readiness: exit code: 1"),
+            "starter failure lost its leading text: {rendered}"
+        );
+        ensure!(
+            rendered.contains("contained memory starter stderr tail: ")
+                && rendered.contains("service supervisor path must be absolute"),
+            "starter failure discarded the child's stderr: {rendered}"
+        );
+        Ok(())
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn starter_job_exit_preserves_independent_owner_and_surviving_client() -> Result<()> {
@@ -2227,6 +2593,7 @@ mod tests {
             let (root, project, options, executable) = windows_service_fixture()?;
             let ready = root.path().join("starter-ready");
             let release = root.path().join("starter-release");
+            let mut starter_stderr = tempfile::tempfile_in(root.path())?;
             let _gate = crate::spawn_gate::spawning().await;
             let mut starter = windows_starter_fixture(
                 &project,
@@ -2235,20 +2602,18 @@ mod tests {
                 &ready,
                 &release,
                 Lifetime::FixtureBreakawayJob,
+                starter_stderr.try_clone()?,
             )
             .spawn()
             .await?;
             let ready_deadline = tokio::time::Instant::now() + windows_starter_readiness();
-            while !ready.exists() {
-                if let Some(status) = starter.try_wait()? {
-                    bail!("contained memory starter exited before readiness: {status}");
-                }
-                ensure!(
-                    tokio::time::Instant::now() < ready_deadline,
-                    "contained memory starter did not publish readiness"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            await_starter_ready(
+                || starter.try_wait(),
+                &ready,
+                ready_deadline,
+                &mut starter_stderr,
+            )
+            .await?;
             let generation = std::fs::read_to_string(&ready)?;
             let mut survivor = try_attach(&options.data_dir, &options.project_scope, &project)
                 .await?
@@ -2333,6 +2698,7 @@ mod tests {
             let (root, project, options, executable) = windows_service_fixture()?;
             let ready = root.path().join("contained-ready");
             let release = root.path().join("contained-release");
+            let mut starter_stderr = tempfile::tempfile_in(root.path())?;
             let _gate = crate::spawn_gate::spawning().await;
             let mut starter = windows_starter_fixture(
                 &project,
@@ -2341,22 +2707,20 @@ mod tests {
                 &ready,
                 &release,
                 Lifetime::OwnedJob,
+                starter_stderr.try_clone()?,
             )
             .spawn()
             .await?;
             // Leave the outer fixture time to report and reap a stalled starter.
             let ready_deadline = (tokio::time::Instant::now() + windows_starter_readiness())
                 .min(fixture_deadline - Duration::from_secs(2));
-            while !ready.exists() {
-                if let Some(status) = starter.try_wait()? {
-                    bail!("contained memory starter exited before readiness: {status}");
-                }
-                ensure!(
-                    tokio::time::Instant::now() < ready_deadline,
-                    "contained memory starter did not publish readiness"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            await_starter_ready(
+                || starter.try_wait(),
+                &ready,
+                ready_deadline,
+                &mut starter_stderr,
+            )
+            .await?;
             let generation = std::fs::read_to_string(&ready)?;
             let mut survivor = try_attach(&options.data_dir, &options.project_scope, &project)
                 .await?
