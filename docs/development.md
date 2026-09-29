@@ -449,8 +449,17 @@ entry past the entry budget, an unreadable directory or entry, and a store
 whose identity cannot be taken. A fixture whose root outgrows either budget
 must scan a narrower root or name a larger budget at its own call site with
 `TempDir::with_depth_budget`, which can only raise the default; the budgets
-are never raised globally. The two template fixtures, which keep a template
-and unopened copies, name an 11-level budget this way.
+are never raised globally. Every store carries directories the scan reads
+four levels below it: its supervisor runs Dolt with `DOLT_ROOT_PATH`
+`<store>/home/root`, where Kuru stages Dolt's global config in
+`.dolt/staging` and Dolt creates `.dolt/eventsData`. A fixture whose data
+directory lies three or more levels below its root exceeds the default 8
+levels at `home/root/.dolt/eventsData`. The two template fixtures, which keep
+a template and unopened copies, name an 11-level budget at their call sites.
+The packaged install and update acceptance in
+`apps/kuru-tui/tests/embedded_runtime.rs`, whose data directories are three
+levels down and whose empty engine cache holds a provisioning probe with the
+same Dolt root, names a 10-level budget.
 
 A kuru-memory fixture that releases a lock and takes it again at once through a
 one-shot acquisition, such as a successor `ServiceOwner::open` after its

@@ -98,8 +98,10 @@ impl TempDir {
     /// Scan this root to `depth` directory levels instead of the default 8,
     /// for a fixture that deliberately keeps store directories no lease
     /// recognises (a template or an unopened copy), whose repositories the
-    /// scan reads in full. Named at the fixture's own call site; a budget
-    /// can only be raised, never lowered.
+    /// scan reads in full, or that places recognised stores deep enough that
+    /// the directories the scan reads beside their skipped repository, such
+    /// as `home/root/.dolt/eventsData`, pass the default. Named at the
+    /// fixture's own call site; a budget can only be raised, never lowered.
     pub fn with_depth_budget(mut self, depth: usize) -> Self {
         assert!(
             depth >= MAX_DEPTH,
