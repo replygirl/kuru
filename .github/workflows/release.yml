@@ -20,6 +20,8 @@ env:
   # Jobs install only their mise-action install_args. Windows exe shims run
   # `mise x`, which would otherwise download every other configured tool.
   MISE_EXEC_AUTO_INSTALL: "false"
+  # `mise run` would do the same before each task; jobs install task tools by name.
+  MISE_TASK_RUN_AUTO_INSTALL: "false"
 
 concurrency:
   group: release
@@ -43,7 +45,6 @@ jobs:
     timeout-minutes: 60
     env:
       MISE_NO_HOOKS: "1"
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # Keep the genuine test-profile Kuru input below its production archive bound.
@@ -181,7 +182,6 @@ jobs:
     needs: [source-quality, tests]
     runs-on: ubuntu-latest
     env:
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       MISE_NO_HOOKS: "1"
     outputs:
       version: ${{ steps.plan.outputs.version }}
@@ -220,8 +220,6 @@ jobs:
   bump:
     needs: plan
     runs-on: ubuntu-latest
-    env:
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
     outputs:
       sha: ${{ steps.commit.outputs.sha }}
     steps:
@@ -276,7 +274,6 @@ jobs:
   build:
     needs: [plan, bump, verify, dolt-windows-arm64]
     env:
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       # Archive jobs do not write Git commits or need repository-hook setup.
       MISE_NO_HOOKS: "1"
     strategy:
@@ -401,7 +398,7 @@ jobs:
       - name: Install package-owned release tools
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: mise run //packages/kuru-delivery:setup
+        run: mise run //packages/kuru-delivery:setup:test-tools
       - name: Generate notes without publishing
         env:
           # Communiqué's OpenAI wire adapter calls Anthropic's compatibility API.
@@ -420,8 +417,6 @@ jobs:
   assemble-candidate:
     needs: [plan, bump, build, notes]
     runs-on: ubuntu-latest
-    env:
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
     outputs:
       artifact_name: ${{ steps.artifact.outputs.name }}
     steps:
@@ -482,7 +477,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       MISE_NO_HOOKS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -574,6 +568,10 @@ jobs:
           install_args: rust aqua:jdx/hk
         env:
           GITHUB_TOKEN: ${{ github.token }}
+      - name: Install app-owned documentation tools before task activation
+        # With automatic installation disabled, setup's PATH must see the pins
+        # before it starts; the runner's preinstalled Node/npm are not substitutes.
+        run: mise run //apps/kuru-docs:setup:tools
       - run: mise run //apps/kuru-docs:setup
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
         id: pages
@@ -618,8 +616,6 @@ jobs:
   publish:
     needs: [plan, bump, assemble-candidate, verify-staged, deploy-docs]
     runs-on: ubuntu-latest
-    env:
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
     permissions:
       contents: write
     steps:
@@ -661,7 +657,6 @@ jobs:
     permissions:
       contents: read
     env:
-      MISE_TASK_RUN_AUTO_INSTALL: "false"
       MISE_NO_HOOKS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

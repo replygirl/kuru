@@ -302,18 +302,44 @@ refreshed. Every matrix job that runs a partition task (`coverage:shard` or
 `bundle-inputs` job fetched and verified once for the run
 ([import](#bundled-engine-build-inputs)).
 
-One exemption is live. The release workflow's `notes` and `build-docs` jobs
-still run `mise run` with task auto-install on, so they download configured
-tools they do not use, and `notes` runs the delivery `setup` task, a bare
-`mise install --include-task-tools`. The check exempts exactly those two jobs
-and pins each by the SHA-256 of its whole parsed job together with the
-workflow `env` and `defaults` it inherits. Any change to them, such as another
-mise-action input or version, an env entry, a step, `shell`,
-`working-directory` or `if`, fails the check until someone re-reviews the job
-and records its new digest; comments and formatting are not part of the pin.
-Every other release job that uses mise must opt out in its job env. The
-follow-up, `release-notes-docs-tool-scope`, scopes those jobs' tool
-installation; it changes release workflow steps, so the maintainer decides it.
+The release workflow is held to the same rule; no job is exempt. PR CI cannot
+run it, so the delivery package's `release_workflow` tests stand in for its
+`notes` and `build-docs` jobs. For each job they derive the tools its steps
+need from the workflow text and the mise task graph those steps reach: each
+task's own `tools`, the programs its commands run, and its dependencies. They
+require every tool to be installed by name in an earlier command, either in
+`install_args` or in a named `mise install`. A tool installed by a dependency
+inside the same `mise run` does not count, because that run's PATH is fixed
+before the dependency installs it. An install counts only for the version it
+installs: an explicit `tool@version` must equal the version the task declares
+or the configuration pins (with `{{vars.*}}` resolved), and an install without
+a version counts as the version configured where it runs. They also reject:
+
+- an install that names no tool;
+- an install step with `if` or `continue-on-error`, whose installs then count
+  for nothing, and a mise-action input other than `experimental`, `version`
+  and `install_args`;
+- workflow or job `defaults`, and a step `working-directory` or `shell`;
+- a `MISE_` variable in the job's or a step's `env`, and a workflow-level one
+  other than `MISE_LOCKED`, `MISE_EXEC_AUTO_INSTALL` and
+  `MISE_TASK_RUN_AUTO_INSTALL`;
+- a step that writes `GITHUB_ENV` or `GITHUB_PATH`.
+
+The derivation reads Linux `run` commands only and knows the programs those
+two jobs reach; a new program fails it until someone records which tool
+provides it. These limits remain:
+
+- it does not see what a compiled tool launches beyond its task's declared
+  tools;
+- it does not read a task's own `env`, `dir` or `shell`, or environment
+  variables other than `MISE_` ones that could change a tool's behaviour;
+- it treats the root `postinstall` hook (`hk install --mise`) as outside the
+  jobs' tool needs, since a failing hook only warns;
+- it trusts mise to install the configured version for an install without
+  one, and does not model a job-level `if` or `continue-on-error`, which skip
+  or tolerate the whole job rather than one install;
+- it cannot prove that the release runner's mise behaves as the model assumes;
+  only a real release run does.
 
 The check reads workflow text only, so these remain outside it:
 
@@ -453,14 +479,11 @@ also keeps it from being downloaded. Every workflow that installs tools sets
 shims run `mise x`, which would otherwise install every missing configured tool,
 mr-boxington included, on the first shim call such as `rustup` or `cargo`.
 `MISE_TASK_RUN_AUTO_INSTALL=false` stops `mise run` doing the same before a
-task. Every workflow sets it at workflow level except the release workflow,
-which sets it in every job that uses mise except `notes` and `build-docs`.
-Those two jobs still download tools they do not use until
-[their exempted follow-up](#commands) scopes them. Every other job installs
-only its `mise-action` `install_args` and the tools its named install tasks
-select. A job that needs another tool must name it in `install_args`; the
-source installers already install only `rust` and pass it
-explicitly to `mise exec`.
+task. Every workflow, the release workflow included, sets both at workflow
+level, so every job installs only its `mise-action` `install_args` and the
+tools its named install tasks select. A job that needs another tool must name
+it in `install_args`; the source installers already install only `rust` and
+pass it explicitly to `mise exec`.
 
 mbx restores outputs by copy-on-write clone on APFS, Btrfs, XFS with reflink,
 and ReFS. On filesystems without cloning, such as ext4, it hard-links the
