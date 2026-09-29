@@ -18,12 +18,12 @@ scratchpad at `flake/lint-rules/`.
 ## 3. Windows-only code is linted [critical]
 
 - [x] 3.1 @regression (agent) Cross-target clippy of `origin/main` 686eb16b for every workspace package with the stand-in toolchain, without `-D warnings` -> 25 distinct warnings that `-D warnings` rejects (`red-windows-main.log`): 8 in kuru-memory, 5 in kuru-delivery, 4 in apps/kuru-tui, 7 in kuru-connectors, 1 in kuru-runtime, 0 in kuru-platform. On the final tree, `mise run lint:windows` -> exit 0 (`green-lint-windows.log`). That run covered the tasks of all six packages, with `KURU_MBX=0` and a scratch `CARGO_TARGET_DIR`; it took 64 s with warm dependencies.
-- [~] 3.2 @runtime (agent) on the PR run in CI (ubuntu-latest), `Lint (x86_64-pc-windows-msvc)` passes with offline bundle inputs and `ci-gate` requires it -> defer: only a CI run can prove it; not pushed by instruction.
+- [~] 3.2 @runtime (agent) on the PR run in CI (ubuntu-latest), `Lint (x86_64-pc-windows-msvc)` passes with offline bundle inputs and `ci-gate` requires it -> defer: this change has not yet run in CI; it will be observed on the final-head PR run before merge.
 
 ## 4. Root gates
 
 - [x] 4.1 @integration (agent) Each of these -> exit 0: `format:check`, `lint`, `typecheck`, `lint:tooling` (including actionlint of the new job), `docs:check`, `cospec validate workspace-lint-rules-windows-target --strict` and `cospec:managed:check`. Package tests, each exit 0: `//packages/kuru-memory:test`: 318 passed.; `//packages/kuru-connectors:test`: 297 passed.; `//packages/kuru-runtime:test`: 220 passed.; `//apps/kuru-tui:test`: 245 passed, 4 ignored; these are the existing; ignored live tests. `//packages/kuru-delivery:test`: exit 0.; `mise.lock` was unchanged after each gate.
-- [~] 4.2 @runtime (agent) Windows behavior of the three edited `cfg(windows)` bodies -> defer: only the native-tests Windows jobs can run them. They are the retry-deadline `take_if` in `provision.rs`, the tail block in `files.rs` `close`, and the fixture wait in `tools.rs`. The cross-target clippy above type-checks them.
+- [~] 4.2 @runtime (agent) Windows behavior of the three edited `cfg(windows)` bodies -> defer: this change has not yet run in CI; the native-tests Windows jobs will observe them on the final-head PR run before merge. They are the retry-deadline `take_if` in `provision.rs`, the tail block in `files.rs` `close`, and the fixture wait in `tools.rs`. The cross-target clippy above type-checks them.
 
 ## 5. Review round: tightened rules (2026-09-29)
 
