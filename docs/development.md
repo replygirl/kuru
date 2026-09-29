@@ -310,12 +310,36 @@ task's own `tools`, the programs its commands run, and its dependencies. They
 require every tool to be installed by name in an earlier command, either in
 `install_args` or in a named `mise install`. A tool installed by a dependency
 inside the same `mise run` does not count, because that run's PATH is fixed
-before the dependency installs it. They also reject an install that names no
-tool. The derivation reads Linux `run` commands only and knows the programs
-those two jobs reach; a new program fails it until someone records which tool
-provides it. The tests do not see what a compiled tool launches beyond its
-task's declared tools. They also cannot prove that the release runner's mise
-behaves as the model assumes; only a real release run does.
+before the dependency installs it. An install counts only for the version it
+installs: an explicit `tool@version` must equal the version the task declares
+or the configuration pins (with `{{vars.*}}` resolved), and an install without
+a version counts as the version configured where it runs. They also reject:
+
+- an install that names no tool;
+- an install step with `if` or `continue-on-error`, whose installs then count
+  for nothing, and a mise-action input other than `experimental`, `version`
+  and `install_args`;
+- workflow or job `defaults`, and a step `working-directory` or `shell`;
+- a `MISE_` variable in the job's or a step's `env`, and a workflow-level one
+  other than `MISE_LOCKED`, `MISE_EXEC_AUTO_INSTALL` and
+  `MISE_TASK_RUN_AUTO_INSTALL`;
+- a step that writes `GITHUB_ENV` or `GITHUB_PATH`.
+
+The derivation reads Linux `run` commands only and knows the programs those
+two jobs reach; a new program fails it until someone records which tool
+provides it. These limits remain:
+
+- it does not see what a compiled tool launches beyond its task's declared
+  tools;
+- it does not read a task's own `env`, `dir` or `shell`, or environment
+  variables other than `MISE_` ones that could change a tool's behaviour;
+- it treats the root `postinstall` hook (`hk install --mise`) as outside the
+  jobs' tool needs, since a failing hook only warns;
+- it trusts mise to install the configured version for an install without
+  one, and does not model a job-level `if` or `continue-on-error`, which skip
+  or tolerate the whole job rather than one install;
+- it cannot prove that the release runner's mise behaves as the model assumes;
+  only a real release run does.
 
 The check reads workflow text only, so these remain outside it:
 
