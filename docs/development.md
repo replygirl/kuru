@@ -55,11 +55,12 @@ OS on Ubuntu. One Rust orchestrator, `kuru-delivery coverage shard` and
 workspace/all-target/all-feature instrumented inventory. Its task-private
 runner, which Cargo invokes for each test executable with the package cwd and
 runtime environment, records the executable's `--list` output and runs only the
-tests that a deterministic hash of the artifact identity and test name assigns
-to that partition, by explicit `--exact` names. Name lists are split into
-several invocations below the Windows command-line limit, and each invocation
-must announce exactly as many tests as it selected. Assignment balances test
-counts, not durations, and keeps a test in the same partition across commits.
+tests assigned to that partition, by explicit `--exact` names. Name lists are
+split into several invocations below the Windows command-line limit, and each
+invocation must announce exactly as many tests as it selected.
+
+Assignment balances recorded test durations from a checked-in table; see
+[duration-aware partition assignment](#duration-aware-partition-assignment).
 
 Each partition exports LCOV and a line export against its own instrumented
 executables, with no threshold, and records a receipt: source commit, tree, Cargo.lock, toolchain and
@@ -261,6 +262,8 @@ bridge before any downloaded application can be trusted.
 | `mise run //packages/kuru-delivery:coverage:shard` | One fail-closed CI coverage partition, configured by `KURU_COVERAGE_*` ([by hand](#running-a-coverage-partition-by-hand)) |
 | `mise run //packages/kuru-delivery:coverage:merge` | Require agreeing receipts from every partition of one OS and, when instrumented, enforce the 90% gate by cargo-llvm-cov's line metric over its partitions' line exports |
 | `mise run //packages/kuru-delivery:test:partition` | One uninstrumented checked partition of the `KURU_COVERAGE_PACKAGES` test suite (CI arm64 memory) |
+| `mise run //packages/kuru-delivery:coverage:timings -- --inputs <dir>` | Rewrite the partition timing table from a completed run's downloaded partition evidence ([assignment](#duration-aware-partition-assignment)) |
+| `mise run //packages/kuru-delivery:coverage:balance` | Print the checked-in timing table's predicted test seconds per partition for every hosted label |
 | `mise run //apps/kuru-tui:test:embedded-runtime` | Package, install, update and reopen actual Kuru with cold offline memory |
 | `mise run //packages/kuru-delivery:test:previous-release-update` | [Previous published release's updater](release.md#previous-release-update-acceptance) installs `KURU_UPDATE_CANDIDATE_BINARY`; optional `GITHUB_TOKEN` |
 | `mise run lint:tooling` | Shell, GitHub Actions and metadata validation |
@@ -646,6 +649,66 @@ on Ubuntu after `bundle-inputs`. It imports the run's verified archives with
 diagnostics only. The native-tests Windows jobs prove that the code compiles,
 links and behaves on Windows. hk does not run `lint:windows` before a push;
 run it locally when changing Windows code.
+
+## Duration-aware partition assignment
+
+Assignment balances recorded durations. The checked-in timing table
+`packages/kuru-delivery/src/coverage/timings.tsv` holds one row per artifact
+key (`package/kind/target`) and test name, with the milliseconds a run
+attributed to that test on each hosted OS label (`-` where the label did not
+time it). Within one exact selection, a test is attributed the time from the
+previous completion line to its own, so an executable's attributed times sum to
+that selection's wall time. The host target selects the label's column. The
+table's tests for that label are placed by one greedy longest-processing-time
+pass: heaviest first, ties by artifact key and then test name, each to the
+least-loaded partition, ties to the lowest index. A listed test without a row
+keeps the SHA-256 hash of its artifact key and name (scheme
+`sha256-artifact-test-v1`), so a new or renamed test still has exactly one
+partition and never fails a run. A local run on a host target with a hosted
+label uses that label's column at its own count. The assignment is a pure function of the
+table, the OS label and the partition count. Every partition computes it from
+the embedded table, and the merge recomputes it from each runner ledger. The
+merge still proves each executable's plans disjoint and complete. Partition
+schemes are named `timed-lpt-v1` and bind the table's canonical digest (header
+and rows, without comments or line endings), so a partition or merge built
+from a different table is refused with both digests named. Durations are never
+fetched at run time. A test keeps its partition until a reviewed commit
+refreshes the table.
+
+Each exact invocation in the runner ledger records the milliseconds from the
+selection's start to each selected test's first completion line. The record
+never decides a partition's result; the ledger check requires only that it
+names selected tests, each once. To refresh the table from a completed run,
+download its partition evidence and run the maintainer task, then review and
+commit the table:
+
+```sh
+gh run download <run-id> -p '*-coverage-*-partition-*' -D /tmp/kuru-run
+mise run //packages/kuru-delivery:coverage:timings -- --inputs /tmp/kuru-run
+```
+
+Repeat `--inputs` for older runs, newest first. The newest run decides each
+measured label's rows, and each weight is the rounded mean over every run that
+measured that test. A label without evidence keeps its column. Only runs with
+the `timed-lpt-v1` scheme record completions; the task refuses earlier
+receipts, which lack the table digest.
+`mise run //packages/kuru-delivery:coverage:balance` prints the checked-in
+table's predicted test seconds per partition for every hosted label.
+
+Every merge reports each partition's predicted and measured test seconds, the
+listed tests without a row and the rows that name no listed test. It prints the
+report and appends it to the job summary. When more than 5% of an OS's listed
+tests have no row, the report carries a warning to refresh the table; the merge
+still passes. Predictions assume attributed times add up. A long test that
+finished alongside faster ones in the same selection is under-attributed.
+The shared test thread count also makes co-located tests of one executable
+overlap. Measured seconds in the merge summary show how close the predictions
+come.
+
+Partitioning never needs to keep particular tests together or apart. The only
+cross-test gate, `kuru-memory`'s test-only spawn gate, serialises lock-taking
+tests against process-spawning tests inside one test process, whichever tests
+share that process.
 
 ## Running a coverage partition by hand
 

@@ -25,6 +25,7 @@ use super::{
     partition::PartitionScheme,
     plan::{self, PartitionPlan},
     read_bounded, read_inventory, read_versioned,
+    timing::{self, TimingReport},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -77,6 +78,8 @@ pub struct MergeSummary {
     pub excluded: Vec<(String, String)>,
     pub partitions: Vec<PartitionRow>,
     pub coverage: Option<CoverageFigures>,
+    /// Predicted partition seconds and the timing table's staleness.
+    pub timing: TimingReport,
 }
 
 /// The merged coverage of an instrumented OS.
@@ -325,6 +328,13 @@ fn accept(
     let receipt: Receipt = read_versioned(&directory.join(RECEIPT_FILE), "coverage receipt")
         .with_context(|| label.clone())?;
     let scheme = PartitionScheme::new(index, options.count)?;
+    ensure!(
+        receipt.partition.timings_sha256 == scheme.timings_sha256,
+        "{label} was placed with timing table {}, but this merge's {} is {}",
+        receipt.partition.timings_sha256,
+        timing::TABLE_PATH,
+        scheme.timings_sha256
+    );
     ensure!(
         receipt.partition == scheme,
         "{label} carries a receipt for partition {} of {}",
@@ -646,6 +656,13 @@ pub fn merge(options: &MergeOptions<'_>) -> Result<MergeSummary> {
         .map(|partition| (partition.index, &partition.plan))
         .collect();
     let completeness = complete(&plans)?;
+    let timing = timing::report(
+        timing::embedded()?,
+        timing::embedded_sha256()?,
+        &accepted[0].receipt.target,
+        options.count,
+        &plans,
+    );
 
     let merged = match options.mode {
         Mode::Instrumented => {
@@ -715,6 +732,7 @@ pub fn merge(options: &MergeOptions<'_>) -> Result<MergeSummary> {
             })
             .collect(),
         coverage: merged.as_ref().map(|(_, figures)| figures.clone()),
+        timing,
     };
     // Written through a private name and renamed only after every check passed.
     let parent = summary_path.parent().expect("summary parent");
@@ -738,6 +756,17 @@ pub fn merge(options: &MergeOptions<'_>) -> Result<MergeSummary> {
         return Err(error);
     }
     Ok(summary)
+}
+
+/// The job-summary Markdown of an accepted merge: its timing section, with
+/// each partition's measured test seconds beside the prediction.
+pub fn summary_markdown(summary: &MergeSummary) -> String {
+    let measured: Vec<Option<u64>> = summary
+        .partitions
+        .iter()
+        .map(|row| row.tests_seconds)
+        .collect();
+    summary.timing.markdown(&summary.os, &measured)
 }
 
 /// Print the per-partition table and totals of an accepted merge.
@@ -772,6 +801,27 @@ pub fn print_summary(summary: &MergeSummary) {
     }
     for (artifact, reason) in &summary.excluded {
         println!("excluded {artifact}: {reason}");
+    }
+    let timing = &summary.timing;
+    println!(
+        "timing table {} ({}): predicted test seconds per partition {}",
+        timing.table_sha256,
+        timing.label.as_deref().unwrap_or("no hosted label"),
+        timing
+            .predicted_ms
+            .iter()
+            .map(|millis| timing::seconds(*millis))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    println!(
+        "timing table: {} listed tests, {} without a row, {} rows name no listed test",
+        timing.listed,
+        timing.unknown.len(),
+        timing.stale_rows
+    );
+    if let Some(warning) = &timing.warning {
+        eprintln!("warning: {warning}");
     }
     if let Some(coverage) = &summary.coverage {
         println!("file lines covered percent");
@@ -1015,7 +1065,7 @@ mod tests {
     #[tokio::test]
     async fn receipts_that_disagree_or_misdescribe_their_evidence_fail() {
         type Edit = fn(&mut serde_json::Value);
-        let cases: [(Edit, &str); 20] = [
+        let cases: [(Edit, &str); 21] = [
             (|r| r["source"] = "other".into(), "was built from other"),
             (
                 |r| r["tree"] = "other".into(),
@@ -1078,6 +1128,10 @@ mod tests {
                 "carries a receipt for partition 1",
             ),
             (|r| r["run_attempt"] = "2".into(), "receipt names attempt 2"),
+            (
+                |r| r["partition"]["timings_sha256"] = "0".repeat(64).into(),
+                "was placed with timing table 0000",
+            ),
         ];
         let downloaded = Downloaded::new(Mode::Instrumented, 2).await;
         let receipt = fs::read(downloaded.evidence(2).join(RECEIPT_FILE)).unwrap();

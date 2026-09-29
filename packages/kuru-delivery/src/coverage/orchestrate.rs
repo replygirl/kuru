@@ -49,6 +49,8 @@ const DIAGNOSTIC_COPIES: [&str; 5] = [
     "coverage.summary.json",
 ];
 const INPUT_PREFIX: &str = "KURU_COVERAGE_";
+/// The hosted job-summary file a merge appends its timing section to.
+const STEP_SUMMARY: &str = "GITHUB_STEP_SUMMARY";
 /// Process variables that change what Cargo builds or how tests run. Their
 /// values, with the coverage environment, form the profile-environment digest.
 const PROFILE_ENV: [&str; 8] = [
@@ -179,6 +181,8 @@ struct MergeInputs {
     partitions: u64,
     inputs: PathBuf,
     report: PathBuf,
+    /// The job summary, when the host provides one.
+    step_summary: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -200,6 +204,7 @@ impl Inputs {
     /// are read from the supplied environment, never the process's own.
     fn parse(step: Step, vars: impl IntoIterator<Item = (OsString, OsString)>) -> Result<Self> {
         let mut values = BTreeMap::new();
+        let mut step_summary = None;
         let mut profile_env: BTreeMap<String, Option<String>> = PROFILE_ENV
             .iter()
             .map(|name| ((*name).to_owned(), None))
@@ -209,6 +214,9 @@ impl Inputs {
                 && let Some(slot) = profile_env.get_mut(name)
             {
                 *slot = Some(value.to_string_lossy().into_owned());
+            }
+            if key == STEP_SUMMARY && !value.is_empty() {
+                step_summary = Some(PathBuf::from(&value));
             }
             let Some(name) = key.to_str().and_then(|key| key.strip_prefix(INPUT_PREFIX)) else {
                 continue;
@@ -302,6 +310,7 @@ impl Inputs {
                     partitions: number("PARTITIONS")?,
                     inputs: path("INPUTS")?,
                     report: path("REPORT")?,
+                    step_summary,
                 })
             }
         };
@@ -1253,6 +1262,29 @@ fn run_merge(common: &Common, inputs: &MergeInputs) -> Result<()> {
     })
     .with_context(|| format!("coverage merge for {} failed", common.os))?;
     merge::print_summary(&summary);
+    // The job summary is informational: failing to append it is reported
+    // and never fails an accepted merge.
+    if let Some(path) = &inputs.step_summary
+        && let Err(error) = append(path, merge::summary_markdown(&summary).as_bytes())
+    {
+        eprintln!(
+            "warning: could not append the timing summary to {}: {error:#}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn append(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.write_all(b"\n")?;
     Ok(())
 }
 
@@ -2339,6 +2371,11 @@ mod tests {
     #[tokio::test]
     async fn independent_partitions_merge_into_one_gated_report() {
         let mut merge = partitions(INSTRUMENTED, 3, None).await;
+        let step_summary = merge.temp.path().join("step-summary.md");
+        fs::write(&step_summary, "earlier step\n").unwrap();
+        merge
+            .vars
+            .insert(STEP_SUMMARY.to_owned(), step_summary.display().to_string());
         merge.run(Step::Merge).await.unwrap();
         let report = fs::read_to_string(merge.job("report/coverage.lcov")).unwrap();
         assert!(report.contains("LF:20\nLH:19\n"), "{report}");
@@ -2348,8 +2385,22 @@ mod tests {
         assert_eq!(summary.executables, 8);
         assert_eq!(summary.tests, 40);
         assert!(merge.fake.calls.is_empty(), "the merge starts no process");
+        // The fixture's tests have no timing rows: the merge passes, warns and
+        // appends the timing section to the job summary.
+        assert_eq!(summary.timing.unknown.len(), 40);
+        assert_eq!(summary.timing.predicted_ms.len(), 3);
+        assert!(summary.timing.warning.is_some());
+        let appended = fs::read_to_string(&step_summary).unwrap();
+        assert!(
+            appended.starts_with("earlier step\n### Partition timing (local)"),
+            "{appended}"
+        );
+        assert!(appended.contains("[!WARNING]"), "{appended}");
 
         let mut memory = partitions(UNINSTRUMENTED, 3, None).await;
+        // An unwritable job summary is reported and never fails the merge.
+        let directory = memory.temp.path().display().to_string();
+        memory.vars.insert(STEP_SUMMARY.to_owned(), directory);
         memory.run(Step::Merge).await.unwrap();
         assert!(!memory.job("report/coverage.lcov").exists());
         assert!(

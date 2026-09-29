@@ -161,13 +161,6 @@ enum BundleCommand {
 }
 
 #[derive(Subcommand)]
-#[cfg_attr(
-    windows,
-    expect(
-        clippy::large_enum_variant,
-        reason = "Windows' wider PathBuf pushes this CLI enum past the size threshold; it is parsed once per process, so its size has no cost"
-    )
-)]
 enum CoverageCommand {
     /// Dispatch one Cargo-selected test executable: list its tests and run
     /// this partition's share with exact selections (the Cargo runner).
@@ -212,6 +205,18 @@ enum CoverageCommand {
         #[arg(long, default_value = ".")]
         root: PathBuf,
     },
+    /// Rewrite the timing table from completed runs' downloaded partition
+    /// evidence, newest run first, for a reviewed commit.
+    Timings {
+        #[arg(long, default_value = coverage::timing::TABLE_PATH)]
+        table: PathBuf,
+        /// A run's download directory of partition evidence; repeat for
+        /// older runs, whose measurements are averaged in.
+        #[arg(long, required = true)]
+        inputs: Vec<PathBuf>,
+    },
+    /// Print the checked-in timing table's predicted partition totals.
+    Balance,
 }
 
 #[tokio::main]
@@ -345,6 +350,19 @@ async fn main() -> Result<()> {
             command: CoverageCommand::Merge { root },
         } => {
             coverage::orchestrate::merge(&root).await?;
+        }
+        Command::Coverage {
+            command: CoverageCommand::Timings { table, inputs },
+        } => {
+            print!("{}", coverage::timing::regenerate(&table, &inputs)?);
+        }
+        Command::Coverage {
+            command: CoverageCommand::Balance,
+        } => {
+            print!(
+                "{}",
+                coverage::timing::describe(coverage::timing::embedded()?)?
+            );
         }
         Command::Install {
             version,

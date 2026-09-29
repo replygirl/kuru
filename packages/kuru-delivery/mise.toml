@@ -80,6 +80,16 @@ description = "Require one OS's partition receipts to agree and be complete, the
 dir = "{{config_root}}/../.."
 run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- coverage merge"
 
+[tasks."coverage:timings"]
+description = "Rewrite the partition timing table from completed runs' downloaded evidence: -- --inputs <dir> [--inputs <older run dir>]"
+dir = "{{config_root}}/../.."
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- coverage timings"
+
+[tasks."coverage:balance"]
+description = "Print the checked-in partition timing table's predicted test seconds per partition"
+dir = "{{config_root}}/../.."
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- coverage balance"
+
 [tasks."build"]
 run = "cargo build -p kuru-delivery --all-features --locked"
 

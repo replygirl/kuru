@@ -1,19 +1,27 @@
 //! Deterministic per-test partitions of libtest executables.
 //!
-//! Every partition lists every executable's tests, assigns each listed test to
-//! exactly one partition by a hash of its artifact identity and name, and runs
-//! its own tests with explicit `--exact` selections. Selections are chunked
-//! under one Windows command-line budget on every OS, so chunk boundaries are
-//! identical everywhere and testable on any host.
+//! Every partition lists every executable's tests and assigns each listed test
+//! to exactly one partition: the checked-in timing table's placement for the
+//! host's OS label (see [`super::timing`]) or, for a test without a row, a
+//! hash of its artifact identity and name. It runs its own tests with explicit
+//! `--exact` selections. Selections are chunked under one Windows command-line
+//! budget on every OS, so chunk boundaries are identical everywhere and
+//! testable on any host.
 
-use super::Artifact;
+use super::{
+    Artifact,
+    timing::{self, Placement},
+};
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 /// The assignment function's name, recorded in every plan and receipt.
-pub const SCHEME: &str = "sha256-artifact-test-v1";
+pub const SCHEME: &str = "timed-lpt-v1";
+/// The hash domain of a test without a timing row. It is the previous scheme's
+/// name, so such a test keeps the partition it had before timing placement.
+const HASH_DOMAIN: &str = "sha256-artifact-test-v1";
 /// The largest partition count any OS may use.
 pub const MAX_PARTITIONS: u32 = 64;
 /// UTF-16 units allowed per exact-selection command line. Windows
@@ -28,6 +36,8 @@ pub struct PartitionScheme {
     /// One-based index, `1..=count`.
     pub index: u32,
     pub count: u32,
+    /// Canonical digest of the timing table that places the tests.
+    pub timings_sha256: String,
 }
 
 impl PartitionScheme {
@@ -36,6 +46,7 @@ impl PartitionScheme {
             scheme: SCHEME.to_owned(),
             index,
             count,
+            timings_sha256: timing::embedded_sha256()?.to_owned(),
         };
         scheme.validate()?;
         Ok(scheme)
@@ -58,21 +69,43 @@ impl PartitionScheme {
             self.index,
             self.count
         );
+        let table = timing::embedded_sha256()?;
+        ensure!(
+            self.timings_sha256 == table,
+            "partition {} of {} was placed with timing table {}, but this helper's {} is {table}",
+            self.index,
+            self.count,
+            self.timings_sha256,
+            timing::TABLE_PATH
+        );
         Ok(())
     }
 
-    /// Whether this partition runs the named test of the keyed artifact.
-    pub fn owns(&self, key: &str, name: &str) -> bool {
-        assign(key, name, self.count) == self.index
+    /// The checked-in table's placement for a host target at this count.
+    pub fn placement(&self, host: &str) -> Result<Placement> {
+        self.validate()?;
+        Placement::for_host(timing::embedded()?, host, self.count)
     }
 
     /// This partition's names from a sorted list, in list order.
-    pub fn assigned(&self, key: &str, listed: &[String]) -> Vec<String> {
-        listed
+    pub fn assigned(
+        &self,
+        placement: &Placement,
+        key: &str,
+        listed: &[String],
+    ) -> Result<Vec<String>> {
+        ensure!(
+            placement.count() == self.count,
+            "a placement for {} partitions cannot assign partition {} of {}",
+            placement.count(),
+            self.index,
+            self.count
+        );
+        Ok(listed
             .iter()
-            .filter(|name| self.owns(key, name))
+            .filter(|name| placement.owner(key, name) == self.index)
             .cloned()
-            .collect()
+            .collect())
     }
 }
 
@@ -87,10 +120,10 @@ pub fn artifact_key(artifact: &Artifact) -> String {
     )
 }
 
-/// The one-based partition of a test.
+/// The one-based hash partition of a test without a timing row.
 pub fn assign(key: &str, name: &str, count: u32) -> u32 {
     let mut hasher = Sha256::new();
-    hasher.update(SCHEME.as_bytes());
+    hasher.update(HASH_DOMAIN.as_bytes());
     hasher.update([0]);
     hasher.update(key.as_bytes());
     hasher.update([0]);
@@ -261,8 +294,12 @@ mod tests {
             let mut sizes = Vec::new();
             for index in 1..=count {
                 let scheme = PartitionScheme::new(index, count).unwrap();
-                let assigned = scheme.assigned("pkg/lib/pkg", &listed);
-                assert_eq!(assigned, scheme.assigned("pkg/lib/pkg", &listed));
+                let placement = scheme.placement("x86_64-unknown-linux-gnu").unwrap();
+                let assigned = scheme.assigned(&placement, "pkg/lib/pkg", &listed).unwrap();
+                assert_eq!(
+                    assigned,
+                    scheme.assigned(&placement, "pkg/lib/pkg", &listed).unwrap()
+                );
                 sizes.push(assigned.len());
                 for name in assigned {
                     assert!(seen.insert(name), "count {count} assigns twice");
@@ -301,6 +338,23 @@ mod tests {
                 .to_string()
                 .contains("scheme")
         );
+        // A plan placed with another table is refused, naming both digests.
+        let mut scheme = PartitionScheme::new(1, 2).unwrap();
+        scheme.timings_sha256 = "0".repeat(64);
+        let error = scheme
+            .placement("x86_64-unknown-linux-gnu")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&"0".repeat(64)), "{error}");
+        assert!(
+            error.contains(timing::embedded_sha256().unwrap()),
+            "{error}"
+        );
+        // A placement for another count cannot assign this partition.
+        let scheme = PartitionScheme::new(1, 2).unwrap();
+        let other = PartitionScheme::new(1, 3).unwrap();
+        let placement = other.placement("x86_64-unknown-linux-gnu").unwrap();
+        assert!(scheme.assigned(&placement, "pkg/lib/pkg", &[]).is_err());
     }
 
     #[test]

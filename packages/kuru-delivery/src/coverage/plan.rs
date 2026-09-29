@@ -3,7 +3,8 @@
 //! Cargo invokes the task-private runner once per test executable. The runner
 //! lists the executable's tests, runs this partition's share with explicit
 //! exact selections and appends one [`RunnerRecord`]. [`validate_run_ledger`]
-//! recomputes every assignment from the recorded list and returns the
+//! recomputes every assignment from the recorded list, the checked-in timing
+//! table and the host target, and returns the
 //! [`PartitionPlan`] the receipt binds; the merge validates each uploaded
 //! ledger again and requires the plans of one OS to be disjoint and complete.
 
@@ -28,6 +29,16 @@ pub const DEADLINE: &str = "deadline";
 pub const LIST: &str = "list";
 pub const EXACT: &str = "exact";
 
+/// One selected test's libtest completion: milliseconds from the start of its
+/// exact selection. It is timing input for the timing table; the ledger check
+/// requires only that it names selected tests, once each.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletedTest {
+    pub name: String,
+    pub millis: u64,
+}
+
 /// One process the runner started for an executable.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +54,10 @@ pub struct InvocationRecord {
     pub started: u64,
     pub finished: u64,
     pub status_code: Option<i32>,
+    /// Selected tests whose completion libtest printed, sorted by name; empty
+    /// for a list run and in ledgers written before timing was recorded.
+    #[serde(default)]
+    pub completed: Vec<CompletedTest>,
 }
 
 /// The runner's record of one Cargo-invoked test executable.
@@ -231,6 +246,19 @@ fn check_invocation(
             names.len()
         );
     }
+    // Completions are informational, but they may only name selected tests,
+    // once each, so a timing refresh never attributes an unselected name.
+    ensure!(
+        invocation
+            .completed
+            .windows(2)
+            .all(|pair| pair[0].name < pair[1].name)
+            && invocation
+                .completed
+                .iter()
+                .all(|test| kind == EXACT && names.binary_search(&test.name).is_ok()),
+        "{executable} {kind} invocation records completions outside its selection"
+    );
     Ok(())
 }
 
@@ -244,7 +272,7 @@ pub fn validate_run_ledger(
     exclusions: &[(&str, &str, &str)],
     records: &[RunnerRecord],
 ) -> Result<PartitionPlan> {
-    partition.validate()?;
+    let placement = partition.placement(host)?;
     let artifacts = runnable_artifacts(inventory)?;
     check_exclusions(exclusions, host, inventory)?;
     ensure!(
@@ -302,7 +330,7 @@ pub fn validate_run_ledger(
         let assigned = if excluded.is_some() {
             Vec::new()
         } else {
-            partition.assigned(&key, &record.listed)
+            partition.assigned(&placement, &key, &record.listed)?
         };
         ensure!(
             record.reason == excluded,

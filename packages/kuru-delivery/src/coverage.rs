@@ -10,6 +10,7 @@ pub mod orchestrate;
 pub mod partition;
 pub mod plan;
 pub mod seed;
+pub mod timing;
 
 use crate::{archive, command};
 use anyhow::{Context, Result, bail, ensure};
@@ -51,6 +52,8 @@ const LIST_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const EVIDENCE_RESERVE: Duration = Duration::from_secs(10 * 60);
 const TEST_LOG_LIMIT: u64 = 32 * 1024 * 1024;
 const RECENT_RESULT_LIMIT: usize = 20;
+/// Distinct completion names one selection's timing keeps.
+const COMPLETION_LIMIT: usize = 64 * 1024;
 const PENDING_LINE_LIMIT: usize = 64 * 1024;
 
 /// Every workspace package. The orchestrator requires `cargo metadata` to name
@@ -916,6 +919,11 @@ struct LibtestProgress {
     completed: usize,
     /// The first `running N tests` announcement: the selection libtest ran.
     announced: Option<usize>,
+    /// When the selection started; completions are timed from it.
+    started: Option<std::time::Instant>,
+    /// Milliseconds from the start to each name's first completion line. A
+    /// nested libtest run's echo of a name therefore never moves it.
+    finished: BTreeMap<String, u64>,
 }
 
 impl LibtestProgress {
@@ -962,6 +970,12 @@ impl LibtestProgress {
         {
             self.long_running.retain(|running| running != name);
             self.completed += 1;
+            if let Some(started) = self.started
+                && self.finished.len() < COMPLETION_LIMIT
+            {
+                let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                self.finished.entry(name.to_owned()).or_insert(millis);
+            }
             if self.recent.len() == RECENT_RESULT_LIMIT {
                 self.recent.pop_front();
             }
@@ -1033,8 +1047,9 @@ struct StallEvidence {
 }
 
 enum Supervision {
-    /// The tree exited; carries libtest's announced selection size.
-    Exited(ExitStatus, Option<usize>),
+    /// The tree exited; carries libtest's announced selection size and each
+    /// completed name's milliseconds from the selection's start.
+    Exited(ExitStatus, Option<usize>, BTreeMap<String, u64>),
     Stalled(Box<StallEvidence>),
     /// The Unix runner itself received a termination request.
     #[cfg(unix)]
@@ -1255,7 +1270,10 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let deadline = tokio::time::Instant::now() + remaining;
-    let mut progress = LibtestProgress::default();
+    let mut progress = LibtestProgress {
+        started: Some(std::time::Instant::now()),
+        ..LibtestProgress::default()
+    };
     let (waited, sample, termination, cleanup, presence_after_reap, output) = {
         let mut relay = std::pin::pin!(relay_output(output, relay, &log, &mut progress));
         let mut relayed = None;
@@ -1298,7 +1316,11 @@ where
             if output != "complete" {
                 eprintln!("coverage runner output relay: {output}");
             }
-            Ok(Supervision::Exited(status, progress.announced))
+            Ok(Supervision::Exited(
+                status,
+                progress.announced,
+                progress.finished,
+            ))
         }
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
             Ok(Supervision::Stalled(Box::new(StallEvidence {
@@ -1526,7 +1548,7 @@ async fn dispatch_with<L: Launcher>(
         diagnostics.is_absolute() && fs::symlink_metadata(diagnostics)?.file_type().is_dir(),
         "coverage diagnostics must be an absolute directory"
     );
-    partition.validate()?;
+    let placement = partition.placement(host)?;
     let executable_path = if executable.is_absolute() {
         executable.to_path_buf()
     } else {
@@ -1625,12 +1647,13 @@ async fn dispatch_with<L: Launcher>(
         started: list_started,
         finished: unix_now()?,
         status_code: Some(0),
+        completed: Vec::new(),
     });
     let excluded = plan::excluded_reason(exclusions, host, &key);
     let assigned = if excluded.is_some() {
         Vec::new()
     } else {
-        partition.assigned(&key, &listed)
+        partition.assigned(&placement, &key, &listed)?
     };
     record.listed = listed;
     record.assigned = assigned.len();
@@ -1718,9 +1741,13 @@ async fn dispatch_with<L: Launcher>(
             started: chunk_started,
             finished: unix_now()?,
             status_code: None,
+            completed: Vec::new(),
         };
         let (status, announced) = match supervision {
-            Supervision::Exited(status, announced) => (status, announced),
+            Supervision::Exited(status, announced, finished) => {
+                invocation.completed = completions(&names, &finished);
+                (status, announced)
+            }
             #[cfg(unix)]
             Supervision::Interrupted(evidence) => {
                 record.invocations.push(invocation);
@@ -1779,6 +1806,23 @@ async fn dispatch_with<L: Launcher>(
     record.status_code = Some(0);
     finish_record(&mut record, ledger, target_dir)?;
     Ok(last)
+}
+
+/// The selected names' completions, sorted by name. Output that names an
+/// unselected test, such as a nested libtest run, is not recorded.
+fn completions(selected: &[String], finished: &BTreeMap<String, u64>) -> Vec<plan::CompletedTest> {
+    let mut completed: Vec<_> = selected
+        .iter()
+        .filter_map(|name| {
+            finished.get(name).map(|millis| plan::CompletedTest {
+                name: name.clone(),
+                millis: *millis,
+            })
+        })
+        .collect();
+    completed.sort_by(|left, right| left.name.cmp(&right.name));
+    completed.dedup_by(|left, right| left.name == right.name);
+    completed
 }
 
 fn stall_report(
@@ -2999,7 +3043,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(supervision, Supervision::Exited(status, _) if status.success()));
+        assert!(matches!(
+            &supervision,
+            Supervision::Exited(status, Some(1), finished)
+                if status.success() && finished.keys().eq(["one"])
+        ));
         assert!(!process.terminated);
         let mut copied = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut relayed, &mut copied)
@@ -3135,7 +3183,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let Supervision::Exited(status, _) = supervision else {
+        let Supervision::Exited(status, _, _) = supervision else {
             panic!("an exiting root was reported as stalled");
         };
         assert_eq!(status.code(), Some(3), "{status:?}");
@@ -3577,6 +3625,16 @@ mod tests {
                 assert_eq!(record.action, plan::RUN);
                 assert_eq!(chunks.len(), 1);
                 assert_eq!(chunks[0].announced, Some(record.assigned));
+                // Every selected name is timed; the scripted nested name is not.
+                let timed: Vec<u64> = chunks[0].completed.iter().map(|test| test.millis).collect();
+                assert_eq!(timed.len(), record.assigned);
+                assert!(timed.iter().all(|millis| *millis >= 10 && millis % 10 == 0));
+                assert!(
+                    chunks[0]
+                        .completed
+                        .iter()
+                        .all(|test| test.name != "nested::unselected")
+                );
                 let log = diagnostics.join(format!(
                     "{}.exact-1.stdout.log",
                     diagnostic_name(&record.executable)
@@ -4016,7 +4074,7 @@ mod tests {
             .position(|record| record.action == plan::RUN)
             .unwrap();
         type Tamper = fn(&mut Vec<RunnerRecord>, usize);
-        let cases: [(Tamper, &str); 16] = [
+        let cases: [(Tamper, &str); 19] = [
             (
                 |records, _| records.push(records[0].clone()),
                 "extra records",
@@ -4074,6 +4132,31 @@ mod tests {
             (
                 |records, at| records[at].invocations[0].kind = plan::EXACT.to_owned(),
                 "expected list",
+            ),
+            (
+                |records, at| {
+                    records[at].invocations[1]
+                        .completed
+                        .push(plan::CompletedTest {
+                            name: "zz::unselected".to_owned(),
+                            millis: 1,
+                        });
+                },
+                "completions outside its selection",
+            ),
+            (
+                |records, at| {
+                    let completed = &mut records[at].invocations[1].completed;
+                    completed.insert(0, completed[0].clone());
+                },
+                "completions outside its selection",
+            ),
+            (
+                |records, at| {
+                    let first = records[at].invocations[1].completed[0].clone();
+                    records[at].invocations[0].completed.push(first);
+                },
+                "completions outside its selection",
             ),
         ];
         for (tamper, reason) in cases {
@@ -4342,11 +4425,21 @@ mod tests {
         let mut args = vec!["--exact".to_owned()];
         args.extend(PROBES.map(str::to_owned));
         let supervision = run_self(&args, temp.path().join("exact.log")).await;
-        let Supervision::Exited(status, announced) = supervision else {
+        let Supervision::Exited(status, announced, finished) = supervision else {
             panic!("the exact probe selection did not exit");
         };
         assert!(status.success(), "{status:?}");
         assert_eq!(announced, Some(2));
+        // Each selected probe's completion is timed for the timing table.
+        let selected: Vec<String> = PROBES.map(str::to_owned).to_vec();
+        let completed = completions(&selected, &finished);
+        assert_eq!(
+            completed
+                .iter()
+                .map(|test| test.name.as_str())
+                .collect::<Vec<_>>(),
+            PROBES
+        );
 
         // A selection sized to the command-line budget still starts: absent
         // names are ordinary filters that select nothing. Short names put the
@@ -4368,7 +4461,7 @@ mod tests {
         }
         assert!(filler > 100);
         let supervision = run_self(&args, temp.path().join("budget.log")).await;
-        let Supervision::Exited(status, announced) = supervision else {
+        let Supervision::Exited(status, announced, _) = supervision else {
             panic!("the budget-sized selection did not exit");
         };
         assert!(status.success(), "{status:?}");
