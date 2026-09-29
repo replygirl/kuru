@@ -94,6 +94,7 @@ The independent final review (verdict ACCEPT, no must-fix, seven should-fix) fou
 - [x] 13.5 S7: the lock-gate comments in `service.rs` and `store/open_error_reap_tests.rs` state what the gate does and that the teardown never probes the lock.
 - [x] 13.6 Record and `docs/development.md` state the served-owner rule for every exit path, including an elapsed deadline, and the scan's budgets and reported truncation.
 - [x] 13.7 Maintainer ruling on the round-11 `.dolt` skip: the scan skips only the database repository `<store>/data/kuru/.dolt` of a store it has recognised; every other `.dolt` is scanned under both budgets. `TempDir::with_depth_budget` names a larger depth budget at a fixture's call site; the two template fixtures use 11. Red before and green after with four `fixture_dir` tests (verification round 12).
+- [x] 13.9 CI round on 67de95cf (round 14): the narrowed scan of 13.7 also tripped `packaged_install_and_update_preserve_complete_offline_memory` in `apps/kuru-tui/tests/embedded_runtime.rs` on every platform, at the `staging` and `eventsData` directories of each store's `home/root/.dolt`, 9 levels below its root. Resolved by the documented per-fixture remedy: `FIXTURE_DEPTH_BUDGET = 10` at that call site, measured from retained roots, the CI paths and Dolt v2.3.5's root layout; every other guarded fixture root audited and found within the default (verification round 14).
 
 Recorded follow-ons, not fixed in this change (they need the shared budget helpers, a later change):
 
