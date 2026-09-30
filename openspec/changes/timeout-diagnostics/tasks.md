@@ -4,8 +4,8 @@
 
 - [ ] 1.1 Add a read-only `NativeChild` accessor in `packages/kuru-platform/src/windows/process.rs` that lists the Job's process IDs with image names, using `QueryInformationJobObject(JobObjectBasicProcessIdList)`, `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` and `QueryFullProcessImageNameW`, and verify with a Windows-native test that a spawned root and grandchild both appear and that nothing acts on a PID.
 - [ ] 1.2 Extend the Windows timeout arm in `packages/kuru-delivery/src/command.rs` to add root state, Job state and the process list to its error text before it terminates the tree, and verify with a tiny-deadline test on a blocking child that the text names the command, arguments, working directory and the blocked child and grandchild.
-- [ ] 1.3 Add the bounded, drained Unix `ps` descendant snapshot before the kill in the `bounded_unix` timeout arm, with `snapshot unavailable: <reason>` on failure, and verify with a tiny-deadline Unix test that the text lists the blocked child and grandchild.
-- [ ] 1.4 Regression test: a snapshot failure (for example an unusable `ps` path in a test seam) appends `snapshot unavailable: <reason>` and keeps the original timeout error text.
+- [x] 1.3 Add the bounded, drained Unix `ps` descendant snapshot before the kill in the `bounded_unix` timeout arm, with `snapshot unavailable: <reason>` on failure, and verify with a tiny-deadline Unix test that the text lists the blocked child and grandchild.
+- [x] 1.4 Regression test: a snapshot failure (for example an unusable `ps` path in a test seam) appends `snapshot unavailable: <reason>` and keeps the original timeout error text.
 
 ## 2. Install family helpers
 
@@ -38,4 +38,24 @@
 
 ## Observed evidence
 
-Not yet run. Filled in during apply.
+2026-09-29, work package P (macOS arm64 host, commits `875d7a4d`, `7b91d257`):
+
+- 1.1 and 1.2 are implemented (`NativeChild::diagnostic_snapshot`, `TreeSnapshot`;
+  the Windows arm appends `command=… arguments=… directory=…; tree before cleanup: …`
+  before `terminate`). Their tests (`diagnostic_snapshot_lists_job_members_without_changing_the_tree`,
+  `quiescence_failure_lists_the_live_descendant_before_owned_cleanup`,
+  `timeout_lists_the_running_root_before_owned_cleanup`) compile under the Windows
+  target lint but have not run: Windows behaviour is unverified until native CI.
+  These boxes stay open until CI records them.
+- 1.3: `bounded_output_timeout_names_the_command_and_its_blocked_root` and
+  `bounded_output_failure_snapshot_lists_the_live_grandchild_before_cleanup` passed
+  in `mise run //packages/kuru-delivery:test` (348 passed, 0 failed, 1 ignored).
+  The snapshot is Unix-wide stock `ps`; Linux procps output was only format-checked
+  in an `ubuntu:24.04` container, not run through Rust.
+- 1.4: `snapshot_failure_is_reported_as_text` (missing `ps` path and a failing `ps`
+  stand-in) and the snapshot unit tests passed in `mise run //packages/kuru-platform:test`
+  (51 passed, 0 failed). The delivery arm appends the snapshot after the original
+  error and cleanup text by construction.
+- Sampling inside short deadlines: `SAMPLE_INTERVAL` and the skipped first tick are
+  unchanged; the snapshot adds one final root sample and one sample per Job member
+  at failure time instead.
