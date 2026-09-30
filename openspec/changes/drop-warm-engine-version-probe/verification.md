@@ -24,7 +24,7 @@
 
 ## 4. Documentation matches the new behavior
 
-- [ ] 4.1 @manual (human) read `docs/memory.md` and `apps/kuru-docs/concepts/memory.md` after the edit -> neither page claims a per-open (warm) version probe; both describe the install-time probe and the unconditional per-open payload hash
+- [x] 4.1 @manual (human) read `docs/memory.md` and `apps/kuru-docs/concepts/memory.md` after the edit -> neither page claims a per-open (warm) version probe; both describe the install-time probe and the unconditional per-open payload hash -> observed 2026-09-30 by the orchestrating session on head 5456e2d0: `git diff origin/main` of both pages shows the warm-open sentences now say the engine is reused "without running the engine again for a version check" and installation "runs the new engine once to confirm its exact version"; no remaining sentence claims a per-open probe
 
 ## 5. Coverage gate holds
 
