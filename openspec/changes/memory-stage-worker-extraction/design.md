@@ -81,18 +81,30 @@ cancellation discipline.
   parameter sprawl inside the new module instead of removing it, and gives
   the template PR nowhere to hang a build-scoped variant of the shared
   inputs.
-- **Each job owns its own `lock: Option<File>` in and out, exactly as
-  `open_inner` does today.** A job takes `Option<File>` (the startup lock, or
-  for a future build job, an exclusive key lock) and returns
-  `Result<Option<File>>`; `open_inner` chains the three calls, taking the
-  lock out of one job's result and into the next job's argument, unchanged
-  from today's `lock.take()` / `lock = Some(returned_lock)` pattern. Rejected:
-  the worker owning the lock across all three jobs internally — that would
-  change `open_inner`'s visible lock lifetime between `preserve_unready_stage`
-  calls (the lock is dropped inside `preserve_unready_stage`'s failure arms
-  today) and risks silently altering when a cancelled opener's lock becomes
-  observable to a second opener, which the new cancellation test exists to
-  catch.
+- **Each job takes the startup lock `File` in and returns it out, exactly as
+  `open_inner` threads it today.** A job takes `File` (the startup lock, or
+  for a future build job, an exclusive key lock) and returns `Result<File>`;
+  `open_inner` passes `lock.take().expect("startup lock")` to `init`, chains
+  each returned `File` into the next job, and stores the last one with
+  `lock = Some(...)` before quiescence, unchanged from today's
+  `lock.take()` / `lock = Some(returned_lock)` pattern. On every error path
+  today `open_inner`'s `lock` is already `None` (the `File` lives inside a
+  `Server` or is dropped inside a failure arm), so passing the `File` by
+  value changes no lock lifetime. Rejected: the worker owning the lock across
+  all three jobs internally — that would change the visible lock lifetime
+  between `preserve_unready_stage` calls (the lock is dropped inside
+  `preserve_unready_stage`'s failure arms today) and risks silently altering
+  when a cancelled opener's lock becomes observable to a second opener, which
+  the new cancellation test exists to catch. Also rejected: `Option<File>` in
+  and out — every caller has a lock, so the `Option` only adds an `expect`.
+- **One private `start` helper opens each job's engine and main pool.** It
+  reports `OpeningDatabase`, calls `Server::open_with_guard` with the lock as
+  the reap guard, and opens the main pool with `close_failed_open` on
+  failure. A private `Start` enum (`Init`, `Migrate`, `Validate`) keeps each
+  start's exact `.context(...)` text and applies the test-only
+  `migrated_stage_pool_delay` only to the validate start, between the server
+  open and the pool open, as today. This is the seam the template build job
+  reuses: it starts one engine and runs its steps on it.
 - **`migrate` keeps calling today's `run_migration_worker` verbatim, not
   inlined into the new module's job body.** `run_migration_worker` already
   encodes the required "worker owns and reaps its server, independent of the
@@ -108,7 +120,12 @@ cancellation discipline.
   `migrated_stage_pool_delay`); `Creation` follows that existing pattern
   exactly, widened to `cfg(any(test, feature = "test-support"))` since
   `test_support` fixtures (built with that feature, not `cfg(test)`) are the
-  actual callers. Rejected: a builder method (`OpenOptions::with_creation`)
+  actual callers. `open_temporary` gains a `creation` argument:
+  `temporary_cold()` passes `Creation::Cold`, while `temporary()` and the
+  test template's `build()` (`test_support/template.rs`) pass
+  `Creation::Default`, since the template build is the open that later takes
+  the copy path. Both variants are constructed explicitly (no derived
+  `Default`). Rejected: a builder method (`OpenOptions::with_creation`)
   — none of the existing test-only fields use one, and adding one here alone
   would be an inconsistent precedent.
 - **Verify no product construction site by grep, not by type-level
