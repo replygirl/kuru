@@ -2084,16 +2084,13 @@ pub(super) async fn exchange_attached_with_id<S: AsyncRead + AsyncWrite + Unpin>
 /// facade cancellation path without changing owner dispatch or persistence.
 ///
 /// The client reads the owner's reply frame while paused and holds it until
-/// `release`. The owner writes that frame only after its handler returned and
-/// the request's receipt settled, so `replied` is the owner-observed event a
-/// test must await before cancelling when it then expects one reconcile to be
-/// definite. A sibling reading the committed row is not that event: storage
-/// can expose a commit before the owner's handler has returned.
+/// `release`. A test cancels after a sibling has seen the effect; the owner
+/// answers the following outcome query definitely from that evidence, so no
+/// owner-side reply event is needed.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub(crate) struct ReplyPause {
     pub sent: tokio::sync::Notify,
-    pub replied: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
     pub promotion_sent: AtomicBool,
 }
@@ -2119,9 +2116,6 @@ pub(super) async fn exchange_attached_with_id_paused<S: AsyncRead + AsyncWrite +
     let reply = tokio::time::timeout(reply_deadline, async {
         let reply: Result<ServiceReply> =
             read_frame(stream, OPERATION_FRAME_LIMIT, reply_deadline).await;
-        if reply.is_ok() {
-            pause.replied.notify_one();
-        }
         pause.release.notified().await;
         reply
     })
