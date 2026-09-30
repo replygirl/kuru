@@ -6,6 +6,14 @@ Local host: macOS arm64, 2026-09-30, worktree based on `origin/main`
 each. Logs are in the session scratchpad (`full-test.log`, `neg-*.log`,
 `typecheck.log`, `move.diff`).
 
+Rebased 2026-09-30: the branch was moved onto `origin/main` `b8c7f489`
+(confirmed by `git merge-base origin/main HEAD`), which carries #140; #141
+was not merged at rebase time. `format:check` and `typecheck` were re-run
+locally post-rebase. The PR's CI run (`gh run 36767143779`, all jobs green,
+see item 2.3 and coverage evidence below) is the full-suite evidence for the
+rebased tree across every OS; nothing in 1.1's assertions changed shape
+after the rebase.
+
 ## 1. Fresh-open engine/lock/lease sequence is unchanged [critical]
 
 - [x] 1.1 @equivalence (agent) `mise run //packages/kuru-memory:test` -> exit 0: lib 371 passed, 3 ignored (the existing opt-in lifecycle measurements), 0 failed; the integration targets passed 10, 5, 12 and 1. No existing test file was edited. The invariant modules all passed: `store::recovery_tests` 23, `store::open_error_reap_tests` 5 (including `staged_open_error_returns_only_after_its_server_is_reaped`, which asserts the moved "open migrated staged main pool" context), `store::marker_fixture` 2 (both ready-marker boundaries, with preservation and reuse), `store::open_pool_budget_tests` 2, `store::migration_lifecycle_tests` 3 and `store::template_tests` 2.
@@ -17,7 +25,7 @@ each. Logs are in the session scratchpad (`full-test.log`, `neg-*.log`,
 - [x] 2.1 @integration (agent) `mise run //packages/kuru-memory:test -- stage_worker` -> `store::stage_worker::tests::cancelled_open_during_stage_build_keeps_startup_lock_until_reap ... ok` (11.2 s), and it passed again in the full run. It cancels the opener at two job boundaries. At `migrate` it pauses at `AfterDdl` and aborts the opener; while the worker is paused, the startup lock is still held and the ledger still shows the stage engine. After resuming, the lock is acquired only when `engine_ledger` shows no live supervisor under the root. At `validate-and-mark` it pauses at the ready-marker `Before` boundary and aborts, then checks the same thing. Each time, a following ordinary open preserves the unready stage once and opens. The init job has no pause point; it releases its lock through the same close and owner drop.
 - [x] 2.2 @regression (agent) Negative checks with the hand-off broken, each a scratch edit reverted afterwards: (a) `drop(server.take_reap_guard())` on the migrate start -> FAILED with `the cancelled stage opener released the startup lock while its migration worker was paused; live owners: [...staging-... has not been reaped]` (`neg-Migrate.log`); (b) the same drop on the validate start of the observed opener only -> FAILED with `a second opener acquired the startup lock before the cancelled stage engine was reaped: [...]` (`neg-Validate.log`).
 
-- [~] 2.3 @runtime (agent) the cancellation test on the native Windows and Linux test jobs -> defer: this change has not yet run in CI; the native-test jobs observe it on the PR run. Locally it ran on macOS only.
+- [x] 2.3 @runtime (agent) the cancellation test on the native Windows and Linux test jobs -> PR #143 head `63216d2aa5cef3734c7b31ed32c950ce741eecfb`, CI run [36767143779](https://github.com/replygirl/kuru/actions/runs/36767143779), all jobs `pass` (`gh pr checks 143 --json name,bucket,link`); `store::stage_worker::tests::cancelled_open_during_stage_build_keeps_startup_lock_until_reap ... ok` observed directly in job logs on Linux (`Native memory partition (ubuntu-24.04-arm, 3)`, job 110064441430) and on Windows arm64 (`native-tests (windows-11-arm) / Behavior partition (windows-11-arm, 5)`, job 110064556943), fetched with `gh api --allow-escape-sequences repos/replygirl/kuru/actions/jobs/<id>/logs`; coverage gate: ubuntu-latest merge (job 110070447100) reports `coverage ubuntu-latest: 94.63% of lines (104337 of 110256) ... gate 90%`, and the `Require native coverage and installation checks` jobs for macos-latest, ubuntu-latest, windows-latest and windows-11-arm all report `pass`.
 
 ## 3. Creation selector reaches no product caller
 
