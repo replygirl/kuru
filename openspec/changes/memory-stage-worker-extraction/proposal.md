@@ -64,8 +64,8 @@ identical externally observable behaviour.
 - `packages/kuru-memory/src/store/stage_worker.rs` (new): the extracted
   `init`, `migrate`, `validate-and-mark` jobs.
 - `packages/kuru-memory/src/test_support.rs` and `store.rs`'s
-  `temporary()` / `temporary_cold()` / `open_temporary()` (15 call sites
-  total per `AGENTS.md`-cited research): thread `Creation` through.
+  `temporary()` / `temporary_cold()` / `open_temporary()` (13 `temporary_cold()`
+  call sites measured at 0b39e733; the research's 15 counted mentions): thread `Creation` through.
 - No change to `packages/kuru-memory/src/server.rs`, `store/migrations.rs`,
   `provision.rs`, or any public API outside `kuru-memory`.
 - `docs/development.md` only if it names the moved functions by path; no

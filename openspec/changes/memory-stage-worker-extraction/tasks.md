@@ -90,3 +90,7 @@
       `run_migration_worker`, `close_migration_worker`,
       `preserve_unready_stage`, or `open_inner`'s staging steps by path;
       otherwise record that no doc change was needed and why.
+      Outcome: `grep -rn "run_migration_worker\|close_migration_worker\|preserve_unready_stage\|open_inner\|close_failed_open\|stage_worker" docs apps/kuru-docs --include=*.md`
+      matched nothing; `docs/development.md:379` names only
+      `MemoryStore::temporary_cold()`, whose signature is unchanged, so no
+      documentation change is needed.
