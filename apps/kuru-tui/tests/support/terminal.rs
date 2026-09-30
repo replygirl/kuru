@@ -494,6 +494,31 @@ impl Terminal {
         }
     }
 
+    /// Waits until the child has exited without reaping it or reading its
+    /// output, so a following wait still observes the exit itself.
+    pub fn wait_exited(&self, timeout: Duration) -> Result<()> {
+        let raw_pid = self.child_id()?.try_into()?;
+        let pid =
+            RustixPid::from_raw(raw_pid).context("terminal child has an invalid process ID")?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            )?
+            .is_some()
+            {
+                return Ok(());
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "terminal child {pid} did not exit within {timeout:?}\n{}",
+                self.diagnostics()
+            );
+            std::thread::sleep(TICK);
+        }
+    }
+
     pub fn wait_exit(&mut self, timeout: Duration) -> Result<()> {
         // The final redraw can exceed the PTY buffer. Keep reading until exit.
         let deadline = Instant::now() + timeout;

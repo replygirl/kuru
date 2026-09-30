@@ -225,12 +225,14 @@ fn terminal_fixture_process() -> Result<()> {
             println!("PARTIAL");
             std::io::stdout().flush()?;
         }
-        // The second line is written after the parent has stopped reading and
-        // just before the exit, so it is still queued when the exit is seen.
+        // The second line waits for the parent's acknowledgment, which it sends
+        // only after it has stopped reading, so LATE is still queued when the
+        // parent observes the exit.
         "late-output" => {
             println!("EARLY");
             std::io::stdout().flush()?;
-            std::thread::sleep(Duration::from_millis(150));
+            let mut acknowledgment = String::new();
+            std::io::stdin().read_line(&mut acknowledgment)?;
             println!("LATE");
             std::io::stdout().flush()?;
         }
@@ -552,10 +554,12 @@ fn terminal_wait_reports_output_still_queued_when_the_exit_is_seen() -> Result<(
     let mut paused = false;
     let error = terminal
         .wait("late output becomes visible", READY_TIMEOUT, |terminal| {
-            // Hold the wait past the child's exit so LATE is queued unread.
+            // Release LATE only once reading has stopped, and hold the wait
+            // until the child has exited, so LATE is queued unread at the exit.
             if !paused && terminal.output.windows(5).any(|bytes| bytes == b"EARLY") {
                 paused = true;
-                std::thread::sleep(Duration::from_millis(700));
+                terminal.send(b"\n")?;
+                terminal.wait_exited(READY_TIMEOUT)?;
             }
             Ok(false)
         })
