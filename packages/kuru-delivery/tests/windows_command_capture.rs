@@ -97,3 +97,73 @@ async fn exited_root_output_survives_descendant_quiescence_failure_and_owned_cle
         .with_context(|| format!("observe descendant lease release; {diagnostic}"))?;
     Ok(())
 }
+
+fn held_tree_command(root: &std::path::Path, mode: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kuru-delivery-fixture"));
+    command
+        .env_clear()
+        .current_dir(root)
+        .arg(mode)
+        .arg(root.join("live-descendant.lock"));
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    command
+}
+
+#[tokio::test]
+async fn quiescence_failure_lists_the_live_descendant_before_owned_cleanup() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut command = held_tree_command(root.path(), "command-output-before-tree-wait");
+    let error = output(&mut command, Duration::from_secs(30))
+        .await
+        .expect_err("a live descendant cannot satisfy command quiescence");
+    let diagnostic = error.to_string();
+    // The descendant held its lease before the root failed, so it is a live
+    // Job member when the tree is observed, ahead of termination.
+    for required in [
+        "wait for native process tree quiescence",
+        &format!("command={:?}", env!("CARGO_BIN_EXE_kuru-delivery-fixture")),
+        r#"arguments=["command-output-before-tree-wait""#,
+        &format!("directory={:?}", root.path()),
+        "tree before cleanup: root pid=",
+        "state=exited(1)",
+        "job active=",
+        "members=[pid=",
+        "image=kuru-delivery-fixture.exe cpu=",
+    ] {
+        ensure!(
+            diagnostic.contains(required),
+            "missing {required}: {diagnostic}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn timeout_lists_the_running_root_before_owned_cleanup() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut command = held_tree_command(root.path(), "command-held-descendant");
+    let error = output(&mut command, Duration::from_secs(2))
+        .await
+        .expect_err("a blocked root must reach the timeout arm");
+    let diagnostic = error.to_string();
+    for required in [
+        "read native stdout/stderr after ",
+        "tool timed out",
+        r#"arguments=["command-held-descendant""#,
+        "tree before cleanup: root pid=",
+        "state=running cpu=",
+        "image=kuru-delivery-fixture.exe cpu=",
+    ] {
+        ensure!(
+            diagnostic.contains(required),
+            "missing {required}: {diagnostic}"
+        );
+    }
+    ensure!(
+        !diagnostic.contains("job_error=") && !diagnostic.contains("image_error="),
+        "tree observation failed: {diagnostic}"
+    );
+    Ok(())
+}

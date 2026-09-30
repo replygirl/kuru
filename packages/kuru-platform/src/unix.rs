@@ -21,6 +21,8 @@ use std::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus},
 };
 
+pub mod snapshot;
+
 const MAX_EINTR_ATTEMPTS: usize = 8;
 
 /// Why this owner can no longer safely signal its remembered group or root.

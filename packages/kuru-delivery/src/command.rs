@@ -392,8 +392,12 @@ mod bounded_unix {
         if let Err(error) =
             capture_until(pid, &mut stdout, &mut stderr, Instant::now() + timeout).await
         {
+            let tree = describe_tree(command, pid).await;
             let cleanup = stop_and_reap(&mut child, pid).await;
-            return Err(io::Error::new(error.kind(), format!("{error}; {cleanup}")));
+            return Err(io::Error::new(
+                error.kind(),
+                format!("{error}; {cleanup}; {tree}"),
+            ));
         }
         let status = finish_and_reap(&mut child, pid).await?;
         Ok(std::process::Output {
@@ -401,6 +405,30 @@ mod bounded_unix {
             stdout: stdout.bytes,
             stderr: stderr.bytes,
         })
+    }
+
+    /// Failure-path text naming the command and its owned tree. The unreaped
+    /// root still anchors its ID and fresh group here, so the snapshot cannot
+    /// describe a reused ID; it runs before cleanup, while descendants remain.
+    /// A snapshot failure is appended as text and never replaces the error.
+    async fn describe_tree(command: &super::Command, pid: Pid) -> String {
+        let command = command.as_std();
+        let root = match root_exited(pid) {
+            Ok(true) => "exited".to_owned(),
+            Ok(false) => "running".to_owned(),
+            Err(error) => format!("unknown ({error})"),
+        };
+        let id = pid.as_raw_nonzero().get().unsigned_abs();
+        let snapshot =
+            tokio::task::spawn_blocking(move || kuru_platform::unix::snapshot::describe(id))
+                .await
+                .unwrap_or_else(|error| format!("snapshot unavailable: {error}"));
+        format!(
+            "command={:?} arguments={:?} directory={:?}; root={root}; {snapshot}",
+            command.get_program(),
+            command.get_args().collect::<Vec<_>>(),
+            command.get_current_dir()
+        )
     }
 
     fn ensure_root_exited(pid: Pid) -> io::Result<()> {
@@ -664,6 +692,9 @@ mod windows {
             // a root's final failure when an enclosing Job still has a live
             // trusted helper. Cleanup failure must not replace that first cause.
             let elapsed = started.elapsed();
+            // Observe the owned tree before terminating it; afterwards the Job
+            // is empty. Text only: nothing acts on the listed process IDs.
+            let tree = child.diagnostic_snapshot();
             let cleanup = terminate(&mut child).await;
             let (stdout_close, stderr_close) = tokio::join!(
                 stdout.close(Duration::from_secs(5)),
@@ -677,8 +708,11 @@ mod windows {
                 format!(
                     "{phase} after {} ms: {error}; stdout_eof={stdout_eof} stderr_eof={stderr_eof}; \
                  cleanup={cleanup:?} stdout_close={stdout_close:?} stderr_close={stderr_close:?}; \
+                 command={:?} arguments={:?} directory={cwd:?}; tree before cleanup: {tree}; \
                  samples=[{}]; stdout prefix: {}; stderr prefix: {}",
                     elapsed.as_millis(),
+                    self.program,
+                    self.arguments,
                     samples.join(", "),
                     prefix(&stdout_bytes),
                     prefix(&stderr_bytes)

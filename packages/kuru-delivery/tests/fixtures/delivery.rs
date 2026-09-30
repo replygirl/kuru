@@ -39,8 +39,7 @@ async fn main() -> io::Result<()> {
                 .find(|arguments| arguments[0] == "--db")
                 .map(|arguments| std::path::PathBuf::from(&arguments[1]))
                 .ok_or_else(|| io::Error::other("audit fixture did not receive --db"))?;
-            let mut command = kuru_delivery::command::rooted(&database, "git");
-            command.args([
+            let git_arguments = [
                 "-c",
                 "user.name=fixture",
                 "-c",
@@ -51,17 +50,27 @@ async fn main() -> io::Result<()> {
                 "--allow-empty",
                 "-m",
                 "controlled scanner changed advisory HEAD",
-            ]);
+            ];
+            let mut command = kuru_delivery::command::rooted(&database, "git");
+            command.args(git_arguments);
+            let started = std::time::Instant::now();
             let output = kuru_delivery::command::bounded_output(
                 &mut command,
                 std::time::Duration::from_secs(10),
                 64 * 1024,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "controlled scanner git {git_arguments:?} in {database:?} failed after {:?}: {error}",
+                    started.elapsed()
+                ))
+            })?;
             if !output.status.success() {
-                return Err(io::Error::other(
-                    "controlled scanner could not advance advisory HEAD",
-                ));
+                return Err(io::Error::other(format!(
+                    "controlled scanner could not advance advisory HEAD: git {git_arguments:?} in {database:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
             }
         }
         if std::env::var_os("KURU_AUDIT_FAIL").is_some() {
@@ -138,6 +147,50 @@ async fn main() -> io::Result<()> {
                 .spawn()?;
             io::stdout().write_all(b"root exited with descendant holding output\n")?;
             io::stdout().flush()?;
+        }
+        #[cfg(unix)]
+        Some("bounded-blocking-tree") => {
+            use std::io::BufRead;
+            // The root blocks with a ready grandchild. `overflow` then fails
+            // the bounded capture only once that grandchild exists.
+            let trigger = arguments
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| io::Error::other("missing blocking tree trigger"))?;
+            let tag = arguments
+                .next()
+                .ok_or_else(|| io::Error::other("missing blocking tree tag"))?;
+            let mut descendant = std::process::Command::new(std::env::current_exe()?)
+                .arg("bounded-ready-descendant")
+                .arg(tag)
+                .stdout(std::process::Stdio::piped())
+                .spawn()?;
+            let mut line = String::new();
+            io::BufReader::new(
+                descendant
+                    .stdout
+                    .take()
+                    .ok_or_else(|| io::Error::other("missing descendant readiness pipe"))?,
+            )
+            .read_line(&mut line)?;
+            if line != "ready\n" {
+                return Err(io::Error::other("blocking tree descendant was not ready"));
+            }
+            match trigger.as_str() {
+                "block" => {}
+                "overflow" => {
+                    io::stdout().write_all(&[b'x'; 8192])?;
+                    io::stdout().flush()?;
+                }
+                _ => return Err(io::Error::other("unknown blocking tree trigger")),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+        #[cfg(unix)]
+        Some("bounded-ready-descendant") => {
+            io::stdout().write_all(b"ready\n")?;
+            io::stdout().flush()?;
+            std::thread::sleep(std::time::Duration::from_secs(60));
         }
         #[cfg(unix)]
         Some("bounded-close-output-before-exit") => {

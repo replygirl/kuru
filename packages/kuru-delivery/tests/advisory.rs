@@ -3,7 +3,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use kuru_delivery::command;
@@ -14,12 +14,18 @@ const FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
 async fn git(directory: &Path, arguments: &[&str]) {
     let mut command = command::rooted(directory, "git");
     command.args(arguments);
+    let started = Instant::now();
     let output = command::bounded_output(&mut command, Duration::from_secs(10), 4096)
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "git {arguments:?} in {directory:?} failed after {:?}: {error}",
+                started.elapsed()
+            )
+        });
     assert!(
         output.status.success(),
-        "{}",
+        "git {arguments:?} in {directory:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -27,12 +33,18 @@ async fn git(directory: &Path, arguments: &[&str]) {
 async fn git_with_environment(directory: &Path, arguments: &[&str], environment: &[(&str, &str)]) {
     let mut command = command::rooted(directory, "git");
     command.args(arguments).envs(environment.iter().copied());
+    let started = Instant::now();
     let output = command::bounded_output(&mut command, Duration::from_secs(10), 4096)
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "git {arguments:?} in {directory:?} failed after {:?}: {error}",
+                started.elapsed()
+            )
+        });
     assert!(
         output.status.success(),
-        "{}",
+        "git {arguments:?} in {directory:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -415,4 +427,113 @@ async fn bounded_output_times_out_and_reaps_descendant_holding_inherited_output(
         matches!(test_kill_process_group(pid), Err(rustix::io::Errno::SRCH)),
         "fixture process group survived bounded cleanup"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bounded_output_timeout_names_the_command_and_its_blocked_root() {
+    let root = tempfile::tempdir().unwrap();
+    let tag = root.path().join("timeout-tree");
+    let tag = tag.to_str().expect("fixture tag path is UTF-8");
+    let mut child = fixture(&["bounded-blocking-tree", "block", tag]);
+    child.current_dir(root.path());
+    let error = command::bounded_output(&mut child, Duration::from_millis(250), 64 * 1024)
+        .await
+        .unwrap_err()
+        .to_string();
+    for required in [
+        "tool timed out",
+        "owned process group stopped and root reaped",
+        &format!("command={:?}", env!("CARGO_BIN_EXE_kuru-delivery-fixture")),
+        &format!(r#"arguments=["bounded-blocking-tree", "block", "{tag}"]"#),
+        &format!("directory=Some({:?})", root.path()),
+        "root=running",
+        &format!("bounded-blocking-tree block {tag}"),
+    ] {
+        assert!(error.contains(required), "missing {required}: {error}");
+    }
+    assert!(!error.contains("snapshot unavailable"), "{error}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bounded_output_failure_snapshot_lists_the_live_grandchild_before_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let tag = root.path().join("overflow-tree");
+    let tag = tag.to_str().expect("fixture tag path is UTF-8");
+    let mut child = fixture(&["bounded-blocking-tree", "overflow", tag]);
+    let error = command::bounded_output(&mut child, Duration::from_secs(30), 1024)
+        .await
+        .unwrap_err()
+        .to_string();
+    for required in [
+        "tool output exceeds limit",
+        "owned process group stopped and root reaped",
+        "root=running",
+        &format!("bounded-blocking-tree overflow {tag}"),
+        // The grandchild was ready before the root overflowed its capture.
+        &format!("bounded-ready-descendant {tag}"),
+    ] {
+        assert!(error.contains(required), "missing {required}: {error}");
+    }
+}
+
+// A missing working directory fails the launch at once, so the failure text of
+// each helper is checked without waiting for a 10-second deadline.
+#[tokio::test]
+async fn git_helpers_name_arguments_directory_and_elapsed_time_when_the_launch_fails() {
+    async fn message(task: impl Future<Output = ()> + Send + 'static) -> String {
+        let panic = tokio::spawn(task).await.unwrap_err().into_panic();
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .expect("helper panics with a formatted message")
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("absent");
+    let plain = message({
+        let missing = missing.clone();
+        async move { git(&missing, &["status", "--short"]).await }
+    })
+    .await;
+    let with_environment = message({
+        let missing = missing.clone();
+        async move { git_with_environment(&missing, &["log"], &[("GIT_PAGER", "cat")]).await }
+    })
+    .await;
+    for (text, arguments) in [
+        (plain, r#"git ["status", "--short"]"#),
+        (with_environment, r#"git ["log"]"#),
+    ] {
+        for required in [arguments, &format!("in {missing:?} failed after ")] {
+            assert!(text.contains(required), "missing {required}: {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn fixture_head_advance_names_git_arguments_directory_and_elapsed_time_when_it_fails() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("absent");
+    let mut child = command::Command::new(env!("CARGO_BIN_EXE_kuru-delivery-fixture"));
+    child
+        .arg("--db")
+        .arg(&missing)
+        .env("KURU_AUDIT_CAPTURE", root.path().join("capture.json"))
+        .env("KURU_AUDIT_ADVANCE_HEAD", "1");
+    let output = command::bounded_output(&mut child, Duration::from_secs(30), 64 * 1024)
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    for required in [
+        "controlled scanner git [",
+        "controlled scanner changed advisory HEAD",
+        // The fixture's `Error: Custom {..}` report escapes the quoted path.
+        "absent",
+        " failed after ",
+    ] {
+        assert!(stderr.contains(required), "missing {required}: {stderr}");
+    }
 }
