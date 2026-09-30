@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io::{Read, Write},
     os::unix::net::UnixStream,
     process::Command,
@@ -138,6 +139,9 @@ pub struct Terminal {
     restored: Box<RestorationCheck>,
     parser: vt100::Parser,
     pub output: Vec<u8>,
+    // Reader messages taken only to report them. Later reads consume these
+    // first, so `output` and the parser advance exactly as if never taken.
+    pending: VecDeque<std::io::Result<Vec<u8>>>,
 }
 
 impl Terminal {
@@ -206,18 +210,28 @@ impl Terminal {
             restored,
             parser: vt100::Parser::new(rows, cols, 0),
             output: Vec::new(),
+            pending: VecDeque::new(),
         })
+    }
+
+    fn receive_output(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<std::result::Result<std::io::Result<Vec<u8>>, mpsc::RecvTimeoutError>> {
+        if let Some(message) = self.pending.pop_front() {
+            return Ok(Ok(message));
+        }
+        Ok(self
+            .receive
+            .as_ref()
+            .context("terminal output is closed")?
+            .recv_timeout(timeout))
     }
 
     pub fn read_for(&mut self, duration: Duration) -> Result<()> {
         let deadline = Instant::now() + duration;
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            match self
-                .receive
-                .as_ref()
-                .context("terminal output is closed")?
-                .recv_timeout(remaining.min(TICK))
-            {
+            match self.receive_output(remaining.min(TICK))? {
                 Ok(Ok(bytes)) => {
                     self.parser.process(&bytes);
                     self.output.extend(bytes);
@@ -262,17 +276,21 @@ impl Terminal {
             Ok(pid) => kuru_platform::unix::snapshot::describe(pid),
             Err(error) => format!("snapshot unavailable: {error}"),
         };
+        let mut complete = self.output.clone();
+        for bytes in self.pending.iter().flatten() {
+            complete.extend_from_slice(bytes);
+        }
         format!(
             "launch: {}; child {state}; complete PTY output ({} bytes): {}; {tree}",
             self.launch,
-            self.output.len(),
-            escaped(&self.output, REPORT_OUTPUT_LIMIT)
+            complete.len(),
+            escaped(&complete, REPORT_OUTPUT_LIMIT)
         )
     }
 
-    // Output still queued when an exit was observed. It is collected only to
-    // report it, after the caller has decided to fail, so the report's complete
-    // output includes it and no wait changes its outcome.
+    // Output still queued when an exit was observed. It is held in `pending`
+    // for the report only: `output` and the parser are unchanged when the wait
+    // returns, and a later read consumes it in order.
     fn late_output(&mut self) -> String {
         let deadline = Instant::now() + LATE_OUTPUT_WINDOW;
         let mut late = Vec::new();
@@ -283,11 +301,15 @@ impl Terminal {
         ) {
             match receive.recv_timeout(remaining.min(TICK)) {
                 Ok(Ok(bytes)) => {
-                    self.parser.process(&bytes);
-                    self.output.extend_from_slice(&bytes);
-                    late.extend(bytes);
+                    late.extend_from_slice(&bytes);
+                    self.pending.push_back(Ok(bytes));
                 }
-                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Ok(Err(error)) => {
+                    self.pending.push_back(Err(error));
+                    ended = "reader closed";
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
                     ended = "reader closed";
                     break;
                 }
@@ -540,12 +562,7 @@ impl Terminal {
         // is lost merely because waitpid won the race.
         let drain_deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            match self
-                .receive
-                .as_ref()
-                .context("terminal output is closed")?
-                .recv_timeout(TICK)
-            {
+            match self.receive_output(TICK)? {
                 Ok(Ok(bytes)) => {
                     self.parser.process(&bytes);
                     self.output.extend(bytes);

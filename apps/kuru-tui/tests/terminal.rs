@@ -583,6 +583,12 @@ fn terminal_wait_reports_output_still_queued_when_the_exit_is_seen() -> Result<(
         "{error}"
     );
     assert!(after.contains("child exited"), "{error}");
+    // Reporting leaves what the caller observes unchanged: the queued output
+    // reaches `output` only through a later read, in order.
+    let late = |output: &[u8]| output.windows(4).any(|bytes| bytes == b"LATE");
+    assert!(!late(&terminal.output), "{error}");
+    terminal.read_for(Duration::from_millis(100))?;
+    assert!(late(&terminal.output), "{error}");
     Ok(())
 }
 

@@ -48,8 +48,12 @@ the root, so a snapshot taken after the kill finds orphans reparented to init.
   report, so the outer `child failed` text carries the inner status and output.
   The nested fixture prints no progress marker: its only marker is
   `INNER_SIZE_OK` on success, and the inner output itself shows what it reached.
-  The window collects for reporting only, after the caller has decided to fail,
-  so it changes no outcome. Inference, not measured: the CI failure may be a
+  The window holds what it collects in a separate pending queue for the report
+  only: `Terminal::output` and the screen parser are unchanged when `wait`
+  returns, and a later read consumes the queued messages first, in order. Callers
+  that use this error as their exit wait and then assert on `output` (for
+  example `wait_for_refusal` in `apps/kuru-tui/tests/trust.rs`) observe exactly
+  what they did before. Inference, not measured: the CI failure may be a
   drain race in which the inner child wrote `SIZE:` but its exit was seen before
   the reader delivered it; the queued-output section distinguishes that from a
   child that never wrote a size. A reader that stays open past the window is

@@ -28,7 +28,7 @@ only.
 
 ## 5. Family 4
 
-- [x] 5.1 @regression (agent) nested child that exits early with code 0 before writing its size report -> the error contains the complete nested PTY output, the exit status and what the nested fixture printed. Evidence: `terminal_fixture_nested_early_exit_reports_the_inner_output_and_status` and the synchronized `terminal_wait_reports_output_still_queued_when_the_exit_is_seen` passed in `mise run //apps/kuru-tui:test`; the latter also passed 30 of 30 direct repeats and 20 of 20 under 28 CPU hogs.
+- [x] 5.1 @regression (agent) nested child that exits early with code 0 before writing its size report -> the error contains the complete nested PTY output, the exit status and what the nested fixture printed. Evidence: `terminal_fixture_nested_early_exit_reports_the_inner_output_and_status` and the synchronized `terminal_wait_reports_output_still_queued_when_the_exit_is_seen` passed in `mise run //apps/kuru-tui:test`; the latter also passed 30 of 30 direct repeats and 20 of 20 under 28 CPU hogs. After late output moved to a separate pending queue, the late-output test also asserts that `Terminal::output` lacks the queued bytes when `wait` returns and gains them on the next read; it passed in `mise run //apps/kuru-tui:test` (2026-09-29), not re-run under repeats or CPU load.
 - [ ] 5.2 @runtime (agent) `terminal_fixture_uses_its_requested_controlling_dimensions` on macos-latest in CI -> passes, and a future occurrence explains itself
 
 ## 6. No behaviour change
