@@ -6,6 +6,8 @@ use std::io::{self, Read, Write};
 #[path = "../support/fixture_git.rs"]
 mod fixture_git;
 
+use sha2::Digest as _;
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     #[cfg(windows)]
@@ -90,9 +92,14 @@ async fn main() -> io::Result<()> {
     {
         None | Some("--version") => println!("native fixture 0.2.0"),
         // Stands in for `kuru -C <project> --data-dir <data> ... run <prompt>
-        // --json` as the open-time harness drives it: the two progress lines,
-        // one store file, and JSON on stdout. The prompt `fail` fails the open.
+        // --json` as the open-time harness drives it: the progress lines, one
+        // store file named by the project's hash, and JSON on stdout. With
+        // `KURU_OPEN_MARKERS=1` it also writes open markers. A prompt
+        // containing `legacy` stands in for a binary without markers,
+        // `markers` for one without the legacy lines (it writes the plain
+        // open sentence instead), and `fail` fails the open.
         Some("-C") => {
+            let started = std::time::Instant::now();
             let values: Vec<String> = std::env::args().skip(1).collect();
             let after = |flag: &str| {
                 values
@@ -101,18 +108,42 @@ async fn main() -> io::Result<()> {
                     .map(|pair| pair[1].clone())
             };
             let data = after("--data-dir").ok_or_else(|| io::Error::other("missing --data-dir"))?;
+            let project = after("-C").ok_or_else(|| io::Error::other("missing -C"))?;
             let prompt = after("run").unwrap_or_default();
-            eprintln!("Memory: waiting for project ownership…");
-            let store = std::path::Path::new(&data)
-                .join("memory")
-                .join("a".repeat(64));
+            let markers = std::env::var_os("KURU_OPEN_MARKERS").is_some_and(|value| value == "1")
+                && !prompt.contains("legacy");
+            let legacy = !prompt.contains("markers");
+            let marker = |event: &str| {
+                if markers {
+                    eprintln!(
+                        "kuru-open-marker v1 {event} {}",
+                        started.elapsed().as_nanos()
+                    );
+                }
+            };
+            marker("open-start");
+            if !legacy {
+                eprintln!("Opening this project's memory…");
+            }
+            marker("waiting-ownership");
+            if legacy {
+                eprintln!("Memory: waiting for project ownership…");
+            }
+            let hash: String = sha2::Sha256::digest(project.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let store = std::path::Path::new(&data).join("memory").join(hash);
             std::fs::create_dir_all(&store)?;
             std::fs::write(store.join("ready.json"), b"{}")?;
-            if prompt == "fail" {
+            if prompt.contains("fail") {
                 eprintln!("Error: memory service readiness deadline exceeded");
                 std::process::exit(1);
             }
-            eprintln!("Memory: ready.");
+            marker("ready");
+            if legacy {
+                eprintln!("Memory: ready.");
+            }
             println!(
                 "{}",
                 serde_json::json!({ "text": format!("[fixture] {prompt}") })

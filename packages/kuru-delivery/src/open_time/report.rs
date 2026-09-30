@@ -3,10 +3,19 @@
 //! A run's open is cut at ordered milestones: its start, the progress lines,
 //! and the moments processes and names were first or last seen. Its stages
 //! are the differences between consecutive milestones the run showed, so
-//! they partition the open: per run they sum to the time to
-//! `Memory: ready.`. A milestone a run did not show merges its two
-//! neighbouring stages into one, named after both ends. Spans that contain
-//! several stages are reported separately as totals, each with its parts.
+//! they partition the open: per run they sum to the time to ready. A
+//! milestone a run did not show merges its two neighbouring stages into one,
+//! named after both ends. Spans that contain several stages are reported
+//! separately as totals, each with its parts.
+//!
+//! Readiness has two signals. A binary that supports it writes
+//! `kuru-open-marker v1 <event> <monotonic_ns>` lines on stderr when
+//! `KURU_OPEN_MARKERS=1` is set: `open-start`, `waiting-ownership` (only when
+//! that wait happens) and `ready`. Older binaries write the legacy
+//! `Memory: waiting for project ownership…` and `Memory: ready.` lines. A
+//! marker takes the place of its legacy line when both are present. Either
+//! way a milestone's time is when the harness read the line, so opens of old
+//! and new binaries are timed alike; `monotonic_ns` is kept as data.
 //!
 //! A sampled milestone is stamped with the end of the first tick that showed
 //! it, so it is late by at most one bracket (the start of the previous tick
@@ -108,17 +117,97 @@ pub struct Engine {
     pub lifetime: Lifetime,
 }
 
+/// The prefix of an open marker line of any version.
+pub const MARKER_PREFIX: &str = "kuru-open-marker ";
+
+/// The plain sentences a binary with open markers writes while memory opens,
+/// in place of the legacy `Memory: ` lines. Progress, not errors.
+const SENTENCES: [&str; 5] = [
+    "Opening this project's memory…",
+    "Getting Kuru's memory ready on this computer…",
+    "Creating this project's memory…",
+    "Upgrading this project's memory…",
+    "Waiting for another copy of Kuru that is using this project's memory…",
+];
+
+/// Which line ended the open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Signal {
+    /// A `kuru-open-marker v1 ready` line.
+    Marker,
+    /// The legacy `Memory: ready.` line.
+    Legacy,
+}
+
+impl Signal {
+    fn label(signal: Option<Self>) -> &'static str {
+        match signal {
+            Some(Self::Marker) => "marker",
+            Some(Self::Legacy) => "legacy",
+            None => "none",
+        }
+    }
+}
+
+/// One `kuru-open-marker v1` line: its event, when the harness read it, and
+/// the binary's own monotonic clock.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Marker {
+    pub event: String,
+    pub t_ms: f64,
+    pub monotonic_ns: u64,
+}
+
+impl Marker {
+    /// A well-formed version 1 marker: exactly an event and an unsigned
+    /// decimal after the prefix.
+    fn parse(line: &Line) -> Option<Self> {
+        let rest = line.text.strip_prefix(MARKER_PREFIX)?.strip_prefix("v1 ")?;
+        let mut fields = rest.split(' ');
+        let (Some(event), Some(ns), None) = (fields.next(), fields.next(), fields.next()) else {
+            return None;
+        };
+        // `u64` parsing alone would also accept a leading `+`.
+        if event.is_empty() || !ns.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        Some(Self {
+            event: event.to_owned(),
+            t_ms: line.t_ms,
+            monotonic_ns: ns.parse().ok()?,
+        })
+    }
+}
+
+/// A progress line, never taken as a run's error line: a line starting
+/// `Memory`, an open marker, or one of the plain open sentences.
+pub fn is_progress(text: &str) -> bool {
+    text.starts_with("Memory") || text.starts_with(MARKER_PREFIX) || SENTENCES.contains(&text)
+}
+
+/// A stderr line kept in the record: a `Memory: ` line, an open marker or a
+/// plain open sentence. None carries a path.
+pub fn kept_line(text: &str) -> bool {
+    text.starts_with("Memory: ") || text.starts_with(MARKER_PREFIX) || SENTENCES.contains(&text)
+}
+
 /// Stage times in milliseconds.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Stages {
-    /// Start to the first progress line: the CLI's work before memory opens.
+    /// Start to the `open-start` marker, or without one to the first
+    /// progress line: the CLI's work before memory opens.
     pub cli_preamble_ms: Option<f64>,
-    /// Start to `Memory: ready.`: the whole open as the user sees it.
+    /// Start to ready: the whole open as the user sees it.
     pub ready_ms: Option<f64>,
+    /// The line that ended the open; absent for a failed open.
+    pub ready_signal: Option<Signal>,
+    /// Every well-formed open marker, in order.
+    pub markers: Vec<Marker>,
     /// The milestones this run showed, in order.
     pub milestones: Vec<Milestone>,
-    /// Consecutive differences of `milestones`: with `Memory: ready.` shown,
-    /// they sum to `ready_ms`.
+    /// Consecutive differences of `milestones`: with ready shown, they sum
+    /// to `ready_ms`.
     pub partition: Vec<Stage>,
     /// Spans over several consecutive stages.
     pub totals: Vec<Total>,
@@ -126,13 +215,13 @@ pub struct Stages {
     pub probe: Option<Lifetime>,
     /// Every engine this run started, in start order.
     pub engines: Vec<Engine>,
-    /// `Memory: ready.` to exit: the demo turn and the command's close.
+    /// Ready to exit: the demo turn and the command's close.
     pub turn_and_exit_ms: Option<f64>,
 }
 
 impl Stages {
     /// The sum of the partition, which equals `ready_ms` when the run
-    /// reached `Memory: ready.`.
+    /// reached ready.
     pub fn partition_sum_ms(&self) -> f64 {
         round(self.partition.iter().map(|stage| stage.ms).sum())
     }
@@ -283,7 +372,21 @@ pub fn derive(observation: &Observation, lines: &[Line], exit_ms: Option<f64>) -
             .find(|line| line.text.starts_with(prefix))
             .map(|line| line.t_ms)
     };
-    let ready = line("Memory: ready.");
+    let markers: Vec<Marker> = lines.iter().filter_map(Marker::parse).collect();
+    let marker = |event: &str| {
+        markers
+            .iter()
+            .find(|marker| marker.event == event)
+            .map(|marker| marker.t_ms)
+    };
+    let (ready, ready_signal) = match (marker("ready"), line("Memory: ready.")) {
+        (Some(at), _) => (Some(at), Some(Signal::Marker)),
+        (None, Some(at)) => (Some(at), Some(Signal::Legacy)),
+        (None, None) => (None, None),
+    };
+    let open_start = marker("open-start");
+    let waiting =
+        marker("waiting-ownership").or_else(|| line("Memory: waiting for project ownership"));
     let started = |role: Role| -> Vec<&ProcessSpan> {
         let mut spans: Vec<&ProcessSpan> = observation
             .processes
@@ -320,10 +423,8 @@ pub fn derive(observation: &Observation, lines: &[Line], exit_ms: Option<f64>) -
 
     let mut chain = Chain::default();
     chain.exact("start", Some(0.0));
-    chain.exact(
-        "progress line",
-        line("Memory: waiting for project ownership"),
-    );
+    chain.exact("open start", open_start);
+    chain.exact("progress line", waiting);
     chain.sampled(
         "owner seen",
         owners.first().and_then(|span| started_bracket(span)),
@@ -396,7 +497,7 @@ pub fn derive(observation: &Observation, lines: &[Line], exit_ms: Option<f64>) -
         })
         .and_then(appeared_bracket),
     );
-    chain.exact("`Memory: ready.`", ready);
+    chain.exact("ready", ready);
 
     let milestones = chain.0.clone();
     let partition: Vec<Stage> = milestones
@@ -443,9 +544,12 @@ pub fn derive(observation: &Observation, lines: &[Line], exit_ms: Option<f64>) -
         })
         .collect();
     let stages = Stages {
-        cli_preamble_ms: line("Memory: waiting for project ownership")
+        cli_preamble_ms: open_start
+            .or(waiting)
             .or_else(|| lines.first().map(|line| line.t_ms)),
         ready_ms: ready,
+        ready_signal,
+        markers,
         milestones,
         partition,
         totals,
@@ -529,7 +633,7 @@ fn staging(record: &Record, index: usize) -> Option<&Engine> {
 type Metric = (&'static str, fn(&Record) -> Option<f64>, bool);
 
 const METRICS: [Metric; 13] = [
-    ("open (to `Memory: ready.`)", |r| r.stages.ready_ms, false),
+    ("open (to ready)", |r| r.stages.ready_ms, false),
     (
         "exit",
         |r| r.timings.exit_ms.filter(|_| r.outcome.success),
@@ -667,8 +771,8 @@ fn describe(records: &[Record]) -> String {
         .map(|record| record.observation.max_bracket_ms)
         .fold(0.0_f64, f64::max);
     let between = if first.mode.retire_wait {
-        "After the first launch and the warm reopen the harness waits for the memory owner \
-         to retire, polling every 100 ms (bound 120 s)."
+        "After the first launch, the warm reopen and the new project the harness waits for \
+         the memory owner to retire, polling every 100 ms (bound 120 s)."
     } else {
         "Ramp series: no run waits for the owner to retire, so owners accumulate; one final \
          wait (polling every 100 ms, bound 120 s) follows the last run."
@@ -698,8 +802,10 @@ pub fn summary(records: &[Record], label: &str) -> String {
     let _ = writeln!(
         text,
         "Release binary measured from outside, {} runs; {failed} of {} runs failed to open \
-         (no `Memory: ready.`); {after} commands failed after opening. No budget is applied. \
-         Times are milliseconds from process start; ratios are unitless.\n",
+         (no readiness signal); {after} commands failed after opening. No budget is applied. \
+         Times are milliseconds from process start; ratios are unitless. Ready is a \
+         `kuru-open-marker v1 ready` line or, from a binary without markers, `Memory: ready.`; \
+         the ready signal column says which.\n",
         records.len(),
         records.len()
     );
@@ -790,10 +896,7 @@ pub fn summary(records: &[Record], label: &str) -> String {
         }
     }
 
-    let _ = writeln!(
-        text,
-        "\nEvery open sample (ms to `Memory: ready.`), in run order:\n"
-    );
+    let _ = writeln!(text, "\nEvery open sample (ms to ready), in run order:\n");
     for case in Case::ALL {
         let samples: Vec<String> = records
             .iter()
@@ -817,9 +920,9 @@ pub fn summary(records: &[Record], label: &str) -> String {
 fn structure(text: &mut String, records: &[Record]) {
     let _ = writeln!(
         text,
-        "\n| case | engine starts | one-sample engine processes | owners started | `dolt version` processes | owner path | 1-min load before | tick cost ms |"
+        "\n| case | engine starts | one-sample engine processes | owners started | `dolt version` processes | owner path | ready signal | 1-min load before | tick cost ms |"
     );
-    let _ = writeln!(text, "|---|---|---|---|---|---|---|---|");
+    let _ = writeln!(text, "|---|---|---|---|---|---|---|---|---|");
     for case in Case::ALL {
         let cases: Vec<&Record> = records
             .iter()
@@ -836,6 +939,16 @@ fn structure(text: &mut String, records: &[Record]) {
             .iter()
             .map(|(path, count)| format!("{path} ×{count}"))
             .collect();
+        let mut signals: BTreeMap<&str, usize> = BTreeMap::new();
+        for record in &cases {
+            *signals
+                .entry(Signal::label(record.stages.ready_signal))
+                .or_default() += 1;
+        }
+        let signals: Vec<String> = signals
+            .iter()
+            .map(|(signal, count)| format!("{signal} ×{count}"))
+            .collect();
         let loads: Vec<f64> = cases
             .iter()
             .filter_map(|record| record.load.before.map(|load| load[0]))
@@ -850,7 +963,7 @@ fn structure(text: &mut String, records: &[Record]) {
             .fold(0.0_f64, f64::max);
         let _ = writeln!(
             text,
-            "| {} | {} | {} | {} | {} | {} | {load} | ≤{cost:.1} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {load} | ≤{cost:.1} |",
             case.label(),
             range(cases.iter().map(|record| record.counts.engine_starts)),
             range(
@@ -861,6 +974,7 @@ fn structure(text: &mut String, records: &[Record]) {
             range(cases.iter().map(|record| record.counts.owners)),
             range(cases.iter().map(|record| record.counts.dolt_version)),
             paths.join(", "),
+            signals.join(", "),
         );
     }
     let _ = writeln!(
