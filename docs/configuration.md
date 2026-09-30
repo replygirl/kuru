@@ -686,7 +686,10 @@ The startup timeout is 1–300 seconds. If a newly started memory service is not
 ready in time, the error `memory service readiness deadline exceeded` also
 reports how that wait was split: election, owner probe, spawn and readiness
 polling in milliseconds, the number of readiness polls, and what the last poll
-found. See [memory storage](memory.md) for
+found. A command that starts while the previous memory service is still shutting
+down waits for it within the same timeout. A service whose starting command never
+attaches exits by itself once this timeout has passed since its endpoint was
+published, when no client is attached. See [memory storage](memory.md) for
 migration, revision inspection and backups, or
 [development](development.md#bundled-engine-build-inputs) for build-input settings.
 

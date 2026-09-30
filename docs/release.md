@@ -344,6 +344,28 @@ Rerun the failed job on the same Release run to retain its original version and
 commit; do not dispatch another release or replace immutable assets to repeat
 the check. The package task also remains available for manual diagnostics.
 
+### Mixed versions across an update
+
+The memory service owner and its clients may come from different versions while a
+session started before an update is still running, because a client spawns the
+executable at its path and an update can replace that file. Nothing here changes
+the pinned protocol: the owner's starter token rides in the handshake hello,
+which is not pinned, and needs no `PROTOCOL_MINOR` bump, so an updated command
+gets no new "protocol is incompatible" refusal.
+
+- A session started before the update has no cancelled-call retention. If it
+  cancels a memory call on its only connection while an updated owner serves it,
+  that owner retires at once and the session's next memory call fails. Restarting
+  the session fixes it. This affects only sessions that were running before the
+  update.
+- An owner started by a pre-token client has no starter token and treats any
+  authenticated attachment as reaching it, so a racing inspection command could
+  retire it inside the starter's readiness polling. This exists only in the
+  mixed case.
+- An updated client that spawns a pre-token executable (a downgrade under a
+  running client) passes the tenth service argument, which the old owner rejects;
+  the client reports that the memory service exited before readiness.
+
 ## Notes model and configuration
 
 `communique.toml` uses top-level `context` and `system_extra` plus `[defaults]`.

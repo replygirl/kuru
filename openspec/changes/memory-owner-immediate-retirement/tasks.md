@@ -42,8 +42,8 @@ Work packages own disjoint files (design D13 and the revised unit 1 design, sect
 
 ## 7. WP6 documentation
 
-- [ ] 7.1 Update `docs/memory.md`, `docs/install.md`, `apps/kuru-docs/guide/installation.md`, `docs/configuration.md` and `docs/development.md` per the revised design section 10, including Option B's uncovered cases and the fixture hooks; verify `mise run docs:check`
-- [ ] 7.2 Add the mixed-version upgrade note to `docs/release.md` if it has upgrade notes; verify the text matches design Risks
+- [x] 7.1 Update `docs/memory.md`, `docs/install.md`, `apps/kuru-docs/guide/installation.md`, `docs/configuration.md` and `docs/development.md` per the revised design section 10, including Option B's uncovered cases and the fixture hooks; verify `mise run docs:check` Observed 2026-09-29 (WP6, macOS): all five files updated (memory.md also carries Option B's uncovered cases and the read-only error text; development.md the observer, ClosePause, DispatchPause, ServeKnobs, await_owner_release, the replacement hook and the starter token); `mise run docs:check`, `docs:build` and `format:check` exit 0. Final pass after the other packages: the text matches the committed behaviour as read in source, not re-derived from a run.
+- [x] 7.2 Add the mixed-version upgrade note to `docs/release.md` if it has upgrade notes; verify the text matches design Risks Observed 2026-09-29 (WP6): docs/release.md has no upgrade-notes section, so a `Mixed versions across an update` subsection was added after previous-release acceptance (pre-update session loses its owner on a cancelled call, pre-token owner admission race, downgrade rejects the tenth argument, no protocol refusal).
 
 ## 8. Verification and close
 
