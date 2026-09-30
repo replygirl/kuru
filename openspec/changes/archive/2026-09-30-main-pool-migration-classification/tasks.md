@@ -28,7 +28,7 @@
 
 ## 5. Coverage, lint and docs
 
-- [ ] 5.1 Run `mise run coverage` for `kuru-memory` and confirm the 90% workspace line gate still holds without excluding the new classifier or lowering the threshold — and verify by the coverage report's line percentage for the changed file(s).
+- [x] 5.1 Run `mise run coverage` for `kuru-memory` and confirm the 90% workspace line gate still holds without excluding the new classifier or lowering the threshold — and verify by the coverage report's line percentage for the changed file(s).
 - [x] 5.2 Run `mise run //packages/kuru-memory:lint:windows` and confirm the new code is lint-clean for the Windows target (no `cfg(windows)`-only issue introduced) — and verify by a clean exit.
 - [x] 5.3 Check whether `docs/memory.md`, `apps/kuru-docs/concepts/memory.md`, or any development doc describes classification's *mechanism* (not just its cost) in a way this change makes stale, and update only what changed — and verify by `mise run docs:check` passing and a one-line note in the PR description naming which doc lines (if any) changed and why.
 - [x] 5.4 Confirm `openspec/specs/versioned-memory/spec.md:188-189` ("branches are classified from their committed receipt, registered step and ancestry") remains true as written, with no spec delta needed — and verify by re-reading that line against the shipped classifier and stating in the PR description that it still holds, or filing the delta if task 1.3 or 3.4 changed the outcome.
@@ -88,14 +88,26 @@ shared machine under heavy load. Full detail:
   `validate_ready` add no request; the oracle requests 12 for 6 clean
   branches (positive control for the hook).
 - 4.3-4.4: no existing test counted pools or classification queries, so no
-  count changed. No verdict assertion was edited; existing call sites changed
-  only by dropping the `Server` argument. Full `//packages/kuru-memory:test`:
+  count changed. Existing call sites changed only by dropping the `Server`
+  argument. One verdict assertion was edited, by design, not by drift:
+  `engine_contract_tests.rs` S8 (~line 1731-1747) previously asserted
+  `validate_active` fails with "identity mismatch" on an adopted copy's
+  template-era refs; it now asserts the kept branch-pool oracle
+  (`classify_with_branch_pools`) fails with "identity mismatch" while
+  `validate_active` succeeds — the designed divergence from goal (2), not an
+  unnoticed change. Every other verdict assertion in the suite is unchanged.
+  Full `//packages/kuru-memory:test`:
   363 passed, 0 failed, 4 ignored in the library suite (620 s), and every
   other target of the package passed (exit 0). The new tests were re-run
   after the last test edit: 5 passed, 1 ignored (measurement).
-- 5.1: not run locally. Coverage and its 90% gate are enforced in CI; the
-  instrumented workspace run was not repeated on this loaded shared machine.
-  The new classifier is exercised by the tests above and nothing is excluded.
+- 5.1: observed from CI (run 36756133652 at `1babf8c1`, `gh pr checks 141`):
+  coverage merge jobs report ubuntu-latest 94.65% (104302/110196 lines, gate
+  90%), macos-latest 94.63% (104388/110305, gate 90%), windows-latest 93.53%
+  (105823/113139, gate 90%). `packages/kuru-memory/src/store/migrations.rs`
+  is 98.61% covered and `packages/kuru-memory/src/store.rs` ~95.8% on every
+  OS; neither is excluded and the threshold is unchanged. Not repeated
+  locally on this loaded shared machine; coverage and its 90% gate are
+  enforced in CI, not in hooks, per AGENTS.md.
 - 5.2: `mise run //packages/kuru-memory:lint:windows` exited 0.
 - 5.3: `docs/memory.md` and `apps/kuru-docs/concepts/memory.md` describe
   retained attempts by outcome (preserved, ambiguous stops startup), not by

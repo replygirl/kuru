@@ -2,7 +2,7 @@
 
 ## 1. No pool opened on any retained branch or its parent during classification [critical]
 
-- [x] 1.1 @benchmark (agent) run `historical_classification_opens_no_branch_or_commit_pools` (tasks.md 4.2), a counting hook on `Server::pool` via `test_support::engine_ledger`, over `validate_active`, `validate_inspection` (reader), and `validate_ready` on a store with clean retained branches -> 0 pool opens for the classification pass; record the observed count in proposal.md's Benchmarks table (tasks.md 6.1)
+- [x] 1.1 @benchmark (agent) run `historical_classification_opens_no_branch_or_commit_pools` (tasks.md 4.2), a counting hook on `Server::pool` implemented as a `cfg(test)` request log on `ServerInner` (`test_support::engine_ledger` has no such hook; see tasks.md 4.2), over `validate_active`, `validate_inspection` (reader), and `validate_ready` on a store with clean retained branches -> 0 pool opens for the classification pass; record the observed count in proposal.md's Benchmarks table (tasks.md 6.1)
 - [x] 1.2 @integration (agent) run the same hook with a dirtied retained branch present -> 0 pool opens for the classification pass itself; the working-set shape check (`retained_failed_shape`) may still pool per design.md D1/SD §7.2, and the test records whether it does
 
 ## 2. Classification verdicts are unchanged (equivalence with today's pool-based classifier) [critical]
@@ -21,7 +21,7 @@
 
 ## 5. Coverage and lint hold
 
-- [ ] 5.1 @runtime (agent) `mise run coverage` for the workspace including `kuru-memory` -> 90% workspace line gate holds with the new classifier included, not excluded
+- [x] 5.1 @runtime (agent) `mise run coverage` for the workspace including `kuru-memory` -> 90% workspace line gate holds with the new classifier included, not excluded
 - [x] 5.2 @runtime (agent) `mise run //packages/kuru-memory:lint:windows` -> clean exit, no Windows-target lint issue introduced
 
 ## 6. Documentation and spec stay accurate
@@ -48,6 +48,12 @@ Recorded 2026-09-30, macOS 27.0 arm64, debug profile, pinned Dolt 2.3.5
 - 3.1: form 1 (detached `USE kuru/<hash>`) matched positive and
   `information_schema`-only negative cases for both roles.
 - 4.1, 4.2: passed.
-- 5.1: not run locally (CI gate; see tasks.md 5.1).
+- 5.1: observed from CI (run 36756133652, `gh pr checks 141`), coverage merge
+  jobs: ubuntu-latest 94.65% (104302/110196 lines, gate 90%), macos-latest
+  94.63% (104388/110305, gate 90%), windows-latest 93.53% (105823/113139,
+  gate 90%); `packages/kuru-memory/src/store/migrations.rs` 98.61% and
+  `packages/kuru-memory/src/store.rs` ~95.8% on every OS. Not repeated
+  locally on this loaded shared machine; the gate is enforced in CI, not in
+  hooks, per AGENTS.md.
 - 5.2: exited 0.
 - 6.1: no doc or spec text changed; `docs:check` passed.
