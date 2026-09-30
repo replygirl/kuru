@@ -3,7 +3,7 @@ use rusqlite::Connection as SqliteConnection;
 use serde_json::json;
 
 async fn assert_current_store(store: &MemoryStore) -> Result<()> {
-    migrations::validate_active(&store.shared.server, &store.pool).await?;
+    migrations::validate_active(&store.pool).await?;
     ensure!(
         migrations::version(&store.pool).await? == migrations::CURRENT_VERSION,
         "fixture did not reach the current schema"

@@ -1909,9 +1909,9 @@ impl MemoryStore {
             (server, pool)
         };
         let validated = if options.read_only {
-            migrations::validate_inspection(&server, &pool).await
+            migrations::validate_inspection(&pool).await
         } else {
-            migrations::validate_active(&server, &pool).await
+            migrations::validate_active(&pool).await
         };
         if let Err(error) = validated {
             return Err(close_failed_open(&server, error).await);
@@ -7295,15 +7295,18 @@ async fn initialize(pool: &MySqlPool) -> Result<()> {
     migrations::validate_supported(pool).await?;
     Ok(())
 }
-async fn validate_schema_v1(pool: &MySqlPool) -> Result<()> {
+async fn validate_schema_v1(connection: &mut MySqlConnection) -> Result<()> {
     for query in [
         "SELECT sequence, namespace, role, content FROM messages LIMIT 0",
         "SELECT `key`, value FROM state LIMIT 0",
         "SELECT id, label FROM operations LIMIT 0",
     ] {
-        tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(query).fetch_all(pool))
-            .await
-            .context("schema v1 validation deadline exceeded")??;
+        tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query(query).fetch_all(&mut *connection),
+        )
+        .await
+        .context("schema v1 validation deadline exceeded")??;
     }
     Ok(())
 }
@@ -7445,7 +7448,7 @@ async fn recover_staging(
             };
             let checked = async {
                 if let (Some(activation), Some(pool)) = (&activation, &pool) {
-                    migrations::validate_ready(&server, pool).await?;
+                    migrations::validate_ready(pool).await?;
                     ensure!(
                         revision(pool).await? == activation.initial_revision,
                         "interrupted import revision differs from its activation record"
@@ -10742,9 +10745,7 @@ mod tests {
             .await?;
         let before = inspection_snapshot(&store.pool).await?;
         assert!(
-            migrations::validate_active(&store.shared.server, &store.pool)
-                .await
-                .is_err(),
+            migrations::validate_active(&store.pool).await.is_err(),
             "the writable validator must retain its clean-working-set rule"
         );
 

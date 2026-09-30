@@ -2450,7 +2450,7 @@ async fn usage_upgrade_publication_fixture(accepted: bool) -> Result<()> {
         }
     );
     if accepted {
-        migrations::validate_usage(&server, &usage).await?;
+        migrations::validate_usage(&usage).await?;
     } else {
         assert_eq!(migrations::version(&usage).await?, 3);
     }

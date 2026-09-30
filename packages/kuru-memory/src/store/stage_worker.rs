@@ -175,7 +175,7 @@ where
     ) -> Result<File> {
         let (server, pool) = self.start(startup, Start::Validate, progress).await?;
         let activated = async {
-            migrations::validate_active(&server, &pool).await?;
+            migrations::validate_active(&pool).await?;
             let initial_revision = revision(&pool).await?;
             let activation = Activation {
                 format: 1,

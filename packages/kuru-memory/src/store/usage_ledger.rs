@@ -391,7 +391,7 @@ pub(super) async fn establish(store: &MemoryStore) -> Result<()> {
     let pool = store.shared.server.pool(BRANCH).await?;
     validate_branch(pool.as_ref()).await?;
     migrations::upgrade_usage(&store.shared.server, pool.as_ref()).await?;
-    migrations::validate_usage(&store.shared.server, pool.as_ref()).await?;
+    migrations::validate_usage(pool.as_ref()).await?;
     validate_branch(pool.as_ref()).await?;
     *store.shared.usage_pool.lock().expect("usage pool lock") = Some(pool);
     Ok(())
