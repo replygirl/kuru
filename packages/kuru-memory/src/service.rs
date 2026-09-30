@@ -7063,6 +7063,101 @@ mod tests {
         Ok(())
     }
 
+    // T6, the window between listener close and endpoint retirement: the
+    // record still names the retiring generation, but nothing accepts.
+    #[tokio::test]
+    async fn a_client_meeting_a_record_without_a_listener_elects_a_successor() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh in-process owner and the reopened spawned
+        // successor the racing client elects.
+        let deadline = crate::test_support::fixture_deadline(1, 1);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let executable = crate::store::test_supervisor()?;
+            let _gate = crate::spawn_gate::spawning().await;
+
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let generation = owner.authority().service_generation.clone();
+            let pause =
+                ClosePause::at_each(&[ClosePoint::AfterListenerDrop, ClosePoint::AfterReap]);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &scope, None).await?);
+            pause.entered.notified().await;
+
+            let record = EndpointRecord::read(&data, &scope)?
+                .context("the record was retired before the listener closed")?;
+            ensure!(
+                record.authority.service_generation == generation,
+                "the published record named another generation"
+            );
+            let observed = try_attach_observed(&data, &scope, &project, None)
+                .await
+                .context("an electing client failed on a record without a listener")?;
+            ensure!(
+                matches!(observed, Err(AttachMiss::TransportUnavailable)),
+                "a record without a listener was not a transport miss: {:?}",
+                observed.as_ref().map(|_| ())
+            );
+            ensure!(
+                request_idle_retirement(&options)
+                    .await
+                    .context("maintenance failed on a record without a listener")?
+                    .is_none(),
+                "maintenance read a record without a listener as an owner answer"
+            );
+
+            let mut racing = Box::pin(attach_or_start(&options, &project, &executable));
+            // On Unix the refused connect returns at once, so one poll takes
+            // the start lock and parks the client on the busy owner lock. A
+            // Windows connect retries the absent pipe until its deadline, so
+            // there the first poll is still inside that connect.
+            #[cfg(unix)]
+            {
+                ensure!(
+                    futures::poll!(racing.as_mut()).is_pending(),
+                    "a client attached while the listener was closed"
+                );
+                ensure!(
+                    ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?.is_none(),
+                    "the racing client did not hold the start election"
+                );
+            }
+            pause.release.notify_one();
+            tokio::select! {
+                biased;
+                () = pause.entered.notified() => {}
+                attached = racing.as_mut() => {
+                    let outcome = attached.map(|_| ());
+                    bail!("the racing client finished before the owner reaped: {outcome:?}");
+                }
+            }
+            ensure!(
+                futures::poll!(racing.as_mut()).is_pending(),
+                "a client finished while the owner lock was still held"
+            );
+            pause.release.notify_one();
+            let successor = racing
+                .await
+                .context("the racing client failed after the owner released its lock")?;
+            ensure!(
+                successor.generation() != generation,
+                "the racing client reached the retiring generation"
+            );
+            served.await??;
+            drop(successor);
+            await_owner_release(&options).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("listener-close race fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
     // T6m
     #[tokio::test]
     async fn maintenance_meeting_a_closing_owner_waits_for_its_lock() -> Result<()> {
