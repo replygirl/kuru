@@ -696,6 +696,107 @@ async fn warm_verification_does_not_wait_for_the_installation_lock() {
     drop(lock);
 }
 
+#[tokio::test]
+async fn only_installation_executes_the_engine_and_warm_opens_still_refuse_changed_bytes() {
+    let root = crate::test_support::tempdir().unwrap();
+    let marker = root.path().join("executions");
+    let cache = root.path().join("cache");
+    // Every execution of this engine appends one line to the marker, using
+    // only shell builtins because the probe runs with a scrubbed environment.
+    let script = format!(
+        "#!/bin/sh\nprintf 'ran\\n' >> '{}'\nprintf 'dolt version {DOLT_VERSION}\\n'\n",
+        marker.display()
+    )
+    .into_bytes();
+    let executions = || {
+        fs::read_to_string(&marker)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let mut fixture = Fixture::new(|entries| entries[2].3 = script.clone());
+    fixture.binary_digest = digest(&script);
+    fixture.binary_bytes = script.len() as u64;
+    // `provision_managed` needs a 'static asset; this per-test fixture lives
+    // for the rest of the test process.
+    let fixture: &'static Fixture = Box::leak(Box::new(fixture));
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+
+    let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
+    let installed = provision_managed_observed(
+        &config,
+        &cache,
+        fixture.spec(),
+        Cow::Borrowed(&fixture.bytes),
+        &mut reporter,
+    )
+    .await
+    .unwrap();
+    drop(reporter);
+    assert_eq!(
+        observed_stages(&mut progress).await,
+        [
+            MemoryOpenStage::WaitingForRuntimeCache,
+            MemoryOpenStage::ExtractingEmbeddedRuntime,
+            MemoryOpenStage::CheckingRuntimeVersion,
+        ]
+    );
+    assert_eq!(
+        executions(),
+        1,
+        "installation must probe the freshly extracted engine exactly once before activating it"
+    );
+
+    for _ in 0..2 {
+        let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
+        let warm = provision_managed_observed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+            &mut reporter,
+        )
+        .await
+        .unwrap();
+        drop(reporter);
+        assert_eq!(warm, installed);
+        assert_eq!(
+            observed_stages(&mut progress).await,
+            [MemoryOpenStage::VerifyingRuntimeCache]
+        );
+    }
+    assert_eq!(executions(), 1, "a warm open must not execute the engine");
+
+    // Same length, different bytes, and it would still record its execution:
+    // only the full digest can refuse it before it runs.
+    let changed = String::from_utf8(script.clone())
+        .unwrap()
+        .replacen("'ran\\n'", "'RAN\\n'", 1)
+        .into_bytes();
+    assert_ne!(changed, script);
+    assert_eq!(changed.len(), script.len());
+    fs::set_permissions(&installed, fs::Permissions::from_mode(0o700)).unwrap();
+    let inode = fs::metadata(&installed).unwrap().ino();
+    executable(&installed, &changed);
+    assert_eq!(fs::metadata(&installed).unwrap().ino(), inode);
+    let error = provision_managed(
+        &config,
+        &cache,
+        fixture.spec(),
+        Cow::Borrowed(&fixture.bytes),
+    )
+    .await
+    .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("cache is invalid"), "{text}");
+    assert!(text.contains("checksum mismatch"), "{text}");
+    assert_eq!(executions(), 1, "a refused cache must never execute");
+    assert_eq!(fs::read(&installed).unwrap(), changed);
+}
+
 async fn observed_stages(progress: &mut crate::MemoryOpenProgress) -> Vec<MemoryOpenStage> {
     let mut stages = Vec::new();
     while let Some(stage) = progress.recv().await {
@@ -747,10 +848,7 @@ async fn observed_provision_reports_actual_cold_warm_and_failure_stages() {
     assert!(warm.is_ok());
     assert_eq!(
         observed_stages(&mut progress).await,
-        [
-            MemoryOpenStage::VerifyingRuntimeCache,
-            MemoryOpenStage::CheckingRuntimeVersion,
-        ]
+        [MemoryOpenStage::VerifyingRuntimeCache]
     );
 
     let corrupt_cached_entry = root.path().join("corrupt-cached-entry");
