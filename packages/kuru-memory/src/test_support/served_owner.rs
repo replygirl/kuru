@@ -26,14 +26,24 @@
 //! not retire the owner (a client task aborted mid-request can legitimately
 //! keep the owner busy): on every exit path the owner is retired or the
 //! verdict is reported, and neither replaces the fixture's error.
+//!
+//! [`ServedOwner::serve`] serves the in-process fixture policy: never reached
+//! by a starter, so the owner outlives its last client until the fixture
+//! retires it. A test of the serve loop itself chooses its policy with
+//! [`ServedOwner::serve_with`] and awaits the loop's ordered events through
+//! [`observed`], [`next_event`] and [`expect_events`], never through a sleep.
 
 use crate::{
     OpenOptions,
-    service::{ServiceOwner, acquire_maintenance_permit},
+    service::{Admission, ServeEvent, ServeKnobs, ServiceOwner, acquire_maintenance_permit},
 };
-use anyhow::{Context, Error, Result, anyhow, ensure};
+use anyhow::{Context, Error, Result, anyhow, bail, ensure};
 use std::{future::Future, path::Path, time::Duration};
-use tokio::{sync::RwLockReadGuard, task::JoinHandle, time::Instant};
+use tokio::{
+    sync::{RwLockReadGuard, mpsc},
+    task::JoinHandle,
+    time::Instant,
+};
 
 /// The owner task a fixture is serving, or nothing once that task has ended.
 ///
@@ -44,18 +54,23 @@ pub(crate) struct ServedOwner {
 }
 
 impl ServedOwner {
-    /// Serve `owner` on a new task: the fixture's first owner, or a successor
-    /// after the previous owner has been reaped.
+    /// Serve `owner` on a new task under the in-process fixture policy,
+    /// [`default_knobs`]: the fixture's first owner, or a successor after the
+    /// previous owner has been reaped.
     pub(crate) fn serve(&mut self, owner: ServiceOwner) -> Result<()> {
+        self.serve_with(owner, default_knobs())
+    }
+
+    /// [`Self::serve`] under the fixture's own policy: who reaches the owner,
+    /// how long it waits for its starter, and the serve-loop observer and
+    /// pauses a test asserts through. Pair a chosen policy with
+    /// [`observed`] to await the loop's events instead of sleeping.
+    pub(crate) fn serve_with(&mut self, owner: ServiceOwner, knobs: ServeKnobs) -> Result<()> {
         ensure!(
             self.task.is_none(),
             "a fixture owner is still being served; reap it before its successor"
         );
-        // Never reached: a fixture owner outlives its last client until the
-        // fixture retires it (WP2 seam; WP4 adds `serve_with`).
-        self.task = Some(tokio::spawn(
-            owner.serve_with(crate::service::ServeKnobs::never_reached()),
-        ));
+        self.task = Some(tokio::spawn(owner.serve_with(knobs)));
         Ok(())
     }
 
@@ -78,10 +93,12 @@ impl ServedOwner {
         joined?
     }
 
-    /// Retire the idle owner with a fixture's success-tail calls: acquire the
-    /// maintenance permit (within `permit_within` when the fixture bounds it),
-    /// await the owner's reap within `reap_within`, then release the permit.
-    /// With no owner being served there is nothing to retire.
+    /// Retire the served owner with a fixture's success-tail calls: acquire
+    /// the maintenance permit (within `permit_within` when the fixture bounds
+    /// it), await the owner's reap within `reap_within`, then release the
+    /// permit. With no owner being served there is nothing to retire. An owner
+    /// that already retired itself under [`Self::serve_with`] is fine: the
+    /// permit then waits out its unlock, and the reap joins the finished task.
     pub(crate) async fn retire(
         &mut self,
         options: &OpenOptions,
@@ -131,6 +148,82 @@ impl ServedOwner {
         })
         .await?;
         Ok(gate)
+    }
+}
+
+/// The policy [`ServedOwner::serve`] serves: never reached by a starter, and
+/// no first-attachment deadline. An in-process fixture owner then ends only
+/// through maintenance retirement, [`ServedOwner::restart`] or lock loss, not
+/// at its last detach. Retiring there would leave a later attach to spawn the
+/// libtest binary as the successor, which cannot serve; the product policy
+/// (retire at the last detach once the starter has attached) is covered by
+/// really spawned owners and by tests that choose it through
+/// [`ServedOwner::serve_with`].
+fn default_knobs() -> ServeKnobs {
+    ServeKnobs::never_reached()
+}
+
+/// The ordered serve-loop events of an [`observed`] owner.
+pub(crate) type ServeEvents = mpsc::UnboundedReceiver<ServeEvent>;
+
+/// Serve-loop knobs that report to the returned ordered event log. The log is
+/// unbounded and its events are sent before the loop acts on them, so a test
+/// that awaits them in order proves the sequence without sleeping. Start from
+/// the returned knobs to add a close or dispatch pause.
+pub(crate) fn observed(
+    admission: Admission,
+    first_attachment: Option<Duration>,
+) -> (ServeKnobs, ServeEvents) {
+    let (observer, events) = mpsc::unbounded_channel();
+    let knobs = ServeKnobs {
+        admission,
+        first_attachment,
+        observer: Some(observer),
+        ..ServeKnobs::never_reached()
+    };
+    (knobs, events)
+}
+
+/// The next event other than a lock recheck, which recurs on the owner's own
+/// schedule. A closed log means the serve loop has ended.
+pub(crate) async fn next_event(events: &mut ServeEvents) -> Result<ServeEvent> {
+    loop {
+        match events
+            .recv()
+            .await
+            .context("the serve loop ended before the expected event")?
+        {
+            ServeEvent::LockRechecked => {}
+            event => return Ok(event),
+        }
+    }
+}
+
+/// Await each of `expected`, in order, as the next non-recheck event.
+pub(crate) async fn expect_events(events: &mut ServeEvents, expected: &[ServeEvent]) -> Result<()> {
+    for expected in expected {
+        let event = next_event(events).await?;
+        ensure!(
+            event == *expected,
+            "serve event {event:?}, expected {expected:?}"
+        );
+    }
+    Ok(())
+}
+
+/// No event other than a lock recheck has been sent since the last one
+/// awaited. Every owner event is sent before the loop acts on it, so an empty
+/// log after a completed client exchange is a settled one.
+pub(crate) fn expect_no_event(events: &mut ServeEvents, context: &str) -> Result<()> {
+    loop {
+        match events.try_recv() {
+            Ok(ServeEvent::LockRechecked) => {}
+            Ok(event) => bail!("{context}: unexpected serve event {event:?}"),
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                bail!("{context}: the serve loop ended")
+            }
+        }
     }
 }
 
@@ -294,6 +387,158 @@ mod tests {
         crate::files::write(&store.join("server.log"), b"Kuru engine shutdown: Ok")?;
         crate::files::write(&store.join("lifecycle.lock"), b"")?;
         Ok(store)
+    }
+
+    /// Attach a bare client to the fixture's published owner.
+    async fn attach(
+        options: &OpenOptions,
+        project: &Path,
+    ) -> Result<crate::service::ServiceAttachment> {
+        crate::service::attach_or_start(options, project, &std::env::current_exe()?).await
+    }
+
+    /// `serve_with` serves the policy the fixture chose. Reached by any
+    /// attachment, the owner retires itself at the last detach: every event
+    /// up to `EnteredEmpty { reached: true }` is in order, the serve task then
+    /// ends cleanly, and its owner lock and endpoint are gone.
+    #[tokio::test]
+    async fn serve_with_applies_the_fixture_policy_and_retires_at_the_last_detach() -> Result<()> {
+        super::super::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let budget = super::super::fixture_deadline(1, 0);
+        let deadline = FixtureDeadline::start(budget, "serve_with fixture");
+        let (root, project, options) = fixture()?;
+        let (knobs, mut events) = observed(Admission::AnyAttachment, None);
+        let settled = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve_with(owner, knobs)?;
+                    expect_events(&mut events, &[ServeEvent::EnteredEmpty { reached: false }])
+                        .await?;
+                    let attachment = attach(&options, &project).await?;
+                    expect_events(&mut events, &[ServeEvent::AttachmentAccepted { active: 1 }])
+                        .await?;
+                    drop(attachment);
+                    expect_events(
+                        &mut events,
+                        &[
+                            ServeEvent::AttachmentJoined { remaining: 0 },
+                            ServeEvent::EnteredEmpty { reached: true },
+                        ],
+                    )
+                    .await?;
+                    served
+                        .reap(budget, "the reached owner did not retire")
+                        .await?;
+                    ensure!(
+                        crate::service::EndpointRecord::read(
+                            &options.data_dir,
+                            &options.project_scope
+                        )?
+                        .is_none(),
+                        "the retired owner left its endpoint"
+                    );
+                    Ok(())
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            budget,
+                            "serve_with fixture owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(settled)
+    }
+
+    /// The default policy for an in-process owner is "never reached": the
+    /// last detach only returns the owner to waiting for a starter, in the
+    /// ordered log, and the owner keeps serving; maintenance ends it.
+    #[tokio::test]
+    async fn a_never_reached_owner_outlives_its_last_client_until_maintenance_retires_it()
+    -> Result<()> {
+        super::super::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let budget = super::super::fixture_deadline(1, 0);
+        let deadline = FixtureDeadline::start(budget, "never reached fixture");
+        let (root, project, options) = fixture()?;
+        let (knobs, mut events) = observed(Admission::Never, None);
+        let settled = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve_with(owner, knobs)?;
+                    expect_events(&mut events, &[ServeEvent::EnteredEmpty { reached: false }])
+                        .await?;
+                    let first = attach(&options, &project).await?;
+                    let generation = first.generation().to_owned();
+                    drop(first);
+                    expect_events(
+                        &mut events,
+                        &[
+                            ServeEvent::AttachmentAccepted { active: 1 },
+                            ServeEvent::AttachmentJoined { remaining: 0 },
+                            ServeEvent::EnteredEmpty { reached: false },
+                        ],
+                    )
+                    .await?;
+                    ensure!(!served.is_finished(), "the never-reached owner retired");
+                    let second = attach(&options, &project).await?;
+                    ensure!(
+                        second.generation() == generation,
+                        "the owner served a new generation after its last client left"
+                    );
+                    drop(second);
+                    expect_events(
+                        &mut events,
+                        &[
+                            ServeEvent::AttachmentAccepted { active: 1 },
+                            ServeEvent::AttachmentJoined { remaining: 0 },
+                            ServeEvent::EnteredEmpty { reached: false },
+                        ],
+                    )
+                    .await?;
+                    expect_no_event(&mut events, "a waiting never-reached owner")?;
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            budget,
+                            "the never-reached owner did not retire",
+                        )
+                        .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            budget,
+                            "never reached fixture owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(settled)
+    }
+
+    /// `serve` is `serve_with` under the never-reached policy: no admission
+    /// reaches the owner and no first-attachment deadline expires.
+    #[test]
+    fn serve_defaults_to_the_never_reached_policy() {
+        let knobs = default_knobs();
+        assert_eq!(knobs.admission, Admission::Never);
+        assert_eq!(knobs.first_attachment, None);
+        assert!(knobs.observer.is_none() && knobs.close_pause.is_none());
+        assert!(knobs.dispatch_pause.is_none());
     }
 
     #[tokio::test]
