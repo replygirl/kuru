@@ -218,11 +218,20 @@ fn terminal_fixture_process() -> Result<()> {
             println!("SIZE:{cols}x{rows}");
             std::io::stdout().flush()?;
         }
-        "nested-dimensions" => {
-            let mut terminal = fixture_with_size("dimensions", 35, 120)?;
-            terminal.wait_text(&["SIZE:120x35"], &[])?;
-            terminal.wait_exit(EXIT_TIMEOUT)?;
-            println!("INNER_SIZE_OK");
+        "nested-dimensions" => nested_size_fixture("dimensions")?,
+        // The nested child exits cleanly before it reports a size.
+        "nested-early-exit" => nested_size_fixture("early-exit")?,
+        "early-exit" => {
+            println!("PARTIAL");
+            std::io::stdout().flush()?;
+        }
+        // The second line is written after the parent has stopped reading and
+        // just before the exit, so it is still queued when the exit is seen.
+        "late-output" => {
+            println!("EARLY");
+            std::io::stdout().flush()?;
+            std::thread::sleep(Duration::from_millis(150));
+            println!("LATE");
             std::io::stdout().flush()?;
         }
         "fragmented-frame" => {
@@ -426,6 +435,25 @@ fn terminal_fixture_process() -> Result<()> {
     Ok(())
 }
 
+// Runs an inner terminal and reports its size. Only this PTY reaches the
+// parent, so a failure carries the inner child's launch, exit state and
+// complete output as well as its own error.
+fn nested_size_fixture(inner: &str) -> Result<()> {
+    let mut terminal = fixture_with_size(inner, 35, 120)?;
+    if let Err(error) = terminal
+        .wait_text(&["SIZE:120x35"], &[])
+        .and_then(|()| terminal.wait_exit(EXIT_TIMEOUT))
+    {
+        return Err(error.context(format!(
+            "nested {inner:?} fixture failed; inner {}",
+            terminal.report()
+        )));
+    }
+    println!("INNER_SIZE_OK");
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
 fn fixture(mode: &str) -> Result<Terminal> {
     fixture_with_size(mode, 35, 120)
 }
@@ -486,6 +514,90 @@ fn terminal_driver_drains_backpressure_and_bounds_stalled_processes() -> Result<
         "{error}"
     );
     assert!(error.to_string().contains("STALLED"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn terminal_timeouts_report_the_launch_and_a_process_tree_snapshot() -> Result<()> {
+    let mut stalled = fixture("stalled")?;
+    stalled.wait_text(&["STALLED"], &[])?;
+    let exit = stalled.wait_exit(Duration::from_millis(100)).unwrap_err();
+    let wait = stalled
+        .wait("never satisfied", Duration::from_millis(100), |_| Ok(false))
+        .unwrap_err();
+    for error in [exit.to_string(), wait.to_string()] {
+        for required in [
+            "timed out after 100ms",
+            "STALLED",
+            "launch: program=",
+            "--exact",
+            "terminal_fixture_process",
+            "LLVM_PROFILE_FILE=",
+            "child running",
+            "complete PTY output (",
+            "process tree of ",
+            "stat=",
+        ] {
+            assert!(error.contains(required), "missing {required}: {error}");
+        }
+        assert!(!error.contains("snapshot unavailable"), "{error}");
+    }
+    assert!(exit.to_string().contains("process exits: timed out"));
+    Ok(())
+}
+
+#[test]
+fn terminal_wait_reports_output_still_queued_when_the_exit_is_seen() -> Result<()> {
+    let mut terminal = fixture("late-output")?;
+    let mut paused = false;
+    let error = terminal
+        .wait("late output becomes visible", READY_TIMEOUT, |terminal| {
+            // Hold the wait past the child's exit so LATE is queued unread.
+            if !paused && terminal.output.windows(5).any(|bytes| bytes == b"EARLY") {
+                paused = true;
+                std::thread::sleep(Duration::from_millis(700));
+            }
+            Ok(false)
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(paused, "{error}");
+    let (before, after) = error
+        .split_once("output not yet read when the exit was seen")
+        .with_context(|| format!("no late-output section: {error}"))?;
+    assert!(before.contains("process exited"), "{error}");
+    assert!(before.contains("code: 0"), "{error}");
+    assert!(before.contains("EARLY"), "{error}");
+    assert!(!before.contains("LATE"), "{error}");
+    assert!(after.contains("LATE"), "{error}");
+    // The report's complete output includes what was still queued.
+    let (_, complete) = after
+        .split_once("complete PTY output (")
+        .with_context(|| format!("no complete output: {error}"))?;
+    assert!(
+        complete.contains("EARLY") && complete.contains("LATE"),
+        "{error}"
+    );
+    assert!(after.contains("child exited"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn terminal_fixture_nested_early_exit_reports_the_inner_output_and_status() -> Result<()> {
+    let mut outer = fixture("nested-early-exit")?;
+    let error = outer.wait_exit(EXIT_TIMEOUT).unwrap_err().to_string();
+    for required in [
+        "child failed",
+        "nested",
+        "early-exit",
+        "fixture failed; inner launch: program=",
+        "process exited",
+        "code: 0",
+        "PARTIAL",
+        "complete PTY output (",
+    ] {
+        assert!(error.contains(required), "missing {required}: {error}");
+    }
     Ok(())
 }
 

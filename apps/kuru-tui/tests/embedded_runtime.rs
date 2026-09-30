@@ -32,6 +32,10 @@ const BOOTSTRAP_INVENTORY_BYTES: usize = 4096;
 // 30-second bound, then includes their handshakes and bounded shutdowns.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(100);
 const PREPARE_INPUT_TIMEOUT: Duration = Duration::from_secs(30);
+// How long a killed Unix fixture command's pipes may stay open, for a
+// descendant that inherited them.
+#[cfg(unix)]
+const PIPE_GRACE: Duration = Duration::from_secs(5);
 // The selected debug or instrumented input may contain compiler metadata removed
 // only from the verified independent copy. This is separate from the 128 MiB
 // shipping archive cap, which is still checked after stripping.
@@ -431,32 +435,87 @@ async fn capture(stream: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
 
 #[cfg(unix)]
 async fn execute(command: &mut Command) -> Result<Output> {
+    execute_within(command, COMMAND_TIMEOUT, PIPE_GRACE).await
+}
+
+// Program, arguments and working directory of a fixture command, for failure
+// text. Environment values are omitted: they can carry synthetic credentials.
+#[cfg(unix)]
+fn describe_command(command: &Command) -> String {
+    let command = command.as_std();
+    format!(
+        "command={:?} arguments={:?} directory={:?}",
+        command.get_program(),
+        command.get_args().collect::<Vec<_>>(),
+        command.get_current_dir()
+    )
+}
+
+#[cfg(unix)]
+async fn record_tree(pid: u32) -> std::io::Result<Vec<kuru_platform::unix::snapshot::ProcessRow>> {
+    tokio::task::spawn_blocking(move || kuru_platform::unix::snapshot::tree(pid))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+#[cfg(unix)]
+async fn execute_within(
+    command: &mut Command,
+    timeout: Duration,
+    pipe_grace: Duration,
+) -> Result<Output> {
+    use kuru_platform::unix::snapshot;
+
+    let description = describe_command(command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = command.spawn().context("start installed Kuru")?;
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("start fixture command: {description}"))?;
     let pid = child.id();
     let stdout = tokio::spawn(capture(child.stdout.take().context("stdout pipe")?));
     let stderr = tokio::spawn(capture(child.stderr.take().context("stderr pipe")?));
-    let status = match tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await {
-        Ok(status) => status?,
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(status) => status.with_context(|| format!("wait for fixture command: {description}"))?,
         Err(_) => {
-            child.kill().await.context("kill timed-out fixture child")?;
-            let output = tokio::time::timeout(Duration::from_secs(5), stdout).await;
-            let error = tokio::time::timeout(Duration::from_secs(5), stderr).await;
+            // Record the tree before the kill: this helper sets no process
+            // group, so descendants orphaned by the kill cannot be found again.
+            // The IDs are diagnostic text only; nothing acts on them.
+            let recorded = match pid {
+                Some(pid) => record_tree(pid).await,
+                None => Err(std::io::Error::other("child has no process ID")),
+            };
+            let tree = match &recorded {
+                Ok(rows) => snapshot::describe_rows(pid.unwrap_or_default(), rows),
+                Err(error) => format!("snapshot unavailable: {error}"),
+            };
+            child.kill().await.with_context(|| {
+                format!("kill timed-out fixture command: {description}; tree before kill: {tree}")
+            })?;
+            let output = tokio::time::timeout(pipe_grace, stdout).await;
+            let error = tokio::time::timeout(pipe_grace, stderr).await;
+            let survivors = match recorded {
+                Ok(rows) => {
+                    tokio::task::spawn_blocking(move || snapshot::describe_still_listed(&rows))
+                        .await
+                        .unwrap_or_else(|error| format!("snapshot unavailable: {error}"))
+                }
+                Err(error) => format!("snapshot unavailable: {error}"),
+            };
             anyhow::bail!(
-                "installed Kuru {pid:?} timed out after {COMMAND_TIMEOUT:?}; stdout={output:?}; stderr={error:?}"
+                "fixture command {pid:?} timed out after {timeout:?}: {description}; stdout={output:?}; stderr={error:?}; tree before kill: {tree}; after the {pipe_grace:?} pipe grace: {survivors}"
             );
         }
     };
-    let stdout = tokio::time::timeout(Duration::from_secs(5), stdout)
+    let stdout = tokio::time::timeout(pipe_grace, stdout)
         .await
-        .context("stdout did not close")???;
-    let stderr = tokio::time::timeout(Duration::from_secs(5), stderr)
+        .with_context(|| format!("stdout did not close: {description}"))???;
+    let stderr = tokio::time::timeout(pipe_grace, stderr)
         .await
-        .context("stderr did not close")???;
+        .with_context(|| format!("stderr did not close: {description}"))???;
     Ok(Output {
         status,
         stdout,
@@ -466,12 +525,104 @@ async fn execute(command: &mut Command) -> Result<Output> {
 
 #[cfg(windows)]
 async fn execute(command: &mut Command) -> Result<Output> {
-    let output = kuru_delivery::command::output(command, COMMAND_TIMEOUT).await?;
+    execute_within(command, COMMAND_TIMEOUT).await
+}
+
+// The shared native timeout arm names the command, arguments and directory and
+// lists the Job before it terminates the tree; this adds the deadline.
+#[cfg(windows)]
+async fn execute_within(command: &mut Command, timeout: Duration) -> Result<Output> {
+    let program = kuru_delivery::command::program(command).to_owned();
+    let output = kuru_delivery::command::output(command, timeout)
+        .await
+        .with_context(|| format!("fixture command {program:?} within {timeout:?}"))?;
     ensure!(
         output.stdout.len() as u64 <= OUTPUT_LIMIT && output.stderr.len() as u64 <= OUTPUT_LIMIT,
         "fixture command exceeded output bound"
     );
     Ok(output)
+}
+
+#[cfg(test)]
+mod execute_failure_tests {
+    use super::*;
+
+    // The shell forks its sleeping child before waiting on it; the two-second
+    // deadline leaves that fork ample time even on a loaded runner.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_names_the_command_and_lists_the_tree_before_and_after_the_kill() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.current_dir(directory.path()).args([
+            "-c",
+            "/bin/sleep 6 & wait",
+            "kuru-execute-timeout",
+        ]);
+        let error = execute_within(
+            &mut command,
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        let error = format!("{error:#}");
+        for required in [
+            "timed out after 2s",
+            r#"command="/bin/sh""#,
+            r#"arguments=["-c", "/bin/sleep 6 & wait", "kuru-execute-timeout"]"#,
+            &format!("directory=Some({:?})", directory.path()),
+            "tree before kill: process tree of ",
+            "kuru-execute-timeout",
+            "/bin/sleep 6",
+            // The sleeping child inherited both pipes, so they stay open.
+            "stdout=Err(Elapsed(()))",
+            "after the 200ms pipe grace: 1 of 2 recorded processes remain listed",
+        ] {
+            assert!(error.contains(required), "missing {required}: {error}");
+        }
+        assert!(!error.contains("installed Kuru"), "{error}");
+        assert!(!error.contains("snapshot unavailable"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_failure_names_the_command() {
+        let mut command = Command::new("/nonexistent/kuru-fixture");
+        command.arg("--probe");
+        let error = execute_within(&mut command, Duration::from_secs(2), PIPE_GRACE)
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(r#"command="/nonexistent/kuru-fixture" arguments=["--probe"]"#),
+            "{error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn timeout_names_the_command_and_lists_the_job_before_cleanup() {
+        let system = kuru_platform::windows::process::system_directory().unwrap();
+        let mut command = Command::new(system.join("WindowsPowerShell/v1.0/powershell.exe"));
+        command
+            .env("SystemRoot", system.parent().unwrap())
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg("Start-Sleep -Seconds 30");
+        let error = execute_within(&mut command, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        for required in [
+            "fixture command",
+            "powershell.exe",
+            "Start-Sleep -Seconds 30",
+            "tree before cleanup",
+            "within 2s",
+        ] {
+            assert!(error.contains(required), "missing {required}: {error}");
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -609,7 +760,9 @@ impl Installation {
         kuru_memory::test_support::await_managed_quiescence(&options).await
     }
     async fn native_auth_status(&self) -> Result<()> {
-        let output = execute(self.command().arg("auth")).await?;
+        let output = execute(self.command().arg("auth"))
+            .await
+            .context("step: installed native auth status without PATH tools")?;
         ensure!(
             output.status.success(),
             "installed native auth failed without PATH tools: {}",
@@ -733,7 +886,8 @@ impl Installation {
                     .args(["--provider", "responses"])
                     .args(&args),
             )
-            .await?;
+            .await
+            .with_context(|| format!("step: installed API-key request {args:?}"))?;
             ensure!(
                 output.status.success(),
                 "installed API request failed: {}",
@@ -774,7 +928,8 @@ impl Installation {
                     "--json",
                 ]),
         )
-        .await?;
+        .await
+        .context("step: installed request with a rejected API key")?;
         ensure!(
             !rejected.status.success(),
             "rejected OpenAI request reported success"
@@ -997,7 +1152,9 @@ async fn verify_installed_shell_activation(
         if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
             command.env("LLVM_PROFILE_FILE", profile);
         }
-        let output = execute(&mut command).await?;
+        let output = execute(&mut command)
+            .await
+            .with_context(|| format!("step: stock shell {shell} completion activation"))?;
         ensure!(
             output.status.success() && String::from_utf8_lossy(&output.stdout).contains(expected),
             "stock shell {shell} did not activate installed completions: {}",
@@ -1013,7 +1170,9 @@ async fn verify_installed_shell_activation(
         .env("PATH", "/usr/bin:/bin")
         .env("MANPATH", &man_root)
         .args(["-w", "kuru"]);
-    let output = execute(&mut man).await?;
+    let output = execute(&mut man)
+        .await
+        .context("step: stock man lookup of the installed page")?;
     let located = String::from_utf8(output.stdout)?;
     ensure!(
         output.status.success() && located.lines().count() == 1,
@@ -1053,7 +1212,9 @@ async fn verify_legacy_core_only_repair(
         .arg(releases)
         .arg("--install-dir")
         .arg(&install_dir);
-    let output = execute(&mut installer).await?;
+    let output = execute(&mut installer)
+        .await
+        .context("step: retained v0.4.1/v0.4.2 installer")?;
     ensure!(
         output.status.success(),
         "retained v0.4.1/v0.4.2 installer could not install the new core: {}",
@@ -1097,7 +1258,9 @@ async fn verify_legacy_core_only_repair(
         if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
             generator.env("LLVM_PROFILE_FILE", profile);
         }
-        let output = execute(&mut generator).await?;
+        let output = execute(&mut generator)
+            .await
+            .with_context(|| format!("step: legacy-upgraded Kuru generating {name}"))?;
         ensure!(
             output.status.success() && output.stderr.is_empty(),
             "legacy-upgraded Kuru could not generate {name} without authority: {}",
@@ -1159,7 +1322,9 @@ async fn verify_installed_powershell_activation(root: &Path, installed: &Path) -
     if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
         command.env("LLVM_PROFILE_FILE", profile);
     }
-    let output = execute(&mut command).await?;
+    let output = execute(&mut command)
+        .await
+        .context("step: stock PowerShell completion activation")?;
     ensure!(
         output.status.success()
             && String::from_utf8_lossy(&output.stdout)
@@ -1392,7 +1557,11 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
     ] {
         let path = generated.join(name);
         fs::create_dir_all(path.parent().context("support file has no parent")?)?;
-        let output = execute(Command::new(&binary).args(args)).await?;
+        let output = execute(Command::new(&binary).args(args))
+            .await
+            .with_context(|| {
+                format!("step: selected pre-install binary generating {name} {args:?}")
+            })?;
         ensure!(
             output.status.success(),
             "selected binary could not generate {name}: {}",

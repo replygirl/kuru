@@ -434,13 +434,31 @@ fn shell_timeout_controls(
     format!("failure-only stock PowerShell controls: {result:?}")
 }
 
-fn success(command: &mut Command) {
-    let output = command.output().unwrap();
+// A launch or timeout failure names the step. The shared native timeout arm
+// adds the command, arguments, directory and the Job's processes before it
+// terminates the tree.
+fn launch(command: &mut Command, step: &str) -> std::process::Output {
+    command
+        .output()
+        .unwrap_or_else(|error| panic!("{step}: {error}"))
+}
+
+fn success(command: &mut Command, step: &str) {
+    let output = launch(command, step);
     assert!(
         output.status.success(),
-        "{}\n{}",
+        "{step}: {}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[should_panic(expected = "step: launch of a missing fixture executable: ")]
+fn fixture_output_failure_names_its_step() {
+    launch(
+        &mut Command::new("Z:\\kuru-missing\\fixture.exe"),
+        "step: launch of a missing fixture executable",
     );
 }
 
@@ -546,7 +564,7 @@ if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -n
                 "-File",
             ])
             .arg(&launcher);
-        child.output().unwrap()
+        launch(&mut child, "step: PE inspection launcher")
     };
     let extended = binary.canonicalize().unwrap();
     let extended = extended.to_str().unwrap();
@@ -806,7 +824,7 @@ fn source_update_builds_through_mise_and_publishes_after_the_trusted_build() {
         .env("GIT_CONFIG_GLOBAL", "fixture-global-config")
         .args(["update", "--source"])
         .arg(&checkout);
-    success(&mut update);
+    success(&mut update, "step: update --source");
     assert_ne!(
         regular_file_info(&File::open(&binary).unwrap())
             .unwrap()
@@ -840,12 +858,15 @@ fn source_update_builds_through_mise_and_publishes_after_the_trusted_build() {
             host
         ]
     );
-    success(command(root.path(), &binary).arg("--version"));
-    let output = command(root.path(), &binary)
+    success(
+        command(root.path(), &binary).arg("--version"),
+        "step: updated executable --version",
+    );
+    let mut invalid = command(root.path(), &binary);
+    invalid
         .args(["update", "--version", "0.2.0", "--source"])
-        .arg(&checkout)
-        .output()
-        .unwrap();
+        .arg(&checkout);
+    let output = launch(&mut invalid, "step: update --version with --source");
     assert!(!output.status.success());
     assert_eq!(
         fs::read_to_string(root.path().join("actions.jsonl"))
@@ -942,7 +963,10 @@ fn source_install_entrypoint_scopes_first_mise_and_restores_environment_on_succe
             } else {
                 serde_json::json!({"no_hooks": null, "auto_install": null, "mbx": null, "install_dir": null})
             };
-            let output = child.output().unwrap();
+            let output = launch(
+                &mut child,
+                &format!("step: source-install entrypoint opposing={opposing} status={status}"),
+            );
             let diagnostic = format!(
                 "opposing={opposing}, status={status}: {}\n{}",
                 String::from_utf8_lossy(&output.stdout),
@@ -998,14 +1022,17 @@ fn source_install_entrypoint_scopes_first_mise_and_restores_environment_on_succe
 #[test]
 fn source_install_entrypoint_rejects_release_options_before_mise_or_environment_changes() {
     let root = tempfile::tempdir().unwrap();
-    let output = source_entrypoint_fixture(root.path())
+    let mut child = source_entrypoint_fixture(root.path());
+    child
         .env("KURU_ENTRYPOINT_INVALID", "1")
         .env("MISE_NO_HOOKS", "0")
         .env("MISE_TASK_RUN_AUTO_INSTALL", "true")
         .env("KURU_MBX", "1")
-        .env("KURU_INSTALL_DIR", "caller relative destination")
-        .output()
-        .unwrap();
+        .env("KURU_INSTALL_DIR", "caller relative destination");
+    let output = launch(
+        &mut child,
+        "step: source-install entrypoint rejecting release options",
+    );
     assert!(!output.status.success());
     assert!(!root.path().join("setup.jsonl").exists());
     let report: serde_json::Value =

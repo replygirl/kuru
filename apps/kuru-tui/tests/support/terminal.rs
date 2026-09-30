@@ -19,6 +19,10 @@ const TICK: Duration = Duration::from_millis(20);
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
 type RestorationCheck = dyn Fn(&dyn MasterPty) -> Result<bool>;
 const OUTPUT_QUEUE: usize = 8;
+// Escaped PTY output shown whole in an unexpected-end report, and the window in
+// which output still queued at an observed exit is collected for it.
+const REPORT_OUTPUT_LIMIT: usize = 16 * 1024;
+const LATE_OUTPUT_WINDOW: Duration = Duration::from_millis(500);
 type OutputReceiver = mpsc::Receiver<std::io::Result<Vec<u8>>>;
 
 fn spawn_reader(
@@ -109,8 +113,23 @@ pub fn startup_timeout(memory_startup: Duration) -> Duration {
     (memory_startup + Duration::from_secs(2)) * 2 + Duration::from_secs(8 + 3 + 2) + READY_TIMEOUT
 }
 
+fn escaped(bytes: &[u8], limit: usize) -> String {
+    let shown: Vec<u8> = bytes[..bytes.len().min(limit)]
+        .iter()
+        .flat_map(|byte| std::ascii::escape_default(*byte))
+        .collect();
+    let mut text = String::from_utf8_lossy(&shown).into_owned();
+    if bytes.len() > limit {
+        text.push_str(&format!(" ... {} more bytes omitted", bytes.len() - limit));
+    }
+    text
+}
+
 pub struct Terminal {
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    // Program, arguments, directory and coverage-profile presence at spawn, for
+    // reports. Environment values are omitted: they can carry synthetic keys.
+    launch: String,
     master: Option<Box<dyn MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
     receive: Option<OutputReceiver>,
@@ -154,6 +173,17 @@ impl Terminal {
                 builder.env_remove(name);
             }
         }
+        let launch = format!(
+            "program={:?} arguments={:?} directory={:?} LLVM_PROFILE_FILE={}",
+            command.get_program(),
+            command.get_args().collect::<Vec<_>>(),
+            command.get_current_dir(),
+            if builder.get_env("LLVM_PROFILE_FILE").is_some() {
+                "present"
+            } else {
+                "absent"
+            }
+        );
         // portable-pty owns the audited setsid/TIOCSCTTY boundary. The child
         // must use this slave as both stdio and its controlling terminal so
         // Crossterm cannot read dimensions from the invoking test runner.
@@ -167,6 +197,7 @@ impl Terminal {
         let (receive, reader_done, output) = spawn_reader(reader);
         Ok(Self {
             child,
+            launch,
             master: Some(pair.master),
             writer: Some(writer),
             receive: Some(receive),
@@ -218,6 +249,58 @@ impl Terminal {
         )
     }
 
+    /// What is known about an unexpected end: launch, child state, the complete
+    /// escaped PTY output and a bounded process-tree snapshot. Failure paths
+    /// only; a snapshot failure is text and never replaces the original error.
+    pub fn report(&mut self) -> String {
+        let state = match self.child.try_wait() {
+            Ok(Some(status)) => format!("exited {status:?}"),
+            Ok(None) => "running".to_owned(),
+            Err(error) => format!("unknown ({error})"),
+        };
+        let tree = match self.child_id() {
+            Ok(pid) => kuru_platform::unix::snapshot::describe(pid),
+            Err(error) => format!("snapshot unavailable: {error}"),
+        };
+        format!(
+            "launch: {}; child {state}; complete PTY output ({} bytes): {}; {tree}",
+            self.launch,
+            self.output.len(),
+            escaped(&self.output, REPORT_OUTPUT_LIMIT)
+        )
+    }
+
+    // Output still queued when an exit was observed. It is collected only to
+    // report it, after the caller has decided to fail, so the report's complete
+    // output includes it and no wait changes its outcome.
+    fn late_output(&mut self) -> String {
+        let deadline = Instant::now() + LATE_OUTPUT_WINDOW;
+        let mut late = Vec::new();
+        let mut ended = "reader still open when the window closed";
+        while let (Some(receive), Some(remaining)) = (
+            self.receive.as_ref(),
+            deadline.checked_duration_since(Instant::now()),
+        ) {
+            match receive.recv_timeout(remaining.min(TICK)) {
+                Ok(Ok(bytes)) => {
+                    self.parser.process(&bytes);
+                    self.output.extend_from_slice(&bytes);
+                    late.extend(bytes);
+                }
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    ended = "reader closed";
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+        format!(
+            "output not yet read when the exit was seen: {} bytes ({ended}): {}",
+            late.len(),
+            escaped(&late, REPORT_OUTPUT_LIMIT)
+        )
+    }
+
     fn child_id(&self) -> Result<u32> {
         self.child
             .process_id()
@@ -238,15 +321,18 @@ impl Terminal {
             }
             if let Some(status) = self.child.try_wait()? {
                 bail!(
-                    "{description}: process exited {status:?}\n{}",
-                    self.diagnostics()
+                    "{description}: process exited {status:?}\n{}\n{}\n{}",
+                    self.diagnostics(),
+                    self.late_output(),
+                    self.report()
                 );
             }
             ensure!(
                 Instant::now() < deadline,
-                "{description}: timed out after {timeout:?}; process {} is still running\n{}",
+                "{description}: timed out after {timeout:?}; process {} is still running\n{}\n{}",
                 self.child_id()?,
-                self.diagnostics()
+                self.diagnostics(),
+                self.report()
             );
         }
     }
@@ -418,9 +504,10 @@ impl Terminal {
             }
             ensure!(
                 Instant::now() < deadline,
-                "process exits: timed out after {timeout:?}; process {} is still running\n{}",
+                "process exits: timed out after {timeout:?}; process {} is still running\n{}\n{}",
                 self.child_id()?,
-                self.diagnostics()
+                self.diagnostics(),
+                self.report()
             );
         };
         // Process exit closes the final slave descriptor. Drain until the
@@ -450,8 +537,9 @@ impl Terminal {
         }
         ensure!(
             status.success(),
-            "child failed: {status:?}\n{}",
-            self.diagnostics()
+            "child failed: {status:?}\n{}\n{}",
+            self.diagnostics(),
+            self.report()
         );
         Ok(())
     }
