@@ -253,18 +253,24 @@ async fn hostname(pool: &MySqlPool) -> Result<String> {
 /// `/proc/sys/kernel/hostname`) on Linux, the `kern.hostname` sysctl on macOS
 /// (what `/bin/hostname` prints) and the physical DNS host name on Windows
 /// (<https://github.com/golang/go/blob/go1.26.2/src/os/sys_linux.go>,
-/// `sys_bsd.go`, `sys_windows.go`). That the engine's `@@hostname` is that
-/// value is inferred, and asserted on Unix by S7. Without a new dependency,
+/// `sys_bsd.go`, `sys_windows.go`). The engine's `@@hostname` defaults to
+/// `os.Hostname()` (go-mysql-server `a939809e084d`, Dolt 2.3.5's pin:
+/// <https://github.com/dolthub/go-mysql-server/blob/a939809e084d/sql/variables/system_variables.go#L197-L200>,
+/// `hostname` at L1031-L1038); S7 asserts the equality on Unix. Without a new dependency,
 /// Windows exposes only the NetBIOS `COMPUTERNAME`, which can differ in case
 /// and length, so there it is an extra needle rather than an equality.
 #[cfg(target_os = "linux")]
 async fn os_hostname() -> Result<String> {
-    Ok(String::from_utf8(files::read_bytes(
-        Path::new("/proc/sys/kernel/hostname"),
-        1024,
-    )?)?
-    .trim()
-    .to_owned())
+    use std::io::Read;
+    // A public kernel file (root-owned, world-readable): read it directly,
+    // not through `files::read_bytes`, which accepts only private objects.
+    let mut text = String::new();
+    std::fs::File::open("/proc/sys/kernel/hostname")
+        .context("open /proc/sys/kernel/hostname")?
+        .take(1024)
+        .read_to_string(&mut text)
+        .context("read /proc/sys/kernel/hostname")?;
+    Ok(text.trim().to_owned())
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
