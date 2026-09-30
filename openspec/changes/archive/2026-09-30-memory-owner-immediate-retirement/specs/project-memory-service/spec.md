@@ -1,34 +1,4 @@
-# project-memory-service Specification
-
-## Purpose
-
-Define the per-project private memory service that owns writable Dolt lifetime, validates compatible local attachments, retains service authority only while attached clients or pending work exist, and exposes exact candidate recovery without granting concurrent conversation-driving authority.
-
-## Requirements
-
-### Requirement: One on-demand project storage owner
-
-For a canonical project, Kuru SHALL start or attach to at most one private memory service which owns the writable store and Dolt supervisor independently of any conversation process. Separate clients SHALL be able to attach to that service, and ending or crashing one client SHALL NOT close another client's storage attachment. The service SHALL retain its owned process and lifecycle authority through child reap. A service attachment SHALL NOT grant permission to drive a second concurrent conversation until session-private history isolation is enabled.
-
-#### Scenario: Simultaneous cold starts
-- **WHEN** two processes start from a cold project at the same time
-- **THEN** exactly one service and one Dolt engine own that project, both processes attach to the same validated service generation, and no duplicate initialization or import occurs
-
-#### Scenario: Starter exits
-- **WHEN** the process that started the service exits while another client remains attached
-- **THEN** the remaining client can read and write through the service and the engine stays owned
-
-### Requirement: Authenticated compatible local attachment
-
-The service SHALL expose only private local IPC and SHALL require a bounded, versioned handshake before admitting a client. It MUST verify canonical project identity, store instance, live service generation, compatible protocol and schema, and owner-private endpoint authority. It MUST reject mismatches without disclosing storage credentials or killing/replacing an active service. Endpoint metadata, PIDs and ports alone SHALL NOT authorize attachment or takeover.
-
-#### Scenario: Wrong project or generation
-- **WHEN** a client supplies another project's identity, a stale generation or an invalid runtime connection secret
-- **THEN** attachment fails before a storage operation and leaves the active owner unchanged
-
-#### Scenario: Active older service
-- **WHEN** an updated client encounters an active service with incompatible required protocol or schema
-- **THEN** it receives an actionable incompatibility result and does not terminate or replace the service
+## MODIFIED Requirements
 
 ### Requirement: Idle shutdown and safe recovery
 

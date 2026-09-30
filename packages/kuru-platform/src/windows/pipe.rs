@@ -9,6 +9,7 @@ use super::{
 use std::{
     cell::UnsafeCell,
     ffi::{OsStr, OsString},
+    fmt,
     future::{Future, poll_fn},
     io, mem,
     os::windows::{
@@ -670,6 +671,32 @@ fn open_client(
     Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
 }
 
+const CONNECT_TIMED_OUT: &str = "private pipe connect timed out";
+
+/// Payload of the `TimedOut` connect error whose last retry found every
+/// instance of an existing pipe busy. Its text is the plain timeout's text,
+/// so the error reads as it always has; only callers that can take another
+/// route, such as an electing service client, inspect the marker.
+#[derive(Debug)]
+pub struct NoFreeInstance;
+
+impl fmt::Display for NoFreeInstance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(CONNECT_TIMED_OUT)
+    }
+}
+
+impl std::error::Error for NoFreeInstance {}
+
+/// Whether `connect` exhausted its deadline with every instance busy. The
+/// payload type decides; kind and text alone never match.
+pub fn is_no_free_instance(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::TimedOut
+        && error
+            .get_ref()
+            .is_some_and(|payload| payload.is::<NoFreeInstance>())
+}
+
 pub async fn connect(address: &OsStr, timeout: Duration) -> io::Result<Pipe> {
     check_address(address)?;
     let mut last_retry_error = None;
@@ -696,10 +723,12 @@ pub async fn connect(address: &OsStr, timeout: Duration) -> io::Result<Pipe> {
             // authority. Callers may inspect their retained election and owner
             // locks before deciding whether a replacement can be started.
             Some(error) if error.kind() == io::ErrorKind::NotFound => Err(error),
-            _ => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "private pipe connect timed out",
-            )),
+            // Busy instances keep the plain timeout's kind and text; only the
+            // typed payload lets such a caller read them the same way.
+            Some(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                Err(io::Error::new(io::ErrorKind::TimedOut, NoFreeInstance))
+            }
+            _ => Err(io::Error::new(io::ErrorKind::TimedOut, CONNECT_TIMED_OUT)),
         },
     }
 }

@@ -888,13 +888,15 @@ async fn service_cleanup_awaits_a_store_that_exists_only_under_its_staging_name(
     let env = Sandbox::new();
     env.success(&["run", "Seed a store another process's engine ran in"]);
     let scope = kuru_runtime::project_scope(&env.project).unwrap();
-    // Stop the CLI's warm service. This process neither ran nor recorded its
-    // engine, so only an awaited quiescence can explain the store.
-    kuru_memory::test_support::retire_idle_service(&kuru_memory::OpenOptions::new(
-        env.data.clone(),
-        scope.clone(),
-    ))
-    .await
+    // The CLI's service retires itself when the command exits; wait for its
+    // close. This process neither ran nor recorded its engine, so only an
+    // awaited quiescence can explain the store.
+    tokio::task::block_in_place(|| {
+        memory::await_owner_exit(&kuru_memory::OpenOptions::new(
+            env.data.clone(),
+            scope.clone(),
+        ))
+    })
     .unwrap();
     let hash = scope.strip_prefix("project/").unwrap();
     let memory = env.data.join("memory");
@@ -986,7 +988,14 @@ async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
     drop(candidate);
     memory.close().await.unwrap();
 
+    // The controlled refusal comes from the owner this fixture starts: a
+    // request on its own attachment, which is then the sole one, reaches the
+    // store and is refused for a stale head. The command line cannot send that
+    // request itself, since it inspects the exact ref first and stops before
+    // the owner. That owner stays up only until its starter and every command
+    // that attached to it have released.
     let diagnostic_path = env.data.join("candidate-owner-diagnostic.log");
+    let elected_path = env.data.join("candidate-elected-owner-diagnostic.log");
     let private = kuru_platform::fs::Directory::open(
         &env.data,
         kuru_platform::fs::Privacy::OwnerOnly,
@@ -996,7 +1005,14 @@ async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
     let diagnostic = private
         .create_new(std::ffi::OsStr::new("candidate-owner-diagnostic.log"))
         .unwrap();
-    let owner = kuru_memory::test_support::spawn_logged_owner(
+    drop(
+        private
+            .create_new(std::ffi::OsStr::new(
+                "candidate-elected-owner-diagnostic.log",
+            ))
+            .unwrap(),
+    );
+    let mut owner = kuru_memory::test_support::spawn_logged_owner(
         &options,
         &env.project.canonicalize().unwrap(),
         Path::new(env!("CARGO_BIN_EXE_kuru")),
@@ -1004,9 +1020,30 @@ async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
     )
     .await
     .unwrap();
+    let controlled = owner
+        .attachment()
+        .call(kuru_memory::service::ServiceCall::AbandonCandidateRef {
+            branch: branch.clone(),
+            base: base.clone(),
+            target: base.clone(),
+        })
+        .await;
 
+    // Every command line child gets the hook that sends the stderr of an owner
+    // it elects to a private file the fixture created. A child that finds a
+    // running owner attaches to it and elects nothing.
+    let run = |args: &[&str]| {
+        env.command()
+            .env(
+                kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+                &elected_path,
+            )
+            .args(args)
+            .output()
+            .unwrap()
+    };
     let run_json = |args: &[&str]| -> anyhow::Result<Value> {
-        let output = env.run(args);
+        let output = run(args);
         anyhow::ensure!(
             output.status.success(),
             "{args:?}: {}",
@@ -1014,9 +1051,11 @@ async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
         );
         Ok(serde_json::from_slice(&output.stdout)?)
     };
-    let commands = (|| -> anyhow::Result<(Output, Value, Value, Value, Value)> {
+    // Reads run while the fixture's owner is up: they attach to it, and only
+    // an abandon is refused while another client is attached.
+    let attached = (|| -> anyhow::Result<(Output, Value, Value)> {
         Ok((
-            env.run(&[
+            run(&[
                 "memory",
                 "candidate-abandon",
                 &branch,
@@ -1027,6 +1066,34 @@ async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
             ]),
             run_json(&["memory", "candidates", "--limit", "1"])?,
             run_json(&["memory", "candidate-status", &branch])?,
+        ))
+    })();
+    let owner_exit = owner.wait_for_exit().await;
+
+    // The owner has exited, so this writable child elects one and must open
+    // the hook's file: a path that does not exist fails the election before
+    // any owner starts, which shows the child reads the hook. (A read-only
+    // child attaches to a running owner or opens locally and elects nothing.)
+    let refused_hook = env
+        .command()
+        .env(
+            kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+            env.data.join("no-such-owner-diagnostic.log"),
+        )
+        .args([
+            "memory",
+            "candidate-abandon",
+            &branch,
+            "--base",
+            &base,
+            "--head",
+            &head,
+        ])
+        .output()
+        .unwrap();
+    // The abandon needs the sole attachment, so it elects an owner of its own.
+    let elected = (|| -> anyhow::Result<(Value, Value)> {
+        Ok((
             run_json(&[
                 "memory",
                 "candidate-abandon",
@@ -1039,55 +1106,49 @@ async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
             run_json(&["memory", "candidate-status", &branch])?,
         ))
     })();
-    let controlled = if commands.is_ok() {
-        // Prove the actual owner's private stderr capture only after the
-        // original CLI sequence; no extra client can race its selected action.
-        async {
-            let (_, opening) = kuru_memory::MemoryStore::open_managed_observed(
-                options.clone(),
-                env.project.canonicalize()?,
-                PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
-            );
-            let diagnostic_client = opening.await?;
-            let result = diagnostic_client
-                .abandon_candidate_ref(&branch, &base, &head)
-                .await;
-            let closed = diagnostic_client.close().await;
-            closed?;
-            anyhow::ensure!(
-                matches!(
-                    result
-                        .err()
-                        .as_ref()
-                        .and_then(|error| error.downcast_ref::<kuru_memory::CandidateRefRejected>())
-                        .map(|rejected| rejected.0),
-                    Some(kuru_memory::CandidateRefRefusal::Changed)
-                ),
-                "controlled missing-ref request did not return a definite changed refusal"
-            );
-            Ok::<(), anyhow::Error>(())
-        }
-        .await
-    } else {
-        Ok(())
-    };
-    let retirement = kuru_memory::test_support::retire_idle_service(&options).await;
-    let owner_exit = owner.wait_for_exit().await;
-    let (rejected, inventory, status, abandoned, missing) = commands.unwrap_or_else(|error| {
-        panic!(
-            "{error:#}; {}",
-            candidate_owner_diagnostic_records(&diagnostic_path)
-        )
-    });
-    retirement.unwrap();
+    let ((rejected, inventory, status), (abandoned, missing)) = attached
+        .and_then(|attached| Ok((attached, elected?)))
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error:#}; fixture owner: {}; elected owners: {}",
+                candidate_owner_diagnostic_records(&diagnostic_path),
+                candidate_owner_diagnostic_records(&elected_path)
+            )
+        });
     owner_exit.unwrap();
-    controlled.unwrap();
-    let diagnostics = candidate_owner_diagnostic_records(&diagnostic_path);
+    let controlled_refusal = controlled
+        .err()
+        .as_ref()
+        .and_then(|error| error.downcast_ref::<kuru_memory::CandidateRefRejected>())
+        .map(|rejected| rejected.0);
     assert!(
-        diagnostics.contains(
+        matches!(
+            controlled_refusal,
+            Some(kuru_memory::CandidateRefRefusal::Changed)
+        ),
+        "the controlled stale-head request did not return a definite changed refusal"
+    );
+    let fixture_owner = candidate_owner_diagnostic_records(&diagnostic_path);
+    assert!(
+        fixture_owner.contains(
             "candidate_owner stage=ref_inspection class=non_sql sqlstate=none vendor=0 reason=other fault=ref_rejected"
         ),
-        "the actual owner did not report the controlled changed-head refusal: {diagnostics}"
+        "the actual owner did not report the controlled changed-head refusal: {fixture_owner}"
+    );
+    assert!(!refused_hook.status.success());
+    let refused_hook = String::from_utf8_lossy(&refused_hook.stderr);
+    assert!(
+        refused_hook.contains("open test owner diagnostic"),
+        "a command line child did not read the owner diagnostic hook: {refused_hook}"
+    );
+    assert!(
+        !env.data.join("no-such-owner-diagnostic.log").exists(),
+        "the owner diagnostic hook created its log"
+    );
+    let elected_owners = candidate_owner_diagnostic_records(&elected_path);
+    assert!(
+        !elected_owners.contains("fault="),
+        "an owner a command elected reported a candidate fault: {elected_owners}"
     );
 
     assert!(!rejected.status.success());
@@ -3126,19 +3187,22 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
         "{cold_stderr}"
     );
 
-    let warm_started = std::time::Instant::now();
-    let warm = env.run(&["run", "warm memory", "--json"]);
-    let warm_elapsed = warm_started.elapsed();
+    // The first command's service retires when that command's last client
+    // detaches, so this command starts its own; if it lands while the first is
+    // still closing it also waits for that close, and the figure includes it.
+    let reopen_started = std::time::Instant::now();
+    let reopen = env.run(&["run", "reopen memory", "--json"]);
+    let reopen_elapsed = reopen_started.elapsed();
     assert!(
-        warm.status.success(),
+        reopen.status.success(),
         "{}",
-        String::from_utf8_lossy(&warm.stderr)
+        String::from_utf8_lossy(&reopen.stderr)
     );
-    let warm_json: Value = serde_json::from_slice(&warm.stdout).unwrap();
-    assert!(warm_json["text"].as_str().unwrap().contains("demo"));
-    assert_memory_progress(&String::from_utf8_lossy(&warm.stderr));
+    let reopen_json: Value = serde_json::from_slice(&reopen.stdout).unwrap();
+    assert!(reopen_json["text"].as_str().unwrap().contains("demo"));
+    assert_memory_progress(&String::from_utf8_lossy(&reopen.stderr));
     eprintln!(
-        "observed isolated CLI startup wall time: cold={cold_elapsed:?}; warm={warm_elapsed:?}; no optimization claim"
+        "observed isolated CLI startup wall time: cold={cold_elapsed:?}; reopen={reopen_elapsed:?}; no optimization claim"
     );
 }
 
@@ -3323,20 +3387,25 @@ fn cli_imports_a_real_legacy_wal_without_changing_its_layout() {
     drop(connection);
 }
 
+/// Each command's memory service retires as soon as that command's last client
+/// detaches, so back-to-back commands each start a fresh service; nothing stays
+/// warm between them. After every command the fixture awaits the service's own
+/// exit, then checks that it retired its endpoint and reaped Dolt before it
+/// released its locks. The close and reopen durations are recorded, not
+/// asserted.
 #[tokio::test]
-async fn sequential_commands_release_clients_reuse_warm_memory_and_reap_on_retirement() {
+async fn sequential_commands_start_a_fresh_owner_each_time() {
     let env = Sandbox::new();
     let scope = kuru_runtime::project_scope(&env.project).unwrap();
     let store_path = env
         .data
         .join("memory")
         .join(scope.strip_prefix("project/").unwrap());
-    let endpoint_path = store_path.join("endpoint.json");
     let stopped = || {
         assert!(
             matches!(std::fs::symlink_metadata(store_path.join("endpoint.json")),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound),
-            "CLI returned while its owned endpoint was still published"
+            "the owner released its lock while its endpoint was still published"
         );
         #[cfg(unix)]
         let lifecycle_path = store_path.join("lifecycle.lock");
@@ -3360,34 +3429,57 @@ async fn sequential_commands_release_clients_reuse_warm_memory_and_reap_on_retir
             .write(true)
             .open(lifecycle_path)
             .unwrap();
-        lease
-            .try_lock()
-            .expect("CLI returned before its supervisor released the lifecycle lease");
-    };
-    env.success(&["run", "Seed memory for sequential inspection"]);
-    let generation = std::fs::read(&endpoint_path).unwrap();
-    let warm = |stage: &str| {
-        assert_eq!(
-            std::fs::read(&endpoint_path)
-                .unwrap_or_else(|error| panic!("{stage}: warm endpoint is unavailable: {error}")),
-            generation,
-            "{stage}: sequential CLI command replaced the warm service generation"
+        lease.try_lock().expect(
+            "the owner released its lock before its supervisor released the lifecycle lease",
         );
     };
-    warm("seed");
-    env.success(&["memory", "status"]);
-    warm("successful memory client");
-    let output = env.run(&["memory", "history", "--limit", "0"]);
-    assert!(!output.status.success());
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope).unwrap();
+    // Run one command, then await the exit of the owner it used. Records the
+    // command's wall time and how long that owner took to finish closing after
+    // the command exited. A writable command elects its own owner, so after
+    // the first its wall time is a reopen after a completed close; a read-only
+    // or failing command starts no owner and its close wait returns at once.
+    let mut observed = Vec::new();
+    let mut sequential = |label: &str, args: &[&str]| {
+        let started = std::time::Instant::now();
+        let output = env.run(args);
+        let command = started.elapsed();
+        let close = memory::await_owner_exit(&options)
+            .unwrap_or_else(|error| panic!("{args:?}: {error:#}"));
+        stopped();
+        observed.push(format!("{label}: command={command:?} close={close:?}"));
+        output
+    };
+    let seed = sequential("seed", &["run", "Seed memory for sequential inspection"]);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("between 1 and 1000"),
+        seed.status.success(),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&seed.stderr)
     );
-    warm("failing memory client");
-    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
-    kuru_memory::test_support::retire_idle_service(&options)
-        .await
-        .unwrap();
-    stopped();
+    let reopened = sequential(
+        "reopen",
+        &["run", "Reopen memory after the last owner closed"],
+    );
+    assert!(
+        reopened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reopened.stderr)
+    );
+    let status = sequential("status", &["memory", "status"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let failing = sequential("failing", &["memory", "history", "--limit", "0"]);
+    assert!(!failing.status.success());
+    assert!(
+        String::from_utf8_lossy(&failing.stderr).contains("between 1 and 1000"),
+        "{}",
+        String::from_utf8_lossy(&failing.stderr)
+    );
+    eprintln!(
+        "observed isolated CLI memory lifetime: {}; no optimization claim",
+        observed.join("; ")
+    );
 }

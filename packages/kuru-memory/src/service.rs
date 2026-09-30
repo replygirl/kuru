@@ -15,7 +15,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use kuru_platform::fs::{Directory, NameRetention, Privacy};
+use kuru_platform::fs::{Directory, NameRetention, Privacy, Publication, PublicationPhase};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -29,11 +29,34 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR: u16 = 7;
 pub const HANDSHAKE_LIMIT: usize = 16 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-pub const SERVICE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest single accept wait before the serve loop re-verifies its owner
+/// lock, while attachments are live or while a new owner awaits its starter.
+const OWNER_LOCK_RECHECK_INTERVAL: Duration = Duration::from_secs(35);
 const MAX_ATTACHMENTS: usize = 32;
 
 #[cfg(feature = "test-support")]
 const STARTUP_STAGE_DIAGNOSTIC_ENV: &str = "KURU_TEST_MEMORY_STARTUP_STAGES";
+
+/// Test-support hook: names an existing private file that receives the
+/// stderr of any owner this process spawns without a caller-supplied stderr.
+/// A test sets it on the CLI children it runs, so the owner a child elects
+/// logs where the test can read it. Inert when unset.
+#[cfg(feature = "test-support")]
+pub const OWNER_DIAGNOSTIC_ENV: &str = "KURU_TEST_MEMORY_OWNER_DIAGNOSTIC";
+
+/// The owner's diagnostic file named by [`OWNER_DIAGNOSTIC_ENV`], opened for
+/// append without creating it, so a child cannot invent a log location.
+#[cfg(feature = "test-support")]
+fn fixture_owner_diagnostic() -> Result<Option<File>> {
+    std::env::var_os(OWNER_DIAGNOSTIC_ENV)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            File::options().append(true).open(&path).with_context(|| {
+                format!("open test owner diagnostic {}", Path::new(&path).display())
+            })
+        })
+        .transpose()
+}
 
 #[cfg(feature = "test-support")]
 fn fixture_startup_stages_enabled() -> bool {
@@ -98,10 +121,10 @@ fn fixture_startup_observations(
         &options.project_scope,
         ServiceLockKind::Owner,
     ) {
-        Ok(Some(lock)) => {
-            drop(lock);
-            "free"
-        }
+        Ok(Some(lock)) => match lock.release() {
+            Ok(()) => "free",
+            Err(_) => "observation-failed",
+        },
         Ok(None) => "held",
         Err(_) => "observation-failed",
     };
@@ -153,6 +176,16 @@ fn parse_service_arguments(
         .to_str()
         .context("service startup timeout is not UTF-8")?
         .parse()?;
+    // Optional: a starter from before the token existed passes nine.
+    let starter_token = arguments
+        .next()
+        .map(|token| {
+            token
+                .to_str()
+                .and_then(|token| uuid::Uuid::parse_str(token).ok())
+                .context("invalid service starter token")
+        })
+        .transpose()?;
     ensure!(arguments.next().is_none(), "unexpected service argument");
     if let Some(path) = &supervisor {
         ensure!(
@@ -166,6 +199,7 @@ fn parse_service_arguments(
     options.config.offline = offline;
     options.config.startup_timeout_secs = startup_timeout_secs;
     options.supervisor = supervisor;
+    options.starter_token = starter_token;
     Ok((project, options))
 }
 
@@ -197,7 +231,20 @@ pub async fn client_fixture_entry(arguments: impl IntoIterator<Item = OsString>)
         })
         .await?;
     ensure!(matches!(result, ServiceValue::Unit));
-    println!("{}", client.generation());
+    // Report the attached generation, then keep the attachment until the
+    // caller closes stdin, so its sibling starter meets a live owner.
+    {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{}", client.generation())?;
+        stdout.flush()?;
+    }
+    tokio::task::spawn_blocking(|| {
+        use std::io::Read;
+        std::io::stdin().read_to_end(&mut Vec::new())
+    })
+    .await??;
+    drop(client);
     Ok(())
 }
 
@@ -239,15 +286,50 @@ pub type LocalStream = tokio::net::UnixStream;
 #[cfg(windows)]
 pub type LocalStream = kuru_platform::windows::pipe::Pipe;
 
-/// One live attachment. Keeping it open prevents the owner from idling out;
-/// a failed exchange invalidates the stream rather than replaying a write.
+/// One live attachment. An open attachment keeps the owner running; a failed
+/// exchange invalidates the stream for reuse rather than replaying a write.
 pub struct ServiceAttachment {
     stream: Option<LocalStream>,
+    /// A stream whose exchange did not complete, kept open but never used
+    /// again, so the owner still counts this client until a replacement
+    /// connection has been installed. Only with `retain_after_abandon`.
+    held: Option<LocalStream>,
+    retain_after_abandon: bool,
     authority: EndpointAuthority,
     locator: Option<AttachmentLocator>,
     last_fault: Option<rpc::ServiceFault>,
     #[cfg(any(test, feature = "test-support"))]
     reply_pause: Option<Arc<rpc::ReplyPause>>,
+}
+
+/// Owns a stream for the length of one exchange. Unless the exchange
+/// completes, dropping it (on an error or a cancelled call) parks the stream
+/// in `held` when the attachment retains abandoned streams, and otherwise
+/// closes it.
+struct InFlight<'a> {
+    stream: Option<LocalStream>,
+    held: &'a mut Option<LocalStream>,
+    retain: bool,
+}
+
+impl InFlight<'_> {
+    fn stream(&mut self) -> &mut LocalStream {
+        self.stream.as_mut().expect("stream in flight")
+    }
+
+    fn complete(mut self) -> LocalStream {
+        self.stream.take().expect("stream in flight")
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.take()
+            && self.retain
+        {
+            *self.held = Some(stream);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -278,6 +360,8 @@ impl AttachmentFactory {
         connect_handshake(&mut stream, &self.authority).await?;
         Ok(ServiceAttachment {
             stream: Some(stream),
+            held: None,
+            retain_after_abandon: false,
             authority: self.authority.clone(),
             locator: Some(self.locator.clone()),
             last_fault: None,
@@ -316,21 +400,35 @@ impl ServiceAttachment {
         id: uuid::Uuid,
         call: ServiceCall,
     ) -> Result<ServiceValue> {
-        let mut stream = self
+        let stream = self
             .stream
             .take()
             .context("memory service attachment is closed")?;
         self.last_fault = None;
+        // A live stream and a held one never coexist: after an incomplete
+        // exchange this attachment has no stream until it is replaced.
+        let mut in_flight = InFlight {
+            stream: Some(stream),
+            held: &mut self.held,
+            retain: self.retain_after_abandon,
+        };
         #[cfg(any(test, feature = "test-support"))]
         let response = if let Some(pause) = self.reply_pause.take() {
-            rpc::exchange_attached_with_id_paused(&mut stream, &self.authority, id, call, &pause)
-                .await?
+            rpc::exchange_attached_with_id_paused(
+                in_flight.stream(),
+                &self.authority,
+                id,
+                call,
+                &pause,
+            )
+            .await?
         } else {
-            rpc::exchange_attached_with_id(&mut stream, &self.authority, id, call).await?
+            rpc::exchange_attached_with_id(in_flight.stream(), &self.authority, id, call).await?
         };
         #[cfg(not(any(test, feature = "test-support")))]
         let response =
-            rpc::exchange_attached_with_id(&mut stream, &self.authority, id, call).await?;
+            rpc::exchange_attached_with_id(in_flight.stream(), &self.authority, id, call).await?;
+        let stream = in_flight.complete();
         self.last_fault = match &response {
             rpc::ServiceResponse::Rejected(fault) => Some(*fault),
             rpc::ServiceResponse::Success(_) => None,
@@ -356,8 +454,26 @@ impl ServiceAttachment {
         })
     }
 
+    /// Close the live stream and any held one. A held stream left in a
+    /// retained clone of this attachment would otherwise keep the owner
+    /// running after an explicit close.
     pub fn close(&mut self) {
         self.stream = None;
+        self.held = None;
+    }
+
+    /// Keep the stream of an incomplete exchange open, unused, until this
+    /// attachment is replaced (Option B for a writable session's primary).
+    pub(crate) fn retain_after_abandon(&mut self) {
+        self.retain_after_abandon = true;
+    }
+
+    pub(crate) fn retains_after_abandon(&self) -> bool {
+        self.retain_after_abandon
+    }
+
+    pub(crate) fn holds_abandoned_stream(&self) -> bool {
+        self.held.is_some()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -426,7 +542,7 @@ pub async fn attach_or_start(
     {
         return Ok(attached);
     }
-    let _start = loop {
+    let start = loop {
         if let Some(lock) = ServiceLock::try_acquire(
             &options.data_dir,
             &options.project_scope,
@@ -446,6 +562,24 @@ pub async fn attach_or_start(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
+    let attached = attach_or_spawn_elected(options, project, executable, started, deadline).await;
+    // Released explicitly on every path: a sibling's child between fork and
+    // exec may hold a duplicate of this lock's description.
+    let released = start.release();
+    let attached = attached?;
+    released?;
+    Ok(attached)
+}
+
+/// The elected part of [`attach_or_start`], run while the caller holds the
+/// start lock.
+async fn attach_or_spawn_elected(
+    options: &crate::store::OpenOptions,
+    project: &Path,
+    executable: &Path,
+    started: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+) -> Result<ServiceAttachment> {
     let elected = tokio::time::Instant::now();
     if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project)
         .await
@@ -454,20 +588,19 @@ pub async fn attach_or_start(
         return Ok(attached);
     }
     loop {
-        // A live owner may still be booting, or reaping Dolt after dropping
+        // A live owner may still be booting, or reaping Dolt after retiring
         // its endpoint. A busy lock never authorizes another spawn.
         if let Some(owner_probe) = ServiceLock::try_acquire(
             &options.data_dir,
             &options.project_scope,
             ServiceLockKind::Owner,
         )? {
-            owner_probe.verify()?;
-            drop(owner_probe);
+            owner_probe.release()?;
             break;
         }
         ensure!(
             tokio::time::Instant::now() < deadline,
-            "existing memory service owner did not publish a valid endpoint"
+            "the previous memory service was still shutting down or did not publish a valid endpoint within memory.startup_timeout_secs"
         );
         if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project)
             .await
@@ -484,41 +617,59 @@ pub async fn attach_or_start(
         .transpose()
         .context("create private test startup diagnostic")?;
     #[cfg(feature = "test-support")]
-    let child_stderr = startup_diagnostic
+    let child_stderr = match startup_diagnostic
         .as_ref()
         .map(File::try_clone)
         .transpose()
-        .context("reopen private test startup diagnostic")?;
+        .context("reopen private test startup diagnostic")?
+    {
+        Some(stderr) => Some(stderr),
+        None => fixture_owner_diagnostic()?,
+    };
     #[cfg(not(feature = "test-support"))]
     let child_stderr = None;
+    // Only this starter presents the token, and only to the child it spawns
+    // here; a token reused from the session's options cannot reach another
+    // owner.
+    let starter_token = options.starter_token.unwrap_or_else(uuid::Uuid::new_v4);
     let mut child = ServiceProcess::new(
-        spawn_service(options, project, executable, child_stderr)
-            .await
-            .context("spawn elected memory service owner")?,
+        spawn_service(
+            options,
+            project,
+            executable,
+            child_stderr,
+            Some(starter_token),
+        )
+        .await
+        .context("spawn elected memory service owner")?,
     );
     let spawned = tokio::time::Instant::now();
     let mut polls: u32 = 0;
     loop {
         polls = polls.saturating_add(1);
-        let last_attach =
-            match try_attach_observed(&options.data_dir, &options.project_scope, project).await {
-                Ok(Ok(attached)) => return Ok(attached),
-                Ok(Err(miss)) => miss,
-                Err(error) => {
-                    let child_state = match child.try_wait() {
-                        Ok(Some(status)) => format!("exited with {status}"),
-                        Ok(None) => "remained running".into(),
-                        Err(status_error) => {
-                            format!("status observation failed with {status_error}")
-                        }
-                    };
-                    return Err(error).with_context(|| {
-                        format!(
-                            "attach after starting the elected memory service; child {child_state}"
-                        )
-                    });
-                }
-            };
+        let last_attach = match try_attach_observed(
+            &options.data_dir,
+            &options.project_scope,
+            project,
+            Some(starter_token),
+        )
+        .await
+        {
+            Ok(Ok(attached)) => return Ok(attached),
+            Ok(Err(miss)) => miss,
+            Err(error) => {
+                let child_state = match child.try_wait() {
+                    Ok(Some(status)) => format!("exited with {status}"),
+                    Ok(None) => "remained running".into(),
+                    Err(status_error) => {
+                        format!("status observation failed with {status_error}")
+                    }
+                };
+                return Err(error).with_context(|| {
+                    format!("attach after starting the elected memory service; child {child_state}")
+                });
+            }
+        };
         if let Some(status) = child.try_wait()? {
             bail!("memory service exited before readiness: {status}");
         }
@@ -547,6 +698,10 @@ pub async fn attach_or_start(
 
 /// A read-only inspection may attach to a published owner without electing or
 /// starting one. The fallback remains an explicitly local read-only open.
+///
+/// The owner lock is probed only while this inspection holds the start lock:
+/// no starter can then be between its election and its owner's single
+/// owner-lock acquisition, which the probe could otherwise make fail.
 pub(crate) async fn attach_existing(
     options: &crate::store::OpenOptions,
     project: &Path,
@@ -561,13 +716,25 @@ pub(crate) async fn attach_existing(
         {
             return Ok(Some(attachment));
         }
-        if let Some(owner_probe) = ServiceLock::try_acquire(
+        if let Some(start) = ServiceLock::try_acquire(
             &options.data_dir,
             &options.project_scope,
-            ServiceLockKind::Owner,
+            ServiceLockKind::Start,
         )? {
-            owner_probe.verify()?;
-            return Ok(None);
+            let owner_probe = ServiceLock::try_acquire(
+                &options.data_dir,
+                &options.project_scope,
+                ServiceLockKind::Owner,
+            );
+            let owner_free = match owner_probe {
+                Ok(Some(owner_probe)) => owner_probe.release().map(|()| true),
+                Ok(None) => Ok(false),
+                Err(error) => Err(error),
+            };
+            start.release()?;
+            if owner_free? {
+                return Ok(None);
+            }
         }
         ensure!(
             tokio::time::Instant::now() < deadline,
@@ -596,15 +763,17 @@ impl AttachMiss {
 }
 
 async fn try_attach(data: &Path, scope: &str, project: &Path) -> Result<Option<ServiceAttachment>> {
-    Ok(try_attach_observed(data, scope, project).await?.ok())
+    Ok(try_attach_observed(data, scope, project, None).await?.ok())
 }
 
 /// [`try_attach`] that also names which existing check found no usable
-/// owner. It performs exactly the same reads, connects and handshake.
+/// owner. It performs exactly the same reads, connects and handshake. Only a
+/// starter attaching to the child it just spawned presents its token.
 async fn try_attach_observed(
     data: &Path,
     scope: &str,
     project: &Path,
+    starter_token: Option<uuid::Uuid>,
 ) -> Result<std::result::Result<ServiceAttachment, AttachMiss>> {
     let Some(record) = EndpointRecord::read(data, scope)? else {
         return Ok(Err(AttachMiss::NoEndpoint));
@@ -615,22 +784,12 @@ async fn try_attach_observed(
     );
     let mut stream = match connect_local(data, scope, &record.address, HANDSHAKE_TIMEOUT).await {
         Ok(stream) => stream,
-        Err(error)
-            if error
-                .chain()
-                .filter_map(|cause| cause.downcast_ref::<io::Error>())
-                .any(|cause| {
-                    matches!(
-                        cause.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                    )
-                }) =>
-        {
+        Err(error) if is_transport_unavailable(&error) => {
             return Ok(Err(AttachMiss::TransportUnavailable));
         }
         Err(error) => return Err(error),
     };
-    match connect_handshake(&mut stream, &record.authority).await {
+    match connect_handshake_presenting(&mut stream, &record.authority, starter_token).await {
         Ok(()) => {}
         // Endpoint retirement and final transport close are distinct steps.
         // A client can connect to the retiring endpoint just before the owner
@@ -642,6 +801,8 @@ async fn try_attach_observed(
     }
     Ok(Ok(ServiceAttachment {
         stream: Some(stream),
+        held: None,
+        retain_after_abandon: false,
         authority: record.authority,
         locator: Some(AttachmentLocator {
             data: data.to_owned(),
@@ -651,6 +812,37 @@ async fn try_attach_observed(
         #[cfg(any(test, feature = "test-support"))]
         reply_pause: None,
     }))
+}
+
+/// A published endpoint that cannot be reached is a transport observation
+/// for an electing client, never owner authority: the owner may have closed
+/// its listener while retiring. On Windows a pipe whose instances stayed busy
+/// through the connect deadline is the same observation. A session bound to
+/// one generation does not use this; it cannot elect.
+fn is_transport_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<io::Error>())
+        .any(|cause| {
+            matches!(
+                cause.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) || is_no_free_instance(cause)
+        })
+}
+
+/// Whether a Windows connect exhausted its deadline on busy pipe instances.
+/// The platform connector marks that case with a typed payload; the error
+/// text alone never matches.
+#[cfg(windows)]
+fn is_no_free_instance(error: &io::Error) -> bool {
+    kuru_platform::windows::pipe::is_no_free_instance(error)
+}
+
+/// A Unix connect has no busy-instance state.
+#[cfg(not(windows))]
+fn is_no_free_instance(_error: &io::Error) -> bool {
+    false
 }
 
 fn ensure_project_scope(project: &Path, scope: &str) -> Result<()> {
@@ -673,11 +865,18 @@ fn ensure_project_scope(project: &Path, scope: &str) -> Result<()> {
     Ok(())
 }
 
-fn service_arguments(options: &crate::store::OpenOptions, project: &Path) -> Vec<OsString> {
+/// The owner's arguments. A starter token, when given, is the optional
+/// tenth argument; the owner then retires on its own only after an
+/// attachment presents it.
+fn service_arguments(
+    options: &crate::store::OpenOptions,
+    project: &Path,
+    starter_token: Option<uuid::Uuid>,
+) -> Vec<OsString> {
     fn path_or_dash(path: Option<&PathBuf>) -> OsString {
         path.map_or_else(|| OsString::from("-"), |path| path.as_os_str().to_owned())
     }
-    vec![
+    let mut arguments = vec![
         "--internal-memory-service".into(),
         project.as_os_str().to_owned(),
         options.data_dir.as_os_str().to_owned(),
@@ -687,7 +886,11 @@ fn service_arguments(options: &crate::store::OpenOptions, project: &Path) -> Vec
         path_or_dash(options.supervisor.as_ref()),
         if options.config.offline { "1" } else { "0" }.into(),
         options.config.startup_timeout_secs.to_string().into(),
-    ]
+    ];
+    if let Some(token) = starter_token {
+        arguments.push(token.to_string().into());
+    }
+    arguments
 }
 
 #[cfg(unix)]
@@ -696,10 +899,11 @@ async fn spawn_service(
     project: &Path,
     executable: &Path,
     stderr: Option<File>,
+    starter_token: Option<uuid::Uuid>,
 ) -> Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     let mut command = std::process::Command::new(executable);
-    command.args(service_arguments(options, project));
+    command.args(service_arguments(options, project, starter_token));
     command.current_dir(project);
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
@@ -719,10 +923,11 @@ async fn spawn_service(
     project: &Path,
     executable: &Path,
     stderr: Option<File>,
+    starter_token: Option<uuid::Uuid>,
 ) -> Result<kuru_platform::windows::process::NativeChild> {
     use kuru_platform::windows::process::{Console, Lifetime, NativeSpawnSpec, Stdio};
     let mut command = NativeSpawnSpec::new(executable.to_owned(), project.to_owned());
-    command.args = service_arguments(options, project);
+    command.args = service_arguments(options, project, starter_token);
     command.lifetime = Lifetime::IndependentService;
     command.console = Console::PrivateHidden;
     command.stderr = stderr.map_or(Stdio::Null, |file| Stdio::Handle(file.into()));
@@ -799,18 +1004,32 @@ impl Drop for ServiceProcess {
     }
 }
 
-/// Test-only retained actual owner. Its stderr is a caller-owned private file;
-/// ordinary service launches continue to discard stderr.
+/// Test-only retained actual owner and the attachment of the fixture that
+/// started it. Its stderr is a caller-owned private file; ordinary service
+/// launches continue to discard stderr. The fixture presented its starter
+/// token, so the owner retires on its own once this attachment and every
+/// other client have released.
 #[cfg(feature = "test-support")]
-pub struct FixtureLoggedOwner(ServiceProcess);
+pub struct FixtureLoggedOwner {
+    process: ServiceProcess,
+    attachment: ServiceAttachment,
+}
 
 #[cfg(feature = "test-support")]
 impl FixtureLoggedOwner {
+    /// The starter's own attachment. The owner counts it like any client,
+    /// so a request sent on it is served while it is the sole attachment.
+    pub fn attachment(&mut self) -> &mut ServiceAttachment {
+        &mut self.attachment
+    }
+
+    /// Release the starter's attachment, then await the owner's own exit.
     pub async fn wait_for_exit(mut self) -> Result<()> {
+        self.attachment.close();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some(status) = self.0.try_wait()? {
-                self.0.0.take();
+            if let Some(status) = self.process.try_wait()? {
+                self.process.0.take();
                 ensure!(
                     status.success(),
                     "fixture memory owner exited unsuccessfully"
@@ -844,16 +1063,32 @@ pub(crate) async fn spawn_logged_owner_fixture(
             .is_none(),
         "fixture already has a managed memory owner"
     );
-    let mut child =
-        ServiceProcess::new(spawn_service(options, project, executable, Some(diagnostic)).await?);
+    let starter_token = uuid::Uuid::new_v4();
+    let mut child = ServiceProcess::new(
+        spawn_service(
+            options,
+            project,
+            executable,
+            Some(diagnostic),
+            Some(starter_token),
+        )
+        .await?,
+    );
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(options.config.startup_timeout_secs);
     loop {
-        if let Some(mut attached) =
-            try_attach(&options.data_dir, &options.project_scope, project).await?
+        if let Ok(attachment) = try_attach_observed(
+            &options.data_dir,
+            &options.project_scope,
+            project,
+            Some(starter_token),
+        )
+        .await?
         {
-            attached.close();
-            return Ok(FixtureLoggedOwner(child));
+            return Ok(FixtureLoggedOwner {
+                process: child,
+                attachment,
+            });
         }
         ensure!(
             child.try_wait()?.is_none(),
@@ -874,9 +1109,121 @@ pub struct ServiceListener {
     inner: kuru_platform::windows::pipe::PrivateServiceListener,
 }
 
+/// Which authenticated attachment marks a new owner as reached by the client
+/// that started it. Until then an empty owner waits for that client instead
+/// of retiring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// Only the attachment that presents this starter token.
+    Starter(uuid::Uuid),
+    /// Any authenticated attachment: an owner started without a token, by a
+    /// starter from before the token existed.
+    #[default]
+    AnyAttachment,
+    /// No attachment: an in-process test owner, which ends only through
+    /// maintenance retirement, a fixture restart or lock loss.
+    #[cfg(test)]
+    Never,
+}
+
+/// Serve-loop policy. [`ServiceOwner::serve`] derives it from the owner's
+/// starter token; in-process tests choose their own through `serve_with`.
+pub(crate) struct ServeKnobs {
+    pub(crate) admission: Admission,
+    /// How long after endpoint publication an owner not yet reached keeps
+    /// waiting for its starter once empty. `None`: without bound.
+    pub(crate) first_attachment: Option<Duration>,
+    /// Longest single accept wait before the owner lock is re-verified.
+    pub(crate) recheck: Duration,
+    #[cfg(test)]
+    pub(crate) observer: Option<tokio::sync::mpsc::UnboundedSender<ServeEvent>>,
+    #[cfg(test)]
+    pub(crate) close_pause: Option<Arc<ClosePause>>,
+    #[cfg(test)]
+    pub(crate) dispatch_pause: Option<Arc<rpc::DispatchPause>>,
+}
+
+#[cfg(test)]
+impl ServeKnobs {
+    /// An in-process fixture owner: never reached, so it outlives its last
+    /// client until maintenance retires it, as fixtures expect.
+    pub(crate) fn never_reached() -> Self {
+        Self {
+            admission: Admission::Never,
+            first_attachment: None,
+            recheck: OWNER_LOCK_RECHECK_INTERVAL,
+            observer: None,
+            close_pause: None,
+            dispatch_pause: None,
+        }
+    }
+
+    fn emit(&self, event: ServeEvent) {
+        if let Some(observer) = &self.observer {
+            let _ = observer.send(event);
+        }
+    }
+}
+
+/// Serve-loop events, in the order the loop acts on them. `EnteredEmpty` is
+/// sent when the loop first finds no attachment: at the start and after the
+/// join that ended the last one, not again on each lock recheck.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServeEvent {
+    AttachmentAccepted { active: usize },
+    AttachmentJoined { remaining: usize },
+    EnteredEmpty { reached: bool },
+    LockRechecked,
+}
+
+/// Where a test holds an owner's shutdown, in shutdown order.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClosePoint {
+    BeforeListenerDrop,
+    AfterListenerDrop,
+    AfterEndpointRetire,
+    /// After the store close and Dolt reap, before the owner lock release.
+    AfterReap,
+}
+
+/// An owner-local test barrier at each of its [`ClosePoint`]s. Modelled on
+/// `ReplyPause`: at each point the owner notifies `entered`, then waits for
+/// `release`.
+#[cfg(test)]
+pub(crate) struct ClosePause {
+    at: Vec<ClosePoint>,
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ClosePause {
+    pub(crate) fn at(point: ClosePoint) -> Arc<Self> {
+        Self::at_each(&[point])
+    }
+
+    pub(crate) fn at_each(points: &[ClosePoint]) -> Arc<Self> {
+        Arc::new(Self {
+            at: points.to_vec(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    async fn reached(pause: Option<&Self>, point: ClosePoint) {
+        if let Some(pause) = pause.filter(|pause| pause.at.contains(&point)) {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+}
+
 /// The service process owns this state after the short starter election lock
 /// has been released. The caller must stop accepting and drain live handlers
-/// before `close`; normal shutdown then reaps Dolt before retiring discovery.
+/// before `close`; normal shutdown retires discovery, then reaps Dolt before
+/// releasing owner authority.
 pub struct ServiceOwner {
     lock: ServiceLock,
     store: crate::store::MemoryStore,
@@ -884,6 +1231,10 @@ pub struct ServiceOwner {
     record: EndpointRecord,
     data_dir: PathBuf,
     receipt_progress: std::sync::Arc<rpc::ReceiptProgress>,
+    starter_token: Option<uuid::Uuid>,
+    startup_timeout: Duration,
+    /// Taken after the endpoint record was published.
+    published: tokio::time::Instant,
 }
 
 impl ServiceOwner {
@@ -934,6 +1285,9 @@ impl ServiceOwner {
             record,
             data_dir: options.data_dir,
             receipt_progress: std::sync::Arc::new(rpc::ReceiptProgress::default()),
+            starter_token: options.starter_token,
+            startup_timeout: Duration::from_secs(options.config.startup_timeout_secs),
+            published: tokio::time::Instant::now(),
         })
     }
 
@@ -951,36 +1305,66 @@ impl ServiceOwner {
         self.listener.accept(deadline).await
     }
 
-    /// Run until the last client releases its connection and the idle grace
-    /// elapses. Each connection has one generation-bound attachment; the store
-    /// itself keeps reads concurrent and serializes short writes.
-    pub async fn serve(mut self) -> Result<()> {
-        let served = self.serve_until_idle().await;
-        let closed = self.close().await;
+    /// The product policy: reached by the attachment that presents this
+    /// owner's starter token, or by any attachment when started without one.
+    pub(crate) fn knobs(&self) -> ServeKnobs {
+        ServeKnobs {
+            admission: self
+                .starter_token
+                .map_or(Admission::AnyAttachment, Admission::Starter),
+            first_attachment: Some(self.startup_timeout),
+            recheck: OWNER_LOCK_RECHECK_INTERVAL,
+            #[cfg(test)]
+            observer: None,
+            #[cfg(test)]
+            close_pause: None,
+            #[cfg(test)]
+            dispatch_pause: None,
+        }
+    }
+
+    /// Run until the last attachment is released after the starter has
+    /// attached. Each connection has one generation-bound attachment; the
+    /// store itself keeps reads concurrent and serializes short writes.
+    pub async fn serve(self) -> Result<()> {
+        let knobs = self.knobs();
+        self.serve_knobs(knobs).await
+    }
+
+    /// [`Self::serve`] under a test's own policy, observer and pauses.
+    #[cfg(test)]
+    pub(crate) async fn serve_with(self, knobs: ServeKnobs) -> Result<()> {
+        self.serve_knobs(knobs).await
+    }
+
+    async fn serve_knobs(mut self, knobs: ServeKnobs) -> Result<()> {
+        let served = self.serve_until_retired(&knobs).await;
+        #[cfg(test)]
+        let closed = self.close_paused(knobs.close_pause.as_deref()).await;
+        #[cfg(not(test))]
+        let closed = self.close_paused().await;
         served.and(closed)
     }
 
-    async fn serve_until_idle(&mut self) -> Result<()> {
-        self.serve_until_idle_with(
-            SERVICE_IDLE_TIMEOUT,
-            SERVICE_IDLE_TIMEOUT + HANDSHAKE_TIMEOUT,
-        )
-        .await
-    }
-
-    async fn serve_until_idle_with(
-        &mut self,
-        idle_timeout: Duration,
-        accept_timeout: Duration,
-    ) -> Result<()> {
+    async fn serve_until_retired(&mut self, knobs: &ServeKnobs) -> Result<()> {
         let mut attachments = tokio::task::JoinSet::new();
         let frame_budget = std::sync::Arc::new(tokio::sync::Semaphore::new(rpc::FRAME_BUDGET_MIB));
-        let retirement = std::sync::Arc::new(rpc::Retirement::default());
+        let retirement = std::sync::Arc::new(rpc::Retirement::new(knobs.admission));
+        #[cfg(test)]
+        if let Some(pause) = &knobs.dispatch_pause {
+            retirement.pause_next_dispatch(pause.clone());
+        }
+        // Absolute, so rejected or non-starter connections never restart it.
+        let starter_deadline = knobs.first_attachment.map(|within| self.published + within);
+        #[cfg(test)]
+        let mut was_empty = false;
         loop {
             if let Err(error) = self.lock.verify() {
                 abort_and_drain(&mut attachments).await;
                 return Err(error);
             }
+            #[cfg(test)]
+            knobs.emit(ServeEvent::LockRechecked);
             if retirement.requested() {
                 while let Some(completed) = attachments.join_next().await {
                     if let Err(error) = completed {
@@ -990,19 +1374,63 @@ impl ServiceOwner {
                 break;
             }
             if attachments.is_empty() {
+                // `reached` is set inside an attachment task; the join that
+                // emptied the set orders that write before this read.
+                let reached = retirement.reached();
+                #[cfg(test)]
+                if !std::mem::replace(&mut was_empty, true) {
+                    knobs.emit(ServeEvent::EnteredEmpty { reached });
+                }
+                if reached {
+                    break;
+                }
+                // Not reached yet: keep serving other clients while the
+                // starter may still attach, within its startup budget.
+                let accept_within = match starter_deadline {
+                    Some(deadline) => {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            tracing::warn!(
+                                "memory service retiring: no starter attached within the startup timeout"
+                            );
+                            break;
+                        }
+                        remaining.min(knobs.recheck)
+                    }
+                    None => knobs.recheck,
+                };
                 tokio::select! {
                     biased;
-                    accepted = self.listener.accept(accept_timeout) => {
-                        self.attach(accepted?, &mut attachments, &frame_budget, &retirement);
-                    }
-                    _ = tokio::time::sleep(idle_timeout) => break,
-                    _ = retirement.notified() => continue,
+                    accepted = self.listener.accept(accept_within) => match accepted {
+                        Ok(stream) => {
+                            if self.attach(stream, &mut attachments, &frame_budget, &retirement) {
+                                #[cfg(test)]
+                                {
+                                    was_empty = false;
+                                    knobs.emit(ServeEvent::AttachmentAccepted {
+                                        active: retirement.active(),
+                                    });
+                                }
+                            }
+                        }
+                        Err(error) if is_accept_timeout(&error) => continue,
+                        Err(error) => return Err(error),
+                    },
+                    () = retirement.notified() => continue,
                 }
             } else {
                 tokio::select! {
-                    accepted = self.listener.accept(accept_timeout) => {
+                    accepted = self.listener.accept(knobs.recheck) => {
                         match accepted {
-                            Ok(stream) => self.attach(stream, &mut attachments, &frame_budget, &retirement),
+                            Ok(stream) => {
+                                if self.attach(stream, &mut attachments, &frame_budget, &retirement) {
+                                    #[cfg(test)]
+                                    knobs.emit(ServeEvent::AttachmentAccepted {
+                                        active: retirement.active(),
+                                    });
+                                }
+                            }
                             Err(error) if is_accept_timeout(&error) => continue,
                             Err(error) => {
                                 abort_and_drain(&mut attachments).await;
@@ -1014,8 +1442,12 @@ impl ServiceOwner {
                         if let Some(Err(error)) = completed {
                             tracing::warn!(error = %error, "memory service attachment task failed");
                         }
+                        #[cfg(test)]
+                        knobs.emit(ServeEvent::AttachmentJoined {
+                            remaining: attachments.len(),
+                        });
                     }
-                    _ = retirement.notified() => continue,
+                    () = retirement.notified() => continue,
                 }
             }
         }
@@ -1028,12 +1460,12 @@ impl ServiceOwner {
         attachments: &mut tokio::task::JoinSet<()>,
         frame_budget: &std::sync::Arc<tokio::sync::Semaphore>,
         retirement: &std::sync::Arc<rpc::Retirement>,
-    ) {
+    ) -> bool {
         if attachments.len() >= MAX_ATTACHMENTS {
-            return;
+            return false;
         }
         let Some(retained) = retirement.attached() else {
-            return;
+            return false;
         };
         let authority = self.record.authority.clone();
         let store = self.store.clone();
@@ -1057,25 +1489,47 @@ impl ServiceOwner {
                 tracing::warn!(error = %error, "memory service attachment ended with an error");
             }
         });
+        true
     }
 
-    /// Close only after accepted requests and client attachments have drained.
-    /// A crash instead leaves a stale record which a successor reconciles only
-    /// after obtaining owner and existing lifecycle authority.
+    /// Close only after accepted requests and client attachments have
+    /// drained: stop accepting, retire the endpoint, close the store (its
+    /// write drain and the Dolt reap, which ends the lifecycle lease), and
+    /// only then release owner authority. A crash instead leaves a stale
+    /// record which a successor reconciles only after obtaining owner and
+    /// existing lifecycle authority.
     pub async fn close(self) -> Result<()> {
+        #[cfg(test)]
+        let closed = self.close_paused(None).await;
+        #[cfg(not(test))]
+        let closed = self.close_paused().await;
+        closed
+    }
+
+    async fn close_paused(self, #[cfg(test)] pause: Option<&ClosePause>) -> Result<()> {
         let Self {
             lock,
             store,
             listener,
             record,
             data_dir,
-            receipt_progress: _,
+            ..
         } = self;
+        #[cfg(test)]
+        ClosePause::reached(pause, ClosePoint::BeforeListenerDrop).await;
         drop(listener);
-        store.close().await?;
-        record.retire(&data_dir, &lock)?;
-        lock.verify()?;
-        Ok(())
+        #[cfg(test)]
+        ClosePause::reached(pause, ClosePoint::AfterListenerDrop).await;
+        let retired = record.retire(&data_dir, &lock);
+        #[cfg(test)]
+        ClosePause::reached(pause, ClosePoint::AfterEndpointRetire).await;
+        // A failed retirement still closes the store and reaps Dolt; the
+        // owner lock is released only after that close has returned.
+        let closed = store.close().await;
+        #[cfg(test)]
+        ClosePause::reached(pause, ClosePoint::AfterReap).await;
+        let released = lock.release();
+        retired.and(closed).and(released)
     }
 }
 
@@ -1209,8 +1663,111 @@ pub(crate) struct MaintenancePermit {
     _owner: ServiceLock,
 }
 
+/// Where a maintenance permit acquisition is, for a caller whose own bound
+/// may cancel it: that caller can name the step it was cancelled in instead
+/// of reporting only that its deadline elapsed.
+#[derive(Default)]
+pub(crate) struct MaintenanceTrace(std::sync::Mutex<MaintenanceStep>);
+
+#[derive(Clone, Copy, Default)]
+struct MaintenanceStep {
+    phase: MaintenancePhase,
+    /// When the current phase began.
+    since: Option<tokio::time::Instant>,
+    /// When the wait for the current lock (start, then owner) began.
+    lock_since: Option<tokio::time::Instant>,
+    /// Retirement requests that found no live endpoint to ask.
+    unanswered: u32,
+    /// Retirement requests the owner refused because clients were attached.
+    busy: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+enum MaintenancePhase {
+    #[default]
+    NotStarted,
+    StartLock,
+    OwnerLock,
+    Requesting,
+    AwaitingRetirement,
+}
+
+impl MaintenanceTrace {
+    /// Begin waiting for the next lock.
+    fn wait_for(&self, phase: MaintenancePhase) {
+        let now = tokio::time::Instant::now();
+        let mut step = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        step.lock_since = Some(now);
+        step.phase = phase;
+        step.since = Some(now);
+    }
+
+    fn enter(&self, phase: MaintenancePhase) {
+        let mut step = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        step.phase = phase;
+        step.since = Some(tokio::time::Instant::now());
+    }
+
+    fn record(&self, outcome: Option<bool>) {
+        let mut step = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match outcome {
+            None => step.unanswered = step.unanswered.saturating_add(1),
+            Some(false) => step.busy = step.busy.saturating_add(1),
+            Some(true) => {}
+        }
+    }
+}
+
+impl std::fmt::Display for MaintenanceTrace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let step = *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let phase = match step.phase {
+            MaintenancePhase::NotStarted => "not started",
+            MaintenancePhase::StartLock => "waiting for the start lock",
+            MaintenancePhase::OwnerLock => "waiting for the owner lock",
+            MaintenancePhase::Requesting => {
+                "asking the owner to retire (endpoint read, connect or reply)"
+            }
+            MaintenancePhase::AwaitingRetirement => {
+                "waiting for the owner lock after the owner accepted retirement"
+            }
+        };
+        let elapsed = |instant: Option<tokio::time::Instant>| {
+            instant.map_or(0, |instant| instant.elapsed().as_millis())
+        };
+        write!(
+            formatter,
+            "maintenance {phase} for {}ms (this lock's wait {}ms); requests without a live endpoint={}; busy replies={}",
+            elapsed(step.since),
+            elapsed(step.lock_since),
+            step.unanswered,
+            step.busy
+        )
+    }
+}
+
 pub(crate) async fn acquire_maintenance_permit(
     options: &crate::store::OpenOptions,
+) -> Result<MaintenancePermit> {
+    acquire_maintenance_permit_traced(options, &MaintenanceTrace::default()).await
+}
+
+/// [`acquire_maintenance_permit`], recording each step in `trace`.
+pub(crate) async fn acquire_maintenance_permit_traced(
+    options: &crate::store::OpenOptions,
+    trace: &MaintenanceTrace,
 ) -> Result<MaintenancePermit> {
     options.config.validate()?;
     ensure!(
@@ -1219,6 +1776,7 @@ pub(crate) async fn acquire_maintenance_permit(
     );
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(options.config.startup_timeout_secs);
+    trace.wait_for(MaintenancePhase::StartLock);
     let start = loop {
         if let Some(lock) = ServiceLock::try_acquire(
             &options.data_dir,
@@ -1235,6 +1793,7 @@ pub(crate) async fn acquire_maintenance_permit(
     };
     let mut retirement_requested = false;
     let mut busy_observations = 0;
+    trace.wait_for(MaintenancePhase::OwnerLock);
     let owner = loop {
         if let Some(lock) = ServiceLock::try_acquire(
             &options.data_dir,
@@ -1244,10 +1803,17 @@ pub(crate) async fn acquire_maintenance_permit(
             break lock;
         }
         if !retirement_requested {
-            match tokio::time::timeout_at(deadline, request_idle_retirement(options))
+            trace.enter(MaintenancePhase::Requesting);
+            let outcome = tokio::time::timeout_at(deadline, request_idle_retirement(options))
                 .await
-                .context("memory maintenance owner-response deadline exceeded")??
-            {
+                .context("memory maintenance owner-response deadline exceeded")??;
+            trace.record(outcome);
+            trace.enter(if outcome == Some(true) {
+                MaintenancePhase::AwaitingRetirement
+            } else {
+                MaintenancePhase::OwnerLock
+            });
+            match outcome {
                 Some(true) => retirement_requested = true,
                 Some(false) => {
                     busy_observations += 1;
@@ -1289,34 +1855,31 @@ async fn request_idle_retirement(options: &crate::store::OpenOptions) -> Result<
     .await
     {
         Ok(stream) => stream,
-        Err(error)
-            if error
-                .chain()
-                .filter_map(|cause| cause.downcast_ref::<io::Error>())
-                .any(|cause| {
-                    matches!(
-                        cause.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                    )
-                }) =>
-        {
-            return Ok(None);
-        }
+        Err(error) if is_transport_unavailable(&error) => return Ok(None),
         Err(error) => return Err(error).context("connect to memory service for maintenance"),
     };
     let mut attachment = ServiceAttachment {
         stream: Some(stream),
+        held: None,
+        retain_after_abandon: false,
         authority: record.authority,
         locator: None,
         last_fault: None,
         #[cfg(any(test, feature = "test-support"))]
         reply_pause: None,
     };
-    connect_handshake(
+    match connect_handshake(
         attachment.stream.as_mut().expect("new maintenance stream"),
         &attachment.authority,
     )
-    .await?;
+    .await
+    {
+        Ok(()) => {}
+        // An owner retiring on its own closes a connection it will never
+        // accept; wait for its owner lock as for a missing endpoint.
+        Err(error) if is_peer_closed(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    }
     let result = attachment.call(ServiceCall::RetireIfIdle).await;
     attachment.close();
     match result? {
@@ -1326,13 +1889,11 @@ async fn request_idle_retirement(options: &crate::store::OpenOptions) -> Result<
 }
 
 impl ServiceLock {
-    /// A busy owner lock means an existing process may still be cleaning up.
-    /// Never remove its lockfile or infer takeover authority from a PID.
-    pub fn try_acquire(
+    fn location(
         data_dir: &Path,
         scope: &str,
         kind: ServiceLockKind,
-    ) -> Result<Option<Self>> {
+    ) -> Result<(Directory, OsString)> {
         let project = crate::store::project_directory(data_dir, scope)?;
         let hash = project.file_name().context("project store has no name")?;
         let locks = data_dir.join("memory/locks");
@@ -1343,6 +1904,17 @@ impl ServiceLock {
             ServiceLockKind::Owner => ".service-owner.lock",
         };
         let name = OsString::from(format!("{}{}", hash.to_string_lossy(), suffix));
+        Ok((directory, name))
+    }
+
+    /// A busy owner lock means an existing process may still be cleaning up.
+    /// Never remove its lockfile or infer takeover authority from a PID.
+    pub fn try_acquire(
+        data_dir: &Path,
+        scope: &str,
+        kind: ServiceLockKind,
+    ) -> Result<Option<Self>> {
+        let (directory, name) = Self::location(data_dir, scope, kind)?;
         let file = directory.lock_file(&name)?;
         match file.try_lock() {
             Ok(()) => {
@@ -1362,6 +1934,40 @@ impl ServiceLock {
     pub fn verify(&self) -> Result<()> {
         self.directory.verify(&self.name, &self.file)?;
         Ok(())
+    }
+
+    /// Verify, then unlock explicitly before closing. On Unix a sibling's
+    /// child between fork and exec can hold a duplicate of this lock's open
+    /// description; closing only this descriptor would leave it locked.
+    pub fn release(self) -> Result<()> {
+        self.verify()?;
+        self.file.unlock().context("release project service lock")?;
+        Ok(())
+    }
+
+    /// Test support: wait, without polling, until whoever holds this kind of
+    /// lock releases it, then release it again at once. It waits on the lock
+    /// itself, so a spawned owner's exit is observed through its own release
+    /// of owner authority. It has no deadline of its own; the caller's
+    /// fixture backstop bounds it, and a blocked waiter ends with the process.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn await_release(data_dir: &Path, scope: &str, kind: ServiceLockKind) -> Result<()> {
+        let data_dir = data_dir.to_owned();
+        let scope = scope.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let (directory, name) = Self::location(&data_dir, &scope, kind)?;
+            let file = directory.lock_file(&name)?;
+            file.lock().context("await project service lock release")?;
+            let lock = Self {
+                directory,
+                name,
+                file,
+                kind,
+            };
+            lock.release()
+        })
+        .await
+        .context("project service lock waiter failed")?
     }
 }
 
@@ -1429,13 +2035,26 @@ impl EndpointRecord {
     }
 
     pub fn read(data_dir: &Path, scope: &str) -> Result<Option<Self>> {
+        Self::read_then(data_dir, scope, || {})
+    }
+
+    /// [`Self::read`] with a hook where a concurrent retirement can land
+    /// between reading the held record and verifying its name.
+    fn read_then(data_dir: &Path, scope: &str, between: impl FnOnce()) -> Result<Option<Self>> {
         let path = Self::path(data_dir, scope)?;
-        let bytes = match crate::files::read_bytes(&path, HANDSHAKE_LIMIT as u64) {
+        let bytes = match crate::files::read_bytes_then(&path, HANDSHAKE_LIMIT as u64, between) {
             Ok(bytes) => bytes,
-            Err(error)
-                if error
-                    .downcast_ref::<io::Error>()
-                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+            Err(error) if is_not_found(&error) => return Ok(None),
+            // Retirement renames the record away before its object can be
+            // marked for deletion, so a read that failed only because it met
+            // a retiring owner (on Windows, a held handle that became
+            // delete-pending) finds the name absent here. Any other state,
+            // including a present name, keeps the original error.
+            Err(_)
+                if matches!(
+                    crate::files::read(&path, Privacy::OwnerOnly),
+                    Err(probe) if is_not_found(&probe)
+                ) =>
             {
                 return Ok(None);
             }
@@ -1487,10 +2106,48 @@ impl EndpointRecord {
                 && current.authority.connection_secret == self.authority.connection_secret,
             "service endpoint generation changed during retirement"
         );
-        directory.remove_file(name, file)?;
+        // Move the record off its discovery name before deleting it. On
+        // Windows a deleted name stays occupied while any reader still holds
+        // it, and later opens of it are denied; a client reading discovery
+        // at this moment must instead find no record. The fixed stage name
+        // replaces any stage an interrupted retirement left behind.
+        directory.rename_file(
+            &directory,
+            name,
+            &file,
+            OsStr::new(RETIRED_ENDPOINT),
+            Publication::ReplaceRegular,
+        )?;
+        match directory.read(name) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => bail!("service endpoint name was occupied during retirement"),
+        }
+        match directory.remove_file(OsStr::new(RETIRED_ENDPOINT), file) {
+            Ok(()) => {}
+            // The deletion was requested but a reader still holds the staged
+            // record, so Windows removes it when that reader closes. It is
+            // off the discovery name and its generation no longer listens.
+            Err(error) if error.phase == PublicationPhase::Uncertain => {
+                tracing::warn!(
+                    error = %error,
+                    "retired memory service endpoint removal awaits a concurrent reader"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
         owner.verify()?;
         Ok(())
     }
+}
+
+/// Private stage for a record leaving discovery; never read as an endpoint.
+const RETIRED_ENDPOINT: &str = "endpoint.retired";
+
+pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1518,6 +2175,11 @@ pub struct ClientHello {
     pub service_generation: String,
     pub connection_secret: String,
     pub schema_version: i32,
+    /// Presented only by the client that spawned this owner, on its first
+    /// attachment. Additive: omitted when absent, so every other hello
+    /// serializes as before. Not a secret, but left out of `Debug`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starter_token: Option<String>,
 }
 
 impl std::fmt::Debug for ClientHello {
@@ -1555,6 +2217,7 @@ impl EndpointAuthority {
             service_generation: self.service_generation.clone(),
             connection_secret: self.connection_secret.clone(),
             schema_version: self.schema_version,
+            starter_token: None,
         }
     }
 
@@ -1614,6 +2277,17 @@ pub async fn accept_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     authority: &EndpointAuthority,
 ) -> Result<std::result::Result<(), HandshakeRejection>> {
+    Ok(accept_handshake_presenting(stream, authority)
+        .await?
+        .map(|_| ()))
+}
+
+/// [`accept_handshake`] that also returns the starter token an admitted
+/// client presented, if any.
+pub(crate) async fn accept_handshake_presenting<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    authority: &EndpointAuthority,
+) -> Result<std::result::Result<Option<String>, HandshakeRejection>> {
     let hello: ClientHello = read_frame(stream, HANDSHAKE_LIMIT, HANDSHAKE_TIMEOUT).await?;
     let decision = authority.verify(&hello);
     let reply = match decision {
@@ -1624,7 +2298,7 @@ pub async fn accept_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         Err(reason) => HandshakeReply::Rejected { reason },
     };
     write_frame(stream, &reply, HANDSHAKE_LIMIT, HANDSHAKE_TIMEOUT).await?;
-    Ok(decision)
+    Ok(decision.map(|()| hello.starter_token))
 }
 
 /// Verify that the peer accepted exactly the generation requested. The
@@ -1633,17 +2307,23 @@ pub async fn connect_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     authority: &EndpointAuthority,
 ) -> Result<()> {
+    connect_handshake_presenting(stream, authority, None).await
+}
+
+/// [`connect_handshake`] for the starter's attachment to the owner it just
+/// spawned, which presents that owner's starter token.
+async fn connect_handshake_presenting<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    authority: &EndpointAuthority,
+    starter_token: Option<uuid::Uuid>,
+) -> Result<()> {
     ensure!(
         authority.version.major == PROTOCOL_MAJOR && authority.version.minor >= PROTOCOL_MINOR,
         "memory service protocol is incompatible; close the active Kuru session or use its matching version"
     );
-    write_frame(
-        stream,
-        &authority.hello(),
-        HANDSHAKE_LIMIT,
-        HANDSHAKE_TIMEOUT,
-    )
-    .await?;
+    let mut hello = authority.hello();
+    hello.starter_token = starter_token.map(|token| token.to_string());
+    write_frame(stream, &hello, HANDSHAKE_LIMIT, HANDSHAKE_TIMEOUT).await?;
     let reply: HandshakeReply = read_frame(stream, HANDSHAKE_LIMIT, HANDSHAKE_TIMEOUT).await?;
     match reply {
         HandshakeReply::Accepted {
@@ -1745,11 +2425,20 @@ pub fn project_path_bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().as_encoded_bytes().to_vec()
 }
 
+/// Windows `ERROR_PIPE_NOT_CONNECTED`: the server closed the pipe instance
+/// this client had connected to, which std leaves uncategorized.
+#[cfg(windows)]
+const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
+
 pub fn is_peer_closed(error: &anyhow::Error) -> bool {
     error
         .chain()
         .filter_map(|cause| cause.downcast_ref::<io::Error>())
         .any(|error| {
+            #[cfg(windows)]
+            if error.raw_os_error() == Some(ERROR_PIPE_NOT_CONNECTED) {
+                return true;
+            }
             matches!(
                 error.kind(),
                 io::ErrorKind::BrokenPipe
@@ -1762,6 +2451,7 @@ pub fn is_peer_closed(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{await_owner_release, expect_events, next_event, observed};
     use std::io::{Seek, SeekFrom, Write};
     use tokio::io::duplex;
 
@@ -1887,9 +2577,10 @@ mod tests {
 
     /// A published endpoint does not prove that this particular attempt has
     /// obtained a Windows pipe instance. Keep that fixture-only readiness
-    /// observation inside the caller's named outer deadline; product
-    /// attachment still treats a connect timeout as an error and never
-    /// silently retries an ambiguous request.
+    /// observation inside the caller's named outer deadline; product election
+    /// treats only a busy pipe through the deadline as a transport miss,
+    /// other connect timeouts remain errors, and it never silently retries
+    /// an ambiguous request.
     async fn try_attach_fixture_stage(
         data: &Path,
         scope: &str,
@@ -2382,7 +3073,8 @@ mod tests {
         .err()
         .context("stale transport authorized replacing a live owner")?;
         ensure!(
-            format!("{error:#}").contains("existing memory service owner did not publish"),
+            format!("{error:#}")
+                .contains("was still shutting down or did not publish a valid endpoint"),
             "live owner refusal lost its authoritative stage: {error:#}"
         );
         ensure!(
@@ -2399,6 +3091,62 @@ mod tests {
             &ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?
                 .context("fixture did not reacquire owner lock for cleanup")?,
         )?;
+        Ok(())
+    }
+
+    // T14, service half: a published pipe whose only instance stays busy
+    // through the connect deadline is a transport miss for an electing
+    // client and for maintenance, not the fatal connect timeout.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn busy_pipe_through_the_deadline_is_a_transport_miss() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let data = root.path().join("private");
+        let options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+        let owner = ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?
+            .context("fixture did not acquire service owner lock")?;
+        let (listener, address) = ServiceListener::bind(&data, &scope)?;
+        let mut endpoint_authority = authority();
+        endpoint_authority.project_path = project_path_bytes(&project);
+        endpoint_authority.project_scope = scope.clone();
+        let endpoint = EndpointRecord {
+            authority: endpoint_authority,
+            address: address.clone(),
+        };
+        endpoint.publish(&data, &owner)?;
+        // Never accepted: this client holds the listener's only instance, so
+        // every later connect retry sees a busy pipe until its deadline.
+        let occupant = connect_local(&data, &scope, &address, HANDSHAKE_TIMEOUT).await?;
+
+        let observed = try_attach_observed(&data, &scope, &project, None)
+            .await
+            .context("an electing client failed on a busy pipe")?;
+        ensure!(
+            matches!(observed, Err(AttachMiss::TransportUnavailable)),
+            "a busy pipe was not a transport miss for an electing client"
+        );
+        ensure!(
+            request_idle_retirement(&options)
+                .await
+                .context("maintenance failed on a busy pipe")?
+                .is_none(),
+            "maintenance reached an owner through a busy pipe"
+        );
+
+        drop(occupant);
+        drop(listener);
+        endpoint.retire(&data, &owner)?;
         Ok(())
     }
 
@@ -2504,9 +3252,7 @@ mod tests {
                             acquire_maintenance_permit(&options),
                         )
                         .await
-                        .context(
-                            "idle owner was not retired before its 30-second grace period",
-                        )??;
+                        .context("maintenance did not retire the idle owner within 20 seconds")??;
                         ensure!(
                             ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?
                                 .is_none(),
@@ -2605,7 +3351,7 @@ mod tests {
     ) -> kuru_platform::windows::process::NativeSpawnSpec {
         use kuru_platform::windows::process::{NativeSpawnSpec, Stdio};
         let mut command = NativeSpawnSpec::new(executable.to_owned(), project.to_owned());
-        command.args = service_arguments(options, project);
+        command.args = service_arguments(options, project, None);
         command.args[0] = "--internal-memory-service-held-client-fixture".into();
         command.args.push(ready.as_os_str().to_owned());
         command.args.push(release.as_os_str().to_owned());
@@ -2734,9 +3480,9 @@ mod tests {
     async fn starter_job_exit_preserves_independent_owner_and_surviving_client() -> Result<()> {
         use kuru_platform::windows::process::Lifetime;
         crate::test_support::warm_runtime_cache().await?;
-        // Real lifecycles: one fresh spawned service owner, which retires only after its idle grace
-        // once the survivor detaches.
-        let deadline = crate::test_support::fixture_deadline(1, 0) + SERVICE_IDLE_TIMEOUT;
+        // Real lifecycles: one fresh spawned service owner, which retires as soon as the survivor
+        // detaches.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let (root, project, options, executable) = windows_service_fixture()?;
             let ready = root.path().join("starter-ready");
@@ -2800,28 +3546,14 @@ mod tests {
                 "surviving client lost a committed row"
             );
             drop(survivor);
-            let idle_deadline =
-                tokio::time::Instant::now() + SERVICE_IDLE_TIMEOUT + Duration::from_secs(20);
-            while EndpointRecord::read(&options.data_dir, &options.project_scope)?.is_some() {
-                ensure!(
-                    tokio::time::Instant::now() < idle_deadline,
-                    "independent owner did not retire before fixture cleanup"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            while ServiceLock::try_acquire(
-                &options.data_dir,
-                &options.project_scope,
-                ServiceLockKind::Owner,
-            )?
-            .is_none()
-            {
-                ensure!(
-                    tokio::time::Instant::now() < idle_deadline,
-                    "independent owner did not release its lifecycle lock after Dolt reap"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            // The starter was reached before it exited, so the last detach
+            // retires the owner at once; its owner lock is released only after
+            // its endpoint is retired and Dolt is reaped.
+            await_owner_release(&options).await?;
+            ensure!(
+                EndpointRecord::read(&options.data_dir, &options.project_scope)?.is_none(),
+                "independent owner released its lock without retiring its endpoint"
+            );
             // The owner ran in another process: record its store's quiescence
             // for the fixture root's teardown.
             crate::test_support::await_managed_quiescence(&options).await?;
@@ -2887,9 +3619,16 @@ mod tests {
                     .await?,
                 ServiceValue::Unit
             ));
-            survivor.close();
 
+            // The survivor stays attached, so only the Job can end this owner:
+            // closing the survivor first would retire it on its own.
             drop(starter); // closes the outer kill-on-close Job and its complete tree
+            await_owner_release(&options).await?;
+            ensure!(
+                survivor.call(ServiceCall::Revision).await.is_err(),
+                "the contained owner survived its outer Job"
+            );
+            survivor.close();
             let mut recovered = attach_or_start(&options, &project, &executable)
                 .await
                 .context("recover after outer Job terminated contained owner")?;
@@ -3134,6 +3873,104 @@ mod tests {
         assert!(EndpointRecord::read(data.path(), &scope).unwrap().is_none());
     }
 
+    /// A client holding the record open, as discovery does while it reads,
+    /// must not turn retirement into an error on either side. On Windows a
+    /// deleted name stays occupied while any handle holds it and later opens
+    /// are denied (native error 5), so deleting the record in place failed
+    /// both the owner's absence check and the client's next read.
+    #[tokio::test]
+    async fn retirement_under_a_held_reader_leaves_no_discoverable_record() -> Result<()> {
+        let _gate = crate::spawn_gate::locking_async().await;
+        let data = tempfile::tempdir()?;
+        let scope = format!("project/{}", "c".repeat(64));
+        let owner = ServiceLock::try_acquire(data.path(), &scope, ServiceLockKind::Owner)?
+            .context("fixture did not acquire service owner lock")?;
+        let mut record = EndpointRecord {
+            authority: authority(),
+            address: "socket-retiring".into(),
+        };
+        record.authority.project_scope = scope.clone();
+        record.publish(data.path(), &owner)?;
+        let reader = crate::files::read(
+            &EndpointRecord::path(data.path(), &scope)?,
+            Privacy::OwnerOnly,
+        )?;
+
+        record
+            .retire(data.path(), &owner)
+            .context("retirement failed while a client held the record open")?;
+        ensure!(
+            EndpointRecord::read(data.path(), &scope)
+                .context("discovery failed after retirement under a held reader")?
+                .is_none(),
+            "a retired record remained discoverable"
+        );
+        let observed =
+            try_attach_observed(data.path(), &scope, Path::new("/private/project"), None)
+                .await
+                .context("an electing client failed on a retiring owner")?;
+        ensure!(
+            matches!(observed, Err(AttachMiss::NoEndpoint)),
+            "an electing client did not read retirement as no endpoint"
+        );
+        ensure!(
+            request_idle_retirement(&crate::store::OpenOptions::new(
+                data.path().to_owned(),
+                scope.clone(),
+            ))
+            .await
+            .context("maintenance failed on a retiring owner")?
+            .is_none(),
+            "maintenance reached a retired owner"
+        );
+
+        drop(reader);
+        let stage = EndpointRecord::directory(data.path(), &scope)?.join(RETIRED_ENDPOINT);
+        ensure!(
+            matches!(
+                std::fs::symlink_metadata(&stage),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            ),
+            "the retired record's stage outlived its last reader"
+        );
+        drop(owner);
+        Ok(())
+    }
+
+    /// A discovery read that already holds the record when the owner retires
+    /// it finds no record. On Windows the held object is then delete-pending,
+    /// which the checked verification refuses as denied rather than missing;
+    /// only the absent discovery name shows the owner retired.
+    #[test]
+    fn a_read_that_meets_retirement_finds_no_record() {
+        let _gate = crate::spawn_gate::locking();
+        let data = tempfile::tempdir().unwrap();
+        let scope = format!("project/{}", "d".repeat(64));
+        let owner = ServiceLock::try_acquire(data.path(), &scope, ServiceLockKind::Owner)
+            .unwrap()
+            .unwrap();
+        let mut record = EndpointRecord {
+            authority: authority(),
+            address: "socket-retiring".into(),
+        };
+        record.authority.project_scope = scope.clone();
+        record.publish(data.path(), &owner).unwrap();
+
+        let mut retired = None;
+        let read = EndpointRecord::read_then(data.path(), &scope, || {
+            retired = Some(record.retire(data.path(), &owner));
+        });
+
+        retired
+            .expect("the hook ran between reading and verifying the record")
+            .expect("retirement failed while a discovery read held the record");
+        assert!(
+            read.expect("a discovery read failed only because it met retirement")
+                .is_none(),
+            "a discovery read that met retirement returned the retired record"
+        );
+    }
+
     #[tokio::test]
     async fn native_listener_authenticates_before_any_operation() {
         let data = tempfile::tempdir().unwrap();
@@ -3194,6 +4031,8 @@ mod tests {
             connect_handshake(&mut stream, &expected).await?;
             let mut attachment = ServiceAttachment {
                 stream: Some(stream),
+                held: None,
+                retain_after_abandon: false,
                 authority: expected,
                 locator: None,
                 last_fault: None,
@@ -3232,7 +4071,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_reaps_real_dolt_before_retiring_endpoint_and_lock() -> Result<()> {
+    async fn owner_retires_endpoint_then_reaps_before_releasing_its_lock() -> Result<()> {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner; the second open is refused on its owner lock
         // before another engine starts.
@@ -3258,7 +4097,7 @@ mod tests {
             let _gate = crate::spawn_gate::spawning().await;
             let mut owner = ServiceOwner::open(options.clone(), &project).await?;
             ensure!(
-                ServiceOwner::open(options, &project).await.is_err(),
+                ServiceOwner::open(options.clone(), &project).await.is_err(),
                 "second service owner must be rejected before another engine opens"
             );
             let record = EndpointRecord::read(&data, &scope)?
@@ -3318,7 +4157,7 @@ mod tests {
                 "closed owner retained its endpoint record"
             );
             ensure!(
-                ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?.is_some(),
+                owner_lock_free(&options)?,
                 "closed owner retained its election lock"
             );
             Ok::<(), anyhow::Error>(())
@@ -4529,12 +5368,17 @@ mod tests {
                 .read(true)
                 .write(true)
                 .open(&diagnostic_path)?;
+            // A token no attachment here presents: this fixture is never the
+            // owner's starter, so the owner does not retire when the original
+            // attachment drops before the sibling attaches (within its startup
+            // budget); only the deliberate crash below ends it.
             let mut process = KillServiceOnDrop(ServiceProcess::new(
                 spawn_service(
                     &options,
                     &project,
                     &executable,
                     Some(diagnostic.try_clone()?),
+                    Some(uuid::Uuid::new_v4()),
                 )
                 .await?,
             ));
@@ -4672,12 +5516,12 @@ mod tests {
                     .await?,
                 ServiceValue::Unit
             ));
-            drop(sibling);
             ensure!(
                 process.0.try_wait()?.is_none(),
                 "fixture owner exited before the deliberate crash"
             );
             process.terminate()?;
+            drop(sibling);
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     if process.0.try_wait()?.is_some() {
@@ -5430,30 +6274,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn independent_clients_elect_one_real_process_and_keep_it_warm() -> Result<()> {
+    async fn independent_clients_elect_one_real_process_and_retire_after_both_detach() -> Result<()>
+    {
         crate::test_support::warm_runtime_cache().await?;
-        // Real lifecycles: one fresh elected service process, which retires only after its idle
-        // grace.
-        let deadline = crate::test_support::fixture_deadline(1, 0) + SERVICE_IDLE_TIMEOUT;
+        // Real lifecycles: one fresh elected service process, which retires as soon as both
+        // clients have detached.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = tempfile::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let data = root.path().join("private");
-            let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
-            options.config.cache_dir = Some(crate::store::test_cache());
-            options.config.offline = true;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
             let executable = crate::store::test_supervisor()?;
-            options.supervisor = Some(executable.clone());
             let _gate = crate::spawn_gate::spawning().await;
             let (first, second) = tokio::join!(
                 attach_or_start(&options, &project, &executable),
@@ -5497,28 +6327,19 @@ mod tests {
                 "live attachment lost its service owner"
             );
             drop(second);
-            let deadline =
-                tokio::time::Instant::now() + SERVICE_IDLE_TIMEOUT + Duration::from_secs(20);
-            loop {
-                if EndpointRecord::read(&data, &scope)?.is_none() {
-                    break;
-                }
-                ensure!(
-                    tokio::time::Instant::now() < deadline,
-                    "idle service did not retire its endpoint after reaping Dolt"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            // Endpoint retirement happens before the service owner drops its
-            // retained lock. Observe both steps, without mistaking that
-            // brief ordering interval for a leaked owner.
-            while ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?.is_none() {
-                ensure!(
-                    tokio::time::Instant::now() < deadline,
-                    "idle service did not release owner authority after endpoint retirement"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            // Awaited on the owner lock itself: it is released only after the
+            // endpoint is retired and Dolt is reaped, with no idle interval.
+            let detached = tokio::time::Instant::now();
+            await_owner_release(&options).await?;
+            let closed = detached.elapsed();
+            ensure!(
+                EndpointRecord::read(&data, &scope)?.is_none(),
+                "retired service released its owner lock without retiring its endpoint"
+            );
+            eprintln!(
+                "memory owner close after last detach: {} ms",
+                closed.as_millis()
+            );
             Ok::<(), anyhow::Error>(())
         })
         .await
@@ -5600,56 +6421,51 @@ mod tests {
     #[tokio::test]
     async fn idle_accept_deadlines_do_not_close_live_attachment() -> Result<()> {
         crate::test_support::warm_runtime_cache().await?;
-        // Real lifecycles: one fresh service owner with a fixture idle interval.
+        // Real lifecycles: one fresh service owner with a short lock recheck interval.
         let deadline = crate::test_support::fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = tempfile::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let data = root.path().join("private");
-            let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
-            options.config.cache_dir = Some(crate::store::test_cache());
-            options.config.offline = true;
-            options.supervisor = Some(crate::store::test_supervisor()?);
+            let (project, scope, data, options) = owner_fixture(root.path())?;
             let _gate = crate::spawn_gate::spawning().await;
-            let mut owner = ServiceOwner::open(options, &project).await?;
-            let record =
-                EndpointRecord::read(&data, &scope)?.context("missing service endpoint")?;
-            let mut client =
-                connect_local(&data, &scope, &record.address, HANDSHAKE_TIMEOUT).await?;
-            let served = tokio::spawn(async move {
-                owner
-                    .serve_until_idle_with(Duration::from_millis(50), Duration::from_millis(100))
-                    .await?;
-                owner.close().await
-            });
-            connect_handshake(&mut client, &record.authority).await?;
-            tokio::time::sleep(Duration::from_millis(350)).await;
-            ensure!(
-                EndpointRecord::read(&data, &scope)?.is_some(),
-                "live attachment was retired after an accept timeout"
-            );
+            let owner = ServiceOwner::open(options, &project).await?;
+            let authority = owner.authority().clone();
+            let (mut knobs, mut events) = observed(Admission::AnyAttachment, None);
+            knobs.recheck = Duration::from_millis(100);
+            let served = tokio::spawn(owner.serve_with(knobs));
+            let mut client = attach_raw(&data, &scope, None).await?;
+            expect_events(
+                &mut events,
+                &[
+                    ServeEvent::EnteredEmpty { reached: false },
+                    ServeEvent::AttachmentAccepted { active: 1 },
+                ],
+            )
+            .await?;
+            // Three rechecks after the accept: at least two accept deadlines
+            // expired while this attachment stayed live and idle.
+            for _ in 0..3 {
+                ensure!(
+                    events.recv().await == Some(ServeEvent::LockRechecked),
+                    "a live attachment ended or the owner acted before three lock rechecks"
+                );
+            }
             ensure!(
                 matches!(
-                    rpc::request_attached(&mut client, &record.authority, ServiceCall::Revision)
-                        .await?,
+                    rpc::request_attached(&mut client, &authority, ServiceCall::Revision).await?,
                     ServiceValue::Revision(_)
                 ),
                 "surviving attachment could not read after accept deadlines"
             );
             drop(client);
-            tokio::time::timeout(Duration::from_secs(10), served)
-                .await
-                .context("owner did not close after the fixture idle interval")???;
+            expect_events(
+                &mut events,
+                &[
+                    ServeEvent::AttachmentJoined { remaining: 0 },
+                    ServeEvent::EnteredEmpty { reached: true },
+                ],
+            )
+            .await?;
+            served.await??;
             Ok::<(), anyhow::Error>(())
         })
         .await
@@ -5663,10 +6479,10 @@ mod tests {
     #[tokio::test]
     async fn separate_cold_starters_share_one_owner_and_preserve_both_writes() -> Result<()> {
         use std::process::Stdio;
+        use tokio::io::AsyncBufReadExt;
         crate::test_support::warm_runtime_cache().await?;
-        // Real lifecycles: one fresh cold-started service owner, which retires only after its idle
-        // grace.
-        let deadline = crate::test_support::fixture_deadline(1, 0) + SERVICE_IDLE_TIMEOUT;
+        // Real lifecycles: one fresh cold-started service owner, then the reopened successor.
+        let deadline = crate::test_support::fixture_deadline(1, 1);
         tokio::time::timeout(deadline, async {
             let root = tempfile::tempdir()?;
             let project = root.path().join("project");
@@ -5691,14 +6507,14 @@ mod tests {
             let ready_two = root.path().join("ready-two");
             let _gate = crate::spawn_gate::spawning().await;
             let spawn = |ready: &Path| -> Result<tokio::process::Child> {
-                let mut args = service_arguments(&options, &project);
+                let mut args = service_arguments(&options, &project, None);
                 args[0] = "--internal-memory-service-client-fixture".into();
                 args.push(barrier.as_os_str().to_owned());
                 args.push(ready.as_os_str().to_owned());
                 let child = tokio::process::Command::new(&executable)
                     .args(args)
                     .current_dir(&project)
-                    .stdin(Stdio::null())
+                    .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true)
@@ -5716,6 +6532,32 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             std::fs::write(&barrier, b"go")?;
+            // Each starter reports its generation once attached and written,
+            // then holds its attachment until its stdin closes: both are
+            // attached at once, so both must reach the same owner.
+            let (mut one, mut two) = (one, two);
+            let mut one_lines = tokio::io::BufReader::new(
+                one.stdout.take().context("first cold starter has no stdout")?,
+            )
+            .lines();
+            let mut two_lines = tokio::io::BufReader::new(
+                two.stdout.take().context("second cold starter has no stdout")?,
+            )
+            .lines();
+            let (generation_one, generation_two) = tokio::join!(
+                tokio::time::timeout(Duration::from_secs(60), one_lines.next_line()),
+                tokio::time::timeout(Duration::from_secs(60), two_lines.next_line()),
+            );
+            let generation_one = generation_one
+                .context("first cold starter did not report its generation")??
+                .unwrap_or_default();
+            let generation_two = generation_two
+                .context("second cold starter did not report its generation")??
+                .unwrap_or_default();
+            // Release both only after reading both; an earlier failure return
+            // kills them on drop.
+            drop(one.stdin.take());
+            drop(two.stdin.take());
             let (one, two) = tokio::join!(
                 tokio::time::timeout(Duration::from_secs(60), one.wait_with_output()),
                 tokio::time::timeout(Duration::from_secs(60), two.wait_with_output()),
@@ -5732,16 +6574,20 @@ mod tests {
                 "second cold starter failed: {}",
                 String::from_utf8_lossy(&two.stderr)
             );
-            let generation_one = String::from_utf8(one.stdout)?.trim().to_owned();
-            let generation_two = String::from_utf8(two.stdout)?.trim().to_owned();
+            let exited = tokio::time::Instant::now();
             ensure!(
                 !generation_one.is_empty() && generation_one == generation_two,
                 "cold starters reached different service generations"
             );
+            // Both starters have exited, so their owner retires at once.
+            await_owner_release(&options).await?;
+            let closed = exited.elapsed();
+            let reopening = tokio::time::Instant::now();
             let mut client = attach_or_start(&options, &project, &executable).await?;
+            let reopened = reopening.elapsed();
             ensure!(
-                client.generation() == generation_one,
-                "cold service did not survive its starter processes"
+                client.generation() != generation_one,
+                "a retired cold service was still attached"
             );
             let ServiceValue::HistoryWindow(window) = client
                 .call(ServiceCall::HistoryWindow {
@@ -5754,32 +6600,931 @@ mod tests {
             };
             ensure!(
                 window.total_rows == 2 && window.messages.len() == 2,
-                "cold starters lost a committed row"
+                "the successor lost a committed row"
             );
             drop(client);
-            let idle_deadline =
-                tokio::time::Instant::now() + SERVICE_IDLE_TIMEOUT + Duration::from_secs(20);
-            loop {
-                if EndpointRecord::read(&data, &scope)?.is_none() {
-                    break;
-                }
-                ensure!(
-                    tokio::time::Instant::now() < idle_deadline,
-                    "cold-start fixture service did not reap before its directory cleanup"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            while ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?.is_none() {
-                ensure!(
-                    tokio::time::Instant::now() < idle_deadline,
-                    "cold-start fixture service did not release owner authority after endpoint retirement"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            await_owner_release(&options).await?;
+            ensure!(
+                EndpointRecord::read(&data, &scope)?.is_none(),
+                "cold-start fixture successor released its lock without retiring its endpoint"
+            );
+            eprintln!(
+                "memory owner close after both starters exited: {} ms; reopen after the close: {} ms",
+                closed.as_millis(),
+                reopened.as_millis()
+            );
             Ok::<(), anyhow::Error>(())
         })
         .await
         .with_context(|| format!("separate cold starter fixture exceeded its {deadline:?} deadline"))??;
+        Ok(())
+    }
+
+    /// A canonical project under `root`, its scope, private data directory
+    /// and offline fixture options.
+    fn owner_fixture(root: &Path) -> Result<(PathBuf, String, PathBuf, crate::store::OpenOptions)> {
+        let project = root.join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let data = root.join("private");
+        let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+        options.config.cache_dir = Some(crate::store::test_cache());
+        options.config.offline = true;
+        options.supervisor = Some(crate::store::test_supervisor()?);
+        Ok((project, scope, data, options))
+    }
+
+    /// An authenticated bare attachment to the published owner, presenting
+    /// `starter_token` when given.
+    async fn attach_raw(
+        data: &Path,
+        scope: &str,
+        starter_token: Option<uuid::Uuid>,
+    ) -> Result<LocalStream> {
+        let record = EndpointRecord::read(data, scope)?.context("missing service endpoint")?;
+        let mut stream = connect_local(data, scope, &record.address, HANDSHAKE_TIMEOUT).await?;
+        connect_handshake_presenting(&mut stream, &record.authority, starter_token).await?;
+        Ok(stream)
+    }
+
+    async fn send_request(
+        stream: &mut LocalStream,
+        authority: &EndpointAuthority,
+        call: ServiceCall,
+    ) -> Result<()> {
+        let request = rpc::ServiceRequest::new(&authority.service_generation, call);
+        write_frame(stream, &request, 1024 * 1024, HANDSHAKE_TIMEOUT).await
+    }
+
+    /// Probe the owner lock, releasing it at once when free.
+    fn owner_lock_free(options: &crate::store::OpenOptions) -> Result<bool> {
+        match ServiceLock::try_acquire(
+            &options.data_dir,
+            &options.project_scope,
+            ServiceLockKind::Owner,
+        )? {
+            Some(lock) => lock.release().map(|()| true),
+            None => Ok(false),
+        }
+    }
+
+    /// Probe the store's lifecycle lease, which the Dolt reap releases,
+    /// unlocking it at once when free.
+    fn lifecycle_lease_free(options: &crate::store::OpenOptions) -> Result<bool> {
+        let store = crate::store::project_directory(&options.data_dir, &options.project_scope)?;
+        let directory = crate::files::directory(&store)?;
+        #[cfg(unix)]
+        let (locks, name) = (
+            crate::files::directory(directory.path())?,
+            OsString::from("lifecycle.lock"),
+        );
+        #[cfg(windows)]
+        let (locks, name) = (
+            crate::files::open_directory(
+                &options.data_dir.join("memory/lifecycles"),
+                Privacy::OwnerOnly,
+                NameRetention::Pinned,
+            )?,
+            OsString::from(format!(
+                "{}.lock",
+                directory
+                    .identity()
+                    .to_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )),
+        );
+        let lock = locks.lock_file(&name)?;
+        match lock.try_lock() {
+            Ok(()) => {
+                lock.unlock()?;
+                Ok(true)
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    // T1
+    #[tokio::test]
+    async fn owner_retires_at_once_when_its_starter_detaches() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let token = uuid::Uuid::new_v4();
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            // A starter deadline far beyond the fixture backstop: only the
+            // detach can end this owner in time.
+            let (knobs, mut events) =
+                observed(Admission::Starter(token), Some(Duration::from_secs(3600)));
+            let served = tokio::spawn(owner.serve_with(knobs));
+            let starter = attach_raw(&data, &scope, Some(token)).await?;
+            expect_events(
+                &mut events,
+                &[
+                    ServeEvent::EnteredEmpty { reached: false },
+                    ServeEvent::AttachmentAccepted { active: 1 },
+                ],
+            )
+            .await?;
+            drop(starter);
+            expect_events(
+                &mut events,
+                &[
+                    ServeEvent::AttachmentJoined { remaining: 0 },
+                    ServeEvent::EnteredEmpty { reached: true },
+                ],
+            )
+            .await?;
+            served.await??;
+            ensure!(
+                EndpointRecord::read(&data, &scope)?.is_none(),
+                "retired owner kept its endpoint"
+            );
+            ensure!(
+                lifecycle_lease_free(&options)?,
+                "retired owner kept its lifecycle lease"
+            );
+            ensure!(owner_lock_free(&options)?, "retired owner kept its lock");
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("last-detach retirement fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
+    // T2
+    #[tokio::test]
+    async fn owner_not_reached_by_its_starter_outlives_other_clients() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let token = uuid::Uuid::new_v4();
+            let owner = ServiceOwner::open(options, &project).await?;
+            let generation = owner.authority().service_generation.clone();
+            let (knobs, mut events) =
+                observed(Admission::Starter(token), Some(Duration::from_secs(3600)));
+            let served = tokio::spawn(owner.serve_with(knobs));
+            expect_events(&mut events, &[ServeEvent::EnteredEmpty { reached: false }]).await?;
+
+            // A rejected handshake is an attachment only until it ends.
+            let record = EndpointRecord::read(&data, &scope)?.context("missing endpoint")?;
+            let mut wrong = record.authority.clone();
+            wrong.connection_secret.push('x');
+            let mut stranger =
+                connect_local(&data, &scope, &record.address, HANDSHAKE_TIMEOUT).await?;
+            ensure!(
+                connect_handshake(&mut stranger, &wrong).await.is_err(),
+                "a wrong secret was admitted"
+            );
+            drop(stranger);
+            let detached = [
+                ServeEvent::AttachmentAccepted { active: 1 },
+                ServeEvent::AttachmentJoined { remaining: 0 },
+                ServeEvent::EnteredEmpty { reached: false },
+            ];
+            expect_events(&mut events, &detached).await?;
+
+            // An authenticated client that is not the starter, such as an
+            // inspection, attaches and detaches without retiring the owner.
+            let inspection = attach_raw(&data, &scope, None).await?;
+            drop(inspection);
+            expect_events(&mut events, &detached).await?;
+            ensure!(
+                EndpointRecord::read(&data, &scope)?
+                    .is_some_and(|record| record.authority.service_generation == generation),
+                "a non-starter retired the fresh owner"
+            );
+
+            let starter = attach_raw(&data, &scope, Some(token)).await?;
+            expect_events(&mut events, &[ServeEvent::AttachmentAccepted { active: 1 }]).await?;
+            drop(starter);
+            expect_events(
+                &mut events,
+                &[
+                    ServeEvent::AttachmentJoined { remaining: 0 },
+                    ServeEvent::EnteredEmpty { reached: true },
+                ],
+            )
+            .await?;
+            served.await??;
+            ensure!(EndpointRecord::read(&data, &scope)?.is_none());
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("starter admission fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
+    // T3
+    #[tokio::test]
+    async fn owner_whose_starter_never_attaches_exits_cleanly() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            // The starter's budget already elapsed at publication.
+            let (knobs, mut events) = observed(
+                Admission::Starter(uuid::Uuid::new_v4()),
+                Some(Duration::ZERO),
+            );
+            let served = tokio::spawn(owner.serve_with(knobs));
+            expect_events(&mut events, &[ServeEvent::EnteredEmpty { reached: false }]).await?;
+            ensure!(
+                next_event(&mut events).await.is_err(),
+                "an owner past its starter deadline kept serving"
+            );
+            served
+                .await?
+                .context("a missing starter made the owner fail")?;
+            ensure!(EndpointRecord::read(&data, &scope)?.is_none());
+            ensure!(owner_lock_free(&options)?);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("missing-starter fixture exceeded its {deadline:?} deadline"))??;
+        Ok(())
+    }
+
+    // T4
+    #[tokio::test]
+    async fn accepted_write_holds_the_owner_after_its_client_leaves() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner, then its reopened successor.
+        let deadline = crate::test_support::fixture_deadline(1, 1);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let authority = owner.authority().clone();
+            let pause = Arc::new(rpc::RegisteredPause::default());
+            owner.receipt_progress.pause_next(pause.clone());
+            let (knobs, mut events) = observed(Admission::AnyAttachment, None);
+            let served = tokio::spawn(owner.serve_with(knobs));
+            let mut writer = attach_raw(&data, &scope, None).await?;
+            let other = attach_raw(&data, &scope, None).await?;
+            send_request(
+                &mut writer,
+                &authority,
+                ServiceCall::AppendMessage {
+                    namespace: "pending-work".into(),
+                    message: kuru_core::Message::text("user", "accepted"),
+                },
+            )
+            .await?;
+            pause.entered.notified().await;
+            // The writer's client vanishes with its request accepted.
+            drop(writer);
+            drop(other);
+            expect_events(
+                &mut events,
+                &[
+                    ServeEvent::EnteredEmpty { reached: false },
+                    ServeEvent::AttachmentAccepted { active: 1 },
+                    ServeEvent::AttachmentAccepted { active: 2 },
+                    ServeEvent::AttachmentJoined { remaining: 1 },
+                ],
+            )
+            .await?;
+            pause.release.notify_one();
+            expect_events(
+                &mut events,
+                &[
+                    ServeEvent::AttachmentJoined { remaining: 0 },
+                    ServeEvent::EnteredEmpty { reached: true },
+                ],
+            )
+            .await?;
+            served.await??;
+            let ((), _gate) = crate::spawn_gate::excluding_spawns(gate, async {
+                let successor = ServiceOwner::open(options, &project).await?;
+                let window = successor
+                    .inspection_store_for_test()
+                    .history_window("pending-work", 4)
+                    .await;
+                let closed = successor.close().await;
+                ensure!(
+                    window?.total_rows == 1,
+                    "the accepted write was not durable when the owner retired"
+                );
+                closed
+            })
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("pending-write fixture exceeded its {deadline:?} deadline"))??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_read_holds_the_owner_until_it_is_answered() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, _options) = owner_fixture(root.path())?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(_options, &project).await?;
+            let authority = owner.authority().clone();
+            let pause = Arc::new(rpc::DispatchPause::default());
+            let (mut knobs, mut events) = observed(Admission::AnyAttachment, None);
+            knobs.dispatch_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            let mut reader = attach_raw(&data, &scope, None).await?;
+            let other = attach_raw(&data, &scope, None).await?;
+            send_request(&mut reader, &authority, ServiceCall::Revision).await?;
+            pause.entered.notified().await;
+            drop(reader);
+            drop(other);
+            expect_events(
+                &mut events,
+                &[
+                    ServeEvent::EnteredEmpty { reached: false },
+                    ServeEvent::AttachmentAccepted { active: 1 },
+                    ServeEvent::AttachmentAccepted { active: 2 },
+                    ServeEvent::AttachmentJoined { remaining: 1 },
+                ],
+            )
+            .await?;
+            pause.release.notify_one();
+            expect_events(
+                &mut events,
+                &[
+                    ServeEvent::AttachmentJoined { remaining: 0 },
+                    ServeEvent::EnteredEmpty { reached: true },
+                ],
+            )
+            .await?;
+            served.await??;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("pending-read fixture exceeded its {deadline:?} deadline"))??;
+        Ok(())
+    }
+
+    // T5
+    #[tokio::test]
+    async fn dream_lease_holder_keeps_the_owner_and_its_candidate_survives() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner, then its reopened successor.
+        let deadline = crate::test_support::fixture_deadline(1, 1);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let authority = owner.authority().clone();
+            let (knobs, mut events) = observed(Admission::AnyAttachment, None);
+            let served = tokio::spawn(owner.serve_with(knobs));
+            let mut dreamer = attach_raw(&data, &scope, None).await?;
+            ensure!(matches!(
+                rpc::request_attached(&mut dreamer, &authority, ServiceCall::TryAcquireDreamLease)
+                    .await?,
+                ServiceValue::DreamLease { acquired: true }
+            ));
+            let mut candidate = attach_raw(&data, &scope, None).await?;
+            let ServiceValue::CandidateStarted { handle, branch, .. } = rpc::request_attached(
+                &mut candidate,
+                &authority,
+                ServiceCall::BeginCandidate {
+                    label: "dream held".into(),
+                },
+            )
+            .await?
+            else {
+                bail!("service did not start the dream candidate");
+            };
+            ensure!(matches!(
+                rpc::request_attached(
+                    &mut candidate,
+                    &authority,
+                    ServiceCall::View {
+                        candidate: Some(handle),
+                        operation: Box::new(rpc::ViewOperation::PutMany {
+                            values: vec![("dream-private".into(), serde_json::json!(1))],
+                        }),
+                    },
+                )
+                .await?,
+                ServiceValue::Unit
+            ));
+            let other = attach_raw(&data, &scope, None).await?;
+            drop(candidate);
+            drop(other);
+            expect_events(
+                &mut events,
+                &[
+                    ServeEvent::EnteredEmpty { reached: false },
+                    ServeEvent::AttachmentAccepted { active: 1 },
+                    ServeEvent::AttachmentAccepted { active: 2 },
+                    ServeEvent::AttachmentAccepted { active: 3 },
+                ],
+            )
+            .await?;
+            let mut remaining = Vec::new();
+            for _ in 0..2 {
+                remaining.push(next_event(&mut events).await?);
+            }
+            ensure!(
+                remaining
+                    == [
+                        ServeEvent::AttachmentJoined { remaining: 2 },
+                        ServeEvent::AttachmentJoined { remaining: 1 },
+                    ],
+                "the lease holder's owner acted before it released: {remaining:?}"
+            );
+            drop(dreamer);
+            expect_events(
+                &mut events,
+                &[
+                    ServeEvent::AttachmentJoined { remaining: 0 },
+                    ServeEvent::EnteredEmpty { reached: true },
+                ],
+            )
+            .await?;
+            served.await??;
+            let ((), _gate) = crate::spawn_gate::excluding_spawns(gate, async {
+                let successor = ServiceOwner::open(options, &project).await?;
+                let inventory = successor
+                    .inspection_store_for_test()
+                    .candidate_inventory(None, 10)
+                    .await;
+                let closed = successor.close().await;
+                ensure!(
+                    inventory?
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.branch == branch),
+                    "a lost candidate attachment took its ref with the owner"
+                );
+                closed
+            })
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("dream-lease fixture exceeded its {deadline:?} deadline"))??;
+        Ok(())
+    }
+
+    // T6
+    #[tokio::test]
+    async fn a_client_racing_shutdown_elects_a_successor_without_error() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh in-process owner; then, twice, a reopened in-process owner and
+        // the reopened spawned successor a racing client elects.
+        let deadline = crate::test_support::fixture_deadline(1, 4);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let executable = crate::store::test_supervisor()?;
+            let mut gate = crate::spawn_gate::spawning().await;
+
+            // Connected but never accepted: the listener closes under it.
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let authority = owner.authority().clone();
+            let pause = ClosePause::at(ClosePoint::BeforeListenerDrop);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &scope, None).await?);
+            pause.entered.notified().await;
+            let record = EndpointRecord::read(&data, &scope)?.context("missing endpoint")?;
+            let mut queued =
+                connect_local(&data, &scope, &record.address, HANDSHAKE_TIMEOUT).await?;
+            pause.release.notify_one();
+            let error = connect_handshake(&mut queued, &authority)
+                .await
+                .err()
+                .context("a closed listener completed a handshake")?;
+            ensure!(
+                is_peer_closed(&error),
+                "an unaccepted connection to a retiring owner was not peer-closed: {error:#}"
+            );
+            served.await??;
+
+            for point in [ClosePoint::AfterEndpointRetire, ClosePoint::AfterReap] {
+                let (owner, next) = crate::spawn_gate::excluding_spawns(gate, async {
+                    ServiceOwner::open(options.clone(), &project).await
+                })
+                .await?;
+                gate = next;
+                let generation = owner.authority().service_generation.clone();
+                let pause = ClosePause::at(point);
+                let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+                knobs.close_pause = Some(pause.clone());
+                let served = tokio::spawn(owner.serve_with(knobs));
+                drop(attach_raw(&data, &scope, None).await?);
+                pause.entered.notified().await;
+                // The endpoint is already retired, so one poll takes the start
+                // lock and parks the client on the busy owner lock.
+                let mut racing = Box::pin(attach_or_start(&options, &project, &executable));
+                ensure!(
+                    futures::poll!(racing.as_mut()).is_pending(),
+                    "a client attached while the owner lock was still held at {point:?}"
+                );
+                ensure!(
+                    ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?.is_none(),
+                    "the racing client did not hold the start election at {point:?}"
+                );
+                pause.release.notify_one();
+                let successor = racing
+                    .await
+                    .with_context(|| format!("racing client failed at {point:?}"))?;
+                ensure!(
+                    successor.generation() != generation,
+                    "the racing client reached the retiring generation at {point:?}"
+                );
+                served.await??;
+                drop(successor);
+                await_owner_release(&options).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("shutdown race fixture exceeded its {deadline:?} deadline"))??;
+        Ok(())
+    }
+
+    // T6, the window between listener close and endpoint retirement: the
+    // record still names the retiring generation, but nothing accepts.
+    #[tokio::test]
+    async fn a_client_meeting_a_record_without_a_listener_elects_a_successor() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh in-process owner and the reopened spawned
+        // successor the racing client elects.
+        let deadline = crate::test_support::fixture_deadline(1, 1);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let executable = crate::store::test_supervisor()?;
+            let _gate = crate::spawn_gate::spawning().await;
+
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let generation = owner.authority().service_generation.clone();
+            let pause =
+                ClosePause::at_each(&[ClosePoint::AfterListenerDrop, ClosePoint::AfterReap]);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &scope, None).await?);
+            pause.entered.notified().await;
+
+            let record = EndpointRecord::read(&data, &scope)?
+                .context("the record was retired before the listener closed")?;
+            ensure!(
+                record.authority.service_generation == generation,
+                "the published record named another generation"
+            );
+            let observed = try_attach_observed(&data, &scope, &project, None)
+                .await
+                .context("an electing client failed on a record without a listener")?;
+            ensure!(
+                matches!(observed, Err(AttachMiss::TransportUnavailable)),
+                "a record without a listener was not a transport miss: {:?}",
+                observed.as_ref().map(|_| ())
+            );
+            ensure!(
+                request_idle_retirement(&options)
+                    .await
+                    .context("maintenance failed on a record without a listener")?
+                    .is_none(),
+                "maintenance read a record without a listener as an owner answer"
+            );
+
+            let mut racing = Box::pin(attach_or_start(&options, &project, &executable));
+            // On Unix the refused connect returns at once, so one poll takes
+            // the start lock and parks the client on the busy owner lock. A
+            // Windows connect retries the absent pipe until its deadline, so
+            // there the first poll is still inside that connect.
+            #[cfg(unix)]
+            {
+                ensure!(
+                    futures::poll!(racing.as_mut()).is_pending(),
+                    "a client attached while the listener was closed"
+                );
+                ensure!(
+                    ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?.is_none(),
+                    "the racing client did not hold the start election"
+                );
+            }
+            pause.release.notify_one();
+            tokio::select! {
+                biased;
+                () = pause.entered.notified() => {}
+                attached = racing.as_mut() => {
+                    let outcome = attached.map(|_| ());
+                    bail!("the racing client finished before the owner reaped: {outcome:?}");
+                }
+            }
+            ensure!(
+                futures::poll!(racing.as_mut()).is_pending(),
+                "a client finished while the owner lock was still held"
+            );
+            pause.release.notify_one();
+            let successor = racing
+                .await
+                .context("the racing client failed after the owner released its lock")?;
+            ensure!(
+                successor.generation() != generation,
+                "the racing client reached the retiring generation"
+            );
+            served.await??;
+            drop(successor);
+            await_owner_release(&options).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("listener-close race fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
+    // T6m
+    #[tokio::test]
+    async fn maintenance_meeting_a_closing_owner_waits_for_its_lock() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner, closed explicitly.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, _scope, _data, options) = owner_fixture(root.path())?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut owner = ServiceOwner::open(options.clone(), &project).await?;
+            // The owner closes the maintenance connection without answering
+            // it, as a retiring owner closes one it will never accept.
+            let closed_peer = async {
+                let stream = owner.accept(HANDSHAKE_TIMEOUT).await?;
+                drop(stream);
+                Ok::<(), anyhow::Error>(())
+            };
+            let (requested, closed) = tokio::join!(request_idle_retirement(&options), closed_peer);
+            closed?;
+            ensure!(
+                requested
+                    .context("maintenance treated a closing owner as an error")?
+                    .is_none(),
+                "maintenance read a closed connection as an owner answer"
+            );
+            owner.close().await?;
+            drop(acquire_maintenance_permit(&options).await?);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("maintenance race fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
+    // T7
+    #[tokio::test]
+    async fn shutdown_retires_endpoint_then_reaps_then_releases_its_lock() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let pause =
+                ClosePause::at_each(&[ClosePoint::AfterEndpointRetire, ClosePoint::AfterReap]);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &scope, None).await?);
+            pause.entered.notified().await;
+            ensure!(
+                EndpointRecord::read(&data, &scope)?.is_none(),
+                "the endpoint outlived its retirement step"
+            );
+            ensure!(
+                !lifecycle_lease_free(&options)?,
+                "the lifecycle lease was released before the store closed"
+            );
+            ensure!(
+                !owner_lock_free(&options)?,
+                "the owner lock was released before the reap"
+            );
+            pause.release.notify_one();
+            pause.entered.notified().await;
+            ensure!(
+                lifecycle_lease_free(&options)?,
+                "the reap did not release the lifecycle lease"
+            );
+            ensure!(
+                !owner_lock_free(&options)?,
+                "the owner lock was released before the owner finished closing"
+            );
+            pause.release.notify_one();
+            served.await??;
+            ensure!(owner_lock_free(&options)?, "the closed owner kept its lock");
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("shutdown order fixture exceeded its {deadline:?} deadline"))??;
+        Ok(())
+    }
+
+    // T12
+    #[tokio::test]
+    async fn inspection_skips_the_owner_probe_while_an_election_is_held() -> Result<()> {
+        // Held for the whole test: it takes and releases real flocks and never
+        // spawns; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        let root = crate::test_support::tempdir()?;
+        let (project, scope, data, mut options) = owner_fixture(root.path())?;
+        options.read_only = true;
+        options.config.startup_timeout_secs = 1;
+        let start = ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?
+            .context("fixture did not acquire the start lock")?;
+        let error =
+            tokio::time::timeout(Duration::from_secs(3), attach_existing(&options, &project))
+                .await
+                .context("inspection did not respect its startup deadline")?
+                .err()
+                .context("inspection concluded no owner while an election was held")?;
+        ensure!(
+            format!("{error:#}").contains("did not publish a readable endpoint"),
+            "inspection did not report the held election: {error:#}"
+        );
+        start.release()?;
+        ensure!(
+            attach_existing(&options, &project).await?.is_none(),
+            "inspection found an owner where none exists"
+        );
+        Ok(())
+    }
+
+    // T13
+    #[test]
+    fn released_lock_is_free_while_a_duplicate_descriptor_remains() -> Result<()> {
+        let _gate = crate::spawn_gate::locking();
+        let data = tempfile::tempdir()?;
+        let scope = format!("project/{}", "f".repeat(64));
+        let owner = ServiceLock::try_acquire(data.path(), &scope, ServiceLockKind::Owner)?
+            .context("fixture did not acquire the owner lock")?;
+        // As a sibling's child holds it between fork and exec.
+        let duplicate = owner.file.try_clone()?;
+        owner.release()?;
+        let reacquired = ServiceLock::try_acquire(data.path(), &scope, ServiceLockKind::Owner)?
+            .context("a released lock stayed held by a duplicate descriptor")?;
+        drop(duplicate);
+        reacquired.release()
+    }
+
+    // T15
+    #[test]
+    fn starter_token_is_an_optional_argument_and_hello_field() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let project = root.path().join("project");
+        let options = crate::store::OpenOptions::new(
+            root.path().join("private"),
+            format!("project/{}", "a".repeat(64)),
+        );
+        let token = uuid::Uuid::new_v4();
+        let with = service_arguments(&options, &project, Some(token));
+        let without = service_arguments(&options, &project, None);
+        ensure!(with.len() == without.len() + 1);
+        ensure!(parse_service_arguments(with[1..].to_vec())?.1.starter_token == Some(token));
+        ensure!(
+            parse_service_arguments(without[1..].to_vec())?
+                .1
+                .starter_token
+                .is_none()
+        );
+        let mut extra = with[1..].to_vec();
+        extra.push("x".into());
+        ensure!(parse_service_arguments(extra).is_err());
+        let mut invalid = without[1..].to_vec();
+        invalid.push("not-a-token".into());
+        ensure!(parse_service_arguments(invalid).is_err());
+
+        let hello = authority().hello();
+        ensure!(
+            serde_json::to_string(&hello)?
+                == r#"{"version":{"major":1,"minor":7},"project_path":[47,112,114,105,118,97,116,101,47,112,114,111,106,101,99,116],"project_scope":"scope","store_instance":"store","service_generation":"generation","connection_secret":"test-secret","schema_version":4}"#,
+            "a hello without a starter token changed its wire form"
+        );
+        let mut presented = hello;
+        presented.starter_token = Some(token.to_string());
+        ensure!(!format!("{presented:?}").contains(&token.to_string()));
+        let decoded: ClientHello = serde_json::from_slice(&serde_json::to_vec(&presented)?)?;
+        ensure!(authority().verify(&decoded).is_ok());
+        ensure!(decoded.starter_token == Some(token.to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_learns_only_the_presented_starter_token() -> Result<()> {
+        let expected = authority();
+        let token = uuid::Uuid::new_v4();
+        for presented in [None, Some(token)] {
+            let (mut client, mut server) = duplex(1024);
+            let server_authority = expected.clone();
+            let accepted = tokio::spawn(async move {
+                accept_handshake_presenting(&mut server, &server_authority).await
+            });
+            connect_handshake_presenting(&mut client, &expected, presented).await?;
+            ensure!(accepted.await?? == Ok(presented.map(|token| token.to_string())));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closing_an_attachment_drops_its_held_stream() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let data = tempfile::tempdir()?;
+            let scope = format!("project/{}", "9".repeat(64));
+            let (mut listener, address) = ServiceListener::bind(data.path(), &scope)?;
+            let mut expected = authority();
+            expected.project_scope = scope.clone();
+            let server_authority = expected.clone();
+            let (received, ready) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept(HANDSHAKE_TIMEOUT).await?;
+                ensure!(
+                    accept_handshake(&mut stream, &server_authority)
+                        .await?
+                        .is_ok()
+                );
+                let _: ServiceRequest = read_frame(&mut stream, 1024, HANDSHAKE_TIMEOUT).await?;
+                let _ = received.send(());
+                // The client never reads a reply; its close ends this read.
+                let mut rest = [0u8; 1];
+                let closed = stream.read(&mut rest).await?;
+                Ok::<usize, anyhow::Error>(closed)
+            });
+            let mut stream =
+                connect_local(data.path(), &scope, &address, HANDSHAKE_TIMEOUT).await?;
+            connect_handshake(&mut stream, &expected).await?;
+            let mut attachment = ServiceAttachment {
+                stream: Some(stream),
+                held: None,
+                retain_after_abandon: false,
+                authority: expected,
+                locator: None,
+                last_fault: None,
+                #[cfg(test)]
+                reply_pause: None,
+            };
+            attachment.retain_after_abandon();
+            let mut call = Box::pin(attachment.call(ServiceCall::Revision));
+            tokio::select! {
+                result = &mut call => bail!("client call unexpectedly completed: {result:?}"),
+                ready = ready => ready.context("fixture server did not receive request")?,
+            }
+            drop(call);
+            ensure!(
+                attachment.stream.is_none() && attachment.holds_abandoned_stream(),
+                "a cancelled call on a retaining attachment did not hold its stream"
+            );
+            ensure!(
+                !server.is_finished(),
+                "the held stream was closed before its attachment"
+            );
+            ensure!(attachment.call(ServiceCall::Revision).await.is_err());
+            attachment.close();
+            ensure!(!attachment.holds_abandoned_stream());
+            ensure!(
+                server.await?? == 0,
+                "the owner saw more than the closed held stream"
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("held stream fixture exceeded 10 seconds")??;
         Ok(())
     }
 }

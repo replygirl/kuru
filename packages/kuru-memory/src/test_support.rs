@@ -29,7 +29,10 @@ pub use fixture_dir::{CreatorTeardown, TempDir, release_after_creator_exit};
 #[cfg(test)]
 mod served_owner;
 #[cfg(test)]
-pub(crate) use served_owner::{FixtureDeadline, serve_without_deadline};
+pub(crate) use served_owner::{
+    FixtureDeadline, ServeEvents, expect_events, expect_no_event, next_event, observed,
+    serve_without_deadline,
+};
 /// Data-tree copy, byte scan and cross-OS capture format for the engine
 /// contract tests.
 #[cfg(test)]
@@ -66,6 +69,14 @@ pub struct ReplyBarrier {
 impl ReplyBarrier {
     pub async fn wait_sent(&self) {
         self.inner.sent.notified().await;
+    }
+
+    /// Wait until the owner's reply frame has arrived and is held. The owner
+    /// writes it only after the request's handler returned and its receipt
+    /// settled, so a call cancelled after this leaves the owner with no
+    /// request in hand. It is not needed for a definite reconcile.
+    pub async fn wait_replied(&self) {
+        self.inner.replied.notified().await;
     }
 
     pub fn promotion_sent(&self) -> bool {
@@ -200,8 +211,7 @@ pub(crate) fn fresh_open_budget() -> std::time::Duration {
 /// fixture gets one single-stall term, the largest bound any other single
 /// product step can reach (an owned server close, a `QUERY_TIMEOUT` statement,
 /// or a startup-budgeted lock, quiescence or maintenance-permit wait), and one
-/// `QUERY_TIMEOUT` for its own operations. A fixture whose owner retires only
-/// through idle expiry adds `SERVICE_IDLE_TIMEOUT` at the call site.
+/// `QUERY_TIMEOUT` for its own operations.
 ///
 /// So one stalled step with its own product bound reports that error before
 /// this backstop expires; the backstop does not budget several steps each
@@ -250,8 +260,23 @@ pub fn open_options(data_dir: PathBuf, project_scope: String) -> Result<OpenOpti
 #[cfg(feature = "test-support")]
 pub use crate::service::FixtureLoggedOwner;
 
+/// Names an existing private file that receives the stderr of the owner a
+/// process elects, when nothing else chooses it. A test sets it on each
+/// command-line child it runs, since the electing child is the process that
+/// reads it: the owner that child starts logs where the test can read it, and
+/// the test never has to start that owner itself. It is deliberately not
+/// forwarded to the owner, which elects nobody. Inert when unset.
+#[cfg(feature = "test-support")]
+pub use crate::service::OWNER_DIAGNOSTIC_ENV;
+
 /// Start the actual service executable with one caller-owned private stderr
-/// file, then wait for its authenticated endpoint before CLI children attach.
+/// file, and wait for its authenticated endpoint. The returned fixture holds
+/// the attachment of the fixture that started it, which is the owner's
+/// starter: the owner stays until that attachment and every other client have
+/// released, and [`FixtureLoggedOwner::wait_for_exit`] releases it and awaits
+/// the owner's own retirement. Start it only when no other owner is running,
+/// and let no command-line child elect its own meanwhile; for the owner a
+/// child elects, use [`OWNER_DIAGNOSTIC_ENV`].
 #[cfg(feature = "test-support")]
 pub async fn spawn_logged_owner(
     options: &OpenOptions,
@@ -285,18 +310,28 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
         .map_err(|error| fixture_startup_error(&fixture_options, error))
 }
 
-/// Retire the exact idle managed owner after fixture clients release their
-/// transports. The maintenance permit is dropped before a successor starts.
+/// Retire the exact managed owner once fixture clients have released their
+/// transports. The owner retires by itself when its last client detaches, so
+/// this waits behind one that is already closing, or asks a still-running one
+/// (a starter-less or not-yet-reached owner) to retire. The maintenance permit
+/// is dropped before a successor starts.
+///
+/// When its bound elapses, the error names the step the acquisition was
+/// cancelled in, so a slow owner close, a still-attached client and a stalled
+/// request are distinguishable from the failure text alone.
 pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
+    let trace = crate::service::MaintenanceTrace::default();
+    let mut refusals: u32 = 0;
     let permit = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            match crate::service::acquire_maintenance_permit(options).await {
+            match crate::service::acquire_maintenance_permit_traced(options, &trace).await {
                 Ok(permit) => break Ok(permit),
                 Err(error)
                     if error
                         .to_string()
                         .contains("memory service has active clients") =>
                 {
+                    refusals = refusals.saturating_add(1);
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 Err(error) => break Err(error),
@@ -304,22 +339,48 @@ pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
         }
     })
     .await
-    .context("idle managed owner did not retire within 10 seconds")??;
+    .with_context(|| {
+        format!(
+            "idle managed owner did not retire within 10 seconds; {trace}; active-client refusals={refusals}"
+        )
+    })??;
     drop(permit);
     Ok(())
+}
+
+/// Wait, without polling, until the managed owner for `options` has released
+/// its owner lock: it retires its endpoint, reaps Dolt and only then unlocks,
+/// so this observes the owner's exit from another process. Use it after the
+/// last client of a spawned owner has closed, before asserting on its
+/// retirement or electing a successor.
+///
+/// It has no deadline of its own; bound it with the fixture's backstop. If
+/// the owner never retires, the blocked waiter cannot be cancelled and ends
+/// with the process, so the test fails at its backstop. It briefly holds the
+/// owner lock itself once the owner releases it, so call it only while no
+/// other client is electing.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn await_owner_release(options: &OpenOptions) -> Result<()> {
+    crate::service::ServiceLock::await_release(
+        &options.data_dir,
+        &options.project_scope,
+        crate::service::ServiceLockKind::Owner,
+    )
+    .await
 }
 
 /// Wait until a managed fixture's store has no live Dolt, and record that on
 /// its fixture root, before the root is released.
 ///
-/// The managed service deliberately outlives its last client by an idle
-/// grace, so closing every client does not stop its engine. Call this after
-/// every client handle for `options` has closed (an attached client makes
-/// [`retire_idle_service`] fail with "active clients"). It retires the idle
-/// owner, whose owner lock is released only after its Dolt is reaped, then
-/// awaits [`await_store_quiescence`] for the project store, each of its
-/// remaining staging directories and each stage preserved under
-/// `interrupted/`. The product's asynchronous idle close is unchanged; only
+/// The managed service retires as soon as its last client detaches, but it
+/// closes asynchronously, so closing every client does not mean its engine is
+/// already reaped. Call this after every client handle for `options` has
+/// closed (an attached client makes [`retire_idle_service`] fail with "active
+/// clients"). It waits behind the owner's own close, or retires an owner that
+/// is still running, either of which releases the owner lock only after its
+/// Dolt is reaped, then awaits [`await_store_quiescence`] for the project
+/// store, each of its remaining staging directories and each stage preserved
+/// under `interrupted/`. The product's asynchronous close is unchanged; only
 /// fixtures wait for it. A fixture that does not know its projects finds
 /// them with [`managed_store_scopes`].
 pub async fn await_managed_quiescence(options: &OpenOptions) -> Result<()> {
@@ -972,5 +1033,121 @@ mod tests {
         assert!(from_profile(root.path()).is_err());
         assert!(snapshot_supervisor(&source, root.path()).is_err());
         assert_eq!(fs::read(&second).unwrap(), b"corrupted private bytes");
+    }
+
+    /// An owner lock held with no endpoint published, as by an owner still
+    /// reaping Dolt after retiring its record: the fixture's bound elapses
+    /// and its error names the step it was cancelled in and what the
+    /// retirement requests met, not only that the deadline elapsed. Paused
+    /// time advances the fixture's own waits; nothing here waits on a clock.
+    #[tokio::test(start_paused = true)]
+    async fn an_elapsed_retirement_bound_names_the_step_it_was_cancelled_in() -> Result<()> {
+        let root = tempdir()?;
+        let options = open_options(
+            root.path().join("private"),
+            format!("project/{}", "1".repeat(64)),
+        )?;
+        let owner = crate::service::ServiceLock::try_acquire(
+            &options.data_dir,
+            &options.project_scope,
+            crate::service::ServiceLockKind::Owner,
+        )?
+        .context("a fresh fixture's owner lock was busy")?;
+        let error = retire_idle_service(&options)
+            .await
+            .expect_err("retirement completed while the owner lock was held");
+        let text = format!("{error:#}");
+        ensure!(
+            text.contains("idle managed owner did not retire within 10 seconds")
+                && text.contains("maintenance waiting for the owner lock for ")
+                && text.contains("busy replies=0")
+                && text.contains("active-client refusals=0")
+                && !text.contains("requests without a live endpoint=0;"),
+            "the elapsed bound did not name its step: {text}"
+        );
+        owner.release()?;
+        root.release(Ok(()))
+    }
+
+    /// A project that never had an owner: its owner lock is free, so the
+    /// wait returns at once, and leaves the lock free.
+    #[tokio::test]
+    async fn awaiting_the_release_of_an_owner_lock_nobody_holds_returns_at_once() -> Result<()> {
+        let root = tempdir()?;
+        let options = open_options(
+            root.path().join("private"),
+            format!("project/{}", "0".repeat(64)),
+        )?;
+        tokio::time::timeout(Duration::from_secs(30), await_owner_release(&options))
+            .await
+            .context("the wait for an unheld owner lock did not return")??;
+        ensure!(
+            crate::service::ServiceLock::try_acquire(
+                &options.data_dir,
+                &options.project_scope,
+                crate::service::ServiceLockKind::Owner,
+            )?
+            .map(crate::service::ServiceLock::release)
+            .transpose()?
+            .is_some(),
+            "the wait left the owner lock held"
+        );
+        Ok(())
+    }
+
+    /// A really spawned owner: the wait returns only when the last client's
+    /// detach has made the owner retire its endpoint, reap Dolt and release
+    /// its lock, without any timer or poll on the test's side.
+    #[tokio::test]
+    async fn awaiting_the_release_of_a_spawned_owner_observes_its_retirement() -> Result<()> {
+        warm_runtime_cache().await?;
+        // Real lifecycles: one fresh elected service process.
+        let deadline = fixture_deadline(1, 0);
+        let root = tempdir()?;
+        let project = root.path().join("project");
+        fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let scope = format!(
+            "project/{}",
+            Sha256::digest(project.as_os_str().as_encoded_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = open_options(root.path().join("private"), scope)?;
+        let executable = crate::store::test_supervisor()?;
+        let gate = crate::spawn_gate::spawning().await;
+        let waited = tokio::time::timeout(deadline, async {
+            let attachment = crate::service::attach_or_start(&options, &project, &executable)
+                .await
+                .context("elect a spawned owner")?;
+            let generation = attachment.generation().to_owned();
+            ensure!(
+                crate::service::EndpointRecord::read(&options.data_dir, &options.project_scope)?
+                    .is_some_and(|record| record.authority.service_generation == generation),
+                "the spawned owner did not publish its endpoint"
+            );
+            drop(attachment);
+            await_owner_release(&options).await?;
+            ensure!(
+                crate::service::EndpointRecord::read(&options.data_dir, &options.project_scope)?
+                    .is_none(),
+                "the owner released its lock without retiring its endpoint"
+            );
+            Ok::<_, Error>(())
+        })
+        .await
+        .with_context(|| format!("spawned owner fixture exceeded its {deadline:?} deadline"))?;
+        drop(gate);
+        waited?;
+        let directory = crate::store::project_directory(&options.data_dir, &options.project_scope)?;
+        #[cfg(unix)]
+        let lifecycle_root: Option<PathBuf> = None;
+        #[cfg(windows)]
+        let lifecycle_root = Some(options.data_dir.join("memory/lifecycles"));
+        for store in project_store_directories(&directory)? {
+            await_store_quiescence(&store, lifecycle_root.as_deref()).await?;
+        }
+        root.release(Ok(()))
     }
 }

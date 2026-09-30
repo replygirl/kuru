@@ -90,6 +90,142 @@ struct RemoteSession {
     mutations: AsyncMutex<()>,
     extra_connections: Arc<Semaphore>,
     attachments: Mutex<Vec<Weak<AsyncMutex<ServiceAttachment>>>>,
+    /// A clean main-view attachment to the verified successor owner, kept
+    /// from checked recovery until `reopen_after_checked_recovery`, so that
+    /// owner never finds this client gone in between. Not in `attachments`:
+    /// the reopen's drain leaves it, and only an explicit close drops it.
+    successor: Mutex<Option<ServiceAttachment>>,
+    #[cfg(test)]
+    replacement_hook: Mutex<Option<Arc<ReplacementHook>>>,
+}
+
+/// Armed while an exchange runs on a writable session's primary attachment.
+/// If the exchange does not complete (cancelled, or failed), that attachment
+/// has kept the old stream open, unused, and dropping this guard starts its
+/// replacement at once, so the owner never sees the client without a
+/// connection. Nothing is resent: the caller's result and any mutation fence
+/// are unchanged.
+struct ReplaceAbandoned {
+    session: Weak<RemoteSession>,
+    primary: Weak<AsyncMutex<ServiceAttachment>>,
+    armed: bool,
+}
+
+impl ReplaceAbandoned {
+    /// Starts unarmed. `checked_call` arms it once the call's stream is live,
+    /// including a stream its lazy connect has just opened. A lazy connect
+    /// that fails or is cancelled leaves it unarmed: that connect was itself
+    /// the replacement attempt, and nothing retries it.
+    fn new(session: &Arc<RemoteSession>, primary: &Arc<AsyncMutex<ServiceAttachment>>) -> Self {
+        Self {
+            session: Arc::downgrade(session),
+            primary: Arc::downgrade(primary),
+            armed: false,
+        }
+    }
+
+    /// Arm for a retaining attachment whose stream is live.
+    fn arm(&mut self, attachment: &ServiceAttachment) {
+        self.armed = attachment.retains_after_abandon() && attachment.has_complete_exchange();
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReplaceAbandoned {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Outside a runtime the held stream stays until the next call's lazy
+        // connect replaces it.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(replace_abandoned(
+                self.session.clone(),
+                self.primary.clone(),
+            ));
+        }
+    }
+}
+
+/// Replace a primary attachment whose exchange did not complete. Close and
+/// replacement take the same attachment lock, so they are totally ordered:
+/// a closed session never gains a new connection, and the held stream is
+/// dropped only when its replacement is installed.
+async fn replace_abandoned(
+    session: Weak<RemoteSession>,
+    primary: Weak<AsyncMutex<ServiceAttachment>>,
+) {
+    let (Some(session), Some(primary)) = (session.upgrade(), primary.upgrade()) else {
+        return;
+    };
+    let mut attachment = primary.lock().await;
+    // A later call's lazy connect or a close may have got here first.
+    if session.closed.load(Ordering::Acquire)
+        || attachment.has_complete_exchange()
+        || !attachment.holds_abandoned_stream()
+    {
+        return;
+    }
+    let connected = session.factory.connect().await;
+    #[cfg(test)]
+    let hook = session.replacement_hook();
+    #[cfg(test)]
+    if let Some(hook) = &hook {
+        hook.after_connect().await;
+    }
+    if session.closed.load(Ordering::Acquire) {
+        #[cfg(test)]
+        if let Some(hook) = &hook {
+            hook.discarded.notify_one();
+        }
+        return;
+    }
+    match connected {
+        Ok(mut replacement) => {
+            replacement.retain_after_abandon();
+            *attachment = replacement;
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook.installed.notify_one();
+            }
+        }
+        Err(error) => {
+            // The owner refuses silently at its attachment limit or during a
+            // candidate-resolution reservation. Keep the held stream and add
+            // no retry: the next call's lazy connect is the second attempt.
+            tracing::debug!(error = %format!("{error:#}"), "memory attachment replacement failed");
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook.failed.notify_one();
+            }
+        }
+    }
+}
+
+/// Test observation of `replace_abandoned`, optionally paused after its
+/// connect and before it installs or discards the new attachment.
+#[cfg(test)]
+#[derive(Default)]
+struct ReplacementHook {
+    pause_after_connect: bool,
+    connected: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    installed: tokio::sync::Notify,
+    discarded: tokio::sync::Notify,
+    failed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ReplacementHook {
+    async fn after_connect(&self) {
+        if self.pause_after_connect {
+            self.connected.notify_one();
+            self.release.notified().await;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -222,7 +358,39 @@ impl std::fmt::Debug for MemoryStore {
 }
 
 impl RemoteSession {
+    /// A new session's main view. Its writable primary keeps a cancelled
+    /// call's stream until a replacement has connected; a read-only primary
+    /// never holds the owner and gets no replacement.
     fn new_view(
+        mut attachment: ServiceAttachment,
+        options: OpenOptions,
+        project: PathBuf,
+        executable: PathBuf,
+    ) -> Result<RemoteView> {
+        if !options.read_only {
+            attachment.retain_after_abandon();
+        }
+        Self::new_session_view(attachment, options, project, executable)
+    }
+
+    /// A new session whose view is a proven candidate ref. Its stream is not
+    /// retained: a cancelled candidate call releases the connection-owned
+    /// handle at once, as forks do.
+    fn new_candidate_view(
+        attachment: ServiceAttachment,
+        options: OpenOptions,
+        project: PathBuf,
+        executable: PathBuf,
+        (handle, creation_id, branch): (Uuid, Uuid, String),
+    ) -> Result<RemoteView> {
+        let mut view = Self::new_session_view(attachment, options, project, executable)?;
+        view.candidate = Some(handle);
+        view.candidate_creation_id = Some(creation_id);
+        view.pinned_view = branch;
+        Ok(view)
+    }
+
+    fn new_session_view(
         attachment: ServiceAttachment,
         options: OpenOptions,
         project: PathBuf,
@@ -246,6 +414,9 @@ impl RemoteSession {
             mutations: AsyncMutex::new(()),
             extra_connections: Arc::new(Semaphore::new(MAX_PARALLEL_CLIENT_CONNECTIONS)),
             attachments: Mutex::new(Vec::new()),
+            successor: Mutex::new(None),
+            #[cfg(test)]
+            replacement_hook: Mutex::new(None),
         });
         let attachment = Arc::new(AsyncMutex::new(attachment));
         session.register(&attachment)?;
@@ -281,6 +452,53 @@ impl RemoteSession {
         Ok(())
     }
 
+    /// Keep `attachment` to the verified successor for the checked reopen.
+    /// Called before `retire_after_checked_recovery`, so a closed session
+    /// here was closed explicitly and its slot must stay empty.
+    fn keep_successor(&self, attachment: ServiceAttachment) {
+        // The slot holds no invariant a panic could break.
+        let mut slot = self
+            .successor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.closed.load(Ordering::Acquire) {
+            *slot = Some(attachment);
+        }
+    }
+
+    fn take_successor(&self) -> Option<ServiceAttachment> {
+        self.successor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// A second connection to the successor, taken before the recovery
+    /// attachment becomes a candidate view whose connection-owned handle a
+    /// main view must not share. Without it the reopen elects as before.
+    /// Takes the factory, not the attachment: a Windows pipe is not `Sync`,
+    /// so a borrowed attachment cannot be held across this await.
+    async fn successor_fork(factory: Result<AttachmentFactory>) -> Option<ServiceAttachment> {
+        match async { factory?.connect().await }.await {
+            Ok(fork) => Some(fork),
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "memory recovery could not keep a successor attachment; the reopen will elect"
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn replacement_hook(&self) -> Option<Arc<ReplacementHook>> {
+        self.replacement_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn retire_after_checked_recovery(&self) {
         // Mark closed while the mutation guard is held so a queued call
         // cannot slip through before the old attachments are drained. The
@@ -299,7 +517,17 @@ impl RemoteSession {
         Ok(())
     }
 
+    /// Explicit close: drain every attachment, then drop a kept successor
+    /// attachment, so an ordinary close still releases every connection.
     async fn close(&self) -> Result<()> {
+        self.drain().await?;
+        drop(self.take_successor());
+        Ok(())
+    }
+
+    /// Close the session and every registered attachment, keeping only the
+    /// successor slot for a checked reopen.
+    async fn drain(&self) -> Result<()> {
         self.closed.store(true, Ordering::Release);
         self.extra_connections.close();
         // A cancelled close must leave every attachment discoverable for a
@@ -367,6 +595,7 @@ impl RemoteSession {
                     // Any candidate, export or ledger handle still names the
                     // retired owner generation; close the old session and
                     // require a checked fresh main view before continuation.
+                    self.keep_successor(attachment);
                     self.retire_after_checked_recovery();
                 }
                 Ok(Some(status == service::rpc::OutcomeStatus::Committed))
@@ -437,6 +666,7 @@ impl RemoteSession {
             branch == pending.view,
             "candidate unit outcome named a different pinned view"
         );
+        let mut successor = None;
         let view = if current_generation {
             let attachment = Arc::new(AsyncMutex::new(attachment));
             self.register(&attachment)?;
@@ -449,16 +679,14 @@ impl RemoteSession {
                 read_only: false,
             }
         } else {
-            let mut view = RemoteSession::new_view(
+            successor = Self::successor_fork(attachment.factory()).await;
+            RemoteSession::new_candidate_view(
                 attachment,
                 self.options.clone(),
                 self.project.clone(),
                 self.executable.clone(),
-            )?;
-            view.candidate = Some(handle);
-            view.candidate_creation_id = Some(creation_id);
-            view.pinned_view = branch;
-            view
+                (handle, creation_id, branch),
+            )?
         };
         *self
             .pending_unit
@@ -467,6 +695,9 @@ impl RemoteSession {
         if current_generation {
             self.uncertain_write.store(false, Ordering::Release);
         } else {
+            if let Some(successor) = successor {
+                self.keep_successor(successor);
+            }
             self.retire_after_checked_recovery();
         }
         Ok(Some(CandidateUnitRecovery {
@@ -516,6 +747,7 @@ impl RemoteSession {
                 if current_generation {
                     self.uncertain_write.store(false, Ordering::Release);
                 } else {
+                    self.keep_successor(attachment);
                     self.retire_after_checked_recovery();
                 }
                 Ok(Some(status == service::rpc::OutcomeStatus::Committed))
@@ -617,6 +849,7 @@ impl RemoteSession {
             !open || reattached.is_some(),
             "open candidate ref lost its checked handle"
         );
+        let mut successor = None;
         let candidate = if let Some((handle, base, branch)) = reattached {
             let view = if current_generation {
                 let attachment = Arc::new(AsyncMutex::new(attachment));
@@ -630,16 +863,14 @@ impl RemoteSession {
                     read_only: false,
                 }
             } else {
-                let mut view = RemoteSession::new_view(
+                successor = Self::successor_fork(attachment.factory()).await;
+                RemoteSession::new_candidate_view(
                     attachment,
                     self.options.clone(),
                     self.project.clone(),
                     self.executable.clone(),
-                )?;
-                view.candidate = Some(handle);
-                view.candidate_creation_id = Some(pending.creation_id);
-                view.pinned_view = branch;
-                view
+                    (handle, pending.creation_id, branch),
+                )?
             };
             Some(Candidate {
                 backend: CandidateBackend::Remote(RemoteCandidate { view, handle, base }),
@@ -647,6 +878,9 @@ impl RemoteSession {
                 reject_next_state_write: Arc::new(AtomicBool::new(false)),
             })
         } else {
+            if !current_generation {
+                successor = Some(attachment);
+            }
             None
         };
         *self
@@ -657,6 +891,9 @@ impl RemoteSession {
         if current_generation {
             self.uncertain_write.store(false, Ordering::Release);
         } else {
+            if let Some(successor) = successor {
+                self.keep_successor(successor);
+            }
             self.retire_after_checked_recovery();
         }
         Ok(Some(CandidateTransitionRecovery {
@@ -726,6 +963,7 @@ impl RemoteSession {
         if current_generation {
             self.uncertain_write.store(false, Ordering::Release);
         } else {
+            self.keep_successor(attachment);
             self.retire_after_checked_recovery();
         }
         Ok(Some(resolution))
@@ -768,6 +1006,7 @@ impl RemoteSession {
         else {
             bail!("candidate creation outcome remains unresolved: {outcome:?}")
         };
+        let mut successor = None;
         let view = if current_generation {
             let attachment = Arc::new(AsyncMutex::new(attachment));
             self.register(&attachment)?;
@@ -782,16 +1021,14 @@ impl RemoteSession {
         } else {
             // Old candidate/export/ledger handles cannot be reused in the
             // successor generation. The proven branch receives a new session.
-            let mut view = RemoteSession::new_view(
+            successor = Self::successor_fork(attachment.factory()).await;
+            RemoteSession::new_candidate_view(
                 attachment,
                 self.options.clone(),
                 self.project.clone(),
                 self.executable.clone(),
-            )?;
-            view.candidate = Some(handle);
-            view.candidate_creation_id = Some(pending.id);
-            view.pinned_view = branch;
-            view
+                (handle, pending.id, branch),
+            )?
         };
         *self
             .pending_candidate
@@ -800,6 +1037,9 @@ impl RemoteSession {
         if current_generation {
             self.uncertain_write.store(false, Ordering::Release);
         } else {
+            if let Some(successor) = successor {
+                self.keep_successor(successor);
+            }
             self.retire_after_checked_recovery();
         }
         Ok(Some(Candidate {
@@ -817,10 +1057,13 @@ impl RemoteView {
         Ok(())
     }
 
+    /// `replace` is the primary's replacement guard, armed here once the
+    /// stream this call will use is live.
     async fn checked_call(
         &self,
         attachment: &mut ServiceAttachment,
         call: ServiceCall,
+        replace: Option<&mut ReplaceAbandoned>,
     ) -> Result<ServiceValue> {
         let mutating = call.may_mutate();
         let _mutation = if mutating {
@@ -828,7 +1071,47 @@ impl RemoteView {
         } else {
             None
         };
+        if let Some(replace) = replace {
+            self.ensure_connected(attachment, mutating).await?;
+            replace.arm(attachment);
+        }
         self.checked_call_locked(attachment, call).await
+    }
+
+    /// Check the session, then reconnect an attachment whose last exchange
+    /// did not complete, to the same generation.
+    async fn ensure_connected(
+        &self,
+        attachment: &mut ServiceAttachment,
+        mutating: bool,
+    ) -> Result<()> {
+        if mutating {
+            self.session.ensure_mutation_allowed()?;
+        } else {
+            self.session.ensure_open()?;
+        }
+        if !attachment.has_complete_exchange() {
+            ensure!(
+                self.candidate.is_none(),
+                "candidate attachment was lost; inspect the durable candidate ref before continuing"
+            );
+            // Build before assigning: a held stream is dropped only once its
+            // replacement exists, and the replacement keeps the primary's rule.
+            let mut replacement = self.session.factory.connect().await.map_err(|error| {
+                if self.read_only {
+                    error.context(
+                        "the memory service ended while this read-only command was disconnected; run the command again",
+                    )
+                } else {
+                    error
+                }
+            })?;
+            if attachment.retains_after_abandon() {
+                replacement.retain_after_abandon();
+            }
+            *attachment = replacement;
+        }
+        Ok(())
     }
 
     /// Candidate transitions hold the shared lock across target capture and
@@ -877,18 +1160,7 @@ impl RemoteView {
             } => Some((branch, base, target)),
             _ => None,
         };
-        if mutating {
-            self.session.ensure_mutation_allowed()?;
-        } else {
-            self.session.ensure_open()?;
-        }
-        if !attachment.has_complete_exchange() {
-            ensure!(
-                self.candidate.is_none(),
-                "candidate attachment was lost; inspect the durable candidate ref before continuing"
-            );
-            *attachment = self.session.factory.connect().await?;
-        }
+        self.ensure_connected(attachment, mutating).await?;
         let candidate_begin = matches!(&call, ServiceCall::BeginCandidate { .. });
         if let Some((method, argument_digest)) = receipt {
             *self
@@ -1020,7 +1292,16 @@ impl RemoteView {
         if self.candidate.is_none() {
             if let Ok(mut attachment) = self.attachment.try_lock() {
                 self.session.ensure_open()?;
-                return self.checked_call(&mut attachment, call).await;
+                // Declared after the lock guard, so on cancellation it drops
+                // first and its task can take the lock only once released.
+                let mut replace = ReplaceAbandoned::new(&self.session, &self.attachment);
+                let result = self
+                    .checked_call(&mut attachment, call, Some(&mut replace))
+                    .await;
+                if attachment.has_complete_exchange() {
+                    replace.disarm();
+                }
+                return result;
             }
             let _permit = self
                 .session
@@ -1034,11 +1315,11 @@ impl RemoteView {
             self.session.register(&attachment)?;
             let mut attachment = attachment.lock().await;
             self.session.ensure_open()?;
-            return self.checked_call(&mut attachment, call).await;
+            return self.checked_call(&mut attachment, call, None).await;
         }
         let mut attachment = self.attachment.lock().await;
         self.session.ensure_open()?;
-        self.checked_call(&mut attachment, call).await
+        self.checked_call(&mut attachment, call, None).await
     }
 
     async fn fork(&self) -> Result<Self> {
@@ -1213,11 +1494,17 @@ impl MemoryStore {
             "read-only memory view cannot resume writable recovery"
         );
         // The close registry survives cancellation, so a later caller can
-        // retry the drain before it attaches to the verified successor.
-        session.close().await?;
-        let attachment =
-            service::attach_or_start(&session.options, &session.project, &session.executable)
-                .await?;
+        // retry the drain before it attaches to the verified successor. The
+        // drain leaves the successor attachment kept by the recovery, so a
+        // cancelled reopen does not lose it; without one, elect as before.
+        session.drain().await?;
+        let attachment = match session.take_successor() {
+            Some(attachment) => attachment,
+            None => {
+                service::attach_or_start(&session.options, &session.project, &session.executable)
+                    .await?
+            }
+        };
         ensure!(
             attachment.store_instance() == session.factory.store_instance(),
             "memory store identity changed before successor reattachment"
@@ -5314,6 +5601,11 @@ mod tests {
                         ));
                     }
                     original_generation.close();
+                    // The cancelled abandon's primary keeps a connection to its
+                    // owner (held, then replaced). The logical client keeps its
+                    // receipt and fence but releases that transport, so the old
+                    // owner can retire.
+                    memory.close_transport_for_test().await?;
                     // Force exact old-owner/Dolt retirement, then expose the
                     // retained request only to a verified successor generation.
                     let _gate = served
@@ -6621,5 +6913,847 @@ mod tests {
             )
             .await;
         root.release(outcome)
+    }
+
+    // Option B and the successor slot (memory-owner-immediate-retirement).
+    // These owners are served in process under the product policy for an
+    // owner started without a starter token: any attachment reaches it, so
+    // each retires by itself once its last attachment is released.
+
+    use crate::test_support::{
+        ServeEvents, expect_events as expect_serve_events,
+        expect_no_event as expect_no_serve_event, next_event as next_serve_event,
+    };
+
+    use service::ServeEvent::{AttachmentAccepted, AttachmentJoined, EnteredEmpty};
+
+    fn retiring_fixture() -> Result<(tempfile::TempDir, PathBuf, OpenOptions)> {
+        let root = tempfile::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        Ok((root, project, options))
+    }
+
+    /// Serve `owner` observed, reached by any attachment, optionally pausing
+    /// the first request of any kind before its dispatch.
+    fn serve_retiring(
+        owner: service::ServiceOwner,
+        dispatch: Option<Arc<service::rpc::DispatchPause>>,
+    ) -> (tokio::task::JoinHandle<Result<()>>, ServeEvents) {
+        let (observer, events) = tokio::sync::mpsc::unbounded_channel();
+        let knobs = service::ServeKnobs {
+            admission: service::Admission::AnyAttachment,
+            observer: Some(observer),
+            dispatch_pause: dispatch,
+            ..service::ServeKnobs::never_reached()
+        };
+        (tokio::spawn(owner.serve_with(knobs)), events)
+    }
+
+    /// Await the owner's retirement after its last attachment: every event
+    /// up to `EnteredEmpty { reached: true }` is a join, and the serve task
+    /// then ends cleanly.
+    async fn expect_retired(
+        events: &mut ServeEvents,
+        served: tokio::task::JoinHandle<Result<()>>,
+    ) -> Result<()> {
+        loop {
+            match next_serve_event(events).await? {
+                EnteredEmpty { reached: true } => break,
+                AttachmentJoined { .. } => {}
+                event => bail!("serve event {event:?} while the owner drained to retirement"),
+            }
+        }
+        served.await?
+    }
+
+    async fn open_retiring(options: &OpenOptions, project: &Path) -> Result<MemoryStore> {
+        MemoryStore::open_managed_observed(
+            options.clone(),
+            project.to_owned(),
+            std::env::current_exe()?,
+        )
+        .1
+        .await
+    }
+
+    fn remote_of(memory: &MemoryStore) -> Result<&RemoteView> {
+        let Backend::Remote(remote) = &memory.backend else {
+            bail!("the fixture did not attach to the service")
+        };
+        Ok(remote)
+    }
+
+    async fn primary_generation(memory: &MemoryStore) -> Result<String> {
+        Ok(remote_of(memory)?
+            .attachment
+            .lock()
+            .await
+            .generation()
+            .to_owned())
+    }
+
+    fn observe_replacement(
+        memory: &MemoryStore,
+        pause_after_connect: bool,
+    ) -> Result<Arc<ReplacementHook>> {
+        let hook = Arc::new(ReplacementHook {
+            pause_after_connect,
+            ..ReplacementHook::default()
+        });
+        *remote_of(memory)?
+            .session
+            .replacement_hook
+            .lock()
+            .map_err(|_| anyhow::anyhow!("replacement hook is poisoned"))? = Some(hook.clone());
+        Ok(hook)
+    }
+
+    /// Start `call` on its own task and cancel it once `reached` completes.
+    async fn cancel_after<T: Send + 'static>(
+        call: impl std::future::Future<Output = Result<T>> + Send + 'static,
+        reached: impl std::future::Future<Output = ()>,
+    ) -> Result<()> {
+        let task = tokio::spawn(call);
+        let _cleanup = AbortOnDrop(task.abort_handle());
+        reached.await;
+        task.abort();
+        ensure!(
+            task.await.is_err_and(|error| error.is_cancelled()),
+            "the paused call completed instead of being cancelled"
+        );
+        Ok(())
+    }
+
+    fn is_active_refusal(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<store::CandidateRefRejected>())
+            .any(|rejected| matches!(rejected.0, store::CandidateRefRefusal::Active))
+    }
+
+    /// A retained open candidate ref with one staged row, made by a local
+    /// open before any owner starts: its branch, base and head.
+    async fn retained_candidate_ref(options: &OpenOptions) -> Result<(String, String, String)> {
+        let local = store::MemoryStore::open(options.clone()).await?;
+        let candidate = local.begin_candidate("retained ref").await?;
+        let branch = candidate.view().pinned_view().to_owned();
+        let base = candidate.base().to_owned();
+        candidate.view().put("staged", &json!(true)).await?;
+        let head = candidate.view().revision().await?;
+        drop(candidate);
+        local.close().await?;
+        Ok((branch, base, head))
+    }
+
+    // T8
+    #[tokio::test]
+    async fn cancelled_primary_call_keeps_the_owner_for_the_next_call() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let (_root, project, options) = retiring_fixture()?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+            let (served, mut events) = serve_retiring(owner, None);
+            let memory = open_retiring(&options, &project).await?;
+            let generation = primary_generation(&memory).await?;
+            let hook = observe_replacement(&memory, false)?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    EnteredEmpty { reached: false },
+                    AttachmentAccepted { active: 1 },
+                ],
+            )
+            .await?;
+            let barrier = crate::test_support::ReplyBarrier::default();
+            memory.fixture_pause_next_service_reply(&barrier).await?;
+            cancel_after(
+                {
+                    let memory = memory.clone();
+                    async move { memory.revision().await }
+                },
+                barrier.wait_replied(),
+            )
+            .await?;
+            // The replacement is accepted while the held stream still counts;
+            // installing it then drops the held stream.
+            expect_serve_events(
+                &mut events,
+                &[
+                    AttachmentAccepted { active: 2 },
+                    AttachmentJoined { remaining: 1 },
+                ],
+            )
+            .await?;
+            hook.installed.notified().await;
+            ensure!(
+                !memory.revision().await?.is_empty(),
+                "the next call after a cancelled one did not succeed"
+            );
+            ensure!(
+                primary_generation(&memory).await? == generation,
+                "the next call after a cancelled one reached another owner generation"
+            );
+            expect_no_serve_event(&mut events, "a client whose call was cancelled")?;
+            memory.close().await?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    AttachmentJoined { remaining: 0 },
+                    EnteredEmpty { reached: true },
+                ],
+            )
+            .await?;
+            served.await??;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("cancelled-call fixture exceeded its {deadline:?} deadline"))??;
+        Ok(())
+    }
+
+    // T8b
+    #[tokio::test]
+    async fn write_cancelled_during_dispatch_keeps_the_owner_and_is_not_resent() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let (_root, project, options) = retiring_fixture()?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+            let dispatch = Arc::new(service::rpc::DispatchPause::default());
+            let (served, mut events) = serve_retiring(owner, Some(dispatch.clone()));
+            let memory = open_retiring(&options, &project).await?;
+            let generation = primary_generation(&memory).await?;
+            let hook = observe_replacement(&memory, false)?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    EnteredEmpty { reached: false },
+                    AttachmentAccepted { active: 1 },
+                ],
+            )
+            .await?;
+            // The first request is this write; the owner holds it undispatched.
+            cancel_after(
+                {
+                    let memory = memory.clone();
+                    async move { memory.append("private/actor", "user", "once").await }
+                },
+                dispatch.entered.notified(),
+            )
+            .await?;
+            expect_serve_events(&mut events, &[AttachmentAccepted { active: 2 }]).await?;
+            hook.installed.notified().await;
+            ensure!(
+                memory
+                    .append("private/actor", "user", "blocked")
+                    .await
+                    .is_err(),
+                "a cancelled accepted write did not fence the session"
+            );
+            // The abandoned handler still runs, so the owner still counts it.
+            expect_no_serve_event(&mut events, "an abandoned handler held in dispatch")?;
+            dispatch.release.notify_one();
+            expect_serve_events(&mut events, &[AttachmentJoined { remaining: 1 }]).await?;
+            ensure!(
+                memory.reconcile().await? == Some(true),
+                "the cancelled write did not reconcile as committed"
+            );
+            // Reconciliation's own same-generation attachment comes and goes.
+            expect_serve_events(
+                &mut events,
+                &[
+                    AttachmentAccepted { active: 2 },
+                    AttachmentJoined { remaining: 1 },
+                ],
+            )
+            .await?;
+            ensure!(
+                memory.history("private/actor", 10).await?.len() == 1,
+                "the cancelled write was lost or resent"
+            );
+            memory.append("private/actor", "user", "after").await?;
+            ensure!(
+                primary_generation(&memory).await? == generation,
+                "the session left its owner generation"
+            );
+            expect_no_serve_event(&mut events, "a reconciled client")?;
+            memory.close().await?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    AttachmentJoined { remaining: 0 },
+                    EnteredEmpty { reached: true },
+                ],
+            )
+            .await?;
+            served.await??;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("cancelled-dispatch fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
+    // T8c
+    #[tokio::test]
+    async fn replacement_racing_close_is_discarded_and_the_owner_retires() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let (_root, project, options) = retiring_fixture()?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+            let (served, mut events) = serve_retiring(owner, None);
+            let memory = open_retiring(&options, &project).await?;
+            let hook = observe_replacement(&memory, true)?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    EnteredEmpty { reached: false },
+                    AttachmentAccepted { active: 1 },
+                ],
+            )
+            .await?;
+            let barrier = crate::test_support::ReplyBarrier::default();
+            memory.fixture_pause_next_service_reply(&barrier).await?;
+            cancel_after(
+                {
+                    let memory = memory.clone();
+                    async move { memory.revision().await }
+                },
+                barrier.wait_replied(),
+            )
+            .await?;
+            hook.connected.notified().await;
+            expect_serve_events(&mut events, &[AttachmentAccepted { active: 2 }]).await?;
+            // The first poll marks the session closed, then waits for the
+            // primary lock that the connected replacement still holds.
+            let mut closing = Box::pin(memory.close());
+            ensure!(
+                futures::poll!(closing.as_mut()).is_pending(),
+                "close finished while the replacement held the primary"
+            );
+            hook.release.notify_one();
+            tokio::select! {
+                () = hook.discarded.notified() => {}
+                () = hook.installed.notified() => {
+                    bail!("a replacement was installed into a closed session")
+                }
+            }
+            closing.await?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    AttachmentJoined { remaining: 1 },
+                    AttachmentJoined { remaining: 0 },
+                    EnteredEmpty { reached: true },
+                ],
+            )
+            .await?;
+            served.await??;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("replacement-close fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
+    // T8d
+    #[tokio::test]
+    async fn refused_replacement_keeps_the_held_stream_until_the_lazy_connect() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let (_root, project, options) = retiring_fixture()?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+            let dispatch = Arc::new(service::rpc::DispatchPause::default());
+            let (served, mut events) = serve_retiring(owner, Some(dispatch.clone()));
+            let memory = open_retiring(&options, &project).await?;
+            let generation = primary_generation(&memory).await?;
+            let hook = observe_replacement(&memory, false)?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    EnteredEmpty { reached: false },
+                    AttachmentAccepted { active: 1 },
+                ],
+            )
+            .await?;
+            // Fill the owner to its attachment limit (32) with bare attachments.
+            let mut bare = Vec::new();
+            for active in 2..=32 {
+                bare.push(
+                    service::attach_existing(&options, &project)
+                        .await?
+                        .context("a bare attachment found no owner")?,
+                );
+                expect_serve_events(&mut events, &[AttachmentAccepted { active }]).await?;
+            }
+            cancel_after(
+                {
+                    let memory = memory.clone();
+                    async move { memory.revision().await }
+                },
+                dispatch.entered.notified(),
+            )
+            .await?;
+            // The owner drops a connection over its limit without a reply.
+            hook.failed.notified().await;
+            expect_no_serve_event(&mut events, "a refused replacement")?;
+            dispatch.release.notify_one();
+            // The next call's lazy connect is the second attempt, and it is
+            // refused too while the owner is full: the call fails, nothing
+            // retries, and the held stream still counts for this client.
+            let refused = memory
+                .revision()
+                .await
+                .expect_err("a lazy connect passed the owner's attachment limit");
+            ensure!(
+                remote_of(&memory)?
+                    .attachment
+                    .lock()
+                    .await
+                    .holds_abandoned_stream(),
+                "a refused lazy connect dropped the held stream: {refused:#}"
+            );
+            expect_no_serve_event(&mut events, "a refused lazy connect")?;
+            drop(bare.pop());
+            expect_serve_events(&mut events, &[AttachmentJoined { remaining: 31 }]).await?;
+            // It drops the held stream only once its own connection exists.
+            ensure!(
+                !memory.revision().await?.is_empty(),
+                "the lazy replacement after a refused one did not serve the call"
+            );
+            expect_serve_events(
+                &mut events,
+                &[
+                    AttachmentAccepted { active: 32 },
+                    AttachmentJoined { remaining: 31 },
+                ],
+            )
+            .await?;
+            ensure!(
+                primary_generation(&memory).await? == generation,
+                "the lazy replacement reached another owner generation"
+            );
+            drop(bare);
+            memory.close().await?;
+            expect_retired(&mut events, served).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("refused-replacement fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
+    // T8e
+    #[tokio::test]
+    async fn call_cancelled_after_a_lazy_reconnect_starts_its_replacement() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let (_root, project, options) = retiring_fixture()?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+            let dispatch = Arc::new(service::rpc::DispatchPause::default());
+            let (served, mut events) = serve_retiring(owner, Some(dispatch.clone()));
+            let memory = open_retiring(&options, &project).await?;
+            let generation = primary_generation(&memory).await?;
+            let hook = observe_replacement(&memory, false)?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    EnteredEmpty { reached: false },
+                    AttachmentAccepted { active: 1 },
+                ],
+            )
+            .await?;
+            // Another client keeps the owner while the primary has no stream.
+            let bare = service::attach_existing(&options, &project)
+                .await?
+                .context("a bare attachment found no owner")?;
+            expect_serve_events(&mut events, &[AttachmentAccepted { active: 2 }]).await?;
+            memory.close_transport_for_test().await?;
+            expect_serve_events(&mut events, &[AttachmentJoined { remaining: 1 }]).await?;
+            // The next call reconnects lazily inside `checked_call`, and the
+            // owner holds that call's request undispatched.
+            cancel_after(
+                {
+                    let memory = memory.clone();
+                    async move { memory.revision().await }
+                },
+                dispatch.entered.notified(),
+            )
+            .await?;
+            // The lazily opened stream is held, and its replacement starts at
+            // cancel time like any other primary's.
+            expect_serve_events(
+                &mut events,
+                &[
+                    AttachmentAccepted { active: 2 },
+                    AttachmentAccepted { active: 3 },
+                ],
+            )
+            .await?;
+            hook.installed.notified().await;
+            dispatch.release.notify_one();
+            expect_serve_events(&mut events, &[AttachmentJoined { remaining: 2 }]).await?;
+            ensure!(
+                !memory.revision().await?.is_empty(),
+                "the next call after a cancelled lazy reconnect did not succeed"
+            );
+            ensure!(
+                primary_generation(&memory).await? == generation,
+                "the replacement reached another owner generation"
+            );
+            expect_no_serve_event(&mut events, "a client whose call was cancelled")?;
+            drop(bare);
+            expect_serve_events(&mut events, &[AttachmentJoined { remaining: 1 }]).await?;
+            memory.close().await?;
+            expect_retired(&mut events, served).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("lazy-reconnect cancel fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
+    // T9
+    #[tokio::test]
+    async fn abandon_during_the_replacement_overlap_is_refused_active_then_succeeds() -> Result<()>
+    {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh local open, then one service owner reopens it.
+        let deadline = fixture_deadline(1, 1);
+        tokio::time::timeout(deadline, async {
+            let (_root, project, options) = retiring_fixture()?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let (branch, base, head) = retained_candidate_ref(&options).await?;
+            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+            let dispatch = Arc::new(service::rpc::DispatchPause::default());
+            let (served, mut events) = serve_retiring(owner, Some(dispatch.clone()));
+            let memory = open_retiring(&options, &project).await?;
+            let hook = observe_replacement(&memory, false)?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    EnteredEmpty { reached: false },
+                    AttachmentAccepted { active: 1 },
+                ],
+            )
+            .await?;
+            // A read does not fence the session, so the abandon is sent.
+            cancel_after(
+                {
+                    let memory = memory.clone();
+                    async move { memory.revision().await }
+                },
+                dispatch.entered.notified(),
+            )
+            .await?;
+            expect_serve_events(&mut events, &[AttachmentAccepted { active: 2 }]).await?;
+            hook.installed.notified().await;
+            let refused = memory
+                .abandon_candidate_ref(&branch, &base, &head)
+                .await
+                .expect_err("abandon passed while the abandoned handler was still counted");
+            ensure!(
+                is_active_refusal(&refused),
+                "overlap refusal was not Active: {refused:#}"
+            );
+            dispatch.release.notify_one();
+            expect_serve_events(&mut events, &[AttachmentJoined { remaining: 1 }]).await?;
+            memory.abandon_candidate_ref(&branch, &base, &head).await?;
+            let status = memory.candidate_ref_status(&branch).await?;
+            ensure!(
+                !matches!(
+                    status.state,
+                    store::CandidateRefState::OpenUnchanged
+                        | store::CandidateRefState::OpenConflict
+                ),
+                "the retried abandon left the ref open: {status:?}"
+            );
+            memory.close().await?;
+            expect_retired(&mut events, served).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("overlap-refusal fixture exceeded its {deadline:?} deadline"))??;
+        Ok(())
+    }
+
+    // T10
+    #[tokio::test]
+    async fn read_only_session_holds_nothing_and_asks_to_run_again() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let (_root, project, options) = retiring_fixture()?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+            let dispatch = Arc::new(service::rpc::DispatchPause::default());
+            let (served, mut events) = serve_retiring(owner, Some(dispatch.clone()));
+            let writer = open_retiring(&options, &project).await?;
+            let mut inspection = options.clone();
+            inspection.read_only = true;
+            let reader = open_retiring(&inspection, &project).await?;
+            remote_of(&reader)?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    EnteredEmpty { reached: false },
+                    AttachmentAccepted { active: 1 },
+                    AttachmentAccepted { active: 2 },
+                ],
+            )
+            .await?;
+            cancel_after(
+                {
+                    let reader = reader.clone();
+                    async move { reader.revision().await }
+                },
+                dispatch.entered.notified(),
+            )
+            .await?;
+            expect_no_serve_event(&mut events, "a cancelled read-only call")?;
+            dispatch.release.notify_one();
+            // No held stream and no replacement: the read's connection ends
+            // with its handler.
+            expect_serve_events(&mut events, &[AttachmentJoined { remaining: 1 }]).await?;
+            writer.close().await?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    AttachmentJoined { remaining: 0 },
+                    EnteredEmpty { reached: true },
+                ],
+            )
+            .await?;
+            served.await??;
+            let error = reader
+                .revision()
+                .await
+                .expect_err("a read-only session reconnected after its owner retired");
+            ensure!(
+                format!("{error:#}")
+                    .contains("read-only command was disconnected; run the command again"),
+                "the read-only reconnect failure lacks its context: {error:#}"
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("read-only fixture exceeded its {deadline:?} deadline"))??;
+        Ok(())
+    }
+
+    /// A session with a settled pending unit write whose owner G1 has
+    /// retired, and its successor G2 served observed but not yet reached:
+    /// the session, G2's generation, its serve task and its events.
+    struct RetiredWithPendingWrite {
+        memory: MemoryStore,
+        successor_generation: String,
+        served: tokio::task::JoinHandle<Result<()>>,
+        events: ServeEvents,
+        _gate: tokio::sync::RwLockReadGuard<'static, ()>,
+    }
+
+    async fn retire_with_pending_write(
+        options: &OpenOptions,
+        project: &Path,
+        gate: tokio::sync::RwLockReadGuard<'static, ()>,
+    ) -> Result<RetiredWithPendingWrite> {
+        let owner = service::ServiceOwner::open(options.clone(), project).await?;
+        let (first, mut first_events) = serve_retiring(owner, None);
+        let memory = open_retiring(options, project).await?;
+        let hook = observe_replacement(&memory, false)?;
+        let barrier = crate::test_support::ReplyBarrier::default();
+        memory.fixture_pause_next_service_reply(&barrier).await?;
+        cancel_after(
+            {
+                let memory = memory.clone();
+                async move { memory.put("recovered", &json!(1)).await }
+            },
+            barrier.wait_replied(),
+        )
+        .await?;
+        hook.installed.notified().await;
+        expect_serve_events(
+            &mut first_events,
+            &[
+                EnteredEmpty { reached: false },
+                AttachmentAccepted { active: 1 },
+                AttachmentAccepted { active: 2 },
+                AttachmentJoined { remaining: 1 },
+            ],
+        )
+        .await?;
+        // The logical session keeps its receipt and fence; its transport
+        // goes, so G1 retires by itself before G2 opens.
+        memory.close_transport_for_test().await?;
+        expect_retired(&mut first_events, first).await?;
+        let (successor, gate) = crate::spawn_gate::excluding_spawns(gate, async {
+            service::ServiceOwner::open(options.clone(), project).await
+        })
+        .await?;
+        let successor_generation = successor.authority().service_generation.clone();
+        let (served, mut events) = serve_retiring(successor, None);
+        expect_serve_events(&mut events, &[EnteredEmpty { reached: false }]).await?;
+        Ok(RetiredWithPendingWrite {
+            memory,
+            successor_generation,
+            served,
+            events,
+            _gate: gate,
+        })
+    }
+
+    // T11
+    #[tokio::test]
+    async fn checked_recovery_ends_on_the_verified_successor() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: per iteration one fresh owner, then its reopened successor.
+        let deadline = fixture_deadline(2, 2);
+        tokio::time::timeout(deadline, async {
+            for reopen in [true, false] {
+                let (_root, project, options) = retiring_fixture()?;
+                let gate = crate::spawn_gate::spawning().await;
+                let RetiredWithPendingWrite {
+                    memory,
+                    successor_generation,
+                    served,
+                    mut events,
+                    _gate,
+                } = retire_with_pending_write(&options, &project, gate).await?;
+                ensure!(
+                    memory.reconcile().await? == Some(true),
+                    "the successor did not prove the pending write"
+                );
+                expect_serve_events(&mut events, &[AttachmentAccepted { active: 1 }]).await?;
+                expect_no_serve_event(&mut events, "a successor after checked recovery")?;
+                if reopen {
+                    let reopened = memory
+                        .reopen_after_checked_recovery()
+                        .await?
+                        .context("checked recovery granted no successor reopen")?;
+                    ensure!(
+                        primary_generation(&reopened).await? == successor_generation,
+                        "the reopen did not end on the verified successor"
+                    );
+                    ensure!(reopened.get("recovered").await? == Some(json!(1)));
+                    expect_no_serve_event(
+                        &mut events,
+                        "a reopened session on its kept attachment",
+                    )?;
+                    reopened.close().await?;
+                    memory.close().await?;
+                } else {
+                    // An explicit close drops the kept attachment.
+                    memory.close().await?;
+                }
+                expect_serve_events(
+                    &mut events,
+                    &[
+                        AttachmentJoined { remaining: 0 },
+                        EnteredEmpty { reached: true },
+                    ],
+                )
+                .await?;
+                served.await??;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("successor-recovery fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
+    // T11a
+    #[tokio::test]
+    async fn kept_successor_attachment_becomes_the_reopened_primary() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh local open, then one owner and its reopened successor.
+        let deadline = fixture_deadline(1, 2);
+        tokio::time::timeout(deadline, async {
+            let (_root, project, options) = retiring_fixture()?;
+            let gate = crate::spawn_gate::spawning().await;
+            let (branch, base, head) = retained_candidate_ref(&options).await?;
+            let RetiredWithPendingWrite {
+                memory,
+                served,
+                mut events,
+                _gate,
+                ..
+            } = retire_with_pending_write(&options, &project, gate).await?;
+            ensure!(memory.reconcile().await? == Some(true));
+            expect_serve_events(&mut events, &[AttachmentAccepted { active: 1 }]).await?;
+            // The kept attachment counts: another client is not the sole one.
+            let other = open_retiring(&options, &project).await?;
+            expect_serve_events(&mut events, &[AttachmentAccepted { active: 2 }]).await?;
+            let refused = other
+                .abandon_candidate_ref(&branch, &base, &head)
+                .await
+                .expect_err("abandon passed beside a kept successor attachment");
+            ensure!(
+                is_active_refusal(&refused),
+                "refusal beside the kept attachment was not Active: {refused:#}"
+            );
+            other.close().await?;
+            expect_serve_events(&mut events, &[AttachmentJoined { remaining: 1 }]).await?;
+            // The reopen adds no connection: the kept one is its primary.
+            let reopened = memory
+                .reopen_after_checked_recovery()
+                .await?
+                .context("checked recovery granted no successor reopen")?;
+            expect_no_serve_event(&mut events, "a reopen on the kept attachment")?;
+            reopened
+                .abandon_candidate_ref(&branch, &base, &head)
+                .await?;
+            reopened.close().await?;
+            memory.close().await?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    AttachmentJoined { remaining: 0 },
+                    EnteredEmpty { reached: true },
+                ],
+            )
+            .await?;
+            served.await??;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("kept-successor fixture exceeded its {deadline:?} deadline"))??;
+        Ok(())
     }
 }

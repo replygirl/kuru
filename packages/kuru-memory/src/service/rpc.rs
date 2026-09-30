@@ -1076,17 +1076,97 @@ impl Drop for Waiting<'_> {
     }
 }
 
+// Option B keeps a cancelled call's connection open until its replacement
+// has connected and handshaken: one connect and a hello write and reply read,
+// each bounded by `HANDSHAKE_TIMEOUT`. The owner's earliest end of such an
+// abandoned connection on its own is `OPERATION_TIMEOUT` (a partial request
+// frame or an unread oversized reply). The replacement must fit inside that
+// window, or the owner could see no attachment from a live client.
+const _: () = assert!(
+    3 * super::HANDSHAKE_TIMEOUT.as_nanos() < OPERATION_TIMEOUT.as_nanos(),
+    "a replacement connection must complete before the owner ends an abandoned one"
+);
+
 #[derive(Default)]
 pub(super) struct Retirement {
     active: AtomicUsize,
     requested: AtomicBool,
     candidate_resolution: AtomicBool,
     notify: Notify,
+    admission: super::Admission,
+    /// Set once an attachment admitted by `admission` has authenticated.
+    /// Before then an empty owner waits for its starter.
+    reached: AtomicBool,
+    #[cfg(test)]
+    dispatch_pause: StdMutex<Option<Arc<DispatchPause>>>,
+}
+
+/// One owner-local test barrier after a complete request frame of any kind
+/// and before its dispatch. Unlike `RegisteredPause`, it also holds reads.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct DispatchPause {
+    pub entered: Notify,
+    pub release: Notify,
 }
 
 impl Retirement {
+    pub(super) fn new(admission: super::Admission) -> Self {
+        Self {
+            admission,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
+    }
+
+    pub(super) fn reached(&self) -> bool {
+        self.reached.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Record an authenticated attachment. Only the starter's token, or any
+    /// attachment for an owner started without one, marks the owner reached.
+    /// The token is compared plainly: it is not a secret.
+    fn admit(&self, presented: Option<&str>) {
+        let reached = match self.admission {
+            super::Admission::Starter(token) => {
+                presented.and_then(|presented| Uuid::parse_str(presented).ok()) == Some(token)
+            }
+            super::Admission::AnyAttachment => true,
+            #[cfg(test)]
+            super::Admission::Never => false,
+        };
+        if reached {
+            self.reached.store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_next_dispatch(&self, pause: Arc<DispatchPause>) {
+        *self.dispatch_pause.lock().expect("dispatch pause lock") = Some(pause);
+    }
+
+    #[cfg(test)]
+    async fn pause_before_dispatch(&self) -> Result<()> {
+        let pause = self
+            .dispatch_pause
+            .lock()
+            .expect("dispatch pause lock")
+            .take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(10), pause.release.notified())
+                .await
+                .context("dispatch test pause exceeded 10 seconds")?;
+        }
+        Ok(())
     }
 
     pub(super) fn attached(self: &Arc<Self>) -> Option<RetainedAttachment> {
@@ -1244,13 +1324,15 @@ pub(super) async fn serve_attached<S: AsyncRead + AsyncWrite + Unpin>(
     retirement: Arc<Retirement>,
     progress: Arc<ReceiptProgress>,
 ) -> Result<()> {
-    ensure!(
-        super::accept_handshake(stream, authority).await?.is_ok(),
-        "memory service handshake rejected"
-    );
+    let Ok(presented) = super::accept_handshake_presenting(stream, authority).await? else {
+        bail!("memory service handshake rejected");
+    };
+    retirement.admit(presented.as_deref());
     let mut state = AttachmentState::default();
     let result = async {
         while let Some((request, _bytes)) = read_next(stream, budget.clone()).await? {
+            #[cfg(test)]
+            retirement.pause_before_dispatch().await?;
             respond(
                 stream,
                 authority,
@@ -2086,11 +2168,18 @@ pub(super) async fn exchange_attached_with_id<S: AsyncRead + AsyncWrite + Unpin>
 /// The client reads the owner's reply frame while paused and holds it until
 /// `release`. A test cancels after a sibling has seen the effect; the owner
 /// answers the following outcome query definitely from that evidence, so no
-/// owner-side reply event is needed.
+/// owner-side reply event is needed for that.
+///
+/// `replied` is a different event: a reply frame has arrived and is held. The
+/// owner settles the request's receipt before it writes that frame and then
+/// only waits for the next request, so a test that must cancel while the
+/// owner has no request in hand (the owner-retirement cancellation tests,
+/// whose serve events are then ordered by client actions alone) awaits it.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub(crate) struct ReplyPause {
     pub sent: tokio::sync::Notify,
+    pub replied: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
     pub promotion_sent: AtomicBool,
 }
@@ -2116,6 +2205,9 @@ pub(super) async fn exchange_attached_with_id_paused<S: AsyncRead + AsyncWrite +
     let reply = tokio::time::timeout(reply_deadline, async {
         let reply: Result<ServiceReply> =
             read_frame(stream, OPERATION_FRAME_LIMIT, reply_deadline).await;
+        if reply.is_ok() {
+            pause.replied.notify_one();
+        }
         pause.release.notified().await;
         reply
     })

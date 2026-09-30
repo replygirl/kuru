@@ -79,6 +79,8 @@ pub(crate) struct Work {
     pub progress: Option<ProgressDescriptor>,
     pub span: tracing::Span,
     pub reply: Option<oneshot::Sender<Result<Completion>>>,
+    #[cfg(test)]
+    pub step_timings: crate::step_timings::StepTimings,
 }
 
 #[derive(Clone)]
@@ -275,6 +277,9 @@ impl Actor {
                         .wait(async { permits.acquire().await.context("actor pool closed") })
                         .await?;
                     let identity = &work.invocation.actor_id;
+                    #[cfg(test)]
+                    work.step_timings
+                        .mark(format!("{identity}: actor permit acquired"));
                     validate_context_sources(identity, &work.context_sources)?;
                     let own_history = work
                         .context_sources
@@ -348,6 +353,9 @@ impl Actor {
                     } else {
                         (None, vec![], 0, vec![], 0, None)
                     };
+                    #[cfg(test)]
+                    work.step_timings
+                        .mark(format!("{identity}: private history read"));
                     if work.manual_compaction {
                         ensure!(
                             required.is_empty() && work.tools.is_empty(),
@@ -401,6 +409,9 @@ impl Actor {
                     } else {
                         (vec![], 0)
                     };
+                    #[cfg(test)]
+                    work.step_timings
+                        .mark(format!("{identity}: notes and public transcript read"));
                     let (full_request, _) = ordinary_request(
                         &work,
                         &namespace,
@@ -455,6 +466,9 @@ impl Actor {
                             .map_err(MemoryFailure)?;
                         work.cancellation.check()?;
                     }
+                    #[cfg(test)]
+                    work.step_timings
+                        .mark(format!("{identity}: prompt inputs appended"));
                     let mut observer = AccountingObserver {
                         ledger: work.ledger.clone(),
                         invocation_id: work.invocation.invocation_id.clone(),
@@ -519,6 +533,9 @@ impl Actor {
                                 .await
                                 .map_err(AccountingFailure)?;
                             admitted = true;
+                            #[cfg(test)]
+                            work.step_timings
+                                .mark(format!("{identity}: usage ledger admitted the invocation"));
                         }
                         let result = work
                             .cancellation

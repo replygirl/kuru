@@ -102,8 +102,9 @@ pub(crate) fn spawning_blocking() -> RwLockReadGuard<'static, ()> {
 /// excluded: give up the caller's shared guard, run `restart` under the
 /// exclusive guard, then downgrade that guard atomically to the shared guard
 /// the rest of the test holds. The caller never waits after `restart`: a
-/// successor owner served inside it starts its 30 s idle timer at once, and a
-/// writer queued meanwhile can wait for other tests far longer than that.
+/// successor owner served inside it is already running and must not wait for
+/// the gate afterwards, and a writer queued meanwhile can wait for other
+/// tests for a long time.
 ///
 /// A one-shot acquisition right after a release (for example a successor
 /// `ServiceOwner::open` after its predecessor closed) needs this. A shared
@@ -156,8 +157,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_restart_returns_its_shared_guard_without_waiting_behind_a_queued_writer() {
-        // A fixture serves its successor inside the restart; the successor's
-        // idle timer then runs. A writer that queued meanwhile (another
+        // A fixture serves its successor inside the restart; the successor is
+        // running from then on. A writer that queued meanwhile (another
         // fixture's restart, itself waiting for other tests) must not delay
         // the caller's shared guard.
         static GATE: Gate = Gate::new();

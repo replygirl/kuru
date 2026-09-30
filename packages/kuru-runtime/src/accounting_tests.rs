@@ -3490,6 +3490,7 @@ async fn periodic_and_shutdown_dreams_use_distinct_attempts() {
 
 struct CancelAfterUsage {
     observed: Arc<Notify>,
+    timings: crate::step_timings::StepTimings,
 }
 
 #[async_trait]
@@ -3499,11 +3500,13 @@ impl Provider for CancelAfterUsage {
     }
 
     async fn stream(&self, _request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()> {
+        self.timings.mark("provider stream entered");
         sink.emit(ProviderEvent::Usage(Usage {
             input_tokens: Some(17),
             ..Usage::default()
         }))
         .await?;
+        self.timings.mark("first usage observation written");
         self.observed.notify_one();
         std::future::pending().await
     }
@@ -3516,6 +3519,7 @@ async fn cancellation_settles_admitted_usage_without_a_terminal_report() {
     let observed = Arc::new(Notify::new());
     let provider = Arc::new(CancelAfterUsage {
         observed: observed.clone(),
+        timings: crate::step_timings::StepTimings::default(),
     });
     let mut harness = Harness::new(config(), directory.path(), memory.clone(), provider, None)
         .await
@@ -3560,24 +3564,31 @@ async fn abandoned_dream_keeps_usage_after_reopen_without_advancing_main() {
         kuru_memory::test_support::open_options(directory.path().join("memory"), scope).unwrap();
     let memory = MemoryStore::open(options.clone()).await.unwrap();
     let observed = Arc::new(Notify::new());
+    let timings = crate::step_timings::StepTimings::recording();
     let provider = Arc::new(CancelAfterUsage {
         observed: observed.clone(),
+        timings: timings.clone(),
     });
     let mut harness = Harness::new(config(), directory.path(), memory.clone(), provider, None)
         .await
         .unwrap();
+    harness.step_timings = timings.clone();
     let session = harness.session.id.clone();
     let main_before = memory.revision().await.unwrap();
     let cancellation = CancellationToken::new();
     let control = cancellation.clone();
-    let running = tokio::spawn(async move {
+    timings.mark("setup finished; dream task spawning");
+    let mut running = tokio::spawn(async move {
         let result = harness.dream_controlled(&control).await;
         harness.shutdown(false).await.unwrap();
         result
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), observed.notified())
+    if tokio::time::timeout(std::time::Duration::from_secs(5), observed.notified())
         .await
-        .unwrap();
+        .is_err()
+    {
+        explain_expired_dream_wait(&mut running, &cancellation, &timings).await;
+    }
     cancellation.cancel();
     let error = tokio::time::timeout(std::time::Duration::from_secs(10), running)
         .await
@@ -3606,4 +3617,55 @@ async fn abandoned_dream_keeps_usage_after_reopen_without_advancing_main() {
         .unwrap();
     assert_eq!(after, before);
     reopened.close().await.unwrap();
+}
+
+/// Fail `abandoned_dream_keeps_usage_after_reopen_without_advancing_main` when
+/// its 5 s wait for the provider's first usage observation expires, saying what
+/// the dream task did instead. The bound itself is unchanged. Timings are read
+/// before anything cancels the task, then the task is cancelled and awaited
+/// under a short bound so the report separates an early error from a slow
+/// prelude.
+async fn explain_expired_dream_wait(
+    running: &mut tokio::task::JoinHandle<Result<crate::DreamReport>>,
+    cancellation: &CancellationToken,
+    timings: &crate::step_timings::StepTimings,
+) -> ! {
+    let steps = timings.render();
+    let outcome = if running.is_finished() {
+        format!(
+            "the dream task had already finished: {}",
+            describe_dream_outcome(running.await)
+        )
+    } else {
+        cancellation.cancel();
+        match tokio::time::timeout(std::time::Duration::from_secs(10), &mut *running).await {
+            Ok(joined) => format!(
+                "the dream task was still running at the deadline; after cancellation it finished: {}",
+                describe_dream_outcome(joined)
+            ),
+            Err(_) => {
+                running.abort();
+                "the dream task was still running at the deadline and did not finish within 10 s \
+                 of cancellation; it was aborted"
+                    .into()
+            }
+        }
+    };
+    panic!(
+        "the dream provider call was not reached within 5 s\n{outcome}\n\
+         steps completed before the report (time since the test created its recorder):\n{steps}"
+    );
+}
+
+fn describe_dream_outcome(
+    joined: std::result::Result<Result<crate::DreamReport>, tokio::task::JoinError>,
+) -> String {
+    match joined {
+        Ok(Ok(report)) => format!("Ok({report:?})"),
+        Ok(Err(error)) => format!(
+            "Err({error:#}); cancelled: {}",
+            crate::turn_was_cancelled(&error)
+        ),
+        Err(error) => format!("the task panicked or was aborted: {error}"),
+    }
 }

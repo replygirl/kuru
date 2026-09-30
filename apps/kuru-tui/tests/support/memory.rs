@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 
 /// Retires managed memory owners created by one application fixture before its
-/// temporary data root is removed. The service intentionally outlives its last
-/// client for a warm idle interval, so subprocess fixtures must own this final
-/// maintenance step rather than leave independent Dolt processes accumulating
-/// across the parallel application suite.
+/// temporary data root is removed. A service retires itself as soon as its last
+/// client detaches but may still be closing when that client exits, so
+/// subprocess fixtures must own this final step and await the close rather than
+/// leave independent Dolt processes accumulating across the parallel
+/// application suite.
 pub struct ServiceCleanup {
     data: Vec<PathBuf>,
     root: Option<kuru_memory::test_support::TempDir>,
@@ -128,6 +129,44 @@ impl Drop for ServiceCleanup {
             }
         }
     }
+}
+
+/// Block until the managed owner for `options` has released its owner lock,
+/// which it does only after retiring its endpoint and reaping Dolt, and return
+/// how long that took. Call it after the last client of that owner has
+/// exited, while nothing else is electing. Returns at once when no owner runs.
+///
+/// The wait runs on its own thread and runtime so the backstop can fail the
+/// test: the lock wait itself cannot be cancelled, and that thread ends with
+/// the process.
+#[allow(
+    dead_code,
+    reason = "each integration-test crate compiles this shared support module independently"
+)]
+pub fn await_owner_exit(options: &kuru_memory::OpenOptions) -> anyhow::Result<std::time::Duration> {
+    // The owner's own close bounds sum to about 30 s (plus a query-timeout
+    // write drain), so this is well beyond a healthy close: hitting it means
+    // the owner's bounds themselves failed to fire.
+    const OWNER_EXIT_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(120);
+    let options = options.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let started = std::time::Instant::now();
+    std::thread::Builder::new()
+        .name("kuru-fixture-owner-exit".into())
+        .spawn(move || {
+            let outcome = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("create owner-exit runtime")
+                .and_then(|runtime| {
+                    runtime.block_on(kuru_memory::test_support::await_owner_release(&options))
+                });
+            let _ = sender.send(outcome);
+        })?;
+    receiver.recv_timeout(OWNER_EXIT_BACKSTOP).map_err(|_| {
+        anyhow::anyhow!("the memory owner did not exit within {OWNER_EXIT_BACKSTOP:?}")
+    })??;
+    Ok(started.elapsed())
 }
 
 /// CLI fixtures use ordinary user configuration and the package's verified
