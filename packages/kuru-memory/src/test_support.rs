@@ -315,16 +315,23 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
 /// this waits behind one that is already closing, or asks a still-running one
 /// (a starter-less or not-yet-reached owner) to retire. The maintenance permit
 /// is dropped before a successor starts.
+///
+/// When its bound elapses, the error names the step the acquisition was
+/// cancelled in, so a slow owner close, a still-attached client and a stalled
+/// request are distinguishable from the failure text alone.
 pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
+    let trace = crate::service::MaintenanceTrace::default();
+    let mut refusals: u32 = 0;
     let permit = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            match crate::service::acquire_maintenance_permit(options).await {
+            match crate::service::acquire_maintenance_permit_traced(options, &trace).await {
                 Ok(permit) => break Ok(permit),
                 Err(error)
                     if error
                         .to_string()
                         .contains("memory service has active clients") =>
                 {
+                    refusals = refusals.saturating_add(1);
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 Err(error) => break Err(error),
@@ -332,7 +339,11 @@ pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
         }
     })
     .await
-    .context("idle managed owner did not retire within 10 seconds")??;
+    .with_context(|| {
+        format!(
+            "idle managed owner did not retire within 10 seconds; {trace}; active-client refusals={refusals}"
+        )
+    })??;
     drop(permit);
     Ok(())
 }
@@ -1022,6 +1033,40 @@ mod tests {
         assert!(from_profile(root.path()).is_err());
         assert!(snapshot_supervisor(&source, root.path()).is_err());
         assert_eq!(fs::read(&second).unwrap(), b"corrupted private bytes");
+    }
+
+    /// An owner lock held with no endpoint published, as by an owner still
+    /// reaping Dolt after retiring its record: the fixture's bound elapses
+    /// and its error names the step it was cancelled in and what the
+    /// retirement requests met, not only that the deadline elapsed. Paused
+    /// time advances the fixture's own waits; nothing here waits on a clock.
+    #[tokio::test(start_paused = true)]
+    async fn an_elapsed_retirement_bound_names_the_step_it_was_cancelled_in() -> Result<()> {
+        let root = tempdir()?;
+        let options = open_options(
+            root.path().join("private"),
+            format!("project/{}", "1".repeat(64)),
+        )?;
+        let owner = crate::service::ServiceLock::try_acquire(
+            &options.data_dir,
+            &options.project_scope,
+            crate::service::ServiceLockKind::Owner,
+        )?
+        .context("a fresh fixture's owner lock was busy")?;
+        let error = retire_idle_service(&options)
+            .await
+            .expect_err("retirement completed while the owner lock was held");
+        let text = format!("{error:#}");
+        ensure!(
+            text.contains("idle managed owner did not retire within 10 seconds")
+                && text.contains("maintenance waiting for the owner lock for ")
+                && text.contains("busy replies=0")
+                && text.contains("active-client refusals=0")
+                && !text.contains("requests without a live endpoint=0;"),
+            "the elapsed bound did not name its step: {text}"
+        );
+        owner.release()?;
+        root.release(Ok(()))
     }
 
     /// A project that never had an owner: its owner lock is free, so the

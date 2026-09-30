@@ -1663,8 +1663,111 @@ pub(crate) struct MaintenancePermit {
     _owner: ServiceLock,
 }
 
+/// Where a maintenance permit acquisition is, for a caller whose own bound
+/// may cancel it: that caller can name the step it was cancelled in instead
+/// of reporting only that its deadline elapsed.
+#[derive(Default)]
+pub(crate) struct MaintenanceTrace(std::sync::Mutex<MaintenanceStep>);
+
+#[derive(Clone, Copy, Default)]
+struct MaintenanceStep {
+    phase: MaintenancePhase,
+    /// When the current phase began.
+    since: Option<tokio::time::Instant>,
+    /// When the wait for the current lock (start, then owner) began.
+    lock_since: Option<tokio::time::Instant>,
+    /// Retirement requests that found no live endpoint to ask.
+    unanswered: u32,
+    /// Retirement requests the owner refused because clients were attached.
+    busy: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+enum MaintenancePhase {
+    #[default]
+    NotStarted,
+    StartLock,
+    OwnerLock,
+    Requesting,
+    AwaitingRetirement,
+}
+
+impl MaintenanceTrace {
+    /// Begin waiting for the next lock.
+    fn wait_for(&self, phase: MaintenancePhase) {
+        let now = tokio::time::Instant::now();
+        let mut step = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        step.lock_since = Some(now);
+        step.phase = phase;
+        step.since = Some(now);
+    }
+
+    fn enter(&self, phase: MaintenancePhase) {
+        let mut step = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        step.phase = phase;
+        step.since = Some(tokio::time::Instant::now());
+    }
+
+    fn record(&self, outcome: Option<bool>) {
+        let mut step = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match outcome {
+            None => step.unanswered = step.unanswered.saturating_add(1),
+            Some(false) => step.busy = step.busy.saturating_add(1),
+            Some(true) => {}
+        }
+    }
+}
+
+impl std::fmt::Display for MaintenanceTrace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let step = *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let phase = match step.phase {
+            MaintenancePhase::NotStarted => "not started",
+            MaintenancePhase::StartLock => "waiting for the start lock",
+            MaintenancePhase::OwnerLock => "waiting for the owner lock",
+            MaintenancePhase::Requesting => {
+                "asking the owner to retire (endpoint read, connect or reply)"
+            }
+            MaintenancePhase::AwaitingRetirement => {
+                "waiting for the owner lock after the owner accepted retirement"
+            }
+        };
+        let elapsed = |instant: Option<tokio::time::Instant>| {
+            instant.map_or(0, |instant| instant.elapsed().as_millis())
+        };
+        write!(
+            formatter,
+            "maintenance {phase} for {}ms (this lock's wait {}ms); requests without a live endpoint={}; busy replies={}",
+            elapsed(step.since),
+            elapsed(step.lock_since),
+            step.unanswered,
+            step.busy
+        )
+    }
+}
+
 pub(crate) async fn acquire_maintenance_permit(
     options: &crate::store::OpenOptions,
+) -> Result<MaintenancePermit> {
+    acquire_maintenance_permit_traced(options, &MaintenanceTrace::default()).await
+}
+
+/// [`acquire_maintenance_permit`], recording each step in `trace`.
+pub(crate) async fn acquire_maintenance_permit_traced(
+    options: &crate::store::OpenOptions,
+    trace: &MaintenanceTrace,
 ) -> Result<MaintenancePermit> {
     options.config.validate()?;
     ensure!(
@@ -1673,6 +1776,7 @@ pub(crate) async fn acquire_maintenance_permit(
     );
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(options.config.startup_timeout_secs);
+    trace.wait_for(MaintenancePhase::StartLock);
     let start = loop {
         if let Some(lock) = ServiceLock::try_acquire(
             &options.data_dir,
@@ -1689,6 +1793,7 @@ pub(crate) async fn acquire_maintenance_permit(
     };
     let mut retirement_requested = false;
     let mut busy_observations = 0;
+    trace.wait_for(MaintenancePhase::OwnerLock);
     let owner = loop {
         if let Some(lock) = ServiceLock::try_acquire(
             &options.data_dir,
@@ -1698,10 +1803,17 @@ pub(crate) async fn acquire_maintenance_permit(
             break lock;
         }
         if !retirement_requested {
-            match tokio::time::timeout_at(deadline, request_idle_retirement(options))
+            trace.enter(MaintenancePhase::Requesting);
+            let outcome = tokio::time::timeout_at(deadline, request_idle_retirement(options))
                 .await
-                .context("memory maintenance owner-response deadline exceeded")??
-            {
+                .context("memory maintenance owner-response deadline exceeded")??;
+            trace.record(outcome);
+            trace.enter(if outcome == Some(true) {
+                MaintenancePhase::AwaitingRetirement
+            } else {
+                MaintenancePhase::OwnerLock
+            });
+            match outcome {
                 Some(true) => retirement_requested = true,
                 Some(false) => {
                     busy_observations += 1;
