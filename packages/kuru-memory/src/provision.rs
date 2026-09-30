@@ -415,10 +415,11 @@ async fn verified_cache(directory: &Path, asset: Asset<'_>) -> Result<PathBuf> {
             )
         })
         .collect();
-    // The cache directory is keyed by the pinned engine version, and the cold
-    // path probed this exact executable before activating it. A matching full
-    // digest therefore identifies that probed engine; a warm open launches no
-    // process of its own.
+    // The cache directory is keyed by the pinned engine version, and before
+    // activating it the cold path probed a private copy whose full digest
+    // matched this executable's pinned digest. A matching full digest here
+    // therefore identifies the same bytes that probe ran; a warm open launches
+    // no process of its own.
     tokio::task::spawn_blocking(move || {
         CheckedCache::open_and_verify(
             &directory_path,
