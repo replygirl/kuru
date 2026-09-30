@@ -111,7 +111,7 @@ enum Command {
         /// Parent of the private scratch root (default: the temporary directory).
         #[arg(long, env = "KURU_OPEN_TIME_SCRATCH")]
         scratch: Option<PathBuf>,
-        /// Iterations; each runs the three cases once.
+        /// Iterations; each runs the four cases once.
         #[arg(long, env = "KURU_OPEN_TIME_ITERATIONS", default_value_t = 10)]
         iterations: usize,
         /// Host label for the summary, such as the CI runner label.

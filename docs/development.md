@@ -1197,9 +1197,9 @@ measured executable embeds the engine its installation job verified.
 
 The harness drives the binary from outside. Each iteration uses a fresh private
 scratch root with its own HOME, configuration, data directory, engine cache,
-project and copy of the executable, and runs three cases of
+two project directories and copy of the executable, and runs four cases of
 `kuru --provider demo --no-dream run measure --json` with offline memory (no
-network, login or credential store):
+network, login or credential store), in this order:
 
 1. `first-launch`: empty engine cache and data directory: engine extraction and
    a new project's staged creation. The harness then waits for the memory owner
@@ -1209,26 +1209,68 @@ network, login or credential store):
 3. `warm-reopen`: immediately afterwards, inside the owner's idle window. The
    record says whether the command attached to the live owner or had to start
    one. The harness then waits for retirement again.
+4. `new-project`: a second, different project directory opened with the same
+   data directory and engine cache, so the engine is already extracted and
+   only the project is new. The harness then waits for retirement again. It
+   is appended after the first three, which keep the predecessor and gap they
+   always had.
+
+Engine starts per case (the structure table's first column) are the
+acceptance numbers for store creation work. Today a release build shows 4 for
+`first-launch`, 1 for `cold-existing`, 0 for an attaching `warm-reopen` and 4
+for `new-project`, which creates its store through the same three staging
+engines and the active one; a per-machine store template is expected to bring
+`new-project` to 2.
+
+Every run gets an explicit, otherwise cleared environment: private `HOME`,
+configuration, cache, data and temporary directories, an empty `PATH`, and
+`KURU_OPEN_MARKERS=1`, which asks a binary that supports open markers to
+write them (see below); an older binary ignores it.
 
 ### What the observer sees
 
-The harness timestamps each stderr progress line (`Memory: waiting for project
-ownership…`, `Memory: ready.`) as it is read, and exit. An observer thread
+The harness timestamps each stderr progress line as it is read, and exit. It
+reads readiness from either of two signals. With `KURU_OPEN_MARKERS=1` set, a
+binary that supports it writes `kuru-open-marker v1 <event> <monotonic_ns>`
+lines on stderr: `open-start` before the client's first attach attempt,
+`waiting-ownership` only when it waits for project ownership, and `ready`
+when memory is ready, including an attach to a running owner. A binary without
+markers writes the legacy `Memory: waiting for project ownership…` and
+`Memory: ready.` lines. A `ready` marker ends the open exactly as
+`Memory: ready.` does, and `waiting-ownership` stands for the legacy waiting
+line; a marker is preferred when both appear, and the legacy lines still work
+when no marker does, so binaries from before and after the marker change both
+measure. Either way the time is when the harness read the line, so old and new
+binaries are timed alike; `<monotonic_ns>` is kept as data in
+`stages.markers`. Each record's `stages.ready_signal` is `marker` or `legacy`
+(absent for a failed open), and the summary counts each per case. Markers, the
+`Memory: ` lines and the plain sentences a marker-writing binary shows while
+memory opens are progress: they are kept in the record and never taken as a
+failed run's error line. An observer thread
 samples, on a fixed period (20 ms by default; the thread sleeps for the rest of
 each period), the Kuru and Dolt processes running from the scratch root (owner,
 supervisors, `dolt sql-server`, `dolt version`) and the names in the data and
 cache directories. It enumerates directories and never opens a file. Enumerating
 a directory opens a handle to it for the length of that one listing, so the
 observer never enters an engine install stage (`.install-*`), a store staging
-directory (`*.staging-*`) or `interrupted`, the directories an open renames or
-removes; that rule holds on every OS. Their appearance and disappearance are
-timed from the parent listing, and it skips Dolt's chunk store, statistics and
-temporary directories. Each listing's names are collected and its handle closed
+directory (`*.staging-*`), `interrupted`, or a store template cache's private
+build store and capture stage (`templates/.build-*` and `templates/.stage-*`
+directly under an engine version directory in the cache), the directories an
+open renames or removes; that rule holds on every OS. Their appearance and
+disappearance are timed from the parent listing, and it skips Dolt's chunk
+store, statistics and temporary directories. The template rule applies only
+under the engine cache's `templates` directory: the same names elsewhere, and
+every project store and its own stage, are observed as before. Each listing's names are collected and its handle closed
 before any child is listed. The directories it still lists (`cache`, the
 version and activated engine directories, `data`, `data/memory`, the active
 store, `services` and `locks`) are not renamed or removed by a successful open. The control
 series lists no files at all, so comparing its open times with the main series
 shows any remaining disturbance.
+
+Recorded names carry no project hash: each 64-hex project hash reads
+`<project>`. In the `new-project` case, the hashes of the projects already in
+`data/memory` when the run starts read `<prior-project>` instead, so the new
+project's store is seen appearing rather than confused with the first one's.
 
 Each tick is stamped when it starts, before the process listing, and when it
 ends, after the file walk. A process or name first seen in a tick happened after
@@ -1248,12 +1290,15 @@ appearing and, for each of the three staging engines (initialize, migrate,
 validate), its supervisor starting, the engine starting and exiting and the
 supervisor exiting; the active store appearing (the rename); the active
 supervisor and engine starting; the active store's `endpoint.json`; the owner's
-service endpoint; and `Memory: ready.`. A cold open shows the probe and the
-active part only, and a warm reopen that attaches shows the progress line and
-`Memory: ready.` only.
+service endpoint; and ready. A binary with open markers adds `open start`
+after the start. A cold open shows the probe and the active part only; a
+`new-project` open shows the owner, the probe, the store stage and its three
+staging engines and the active part, without the install stage; and a warm
+reopen that attaches shows the progress line (or, with markers, the open
+start) and ready only.
 
 The stages are the differences between consecutive milestones a run showed, so
-they partition the open: per run they sum to its time to `Memory: ready.`. A
+they partition the open: per run they sum to its time to ready. A
 milestone a run did not show merges its two neighbours into one stage named
 after both ends. Each sampled milestone is stamped at the end of the tick that
 first showed it, so a stage between two sampled milestones is off by less than
@@ -1300,9 +1345,9 @@ the first launch just started, which its owner path reports. The iteration
 directories are kept until one final retirement wait after the last run.
 `KURU_OPEN_TIME_INTERVAL_MS` sets the sampling period.
 
-A failed open is a run without `Memory: ready.`; a command that fails after that
-line is counted separately. Both are results, recorded with the exit status and
-first error line. Only an infrastructure failure, such as a process that has not
+A failed open is a run with no readiness signal (neither a `ready` marker nor
+`Memory: ready.`); a command that fails after that line is counted separately.
+Both are results, recorded with the exit status and first error line. Only an infrastructure failure, such as a process that has not
 retired after 120 s (polled every 100 ms), stops the series with a non-zero
 exit, and that process is never killed. The sampling period and the retirement
 poll belong to this unshipped measurement tool; they are stated in every summary
@@ -1314,8 +1359,10 @@ totals with the milestones they pass through, other times (exit, lifetimes,
 probes, the recorded bracket), every open sample in run order, and per-case
 engine starts, owner path, load and census. Download the
 `ci-open-time-ubuntu-latest-attempt-<n>` artifact for each series' `records.jsonl`, one
-`kuru.open-time.v2` JSON object per run, and `summary.md`. Records hold no path,
-credential or memory content.
+`kuru.open-time.v3` JSON object per run, and `summary.md`. Version 3 added the
+`new-project` case, `stages.ready_signal` and `stages.markers`, and names the
+final milestone `ready` for either signal. Records hold no path, credential or
+memory content.
 
 ### Which builds have recorded a readiness failure
 
