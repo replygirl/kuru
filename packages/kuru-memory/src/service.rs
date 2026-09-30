@@ -451,12 +451,14 @@ impl ServiceAttachment {
 
     /// Keep the stream of an incomplete exchange open, unused, until this
     /// attachment is replaced (Option B for a writable session's primary).
-    #[cfg(test)]
     pub(crate) fn retain_after_abandon(&mut self) {
         self.retain_after_abandon = true;
     }
 
-    #[cfg(test)]
+    pub(crate) fn retains_after_abandon(&self) -> bool {
+        self.retain_after_abandon
+    }
+
     pub(crate) fn holds_abandoned_stream(&self) -> bool {
         self.held.is_some()
     }
