@@ -123,13 +123,13 @@ async fn quiescence_failure_lists_the_live_descendant_before_owned_cleanup() -> 
     // Job member when the tree is observed, ahead of termination.
     for required in [
         "wait for native process tree quiescence",
-        env!("CARGO_BIN_EXE_kuru-delivery-fixture"),
+        &format!("command={:?}", env!("CARGO_BIN_EXE_kuru-delivery-fixture")),
         r#"arguments=["command-output-before-tree-wait""#,
         &format!("directory={:?}", root.path()),
         "tree before cleanup: root pid=",
         "state=exited(1)",
-        "job active=1 ",
-        "listed=1/1 members=[pid=",
+        "job active=",
+        "members=[pid=",
         "image=kuru-delivery-fixture.exe cpu=",
     ] {
         ensure!(

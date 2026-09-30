@@ -432,7 +432,7 @@ async fn bounded_output_timeout_names_the_command_and_its_blocked_root() {
     for required in [
         "tool timed out",
         "owned process group stopped and root reaped",
-        env!("CARGO_BIN_EXE_kuru-delivery-fixture"),
+        &format!("command={:?}", env!("CARGO_BIN_EXE_kuru-delivery-fixture")),
         &format!(r#"arguments=["bounded-blocking-tree", "block", "{tag}"]"#),
         &format!("directory=Some({:?})", root.path()),
         "root=running",

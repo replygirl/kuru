@@ -65,3 +65,26 @@ fn snapshot_failure_is_reported_as_text() {
         "{failing}"
     );
 }
+
+#[test]
+fn snapshot_helper_is_bounded_when_ps_does_not_finish() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    // `exec` keeps the stand-in a single process, like `ps`, so stopping it
+    // through its owned handle also closes both pipes.
+    let stalled = root.path().join("stalled-ps");
+    std::fs::write(&stalled, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+    std::fs::set_permissions(&stalled, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let started = std::time::Instant::now();
+    let text = snapshot::describe_with(&stalled, std::process::id());
+    let elapsed = started.elapsed();
+    assert!(
+        text.starts_with("snapshot unavailable: ") && text.contains("did not finish within"),
+        "{text}"
+    );
+    assert!(elapsed >= snapshot::SNAPSHOT_TIMEOUT, "{elapsed:?}");
+    assert!(
+        elapsed < snapshot::SNAPSHOT_TIMEOUT + std::time::Duration::from_secs(3),
+        "{elapsed:?}"
+    );
+}
