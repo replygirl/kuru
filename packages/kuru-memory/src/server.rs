@@ -2568,7 +2568,7 @@ async fn initialize_database(
             ensure!(
                 key == compiled,
                 "memory store template key {key:?} differs from this supervisor's compiled \
-                 template key {compiled:?}; the stage was not written"
+                 template key {compiled:?}; its data was not written"
             );
             if identity.instance == TEMPLATE_INSTANCE {
                 // A template build: today's bootstrap writes the placeholder.
@@ -2715,8 +2715,12 @@ async fn adopt_on(
     phase: &mut &'static str,
 ) -> Result<()> {
     use sqlx::Executor;
-    *phase = "verifying the store template placeholder";
     for (database, reference) in ADOPTED_REFS {
+        *phase = if database == USAGE_DATABASE {
+            "verifying the store template placeholder on the usage branch"
+        } else {
+            "verifying the store template placeholder on main"
+        };
         // Both names are constants of this module; `USE` takes no parameter.
         connection
             .execute(sqlx::AssertSqlSafe(format!("USE `{database}`")))
