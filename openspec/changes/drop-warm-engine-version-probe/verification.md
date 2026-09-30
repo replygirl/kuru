@@ -14,7 +14,7 @@
 
 - [x] 2.1 @unit (agent) `observed_provision_reports_actual_cold_warm_and_failure_stages`, cold branch -> observed pass with the cold assertion unchanged, `[WaitingForRuntimeCache, ExtractingEmbeddedRuntime, CheckingRuntimeVersion]`; its wrong-version (`MISMATCH`, 2.3.2) branch and `failing_exact_version_probe_never_activates_and_releases_installation_authority` also pass, so the cold probe still fails closed
 
-- [~] 2.2 @integration (agent) `real_embedded_windows_engine_installs_offline_and_corrupt_cache_fails_before_execution` or the equivalent native cold-install test on the current host target -> defer: the Windows test is `cfg(windows)` and cannot run on this macOS host (it compiled and passed clippy for `x86_64-pc-windows-msvc`); on the host, `actual_warm_cache_verifies_concurrently_while_installation_lock_is_held` cold-installed the real bundled engine through the unchanged cold probe and passed; the native Windows run is left to the PR's CI
+- [x] 2.2 @integration (agent) `real_embedded_windows_engine_installs_offline_and_corrupt_cache_fails_before_execution` or the equivalent native cold-install test on the current host target -> observed in CI run 36747697223 on head `2db4cfb7`: `provision::native_tests::real_embedded_windows_engine_installs_offline_and_corrupt_cache_fails_before_execution ... ok` on windows-latest (coverage partition 3, job 109998333670) and windows-11-arm (behavior partition 3, job 109998458908); on the macOS host, `actual_warm_cache_verifies_concurrently_while_installation_lock_is_held` cold-installed the real bundled engine through the unchanged cold probe and passed
 
 ## 3. Behavior is otherwise unchanged (equivalence)
 
@@ -28,4 +28,4 @@
 
 ## 5. Coverage gate holds
 
-- [~] 5.1 @runtime (agent) `mise run coverage` -> defer: not run locally, the combined instrumented workspace suite is long and this machine is shared with other builds; observe the PR's CI coverage job (90% gate) before archive
+- [x] 5.1 @runtime (agent) `mise run coverage` -> not run locally; observed in CI run 36747697223 on head `2db4cfb7`: macOS coverage merge (job 110007407481) 94.62% of lines (103791 of 109690) against the 90% gate, `provision.rs` 95.62%. The Ubuntu and windows-latest merges did not compute because a partition on each failed on a test outside this diff (tasks 3.5 names them); those two gates remain to be observed on the final head's run before merge
