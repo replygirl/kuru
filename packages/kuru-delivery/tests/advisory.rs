@@ -416,3 +416,52 @@ async fn bounded_output_times_out_and_reaps_descendant_holding_inherited_output(
         "fixture process group survived bounded cleanup"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bounded_output_timeout_names_the_command_and_its_blocked_root() {
+    let root = tempfile::tempdir().unwrap();
+    let tag = root.path().join("timeout-tree");
+    let tag = tag.to_str().expect("fixture tag path is UTF-8");
+    let mut child = fixture(&["bounded-blocking-tree", "block", tag]);
+    child.current_dir(root.path());
+    let error = command::bounded_output(&mut child, Duration::from_millis(250), 64 * 1024)
+        .await
+        .unwrap_err()
+        .to_string();
+    for required in [
+        "tool timed out",
+        "owned process group stopped and root reaped",
+        env!("CARGO_BIN_EXE_kuru-delivery-fixture"),
+        &format!(r#"arguments=["bounded-blocking-tree", "block", "{tag}"]"#),
+        &format!("directory=Some({:?})", root.path()),
+        "root=running",
+        &format!("bounded-blocking-tree block {tag}"),
+    ] {
+        assert!(error.contains(required), "missing {required}: {error}");
+    }
+    assert!(!error.contains("snapshot unavailable"), "{error}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bounded_output_failure_snapshot_lists_the_live_grandchild_before_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let tag = root.path().join("overflow-tree");
+    let tag = tag.to_str().expect("fixture tag path is UTF-8");
+    let mut child = fixture(&["bounded-blocking-tree", "overflow", tag]);
+    let error = command::bounded_output(&mut child, Duration::from_secs(30), 1024)
+        .await
+        .unwrap_err()
+        .to_string();
+    for required in [
+        "tool output exceeds limit",
+        "owned process group stopped and root reaped",
+        "root=running",
+        &format!("bounded-blocking-tree overflow {tag}"),
+        // The grandchild was ready before the root overflowed its capture.
+        &format!("bounded-ready-descendant {tag}"),
+    ] {
+        assert!(error.contains(required), "missing {required}: {error}");
+    }
+}

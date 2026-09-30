@@ -140,6 +140,50 @@ async fn main() -> io::Result<()> {
             io::stdout().flush()?;
         }
         #[cfg(unix)]
+        Some("bounded-blocking-tree") => {
+            use std::io::BufRead;
+            // The root blocks with a ready grandchild. `overflow` then fails
+            // the bounded capture only once that grandchild exists.
+            let trigger = arguments
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| io::Error::other("missing blocking tree trigger"))?;
+            let tag = arguments
+                .next()
+                .ok_or_else(|| io::Error::other("missing blocking tree tag"))?;
+            let mut descendant = std::process::Command::new(std::env::current_exe()?)
+                .arg("bounded-ready-descendant")
+                .arg(tag)
+                .stdout(std::process::Stdio::piped())
+                .spawn()?;
+            let mut line = String::new();
+            io::BufReader::new(
+                descendant
+                    .stdout
+                    .take()
+                    .ok_or_else(|| io::Error::other("missing descendant readiness pipe"))?,
+            )
+            .read_line(&mut line)?;
+            if line != "ready\n" {
+                return Err(io::Error::other("blocking tree descendant was not ready"));
+            }
+            match trigger.as_str() {
+                "block" => {}
+                "overflow" => {
+                    io::stdout().write_all(&[b'x'; 8192])?;
+                    io::stdout().flush()?;
+                }
+                _ => return Err(io::Error::other("unknown blocking tree trigger")),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+        #[cfg(unix)]
+        Some("bounded-ready-descendant") => {
+            io::stdout().write_all(b"ready\n")?;
+            io::stdout().flush()?;
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+        #[cfg(unix)]
         Some("bounded-close-output-before-exit") => {
             use std::os::unix::process::CommandExt;
             // Replace this fixture root in place so it retains the helper's
