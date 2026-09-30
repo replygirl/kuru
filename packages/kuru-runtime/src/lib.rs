@@ -91,6 +91,9 @@ mod permission_tests;
 mod accounting_tests;
 
 #[cfg(test)]
+mod step_timings;
+
+#[cfg(test)]
 mod public_test_support;
 
 #[cfg(test)]

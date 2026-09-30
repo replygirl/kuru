@@ -553,6 +553,8 @@ pub struct Harness {
     pub(crate) reject_next_hook_annotation: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) reject_next_turn_settlement: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) step_timings: crate::step_timings::StepTimings,
 }
 
 #[derive(Clone)]
@@ -841,6 +843,8 @@ impl Harness {
             reject_next_hook_annotation: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             reject_next_turn_settlement: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            step_timings: crate::step_timings::StepTimings::default(),
         };
         harness.sync_actors_with(&actor_namespaces);
         harness.save().await?;
@@ -3119,6 +3123,9 @@ impl Harness {
             .cancellation
             .wait(self.selected_model_metadata())
             .await?;
+        #[cfg(test)]
+        self.step_timings
+            .mark(format!("{id}: model metadata resolved"));
         let context_budget = ContextBudget::resolve(
             metadata.resolved_context_window(self.config.assumed_context_window_tokens),
             metadata.max_output_tokens.as_ref().map(|fact| fact.value),
@@ -3199,6 +3206,8 @@ impl Harness {
             progress: control.progress,
             span: tracing::info_span!(target: "kuru.actor", "actor", actor = self.actor_correlation(id), operation = "completion"),
             reply: Some(reply),
+            #[cfg(test)]
+            step_timings: self.step_timings.clone(),
         };
         control
             .cancellation
@@ -3211,6 +3220,9 @@ impl Harness {
                 Ok(())
             })
             .await?;
+        #[cfg(test)]
+        self.step_timings
+            .mark(format!("{id}: work sent to its actor"));
         Ok((
             rx.await.context("actor response channel closed")??,
             invocation_id,

@@ -72,10 +72,16 @@ impl Harness {
         if reset_context {
             self.reset_context_snapshot();
         }
+        #[cfg(test)]
+        self.step_timings.mark("dream started");
         cancellation.check()?;
         self.reconcile().await?;
+        #[cfg(test)]
+        self.step_timings.mark("reconcile finished");
         cancellation.check()?;
         let _dream_lease = cancellation.wait(self.memory.acquire_dream_lease()).await?;
+        #[cfg(test)]
+        self.step_timings.mark("dream lease acquired");
         cancellation.check()?;
         let active = self
             .topology
@@ -91,6 +97,8 @@ impl Harness {
         let hook_budget = hook_host.budget();
         let dream_tools = vec![dream_tool()];
         let candidate = self.memory.begin_candidate("dream").await?;
+        #[cfg(test)]
+        self.step_timings.mark("dream candidate begun");
         // A cancelled future drops local stack state without running the
         // error path below. Keep the exact ref on Harness before the first
         // candidate write or promotion await.
