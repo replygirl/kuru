@@ -631,9 +631,9 @@ async fn adoption_requires_compiled_key_and_placeholder_on_both_refs() -> Result
 /// A verdict against the template's bytes reaches the caller as the typed
 /// verdict; a key mismatch and a SQL error do not. On Unix an in-process
 /// supervisor also shows the response frame itself: `TemplateRejected` for
-/// a foreign row on either ref, a dirty working set and a rewrite that
-/// changes no row, and `Failed` for a key mismatch, a bootstrap deadline in
-/// the middle of adoption and a killed engine.
+/// a foreign row on either ref, a dirty working set on either ref and a
+/// rewrite that changes no row, and `Failed` for a key mismatch, a bootstrap
+/// deadline in the middle of adoption and a killed engine.
 #[tokio::test]
 async fn adoption_verdicts_are_typed_and_engine_failures_are_not() -> Result<()> {
     let root = fixture_root()?;
@@ -707,6 +707,17 @@ async fn in_process_responses(root: &Path, template: &Template, foreign: &Templa
         &["INSERT INTO state (`key`, value) VALUES ('dirty', 'uncommitted')"],
     )
     .await?;
+    // The usage branch's working set, on a branch-qualified session: the
+    // dirty-state count must read that ref's status, not `main`'s.
+    let dirty_usage = variant(
+        template,
+        &root.join("dirty-usage"),
+        &[
+            "USE `kuru/kuru_usage_v1`",
+            "CREATE TABLE dirty_usage (id INT PRIMARY KEY)",
+        ],
+    )
+    .await?;
     let data_dir = root.join("in-process");
     /// One in-process start: the stage's source, an optional key to name
     /// instead of the compiled one, the fault, an optional startup timeout,
@@ -745,11 +756,18 @@ async fn in_process_responses(root: &Path, template: &Template, foreign: &Templa
             "the main identity row",
         ),
         case(
-            "dirty working set",
+            "dirty main working set",
             &dirty,
             Fault::Nothing,
             true,
-            "uncommitted changes",
+            "the main working set holds 1 uncommitted changes",
+        ),
+        case(
+            "dirty usage branch working set",
+            &dirty_usage,
+            Fault::Nothing,
+            true,
+            "the usage branch working set holds 1 uncommitted changes",
         ),
         case(
             "rewrite of no row",
@@ -846,8 +864,11 @@ async fn copy_remnant_without_identity_is_preserved_without_engine_start() -> Re
         let scope = scope('5');
         let bare = copy_stage(&template, &data_dir, &scope)?;
         let interrupted_write = copy_stage(&template, &data_dir, &scope)?;
-        let staging = files::ensure_private_directory(&interrupted_write.join("staging"))?;
-        staging.create_new(OsStr::new(&format!("record-{}.tmp", Uuid::new_v4())))?;
+        // The directory handle and the record it creates are temporaries
+        // dropped before recovery: Windows refuses to move a directory while
+        // any descendant is held open.
+        files::ensure_private_directory(&interrupted_write.join("staging"))?
+            .create_new(OsStr::new(&format!("record-{}.tmp", Uuid::new_v4())))?;
         let stages = [bare, interrupted_write];
         let keys = stages
             .iter()
