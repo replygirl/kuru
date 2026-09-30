@@ -9,22 +9,22 @@
 
 ## 2. Install family helpers
 
-- [ ] 2.1 In `embedded_runtime.rs` `execute` (Unix), take the descendant snapshot before `child.kill()`, re-check the recorded processes after the pipe grace, and add the command, arguments and working directory; verify with a tiny-deadline negative test.
+- [x] 2.1 In `embedded_runtime.rs` `execute` (Unix), take the descendant snapshot before `child.kill()`, re-check the recorded processes after the pipe grace, and add the command, arguments and working directory; verify with a tiny-deadline negative test.
 - [ ] 2.2 Add step and argument context to the nine bare `execute` sites and the Windows `execute`, and fix the misleading "installed Kuru" text at the pre-install selected-binary site; verify no deadline or assertion changed.
 - [ ] 2.3 Add context to `windows_cli.rs` `success()` and the six direct `.output()` sites; verify by a Windows-native tiny-deadline test in CI.
 
 ## 3. Git child family helpers
 
-- [ ] 3.1 Replace the `unwrap()` in `src/advisory.rs` `tests::git` and `git_with_environment` with a panic carrying arguments, directory and elapsed time; verify with a tiny-deadline negative test.
-- [ ] 3.2 Do the same in `tests/advisory.rs` `git` and `git_with_environment`, the `src/coverage.rs` test `git`, and the `tests/fixtures/delivery.rs` fixture binary; verify each helper's message.
+- [x] 3.1 Replace the `unwrap()` in `src/advisory.rs` `tests::git` and `git_with_environment` with a panic carrying arguments, directory and elapsed time; verify with a tiny-deadline negative test.
+- [x] 3.2 Do the same in `tests/advisory.rs` `git` and `git_with_environment`, the `src/coverage.rs` test `git`, and the `tests/fixtures/delivery.rs` fixture binary; verify each helper's message.
 
 ## 4. Terminal family helper
 
-- [ ] 4.1 Record program, arguments and `LLVM_PROFILE_FILE` presence in `Terminal::spawn` in `apps/kuru-tui/tests/support/terminal.rs`, and add a bounded `ps` snapshot of the child and its descendants to the `wait_exit` timeout arm (and `wait`); verify the two negative tests still assert `process exits: timed out` plus `STALLED` and `child failed`.
+- [x] 4.1 Record program, arguments and `LLVM_PROFILE_FILE` presence in `Terminal::spawn` in `apps/kuru-tui/tests/support/terminal.rs`, and add a bounded `ps` snapshot of the child and its descendants to the `wait_exit` timeout arm (and `wait`); verify the two negative tests still assert `process exits: timed out` plus `STALLED` and `child failed`.
 
 ## 5. Family 4: nested terminal fixture
 
-- [ ] 5.1 In `terminal_fixture_uses_its_requested_controlling_dimensions`, capture the nested child's complete PTY output and exit status in the error and make the nested fixture record what it printed; verify by a negative test in which the nested child exits early that the error contains the output and status.
+- [x] 5.1 In `terminal_fixture_uses_its_requested_controlling_dimensions`, capture the nested child's complete PTY output and exit status in the error and make the nested fixture record what it printed; verify by a negative test in which the nested child exits early that the error contains the output and status.
 
 ## 6. Verification
 
@@ -59,3 +59,22 @@
 - Sampling inside short deadlines: `SAMPLE_INTERVAL` and the skipped first tick are
   unchanged; the snapshot adds one final root sample and one sample per Job member
   at failure time instead.
+
+2026-09-29, work package H (macOS arm64 host):
+
+- 2.1 and 2.2: `embedded_runtime.rs` `execute` is now `execute_within` on both platforms
+  (`execute` passes the unchanged `COMMAND_TIMEOUT`). Unix names the command, arguments
+  and directory, records the process tree before `child.kill()`, and after the pipe
+  grace lists which recorded processes are still listed. The nine bare sites carry a
+  `step:` context; the misleading "installed Kuru" text is gone from the shared helper.
+  `execute_failure_tests` passed on macOS. 2.2 stays open: the Windows `execute` context
+  and its test compile under `lint:windows` but are unrun.
+- 2.3: `windows_cli.rs` gained `launch()`; `success()` and four direct `.output()` sites
+  use it. The other two direct sites already panic with their stages. Windows-only,
+  unrun until native CI.
+- 3.1 and 3.2: five helpers and the fixture binary panic with arguments, directory and
+  elapsed time; each has a launch-failure test that passed locally.
+- 4.1: `Terminal` records its launch; timeout, exit and failure arms append `report()`.
+  `terminal_timeouts_report_the_launch_and_a_process_tree_snapshot` passed.
+- 5.1: `terminal_wait_reports_output_still_queued_when_the_exit_is_seen` and
+  `terminal_fixture_nested_early_exit_reports_the_inner_output_and_status` passed.
