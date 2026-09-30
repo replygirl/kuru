@@ -231,7 +231,20 @@ pub async fn client_fixture_entry(arguments: impl IntoIterator<Item = OsString>)
         })
         .await?;
     ensure!(matches!(result, ServiceValue::Unit));
-    println!("{}", client.generation());
+    // Report the attached generation, then keep the attachment until the
+    // caller closes stdin, so its sibling starter meets a live owner.
+    {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{}", client.generation())?;
+        stdout.flush()?;
+    }
+    tokio::task::spawn_blocking(|| {
+        use std::io::Read;
+        std::io::stdin().read_to_end(&mut Vec::new())
+    })
+    .await??;
+    drop(client);
     Ok(())
 }
 
@@ -6203,13 +6216,12 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn separate_cold_starters_elect_one_owner_at_a_time_and_preserve_both_writes()
-    -> Result<()> {
+    async fn separate_cold_starters_share_one_owner_and_preserve_both_writes() -> Result<()> {
         use std::process::Stdio;
+        use tokio::io::AsyncBufReadExt;
         crate::test_support::warm_runtime_cache().await?;
-        // Real lifecycles: one fresh cold-started service owner, possibly a reopened second one when
-        // the first starter's owner retired before the other attached, then the reopened successor.
-        let deadline = crate::test_support::fixture_deadline(1, 2);
+        // Real lifecycles: one fresh cold-started service owner, then the reopened successor.
+        let deadline = crate::test_support::fixture_deadline(1, 1);
         tokio::time::timeout(deadline, async {
             let root = tempfile::tempdir()?;
             let project = root.path().join("project");
@@ -6241,7 +6253,7 @@ mod tests {
                 let child = tokio::process::Command::new(&executable)
                     .args(args)
                     .current_dir(&project)
-                    .stdin(Stdio::null())
+                    .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true)
@@ -6259,6 +6271,32 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             std::fs::write(&barrier, b"go")?;
+            // Each starter reports its generation once attached and written,
+            // then holds its attachment until its stdin closes: both are
+            // attached at once, so both must reach the same owner.
+            let (mut one, mut two) = (one, two);
+            let mut one_lines = tokio::io::BufReader::new(
+                one.stdout.take().context("first cold starter has no stdout")?,
+            )
+            .lines();
+            let mut two_lines = tokio::io::BufReader::new(
+                two.stdout.take().context("second cold starter has no stdout")?,
+            )
+            .lines();
+            let (generation_one, generation_two) = tokio::join!(
+                tokio::time::timeout(Duration::from_secs(60), one_lines.next_line()),
+                tokio::time::timeout(Duration::from_secs(60), two_lines.next_line()),
+            );
+            let generation_one = generation_one
+                .context("first cold starter did not report its generation")??
+                .unwrap_or_default();
+            let generation_two = generation_two
+                .context("second cold starter did not report its generation")??
+                .unwrap_or_default();
+            // Release both only after reading both; an earlier failure return
+            // kills them on drop.
+            drop(one.stdin.take());
+            drop(two.stdin.take());
             let (one, two) = tokio::join!(
                 tokio::time::timeout(Duration::from_secs(60), one.wait_with_output()),
                 tokio::time::timeout(Duration::from_secs(60), two.wait_with_output()),
@@ -6276,16 +6314,9 @@ mod tests {
                 String::from_utf8_lossy(&two.stderr)
             );
             let exited = tokio::time::Instant::now();
-            let generation_one = String::from_utf8(one.stdout)?.trim().to_owned();
-            let generation_two = String::from_utf8(two.stdout)?.trim().to_owned();
-            // Each starter attaches, writes and exits on its own schedule. A
-            // starter that finds the other's owner already retiring waits for
-            // its owner lock and elects a successor without error, so the two
-            // may report different generations; the owner lock keeps them from
-            // ever overlapping.
             ensure!(
-                !generation_one.is_empty() && !generation_two.is_empty(),
-                "a cold starter reported no service generation"
+                !generation_one.is_empty() && generation_one == generation_two,
+                "cold starters reached different service generations"
             );
             // Both starters have exited, so their owner retires at once.
             await_owner_release(&options).await?;
@@ -6294,7 +6325,7 @@ mod tests {
             let mut client = attach_or_start(&options, &project, &executable).await?;
             let reopened = reopening.elapsed();
             ensure!(
-                client.generation() != generation_one && client.generation() != generation_two,
+                client.generation() != generation_one,
                 "a retired cold service was still attached"
             );
             let ServiceValue::HistoryWindow(window) = client
