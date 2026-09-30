@@ -154,6 +154,8 @@ struct Shared {
     candidate_recovery_pause: Option<Arc<CandidateRecoveryPause>>,
     #[cfg(test)]
     candidate_cleanup_failure: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    apply_pause: StdMutex<Option<Arc<ApplyPause>>>,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -162,6 +164,36 @@ struct Shared {
 struct CandidateRecoveryPause {
     reached: Arc<Semaphore>,
     resume: Arc<Semaphore>,
+}
+
+/// Take-once test pauses inside the next unit write transaction on this
+/// store: after its receipt `INSERT` and before `DOLT_COMMIT`, then after
+/// `DOLT_COMMIT` and before the SQL `COMMIT`. The writer keeps the write guard
+/// while paused, so only a lock-free read can observe either point.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ApplyPause {
+    receipt_inserted: ApplyPausePoint,
+    dolt_committed: ApplyPausePoint,
+    /// Fail after `DOLT_COMMIT`, so the connection drops without SQL `COMMIT`.
+    fail_after_commit: AtomicBool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ApplyPausePoint {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ApplyPausePoint {
+    async fn pause(&self) -> Result<()> {
+        self.reached.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), self.resume.notified())
+            .await
+            .context("write transaction test pause exceeded 10 seconds")
+    }
 }
 
 #[cfg(test)]
@@ -1576,17 +1608,7 @@ impl MemoryStore {
         argument_digest: &str,
     ) -> Result<Option<bool>> {
         self.readable()?;
-        ensure!(
-            !method.is_empty() && method.len() <= 64 && method.is_ascii(),
-            "invalid logical mutation method"
-        );
-        ensure!(
-            argument_digest.len() == 64
-                && argument_digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-            "invalid logical mutation argument digest"
-        );
+        validate_logical_query(method, argument_digest)?;
         let names = if branch == "main" {
             None
         } else {
@@ -1618,6 +1640,28 @@ impl MemoryStore {
             }
         }
         Ok(Some(false))
+    }
+
+    /// Lock-free positive evidence for one main-view unit receipt. It takes
+    /// no write guard and does not reconcile another writer's uncertain
+    /// session: the receipt row is written in the same `DOLT_COMMIT` that
+    /// publishes its effect, so a matching row is durable committed evidence
+    /// while that writer is still running. A miss proves nothing; only the
+    /// guarded [`Self::indexed_logical_outcome`] after settlement may.
+    pub(crate) async fn probe_logical_receipt(
+        &self,
+        id: Uuid,
+        method: &str,
+        argument_digest: &str,
+    ) -> Result<bool> {
+        self.readable()?;
+        ensure!(
+            self.branch == "main",
+            "the lock-free receipt probe reads only the main view"
+        );
+        validate_logical_query(method, argument_digest)?;
+        let expected = self.logical_receipt_for_view("main", id, method, argument_digest);
+        operation_receipt_matches(&self.pool, &expected).await
     }
 
     pub fn exists(data_dir: &Path, project_scope: &str) -> Result<bool> {
@@ -1988,6 +2032,8 @@ impl MemoryStore {
             candidate_recovery_pause: options.candidate_recovery_pause,
             #[cfg(test)]
             candidate_cleanup_failure: options.candidate_cleanup_failure,
+            #[cfg(test)]
+            apply_pause: StdMutex::new(None),
             _permit: permit,
         });
         let store = Self {
@@ -3567,6 +3613,13 @@ impl MemoryStore {
                 connection: id,
                 receipt: Receipt::Operation(operation.clone()),
             });
+            #[cfg(test)]
+            let pause = store
+                .shared
+                .apply_pause
+                .lock()
+                .expect("apply pause lock")
+                .take();
             let result = tokio::time::timeout(
                 QUERY_TIMEOUT,
                 apply(
@@ -3575,6 +3628,8 @@ impl MemoryStore {
                     &label,
                     mutation,
                     logical.as_ref(),
+                    #[cfg(test)]
+                    pause.as_deref(),
                 ),
             )
             .await;
@@ -4594,6 +4649,7 @@ async fn apply(
     label: &str,
     mutation: Mutation,
     logical: Option<&LogicalReceipt>,
+    #[cfg(test)] pause: Option<&ApplyPause>,
 ) -> Result<()> {
     let mut transaction = connection.begin().await?;
     match mutation {
@@ -4859,11 +4915,22 @@ async fn apply(
             .execute(&mut *transaction)
             .await?;
     }
+    #[cfg(test)]
+    if let Some(pause) = pause {
+        pause.receipt_inserted.pause().await?;
+    }
     sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
         .bind(format!("{label} [{operation}]"))
         .bind(AUTHOR)
         .fetch_all(&mut *transaction)
         .await?;
+    #[cfg(test)]
+    if let Some(pause) = pause {
+        pause.dolt_committed.pause().await?;
+        if pause.fail_after_commit.swap(false, Ordering::SeqCst) {
+            bail!("injected write failure after DOLT_COMMIT");
+        }
+    }
     transaction.commit().await?;
     Ok(())
 }
@@ -7263,6 +7330,21 @@ async fn operation_exists(pool: &MySqlPool, operation: &str) -> Result<bool> {
     .await
     .context("memory reconciliation deadline exceeded")??;
     Ok(result.is_some())
+}
+
+fn validate_logical_query(method: &str, argument_digest: &str) -> Result<()> {
+    ensure!(
+        !method.is_empty() && method.len() <= 64 && method.is_ascii(),
+        "invalid logical mutation method"
+    );
+    ensure!(
+        argument_digest.len() == 64
+            && argument_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "invalid logical mutation argument digest"
+    );
+    Ok(())
 }
 
 async fn operation_receipt_matches(pool: &MySqlPool, expected: &LogicalReceipt) -> Result<bool> {
@@ -10871,6 +10953,7 @@ mod tests {
                 usage_pool: StdMutex::new(None),
                 candidate_recovery_pause: None,
                 candidate_cleanup_failure: None,
+                apply_pause: StdMutex::new(None),
                 _permit: None,
             }),
             pool: pool.clone(),
@@ -11840,6 +11923,7 @@ mod tests {
                 mode: None,
             },
             None,
+            None,
         )
         .await
         .unwrap();
@@ -11862,6 +11946,7 @@ mod tests {
                     public_turn: None,
                     mode: None,
                 },
+                None,
                 None,
             )
             .await
@@ -11902,6 +11987,95 @@ mod tests {
         });
         assert_eq!(store.reconcile().await.unwrap(), Some(false));
         store.close().await.unwrap();
+    }
+
+    /// T8: the lock-free outcome probe's proof standard, measured on pinned
+    /// Dolt. A receipt row is not visible to another session between its
+    /// `INSERT` and `DOLT_COMMIT`; after `DOLT_COMMIT` it is visible, and it
+    /// stays durable when the writer's connection then drops without SQL
+    /// `COMMIT`. Both reads run while the writer holds the write guard.
+    #[tokio::test]
+    async fn receipt_is_hidden_before_dolt_commit_and_durable_without_sql_commit() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let pause = Arc::new(ApplyPause::default());
+        pause.fail_after_commit.store(true, Ordering::SeqCst);
+        *store.shared.apply_pause.lock().expect("apply pause lock") = Some(pause.clone());
+        let id = Uuid::new_v4();
+        let arguments = b"publication proof arguments";
+        let digest = Sha256::digest(arguments)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let message = Message::text("user", "published once");
+        let view = store.with_logical_receipt(id, "append_message", arguments);
+        let written = message.clone();
+        let mut writer =
+            tokio::spawn(async move { view.append_message("publication", &written).await });
+        let tested = async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                pause.receipt_inserted.reached.notified(),
+            )
+            .await
+            .context("write did not reach its receipt insert")?;
+            let hidden = tokio::time::timeout(
+                Duration::from_secs(10),
+                store.probe_logical_receipt(id, "append_message", &digest),
+            )
+            .await
+            .context("probe blocked before DOLT_COMMIT")??;
+            ensure!(!hidden, "receipt was visible before DOLT_COMMIT");
+            pause.receipt_inserted.resume.notify_one();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                pause.dolt_committed.reached.notified(),
+            )
+            .await
+            .context("write did not reach DOLT_COMMIT")?;
+            let published = tokio::time::timeout(
+                Duration::from_secs(10),
+                store.probe_logical_receipt(id, "append_message", &digest),
+            )
+            .await
+            .context("probe blocked after DOLT_COMMIT")??;
+            ensure!(published, "receipt was not visible after DOLT_COMMIT");
+            pause.dolt_committed.resume.notify_one();
+            // The injected failure drops the transaction without SQL COMMIT;
+            // the worker then awaits session end and finds its receipt.
+            tokio::time::timeout(Duration::from_secs(40), &mut writer)
+                .await
+                .context("uncertain write did not resolve")???;
+            ensure!(
+                !pause.fail_after_commit.load(Ordering::SeqCst),
+                "write did not take the injected post-commit failure"
+            );
+            ensure!(
+                store
+                    .shared
+                    .uncertain
+                    .lock()
+                    .expect("uncertain lock")
+                    .is_none()
+            );
+            ensure!(
+                store
+                    .probe_logical_receipt(id, "append_message", &digest)
+                    .await?,
+                "receipt disappeared after the session ended without SQL COMMIT"
+            );
+            ensure!(store.history("publication", 10).await? == [message.clone()]);
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        pause.receipt_inserted.resume.notify_one();
+        pause.dolt_committed.resume.notify_one();
+        if !writer.is_finished() {
+            writer.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut writer).await;
+        }
+        let closed = store.close().await;
+        tested?;
+        closed
     }
 
     #[tokio::test]

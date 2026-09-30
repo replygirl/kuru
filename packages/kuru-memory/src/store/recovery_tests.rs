@@ -1228,6 +1228,7 @@ async fn live_original_session_blocks_receipt_reconciliation_even_after_commit()
         "barrier",
         Mutation::State(vec![("settled".into(), "true".into())]),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1637,6 +1638,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
             usage_pool: StdMutex::new(None),
             candidate_recovery_pause: None,
             candidate_cleanup_failure: None,
+            apply_pause: StdMutex::new(None),
             _permit: None,
         }),
         pool,
