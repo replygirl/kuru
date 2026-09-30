@@ -2168,11 +2168,18 @@ pub(super) async fn exchange_attached_with_id<S: AsyncRead + AsyncWrite + Unpin>
 /// The client reads the owner's reply frame while paused and holds it until
 /// `release`. A test cancels after a sibling has seen the effect; the owner
 /// answers the following outcome query definitely from that evidence, so no
-/// owner-side reply event is needed.
+/// owner-side reply event is needed for that.
+///
+/// `replied` is a different event: a reply frame has arrived and is held. The
+/// owner settles the request's receipt before it writes that frame and then
+/// only waits for the next request, so a test that must cancel while the
+/// owner has no request in hand (the owner-retirement cancellation tests,
+/// whose serve events are then ordered by client actions alone) awaits it.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub(crate) struct ReplyPause {
     pub sent: tokio::sync::Notify,
+    pub replied: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
     pub promotion_sent: AtomicBool,
 }
@@ -2198,6 +2205,9 @@ pub(super) async fn exchange_attached_with_id_paused<S: AsyncRead + AsyncWrite +
     let reply = tokio::time::timeout(reply_deadline, async {
         let reply: Result<ServiceReply> =
             read_frame(stream, OPERATION_FRAME_LIMIT, reply_deadline).await;
+        if reply.is_ok() {
+            pause.replied.notify_one();
+        }
         pause.release.notified().await;
         reply
     })
