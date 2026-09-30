@@ -1279,11 +1279,22 @@ impl LifecycleLease {
 }
 
 fn prepare_directory(directory: &Path, read_only: bool) -> Result<()> {
+    prepare_directory_then(directory, read_only, |_| {})
+}
+
+/// [`prepare_directory`] with a hook between listing an entry and opening it,
+/// where a previous owner generation's supervisor can retire its record.
+fn prepare_directory_then(
+    directory: &Path,
+    read_only: bool,
+    mut listed: impl FnMut(&str),
+) -> Result<()> {
     if read_only {
         private_metadata(directory, true).context("memory has not been initialized privately")?;
     } else {
         private_directory(directory)?;
     }
+    let scanned = files::directory(directory)?;
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -1305,20 +1316,61 @@ fn prepare_directory(directory: &Path, read_only: bool) -> Result<()> {
                 ),
             "unrecognized memory directory entry: {name}"
         );
-        private_metadata(&entry.path(), is_directory)?;
+        listed(name);
+        if is_directory {
+            private_metadata(&entry.path(), true)?;
+            continue;
+        }
+        // This scan runs before its caller holds the lifecycle lease, so a
+        // previous owner generation's supervisor can still be retiring its
+        // endpoint record under that lease. A listed regular file whose open
+        // finds its name gone, or its object unlinked, has no privacy left to
+        // check. It is skipped only while the scanned directory itself is
+        // unchanged; every other error, and any error for a directory entry,
+        // still fails the scan.
+        match private_metadata(&entry.path(), false) {
+            Ok(_) => {}
+            Err(error) if crate::service::is_not_found(&error) => scanned
+                .revalidate()
+                .context("memory directory changed while its entries were checked")?,
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
 
 fn read_record<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    read_record_then(path, || {})
+}
+
+/// [`read_record`] with a hook between its existence check and its open, where
+/// a previous owner generation's supervisor can retire the record.
+fn read_record_then<T: DeserializeOwned>(path: &Path, between: impl FnOnce()) -> Result<Option<T>> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         result => {
             result?;
         }
     }
-    private_metadata(path, false)?;
-    let bytes = files::read_bytes(path, RECORD_LIMIT as u64)?;
+    let parent = files::parent(path, Privacy::OwnerOnly, NameRetention::Movable)?;
+    between();
+    // A previous owner generation's supervisor retires its endpoint record
+    // under a lease this reader does not hold, so the record can vanish after
+    // the check above: at its open, or before its name is verified again after
+    // the read. That NotFound is the absence the check would have reported,
+    // once the parent directory is unchanged; every other error still fails.
+    let bytes = match private_metadata(path, false)
+        .and_then(|_| files::read_bytes(path, RECORD_LIMIT as u64))
+    {
+        Ok(bytes) => bytes,
+        Err(error) if crate::service::is_not_found(&error) => {
+            parent
+                .revalidate()
+                .context("memory record directory changed while the record was read")?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     ensure!(
         bytes.len() <= RECORD_LIMIT,
         "memory record exceeds size limit"
@@ -2384,6 +2436,9 @@ mod startup_budget_tests;
 #[cfg(all(test, unix))]
 #[path = "server_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "server/vanished_entry_tests.rs"]
+mod vanished_entry_tests;
 #[cfg(all(test, windows))]
 #[path = "server/windows_tests.rs"]
 mod windows_tests;

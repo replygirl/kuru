@@ -2144,7 +2144,7 @@ impl EndpointRecord {
 /// Private stage for a record leaving discovery; never read as an endpoint.
 const RETIRED_ENDPOINT: &str = "endpoint.retired";
 
-fn is_not_found(error: &anyhow::Error) -> bool {
+pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<io::Error>()
         .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
