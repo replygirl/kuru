@@ -121,7 +121,27 @@ pub struct OpenOptions {
     candidate_cleanup_failure: Option<Arc<AtomicBool>>,
     #[cfg(test)]
     migrated_stage_pool_delay: Option<(Duration, Arc<AtomicBool>)>,
+    /// Test-support creation path; no open reads it before creation from a
+    /// template exists.
+    #[cfg(any(test, feature = "test-support"))]
+    creation: Creation,
 }
+
+/// How a test-support open creates a store that does not exist yet.
+///
+/// Crate-private, so no product caller can choose a creation path. Both
+/// variants take today's cold staged build; `Cold` names the fixtures that
+/// must keep that path once another one exists.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Creation {
+    /// The ordinary creation path.
+    Default,
+    /// Always the cold staged build: initialization, every migration, staged
+    /// validation and activation.
+    Cold,
+}
+
 impl OpenOptions {
     pub fn new(data_dir: PathBuf, project_scope: String) -> Self {
         Self {
@@ -138,6 +158,8 @@ impl OpenOptions {
             candidate_cleanup_failure: None,
             #[cfg(test)]
             migrated_stage_pool_delay: None,
+            #[cfg(any(test, feature = "test-support"))]
+            creation: Creation::Default,
         }
     }
 }
@@ -1514,6 +1536,7 @@ mod export;
 pub(crate) mod marker_fixture;
 mod migrations;
 pub(crate) mod purge;
+mod stage_worker;
 mod usage_ledger;
 pub use export::{ActiveExportSnapshot, ExportCursor, ExportPage, ExportProvenance, StorageRecord};
 pub use usage_ledger::{UsageLedger, UsageProof};
@@ -1793,158 +1816,30 @@ impl MemoryStore {
                     name.to_string_lossy(),
                     Uuid::new_v4()
                 ));
-                private_dir(&staging)?;
-                progress.report(MemoryOpenStage::OpeningDatabase);
-                let server = Server::open_with_guard(
-                    make_options(staging.clone(), false),
-                    lock.take().expect("startup lock"),
-                )
-                .await
-                .context("open staged memory server")?;
-                let pool = match server.pool("main").await.context("open staged main pool") {
-                    Ok(pool) => pool,
-                    Err(error) => return Err(close_failed_open(&server, error).await),
+                let worker = stage_worker::StageWorker {
+                    make_options: &make_options,
+                    stage: &staging,
+                    parent,
+                    lifecycle_root: lifecycle_root.as_deref(),
+                    timeout,
+                    project_scope: &options.project_scope,
+                    legacy: legacy.as_ref(),
+                    #[cfg(test)]
+                    migration_hooks: options.migration_hooks.clone(),
+                    #[cfg(test)]
+                    migrated_stage_pool_delay: options.migrated_stage_pool_delay.clone(),
                 };
-                let initialized = async {
-                    initialize(&pool).await?;
-                    if let Some(legacy) = &legacy {
-                        import(&pool, legacy).await?;
-                    }
-                    Ok::<_, anyhow::Error>(())
-                }
-                .await;
-                match (initialized, close_migration_worker(server, pool).await) {
-                    (Ok(()), Ok(returned_lock)) => lock = Some(returned_lock),
-                    (Err(error), Ok(returned_lock)) => {
-                        let retained_lock = returned_lock;
-                        if let Err(preserve) = preserve_unready_stage(
-                            &staging,
-                            parent,
-                            lifecycle_root.as_deref(),
-                            timeout,
-                        )
-                        .await
-                        {
-                            return Err(error.context(format!(
-                                "memory staging initialization preservation also failed: {preserve:#}"
-                            )));
-                        }
-                        drop(retained_lock);
-                        return Err(error);
-                    }
-                    (Ok(()), Err(cleanup)) => return Err(cleanup),
-                    (Err(error), Err(cleanup)) => {
-                        return Err(error.context(format!(
-                            "memory staging initialization cleanup also failed: {cleanup:#}"
-                        )));
-                    }
-                }
-
-                // Migration itself is an accepted worker just as it is for an
-                // existing project.  A cancelled stage opener cannot abandon
-                // DDL or release its writer lock before the supervisor reaps.
-                progress.report(MemoryOpenStage::OpeningDatabase);
-                let server = Server::open_with_guard(
-                    make_options(staging.clone(), false),
-                    lock.take().expect("startup lock"),
-                )
-                .await
-                .context("reopen staged memory server for migration")?;
-                let pool = match server.pool("main").await.context("open staged main pool") {
-                    Ok(pool) => pool,
-                    Err(error) => return Err(close_failed_open(&server, error).await),
-                };
-                #[cfg(test)]
-                let (returned_lock, migrated) =
-                    run_migration_worker(server, pool, options.migration_hooks.clone()).await?;
-                #[cfg(not(test))]
-                let (returned_lock, migrated) = run_migration_worker(server, pool).await?;
-                lock = Some(returned_lock);
-                if let Err(error) = migrated {
-                    if let Err(preserve) =
-                        preserve_unready_stage(&staging, parent, lifecycle_root.as_deref(), timeout)
-                            .await
-                    {
-                        return Err(error.context(format!(
-                            "memory staging migration preservation also failed: {preserve:#}"
-                        )));
-                    }
-                    return Err(error);
-                }
-
-                progress.report(MemoryOpenStage::OpeningDatabase);
-                let server = Server::open_with_guard(
-                    make_options(staging.clone(), false),
-                    lock.take().expect("startup lock"),
-                )
-                .await
-                .context("reopen migrated staged memory server")?;
-                #[cfg(test)]
-                if let Some((delay, entered)) = options.migrated_stage_pool_delay.clone() {
-                    server.delay_next_pool_authentication(delay, entered);
-                }
-                let pool = match server
-                    .pool("main")
-                    .await
-                    .context("open migrated staged main pool")
-                {
-                    Ok(pool) => pool,
-                    Err(error) => return Err(close_failed_open(&server, error).await),
-                };
-                let activated = async {
-                    migrations::validate_active(&server, &pool).await?;
-                    let initial_revision = revision(&pool).await?;
-                    let activation = Activation {
-                        format: 1,
-                        project_scope: options.project_scope.clone(),
-                        initial_revision,
-                        migration: legacy.as_ref().map(|legacy| legacy.receipt.clone()),
-                    };
-                    marker_fixture::reach(
-                        &mut marker_pause,
-                        marker_fixture::Boundary::Before,
-                        &staging,
-                        &activation,
-                    )
+                // Each job's engine holds the startup lock as its reap guard
+                // and returns it only after that engine has been reaped.
+                let returned_lock = worker
+                    .init(lock.take().expect("startup lock"), progress)
                     .await?;
-                    write_json(&staging.join("ready.json"), &activation)?;
-                    marker_fixture::reach(
-                        &mut marker_pause,
-                        marker_fixture::Boundary::After,
-                        &staging,
-                        &activation,
-                    )
-                    .await?;
-                    Ok::<_, anyhow::Error>(())
-                }
-                .await;
-                match (activated, close_migration_worker(server, pool).await) {
-                    (Ok(()), Ok(returned_lock)) => lock = Some(returned_lock),
-                    (Err(error), Ok(returned_lock)) => {
-                        let retained_lock = returned_lock;
-                        if !staging.join("ready.json").exists()
-                            && let Err(preserve) = preserve_unready_stage(
-                                &staging,
-                                parent,
-                                lifecycle_root.as_deref(),
-                                timeout,
-                            )
-                            .await
-                        {
-                            return Err(error.context(format!(
-                                "memory staging activation preservation also failed: {preserve:#}"
-                            )));
-                        }
-                        drop(retained_lock);
-                        return Err(error);
-                    }
-                    (Ok(()), Err(cleanup)) => return Err(cleanup),
-                    (Err(error), Err(cleanup)) => {
-                        return Err(error.context(format!(
-                            "memory staging activation cleanup also failed: {cleanup:#}"
-                        )));
-                    }
-                }
+                let returned_lock = worker.migrate(returned_lock, progress).await?;
+                lock = Some(
+                    worker
+                        .validate_and_mark(returned_lock, &mut marker_pause, progress)
+                        .await?,
+                );
                 let lease =
                     Server::quiescence_at(&staging, lifecycle_root.as_deref(), timeout).await?;
                 StoppedStage { _lease: lease }
@@ -2087,7 +1982,7 @@ impl MemoryStore {
         .await
         .context("copy the pre-migrated memory test template")?;
         let permit = temporary_permit().await?;
-        Self::open_temporary(directory, Some(permit)).await
+        Self::open_temporary(directory, Some(permit), Creation::Default).await
     }
 
     /// Real isolated Dolt fixture created by a complete cold open: a new
@@ -2098,18 +1993,21 @@ impl MemoryStore {
     pub async fn temporary_cold() -> Result<Self> {
         let permit = temporary_permit().await?;
         let directory = Arc::new(temporary_directory()?);
-        Self::open_temporary(directory, Some(permit)).await
+        Self::open_temporary(directory, Some(permit), Creation::Cold).await
     }
 
-    /// Open the fixture store under `directory/private`, creating it by a cold
-    /// open when absent. The retained directory outlives the supervisor reap.
+    /// Open the fixture store under `directory/private`, creating it through
+    /// `creation` when absent. The retained directory outlives the supervisor
+    /// reap.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn open_temporary(
         directory: Arc<tempfile::TempDir>,
         permit: Option<OwnedSemaphorePermit>,
+        creation: Creation,
     ) -> Result<Self> {
-        let options =
+        let mut options =
             crate::test_support::open_options(directory.path().join("private"), temporary_scope())?;
+        options.creation = creation;
         let mut progress = ProgressReporter::silent();
         let fixture_options = options.clone();
         let opened = Self::open_inner(

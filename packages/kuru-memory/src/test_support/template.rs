@@ -37,7 +37,11 @@
 //!
 //! [`MemoryStore::temporary`]: crate::MemoryStore::temporary
 use super::{digest, profile};
-use crate::{files, server::Server, store::MemoryStore};
+use crate::{
+    files,
+    server::Server,
+    store::{Creation, MemoryStore},
+};
 use anyhow::{Context, Result, bail, ensure};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde::{Deserialize, Serialize};
@@ -312,9 +316,13 @@ async fn build(root: &Directory, fingerprint: &str, scope: &str) -> Result<()> {
     let data = cold.path().join("private");
     // No fixture permit: template-backed callers acquire theirs after copying.
     // Boxed: the complete cold-open future is far larger than a copy.
-    let store = Box::pin(MemoryStore::open_temporary(cold.clone(), None))
-        .await
-        .context("cold-open the memory test template source")?;
+    let store = Box::pin(MemoryStore::open_temporary(
+        cold.clone(),
+        None,
+        Creation::Default,
+    ))
+    .await
+    .context("cold-open the memory test template source")?;
     store
         .close()
         .await
