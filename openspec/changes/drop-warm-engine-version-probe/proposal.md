@@ -5,7 +5,10 @@
 Every ordinary project-memory open that finds the cached Dolt engine already installed (the
 "warm" path, taken once each time a per-project memory owner process starts) spawns a `dolt
 version` child process after fully hashing the cached executable, `LICENSES` and every notice
-file. That process launch costs roughly 47-71 ms and, unlike the hash, buys almost nothing beyond
+file. Maintainer measurements taken on macOS before and outside this change put that process
+launch at a median of about 47 ms in the release smoke harness (the probe alone, within a 628 ms
+existing-project open) and 71 ms in the test build (beside a 61 ms hash); this change did not
+re-measure it. Unlike the hash, the probe buys almost nothing beyond
 what the hash already proves: the cache directory is keyed by `DOLT_VERSION`
 (`packages/kuru-memory/src/provision.rs`), so a mismatched Dolt version lands in a different
 directory rather than overwriting a verified one, and the exact version of a freshly extracted
