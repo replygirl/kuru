@@ -178,7 +178,9 @@ impl Ref {
 
 /// Assert the template shape of the store `main` serves, with `row` as its
 /// identity on `main` and on the usage branch. See the module documentation
-/// for what is a verdict and what is not.
+/// for what is a verdict and what is not. It classifies the retained main
+/// attempts itself, so a caller validating the store first uses a validation
+/// that does not classify them again.
 pub(in crate::store) async fn check(main: &MySqlPool, row: Row<'_>) -> Result<()> {
     let expected = expected(REGISTRY, USAGE_REGISTRY, USAGE_ANCHOR, row.adopted())?;
     branches(main, &expected).await?;

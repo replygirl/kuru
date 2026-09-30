@@ -238,8 +238,10 @@ where
     ) -> Result<File> {
         let (server, pool) = self.start(startup, start, progress).await?;
         let activated = async {
-            migrations::validate_active(&pool).await?;
             if matches!(start, Start::Adopt) {
+                // The shape check classifies the retained attempts itself;
+                // classifying them here as well would repeat that work.
+                migrations::validate_active_unclassified(&pool).await?;
                 migrations::template_shape::check(
                     &pool,
                     migrations::template_shape::Row::Adopted {
@@ -248,6 +250,8 @@ where
                     },
                 )
                 .await?;
+            } else {
+                migrations::validate_active(&pool).await?;
             }
             let initial_revision = revision(&pool).await?;
             let activation = Activation {

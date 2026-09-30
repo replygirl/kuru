@@ -1154,6 +1154,14 @@ pub(super) async fn validate_active(pool: &MySqlPool) -> Result<()> {
     validate_active_with(REGISTRY, pool).await
 }
 
+/// [`validate_active`] without classifying retained attempts, for a caller
+/// that classifies them itself: the template shape check does, so a copied
+/// stage's engine validates with this and then runs that check.
+pub(super) async fn validate_active_unclassified(pool: &MySqlPool) -> Result<()> {
+    validate_current_with(REGISTRY, pool).await?;
+    clean(pool).await
+}
+
 /// Validate a current-schema read-only main without treating unrelated working
 /// data as a migration failure.
 pub(super) async fn validate_inspection(pool: &MySqlPool) -> Result<()> {
