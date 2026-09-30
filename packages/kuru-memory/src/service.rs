@@ -818,14 +818,16 @@ fn is_transport_unavailable(error: &anyhow::Error) -> bool {
         })
 }
 
-/// Whether a Windows connect exhausted its deadline on busy pipe instances;
-/// never true on Unix.
-///
-/// Seam until `kuru_platform::windows::pipe::is_no_free_instance` lands
-/// (work package WP1 of memory-owner-immediate-retirement): the platform
-/// connector does not yet mark that case, so this recognizes nothing and a
-/// busy pipe stays the fatal timeout it is today. On Windows, return the
-/// platform predicate instead; do not match on the error text.
+/// Whether a Windows connect exhausted its deadline on busy pipe instances.
+/// The platform connector marks that case with a typed payload; the error
+/// text alone never matches.
+#[cfg(windows)]
+fn is_no_free_instance(error: &io::Error) -> bool {
+    kuru_platform::windows::pipe::is_no_free_instance(error)
+}
+
+/// A Unix connect has no busy-instance state.
+#[cfg(not(windows))]
 fn is_no_free_instance(_error: &io::Error) -> bool {
     false
 }
@@ -2913,6 +2915,62 @@ mod tests {
             &ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?
                 .context("fixture did not reacquire owner lock for cleanup")?,
         )?;
+        Ok(())
+    }
+
+    // T14, service half: a published pipe whose only instance stays busy
+    // through the connect deadline is a transport miss for an electing
+    // client and for maintenance, not the fatal connect timeout.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn busy_pipe_through_the_deadline_is_a_transport_miss() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let data = root.path().join("private");
+        let options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+        let owner = ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?
+            .context("fixture did not acquire service owner lock")?;
+        let (listener, address) = ServiceListener::bind(&data, &scope)?;
+        let mut endpoint_authority = authority();
+        endpoint_authority.project_path = project_path_bytes(&project);
+        endpoint_authority.project_scope = scope.clone();
+        let endpoint = EndpointRecord {
+            authority: endpoint_authority,
+            address: address.clone(),
+        };
+        endpoint.publish(&data, &owner)?;
+        // Never accepted: this client holds the listener's only instance, so
+        // every later connect retry sees a busy pipe until its deadline.
+        let occupant = connect_local(&data, &scope, &address, HANDSHAKE_TIMEOUT).await?;
+
+        let observed = try_attach_observed(&data, &scope, &project, None)
+            .await
+            .context("an electing client failed on a busy pipe")?;
+        ensure!(
+            matches!(observed, Err(AttachMiss::TransportUnavailable)),
+            "a busy pipe was not a transport miss for an electing client"
+        );
+        ensure!(
+            request_idle_retirement(&options)
+                .await
+                .context("maintenance failed on a busy pipe")?
+                .is_none(),
+            "maintenance reached an owner through a busy pipe"
+        );
+
+        drop(occupant);
+        drop(listener);
+        endpoint.retire(&data, &owner)?;
         Ok(())
     }
 
