@@ -58,11 +58,13 @@ defect here is caught in isolation rather than inside the larger P4b change.
   identity row and the registry-derived branch/commit-count expectations, for
   later reuse by both the template build (P4b) and this PR's own adoption path
   on the stage engine.
-- Ten new tests (`store/recovery_tests.rs` and the adoption bootstrap path)
-  exercising adoption, the typed verdict, and classes R and U against
-  hand-built template-like stages (copied fixture `data/` plus a hand-written
-  `identity.json`), using the engine start ledger to prove zero engine starts
-  for classes R and U.
+- Ten new tests (`store/template_stage_tests.rs`, `server/template_identity_tests.rs`
+  and the shape module's unit test) exercising adoption, the typed verdict,
+  and classes R and U against hand-built template-like stages (a template
+  store built by the real chain under the build identity, its stopped `data/`
+  copied by the checked fixture copy, and the copy's identity record written
+  last), using a per-directory engine start count in the engine ledger to
+  prove zero engine starts for classes R and U.
 - `docs/memory.md` and `apps/kuru-docs/concepts/memory.md` gain a short,
   accurate passage on template-born stores' identity and recovery, stated as
   having no user-visible effect yet, since no open takes this path.
@@ -93,13 +95,14 @@ computation, build worker, copy worker or creation selector is added (P4b).
 - `packages/kuru-memory/src/store.rs`: `recover_staging` (classes R and U,
   ordered before the existing identity-without-marker writable-recovery
   branch at store.rs:7443-7454), `preserve_unready_stage` reuse.
-- `packages/kuru-memory/src/store/migrations.rs` and a new
-  `store/creation_template.rs` (or equivalent shared module): the
-  template-shape-check function, parameterized so the P4b build and this PR's
-  S1 adoption path share one implementation.
-- `packages/kuru-memory/src/store/recovery_tests.rs`: classes R and U tests;
-  the existing "unrecognized interrupted import without server identity" test
-  keeps only truly unknown entries.
+- `packages/kuru-memory/src/store/migrations/template_shape.rs` (a child of
+  `migrations.rs`): the template-shape-check function, parameterized so the
+  P4b build and this PR's S1 adoption path share one implementation.
+- `packages/kuru-memory/src/store/stage_worker.rs`: the `adopt_and_mark` job
+  that the creation path will call for a copied stage.
+- `packages/kuru-memory/src/store/template_stage_tests.rs`: the adoption,
+  verdict, shape and class R/U tests, plus a fail-closed test for stages
+  that stay unrecognized.
 - `packages/kuru-memory/src/store/engine_contract_tests.rs`: unchanged, but
   referenced — it already exercises adoption SQL by hand and its S1/S2
   findings ground this design's bootstrap protocol.

@@ -56,14 +56,15 @@ pub(super) async fn reach(
     Ok(())
 }
 
+/// One pause at the ready-marker boundary before or after the marker, with
+/// its observation receiver and its release sender.
 #[cfg(any(windows, test))]
-pub(crate) fn prepare(
-    options: OpenOptions,
+pub(super) fn pause(
     after_marker: bool,
 ) -> (
     oneshot::Receiver<ReadyMarkerObservation>,
     oneshot::Sender<()>,
-    impl std::future::Future<Output = Result<MemoryStore>>,
+    ReadyMarkerPause,
 ) {
     let (reached, observation) = oneshot::channel();
     let (release, wait) = oneshot::channel();
@@ -77,6 +78,19 @@ pub(crate) fn prepare(
         reached,
         release: wait,
     };
+    (observation, release, pause)
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn prepare(
+    options: OpenOptions,
+    after_marker: bool,
+) -> (
+    oneshot::Receiver<ReadyMarkerObservation>,
+    oneshot::Sender<()>,
+    impl std::future::Future<Output = Result<MemoryStore>>,
+) {
+    let (observation, release, pause) = pause(after_marker);
     (observation, release, {
         let mut progress = crate::progress::ProgressReporter::silent();
         async move { MemoryStore::open_inner(options, None, None, Some(pause), &mut progress).await }

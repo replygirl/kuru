@@ -116,6 +116,48 @@ retries, or the cold path's own behavior.
   starts on an unready template stage" true without special-casing the
   generic branch itself.
 
+- **Adoption verifies both refs before rewriting either.** The usage branch
+  and `main` must each hold a clean working set and the compiled placeholder
+  as their only identity row before the first guarded rewrite. Rejected
+  alternative: verify-then-rewrite per ref, as the design's step list reads.
+  A placeholder foreign only on `main` would then leave an adopted usage
+  branch behind a refused stage, and `DOLT_COMMIT('-am')` would commit any
+  dirty template working set into the adoption commit. The spec delta's
+  "before rewriting either one" requires the stricter order.
+
+- **A failed adoption start leaves the stage where it is.** The stage
+  engine's reap guard is the project's startup lock; a failed
+  `Server::open_with_guard` releases it with the reaped owner. Preserving the
+  stage then, without the lock, could race another opener, so the adopt job
+  returns the error and leaves the unready stage for the next open's recovery,
+  which preserves it as Class U without a start, exactly as a failed first
+  staging start is left today. A failure after a successful start (validation
+  or the shape check) is preserved by the job itself, under the returned
+  lock, as `validate_and_mark` does.
+
+- **The adopt job is a stage-worker job with no product caller yet.**
+  `StageWorker::adopt_and_mark`, the shape check module and the two identity
+  writers are production code carrying `expect(dead_code, reason = ...)` only
+  outside tests, so the template cache's creation path adds a caller and
+  removes the expectation instead of moving test code into production.
+
+- **The shape check classifies retained main attempts only.** Main attempts
+  are classified from `main` as every open does. Classification compares a
+  retained attempt's head with the head of the ref it serves, so usage
+  attempts are classified by `validate_usage` from the usage pool (which the
+  build and every writable open run); the shape check only requires their
+  count and targets to match the registry.
+
+- **Engine faults inside adoption are exercised in an in-process
+  supervisor on Unix only.** A task-local fault (`server::adoption_fault`)
+  can fail, stall or kill the owned engine at a point in the adoption group
+  and can make the usage rewrite change zero rows. The in-process supervisor
+  pattern exists only in the Unix server tests (Windows supervisors use a
+  private pipe rendezvous). Windows still runs every test that goes through
+  the spawned supervisor: adoption, both verdict directions at the client,
+  classes R and U before the first start and after initialization, reuse,
+  the later key and the shape verdicts.
+
 ## Risks / Trade-offs
 
 - [Risk] The shared shape-check function is exercised in this change only

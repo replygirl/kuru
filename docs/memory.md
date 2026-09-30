@@ -231,6 +231,38 @@ record, the database identity record, and the supervisor protocol. An old dream
 candidate stays on its recorded historical schema and remains stale if `main`
 has since advanced; it is never silently rewritten by an upgrade.
 
+## Template-born stores
+
+Kuru can now adopt and recover a new project store copied from a
+pre-migrated store template, but no open creates a store that way yet: new
+projects are still built by running every schema step, and nothing
+user-visible changes in this release.
+
+A copied store records the template it came from in its private identity
+record (`identity.json`, field `template`). A store created directly or by
+import has no such field and keeps its identity record byte-for-byte. The
+copy's first database start adopts it once: it checks that `main` and the
+usage branch each still hold only the template's fixed placeholder identity
+with clean working sets, then rewrites that row to the project's own identity
+with one commit on the usage branch and one on `main`, and creates new
+database credentials. Copies of one machine's template share only its schema
+history (the schema initialization and migration commits under the
+placeholder identity), never project data or credentials; each project's own
+history starts at its adoption commits, and its initial revision is the `main`
+adoption commit. Before the copy is marked ready, Kuru validates it and checks
+that it holds nothing but the expected branches, commits, schema and identity.
+
+A copy whose bytes differ from what this build expects is refused with a
+distinct template verdict; an engine, SQL, I/O or deadline failure, or a copy
+made for a different Kuru build, is an ordinary error. Either way the unready
+copy is kept and never activated. If a crash interrupts a copy before or during
+adoption, the next open moves it under `memory/interrupted/` without starting
+its database and builds the store afresh; a copy already marked ready is
+activated like any completed stage. A copy is compared with the Kuru build
+only before adoption, so an adopted store keeps opening under later releases. A release
+without this support fails closed on a template-born store's identity record
+rather than misreading it.
+
 ## Dream revisions and undo
 
 Dreams use an isolated candidate branch. Their notes, histories, reports and

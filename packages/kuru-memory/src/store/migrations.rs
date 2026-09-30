@@ -2329,6 +2329,15 @@ async fn publish(
 #[cfg(test)]
 mod main_pool_classification_tests;
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no open creates or builds a template stage until the template cache lands"
+    )
+)]
+pub(super) mod template_shape;
+
 #[cfg(test)]
 mod tests {
     use super::*;

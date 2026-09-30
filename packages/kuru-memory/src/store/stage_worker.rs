@@ -11,6 +11,10 @@
 //!   migration worker, which owns and reaps it.
 //! - [`StageWorker::validate_and_mark`]: start again, validate, and publish
 //!   `ready.json` between the marker boundaries, then close.
+//! - [`StageWorker::adopt_and_mark`]: the one start of a stage whose `data/`
+//!   was copied from a store template and whose identity names it. The
+//!   supervisor's bootstrap adopts the copy; the job then validates it,
+//!   checks the template shape and publishes `ready.json` as above.
 //!
 //! Every job receives the startup lock and returns it only after its engine
 //! has been reaped: the lock is each server's reap guard, so a cancelled
@@ -25,6 +29,14 @@ enum Start {
     Init,
     Migrate,
     Validate,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no open creates a template stage until the template cache lands"
+        )
+    )]
+    Adopt,
 }
 
 impl Start {
@@ -33,6 +45,7 @@ impl Start {
             Self::Init => "open staged memory server",
             Self::Migrate => "reopen staged memory server for migration",
             Self::Validate => "reopen migrated staged memory server",
+            Self::Adopt => "open and adopt the copied template stage",
         }
     }
 
@@ -40,6 +53,7 @@ impl Start {
         match self {
             Self::Init | Self::Migrate => "open staged main pool",
             Self::Validate => "open migrated staged main pool",
+            Self::Adopt => "open adopted template stage main pool",
         }
     }
 }
@@ -173,9 +187,63 @@ where
         marker_pause: &mut Option<marker_fixture::ReadyMarkerPause>,
         progress: &mut ProgressReporter,
     ) -> Result<File> {
-        let (server, pool) = self.start(startup, Start::Validate, progress).await?;
+        self.mark(startup, Start::Validate, marker_pause, progress)
+            .await
+    }
+
+    /// The one engine start of a stage copied from a store template, whose
+    /// identity record names that template and is not yet initialized.
+    ///
+    /// The supervisor's bootstrap adopts the copy (its own instance on the
+    /// usage branch and `main`, and new credentials); a failed adoption,
+    /// including a [`crate::server::TemplateVerdict`], fails the start and
+    /// leaves the unready stage where it is, as a failed first staging start
+    /// is left today, for the next open's recovery to preserve without an
+    /// engine start. After adoption this validates the store, checks the
+    /// template shape with the adopted identity, and publishes `ready.json`;
+    /// a failure there preserves the unready stage like any validation
+    /// failure. The initial revision is the adoption head of `main`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no open creates a template stage until the template cache lands"
+        )
+    )]
+    pub(super) async fn adopt_and_mark(
+        &self,
+        startup: File,
+        marker_pause: &mut Option<marker_fixture::ReadyMarkerPause>,
+        progress: &mut ProgressReporter,
+    ) -> Result<File> {
+        ensure!(
+            self.legacy.is_none(),
+            "a legacy import never creates its store from a template"
+        );
+        self.mark(startup, Start::Adopt, marker_pause, progress)
+            .await
+    }
+
+    async fn mark(
+        &self,
+        startup: File,
+        start: Start,
+        marker_pause: &mut Option<marker_fixture::ReadyMarkerPause>,
+        progress: &mut ProgressReporter,
+    ) -> Result<File> {
+        let (server, pool) = self.start(startup, start, progress).await?;
         let activated = async {
             migrations::validate_active(&pool).await?;
+            if matches!(start, Start::Adopt) {
+                migrations::template_shape::check(
+                    &pool,
+                    migrations::template_shape::Row::Adopted {
+                        instance: server.instance(),
+                        project_scope: self.project_scope,
+                    },
+                )
+                .await?;
+            }
             let initial_revision = revision(&pool).await?;
             let activation = Activation {
                 format: 1,

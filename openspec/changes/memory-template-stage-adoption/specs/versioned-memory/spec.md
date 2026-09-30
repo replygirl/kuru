@@ -17,9 +17,13 @@ A staging directory MAY instead reach the current schema through an adopted
 copy of a machine's store template rather than the migration chain. Recovery
 MUST classify such a stage before any class that would start an engine, and
 MUST NOT start an engine on one: a copy interrupted before its identity marker
-was written, and a copy whose identity marker is present but whose adoption
-never completed, are both preserved under the interrupted-stage protocol
-without a server ever starting against them.
+was written, and a copy whose identity marker is present but which never
+published `ready.json`, whatever point its adoption reached, are both
+preserved under the interrupted-stage protocol without a server ever starting
+against them. A template copy that published `ready.json` is recovered as any
+ready stage is. A stage without an identity record holding anything outside
+the copy remnant's allowed set remains unrecognized and fails before any
+engine start.
 
 #### Scenario: Fresh or imported activation
 
@@ -45,6 +49,11 @@ without a server ever starting against them.
 
 - **WHEN** recovery finds a staging directory whose `identity.json` names a source template and no `ready.json` exists, whatever point the prior adoption attempt reached
 - **THEN** Kuru waits for quiescence within the existing bound and preserves the whole stage under the interrupted-stage protocol without starting an engine against it, and never runs adoption SQL as part of recovery.
+
+#### Scenario: Ready template copy is reused
+
+- **WHEN** recovery finds a template copy that completed adoption, validation and its template shape check and published `ready.json`
+- **THEN** it is inspected and activated through the existing ready-stage path at its recorded initial revision, without adoption running again.
 
 ## ADDED Requirements
 
@@ -72,19 +81,35 @@ Adoption from a verified template copy MUST happen at most once, only from a
 staging directory whose identity record is not yet marked initialized and
 names a source template, and MUST NOT be attempted again once that mark is
 set or from any recovery path. Adoption MUST verify that the placeholder
-instance and project-scope row the template publishes is present, unchanged,
-on both the copy's usage branch and its main branch before rewriting either
-one, MUST rewrite that row to the copy's own new instance and project scope
-and commit the change on the usage branch and then on main, each as its own
-Dolt commit, and MUST verify the rewritten row on both branches before the
-identity record is marked initialized. A copy's credentials MUST be newly
-generated and MUST NOT be usable against any other copy of the same template
-or against the template itself.
+instance and project-scope row the template publishes is present, unchanged
+and the only row, and that the working set is clean, on both the copy's usage
+branch and its main branch before rewriting either one, MUST rewrite that row
+to the copy's own new instance and project scope and commit the change on the
+usage branch and then on main, each as its own Dolt commit, and MUST verify
+the rewritten row on both branches before the identity record is marked
+initialized. A copy's credentials MUST be newly generated and MUST NOT be
+usable against any other copy of the same template or against the template
+itself.
 
-A completed comparison that finds the row, or the count of rows a rewrite
-affected, to be something other than what adoption expects is a verdict
-against the template's bytes, and Kuru MUST report it through a response type
-distinct from an ordinary failure and from a client-side startup error. An
+Before a template copy publishes `ready.json`, its own engine MUST validate
+the store and check the template shape with the adopted identity: the exact
+branch set of `main`, the usage branch and one clean retained migration
+branch per executed schema step; both refs at their current schema versions
+with clean working sets; commit counts on both refs derived from the compiled
+migration registries plus one adoption commit each; the adopted identity as
+the only identity row on both refs; no rows in any project-data table; and no
+views, triggers, routines, stored schema objects, stored procedures or ignore
+rules. The same check, with the placeholder identity and no adoption commits,
+SHALL be the one a template build runs. A completed shape query that returns
+another value is a verdict against the template's bytes; a query error or
+deadline is not.
+
+A completed comparison that finds the row, the working set, the count of
+rows a rewrite affected, or the template shape to be something other than
+what adoption expects is a verdict against the template's bytes, and Kuru
+MUST report it through a response type distinct from an ordinary failure and
+from a client-side startup error, which the opening client MUST surface as
+the same typed verdict. An
 engine failure, a lost or malformed reply, a deadline, an authentication
 failure, a SQL error unrelated to the expected row or count, or a mismatched
 compiled template key MUST NOT be reported through that verdict response and
@@ -114,8 +139,13 @@ SHALL be that main adoption commit.
 
 #### Scenario: A verdict against the template's bytes is typed and distinct
 
-- **WHEN** the placeholder row adoption expects is not present unchanged on either branch, or a rewrite affects a count of rows other than the one expected
-- **THEN** Kuru reports the distinct verdict response, and the staging directory is preserved without adoption having been retried.
+- **WHEN** the placeholder row adoption expects is not present unchanged on either branch, either working set is dirty, or a rewrite affects a count of rows other than the one expected
+- **THEN** Kuru reports the distinct verdict response before either branch is rewritten where the comparison precedes the rewrites, and the staging directory is preserved without adoption having been retried.
+
+#### Scenario: A template shape violation prevents the ready marker
+
+- **WHEN** an adopted copy holds an extra commit, an extra branch, a project-data row or a view
+- **THEN** its engine reports the typed verdict before `ready.json`, the unready stage is preserved under the interrupted-stage protocol, and no active project directory appears.
 
 #### Scenario: An engine failure during adoption is not a verdict
 

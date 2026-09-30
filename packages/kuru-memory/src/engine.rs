@@ -83,6 +83,12 @@ pub(crate) fn environment(home: &Path) -> Result<Vec<(OsString, OsString)>> {
 }
 
 impl Child {
+    /// The owned child's process ID, while it has not been reaped.
+    #[cfg(all(test, unix))]
+    pub(crate) fn id(&self) -> Option<u32> {
+        self.inner.id()
+    }
+
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.inner.try_wait()
     }
