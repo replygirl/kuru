@@ -67,7 +67,7 @@ usage-argv = { version = "=6.11.1", features = ["complete"] }
 tempfile = "=3.27.0"
 url = "=2.5.8"
 unicode-width = "=0.2.2"
-jsonschema = { version = "=0.58.0", default-features = false }
+jsonschema = { version = "=0.58.1", default-features = false }
 cap-std = "=4.0.3"
 cap-fs-ext = "=4.0.3"
 nix = { version = "=0.31.3", features = ["signal", "process", "term", "poll", "fs", "user"] }
