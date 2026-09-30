@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use kuru_delivery::{
-    advisory, archive, bundle, coverage, docs, published_windows, repo, shell_support,
+    advisory, archive, bundle, coverage, docs, open_time, published_windows, repo, shell_support,
 };
 use std::{ffi::OsString, path::PathBuf};
 
@@ -100,6 +100,36 @@ enum Command {
     Repo {
         #[arg(long, default_value = ".")]
         root: PathBuf,
+    },
+    /// Measure a release kuru executable's memory open time from outside,
+    /// report only: no time is compared with a budget.
+    OpenTime {
+        #[arg(long, env = "KURU_OPEN_TIME_BINARY")]
+        binary: PathBuf,
+        #[arg(long, env = "KURU_OPEN_TIME_OUTPUT")]
+        output: PathBuf,
+        /// Parent of the private scratch root (default: the temporary directory).
+        #[arg(long, env = "KURU_OPEN_TIME_SCRATCH")]
+        scratch: Option<PathBuf>,
+        /// Iterations; each runs the four cases once.
+        #[arg(long, env = "KURU_OPEN_TIME_ITERATIONS", default_value_t = 10)]
+        iterations: usize,
+        /// Host label for the summary, such as the CI runner label.
+        #[arg(long, env = "KURU_OPEN_TIME_LABEL")]
+        label: Option<String>,
+        /// Also append the summary to this file (a CI job summary).
+        #[arg(long, env = "GITHUB_STEP_SUMMARY")]
+        summary: Option<PathBuf>,
+        /// Sampling period of the process and file observer, in milliseconds.
+        #[arg(long, env = "KURU_OPEN_TIME_INTERVAL_MS", default_value_t = 20)]
+        interval_ms: u64,
+        /// `off` runs the control series: processes only, no file listing.
+        #[arg(long, env = "KURU_OPEN_TIME_FILES", default_value = "on", value_parser = ["on", "off"])]
+        files: String,
+        /// `off` runs the ramp series: no wait for owner retirement between
+        /// runs, one wait after the last.
+        #[arg(long, env = "KURU_OPEN_TIME_RETIRE_WAIT", default_value = "on", value_parser = ["on", "off"])]
+        retire_wait: String,
     },
 }
 
@@ -419,6 +449,34 @@ async fn main() -> Result<()> {
             let errors = docs::check(&root, &base)?;
             ensure!(errors.is_empty(), "{}", errors.join("\n"));
             println!("Public docs artifacts, local links and anchors passed ({base}).");
+        }
+        Command::OpenTime {
+            binary,
+            output,
+            scratch,
+            iterations,
+            label,
+            summary,
+            interval_ms,
+            files,
+            retire_wait,
+        } => {
+            let mut options = open_time::Options::new(binary, output);
+            options.scratch = scratch;
+            options.iterations = iterations;
+            if let Some(label) = label {
+                options.label = label;
+            }
+            options.summary = summary.filter(|path| !path.as_os_str().is_empty());
+            options.interval = std::time::Duration::from_millis(interval_ms);
+            options.files = files == "on";
+            options.retire_wait = retire_wait == "on";
+            let report = open_time::run(&options).await?;
+            println!("{}", report.summary);
+            println!(
+                "Recorded {} runs ({} failed to open, {} failed after opening); no budget is applied.",
+                report.records, report.failed_opens, report.failed_after_open
+            );
         }
         Command::Repo { root } => {
             let errors = repo::check(&root)?;

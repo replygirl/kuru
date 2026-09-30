@@ -192,7 +192,9 @@ supported-platform proof of that whole suite; nothing is subset. The Windows
 offline build-input check (`bundle:verify-native-build`) has no test inventory
 to partition and stays in the Windows installation job.
 Windows primitives retain a separate native coverage job for early feedback. The
-required `ci-gate` accepts only success from every branch of this graph.
+required `ci-gate` accepts only success from every branch of this graph. The
+report-only `open-time` job is outside that graph; see
+[open-time report](#open-time-report).
 
 Windows on Arm (`windows-11-arm`) runs the same partitioned workspace suites as
 x64, uninstrumented, as separately named behavioral evidence: `Behavior
@@ -746,6 +748,236 @@ example `kuru-memory`, and runs through
 `KURU_COVERAGE_MODE=uninstrumented` and the same `KURU_COVERAGE_PACKAGES`, which
 the merge requires every receipt's scope to equal. An optional `KURU_COVERAGE_SEED` names a
 dependency seed directory to import (below); leave it unset locally.
+
+## Open-time report
+
+`ci.yml`'s `Open-time report (ubuntu-latest)` job measures how long the release
+`kuru` takes to open project memory, as a user would see it, on ubuntu-latest
+only. It is **report only**: it never compares a time with a budget, `ci-gate`
+does not need it, and job-level `continue-on-error` keeps even its own failures
+(a missing artifact, a runner problem) out of the run's result. It is the first
+form of the open-time budget check, not a check yet. This CI job is the way to
+measure open time in CI; to measure it on a developer machine, run the harness
+locally (see below).
+
+The ubuntu-latest installation job publishes the release executable it has just
+installed as `ci-release-binary-ubuntu-latest` (a step that cannot fail that
+job). That upload (about 71 MB) runs inside the gating installation job, so its
+few seconds are on `ci-gate`'s critical path; the measurement itself is not.
+The open-time job starts after `native-tests`, downloads that exact binary,
+builds only the delivery tool (which needs no engine bundle input) and runs
+`mise run //packages/kuru-delivery:measure:open-time` four times: the main
+series (10 iterations), a control series with file observation off (5), a
+series with a coarse 200 ms sampling period (3) that shows the observer's own
+effect, and a ramp without retirement waits (6). Nothing is rebuilt, and the
+measured executable embeds the engine its installation job verified.
+
+The harness drives the binary from outside. Each iteration uses a fresh private
+scratch root with its own HOME, configuration, data directory, engine cache,
+two project directories and copy of the executable, and runs four cases of
+`kuru --provider demo --no-dream run measure --json` with offline memory (no
+network, login or credential store), in this order:
+
+1. `first-launch`: empty engine cache and data directory: engine extraction and
+   a new project's staged creation. The harness then waits for the memory owner
+   to retire (30 s idle, then close).
+2. `cold-existing`: the same project with no live owner: one engine start. It
+   runs right after the first launch, so the page cache is warm.
+3. `warm-reopen`: immediately afterwards, inside the owner's idle window. The
+   record says whether the command attached to the live owner or had to start
+   one. The harness then waits for retirement again.
+4. `new-project`: a second, different project directory opened with the same
+   data directory and engine cache, so the engine is already extracted and
+   only the project is new. The harness then waits for retirement again. It
+   is appended after the first three, which keep the predecessor and gap they
+   always had.
+
+Engine starts per case (the structure table's first column) are the
+acceptance numbers for store creation work. Today a release build shows 4 for
+`first-launch`, 1 for `cold-existing`, 0 for an attaching `warm-reopen` and 4
+for `new-project`, which creates its store through the same three staging
+engines and the active one; a per-machine store template is expected to bring
+`new-project` to 2.
+
+Every run gets an explicit, otherwise cleared environment: private `HOME`,
+configuration, cache, data and temporary directories, an empty `PATH`, and
+`KURU_OPEN_MARKERS=1`, which asks a binary that supports open markers to
+write them (see below); an older binary ignores it.
+
+### What the observer sees
+
+The harness timestamps each stderr progress line as it is read, and exit. It
+reads readiness from either of two signals. With `KURU_OPEN_MARKERS=1` set, a
+binary that supports it writes `kuru-open-marker v1 <event> <monotonic_ns>`
+lines on stderr: `open-start` before the client's first attach attempt,
+`waiting-ownership` only when it waits for project ownership, and `ready`
+when memory is ready, including an attach to a running owner. A binary without
+markers writes the legacy `Memory: waiting for project ownership…` and
+`Memory: ready.` lines. A `ready` marker ends the open exactly as
+`Memory: ready.` does, and `waiting-ownership` stands for the legacy waiting
+line; a marker is preferred when both appear, and the legacy lines still work
+when no marker does, so binaries from before and after the marker change both
+measure. Either way the time is when the harness read the line, so old and new
+binaries are timed alike; `<monotonic_ns>` is kept as data in
+`stages.markers`. Each record's `stages.ready_signal` is `marker` or `legacy`
+(absent for a failed open), and the summary counts each per case. Markers, the
+`Memory: ` lines and the plain sentences a marker-writing binary shows while
+memory opens are progress: they are kept in the record and never taken as a
+failed run's error line. An observer thread
+samples, on a fixed period (20 ms by default; the thread sleeps for the rest of
+each period), the Kuru and Dolt processes running from the scratch root (owner,
+supervisors, `dolt sql-server`, `dolt version`) and the names in the data and
+cache directories. It enumerates directories and never opens a file. Enumerating
+a directory opens a handle to it for the length of that one listing, so the
+observer never enters an engine install stage (`.install-*`), a store staging
+directory (`*.staging-*`), `interrupted`, or a store template cache's private
+build store and capture stage (`templates/.build-*` and `templates/.stage-*`
+directly under an engine version directory in the cache), the directories an
+open renames or removes; that rule holds on every OS. Their appearance and
+disappearance are timed from the parent listing, and it skips Dolt's chunk
+store, statistics and temporary directories. The template rule applies only
+under the engine cache's `templates` directory: the same names elsewhere, and
+every project store and its own stage, are observed as before. Each listing's names are collected and its handle closed
+before any child is listed. The directories it still lists (`cache`, the
+version and activated engine directories, `data`, `data/memory`, the active
+store, `services` and `locks`) are not renamed or removed by a successful open. The control
+series lists no files at all, so comparing its open times with the main series
+shows any remaining disturbance.
+
+Recorded names carry no project hash: each 64-hex project hash reads
+`<project>`. In the `new-project` case, the hashes of the projects already in
+`data/memory` when the run starts read `<prior-project>` instead, so the new
+project's store is seen appearing rather than confused with the first one's.
+
+Each tick is stamped when it starts, before the process listing, and when it
+ends, after the file walk. A process or name first seen in a tick happened after
+the previous tick started and by the end of this one; the record keeps both
+stamps. The widest such bracket in a run is its `max_bracket_ms`, the error
+bound, reported beside the observer's mean tick cost. A process shorter than
+one period can be missed; one seen by a single tick has no lifetime lower bound
+and is reported by its bracket instead of as zero.
+
+### Stages
+
+Every run's open is cut at ordered milestones, in the order the owner performs
+them: the start; the progress line; the owner seen; on a first launch the
+install stage appearing, `dolt version` starting and exiting, the engine
+activated and the install stage removed, then the store stage directory
+appearing and, for each of the three staging engines (initialize, migrate,
+validate), its supervisor starting, the engine starting and exiting and the
+supervisor exiting; the active store appearing (the rename); the active
+supervisor and engine starting; the active store's `endpoint.json`; the owner's
+service endpoint; and ready. A binary with open markers adds `open start`
+after the start. A cold open shows the probe and the active part only; a
+`new-project` open shows the owner, the probe, the store stage and its three
+staging engines and the active part, without the install stage; and a warm
+reopen that attaches shows the progress line (or, with markers, the open
+start) and ready only.
+
+The stages are the differences between consecutive milestones a run showed, so
+they partition the open: per run they sum to its time to ready. A
+milestone a run did not show merges its two neighbours into one stage named
+after both ends. Each sampled milestone is stamped at the end of the tick that
+first showed it, so a stage between two sampled milestones is off by less than
+the recorded bracket either way; each stage keeps its bounds, and a small
+negative stage means two milestones fell within one bracket, seen in the other
+order. A derived stage whose value is below minus its recorded bracket is not
+an interval reversed by sampling noise: it means the fixed milestone order this
+harness assumes is wrong on that OS, and any total containing that stage is
+mis-attributed. Spans that contain several stages are reported separately as totals,
+each with the milestones it passes through: engine provisioning (the install
+stage's lifetime), staged store creation, each staging supervisor's lifetime,
+the active open (active supervisor to service endpoint) and the owner's whole
+open. Totals are not additive with the partition.
+
+Work inside one span cannot be separated from outside: extraction, hashing and
+the probe copy (before `dolt version` starts); an engine's startup against its
+served work, individual migration steps, branch classification, session-end
+waits and the stage's `ready.json`, all inside the staging engines' lifetimes;
+TCP readiness and bootstrap SQL inside an engine's spawn to its endpoint; and
+active validation, candidate recovery and the usage ledger inside the active
+engine's endpoint to the service endpoint. Diagnostics rows carry no timestamp,
+and the owner records none, so tracing cannot split them either.
+
+### Census, calibration and modes
+
+Before and after each run the harness takes a census: this user's Kuru and Dolt
+processes anywhere on the host, by image name and role (never a command line),
+split into those from the scratch root and any others; the open file descriptor
+count and listening TCP ports of the processes from the scratch root (from
+`/proc` on Linux and `lsof` on macOS, recorded as unavailable if the query
+fails); and the `*.staging-*` and `interrupted` directories under the scratch
+data directories. Each record also keeps the retirement wait after it and the
+part of that wait until the owner process was gone. It records the load average
+before and after and a calibration probe: SHA-256 over 256 MiB repeated five times (the
+median is kept) and a 64 MiB write, fsync and read in the scratch root. Use the
+`open / CPU probe` ratio to compare runs of one runner label, such as a pull
+request's head against its base, not runners of different kinds.
+
+`KURU_OPEN_TIME_FILES=off` runs the control series: processes only.
+`KURU_OPEN_TIME_RETIRE_WAIT=off` runs the ramp: consecutive iterations start
+while earlier owners are still inside their idle window, so owners accumulate
+and the census shows it; there, the cold-existing case attaches to the owner
+the first launch just started, which its owner path reports. The iteration
+directories are kept until one final retirement wait after the last run.
+`KURU_OPEN_TIME_INTERVAL_MS` sets the sampling period.
+
+A failed open is a run with no readiness signal (neither a `ready` marker nor
+`Memory: ready.`); a command that fails after that line is counted separately.
+Both are results, recorded with the exit status and first error line. Only an infrastructure failure, such as a process that has not
+retired after 120 s (polled every 100 ms), stops the series with a non-zero
+exit, and that process is never killed. The sampling period and the retirement
+poll belong to this unshipped measurement tool; they are stated in every summary
+and are not waits in product or test code.
+
+To read the output, open the job summary. For each series it has the partition
+of the open per case (n, median, minimum, maximum and spread of each stage), the
+totals with the milestones they pass through, other times (exit, lifetimes,
+probes, the recorded bracket), every open sample in run order, and per-case
+engine starts, owner path, load and census. Download the
+`ci-open-time-ubuntu-latest-attempt-<n>` artifact for each series' `records.jsonl`, one
+`kuru.open-time.v3` JSON object per run, and `summary.md`. Version 3 added the
+`new-project` case, `stages.ready_signal` and `stages.markers`, and names the
+final milestone `ready` for either signal. Records hold no path, credential or
+memory content.
+
+### Which builds have recorded a readiness failure
+
+`packaged_install_and_update_preserve_complete_offline_memory` in
+`apps/kuru-tui/tests/embedded_runtime.rs` packages and runs
+`KURU_EMBEDDED_TEST_BINARY` when set, and otherwise Cargo's own `kuru` for the
+test (`CARGO_BIN_EXE_kuru`). The coverage partitions run `cargo test` without
+`--release` and do not set that variable, so there the test runs the
+instrumented test-profile (unoptimized) build, copied privately because
+`LLVM_PROFILE_FILE` is set. In `ci.yml`, only each installation job's `Verify
+installed offline runtime` step and the Linux arm64 `native-build` job run it
+against a release build; `release.yml`
+runs it against its release and staged binaries. A readiness
+deadline in a coverage partition is therefore a result for a debug build, not
+a release one.
+
+This CI job only runs on ubuntu-latest; to measure open time on any other
+developer machine (macOS included), run the harness locally with the same
+task, against a release build:
+
+```sh
+mise run build:release
+KURU_OPEN_TIME_BINARY="$PWD/target/release/kuru" \
+KURU_OPEN_TIME_OUTPUT="$(mktemp -d)/open-time" \
+  mise run //packages/kuru-delivery:measure:open-time
+```
+
+`KURU_OPEN_TIME_ITERATIONS`, `KURU_OPEN_TIME_SCRATCH` (the parent of the
+private scratch root), `KURU_OPEN_TIME_LABEL` and the mode variables above are
+optional. A busy machine distorts the numbers; the recorded load shows by how
+much.
+
+Phase 2 turns this job into the budget check by adding a comparison step after
+the measurement: probe-normalised medians of the pull request's head against
+its base, and an absolute ceiling well under `startup_timeout_secs`, using
+margins taken from the spread this job has recorded. Only then does it
+drop `continue-on-error` and join `ci-gate`'s needs. Until then, nothing reads
+these numbers automatically.
 
 ## Shared build cache
 
