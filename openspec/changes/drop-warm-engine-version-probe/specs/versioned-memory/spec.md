@@ -16,4 +16,4 @@ Kuru SHALL use pinned full Dolt for live memory and include the verified officia
 
 #### Scenario: Observed startup
 - **WHEN** an application requests an observed memory open
-- **THEN** it receives fixed stages only where project ownership, managed cache verification or extraction, install-time version probing, database preparation or opening actually begins, and receives ready only with a usable returned store.
+- **THEN** it receives fixed stages only where project ownership, managed cache verification or extraction, version probing of a freshly extracted engine or an explicit `dolt_binary`, database preparation or opening actually begins, and receives ready only with a usable returned store.

@@ -61,8 +61,10 @@ None.
 ## Impact
 
 - `packages/kuru-memory/src/provision.rs`: remove `CheckedCache::probe` and its warm-path call
-  site (`verified_cache_observed`); cold-path probing (`provision_with_extractor_observed`, the
-  cold `CheckingRuntimeVersion` report, and the cold-path probe struct/function) is untouched.
+  site (formerly `verified_cache_observed`, now the progress-free `verified_cache`, with
+  `verify_existing_cache` losing its unused `progress` argument); cold-path probing
+  (`provision_with_extractor_observed`, the cold `CheckingRuntimeVersion` report, and the
+  cold-path probe struct/function) and the explicit `dolt_binary` probe are untouched.
 - `packages/kuru-memory/src/provision/tests.rs`: the warm-stage assertion in
   `observed_provision_reports_actual_cold_warm_and_failure_stages` changes from
   `[VerifyingRuntimeCache, CheckingRuntimeVersion]` to `[VerifyingRuntimeCache]`; corruption tests
