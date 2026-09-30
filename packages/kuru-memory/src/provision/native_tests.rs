@@ -254,10 +254,12 @@ fn leftover_stage_receipts(receipts: &Path) -> Vec<PathBuf> {
 }
 
 /// Bound both the removal retry below and the post-removal absence wait: the
-/// fixture deletes a cache binary the warm probes just executed, so Windows
-/// may refuse the delete-capable open, refuse the disposition itself, or
-/// leave the name delete-pending after a reported-successful removal while
-/// that image section is torn down. One window covers all three.
+/// fixture deletes a freshly installed executable image that another handle
+/// may still hold, so Windows may refuse the delete-capable open, refuse the
+/// disposition itself, or leave the name delete-pending after a
+/// reported-successful removal while that handle is released. Warm opens do
+/// not execute the cached binary; the bounded retry covers any other transient
+/// holder. One window covers all three.
 const FIXTURE_CLEANUP_RETRY_LIMIT: Duration = Duration::from_secs(2);
 const FIXTURE_CLEANUP_RETRY_SPACING: Duration = Duration::from_millis(20);
 
@@ -267,7 +269,7 @@ fn remove_fixture_binary(binary: &Path, expected: kuru_platform::fs::FileIdentit
     loop {
         let (parent, file) = match files::read(binary, Privacy::OwnerOnly) {
             Ok(held) => held,
-            // A just-executed Windows image can temporarily deny even the
+            // A recently opened Windows image can temporarily deny even the
             // checked read open before we reach the removal syscall. Retry
             // only these native sharing/access denials, within the same
             // deadline as removal and namespace-disappearance observation.
@@ -305,9 +307,9 @@ fn remove_fixture_binary(binary: &Path, expected: kuru_platform::fs::FileIdentit
         );
         match parent.remove_file(files::name(binary)?, file) {
             Ok(()) => return wait_for_fixture_binary_absence(binary, &mut retry_deadline),
-            // The fixture deletes a cache binary the warm probes just executed,
-            // so Windows may refuse either the delete-capable open or the
-            // disposition itself while that image section is torn down.
+            // The fixture deletes a freshly installed executable image, so
+            // Windows may refuse either the delete-capable open or the
+            // disposition itself while another handle to it is released.
             Err(error)
                 if matches!(
                     std::error::Error::source(&error)
@@ -335,7 +337,7 @@ fn remove_fixture_binary(binary: &Path, expected: kuru_platform::fs::FileIdentit
 }
 
 /// A reported-successful removal can still leave the name delete-pending: the
-/// just-executed image is torn down asynchronously, and Windows refuses a
+/// last handle to the image is released asynchronously, and Windows refuses a
 /// later create at the same name (native error 5) until the pending delete
 /// completes. Wait for the name to become genuinely absent — confirmed only
 /// by `NotFound`, never inferred from a successful or a still-denied query —
@@ -1584,7 +1586,7 @@ async fn actual_warm_cache_verifies_concurrently_while_installation_lock_is_held
     assert_eq!(concurrent.0.unwrap(), binary);
     assert_eq!(concurrent.1.unwrap(), binary);
     eprintln!(
-        "observed actual managed provisioning: cold={cold_elapsed:?}; two concurrent warm opens={warm_elapsed:?}; full payload digests and version probes retained"
+        "observed actual managed provisioning: cold={cold_elapsed:?}; two concurrent warm opens={warm_elapsed:?}; warm opens verify full payload digests and launch no version probe"
     );
     drop(lock);
 

@@ -95,10 +95,15 @@ Every Kuru executable includes the pinned native Dolt archive and its license
 notices. First memory use verifies and extracts those bytes locally; it needs no
 network, compiler or separate engine installation. The cache is `tools/dolt`
 inside the Kuru data directory; `memory.cache_dir` selects another location.
-Subsequent runs read every cached engine and license byte for its pinned digest,
-revalidate the checked names and identities, run the exact-version probe and then
-reuse the engine. Independent warm opens perform those checks concurrently; the
-exclusive installation lock is reserved for missing-cache extraction and atomic
+Installation runs the freshly extracted engine once to confirm its exact version
+before activating it. Subsequent runs read every cached engine and license byte
+for its pinned digest, revalidate the checked names and identities and then
+reuse the engine without running it again to check its version: the cache
+directory is named for that pinned version, so a matching digest identifies the
+engine installation already checked. An intact cached engine that nonetheless
+cannot run on this system is reported when its database server fails to start.
+Independent warm opens perform those checks concurrently; the exclusive
+installation lock is reserved for missing-cache extraction and atomic
 publication. Corrupt existing caches fail before execution and remain preserved
 for inspection.
 

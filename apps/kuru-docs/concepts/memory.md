@@ -51,10 +51,13 @@ $XDG_DATA_HOME/kuru/memory/<canonical-project-hash>/
 If `XDG_DATA_HOME` is unset, the data directory is `~/.local/share/kuru` on macOS/Linux or `$env:LOCALAPPDATA\kuru` on Windows, with `$env:USERPROFILE\AppData\Local\kuru` as its Windows fallback. `--data-dir` or `KURU_DATA_DIR` chooses a separate directory. Keep it outside the tool workspace and restrict access as you would any chat history.
 
 Kuru includes its verified native Dolt engine and license notices in the
-executable. First memory use extracts them locally, including when offline. Later
+executable. First memory use extracts them locally, including when offline, and
+runs the new engine once to confirm its exact version before using it. Later
 runs read the complete cached payloads for their pinned digests, revalidate their
-checked names and identities, run the exact-version probe and reuse the cache at
-`tools/dolt` inside the data directory. Independent warm opens verify concurrently;
+checked names and identities and reuse the cache at `tools/dolt` inside the data
+directory without running the engine again for a version check. An intact cached
+engine that cannot run on this system is reported when its database fails to
+start. Independent warm opens verify concurrently;
 the installation lock is reserved for missing-cache extraction and publication.
 No separate engine installation or runtime download is needed. `memory.cache_dir`
 selects another extraction directory. Corrupt existing caches fail before

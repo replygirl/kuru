@@ -34,7 +34,8 @@ const ACTIVATION_RETRY_SPACING: Duration = Duration::from_millis(20);
 
 /// Extract the bundled engine or reuse its verified cache, including offline
 /// first use. An explicit development binary still passes the exact version
-/// guard; managed entries also pass their immutable payload checksums.
+/// guard. Managed entries pass their immutable payload checksums on every open;
+/// their exact version is probed once, before a fresh extraction is activated.
 pub async fn provision(config: &MemoryConfig, default_cache: &Path) -> Result<PathBuf> {
     let mut progress = ProgressReporter::silent();
     provision_observed(config, default_cache, &mut progress).await
@@ -128,7 +129,7 @@ async fn provision_with_extractor_observed(
         // no lock is taken unless a receipt exists, and none is waited for.
         warm_sweep_if_receipted(cache, versions).await;
         progress.report(MemoryOpenStage::VerifyingRuntimeCache);
-        return verify_existing_cache(&destination, asset, progress).await;
+        return verify_existing_cache(&destination, asset).await;
     }
     progress.report(MemoryOpenStage::WaitingForRuntimeCache);
     let lock = cache_lock(&cache, LOCK_TIMEOUT).await?;
@@ -139,7 +140,7 @@ async fn provision_with_extractor_observed(
     if destination_exists(&destination)? {
         drop(lock);
         progress.report(MemoryOpenStage::VerifyingRuntimeCache);
-        return verify_existing_cache(&destination, asset, progress).await;
+        return verify_existing_cache(&destination, asset).await;
     }
     // From here the stage and the lock travel as one lease, so every exit -
     // an error, a cancelled caller or a worker that outlives it - resolves
@@ -386,32 +387,16 @@ fn destination_exists(path: &Path) -> Result<bool> {
     }
 }
 
-async fn verify_existing_cache(
-    destination: &Path,
-    asset: Asset<'_>,
-    progress: &mut ProgressReporter,
-) -> Result<PathBuf> {
-    verified_cache_observed(destination, asset, progress)
-        .await
-        .with_context(|| {
-            format!(
-                "Dolt cache is invalid at {}; preserve or remove that version directory and retry",
-                destination.display()
-            )
-        })
+async fn verify_existing_cache(destination: &Path, asset: Asset<'_>) -> Result<PathBuf> {
+    verified_cache(destination, asset).await.with_context(|| {
+        format!(
+            "Dolt cache is invalid at {}; preserve or remove that version directory and retry",
+            destination.display()
+        )
+    })
 }
 
-#[cfg(all(test, unix))]
 async fn verified_cache(directory: &Path, asset: Asset<'_>) -> Result<PathBuf> {
-    let mut progress = ProgressReporter::silent();
-    verified_cache_observed(directory, asset, &mut progress).await
-}
-
-async fn verified_cache_observed(
-    directory: &Path,
-    asset: Asset<'_>,
-    progress: &mut ProgressReporter,
-) -> Result<PathBuf> {
     let binary = directory.join(asset.executable_name);
     let directory_path = directory.to_owned();
     let executable_name = asset.executable_name.to_owned();
@@ -430,7 +415,12 @@ async fn verified_cache_observed(
             )
         })
         .collect();
-    let checked = tokio::task::spawn_blocking(move || {
+    // The cache directory is keyed by the pinned engine version, and before
+    // activating it the cold path probed a private copy whose full digest
+    // matched this executable's pinned digest. A matching full digest here
+    // therefore identifies the same bytes that probe ran; a warm open launches
+    // no process of its own.
+    tokio::task::spawn_blocking(move || {
         CheckedCache::open_and_verify(
             &directory_path,
             &executable_name,
@@ -442,8 +432,6 @@ async fn verified_cache_observed(
         )
     })
     .await??;
-    progress.report(MemoryOpenStage::CheckingRuntimeVersion);
-    checked.probe(binary.clone()).await?;
     Ok(binary)
 }
 
@@ -513,32 +501,6 @@ impl CheckedCache {
             self.directory.verify(name, file)?;
         }
         Ok(())
-    }
-
-    async fn probe(self, binary: PathBuf) -> Result<()> {
-        let home = PrivateTemp::new("kuru-dolt-version-", None)?;
-        let home_path = home.path().to_owned();
-        let (send, receive) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
-            .name("kuru-dolt-probe".into())
-            .spawn(move || {
-                // Keep the exact verified payload handles and private probe home
-                // until the owned child has been reaped, even if the caller exits.
-                let result = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("create owned Dolt probe executor")
-                    .and_then(|runtime| {
-                        self.revalidate()
-                            .and_then(|()| runtime.block_on(verify_version(&binary, &home_path)))
-                    });
-                let _ = send.send((self, home, result));
-            })
-            .context("start owned Dolt probe thread")?;
-        let (_checked, _home, result) = receive
-            .await
-            .context("owned Dolt probe did not return its result")?;
-        result
     }
 }
 
