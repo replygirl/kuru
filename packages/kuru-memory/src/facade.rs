@@ -6898,7 +6898,10 @@ mod tests {
     // owner started without a starter token: any attachment reaches it, so
     // each retires by itself once its last attachment is released.
 
-    type ServeEvents = tokio::sync::mpsc::UnboundedReceiver<service::ServeEvent>;
+    use crate::test_support::{
+        ServeEvents, expect_events as expect_serve_events,
+        expect_no_event as expect_no_serve_event, next_event as next_serve_event,
+    };
 
     use service::ServeEvent::{AttachmentAccepted, AttachmentJoined, EnteredEmpty};
 
@@ -6933,49 +6936,6 @@ mod tests {
             ..service::ServeKnobs::never_reached()
         };
         (tokio::spawn(owner.serve_with(knobs)), events)
-    }
-
-    async fn next_serve_event(events: &mut ServeEvents) -> Result<service::ServeEvent> {
-        loop {
-            match events
-                .recv()
-                .await
-                .context("the serve loop ended before the expected event")?
-            {
-                service::ServeEvent::LockRechecked => {}
-                event => return Ok(event),
-            }
-        }
-    }
-
-    async fn expect_serve_events(
-        events: &mut ServeEvents,
-        expected: &[service::ServeEvent],
-    ) -> Result<()> {
-        for expected in expected {
-            let event = next_serve_event(events).await?;
-            ensure!(
-                event == *expected,
-                "serve event {event:?}, expected {expected:?}"
-            );
-        }
-        Ok(())
-    }
-
-    /// No event other than a lock recheck has been sent since the last one
-    /// awaited. Every owner event is sent before the loop acts on it, so an
-    /// empty channel after a completed client exchange is a settled log.
-    fn expect_no_serve_event(events: &mut ServeEvents, context: &str) -> Result<()> {
-        loop {
-            match events.try_recv() {
-                Ok(service::ServeEvent::LockRechecked) => {}
-                Ok(event) => bail!("{context}: unexpected serve event {event:?}"),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return Ok(()),
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    bail!("{context}: the serve loop ended")
-                }
-            }
-        }
     }
 
     /// Await the owner's retirement after its last attachment: every event

@@ -2273,6 +2273,7 @@ pub fn is_peer_closed(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{await_owner_release, expect_events, next_event, observed};
     use std::io::{Seek, SeekFrom, Write};
     use tokio::io::duplex;
 
@@ -6291,52 +6292,6 @@ mod tests {
         Ok((project, scope, data, options))
     }
 
-    /// Serve-loop knobs with an ordered observer.
-    fn observed(
-        admission: Admission,
-        first_attachment: Option<Duration>,
-    ) -> (ServeKnobs, tokio::sync::mpsc::UnboundedReceiver<ServeEvent>) {
-        let (observer, events) = tokio::sync::mpsc::unbounded_channel();
-        let knobs = ServeKnobs {
-            admission,
-            first_attachment,
-            observer: Some(observer),
-            ..ServeKnobs::never_reached()
-        };
-        (knobs, events)
-    }
-
-    /// The next serve event other than a lock recheck. A closed channel means
-    /// the serve loop has ended.
-    async fn next_event(
-        events: &mut tokio::sync::mpsc::UnboundedReceiver<ServeEvent>,
-    ) -> Result<ServeEvent> {
-        loop {
-            match events
-                .recv()
-                .await
-                .context("the serve loop ended before the expected event")?
-            {
-                ServeEvent::LockRechecked => {}
-                event => return Ok(event),
-            }
-        }
-    }
-
-    async fn expect_events(
-        events: &mut tokio::sync::mpsc::UnboundedReceiver<ServeEvent>,
-        expected: &[ServeEvent],
-    ) -> Result<()> {
-        for expected in expected {
-            let event = next_event(events).await?;
-            ensure!(
-                event == *expected,
-                "serve event {event:?}, expected {expected:?}"
-            );
-        }
-        Ok(())
-    }
-
     /// An authenticated bare attachment to the published owner, presenting
     /// `starter_token` when given.
     async fn attach_raw(
@@ -6357,15 +6312,6 @@ mod tests {
     ) -> Result<()> {
         let request = rpc::ServiceRequest::new(&authority.service_generation, call);
         write_frame(stream, &request, 1024 * 1024, HANDSHAKE_TIMEOUT).await
-    }
-
-    async fn await_owner_release(options: &crate::store::OpenOptions) -> Result<()> {
-        ServiceLock::await_release(
-            &options.data_dir,
-            &options.project_scope,
-            ServiceLockKind::Owner,
-        )
-        .await
     }
 
     /// Probe the owner lock, releasing it at once when free.
