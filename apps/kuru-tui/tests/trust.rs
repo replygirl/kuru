@@ -1483,9 +1483,12 @@ async fn reached_undo_uses_only_approved_memory_authority_and_no_provider_route(
     assert_eq!(http.requests(), 0, "approved undo contacted the provider");
     assert!(!sandbox.data.join("trust").exists());
 
-    // The approved CLI command owns the intentionally warm managed service.
-    // This final phase only inspects its committed result; a direct writable
-    // reopen would compete with that owner instead of testing the CLI state.
+    // The approved CLI command's managed service retires as soon as that
+    // command exits. Await its exit, so no service is running or closing, and
+    // inspect the committed result with a read-only open: it attaches to no
+    // service and opens the store locally. A direct writable reopen would
+    // instead start a service of this fixture's own.
+    tokio::task::block_in_place(|| memory::await_owner_exit(&options)).unwrap();
     let mut observed_options = options;
     observed_options.read_only = true;
     let project = sandbox.project.canonicalize().unwrap();
@@ -1495,6 +1498,10 @@ async fn reached_undo_uses_only_approved_memory_authority_and_no_provider_route(
         PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
     );
     let memory = opening.await.unwrap();
+    assert!(
+        format!("{memory:?}").contains(r#"backend: "local""#),
+        "the read-only inspection attached to a service instead of opening the store locally: {memory:?}"
+    );
     assert_ne!(memory.revision().await.unwrap(), before_revision);
     assert_eq!(
         memory.get(&format!("{scope}/sessions")).await.unwrap(),

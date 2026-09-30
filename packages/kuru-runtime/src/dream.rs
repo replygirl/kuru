@@ -1105,7 +1105,7 @@ mod cancellation_tests {
             observer.close().await?;
             sibling.close().await?;
             memory.close().await?;
-            // The managed owner outlives its last client by its idle grace;
+            // The managed owner may still be closing after its last client;
             // release `data` only after that owner has reaped its Dolt.
             kuru_memory::test_support::await_managed_quiescence(&options).await?;
             }
