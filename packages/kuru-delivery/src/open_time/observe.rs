@@ -6,14 +6,21 @@
 //! directory handle for the length of one listing, and on Windows an open
 //! handle inside a directory's tree can make renaming or removing that
 //! directory fail. So the observer never enters an engine install stage
-//! (`.install-*`), a store staging directory (`*.staging-*`) or `interrupted`,
-//! the directories the product renames or removes during an open: their
-//! appearance and disappearance are timed from the parent listing only. Each
-//! listing's names are collected and its handle closed before any child is
-//! listed, and Dolt's chunk store, statistics and temporary directories are
-//! skipped. The directories still listed (`cache`, a version directory, the
-//! activated engine directory, `data`, `data/memory`, the active store,
-//! `services`, `locks`) are not renamed or removed by a successful open.
+//! (`.install-*`), a store staging directory (`*.staging-*`), `interrupted`,
+//! or a template cache's private build and capture stages
+//! (`cache/<version>/templates/.build-*` and `.stage-*`), the directories the
+//! product renames or removes during an open: their appearance and
+//! disappearance are timed from the parent listing only. Each listing's names
+//! are collected and its handle closed before any child is listed, and Dolt's
+//! chunk store, statistics and temporary directories are skipped. The
+//! directories still listed (`cache`, a version directory, the activated
+//! engine directory, `data`, `data/memory`, the active store, `services`,
+//! `locks`) are not renamed or removed by a successful open.
+//!
+//! Names carry no project hash: every 64-hex project hash reads `<project>`,
+//! except the hashes of projects that existed before a run that creates a
+//! different one (the `new-project` case), which read `<prior-project>`, so
+//! the new project's store is seen appearing.
 //!
 //! Sampling has a fixed period: the sampler thread sleeps for the rest of each
 //! interval. Every tick stamps its start, before the process listing, and its
@@ -58,6 +65,66 @@ const DEPTH: usize = 4;
 /// interrupted stages. The product renames or removes these during an open.
 pub fn unentered(name: &str) -> bool {
     name.starts_with(".install-") || name.contains(".staging-") || name == "interrupted"
+}
+
+/// A template cache's private build store or capture stage: a `.build-*` or
+/// `.stage-*` directory whose parent is `templates` under the engine cache
+/// (the `cache/` key prefix). The product renames and removes these while it
+/// builds a template. The same names anywhere else are ordinary directories.
+pub fn template_work(raw: &str) -> bool {
+    let mut segments = raw.rsplit('/');
+    let (Some(name), Some(parent)) = (segments.next(), segments.next()) else {
+        return false;
+    };
+    raw.starts_with("cache/")
+        && parent == "templates"
+        && (name.starts_with(".build-") || name.starts_with(".stage-"))
+}
+
+/// The token for the hash of a project that existed before the run.
+pub const PRIOR_PROJECT: &str = "<prior-project>";
+
+/// The observation key of a root-relative name: each segment beginning with
+/// one of the `prior` project hashes has it replaced by [`PRIOR_PROJECT`],
+/// and the result is [`normalize`]d.
+pub fn key(raw: &str, prior: &[String]) -> String {
+    if prior.is_empty() {
+        return normalize(raw);
+    }
+    let rewritten: Vec<String> = raw
+        .split('/')
+        .map(|segment| {
+            prior
+                .iter()
+                .find_map(|hash| segment.strip_prefix(hash.as_str()))
+                .map_or_else(
+                    || segment.to_owned(),
+                    |rest| format!("{PRIOR_PROJECT}{rest}"),
+                )
+        })
+        .collect();
+    normalize(&rewritten.join("/"))
+}
+
+/// The project hashes of the stores in `memory` (a `data/memory` directory):
+/// the 64-hex prefix of each name that has one, without duplicates.
+pub fn project_hashes(memory: &Path) -> Vec<String> {
+    let names: Vec<String> = match std::fs::read_dir(memory) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    let mut hashes: Vec<String> = names
+        .iter()
+        .filter_map(|name| name.get(..64))
+        .filter(|prefix| prefix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_owned)
+        .collect();
+    hashes.sort();
+    hashes.dedup();
+    hashes
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -131,11 +198,23 @@ impl Store {
 /// A root-relative name with its run-specific parts replaced, so one key
 /// names the same thing in every run: a 64-hex project hash, a UUID (stage
 /// directories, staged records, retired endpoints), an install directory's
-/// random suffix and a numeric temporary suffix.
+/// random suffix, a template build or capture stage's key and suffix, and a
+/// numeric temporary suffix.
 pub fn normalize(relative: &str) -> String {
+    let cache = relative.starts_with("cache/");
+    let mut parent = "";
     relative
         .split('/')
         .map(|segment| {
+            let in_templates = cache && parent == "templates";
+            parent = segment;
+            if in_templates {
+                for stage in [".build-", ".stage-"] {
+                    if segment.starts_with(stage) && segment.len() > stage.len() {
+                        return format!("{stage}<tmp>");
+                    }
+                }
+            }
             let (hash, rest) = match segment.get(..64) {
                 Some(prefix) if prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
                     ("<project>", &segment[64..])
@@ -510,17 +589,20 @@ pub struct Observer {
 
 impl Observer {
     /// `watched` maps a key prefix (`data`, `cache`) to its directory; an
-    /// empty list is the control mode, which lists no files.
+    /// empty list is the control mode, which lists no files. Names beginning
+    /// with a `prior` project hash read [`PRIOR_PROJECT`].
     pub fn start(
         root: &Path,
         watched: Vec<(&'static str, PathBuf)>,
+        prior: Vec<String>,
         epoch: Instant,
         interval: Duration,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let root = root.to_owned();
-        let handle = std::thread::spawn(move || sample(&root, &watched, epoch, interval, &flag));
+        let handle =
+            std::thread::spawn(move || sample(&root, &watched, &prior, epoch, interval, &flag));
         Self { stop, handle }
     }
 
@@ -533,6 +615,7 @@ impl Observer {
 fn sample(
     root: &Path,
     watched: &[(&'static str, PathBuf)],
+    prior: &[String],
     epoch: Instant,
     interval: Duration,
     stop: &AtomicBool,
@@ -559,7 +642,7 @@ fn sample(
             .collect();
         let mut present = HashSet::new();
         for (prefix, directory) in watched {
-            walk(directory, prefix, 0, &mut present);
+            walk(directory, prefix, 0, prior, &mut present);
         }
         // Stamped after both listings, so a first sighting's time is an
         // upper bound on when the process or name appeared.
@@ -663,11 +746,18 @@ fn sample(
     observation
 }
 
-/// List `directory` and record every normalised name under `prefix`. The
-/// listing's names are collected and its enumeration handle closed before
-/// any child directory is listed; an [`unentered`] directory is recorded
-/// but never listed.
-pub fn walk(directory: &Path, prefix: &str, depth: usize, present: &mut HashSet<String>) {
+/// List `directory` and record every name under `prefix` by its [`key`],
+/// with the `prior` project hashes. The listing's names are collected and its
+/// enumeration handle closed before any child directory is listed; an
+/// [`unentered`] directory or a [`template_work`] directory is recorded but
+/// never listed.
+pub fn walk(
+    directory: &Path,
+    prefix: &str,
+    depth: usize,
+    prior: &[String],
+    present: &mut HashSet<String>,
+) {
     if depth > DEPTH {
         return;
     }
@@ -692,9 +782,9 @@ pub fn walk(directory: &Path, prefix: &str, depth: usize, present: &mut HashSet<
             continue;
         }
         let raw = format!("{prefix}/{name}");
-        present.insert(normalize(&raw));
-        if is_directory && !unentered(&name) {
-            walk(&path, &raw, depth + 1, present);
+        present.insert(key(&raw, prior));
+        if is_directory && !unentered(&name) && !template_work(&raw) {
+            walk(&path, &raw, depth + 1, prior, present);
         }
     }
 }

@@ -34,7 +34,7 @@ async fn every_run_of_a_live_command_is_recorded_and_summarised() {
     let report = open_time::run(&options(root.path(), 2, "measure"))
         .await
         .unwrap();
-    assert_eq!((report.records, report.failed_opens), (6, 0));
+    assert_eq!((report.records, report.failed_opens), (8, 0));
     let records = records(root.path());
     let cases: Vec<&str> = records
         .iter()
@@ -46,13 +46,18 @@ async fn every_run_of_a_live_command_is_recorded_and_summarised() {
             "first-launch",
             "cold-existing",
             "warm-reopen",
+            "new-project",
             "first-launch",
             "cold-existing",
-            "warm-reopen"
+            "warm-reopen",
+            "new-project"
         ]
     );
     for record in &records {
-        assert_eq!(record["schema"], "kuru.open-time.v2");
+        assert_eq!(record["schema"], "kuru.open-time.v3");
+        // The fixture writes both signals when KURU_OPEN_MARKERS=1 reaches
+        // it through the cleared environment; the marker ends the open.
+        assert_eq!(record["stages"]["ready_signal"], "marker", "{record}");
         assert_eq!(record["binary"]["version"], "native fixture 0.2.0");
         assert_eq!(record["outcome"]["success"], true);
         assert_eq!(record["outcome"]["json_stdout"], true);
@@ -86,18 +91,44 @@ async fn every_run_of_a_live_command_is_recorded_and_summarised() {
             .map(|stage| stage["ms"].as_f64().unwrap())
             .sum();
         assert!((sum - ready).abs() < 0.05, "{record}");
-        // Only progress lines are kept, never paths or other output.
+        // Only progress lines and markers are kept, never paths or other
+        // output.
         for line in record["stderr"].as_array().unwrap() {
-            assert!(line["text"].as_str().unwrap().starts_with("Memory: "));
+            let text = line["text"].as_str().unwrap();
+            assert!(
+                text.starts_with("Memory: ") || text.starts_with("kuru-open-marker v1 "),
+                "{text}"
+            );
         }
         let text = record.to_string();
         assert!(!text.contains(&*root.path().to_string_lossy()), "{text}");
     }
-    // The first two runs of an iteration wait for retirement; the warm
-    // reopen runs inside the previous run's window.
+    // The first launch, the warm reopen and the new project wait for
+    // retirement; the cold open runs right after the first launch's wait,
+    // and the warm reopen inside the cold open's window.
     assert!(records[0]["retire_wait_ms"].is_number());
     assert!(records[1]["retire_wait_ms"].is_null());
     assert!(records[2]["retire_wait_ms"].is_number());
+    assert!(records[3]["retire_wait_ms"].is_number());
+    // The new project is a different project in the same data directory:
+    // the first project's store is named apart from the first tick on, and
+    // the new one is seen under `<project>`.
+    for record in [&records[3], &records[7]] {
+        let files = record["observation"]["files"].as_array().unwrap();
+        let named = |key: &str| files.iter().find(|file| file["key"] == key);
+        let prior = named("data/memory/<prior-project>").expect("prior project store");
+        assert!(prior["absent_at_ms"].is_null(), "{record}");
+        assert!(named("data/memory/<project>").is_some(), "{record}");
+    }
+    for record in [&records[1], &records[2]] {
+        let files = record["observation"]["files"].as_array().unwrap();
+        assert!(
+            files
+                .iter()
+                .all(|file| !file["key"].as_str().unwrap().contains("<prior-project>")),
+            "{record}"
+        );
+    }
     assert!(records[0]["owner_retired_ms"].is_number());
     assert_eq!(report.final_retire_wait_ms, None);
     assert!(records[1]["gap_since_previous_ms"].is_number());
@@ -105,7 +136,7 @@ async fn every_run_of_a_live_command_is_recorded_and_summarised() {
     assert_eq!(summary, report.summary);
     assert!(summary.contains("report only"), "{summary}");
     assert!(
-        summary.contains("| warm-reopen | open (to `Memory: ready.`) | 2 |"),
+        summary.contains("| warm-reopen | open (to ready) | 2 |"),
         "{summary}"
     );
     // The scratch root and every iteration directory are removed.
@@ -121,17 +152,19 @@ async fn a_failed_open_is_a_result_and_the_series_completes() {
     let report = open_time::run(&options(root.path(), 1, "fail"))
         .await
         .unwrap();
-    assert_eq!((report.records, report.failed_opens), (3, 3));
+    assert_eq!((report.records, report.failed_opens), (4, 4));
     for record in records(root.path()) {
         assert_eq!(record["outcome"]["success"], false);
         assert_eq!(record["outcome"]["exit_code"], 1);
+        // The markers before the error are progress, never the error line.
         assert_eq!(
             record["outcome"]["error"],
             "Error: memory service readiness deadline exceeded"
         );
         assert!(record["stages"]["ready_ms"].is_null());
+        assert!(record["stages"]["ready_signal"].is_null());
     }
-    assert!(report.summary.contains("3 of 3 runs failed to open"));
+    assert!(report.summary.contains("4 of 4 runs failed to open"));
 }
 
 #[tokio::test]
@@ -231,7 +264,7 @@ async fn the_control_series_lists_no_files_and_the_ramp_waits_once() {
     control.files = false;
     control.interval = Duration::from_millis(200);
     let report = open_time::run(&control).await.unwrap();
-    assert_eq!((report.records, report.failed_opens), (3, 0));
+    assert_eq!((report.records, report.failed_opens), (4, 0));
     for record in records(root.path()) {
         assert_eq!(record["observation"]["files_observed"], false);
         assert_eq!(record["observation"]["files"], serde_json::json!([]));
@@ -253,7 +286,7 @@ async fn the_control_series_lists_no_files_and_the_ramp_waits_once() {
     let mut ramp = options(ramp_root.path(), 2, "measure");
     ramp.retire_wait = false;
     let report = open_time::run(&ramp).await.unwrap();
-    assert_eq!((report.records, report.failed_opens), (6, 0));
+    assert_eq!((report.records, report.failed_opens), (8, 0));
     for record in records(ramp_root.path()) {
         assert!(record["retire_wait_ms"].is_null(), "{record}");
         assert_eq!(record["mode"]["retire_wait"], false);
@@ -274,4 +307,84 @@ async fn the_control_series_lists_no_files_and_the_ramp_waits_once() {
             .count(),
         0
     );
+}
+
+/// A binary from before the marker change (legacy lines only), one from after
+/// it (markers and the plain sentence, no `Memory: ` lines), and one of each
+/// whose open fails: each run records which signal ended its open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn either_readiness_signal_ends_the_open_and_the_record_names_it() {
+    for (prompt, signal, failed) in [
+        ("legacy", Some("legacy"), 0),
+        ("markers", Some("marker"), 0),
+        ("markers-fail", None, 4),
+        ("legacy-fail", None, 4),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let report = open_time::run(&options(root.path(), 1, prompt))
+            .await
+            .unwrap();
+        assert_eq!(
+            (report.records, report.failed_opens),
+            (4, failed),
+            "{prompt}"
+        );
+        for record in records(root.path()) {
+            let texts: Vec<&str> = record["stderr"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|line| line["text"].as_str().unwrap())
+                .collect();
+            let markers = texts
+                .iter()
+                .filter(|text| text.starts_with("kuru-open-marker v1 "))
+                .count();
+            let legacy = texts
+                .iter()
+                .filter(|text| text.starts_with("Memory: "))
+                .count();
+            match signal {
+                Some(signal) => {
+                    assert_eq!(record["stages"]["ready_signal"], signal, "{record}");
+                    let ready = record["stages"]["ready_ms"].as_f64().unwrap();
+                    let last = record["stages"]["milestones"]
+                        .as_array()
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .clone();
+                    assert_eq!(last["name"], "ready", "{record}");
+                    assert_eq!(last["at_ms"].as_f64().unwrap(), ready, "{record}");
+                    assert_eq!(record["outcome"]["success"], true);
+                }
+                None => {
+                    assert!(record["stages"]["ready_signal"].is_null(), "{record}");
+                    assert!(record["stages"]["ready_ms"].is_null(), "{record}");
+                    assert_eq!(
+                        record["outcome"]["error"],
+                        "Error: memory service readiness deadline exceeded",
+                        "{record}"
+                    );
+                }
+            }
+            if prompt.starts_with("markers") {
+                assert_eq!(legacy, 0, "{record}");
+                assert!(markers >= 2, "{record}");
+                // The plain sentence at open start is kept as progress.
+                assert!(
+                    texts.contains(&"Opening this project's memory…"),
+                    "{record}"
+                );
+                assert_eq!(
+                    record["stages"]["markers"][0]["event"], "open-start",
+                    "{record}"
+                );
+                assert!(record["stages"]["markers"][0]["monotonic_ns"].is_u64());
+            } else {
+                assert_eq!(markers, 0, "{record}");
+                assert!(legacy >= 1, "{record}");
+            }
+        }
+    }
 }

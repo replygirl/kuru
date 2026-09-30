@@ -2,9 +2,12 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::census::{self, parse_lsof, parse_netstat, parse_proc_net_tcp, socket_inode};
 use super::observe::{
-    FileSpan, Observation, ProcessSpan, Role, Seen, Store, classify, normalize, unentered, walk,
+    FileSpan, Observation, PRIOR_PROJECT, ProcessSpan, Role, Seen, Store, classify, key, normalize,
+    project_hashes, template_work, unentered, walk,
 };
-use super::report::{Counts, Derived, OwnerPath, derive, stats, summary};
+use super::report::{
+    Counts, Derived, OwnerPath, Signal, derive, is_progress, kept_line, stats, summary,
+};
 use super::{Case, Line, Record};
 
 fn args(values: &[&str]) -> Vec<String> {
@@ -264,7 +267,7 @@ fn a_first_launch_is_partitioned_at_each_observed_milestone() {
             "active engine started",
             "active engine endpoint",
             "service endpoint",
-            "`Memory: ready.`",
+            "ready",
         ]
     );
     let stage = |name: &str| {
@@ -292,10 +295,7 @@ fn a_first_launch_is_partitioned_at_each_observed_milestone() {
         stage("staging supervisor 3 exited → active store appeared"),
         Some((200.0, 190.0, 220.0))
     );
-    assert_eq!(
-        stage("service endpoint → `Memory: ready.`"),
-        Some((40.0, 40.0, 50.0))
-    );
+    assert_eq!(stage("service endpoint → ready"), Some((40.0, 40.0, 50.0)));
     let total = |name: &str| {
         stages
             .totals
@@ -328,6 +328,8 @@ fn a_first_launch_is_partitioned_at_each_observed_milestone() {
         }
     );
     assert_eq!(derived.path, OwnerPath::SpawnedOwner);
+    assert_eq!(stages.ready_signal, Some(Signal::Legacy));
+    assert!(stages.markers.is_empty());
 }
 
 #[test]
@@ -389,7 +391,8 @@ fn a_single_sighting_has_no_lower_bound_and_a_bracketed_upper_bound() {
 
 /// Real observations from the local smoke run of the release binary at
 /// a8ce468b (the first iteration of the main series and the control's first
-/// launch), trimmed to what [`derive`] reads.
+/// launch) and, for `new-project`, the first iteration of the smoke run at
+/// b3ca1d02's product code, trimmed to what [`derive`] reads.
 #[test]
 fn recorded_observations_are_partitioned_exactly() {
     #[derive(serde::Deserialize)]
@@ -433,10 +436,26 @@ fn recorded_observations_are_partitioned_exactly() {
                 );
             }
             "warm-reopen" => assert_eq!(derived.path, OwnerPath::Attached),
-            _ => assert_eq!(derived.counts.engine_starts, 1, "{}", run.case),
+            "new-project" => {
+                // A new project with a warm engine cache: the three staging
+                // engines and the active one, and no install stage.
+                assert_eq!(derived.counts.engine_starts, 4, "{}", run.case);
+                assert_eq!(derived.counts.staging_engine_starts, 3, "{}", run.case);
+                let names: Vec<&str> = derived
+                    .stages
+                    .milestones
+                    .iter()
+                    .map(|milestone| milestone.name.as_str())
+                    .collect();
+                assert!(names.contains(&"active store appeared"), "{names:?}");
+                assert!(!names.contains(&"install stage appeared"), "{names:?}");
+                assert_eq!(derived.path, OwnerPath::SpawnedOwner);
+            }
+            "cold-existing" => assert_eq!(derived.counts.engine_starts, 1, "{}", run.case),
+            other => panic!("unexpected recorded case {other}"),
         }
     }
-    assert_eq!(cases.len(), 3);
+    assert_eq!(cases.len(), 4);
 }
 
 #[test]
@@ -468,7 +487,7 @@ fn a_warm_reopen_that_finds_its_owner_is_an_attach() {
         .collect();
     // No owner started, and an endpoint present before the run is not a
     // publication in this run.
-    assert_eq!(names, ["start", "progress line", "`Memory: ready.`"]);
+    assert_eq!(names, ["start", "progress line", "ready"]);
     assert_eq!(derived.stages.ready_ms, Some(140.0));
     assert_partitions(&derived);
 }
@@ -485,6 +504,7 @@ fn a_failed_open_keeps_its_partial_stages_and_no_ready_time() {
     let derived = derive(&Observation::default(), &lines, Some(30_410.0));
     assert_eq!(derived.stages.ready_ms, None);
     assert_eq!(derived.stages.turn_and_exit_ms, None);
+    assert_eq!(derived.stages.ready_signal, None);
     assert_eq!(derived.stages.cli_preamble_ms, Some(80.0));
     assert_eq!(derived.path, OwnerPath::NoOwnerObserved);
     // The partial partition ends at the last milestone the run showed.
@@ -494,6 +514,7 @@ fn a_failed_open_keeps_its_partial_stages_and_no_ready_time() {
 fn record(case: Case, iteration: usize, ready: Option<f64>, success: bool) -> Record {
     let mut record = Record::fixture(case, iteration);
     record.stages.ready_ms = ready;
+    record.stages.ready_signal = ready.map(|_| Signal::Legacy);
     record.timings.exit_ms = ready.map(|ready| ready + 500.0);
     record.outcome.success = success;
     record.probe.cpu_ms = 100.0;
@@ -508,6 +529,10 @@ fn summary_lists_every_sample_with_median_extremes_and_spread_per_case() {
     let mut opened_then_failed = record(Case::WarmReopen, 2, Some(160.0), false);
     opened_then_failed.observation.max_bracket_ms = 47.0;
     opened_then_failed.observation.mean_tick_cost_ms = 6.0;
+    let mut new_project = record(Case::NewProject, 1, Some(4_000.0), true);
+    new_project.stages.ready_signal = Some(Signal::Marker);
+    // Keeps the series' mean tick cost at 7 ms over 7 runs.
+    new_project.observation.mean_tick_cost_ms = 1.0;
     let records = vec![
         record(Case::FirstLaunch, 1, Some(9_000.0), true),
         record(Case::FirstLaunch, 2, Some(11_000.0), true),
@@ -515,28 +540,35 @@ fn summary_lists_every_sample_with_median_extremes_and_spread_per_case() {
         record(Case::ColdExisting, 2, None, false),
         record(Case::WarmReopen, 1, Some(150.0), true),
         opened_then_failed,
+        new_project,
     ];
     let text = summary(&records, "unit");
     assert!(
-        text.contains(
-            "| first-launch | open (to `Memory: ready.`) | 2 | 10000 | 9000 | 11000 | 2000 |"
-        ),
+        text.contains("| first-launch | open (to ready) | 2 | 10000 | 9000 | 11000 | 2000 |"),
         "{text}"
     );
     assert!(
-        text.contains(
-            "| cold-existing | open (to `Memory: ready.`) | 1 | 1200 | 1200 | 1200 | 0 |"
-        ),
+        text.contains("| cold-existing | open (to ready) | 1 | 1200 | 1200 | 1200 | 0 |"),
         "{text}"
     );
     assert!(text.contains("first-launch: 9000, 11000"), "{text}");
+    assert!(
+        text.contains("| new-project | open (to ready) | 1 | 4000 | 4000 | 4000 | 0 |"),
+        "{text}"
+    );
+    assert!(text.contains("new-project: 4000"), "{text}");
+    // Which signal ended each open, per case.
+    assert!(text.contains("| ready signal |"), "{text}");
+    assert!(text.contains("| legacy ×2 |"), "{text}");
+    assert!(text.contains("| marker ×1 |"), "{text}");
+    assert!(text.contains("| legacy ×1, none ×1 |"), "{text}");
     assert!(text.contains("cold-existing: 1200, failed"), "{text}");
     assert!(
         text.contains("warm-reopen: 150, 160 (command failed after opening)"),
         "{text}"
     );
-    // One definition of a failed open: no `Memory: ready.`.
-    assert!(text.contains("1 of 6 runs failed to open"), "{text}");
+    // One definition of a failed open: no readiness signal.
+    assert!(text.contains("1 of 7 runs failed to open"), "{text}");
     assert!(text.contains("1 commands failed after opening"), "{text}");
     assert!(text.contains("report only"), "{text}");
     // The error bound is the recorded bracket, with the tick cost and the
@@ -590,8 +622,8 @@ fn the_walk_lists_stage_directories_from_their_parents_only() {
     std::fs::create_dir_all(cache.join("2.3.5/aarch64-apple-darwin")).unwrap();
     std::fs::write(cache.join("2.3.5/aarch64-apple-darwin/dolt"), b"").unwrap();
     let mut present = HashSet::new();
-    walk(&data, "data", 0, &mut present);
-    walk(&cache, "cache", 0, &mut present);
+    walk(&data, "data", 0, &[], &mut present);
+    walk(&cache, "cache", 0, &[], &mut present);
     for key in [
         "data/memory/<project>.staging-<id>",
         "data/memory/<project>/endpoint.json",
@@ -612,6 +644,62 @@ fn the_walk_lists_stage_directories_from_their_parents_only() {
     }
     assert!(unentered(".install-x") && unentered("p.staging-1") && unentered("interrupted"));
     assert!(!unentered(".install.lock") && !unentered("staging"));
+}
+
+#[test]
+fn the_walk_lists_template_build_and_capture_stages_from_their_parent_only() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    let templates = cache.join("2.3.5/templates");
+    let id = "40abe117-205d-4fa8-9f78-3aef3e63e21d";
+    for directory in [
+        format!(".build-k1-{id}/store/data/.dolt"),
+        format!(".stage-k1-{id}/data"),
+        "k1/data".to_owned(),
+    ] {
+        std::fs::create_dir_all(templates.join(directory)).unwrap();
+    }
+    std::fs::write(templates.join("k1/manifest.json"), b"{}").unwrap();
+    std::fs::write(templates.join("k1.lock"), b"").unwrap();
+    // The same names outside the engine cache's `templates` are ordinary
+    // directories, and a project store's own stage keeps today's rule.
+    let data = root.path().join("data");
+    let hash = "b".repeat(64);
+    for directory in [
+        format!("memory/{hash}/.stage-x/child"),
+        format!("memory/{hash}/.build-y/child"),
+        format!("memory/{hash}.staging-{id}/data"),
+    ] {
+        std::fs::create_dir_all(data.join(directory)).unwrap();
+    }
+    std::fs::create_dir_all(cache.join("2.3.5/.stage-z/child")).unwrap();
+    let mut present = HashSet::new();
+    walk(&cache, "cache", 0, &[], &mut present);
+    walk(&data, "data", 0, &[], &mut present);
+    for key in [
+        "cache/2.3.5/templates/.build-<tmp>",
+        "cache/2.3.5/templates/.stage-<tmp>",
+        "cache/2.3.5/templates/k1/manifest.json",
+        "cache/2.3.5/templates/k1/data",
+        "cache/2.3.5/templates/k1.lock",
+        "cache/2.3.5/.stage-z/child",
+        "data/memory/<project>/.stage-x/child",
+        "data/memory/<project>/.build-y/child",
+        "data/memory/<project>.staging-<id>",
+    ] {
+        assert!(present.contains(key), "{key} missing from {present:?}");
+    }
+    for key in &present {
+        assert!(
+            !key.contains("templates/.build-") || key.ends_with(".build-<tmp>"),
+            "entered {key}"
+        );
+        assert!(
+            !key.contains("templates/.stage-") || key.ends_with(".stage-<tmp>"),
+            "entered {key}"
+        );
+        assert!(!key.contains(".staging-<id>/"), "entered {key}");
+    }
 }
 
 #[test]
@@ -674,4 +762,289 @@ fn the_census_counts_processes_by_owner_and_stage_directories_by_iteration() {
         std::fs::create_dir_all(root.path().join(directory)).unwrap();
     }
     assert_eq!(census::stages(root.path()), (2, 1));
+}
+
+#[test]
+fn a_prior_project_is_named_apart_from_the_project_the_run_creates() {
+    let prior = "a".repeat(64);
+    let new = "b".repeat(64);
+    let hashes = vec![prior.clone()];
+    assert_eq!(
+        key(&format!("data/memory/{prior}"), &hashes),
+        format!("data/memory/{PRIOR_PROJECT}")
+    );
+    assert_eq!(
+        key(
+            &format!("data/memory/services/{prior}/endpoint.json"),
+            &hashes
+        ),
+        "data/memory/services/<prior-project>/endpoint.json"
+    );
+    assert_eq!(
+        key(&format!("data/memory/{new}.staging-1/ready.json"), &hashes),
+        "data/memory/<project>.staging-1/ready.json"
+    );
+    // Without prior hashes a key is its normalised name, as before.
+    assert_eq!(
+        key(&format!("data/memory/{prior}"), &[]),
+        "data/memory/<project>"
+    );
+    let root = tempfile::tempdir().unwrap();
+    let memory = root.path().join("data/memory");
+    for directory in [
+        prior.clone(),
+        format!("{prior}.staging-2"),
+        "services".to_owned(),
+        "interrupted".to_owned(),
+        "g".repeat(64),
+    ] {
+        std::fs::create_dir_all(memory.join(directory)).unwrap();
+    }
+    assert_eq!(project_hashes(&memory), vec![prior.clone()]);
+    assert!(project_hashes(&root.path().join("absent")).is_empty());
+    std::fs::create_dir_all(memory.join(&new)).unwrap();
+    let mut present = HashSet::new();
+    walk(&root.path().join("data"), "data", 0, &hashes, &mut present);
+    assert!(
+        present.contains("data/memory/<prior-project>"),
+        "{present:?}"
+    );
+    assert!(present.contains("data/memory/<project>"), "{present:?}");
+    assert!(
+        present.contains("data/memory/<prior-project>.staging-<n>")
+            || present.contains("data/memory/<prior-project>.staging-2"),
+        "{present:?}"
+    );
+}
+
+/// A second project in a data directory whose engine cache is warm: the
+/// earlier project's store is there from the first tick under its own name,
+/// and the new store is seen appearing.
+fn new_project_observation() -> Observation {
+    let staging = Some(Store::Staging);
+    let mut prior_store = file("data/memory/<prior-project>", 0.0, None);
+    prior_store.absent_at_ms = None;
+    let mut engine = file("cache/2.3.5/aarch64-apple-darwin/dolt", 0.0, None);
+    engine.absent_at_ms = None;
+    Observation {
+        processes: vec![
+            process(Role::Cli, None, 5.0, 4_000.0),
+            process(Role::Owner, None, 700.0, 4_000.0),
+            process(Role::DoltVersion, None, 760.0, 800.0),
+            process(Role::Supervisor, None, 900.0, 1_900.0),
+            process(Role::SqlServer, staging, 920.0, 1_880.0),
+            process(Role::Supervisor, None, 2_000.0, 2_700.0),
+            process(Role::SqlServer, staging, 2_020.0, 2_680.0),
+            process(Role::Supervisor, None, 2_800.0, 3_100.0),
+            process(Role::SqlServer, staging, 2_820.0, 3_080.0),
+            process(Role::Supervisor, None, 3_200.0, 4_000.0),
+            process(Role::SqlServer, Some(Store::Active), 3_220.0, 4_000.0),
+        ],
+        files: vec![
+            prior_store,
+            engine,
+            file("data/memory/<project>.staging-<id>", 860.0, Some(3_180.0)),
+            file("data/memory/<project>", 3_180.0, None),
+            file("data/memory/<project>/endpoint.json", 3_300.0, None),
+            file(
+                "data/memory/services/<project>/endpoint.json",
+                3_600.0,
+                None,
+            ),
+        ],
+        files_observed: true,
+        ticks: 200,
+        interval_ms: 20.0,
+        max_gap_ms: 25.0,
+        max_bracket_ms: 30.0,
+        mean_tick_cost_ms: 2.0,
+    }
+}
+
+#[test]
+fn a_new_project_with_a_warm_engine_is_partitioned_without_provisioning() {
+    let lines = [
+        line(650.0, "Memory: waiting for project ownership…"),
+        line(3_650.0, "Memory: ready."),
+    ];
+    let derived = derive(&new_project_observation(), &lines, Some(4_100.0));
+    assert_partitions(&derived);
+    let names: Vec<&str> = derived
+        .stages
+        .milestones
+        .iter()
+        .map(|milestone| milestone.name.as_str())
+        .collect();
+    assert!(names.contains(&"active store appeared"), "{names:?}");
+    assert!(names.contains(&"store stage appeared"), "{names:?}");
+    // The engine cache was warm: nothing was extracted or activated.
+    assert!(!names.contains(&"install stage appeared"), "{names:?}");
+    assert!(!names.contains(&"engine activated"), "{names:?}");
+    assert_eq!(derived.counts.engine_starts, 4);
+    assert_eq!(derived.counts.staging_engine_starts, 3);
+    assert_eq!(derived.path, OwnerPath::SpawnedOwner);
+    assert!(
+        derived
+            .stages
+            .totals
+            .iter()
+            .any(|total| total.name.starts_with("staged store creation")),
+        "{:?}",
+        derived.stages.totals
+    );
+}
+
+fn marker(t_ms: f64, event: &str, ns: u64) -> Line {
+    line(t_ms, &format!("kuru-open-marker v1 {event} {ns}"))
+}
+
+#[test]
+fn a_ready_marker_ends_the_open_and_names_its_signal() {
+    let mut owner = process(Role::Owner, None, 0.0, 400.0);
+    owner.preexisting = true;
+    owner.not_seen_ms = None;
+    let observation = Observation {
+        processes: vec![owner],
+        ..Observation::default()
+    };
+    // A binary with markers and without the legacy lines, attaching.
+    let lines = [
+        marker(40.0, "open-start", 1_000),
+        line(41.0, "Opening this project's memory…"),
+        marker(95.0, "ready", 56_000_000),
+    ];
+    let derived = derive(&observation, &lines, Some(300.0));
+    assert_partitions(&derived);
+    let stages = &derived.stages;
+    assert_eq!(stages.ready_ms, Some(95.0));
+    assert_eq!(stages.ready_signal, Some(Signal::Marker));
+    assert_eq!(stages.cli_preamble_ms, Some(40.0));
+    assert_eq!(stages.turn_and_exit_ms, Some(205.0));
+    let names: Vec<&str> = stages
+        .milestones
+        .iter()
+        .map(|milestone| milestone.name.as_str())
+        .collect();
+    assert_eq!(names, ["start", "open start", "ready"]);
+    let events: Vec<(&str, f64, u64)> = stages
+        .markers
+        .iter()
+        .map(|marker| (marker.event.as_str(), marker.t_ms, marker.monotonic_ns))
+        .collect();
+    assert_eq!(
+        events,
+        [("open-start", 40.0, 1_000), ("ready", 95.0, 56_000_000)]
+    );
+    assert_eq!(derived.path, OwnerPath::Attached);
+}
+
+#[test]
+fn a_waiting_marker_is_the_progress_line_and_a_marker_wins_over_the_legacy_line() {
+    let lines = [
+        marker(30.0, "open-start", 10),
+        marker(90.0, "waiting-ownership", 20),
+        line(91.0, "Memory: waiting for project ownership…"),
+        marker(140.0, "ready", 30),
+        line(141.0, "Memory: ready."),
+    ];
+    let derived = derive(&Observation::default(), &lines, Some(390.0));
+    assert_partitions(&derived);
+    let names: Vec<&str> = derived
+        .stages
+        .milestones
+        .iter()
+        .map(|milestone| milestone.name.as_str())
+        .collect();
+    assert_eq!(names, ["start", "open start", "progress line", "ready"]);
+    assert_eq!(derived.stages.milestones[2].at_ms, 90.0);
+    assert_eq!(derived.stages.ready_ms, Some(140.0));
+    assert_eq!(derived.stages.ready_signal, Some(Signal::Marker));
+    // Without an open-start marker the preamble ends at the progress line.
+    let derived = derive(&Observation::default(), &lines[1..], Some(390.0));
+    assert_eq!(derived.stages.cli_preamble_ms, Some(90.0));
+}
+
+#[test]
+fn malformed_or_later_markers_never_end_an_open() {
+    let lines = [
+        line(30.0, "kuru-open-marker v2 ready 10"),
+        line(31.0, "kuru-open-marker v1 ready soon"),
+        line(32.0, "kuru-open-marker v1 ready 10 extra"),
+        line(33.0, "kuru-open-marker v1"),
+        line(40.0, "Error: memory service readiness deadline exceeded"),
+    ];
+    let derived = derive(&Observation::default(), &lines, Some(50.0));
+    assert_eq!(derived.stages.ready_ms, None);
+    assert_eq!(derived.stages.ready_signal, None);
+    assert!(derived.stages.markers.is_empty());
+    // They are still progress output: never the error line, and kept.
+    for line in &lines[..4] {
+        assert!(is_progress(&line.text), "{}", line.text);
+        assert!(kept_line(&line.text), "{}", line.text);
+    }
+    assert!(!is_progress(&lines[4].text));
+    assert!(!kept_line(&lines[4].text));
+}
+
+#[test]
+fn progress_lines_are_the_legacy_lines_markers_and_the_open_sentences() {
+    for text in [
+        "Memory: ready.",
+        "Memory: waiting for project ownership…",
+        "Memory: retained an install stage for later cleanup.",
+        "kuru-open-marker v1 ready 5",
+        "Opening this project's memory…",
+        "Getting Kuru's memory ready on this computer…",
+        "Creating this project's memory…",
+        "Upgrading this project's memory…",
+        "Waiting for another copy of Kuru that is using this project's memory…",
+    ] {
+        assert!(is_progress(text), "{text}");
+        assert!(kept_line(text), "{text}");
+    }
+    for text in [
+        "Error: memory service exited before readiness",
+        "warning: /private/tmp/root/data is shared",
+        "Opening /private/tmp/root…",
+    ] {
+        assert!(!is_progress(text), "{text}");
+        assert!(!kept_line(text), "{text}");
+    }
+    // The error line is chosen as before: any line starting `Memory` is
+    // progress, but only `Memory: ` lines are kept.
+    assert!(is_progress("Memory service note"));
+    assert!(!kept_line("Memory service note"));
+}
+
+#[test]
+fn the_new_project_case_follows_the_existing_three() {
+    assert_eq!(
+        Case::ALL,
+        [
+            Case::FirstLaunch,
+            Case::ColdExisting,
+            Case::WarmReopen,
+            Case::NewProject
+        ]
+    );
+    assert_eq!(Case::NewProject.label(), "new-project");
+}
+
+#[test]
+fn template_work_is_only_a_build_or_capture_stage_in_the_engine_cache() {
+    assert!(template_work("cache/2.3.5/templates/.build-k-1"));
+    assert!(template_work("cache/2.3.5/templates/.stage-k-1"));
+    assert!(!template_work("cache/2.3.5/templates/k"));
+    assert!(!template_work("cache/2.3.5/templates/.rejected-k-1"));
+    assert!(!template_work("cache/2.3.5/.build-k-1"));
+    assert!(!template_work("data/memory/templates/.build-k-1"));
+    assert!(!template_work("templates"));
+    assert_eq!(
+        normalize("cache/2.3.5/templates/.build-k-40abe117-205d-4fa8-9f78-3aef3e63e21d"),
+        "cache/2.3.5/templates/.build-<tmp>"
+    );
+    assert_eq!(
+        normalize("data/memory/templates/.build-k"),
+        "data/memory/templates/.build-k"
+    );
 }

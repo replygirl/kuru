@@ -1,22 +1,27 @@
 //! Report-only open-time measurement of a release `kuru` executable, driven
 //! from outside the binary.
 //!
-//! Each iteration runs three cases in a fresh scratch root, with its own
-//! HOME, configuration, data directory, engine cache and project, and a fresh
-//! copy of the executable:
+//! Each iteration runs four cases in a fresh scratch root, with its own
+//! HOME, configuration, data directory, engine cache and two project
+//! directories, and a fresh copy of the executable:
 //!
 //! 1. `first-launch`: empty engine cache and data (engine extraction, a new
 //!    project's staged creation), then a wait for the owner to retire;
 //! 2. `cold-existing`: the same project with no live owner;
 //! 3. `warm-reopen`: immediately after, inside the owner's idle window, then a
-//!    wait for retirement.
+//!    wait for retirement;
+//! 4. `new-project`: a second, different project in the same data directory
+//!    and engine cache, so the engine is warm and only the project is new,
+//!    then a wait for retirement.
 //!
 //! Each run is `kuru --provider demo --no-dream run <prompt> --json` with
-//! offline memory: no network, no login and no credential store. The harness
-//! records wall-clock times of the stderr progress lines and of exit, what
-//! [`observe`] saw, a [`census`] before and after the run, host load before
-//! and after, and a fixed CPU and IO calibration probe. It writes one
-//! `kuru.open-time.v2` JSON line per run and a Markdown summary. It never
+//! offline memory: no network, no login and no credential store, and with
+//! `KURU_OPEN_MARKERS=1`, so a binary that supports open markers writes them.
+//! The harness records wall-clock times of the stderr progress lines and
+//! markers and of exit, what [`observe`] saw, a [`census`] before and after
+//! the run, host load before and after, and a fixed CPU and IO calibration
+//! probe. It writes one `kuru.open-time.v3` JSON line per run and a Markdown
+//! summary. It never
 //! compares a time with a budget: a slow or failed open is a result, and only
 //! an infrastructure failure (a missing binary, an unwritable output, a
 //! process that does not retire) makes it fail.
@@ -48,7 +53,9 @@ use census::Census;
 use observe::{Observation, Observer, Processes, millis};
 use report::{Counts, OwnerPath, Stages};
 
-pub const SCHEMA: &str = "kuru.open-time.v2";
+/// v3: the `new-project` case, `stages.ready_signal` and `stages.markers`,
+/// and the final milestone named `ready` for either signal.
+pub const SCHEMA: &str = "kuru.open-time.v3";
 const RECORDS: &str = "records.jsonl";
 const SUMMARY: &str = "summary.md";
 /// The owner idles 30 s after its last client (kuru-memory
@@ -83,8 +90,8 @@ pub struct Options {
     pub interval: Duration,
     /// List file names as well as processes; off for the control series.
     pub files: bool,
-    /// Wait for the owner to retire after the first launch and the warm
-    /// reopen; off for the ramp series.
+    /// Wait for the owner to retire after the first launch, the warm reopen
+    /// and the new project; off for the ramp series.
     pub retire_wait: bool,
     /// Bound on one command; past it the command is stopped and recorded.
     pub run_bound: Duration,
@@ -115,16 +122,25 @@ pub enum Case {
     FirstLaunch,
     ColdExisting,
     WarmReopen,
+    NewProject,
 }
 
 impl Case {
-    pub const ALL: [Self; 3] = [Self::FirstLaunch, Self::ColdExisting, Self::WarmReopen];
+    /// In run order. `new-project` is appended, so the first three keep the
+    /// predecessor and gap they always had.
+    pub const ALL: [Self; 4] = [
+        Self::FirstLaunch,
+        Self::ColdExisting,
+        Self::WarmReopen,
+        Self::NewProject,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::FirstLaunch => "first-launch",
             Self::ColdExisting => "cold-existing",
             Self::WarmReopen => "warm-reopen",
+            Self::NewProject => "new-project",
         }
     }
 }
@@ -186,13 +202,14 @@ pub struct Timings {
 pub struct Outcome {
     pub success: bool,
     pub exit_code: Option<i32>,
-    /// First non-progress stderr line, with the scratch root replaced.
+    /// First stderr line that is not progress ([`report::is_progress`]), with
+    /// the scratch root replaced.
     pub error: Option<String>,
     /// Stdout parsed as the JSON `run --json` promises.
     pub json_stdout: bool,
 }
 
-/// One run: `kuru.open-time.v2`. Times are milliseconds from the moment
+/// One run: `kuru.open-time.v3`. Times are milliseconds from the moment
 /// before the command was started. No path, credential or memory content.
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
@@ -211,6 +228,7 @@ pub struct Record {
     /// Taken after the command exited and the observer stopped.
     pub census_after: Census,
     pub timings: Timings,
+    /// Progress lines and open markers ([`report::kept_line`]).
     pub stderr: Vec<Line>,
     pub stages: Stages,
     pub counts: Counts,
@@ -224,9 +242,9 @@ pub struct Record {
 }
 
 impl Record {
-    /// Whether memory opened: the run printed `Memory: ready.`. The one
-    /// definition of a failed open; a command that fails after that line is
-    /// counted separately.
+    /// Whether memory opened: the run wrote a `ready` open marker or
+    /// `Memory: ready.`. The one definition of a failed open; a command that
+    /// fails after that line is counted separately.
     pub fn opened(&self) -> bool {
         self.stages.ready_ms.is_some()
     }
@@ -266,7 +284,7 @@ impl Record {
 #[derive(Debug)]
 pub struct Report {
     pub records: usize,
-    /// Runs without `Memory: ready.`.
+    /// Runs without a readiness signal (a `ready` marker or `Memory: ready.`).
     pub failed_opens: usize,
     /// Runs that opened and then failed.
     pub failed_after_open: usize,
@@ -284,6 +302,8 @@ struct Scratch {
     data: PathBuf,
     cache: PathBuf,
     project: PathBuf,
+    /// The `new-project` case's project, beside the first.
+    new_project: PathBuf,
     temporary: PathBuf,
     empty_path: PathBuf,
 }
@@ -299,6 +319,7 @@ impl Scratch {
             data: root.join("data"),
             cache: root.join("cache"),
             project: root.join("project"),
+            new_project: root.join("new-project"),
             temporary: root.join("tmp"),
             empty_path: root.join("no-external-tools"),
             root,
@@ -308,6 +329,7 @@ impl Scratch {
             &scratch.home,
             &scratch.config.join("kuru"),
             &scratch.project,
+            &scratch.new_project,
             &scratch.temporary,
             &scratch.empty_path,
             &scratch.root.join("bin"),
@@ -335,6 +357,14 @@ impl Scratch {
         self.config.join("kuru").join("config.toml")
     }
 
+    /// The project directory a case opens.
+    fn project(&self, case: Case) -> &Path {
+        match case {
+            Case::NewProject => &self.new_project,
+            _ => &self.project,
+        }
+    }
+
     /// Holds `<project>/endpoint.json` while an owner is published.
     fn endpoint_directory(&self) -> PathBuf {
         self.data.join("memory").join("services")
@@ -357,6 +387,9 @@ impl Scratch {
         .into_iter()
         .map(|(key, value)| (OsString::from(key), value.as_os_str().to_owned()))
         .collect();
+        // A binary that supports open markers writes them; any other ignores
+        // the variable and writes the legacy progress lines only.
+        environment.push(("KURU_OPEN_MARKERS".into(), "1".into()));
         // An instrumented fixture keeps its coverage destination; a release
         // binary ignores it.
         for key in ["LLVM_PROFILE_FILE", "SystemRoot"] {
@@ -367,8 +400,8 @@ impl Scratch {
         environment
     }
 
-    fn arguments(&self, prompt: &str) -> Vec<OsString> {
-        let mut args: Vec<OsString> = vec!["-C".into(), self.project.clone().into()];
+    fn arguments(&self, case: Case, prompt: &str) -> Vec<OsString> {
+        let mut args: Vec<OsString> = vec!["-C".into(), self.project(case).into()];
         args.push("--data-dir".into());
         args.push(self.data.clone().into());
         args.push("--config".into());
@@ -499,9 +532,16 @@ impl Series<'_> {
         let probe = calibrate(&scratch.root)?;
         let launch = launch::Launch {
             program: scratch.binary.clone(),
-            args: scratch.arguments(&self.options.prompt),
+            args: scratch.arguments(case, &self.options.prompt),
             environment: scratch.environment(),
-            cwd: scratch.project.clone(),
+            cwd: scratch.project(case).to_owned(),
+        };
+        // The projects already in the data directory are named apart, so the
+        // new project's store is seen appearing. Listed before the epoch.
+        let prior = if case == Case::NewProject {
+            observe::project_hashes(&scratch.data.join("memory"))
+        } else {
+            Vec::new()
         };
         let started_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -518,7 +558,7 @@ impl Series<'_> {
         } else {
             Vec::new()
         };
-        let observer = Observer::start(&scratch.root, watched, epoch, self.options.interval);
+        let observer = Observer::start(&scratch.root, watched, prior, epoch, self.options.interval);
         let finished = launch::run(&launch, epoch, self.options.run_bound).await;
         self.previous_exit = Some(Instant::now());
         let observation = observer.finish();
@@ -529,13 +569,13 @@ impl Series<'_> {
         let error = finished
             .lines
             .iter()
-            .find(|line| !line.text.starts_with("Memory"))
+            .find(|line| !report::is_progress(&line.text))
             .filter(|_| !finished.success)
             .map(|line| redact(&line.text, &scratch.root));
         let stderr = finished
             .lines
             .iter()
-            .filter(|line| line.text.starts_with("Memory: "))
+            .filter(|line| report::kept_line(&line.text))
             .cloned()
             .collect();
         Ok(Record {
