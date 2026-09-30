@@ -51,7 +51,11 @@ impl ServedOwner {
             self.task.is_none(),
             "a fixture owner is still being served; reap it before its successor"
         );
-        self.task = Some(tokio::spawn(owner.serve()));
+        // Never reached: a fixture owner outlives its last client until the
+        // fixture retires it (WP2 seam; WP4 adds `serve_with`).
+        self.task = Some(tokio::spawn(
+            owner.serve_with(crate::service::ServeKnobs::never_reached()),
+        ));
         Ok(())
     }
 
