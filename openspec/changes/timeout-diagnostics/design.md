@@ -40,9 +40,20 @@ the root, so a snapshot taken after the kill finds orphans reparented to init.
   the kill, and survivors of the recorded set are re-checked after the pipe grace.
 - **Failure isolation.** A snapshot failure appends `snapshot unavailable:
   <reason>` to the original message and never replaces it.
-- **Family 4.** The fixture test reads the nested child's PTY output to EOF and
-  its exit status when the size report is missing, and the nested fixture prints
-  a marker naming what it reached, so an early clean exit is explained.
+- **Family 4.** When `Terminal::wait` observes an exit before its condition, it
+  reports the exit status, then collects output still queued for up to 500 ms
+  (`LATE_OUTPUT_WINDOW`, stopping early when the reader closes) and appends
+  `Terminal::report()`: launch, child state, the complete escaped PTY output and
+  a process-tree snapshot. The nested fixture wraps the inner failure with that
+  report, so the outer `child failed` text carries the inner status and output.
+  The nested fixture prints no progress marker: its only marker is
+  `INNER_SIZE_OK` on success, and the inner output itself shows what it reached.
+  The window collects for reporting only, after the caller has decided to fail,
+  so it changes no outcome. Inference, not measured: the CI failure may be a
+  drain race in which the inner child wrote `SIZE:` but its exit was seen before
+  the reader delivered it; the queued-output section distinguishes that from a
+  child that never wrote a size. A reader that stays open past the window is
+  named as such rather than read to EOF.
 - **Terminal helper** records program, args and whether `LLVM_PROFILE_FILE`
   reached the child at `Terminal::spawn`; the `wait_exit` bail keeps the
   substrings `process exits: timed out` and `child failed` that the negative
@@ -54,6 +65,15 @@ the root, so a snapshot taken after the kill finds orphans reparented to init.
   only, failure path only, bounded.
 - The `ps` snapshot adds latency to the 100 ms negative terminal test.
   Mitigation: bounded wait; the test expects failure and asserts only substrings.
+- The shipped Unix `bounded_output` arm runs the `ps` snapshot before
+  `stop_and_reap` on every capture failure (timeout, overflow or read error), so
+  cleanup of a failed tool can start up to `SNAPSHOT_TIMEOUT` (2 s) later.
+  Mitigation: failure path only, bounded, the process group stays owned and
+  unreaped throughout, and no deadline or outcome changes.
+- Unix callers of `command::output` (the Tokio timeout with `tool timed out`)
+  get no snapshot or command context; only `bounded_output` and the test helpers
+  built on it do. This gap is accepted for now; the recorded families use
+  `bounded_output`, the embedded-runtime `execute` helper or `Terminal`.
 - Job PID lists race with process exit. Mitigation: printed as a point-in-time
   observation, never acted on.
 - Windows evidence exists only from native CI runs; local macOS cannot exercise

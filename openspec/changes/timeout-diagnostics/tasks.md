@@ -15,8 +15,8 @@
 
 ## 3. Git child family helpers
 
-- [x] 3.1 Replace the `unwrap()` in `src/advisory.rs` `tests::git` and `git_with_environment` with a panic carrying arguments, directory and elapsed time; verify with a tiny-deadline negative test.
-- [x] 3.2 Do the same in `tests/advisory.rs` `git` and `git_with_environment`, the `src/coverage.rs` test `git`, and the `tests/fixtures/delivery.rs` fixture binary; verify each helper's message.
+- [x] 3.1 Replace the `unwrap()` in `src/advisory.rs` `tests::git` and `git_with_environment` with a panic carrying arguments, directory and elapsed time and the `bounded_output` error text; verify with a launch-failure test (missing working directory) that the panic names the arguments, directory and elapsed time. The timeout snapshot reaches the panic by composition: each helper embeds the `bounded_output` error, whose timeout arm is covered by `bounded_output_timeout_names_the_command_and_its_blocked_root`. No tiny-deadline test runs through a helper.
+- [x] 3.2 Do the same in `tests/advisory.rs` `git` and `git_with_environment`, the `src/coverage.rs` test `git`, and the `tests/fixtures/delivery.rs` fixture binary; verify each helper's message with the same launch-failure test and composition argument.
 
 ## 4. Terminal family helper
 
@@ -24,7 +24,7 @@
 
 ## 5. Family 4: nested terminal fixture
 
-- [x] 5.1 In `terminal_fixture_uses_its_requested_controlling_dimensions`, capture the nested child's complete PTY output and exit status in the error and make the nested fixture record what it printed; verify by a negative test in which the nested child exits early that the error contains the output and status.
+- [x] 5.1 In `terminal_fixture_uses_its_requested_controlling_dimensions`, capture the nested child's complete PTY output and exit status in the error, including output still queued when the exit was seen, and wrap it with the inner `Terminal::report()`; verify by a negative test in which the nested child exits early that the error contains the output and status, and by a synchronized late-output test that queued output is reported separately.
 
 ## 6. Verification
 
