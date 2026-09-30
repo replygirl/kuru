@@ -3565,6 +3565,8 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
                 .await
                 .context("write did not register its receipt before dispatch")?;
+            // No settlement wait: the registered, unpublished write is in flight.
+            progress.set_settlement_wait(Some(Duration::ZERO));
             ensure!(
                 matches!(
                     query(&mut owner, &data, &scope, &authority, &progress, outcome()).await?,
@@ -3606,6 +3608,890 @@ mod tests {
         tested.context("in-flight outcome fixture exceeded 40 seconds")??;
         closed?;
         Ok(())
+    }
+
+    /// One real owner whose single-request and managed attachments share its
+    /// own receipt progress, as the owner's attachment tasks do.
+    struct SettlementFixture {
+        _gate: tokio::sync::RwLockReadGuard<'static, ()>,
+        _root: crate::test_support::TempDir,
+        data: PathBuf,
+        scope: String,
+        owner: ServiceOwner,
+        authority: EndpointAuthority,
+        progress: std::sync::Arc<rpc::ReceiptProgress>,
+    }
+
+    /// One request on its own attachment, served by the fixture owner.
+    /// Dropping it aborts both halves.
+    struct Served {
+        client: tokio::task::JoinHandle<Result<rpc::ServiceResponse>>,
+        server: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    impl Served {
+        fn is_finished(&self) -> bool {
+            self.client.is_finished() || self.server.is_finished()
+        }
+
+        async fn finish(mut self) -> Result<rpc::ServiceResponse> {
+            let (client, server) = tokio::time::timeout(Duration::from_secs(20), async {
+                tokio::join!(&mut self.client, &mut self.server)
+            })
+            .await
+            .context("served request did not finish")?;
+            server??;
+            client?
+        }
+    }
+
+    impl Drop for Served {
+        fn drop(&mut self) {
+            self.client.abort();
+            self.server.abort();
+        }
+    }
+
+    impl SettlementFixture {
+        async fn open() -> Result<Self> {
+            crate::test_support::warm_runtime_cache().await?;
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let data = root.path().join("private");
+            let options = crate::test_support::open_options(data.clone(), scope.clone())?;
+            let gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options, &project).await?;
+            let authority = owner.authority().clone();
+            let progress = owner.receipt_progress.clone();
+            Ok(Self {
+                _gate: gate,
+                _root: root,
+                data,
+                scope,
+                owner,
+                authority,
+                progress,
+            })
+        }
+
+        async fn pair(&mut self) -> Result<(LocalStream, LocalStream)> {
+            let client = connect_local(
+                &self.data,
+                &self.scope,
+                &self.owner.record.address,
+                HANDSHAKE_TIMEOUT,
+            )
+            .await?;
+            let server = self.owner.accept(HANDSHAKE_TIMEOUT).await?;
+            Ok((client, server))
+        }
+
+        /// Serve one request on a fresh single-request attachment.
+        async fn spawn_one(&mut self, id: uuid::Uuid, call: ServiceCall) -> Result<Served> {
+            let (mut client, mut server) = self.pair().await?;
+            let authority = self.authority.clone();
+            let client = tokio::spawn(async move {
+                connect_handshake(&mut client, &authority).await?;
+                rpc::exchange_attached_with_id(&mut client, &authority, id, call).await
+            });
+            let authority = self.authority.clone();
+            let store = self.owner.store.clone();
+            let progress = self.progress.clone();
+            let server = tokio::spawn(async move {
+                rpc::serve_one_with_progress(&mut server, &authority, &store, &progress).await
+            });
+            Ok(Served { client, server })
+        }
+
+        async fn call(&mut self, call: ServiceCall) -> Result<rpc::ServiceResponse> {
+            self.spawn_one(uuid::Uuid::new_v4(), call)
+                .await?
+                .finish()
+                .await
+        }
+
+        /// A managed attachment counted by `retirement`, as `attach` counts
+        /// one, and its authenticated client stream.
+        async fn attach_managed(
+            &mut self,
+            budget: &std::sync::Arc<tokio::sync::Semaphore>,
+            retirement: &std::sync::Arc<rpc::Retirement>,
+        ) -> Result<(LocalStream, tokio::task::JoinHandle<Result<()>>)> {
+            let (mut client, mut server) = self.pair().await?;
+            let retained = retirement
+                .attached()
+                .context("test retirement refused an attachment")?;
+            let authority = self.authority.clone();
+            let store = self.owner.store.clone();
+            let budget = budget.clone();
+            let retirement = retirement.clone();
+            let progress = self.progress.clone();
+            let served = tokio::spawn(async move {
+                let _retained = retained;
+                rpc::serve_attached(
+                    &mut server,
+                    &authority,
+                    &store,
+                    budget,
+                    retirement,
+                    progress,
+                )
+                .await
+            });
+            connect_handshake(&mut client, &self.authority).await?;
+            Ok((client, served))
+        }
+
+        async fn close(self) -> Result<()> {
+            tokio::time::timeout(Duration::from_secs(20), self.owner.close())
+                .await
+                .context("settlement fixture owner did not reap")?
+        }
+    }
+
+    /// Builds the main-view outcome query for `write` sent with `id`.
+    fn unit_outcome(
+        authority: &EndpointAuthority,
+        id: uuid::Uuid,
+        write: &ServiceCall,
+    ) -> Result<impl Fn() -> ServiceCall + Send + 'static> {
+        let (method, argument_digest) = write
+            .unit_receipt_fingerprint("main")?
+            .context("write has no logical receipt")?;
+        let generation = authority.service_generation.clone();
+        Ok(move || ServiceCall::Outcome {
+            original_id: id,
+            original_generation: generation.clone(),
+            view: "main".into(),
+            method: method.into(),
+            argument_digest: argument_digest.clone(),
+        })
+    }
+
+    fn outcome_status(response: rpc::ServiceResponse) -> Result<rpc::OutcomeStatus> {
+        match rpc::resolve_response(response)? {
+            ServiceValue::Outcome(status) => Ok(status),
+            other => bail!("outcome query returned {other:?}"),
+        }
+    }
+
+    async fn next_wait_event(
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<rpc::WaitEvent>,
+    ) -> Result<rpc::WaitEvent> {
+        tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .context("no settlement wait event within 10 seconds")?
+            .context("settlement wait events closed")
+    }
+
+    fn append(text: &str) -> ServiceCall {
+        ServiceCall::AppendMessage {
+            namespace: "settlement".into(),
+            message: kuru_core::Message::text("user", text),
+        }
+    }
+
+    async fn settled_fixture<F>(test: F) -> Result<()>
+    where
+        F: AsyncFnOnce(&mut SettlementFixture) -> Result<()>,
+    {
+        let mut fixture = SettlementFixture::open().await?;
+        let tested = tokio::time::timeout(Duration::from_secs(90), test(&mut fixture)).await;
+        let closed = fixture.close().await;
+        tested.context("settlement fixture exceeded 90 seconds")??;
+        closed
+    }
+
+    /// T1: durable evidence answers at once while the writer is registered.
+    #[tokio::test]
+    async fn committed_receipt_is_reported_while_its_writer_is_registered() -> Result<()> {
+        settled_fixture(async |fx| {
+            let mut events = fx.progress.watch_waits();
+            let pause = std::sync::Arc::new(rpc::SettlementPause::default());
+            fx.progress.pause_settlement_next(pause.clone());
+            let id = uuid::Uuid::new_v4();
+            let write = append("published before settlement");
+            let outcome = unit_outcome(&fx.authority, id, &write)?;
+            let writer = fx.spawn_one(id, write).await?;
+            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+                .await
+                .context("write did not reach settlement")?;
+            let reported = outcome_status(fx.call(outcome()).await?)?;
+            ensure!(
+                reported == rpc::OutcomeStatus::Committed,
+                "visible receipt of a registered write was reported {reported:?}"
+            );
+            ensure!(!writer.is_finished(), "writer finished before release");
+            ensure!(
+                events.try_recv().is_err(),
+                "a visible receipt still waited for settlement"
+            );
+            pause.release.notify_one();
+            ensure!(matches!(
+                rpc::resolve_response(writer.finish().await?)?,
+                ServiceValue::Unit
+            ));
+            let settled = outcome_status(fx.call(outcome()).await?)?;
+            ensure!(
+                settled == rpc::OutcomeStatus::Committed,
+                "settled write reported {settled:?}"
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    /// T2: before the receipt exists, the query waits and then answers.
+    #[tokio::test]
+    async fn unpublished_receipt_waits_for_settlement_then_commits() -> Result<()> {
+        settled_fixture(async |fx| {
+            let mut events = fx.progress.watch_waits();
+            let pause = std::sync::Arc::new(rpc::RegisteredPause::default());
+            fx.progress.pause_next(pause.clone());
+            let id = uuid::Uuid::new_v4();
+            let write = append("published after the query");
+            let outcome = unit_outcome(&fx.authority, id, &write)?;
+            let writer = fx.spawn_one(id, write).await?;
+            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+                .await
+                .context("write did not register")?;
+            let query = fx.spawn_one(uuid::Uuid::new_v4(), outcome()).await?;
+            ensure!(next_wait_event(&mut events).await? == rpc::WaitEvent::Entered);
+            ensure!(!query.is_finished(), "query answered before settlement");
+            pause.release.notify_one();
+            let reported = outcome_status(query.finish().await?)?;
+            ensure!(
+                reported == rpc::OutcomeStatus::Committed,
+                "query reported {reported:?}"
+            );
+            ensure!(
+                next_wait_event(&mut events).await?
+                    == rpc::WaitEvent::Ended(rpc::SettlementWaitEnd::Settled)
+            );
+            ensure!(matches!(
+                rpc::resolve_response(writer.finish().await?)?,
+                ServiceValue::Unit
+            ));
+            Ok(())
+        })
+        .await
+    }
+
+    /// T4: a rejected receipt-bearing write is absent only after it settles;
+    /// with no wait budget it is still in flight.
+    #[tokio::test]
+    async fn rejected_write_is_absent_only_after_settlement() -> Result<()> {
+        settled_fixture(async |fx| {
+            let mut events = fx.progress.watch_waits();
+            let pause = std::sync::Arc::new(rpc::RegisteredPause::default());
+            fx.progress.pause_next(pause.clone());
+            let id = uuid::Uuid::new_v4();
+            // Rejected by validation before any SQL write.
+            let write = ServiceCall::AppendMessage {
+                namespace: " ".into(),
+                message: kuru_core::Message::text("user", "never stored"),
+            };
+            let outcome = unit_outcome(&fx.authority, id, &write)?;
+            let writer = fx.spawn_one(id, write).await?;
+            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+                .await
+                .context("write did not register")?;
+            fx.progress.set_settlement_wait(Some(Duration::ZERO));
+            let unbudgeted = outcome_status(fx.call(outcome()).await?)?;
+            ensure!(
+                unbudgeted == rpc::OutcomeStatus::InFlight,
+                "zero-budget query reported {unbudgeted:?}"
+            );
+            ensure!(next_wait_event(&mut events).await? == rpc::WaitEvent::Entered);
+            ensure!(
+                next_wait_event(&mut events).await?
+                    == rpc::WaitEvent::Ended(rpc::SettlementWaitEnd::Exhausted)
+            );
+            fx.progress.set_settlement_wait(None);
+            let query = fx.spawn_one(uuid::Uuid::new_v4(), outcome()).await?;
+            ensure!(next_wait_event(&mut events).await? == rpc::WaitEvent::Entered);
+            ensure!(!query.is_finished(), "query answered before settlement");
+            pause.release.notify_one();
+            let reported = outcome_status(query.finish().await?)?;
+            ensure!(
+                reported == rpc::OutcomeStatus::Absent,
+                "query reported {reported:?}"
+            );
+            ensure!(
+                next_wait_event(&mut events).await?
+                    == rpc::WaitEvent::Ended(rpc::SettlementWaitEnd::Settled)
+            );
+            ensure!(rpc::resolve_response(writer.finish().await?).is_err());
+            Ok(())
+        })
+        .await
+    }
+
+    /// T5: usage-ledger proofs answer from the probe or after settlement.
+    #[tokio::test]
+    async fn usage_proof_is_committed_while_registered_and_after_settlement() -> Result<()> {
+        use kuru_core::{InvocationStart, UsagePhase};
+
+        settled_fixture(async |fx| {
+            let mut events = fx.progress.watch_waits();
+            let start = |invocation: &str| InvocationStart {
+                session_id: "settlement-session".into(),
+                invocation_id: invocation.into(),
+                operation_id: "settlement-turn".into(),
+                phase: UsagePhase::Speak,
+                actor_id: "speaker".into(),
+                route: "responses".into(),
+                model: "model".into(),
+                price_at_invocation: None,
+            };
+            fx.owner
+                .store
+                .usage_ledger()?
+                .mark_new_session("settlement-session")
+                .await?;
+            let admit = |invocation: &str| ServiceCall::Ledger {
+                operation: Box::new(rpc::LedgerOperation::Admit {
+                    start: Box::new(start(invocation)),
+                }),
+            };
+            let query = |fx: &SettlementFixture, id, invocation: &str| -> Result<ServiceCall> {
+                Ok(ServiceCall::LedgerOutcome {
+                    original_id: id,
+                    original_generation: fx.authority.service_generation.clone(),
+                    proof: crate::store::UsageProof::admit(&start(invocation))?,
+                })
+            };
+
+            let settlement = std::sync::Arc::new(rpc::SettlementPause::default());
+            fx.progress.pause_settlement_next(settlement.clone());
+            let id = uuid::Uuid::new_v4();
+            let writer = fx.spawn_one(id, admit("visible")).await?;
+            tokio::time::timeout(Duration::from_secs(10), settlement.entered.notified())
+                .await
+                .context("usage write did not reach settlement")?;
+            let reported = outcome_status(fx.call(query(fx, id, "visible")?).await?)?;
+            ensure!(
+                reported == rpc::OutcomeStatus::Committed,
+                "visible proof reported {reported:?}"
+            );
+            ensure!(events.try_recv().is_err(), "a visible proof still waited");
+            settlement.release.notify_one();
+            ensure!(matches!(
+                rpc::resolve_response(writer.finish().await?)?,
+                ServiceValue::Unit
+            ));
+
+            let registered = std::sync::Arc::new(rpc::RegisteredPause::default());
+            fx.progress.pause_next(registered.clone());
+            let id = uuid::Uuid::new_v4();
+            let writer = fx.spawn_one(id, admit("waited")).await?;
+            tokio::time::timeout(Duration::from_secs(10), registered.entered.notified())
+                .await
+                .context("usage write did not register")?;
+            let waiting = fx
+                .spawn_one(uuid::Uuid::new_v4(), query(fx, id, "waited")?)
+                .await?;
+            ensure!(next_wait_event(&mut events).await? == rpc::WaitEvent::Entered);
+            ensure!(
+                !waiting.is_finished(),
+                "usage query answered before settlement"
+            );
+            registered.release.notify_one();
+            let reported = outcome_status(waiting.finish().await?)?;
+            ensure!(
+                reported == rpc::OutcomeStatus::Committed,
+                "waited proof reported {reported:?}"
+            );
+            ensure!(
+                next_wait_event(&mut events).await?
+                    == rpc::WaitEvent::Ended(rpc::SettlementWaitEnd::Settled)
+            );
+            ensure!(matches!(
+                rpc::resolve_response(writer.finish().await?)?,
+                ServiceValue::Unit
+            ));
+            Ok(())
+        })
+        .await
+    }
+
+    /// T6: candidate transitions and selected abandonment are read under the
+    /// guard only after settlement; with no wait budget they are in flight.
+    #[tokio::test]
+    async fn candidate_transitions_answer_only_after_settlement() -> Result<()> {
+        use rpc::{CandidateTransitionKind, CandidateTransitionResult, ViewOperation};
+
+        async fn request(
+            client: &mut LocalStream,
+            authority: &EndpointAuthority,
+            call: ServiceCall,
+        ) -> Result<ServiceValue> {
+            rpc::resolve_response(
+                rpc::exchange_attached_with_id(client, authority, uuid::Uuid::new_v4(), call)
+                    .await?,
+            )
+        }
+
+        fn transition(response: rpc::ServiceResponse) -> Result<CandidateTransitionResult> {
+            match rpc::resolve_response(response)? {
+                ServiceValue::CandidateTransitionOutcome(result) => Ok(result),
+                other => bail!("transition query returned {other:?}"),
+            }
+        }
+
+        /// Pause `call` at settlement, show a zero-budget query in flight,
+        /// then show a budgeted query waiting until release.
+        async fn paused_transition(
+            fx: &mut SettlementFixture,
+            events: &mut tokio::sync::mpsc::UnboundedReceiver<rpc::WaitEvent>,
+            mut client: LocalStream,
+            id: uuid::Uuid,
+            call: ServiceCall,
+            query: impl Fn() -> ServiceCall,
+        ) -> Result<(rpc::ServiceResponse, CandidateTransitionResult)> {
+            let pause = std::sync::Arc::new(rpc::SettlementPause::default());
+            fx.progress.pause_settlement_next(pause.clone());
+            let authority = fx.authority.clone();
+            let mut writer = tokio::spawn(async move {
+                rpc::exchange_attached_with_id(&mut client, &authority, id, call).await
+            });
+            let observed = async {
+                tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+                    .await
+                    .context("transition did not reach settlement")?;
+                fx.progress.set_settlement_wait(Some(Duration::ZERO));
+                let unbudgeted = transition(fx.call(query()).await?)?;
+                ensure!(
+                    matches!(unbudgeted, CandidateTransitionResult::InFlight),
+                    "zero-budget transition query reported {unbudgeted:?}"
+                );
+                ensure!(next_wait_event(events).await? == rpc::WaitEvent::Entered);
+                ensure!(
+                    next_wait_event(events).await?
+                        == rpc::WaitEvent::Ended(rpc::SettlementWaitEnd::Exhausted)
+                );
+                fx.progress.set_settlement_wait(None);
+                let waiting = fx.spawn_one(uuid::Uuid::new_v4(), query()).await?;
+                ensure!(next_wait_event(events).await? == rpc::WaitEvent::Entered);
+                ensure!(
+                    !waiting.is_finished(),
+                    "transition query answered before settlement"
+                );
+                pause.release.notify_one();
+                let answered = transition(waiting.finish().await?)?;
+                ensure!(
+                    next_wait_event(events).await?
+                        == rpc::WaitEvent::Ended(rpc::SettlementWaitEnd::Settled)
+                );
+                let written = tokio::time::timeout(Duration::from_secs(20), &mut writer)
+                    .await
+                    .context("transition writer did not finish")???;
+                Ok((written, answered))
+            }
+            .await;
+            pause.release.notify_one();
+            writer.abort();
+            observed
+        }
+
+        settled_fixture(async |fx| {
+            let mut events = fx.progress.watch_waits();
+            let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(rpc::FRAME_BUDGET_MIB));
+            let retirement = std::sync::Arc::new(rpc::Retirement::default());
+            for kind in [CandidateTransitionKind::Promote, CandidateTransitionKind::Abandon] {
+                let (mut client, served) = fx.attach_managed(&budget, &retirement).await?;
+                let ServiceValue::CandidateStarted { handle, base, branch } = request(
+                    &mut client,
+                    &fx.authority,
+                    ServiceCall::BeginCandidate { label: "settled transition".into() },
+                )
+                .await?
+                else {
+                    bail!("service did not start the candidate")
+                };
+                ensure!(matches!(
+                    request(
+                        &mut client,
+                        &fx.authority,
+                        ServiceCall::View {
+                            candidate: Some(handle),
+                            operation: Box::new(ViewOperation::PutMany {
+                                values: vec![("private".into(), serde_json::json!(1))],
+                            }),
+                        },
+                    )
+                    .await?,
+                    ServiceValue::Unit
+                ));
+                let ServiceValue::Revision(target) = request(
+                    &mut client,
+                    &fx.authority,
+                    ServiceCall::View {
+                        candidate: Some(handle),
+                        operation: Box::new(ViewOperation::Revision),
+                    },
+                )
+                .await?
+                else {
+                    bail!("service did not report the candidate target")
+                };
+                let id = uuid::Uuid::new_v4();
+                let call = match kind {
+                    CandidateTransitionKind::Promote => ServiceCall::PromoteCandidate {
+                        handle,
+                        branch: branch.clone(),
+                        base: base.clone(),
+                        target: target.clone(),
+                    },
+                    CandidateTransitionKind::Abandon => ServiceCall::AbandonCandidate {
+                        handle,
+                        branch: branch.clone(),
+                        base: base.clone(),
+                        target: target.clone(),
+                    },
+                };
+                let generation = fx.authority.service_generation.clone();
+                let expected = target.clone();
+                let query = move || ServiceCall::CandidateTransitionOutcome {
+                    original_id: id,
+                    original_generation: generation.clone(),
+                    transition: kind,
+                    branch: branch.clone(),
+                    base: base.clone(),
+                    target: expected.clone(),
+                };
+                let (written, answered) =
+                    paused_transition(fx, &mut events, client, id, call, query).await?;
+                match kind {
+                    CandidateTransitionKind::Promote => {
+                        ensure!(matches!(
+                            rpc::resolve_response(written)?,
+                            ServiceValue::Revision(revision) if revision == target
+                        ));
+                        ensure!(
+                            matches!(&answered, CandidateTransitionResult::Promoted { revision } if *revision == target),
+                            "settled promotion reported {answered:?}"
+                        );
+                    }
+                    CandidateTransitionKind::Abandon => {
+                        ensure!(matches!(rpc::resolve_response(written)?, ServiceValue::Unit));
+                        ensure!(
+                            matches!(answered, CandidateTransitionResult::Abandoned),
+                            "settled abandonment reported {answered:?}"
+                        );
+                    }
+                }
+                tokio::time::timeout(Duration::from_secs(10), served)
+                    .await
+                    .context("transition attachment did not end")???;
+            }
+
+            // Selected abandonment needs a managed owner with no other
+            // counted attachment; the queries are unmanaged.
+            let candidate = fx.owner.store.begin_candidate("selected abandonment").await?;
+            let branch = candidate.view().pinned_view().to_owned();
+            let base = candidate.base().to_owned();
+            candidate.view().put("private", &serde_json::json!(2)).await?;
+            let target = candidate.view().revision().await?;
+            drop(candidate);
+            let (client, served) = fx.attach_managed(&budget, &retirement).await?;
+            let id = uuid::Uuid::new_v4();
+            let (written, answered) = paused_transition(
+                fx,
+                &mut events,
+                client,
+                id,
+                ServiceCall::AbandonCandidateRef {
+                    branch: branch.clone(),
+                    base: base.clone(),
+                    target: target.clone(),
+                },
+                {
+                    let generation = fx.authority.service_generation.clone();
+                    move || ServiceCall::SelectedAbandonOutcome {
+                        original_id: id,
+                        original_generation: generation.clone(),
+                        branch: branch.clone(),
+                        base: base.clone(),
+                        target: target.clone(),
+                    }
+                },
+            )
+            .await?;
+            ensure!(matches!(rpc::resolve_response(written)?, ServiceValue::Unit));
+            ensure!(
+                matches!(answered, CandidateTransitionResult::Abandoned),
+                "settled selected abandonment reported {answered:?}"
+            );
+            tokio::time::timeout(Duration::from_secs(10), served)
+                .await
+                .context("selected abandonment attachment did not end")???;
+            Ok(())
+        })
+        .await
+    }
+
+    /// T7: candidate creation is read under the guard after settlement.
+    #[tokio::test]
+    async fn candidate_creation_answers_open_after_settlement() -> Result<()> {
+        settled_fixture(async |fx| {
+            let mut events = fx.progress.watch_waits();
+            let pause = std::sync::Arc::new(rpc::SettlementPause::default());
+            fx.progress.pause_settlement_next(pause.clone());
+            let id = uuid::Uuid::new_v4();
+            let writer = fx
+                .spawn_one(
+                    id,
+                    ServiceCall::BeginCandidate {
+                        label: "settled creation".into(),
+                    },
+                )
+                .await?;
+            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+                .await
+                .context("candidate creation did not reach settlement")?;
+            let query = fx
+                .spawn_one(
+                    uuid::Uuid::new_v4(),
+                    ServiceCall::CandidateOutcome {
+                        original_id: id,
+                        original_generation: fx.authority.service_generation.clone(),
+                    },
+                )
+                .await?;
+            ensure!(next_wait_event(&mut events).await? == rpc::WaitEvent::Entered);
+            ensure!(
+                !query.is_finished(),
+                "creation query answered before settlement"
+            );
+            pause.release.notify_one();
+            let ServiceValue::CandidateOutcome(rpc::CandidateCreationOutcome::Open {
+                base: observed_base,
+                branch: observed_branch,
+                ..
+            }) = rpc::resolve_response(query.finish().await?)?
+            else {
+                bail!("settled candidate creation was not reported open")
+            };
+            let ServiceValue::CandidateStarted { base, branch, .. } =
+                rpc::resolve_response(writer.finish().await?)?
+            else {
+                bail!("candidate creation did not start")
+            };
+            ensure!(observed_base == base && observed_branch == branch);
+            Ok(())
+        })
+        .await
+    }
+
+    /// T10: a handler dropped before it returned never proves absence.
+    #[tokio::test]
+    async fn dropped_registered_write_is_not_reported_absent() -> Result<()> {
+        settled_fixture(async |fx| {
+            let pause = std::sync::Arc::new(rpc::RegisteredPause::default());
+            fx.progress.pause_next(pause.clone());
+            let id = uuid::Uuid::new_v4();
+            let write = append("dropped before dispatch");
+            let outcome = unit_outcome(&fx.authority, id, &write)?;
+            let mut writer = fx.spawn_one(id, write).await?;
+            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+                .await
+                .context("write did not register")?;
+            writer.server.abort();
+            let aborted = tokio::time::timeout(Duration::from_secs(10), &mut writer.server)
+                .await
+                .context("aborted serve task did not end")?;
+            ensure!(aborted.is_err_and(|error| error.is_cancelled()));
+            drop(writer);
+            let reported = outcome_status(fx.call(outcome()).await?)?;
+            ensure!(
+                reported == rpc::OutcomeStatus::StillUncertain,
+                "dropped handler was reported {reported:?}"
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    /// T11: the lock-free probe keeps the receipt-conflict fault.
+    #[tokio::test]
+    async fn probe_reports_a_conflicting_receipt_as_a_fault() -> Result<()> {
+        settled_fixture(async |fx| {
+            let pause = std::sync::Arc::new(rpc::SettlementPause::default());
+            fx.progress.pause_settlement_next(pause.clone());
+            let id = uuid::Uuid::new_v4();
+            let write = append("the original arguments");
+            let conflicting = unit_outcome(&fx.authority, id, &append("different arguments"))?;
+            let writer = fx.spawn_one(id, write).await?;
+            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+                .await
+                .context("write did not reach settlement")?;
+            let response = fx.call(conflicting()).await?;
+            ensure!(
+                matches!(
+                    response,
+                    rpc::ServiceResponse::Rejected(rpc::ServiceFault::ReceiptConflict)
+                ),
+                "conflicting receipt was reported {response:?}"
+            );
+            pause.release.notify_one();
+            ensure!(matches!(
+                rpc::resolve_response(writer.finish().await?)?,
+                ServiceValue::Unit
+            ));
+            Ok(())
+        })
+        .await
+    }
+
+    /// T12 (lead condition 1): a waiting outcome query holds no write guard;
+    /// other attachments read and write while it waits.
+    #[tokio::test]
+    async fn outcome_wait_leaves_other_attachments_free() -> Result<()> {
+        settled_fixture(async |fx| {
+            let mut events = fx.progress.watch_waits();
+            let pause = std::sync::Arc::new(rpc::RegisteredPause::default());
+            fx.progress.pause_next(pause.clone());
+            let id = uuid::Uuid::new_v4();
+            let write = append("paused writer");
+            let outcome = unit_outcome(&fx.authority, id, &write)?;
+            let writer = fx.spawn_one(id, write).await?;
+            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+                .await
+                .context("write did not register")?;
+            let query = fx.spawn_one(uuid::Uuid::new_v4(), outcome()).await?;
+            ensure!(next_wait_event(&mut events).await? == rpc::WaitEvent::Entered);
+            let read = fx
+                .call(ServiceCall::Get {
+                    key: "absent".into(),
+                })
+                .await?;
+            ensure!(matches!(
+                rpc::resolve_response(read)?,
+                ServiceValue::StoredValue(None)
+            ));
+            let written = fx.call(append("another session's write")).await?;
+            ensure!(matches!(
+                rpc::resolve_response(written)?,
+                ServiceValue::Unit
+            ));
+            ensure!(!query.is_finished(), "query answered before settlement");
+            ensure!(!writer.is_finished(), "paused writer finished");
+            pause.release.notify_one();
+            let reported = outcome_status(query.finish().await?)?;
+            ensure!(
+                reported == rpc::OutcomeStatus::Committed,
+                "query reported {reported:?}"
+            );
+            ensure!(matches!(
+                rpc::resolve_response(writer.finish().await?)?,
+                ServiceValue::Unit
+            ));
+            Ok(())
+        })
+        .await
+    }
+
+    /// T13 (lead condition 1): when the querying client disconnects or is
+    /// cancelled, the owner's wait ends while the writer is still paused, and
+    /// the attachment's frame budget, retirement count and waiter are released.
+    #[tokio::test]
+    async fn outcome_wait_ends_when_its_client_leaves() -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        settled_fixture(async |fx| {
+            let mut events = fx.progress.watch_waits();
+            let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(rpc::FRAME_BUDGET_MIB));
+            let retirement = std::sync::Arc::new(rpc::Retirement::default());
+            for cancel in [false, true] {
+                let pause = std::sync::Arc::new(rpc::RegisteredPause::default());
+                fx.progress.pause_next(pause.clone());
+                let id = uuid::Uuid::new_v4();
+                let write = append(if cancel {
+                    "cancelled query"
+                } else {
+                    "disconnected query"
+                });
+                let outcome = unit_outcome(&fx.authority, id, &write)?;
+                let writer = fx.spawn_one(id, write).await?;
+                tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+                    .await
+                    .context("write did not register")?;
+                ensure!(retirement.active_for_test() == 0);
+                let (mut client, served) = fx.attach_managed(&budget, &retirement).await?;
+                ensure!(retirement.active_for_test() == 1);
+                let client = if cancel {
+                    let authority = fx.authority.clone();
+                    let query = outcome();
+                    let call = tokio::spawn(async move {
+                        rpc::exchange_attached_with_id(
+                            &mut client,
+                            &authority,
+                            uuid::Uuid::new_v4(),
+                            query,
+                        )
+                        .await
+                    });
+                    ensure!(next_wait_event(&mut events).await? == rpc::WaitEvent::Entered);
+                    call.abort();
+                    let cancelled = tokio::time::timeout(Duration::from_secs(10), call)
+                        .await
+                        .context("cancelled client call did not end")?;
+                    ensure!(cancelled.is_err_and(|error| error.is_cancelled()));
+                    None
+                } else {
+                    let request =
+                        rpc::ServiceRequest::new(&fx.authority.service_generation, outcome());
+                    let body = serde_json::to_vec(&request)?;
+                    client.write_all(&(body.len() as u32).to_be_bytes()).await?;
+                    client.write_all(&body).await?;
+                    client.flush().await?;
+                    ensure!(next_wait_event(&mut events).await? == rpc::WaitEvent::Entered);
+                    Some(client)
+                };
+                drop(client);
+                ensure!(
+                    next_wait_event(&mut events).await?
+                        == rpc::WaitEvent::Ended(rpc::SettlementWaitEnd::ClientGone),
+                    "query wait did not end on client departure"
+                );
+                ensure!(
+                    !writer.is_finished(),
+                    "writer settled before the client left"
+                );
+                let ended = tokio::time::timeout(Duration::from_secs(10), served)
+                    .await
+                    .context("query attachment did not end")??;
+                if let Err(error) = ended {
+                    ensure!(is_peer_closed(&error), "query attachment failed: {error:#}");
+                }
+                ensure!(budget.available_permits() == rpc::FRAME_BUDGET_MIB);
+                ensure!(retirement.active_for_test() == 0);
+                ensure!(fx.progress.waiters_for_test() == 0);
+                pause.release.notify_one();
+                ensure!(matches!(
+                    rpc::resolve_response(writer.finish().await?)?,
+                    ServiceValue::Unit
+                ));
+                let reported = outcome_status(fx.call(outcome()).await?)?;
+                ensure!(
+                    reported == rpc::OutcomeStatus::Committed,
+                    "fresh query reported {reported:?}"
+                );
+            }
+            Ok(())
+        })
+        .await
     }
 
     #[tokio::test]

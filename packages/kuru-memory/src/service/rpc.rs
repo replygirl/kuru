@@ -710,10 +710,24 @@ struct ProgressState {
 /// In-process proof for a same-generation outcome query. Eviction can only
 /// turn a definitive absence into "still uncertain", never the reverse.
 #[derive(Default)]
-pub(super) struct ReceiptProgress(
-    StdMutex<ProgressState>,
-    #[cfg(test)] StdMutex<Option<Arc<RegisteredPause>>>,
-);
+pub(super) struct ReceiptProgress {
+    state: StdMutex<ProgressState>,
+    /// Woken whenever a registered request ends; waiters re-sample their key.
+    settled: Notify,
+    #[cfg(test)]
+    seams: ProgressSeams,
+}
+
+/// Owner-local test seams. None of them changes what a request does.
+#[cfg(test)]
+#[derive(Default)]
+struct ProgressSeams {
+    registered: StdMutex<Option<Arc<RegisteredPause>>>,
+    settlement: StdMutex<Option<Arc<SettlementPause>>>,
+    settlement_wait: StdMutex<Option<std::time::Duration>>,
+    events: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<WaitEvent>>>,
+    waiters: AtomicUsize,
+}
 
 /// One owner-local test barrier after a mutating request has registered its
 /// receipt key and before it can reach Dolt. Outcome requests remain unpaused.
@@ -722,6 +736,33 @@ pub(super) struct ReceiptProgress(
 pub(super) struct RegisteredPause {
     pub entered: Notify,
     pub release: Notify,
+}
+
+/// One owner-local test barrier after a registered request's handler returned
+/// its value and before the request settles: its effect is already durable
+/// while its key still reads as running. Outcome requests remain unpaused.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct SettlementPause {
+    pub entered: Notify,
+    pub release: Notify,
+}
+
+/// Ordered observations of outcome queries waiting for settlement.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WaitEvent {
+    Entered,
+    Ended(SettlementWaitEnd),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SettlementWaitEnd {
+    Settled,
+    Exhausted,
+    ClientGone,
+    ClientProtocolViolation,
 }
 
 #[derive(Clone, Copy)]
@@ -734,20 +775,29 @@ enum ReceiptProgressState {
 struct RunningReceipt {
     progress: Arc<ReceiptProgress>,
     key: ReceiptKey,
+    settled: bool,
+}
+
+impl RunningReceipt {
+    /// The request's handler returned a value, success or fault.
+    fn settle(mut self) {
+        self.settled = true;
+    }
 }
 
 impl ReceiptProgress {
     fn begin(self: &Arc<Self>, key: ReceiptKey) -> RunningReceipt {
-        let mut state = self.0.lock().expect("receipt progress lock");
+        let mut state = self.state.lock().expect("receipt progress lock");
         *state.running.entry(key.clone()).or_default() += 1;
         RunningReceipt {
             progress: self.clone(),
             key,
+            settled: false,
         }
     }
 
     fn status(&self, key: &ReceiptKey) -> ReceiptProgressState {
-        let state = self.0.lock().expect("receipt progress lock");
+        let state = self.state.lock().expect("receipt progress lock");
         if state.running.contains_key(key) {
             ReceiptProgressState::Running
         } else if state.completed.contains(key) {
@@ -759,12 +809,44 @@ impl ReceiptProgress {
 
     #[cfg(test)]
     pub(super) fn pause_next(&self, pause: Arc<RegisteredPause>) {
-        *self.1.lock().expect("receipt pause lock") = Some(pause);
+        *self.seams.registered.lock().expect("receipt pause lock") = Some(pause);
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_settlement_next(&self, pause: Arc<SettlementPause>) {
+        *self.seams.settlement.lock().expect("receipt pause lock") = Some(pause);
+    }
+
+    /// Replace the settlement wait limit; `ZERO` answers in flight at once.
+    #[cfg(test)]
+    pub(super) fn set_settlement_wait(&self, limit: Option<std::time::Duration>) {
+        *self
+            .seams
+            .settlement_wait
+            .lock()
+            .expect("settlement wait lock") = limit;
+    }
+
+    #[cfg(test)]
+    pub(super) fn watch_waits(&self) -> tokio::sync::mpsc::UnboundedReceiver<WaitEvent> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *self.seams.events.lock().expect("wait event lock") = Some(sender);
+        receiver
+    }
+
+    #[cfg(test)]
+    pub(super) fn waiters_for_test(&self) -> usize {
+        self.seams.waiters.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
     async fn pause_after_registration(&self) -> Result<()> {
-        let pause = self.1.lock().expect("receipt pause lock").take();
+        let pause = self
+            .seams
+            .registered
+            .lock()
+            .expect("receipt pause lock")
+            .take();
         if let Some(pause) = pause {
             pause.entered.notify_one();
             tokio::time::timeout(std::time::Duration::from_secs(10), pause.release.notified())
@@ -773,11 +855,28 @@ impl ReceiptProgress {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    async fn pause_before_settlement(&self) -> Result<()> {
+        let pause = self
+            .seams
+            .settlement
+            .lock()
+            .expect("receipt pause lock")
+            .take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(10), pause.release.notified())
+                .await
+                .context("settlement test pause exceeded 10 seconds")?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for RunningReceipt {
     fn drop(&mut self) {
-        let mut state = self.progress.0.lock().expect("receipt progress lock");
+        let mut state = self.progress.state.lock().expect("receipt progress lock");
         let remaining = state
             .running
             .get_mut(&self.key)
@@ -838,6 +937,11 @@ impl Retirement {
 
     pub(super) fn notified(&self) -> impl std::future::Future<Output = ()> + '_ {
         self.notify.notified()
+    }
+
+    #[cfg(test)]
+    pub(super) fn active_for_test(&self) -> usize {
+        self.active.load(Ordering::Acquire)
     }
 
     fn request_if_idle(&self) -> bool {
@@ -1030,104 +1134,126 @@ async fn respond<S: AsyncWrite + Unpin>(
     request: ServiceRequest,
 ) -> Result<()> {
     let response = if request.generation == authority.service_generation {
-        let processed = async {
-            let key = receipt_progress_key(&request.call, request.id, state, store)?;
-            let _running = key.map(|key| progress.begin(key));
-            #[cfg(test)]
-            if _running.is_some() {
-                progress.pause_after_registration().await?;
-            }
-            match request.call {
-                ServiceCall::Outcome {
-                    original_id,
-                    original_generation,
-                    view,
-                    method,
-                    argument_digest,
-                } => {
-                    reconcile_outcome(
-                        store,
-                        authority,
-                        progress,
-                        OutcomeQuery {
-                            id: original_id,
-                            original_generation: &original_generation,
-                            view: &view,
-                            method: &method,
-                            argument_digest: &argument_digest,
-                        },
-                    )
-                    .await
+        // The receipt outlives the handler future's value so that it settles
+        // only after the handler returned; a dropped future never settles.
+        let (running, processed) =
+            match receipt_progress_key(&request.call, request.id, state, store) {
+                Err(error) => (None, Err(error)),
+                Ok(key) => {
+                    let running = key.map(|key| progress.begin(key));
+                    let processed = async {
+                        #[cfg(test)]
+                        if running.is_some() {
+                            progress.pause_after_registration().await?;
+                        }
+                        match request.call {
+                            ServiceCall::Outcome {
+                                original_id,
+                                original_generation,
+                                view,
+                                method,
+                                argument_digest,
+                            } => {
+                                reconcile_outcome(
+                                    store,
+                                    authority,
+                                    progress,
+                                    OutcomeQuery {
+                                        id: original_id,
+                                        original_generation: &original_generation,
+                                        view: &view,
+                                        method: &method,
+                                        argument_digest: &argument_digest,
+                                    },
+                                )
+                                .await
+                            }
+                            ServiceCall::CandidateOutcome {
+                                original_id,
+                                original_generation,
+                            } => {
+                                candidate_outcome(
+                                    store,
+                                    state,
+                                    progress,
+                                    original_id,
+                                    &original_generation,
+                                )
+                                .await
+                            }
+                            ServiceCall::LedgerOutcome {
+                                original_id,
+                                original_generation,
+                                proof,
+                            } => {
+                                ledger_outcome(
+                                    store,
+                                    authority,
+                                    progress,
+                                    original_id,
+                                    &original_generation,
+                                    &proof,
+                                )
+                                .await
+                            }
+                            ServiceCall::CandidateTransitionOutcome {
+                                original_id,
+                                original_generation,
+                                transition,
+                                branch,
+                                base,
+                                target,
+                            } => {
+                                candidate_transition_outcome(
+                                    store,
+                                    authority,
+                                    progress,
+                                    original_id,
+                                    &original_generation,
+                                    transition,
+                                    &branch,
+                                    &base,
+                                    &target,
+                                    false,
+                                )
+                                .await
+                            }
+                            ServiceCall::SelectedAbandonOutcome {
+                                original_id,
+                                original_generation,
+                                branch,
+                                base,
+                                target,
+                            } => {
+                                candidate_transition_outcome(
+                                    store,
+                                    authority,
+                                    progress,
+                                    original_id,
+                                    &original_generation,
+                                    CandidateTransitionKind::Abandon,
+                                    &branch,
+                                    &base,
+                                    &target,
+                                    true,
+                                )
+                                .await
+                            }
+                            call => dispatch(store, state, retirement, request.id, call).await,
+                        }
+                    }
+                    .await;
+                    (running, processed)
                 }
-                ServiceCall::CandidateOutcome {
-                    original_id,
-                    original_generation,
-                } => {
-                    candidate_outcome(store, state, progress, original_id, &original_generation)
-                        .await
-                }
-                ServiceCall::LedgerOutcome {
-                    original_id,
-                    original_generation,
-                    proof,
-                } => {
-                    ledger_outcome(
-                        store,
-                        authority,
-                        progress,
-                        original_id,
-                        &original_generation,
-                        &proof,
-                    )
-                    .await
-                }
-                ServiceCall::CandidateTransitionOutcome {
-                    original_id,
-                    original_generation,
-                    transition,
-                    branch,
-                    base,
-                    target,
-                } => {
-                    candidate_transition_outcome(
-                        store,
-                        authority,
-                        progress,
-                        original_id,
-                        &original_generation,
-                        transition,
-                        &branch,
-                        &base,
-                        &target,
-                        false,
-                    )
-                    .await
-                }
-                ServiceCall::SelectedAbandonOutcome {
-                    original_id,
-                    original_generation,
-                    branch,
-                    base,
-                    target,
-                } => {
-                    candidate_transition_outcome(
-                        store,
-                        authority,
-                        progress,
-                        original_id,
-                        &original_generation,
-                        CandidateTransitionKind::Abandon,
-                        &branch,
-                        &base,
-                        &target,
-                        true,
-                    )
-                    .await
-                }
-                call => dispatch(store, state, retirement, request.id, call).await,
-            }
+            };
+        #[cfg(test)]
+        let processed = match running.is_some() {
+            true => progress.pause_before_settlement().await.and(processed),
+            false => processed,
+        };
+        if let Some(running) = running {
+            running.settle();
         }
-        .await;
         match processed {
             Ok(value) => ServiceResponse::Success(Box::new(value)),
             Err(error) => {
@@ -2400,6 +2526,101 @@ mod tests {
             changed_mode.unit_receipt_fingerprint("main")?
         );
         Ok(())
+    }
+
+    fn receipt_key() -> ReceiptKey {
+        ReceiptKey {
+            view: "main".into(),
+            id: Uuid::new_v4(),
+        }
+    }
+
+    fn is_unknown(progress: &ReceiptProgress, key: &ReceiptKey) -> bool {
+        matches!(progress.status(key), ReceiptProgressState::Unknown)
+    }
+
+    /// T14 (a): a later same-ID request whose handler was dropped makes the
+    /// key unknown for the rest of the generation, whatever settles later.
+    #[test]
+    fn unsettled_drop_after_a_settled_request_keeps_the_key_unknown() {
+        let progress = Arc::new(ReceiptProgress::default());
+        let key = receipt_key();
+        progress.begin(key.clone()).settle();
+        assert!(matches!(
+            progress.status(&key),
+            ReceiptProgressState::Completed
+        ));
+        drop(progress.begin(key.clone()));
+        assert!(is_unknown(&progress, &key));
+        progress.begin(key.clone()).settle();
+        assert!(is_unknown(&progress, &key));
+    }
+
+    /// T14 (b): with two concurrent same-key requests, one dropped unsettled
+    /// keeps the key unknown in either completion order.
+    #[test]
+    fn concurrent_unsettled_drop_keeps_the_key_unknown_in_either_order() {
+        let progress = Arc::new(ReceiptProgress::default());
+        let key = receipt_key();
+        let settled = progress.begin(key.clone());
+        let dropped = progress.begin(key.clone());
+        drop(dropped);
+        assert!(matches!(
+            progress.status(&key),
+            ReceiptProgressState::Running
+        ));
+        settled.settle();
+        assert!(is_unknown(&progress, &key));
+
+        let key = receipt_key();
+        let settled = progress.begin(key.clone());
+        let dropped = progress.begin(key.clone());
+        settled.settle();
+        drop(dropped);
+        assert!(is_unknown(&progress, &key));
+    }
+
+    /// T14 (c): overflowing the bounded unsettled marks makes every key that
+    /// is not running unknown, never completed, for the generation.
+    #[test]
+    fn unsettled_overflow_makes_every_idle_key_unknown() {
+        let progress = Arc::new(ReceiptProgress::default());
+        let earlier = receipt_key();
+        progress.begin(earlier.clone()).settle();
+        for _ in 0..=COMPLETED_RECEIPT_WINDOW {
+            drop(progress.begin(receipt_key()));
+        }
+        assert!(is_unknown(&progress, &earlier));
+        let later = receipt_key();
+        let running = progress.begin(later.clone());
+        assert!(matches!(
+            progress.status(&later),
+            ReceiptProgressState::Running
+        ));
+        running.settle();
+        assert!(is_unknown(&progress, &later));
+    }
+
+    /// T14 (d): every request end, settled or not, wakes settlement waiters.
+    #[test]
+    fn every_request_end_wakes_settlement_waiters() {
+        use futures::FutureExt;
+
+        let progress = Arc::new(ReceiptProgress::default());
+        for settle in [true, false] {
+            let running = progress.begin(receipt_key());
+            let mut notified = std::pin::pin!(progress.settled.notified());
+            notified.as_mut().enable();
+            if settle {
+                running.settle();
+            } else {
+                drop(running);
+            }
+            assert!(
+                notified.now_or_never().is_some(),
+                "request end (settled: {settle}) did not wake a waiter"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
