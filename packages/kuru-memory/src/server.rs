@@ -118,6 +118,9 @@ struct ServerInner {
     candidate_wait_observer: Mutex<Option<oneshot::Sender<()>>>,
     #[cfg(test)]
     next_pool_probe_delay: StdMutex<Option<(Duration, Arc<AtomicBool>)>>,
+    /// Every branch or revision a caller asked [`Server::pool`] for, in order.
+    #[cfg(test)]
+    pool_requests: StdMutex<Vec<String>>,
     owner: Mutex<Option<Owner>>,
     reap_guard: Arc<StdMutex<Option<File>>>,
     closed: AtomicBool,
@@ -772,6 +775,8 @@ impl Server {
             candidate_wait_observer: Mutex::new(None),
             #[cfg(test)]
             next_pool_probe_delay: StdMutex::new(None),
+            #[cfg(test)]
+            pool_requests: StdMutex::new(Vec::new()),
             owner: Mutex::new(owner),
             reap_guard,
             closed: AtomicBool::new(false),
@@ -779,6 +784,12 @@ impl Server {
     }
 
     pub async fn pool(&self, branch: &str) -> Result<Arc<MySqlPool>> {
+        #[cfg(test)]
+        self.0
+            .pool_requests
+            .lock()
+            .expect("pool request log lock")
+            .push(branch.to_owned());
         let _admission = self.fence_pool(branch).await?;
         let mut pools = self.0.pools.lock().await;
         ensure!(
@@ -908,6 +919,17 @@ impl Server {
             "candidate wait observer already installed"
         );
         receiver
+    }
+
+    /// The branches and revisions [`Self::pool`] was asked for so far, in order,
+    /// including requests a cached pool answered.
+    #[cfg(test)]
+    pub(crate) fn pool_requests(&self) -> Vec<String> {
+        self.0
+            .pool_requests
+            .lock()
+            .expect("pool request log lock")
+            .clone()
     }
 
     #[cfg(test)]

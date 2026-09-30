@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use kuru_core::Mode;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use sqlx::{MySqlPool, Row};
+use sqlx::{Connection, Executor, MySql, MySqlConnection, MySqlPool, Row};
 use std::collections::BTreeSet;
 use uuid::Uuid;
 
@@ -20,6 +20,8 @@ use crate::server::Server;
 
 pub(super) const CURRENT_VERSION: i32 = 7;
 pub(super) const USAGE_CURRENT_VERSION: i32 = 4;
+/// The engine database every branch and revision database name qualifies.
+const DATABASE: &str = "kuru";
 const RESERVED_PREFIX: &str = "kuru_migration_";
 const USAGE_RESERVED_PREFIX: &str = "kuru_usage_migration_";
 const INVENTORY_LIMIT: usize = 64;
@@ -624,12 +626,18 @@ fn hash_field(hash: &mut Sha256, tag: &[u8], value: &[u8]) {
     hash.update(value);
 }
 
+const VERSION_QUERY: &str = "SELECT id, version FROM kuru_schema LIMIT 2";
+
 pub(super) async fn version(pool: &MySqlPool) -> Result<i32> {
-    version_from_query(pool, "SELECT id, version FROM kuru_schema LIMIT 2").await
+    version_from(pool).await
 }
 
-async fn version_from_query(pool: &MySqlPool, query: &'static str) -> Result<i32> {
-    let rows = bounded_query(sqlx::query(query).fetch_all(pool))
+async fn version_on(connection: &mut MySqlConnection) -> Result<i32> {
+    version_from(connection).await
+}
+
+async fn version_from<'e>(executor: impl sqlx::Executor<'e, Database = MySql>) -> Result<i32> {
+    let rows = bounded_query(sqlx::query(VERSION_QUERY).fetch_all(executor))
         .await
         .context("database is not an initialized Kuru memory store")?;
     ensure!(
@@ -660,32 +668,53 @@ pub(super) async fn validate_historical(pool: &MySqlPool) -> Result<i32> {
 
 async fn validate_supported_with(registry: Registry, pool: &MySqlPool) -> Result<i32> {
     registry.validate()?;
-    let found = version(pool).await?;
-    validate_version_with(registry, pool, found).await?;
+    let mut connection = acquire(pool).await?;
+    let found = version_on(&mut connection).await?;
+    validate_version_on(registry, &mut connection, found).await?;
     Ok(found)
 }
 
+/// One pooled connection for a whole validation pass. The schema validator
+/// runs on one session so the same checks can run on a detached connection
+/// whose database was switched to a revision (see `RevisionReader`).
+async fn acquire(pool: &MySqlPool) -> Result<sqlx::pool::PoolConnection<MySql>> {
+    bounded_query(pool.acquire()).await
+}
+
 async fn validate_version_with(registry: Registry, pool: &MySqlPool, expected: i32) -> Result<()> {
-    let found = version(pool).await?;
+    let mut connection = acquire(pool).await?;
+    validate_version_on(registry, &mut connection, expected).await
+}
+
+async fn validate_version_on(
+    registry: Registry,
+    connection: &mut MySqlConnection,
+    expected: i32,
+) -> Result<()> {
+    let found = version_on(connection).await?;
     ensure!(
         found == expected,
         "Dolt migration branch has schema version {found}, expected {expected}"
     );
-    validate_schema_with(registry, pool, expected).await
+    validate_schema_on(registry, connection, expected).await
 }
 
-async fn validate_schema_with(registry: Registry, pool: &MySqlPool, found: i32) -> Result<()> {
+async fn validate_schema_on(
+    registry: Registry,
+    connection: &mut MySqlConnection,
+    found: i32,
+) -> Result<()> {
     ensure!(
         (1..=registry.current).contains(&found),
         "unsupported Dolt memory schema version {found}"
     );
-    validate_schema_v1(pool).await?;
+    validate_schema_v1(connection).await?;
     if found == 1 {
         let receipt_tables: i64 = bounded_query(
             sqlx::query_scalar(
                 "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND BINARY table_name = BINARY 'kuru_migrations'",
             )
-            .fetch_one(pool),
+            .fetch_one(&mut *connection),
         )
         .await?;
         ensure!(
@@ -694,14 +723,16 @@ async fn validate_schema_with(registry: Registry, pool: &MySqlPool, found: i32) 
         );
     }
     if found >= 2 {
-        validate_receipts(registry, pool, found).await?;
+        validate_receipts(registry, connection, found).await?;
     }
     if found >= 3 {
-        bounded_query(sqlx::query("SELECT content_format FROM messages LIMIT 0").fetch_all(pool))
-            .await?;
+        bounded_query(
+            sqlx::query("SELECT content_format FROM messages LIMIT 0").fetch_all(&mut *connection),
+        )
+        .await?;
         let columns = bounded_query(
             sqlx::query("SELECT data_type, is_nullable, column_default, character_maximum_length, character_set_name, collation_name FROM information_schema.columns WHERE table_schema = DATABASE() AND BINARY table_name = BINARY 'messages' AND BINARY column_name = BINARY 'content_format'")
-                .fetch_all(pool),
+                .fetch_all(&mut *connection),
         )
         .await?;
         ensure!(
@@ -729,37 +760,38 @@ async fn validate_schema_with(registry: Registry, pool: &MySqlPool, found: i32) 
         );
     }
     if found >= 4 {
-        validate_operation_receipt_shape(pool).await?;
+        validate_operation_receipt_shape(connection).await?;
     }
     if found >= 5 {
-        validate_session_provenance_shape(pool, found).await?;
+        validate_session_provenance_shape(connection, found).await?;
     }
     if found >= 7 {
-        validate_session_lifecycle_shape(pool).await?;
+        validate_session_lifecycle_shape(connection).await?;
     }
     #[cfg(test)]
     if registry.current >= 8 && found >= 8 {
         bounded_query(
-            sqlx::query("SELECT marker FROM kuru_migration_test_v8 LIMIT 0").fetch_all(pool),
+            sqlx::query("SELECT marker FROM kuru_migration_test_v8 LIMIT 0")
+                .fetch_all(&mut *connection),
         )
         .await?;
     }
     Ok(())
 }
 
-async fn validate_session_lifecycle_shape(pool: &MySqlPool) -> Result<()> {
+async fn validate_session_lifecycle_shape(connection: &mut MySqlConnection) -> Result<()> {
     bounded_query(
         sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog LIMIT 0")
-            .fetch_all(pool),
+            .fetch_all(&mut *connection),
     )
     .await?;
     bounded_query(
         sqlx::query("SELECT node_id, origin_session_id, turn_id, record_kind, continuation_of_node_id, predecessor_node_id, settlement, user_entry, speaker_id, terminal_entries, record_format FROM session_public_turns LIMIT 0")
-            .fetch_all(pool),
+            .fetch_all(&mut *connection),
     )
     .await?;
     validate_columns(
-        pool,
+        connection,
         "session_catalog",
         &[
             ("session_id", "varbinary", Some(128), false),
@@ -778,7 +810,7 @@ async fn validate_session_lifecycle_shape(pool: &MySqlPool) -> Result<()> {
     )
     .await?;
     validate_columns(
-        pool,
+        connection,
         "session_public_turns",
         &[
             ("node_id", "char", Some(64), false),
@@ -795,9 +827,16 @@ async fn validate_session_lifecycle_shape(pool: &MySqlPool) -> Result<()> {
         ],
     )
     .await?;
-    validate_index(pool, "session_catalog", "PRIMARY", true, &["session_id"]).await?;
     validate_index(
-        pool,
+        connection,
+        "session_catalog",
+        "PRIMARY",
+        true,
+        &["session_id"],
+    )
+    .await?;
+    validate_index(
+        connection,
         "session_catalog",
         "session_catalog_created_order",
         true,
@@ -805,16 +844,23 @@ async fn validate_session_lifecycle_shape(pool: &MySqlPool) -> Result<()> {
     )
     .await?;
     validate_index(
-        pool,
+        connection,
         "session_catalog",
         "session_catalog_lifecycle_order",
         false,
         &["lifecycle_state", "updated_order", "session_id"],
     )
     .await?;
-    validate_index(pool, "session_public_turns", "PRIMARY", true, &["node_id"]).await?;
     validate_index(
-        pool,
+        connection,
+        "session_public_turns",
+        "PRIMARY",
+        true,
+        &["node_id"],
+    )
+    .await?;
+    validate_index(
+        connection,
         "session_public_turns",
         "session_public_turn_identity",
         true,
@@ -822,7 +868,7 @@ async fn validate_session_lifecycle_shape(pool: &MySqlPool) -> Result<()> {
     )
     .await?;
     validate_index(
-        pool,
+        connection,
         "session_public_turns",
         "session_public_turn_predecessor",
         false,
@@ -830,7 +876,7 @@ async fn validate_session_lifecycle_shape(pool: &MySqlPool) -> Result<()> {
     )
     .await?;
     validate_index(
-        pool,
+        connection,
         "session_public_turns",
         "session_public_turn_continuation",
         false,
@@ -840,11 +886,17 @@ async fn validate_session_lifecycle_shape(pool: &MySqlPool) -> Result<()> {
     Ok(())
 }
 
-async fn validate_session_provenance_shape(pool: &MySqlPool, version: i32) -> Result<()> {
-    bounded_query(sqlx::query("SELECT session_id FROM messages LIMIT 0").fetch_all(pool)).await?;
+async fn validate_session_provenance_shape(
+    connection: &mut MySqlConnection,
+    version: i32,
+) -> Result<()> {
+    bounded_query(
+        sqlx::query("SELECT session_id FROM messages LIMIT 0").fetch_all(&mut *connection),
+    )
+    .await?;
     let columns = bounded_query(
         sqlx::query("SELECT data_type, is_nullable, character_maximum_length FROM information_schema.columns WHERE table_schema = DATABASE() AND BINARY table_name = BINARY 'messages' AND BINARY column_name = BINARY 'session_id'")
-            .fetch_all(pool),
+            .fetch_all(&mut *connection),
     )
     .await?;
     ensure!(
@@ -861,10 +913,10 @@ async fn validate_session_provenance_shape(pool: &MySqlPool, version: i32) -> Re
     } else {
         "SELECT summary_id, actor_namespace, session_id, source_namespace, summary_namespace, source_view, source_revision, after_sequence, through_sequence, turn_id, invocation_id, record_format, summary FROM context_summaries LIMIT 0"
     };
-    bounded_query(sqlx::query(summary_projection).fetch_all(pool)).await?;
+    bounded_query(sqlx::query(summary_projection).fetch_all(&mut *connection)).await?;
     bounded_query(
         sqlx::query("SELECT actor_namespace, session_id, source_namespace, through_sequence, summary_id, source_view, source_revision FROM context_summary_cursors LIMIT 0")
-            .fetch_all(pool),
+            .fetch_all(&mut *connection),
     )
     .await?;
     let mut summary_columns = vec![
@@ -890,9 +942,9 @@ async fn validate_session_provenance_shape(pool: &MySqlPool, version: i32) -> Re
         ("record_format", "varchar", Some(32), false),
         ("summary", "longtext", None, false),
     ]);
-    validate_columns(pool, "context_summaries", &summary_columns).await?;
+    validate_columns(connection, "context_summaries", &summary_columns).await?;
     validate_columns(
-        pool,
+        connection,
         "context_summary_cursors",
         &[
             ("actor_namespace", "varbinary", Some(1024), false),
@@ -906,16 +958,23 @@ async fn validate_session_provenance_shape(pool: &MySqlPool, version: i32) -> Re
     )
     .await?;
     validate_index(
-        pool,
+        connection,
         "messages",
         "messages_namespace_session_sequence",
         false,
         &["namespace", "session_id", "sequence"],
     )
     .await?;
-    validate_index(pool, "context_summaries", "PRIMARY", true, &["summary_id"]).await?;
     validate_index(
-        pool,
+        connection,
+        "context_summaries",
+        "PRIMARY",
+        true,
+        &["summary_id"],
+    )
+    .await?;
+    validate_index(
+        connection,
         "context_summaries",
         "context_summary_source_range",
         true,
@@ -928,7 +987,7 @@ async fn validate_session_provenance_shape(pool: &MySqlPool, version: i32) -> Re
     )
     .await?;
     validate_index(
-        pool,
+        connection,
         "context_summary_cursors",
         "PRIMARY",
         true,
@@ -939,14 +998,14 @@ async fn validate_session_provenance_shape(pool: &MySqlPool, version: i32) -> Re
 }
 
 async fn validate_columns(
-    pool: &MySqlPool,
+    connection: &mut MySqlConnection,
     table: &str,
     expected: &[(&str, &str, Option<i64>, bool)],
 ) -> Result<()> {
     let rows = bounded_query(
         sqlx::query("SELECT column_name, data_type, is_nullable, character_maximum_length FROM information_schema.columns WHERE table_schema = DATABASE() AND BINARY table_name = BINARY ? ORDER BY ordinal_position")
             .bind(table)
-            .fetch_all(pool),
+            .fetch_all(&mut *connection),
     )
     .await?;
     ensure!(
@@ -972,7 +1031,7 @@ async fn validate_columns(
 }
 
 async fn validate_index(
-    pool: &MySqlPool,
+    connection: &mut MySqlConnection,
     table: &str,
     index: &str,
     unique: bool,
@@ -982,7 +1041,7 @@ async fn validate_index(
         sqlx::query("SELECT column_name, non_unique FROM information_schema.statistics WHERE table_schema = DATABASE() AND BINARY table_name = BINARY ? AND BINARY index_name = BINARY ? ORDER BY seq_in_index")
             .bind(table)
             .bind(index)
-            .fetch_all(pool),
+            .fetch_all(&mut *connection),
     )
     .await?;
     ensure!(
@@ -1000,17 +1059,17 @@ async fn validate_index(
     Ok(())
 }
 
-async fn validate_operation_receipt_shape(pool: &MySqlPool) -> Result<()> {
+async fn validate_operation_receipt_shape(connection: &mut MySqlConnection) -> Result<()> {
     bounded_query(
         sqlx::query(
             "SELECT receipt_format, method, request_digest, result_ref FROM operations LIMIT 0",
         )
-        .fetch_all(pool),
+        .fetch_all(&mut *connection),
     )
     .await?;
     let rows = bounded_query(
         sqlx::query("SELECT column_name, data_type, is_nullable, column_default, character_maximum_length, character_set_name, collation_name FROM information_schema.columns WHERE table_schema = DATABASE() AND BINARY table_name = BINARY 'operations' AND BINARY column_name IN (BINARY 'receipt_format', BINARY 'method', BINARY 'request_digest', BINARY 'result_ref')")
-            .fetch_all(pool),
+            .fetch_all(&mut *connection),
     )
     .await?;
     ensure!(
@@ -1091,26 +1150,26 @@ async fn validate_current_with(registry: Registry, pool: &MySqlPool) -> Result<(
     Ok(())
 }
 
-pub(super) async fn validate_active(server: &Server, pool: &MySqlPool) -> Result<()> {
-    validate_active_with(REGISTRY, server, pool).await
+pub(super) async fn validate_active(pool: &MySqlPool) -> Result<()> {
+    validate_active_with(REGISTRY, pool).await
 }
 
 /// Validate a current-schema read-only main without treating unrelated working
 /// data as a migration failure.
-pub(super) async fn validate_inspection(server: &Server, pool: &MySqlPool) -> Result<()> {
+pub(super) async fn validate_inspection(pool: &MySqlPool) -> Result<()> {
     validate_current_with(REGISTRY, pool).await?;
     authority_working_set(pool).await?;
-    classify_historical_attempts(REGISTRY, server, pool, REGISTRY.current).await
+    classify_historical_attempts(REGISTRY, pool, REGISTRY.current).await
 }
 
 /// Validate a stopped staging database exactly at the version published in its
 /// immutable ready marker. A supported older stage remains activatable, but it
 /// cannot contain attempts for work its publishing binary had not completed.
-pub(super) async fn validate_ready(server: &Server, pool: &MySqlPool) -> Result<i32> {
-    validate_ready_with(REGISTRY, server, pool).await
+pub(super) async fn validate_ready(pool: &MySqlPool) -> Result<i32> {
+    validate_ready_with(REGISTRY, pool).await
 }
 
-async fn validate_ready_with(registry: Registry, server: &Server, pool: &MySqlPool) -> Result<i32> {
+async fn validate_ready_with(registry: Registry, pool: &MySqlPool) -> Result<i32> {
     let found = validate_supported_with(registry, pool).await?;
     inventory_with(registry, pool).await?;
     clean(pool).await?;
@@ -1121,17 +1180,21 @@ async fn validate_ready_with(registry: Registry, server: &Server, pool: &MySqlPo
             "ready Dolt memory stage contains an attempt newer than its schema"
         );
     }
-    classify_historical_attempts(registry, server, pool, found).await?;
+    classify_historical_attempts(registry, pool, found).await?;
     Ok(found)
 }
 
-async fn validate_active_with(registry: Registry, server: &Server, pool: &MySqlPool) -> Result<()> {
+async fn validate_active_with(registry: Registry, pool: &MySqlPool) -> Result<()> {
     validate_current_with(registry, pool).await?;
     clean(pool).await?;
-    classify_historical_attempts(registry, server, pool, registry.current).await
+    classify_historical_attempts(registry, pool, registry.current).await
 }
 
-async fn validate_receipts(registry: Registry, pool: &MySqlPool, found: i32) -> Result<()> {
+async fn validate_receipts(
+    registry: Registry,
+    connection: &mut MySqlConnection,
+    found: i32,
+) -> Result<()> {
     let expected: Vec<_> = registry
         .definitions
         .iter()
@@ -1143,7 +1206,7 @@ async fn validate_receipts(registry: Registry, pool: &MySqlPool, found: i32) -> 
             "SELECT version, id, digest, operation FROM kuru_migrations ORDER BY version LIMIT ?",
         )
         .bind(limit)
-        .fetch_all(pool),
+        .fetch_all(connection),
     )
     .await?;
     ensure!(
@@ -1248,11 +1311,62 @@ async fn authority_working_set(pool: &MySqlPool) -> Result<()> {
 }
 
 async fn retained_failed_shape(pool: &MySqlPool, definition: &Definition) -> Result<bool> {
+    retained_failed_shape_in(pool, WorkingSet::Session, definition).await
+}
+
+/// Whose working set a `dolt_status` read observes: the querying session's
+/// own database, or one reserved branch named from any session. The branch
+/// form reads the same system table the branch's own session reads, without
+/// a connection (and so without an identity check) on that branch.
+#[derive(Clone, Copy)]
+enum WorkingSet<'a> {
+    Session,
+    Branch(&'a str),
+}
+
+impl WorkingSet<'_> {
+    fn status_table(self) -> Result<String> {
+        match self {
+            Self::Session => Ok("dolt_status".to_owned()),
+            Self::Branch(name) => {
+                // Only names already accepted by `parse_attempt_in` reach here;
+                // re-check the alphabet before placing one in SQL text.
+                ensure!(
+                    !name.is_empty()
+                        && name.len() <= 128
+                        && name.bytes().all(|byte| byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || byte == b'_'),
+                    "reserved migration branch is malformed"
+                );
+                Ok(format!("`{DATABASE}/{name}`.dolt_status"))
+            }
+        }
+    }
+}
+
+async fn working_set_changes(main: &MySqlPool, working_set: WorkingSet<'_>) -> Result<i64> {
+    bounded_query(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {}",
+            working_set.status_table()?
+        )))
+        .fetch_one(main),
+    )
+    .await
+}
+
+async fn retained_failed_shape_in(
+    pool: &MySqlPool,
+    working_set: WorkingSet<'_>,
+    definition: &Definition,
+) -> Result<bool> {
     let limit = i64::try_from(definition.failed_status.len() + 1)?;
     let rows = bounded_query(
-        sqlx::query(
-            "SELECT table_name, staged, status FROM dolt_status ORDER BY BINARY table_name, staged, BINARY status LIMIT ?",
-        )
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT table_name, staged, status FROM {} ORDER BY BINARY table_name, staged, BINARY status LIMIT ?",
+            working_set.status_table()?
+        )))
         .bind(limit)
         .fetch_all(pool),
     )
@@ -1374,7 +1488,7 @@ pub(super) async fn upgrade_usage_with_hooks(
     upgrade_in(USAGE_REGISTRY, server, usage, hooks, USAGE_RESERVED_PREFIX).await
 }
 
-pub(super) async fn validate_usage(server: &Server, usage: &MySqlPool) -> Result<()> {
+pub(super) async fn validate_usage(usage: &MySqlPool) -> Result<()> {
     let found = validate_supported_with(USAGE_REGISTRY, usage).await?;
     ensure!(
         found == USAGE_REGISTRY.current,
@@ -1385,7 +1499,6 @@ pub(super) async fn validate_usage(server: &Server, usage: &MySqlPool) -> Result
     inventory_in(USAGE_REGISTRY, usage, USAGE_RESERVED_PREFIX).await?;
     classify_historical_attempts_in(
         USAGE_REGISTRY,
-        server,
         usage,
         USAGE_REGISTRY.current,
         USAGE_RESERVED_PREFIX,
@@ -1421,7 +1534,7 @@ async fn upgrade_in(
     loop {
         let found = validate_supported_with(registry, main).await?;
         inventory_in(registry, main, prefix).await?;
-        classify_historical_attempts_in(registry, server, main, found, prefix).await?;
+        classify_historical_attempts_in(registry, main, found, prefix).await?;
         if found == registry.current {
             return Ok(());
         }
@@ -1492,14 +1605,196 @@ async fn ensure_usage_branch_at_v4(main: &MySqlPool, base: &str) -> Result<()> {
 
 async fn classify_historical_attempts(
     registry: Registry,
-    server: &Server,
     main: &MySqlPool,
     current: i32,
 ) -> Result<()> {
-    classify_historical_attempts_in(registry, server, main, current, RESERVED_PREFIX).await
+    classify_historical_attempts_in(registry, main, current, RESERVED_PREFIX).await
 }
 
+/// Classify every retained attempt at or below `current` from the caller's
+/// own pool. Branch refs, working sets, rows at a commit, parents and ancestry
+/// are system-table and `AS OF` reads; full schema validation at a commit runs
+/// the unchanged validator on one detached session switched to that commit.
+/// No pool is opened on a branch or commit, so a retained branch whose
+/// identity row differs from the opener's is still classified by its content.
 async fn classify_historical_attempts_in(
+    registry: Registry,
+    main: &MySqlPool,
+    current: i32,
+    prefix: &str,
+) -> Result<()> {
+    let mut revisions = RevisionReader::default();
+    let classified =
+        classify_retained_attempts(registry, main, &mut revisions, current, prefix).await;
+    after_cleanup(classified, revisions.close().await)
+}
+
+async fn classify_retained_attempts(
+    registry: Registry,
+    main: &MySqlPool,
+    revisions: &mut RevisionReader,
+    current: i32,
+    prefix: &str,
+) -> Result<()> {
+    let main_head = revision(main).await?;
+    for name in reserved_names_in(main, prefix).await? {
+        let (target, operation) = parse_attempt_in(prefix, &name)?;
+        ensure!(
+            target <= current + 1,
+            "reserved Dolt migration branch targets an out-of-order step"
+        );
+        if target > current {
+            continue;
+        }
+        let definition = registry.definition(target)?;
+        let working_set = WorkingSet::Branch(&name);
+        let head = branch_head(main, &name).await?;
+        let head_version = version_as_of(main, &head).await?;
+        let dirty = working_set_changes(main, working_set).await?;
+        let outcome = if dirty == 0 {
+            // A clean branch's working set is its head commit.
+            revisions
+                .validate(main, registry, &head, definition.to)
+                .await?;
+            let receipt = receipt_as_of(main, &head, definition.to).await?;
+            ensure!(
+                receipt == operation.hyphenated().to_string(),
+                "historical Dolt migration receipt does not match its branch"
+            );
+            let parent = sole_parent(main, &head).await?;
+            revisions
+                .validate(main, registry, &parent, definition.from)
+                .await?;
+            ancestor(main, &head).await? && ancestor(main, &parent).await?
+        } else {
+            ensure!(
+                head_version == definition.from,
+                "dirty historical Dolt migration branch has an unexpected schema"
+            );
+            revisions
+                .validate(main, registry, &head, definition.from)
+                .await?;
+            ensure!(
+                retained_failed_shape_in(main, working_set, definition).await?,
+                "dirty historical Dolt migration branch has an unexpected working set"
+            );
+            ancestor(main, &head).await?
+        };
+        ensure!(
+            outcome,
+            "historical Dolt migration branch is not retained by active history"
+        );
+        ensure!(
+            head != main_head || target == current,
+            "historical Dolt migration branch unexpectedly names active main"
+        );
+    }
+    Ok(())
+}
+
+/// Dolt's commit hash: 20 bytes as 32 characters of base32 `{0-9,a-v}`.
+/// Neither `AS OF` nor `USE` accepts a placeholder, so every revision is
+/// checked against this alphabet before it is placed in SQL text.
+fn commit_hash(value: &str) -> Result<&str> {
+    ensure!(
+        value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'v').contains(&byte)),
+        "Dolt migration revision is not a commit hash"
+    );
+    Ok(value)
+}
+
+async fn branch_head(main: &MySqlPool, name: &str) -> Result<String> {
+    let heads: Vec<String> = bounded_query(
+        sqlx::query_scalar("SELECT hash FROM dolt_branches WHERE BINARY name = BINARY ? LIMIT 2")
+            .bind(name)
+            .fetch_all(main),
+    )
+    .await?;
+    ensure!(
+        heads.len() == 1,
+        "historical Dolt migration branch head is missing or ambiguous"
+    );
+    let head = heads.into_iter().next().expect("one head checked");
+    commit_hash(&head)?;
+    Ok(head)
+}
+
+async fn version_as_of(main: &MySqlPool, commit: &str) -> Result<i32> {
+    bounded_query(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT version FROM kuru_schema AS OF '{}' WHERE id = 1",
+            commit_hash(commit)?
+        )))
+        .fetch_one(main),
+    )
+    .await
+}
+
+async fn receipt_as_of(main: &MySqlPool, commit: &str, version: i32) -> Result<String> {
+    bounded_query(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT operation FROM kuru_migrations AS OF '{}' WHERE version = ?",
+            commit_hash(commit)?
+        )))
+        .bind(version)
+        .fetch_one(main),
+    )
+    .await
+}
+
+/// One detached session from the caller's pool, switched with `USE` to one
+/// immutable commit at a time so the unchanged `DATABASE()`-scoped schema
+/// validator reads that commit exactly as a session opened on it would. It
+/// never returns to the pool: `close` ends it, and any error ends the pass.
+#[derive(Default)]
+struct RevisionReader {
+    connection: Option<MySqlConnection>,
+}
+
+impl RevisionReader {
+    async fn validate(
+        &mut self,
+        source: &MySqlPool,
+        registry: Registry,
+        commit: &str,
+        expected: i32,
+    ) -> Result<()> {
+        let database = format!("{DATABASE}/{}", commit_hash(commit)?);
+        if self.connection.is_none() {
+            self.connection = Some(acquire(source).await?.detach());
+        }
+        let connection = self
+            .connection
+            .as_mut()
+            .expect("revision session acquired above");
+        bounded_query(connection.execute(sqlx::AssertSqlSafe(format!("USE `{database}`")))).await?;
+        let selected: Option<String> =
+            bounded_query(sqlx::query_scalar("SELECT DATABASE()").fetch_one(&mut *connection))
+                .await?;
+        ensure!(
+            selected.as_deref() == Some(database.as_str()),
+            "Dolt migration revision session did not select its commit"
+        );
+        validate_version_on(registry, connection, expected).await
+    }
+
+    async fn close(self) -> Result<()> {
+        if let Some(connection) = self.connection {
+            bounded_query(connection.close()).await?;
+        }
+        Ok(())
+    }
+}
+
+/// The classifier this module used before main-pool classification: a pool on
+/// every retained branch and on its parent commit. Kept only as the parity
+/// oracle for `main_pool_classification_agrees_with_branch_pool_classification`;
+/// no product path reaches it.
+#[cfg(test)]
+async fn classify_with_branch_pools_in(
     registry: Registry,
     server: &Server,
     main: &MySqlPool,
@@ -2032,6 +2327,9 @@ async fn publish(
 }
 
 #[cfg(test)]
+mod main_pool_classification_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -2117,7 +2415,7 @@ mod tests {
         )
         .await?;
         let before = durable_snapshot(&main).await?;
-        let error = validate_active_with(RELEASED_V3_REGISTRY, &server, &main)
+        let error = validate_active_with(RELEASED_V3_REGISTRY, &main)
             .await
             .expect_err("a v3 binary must reject v4 memory before opening it for writes");
         assert!(
@@ -2135,7 +2433,7 @@ mod tests {
     async fn v6_registry_rejects_v7_store_without_mutating_it() -> Result<()> {
         let store = super::super::MemoryStore::temporary_cold().await?;
         let before = durable_snapshot(&store.pool).await?;
-        let error = validate_active_with(RELEASED_V6_REGISTRY, &store.shared.server, &store.pool)
+        let error = validate_active_with(RELEASED_V6_REGISTRY, &store.pool)
             .await
             .expect_err("a v6 binary must reject v7 memory before opening it for writes");
         assert!(
@@ -3278,10 +3576,7 @@ mod tests {
         failed.close().await;
         drop(failed);
 
-        assert_eq!(
-            validate_ready_with(TEST_REGISTRY, &store.shared.server, &store.pool).await?,
-            7
-        );
+        assert_eq!(validate_ready_with(TEST_REGISTRY, &store.pool).await?, 7);
         let v8_operation = Uuid::new_v4();
         let v8_name = attempt_name(8, v8_operation);
         let current_base = store.revision().await?;
@@ -3293,7 +3588,7 @@ mod tests {
         )
         .await?;
         assert!(
-            validate_ready_with(TEST_REGISTRY, &store.shared.server, &store.pool)
+            validate_ready_with(TEST_REGISTRY, &store.pool)
                 .await
                 .is_err(),
             "a ready v8 stage must reject while an earlier failed attempt remains"
@@ -3306,7 +3601,7 @@ mod tests {
             &MigrationRunnerHooks::none(),
         )
         .await?;
-        validate_active_with(TEST_REGISTRY, &store.shared.server, &store.pool).await?;
+        validate_active_with(TEST_REGISTRY, &store.pool).await?;
         assert_eq!(version(&store.pool).await?, 8);
         let v8_attempt = store.shared.server.pool(&v8_name).await?;
         assert_eq!(revision(&v8_attempt).await?, store.revision().await?);
@@ -3415,7 +3710,7 @@ mod tests {
         )
         .await?;
         commit_fixture(&store.pool, "Test future-v8 conversation write").await?;
-        validate_active_with(TEST_REGISTRY, &store.shared.server, &store.pool).await?;
+        validate_active_with(TEST_REGISTRY, &store.pool).await?;
         assert_eq!(version(&store.pool).await?, 8);
         let promoted_value: String = bounded_query(
             sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
@@ -3453,7 +3748,7 @@ mod tests {
         let server = super::super::tests::released_server(&options).await?;
         let main = server.pool("main").await?;
         upgrade_with(TEST_REGISTRY, &server, &main, &MigrationRunnerHooks::none()).await?;
-        validate_active_with(TEST_REGISTRY, &server, &main).await?;
+        validate_active_with(TEST_REGISTRY, &main).await?;
         assert_eq!(revision(&main).await?, final_head);
         let reopened_refs: BTreeSet<(String, String)> = {
             let mut refs = BTreeSet::new();
@@ -4146,7 +4441,7 @@ mod tests {
         )));
         let before_refusal = durable_snapshot(&store.pool).await?;
         let exported_before_refusal = serde_json::to_value(&records)?;
-        let error = validate_active_with(RELEASED_V6_REGISTRY, &store.shared.server, &store.pool)
+        let error = validate_active_with(RELEASED_V6_REGISTRY, &store.pool)
             .await
             .expect_err("a v6 validator must refuse this populated v7 store");
         assert!(

@@ -23,8 +23,8 @@ Replace the per-branch and per-parent pool opens in
 `classify_historical_attempts_in` and `validate_commit_version` with queries
 issued from the existing main connection pool the caller already holds:
 `AS OF '<hash>'` reads for schema version and receipts, `dolt_branches` for
-head hash and the `dirty` flag, a revision-qualified
-`` `kuru/<branch>`.dolt_status `` read for the working-set shape check,
+the head hash, a branch-qualified `` `kuru/<branch>`.dolt_status `` read for
+the dirty discriminator and the working-set shape check,
 `dolt_commit_ancestors` for the sole-parent check, and `dolt_log` for
 ancestry (already main-pool queries today). The one check with no drop-in
 main-pool equivalent is full schema validation (`validate_version_with`) at
@@ -77,10 +77,10 @@ implementation-blocking finding, not a requirements change.)
 
 ## Benchmarks
 
-| Metric | Before (measured) | After (to record) | How measured |
+| Metric | Before (measured) | After (measured) | How measured |
 |---|---|---|---|
-| `Server::pool` opens per classified retained branch, on `validate_active` / `validate_inspection` (reader) / `validate_ready` | 2 per branch (1 branch pool + 1 parent-commit pool), clean path; 1 per branch, dirty path | 0 | `test_support::engine_ledger` counting hook on `Server::pool`, asserted in the new `historical_classification_opens_no_branch_or_commit_pools` test (task 2) |
-| Wall-clock cost of classifying N retained branches on an existing-project open | not separately measured today (folded into open time) | recorded, not gated — no product deadline changes | local timing note beside the pool-count assertion, for the findings file only; not a pass/fail criterion (this change does not touch `startup_timeout_secs` or any deadline) |
+| `Server::pool` requests per classified retained branch, on `validate_active` / `validate_inspection` (reader) / `validate_ready` / `validate_usage` / each `upgrade_in` step | 2 per branch: branch pool + parent-commit pool (clean path); branch pool + head-commit pool (dirty path) | 0 | a `cfg(test)` request log on `Server::pool`, asserted by `historical_classification_opens_no_branch_or_commit_pools` (the kept oracle requests 12 for 6 clean branches on the same server) |
+| In-process `validate_active` on a v7 store with 6 retained branches (report only) | median 270.2 ms (N=7: 277.0, 281.6, 270.2, 276.6, 258.4, 266.8, 269.7) | median 187.3 ms (N=7: 190.0, 190.6, 184.7, 188.2, 182.9, 187.3, 180.2) | `measure_validate_active_classification` (ignored; run explicitly), same process, alternating, one warm-up each; debug profile, macOS arm64, load average 31-40. A second batch at load average 6-7: medians 264.4 ms before, 182.6 ms after (N=7 each). "Before" is the replaced path reconstructed from the kept oracle, not a base-commit checkout. Not a pass/fail criterion; no deadline changes |
 
 The primary, gating metric is the pool count, because it is deterministic and
 directly reflects the removed work (a Dolt connection, `USE`, and an
