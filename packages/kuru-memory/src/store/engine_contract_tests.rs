@@ -1653,7 +1653,7 @@ async fn record_classification_checks_have_main_pool_equivalents() -> Result<()>
         let (options, store) = cold_open(&root.path().join("source"), &scope('8')).await?;
         let compared = async {
             let server = &store.shared.server;
-            migrations::validate_active(server, &store.pool).await?;
+            migrations::validate_active(&store.pool).await?;
             let branches = migration_branches(&refs(&store.pool).await?);
             ensure!(!branches.is_empty(), "no retained migration branch");
             let mut baseline = Vec::new();
@@ -1728,11 +1728,23 @@ async fn record_classification_checks_have_main_pool_equivalents() -> Result<()>
         let (adopted, commits) = adopt_and_restart(served, &source.scope).await?;
         let main = adopted.server.pool("main").await?;
         let checked = async {
-            let error = migrations::validate_active(&adopted.server, &main)
+            // The branch-pool path still refuses these refs: opening a pool on
+            // a retained branch checks its instance identity against main's,
+            // and the adopted copy's branches predate adoption.
+            let branch_name = baseline
+                .first()
+                .map(|today| today.name.clone())
+                .context("no retained migration branch in baseline")?;
+            let error = classify_with_branch_pools(&adopted.server, &main, &branch_name)
                 .await
                 .expect_err("branch-pool classification must fail on template-era refs");
-            eprintln!("engine contract S8 today's classifier on an adopted copy: {error:#}");
+            eprintln!("engine contract S8 branch-pool classifier on an adopted copy: {error:#}");
             assert!(format!("{error:#}").contains("identity mismatch"), "{error:#}");
+            // The product's main-pool classifier opens no branch pool and so
+            // is unaffected by the identity mismatch: it succeeds.
+            migrations::validate_active(&main)
+                .await
+                .context("main-pool classification must succeed on template-era refs")?;
             for today in &baseline {
                 let mut expected = today.clone();
                 // Main moved to its adoption commit; no retained branch names it.
@@ -1790,7 +1802,7 @@ async fn consume_and_adopt(root: &Path, capture: &Path) -> Result<Capture> {
         let heads = refs(&main).await?;
         assert_eq!(heads["main"].hash, record.main_head);
         assert_eq!(heads[usage_ledger::BRANCH].hash, record.usage_head);
-        migrations::validate_active(&served.server, &main).await?;
+        migrations::validate_active(&main).await?;
         Ok(())
     }
     .await;
