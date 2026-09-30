@@ -239,6 +239,16 @@ impl UsageLedger {
         self.store.readable()?;
         let _guard = self.store.shared.write.lock().await;
         self.store.resolve_uncertain().await?;
+        self.inspect_proof_unguarded(proof).await
+    }
+
+    /// The same natural-key read without the write guard or reconciliation.
+    /// Each positive proof is one read of a final-state key that its write
+    /// publishes in the same `DOLT_COMMIT`, so `true` is durable committed
+    /// evidence even while that write is still running. `false` proves nothing.
+    pub(crate) async fn inspect_proof_unguarded(&self, proof: &UsageProof) -> Result<bool> {
+        proof.validate()?;
+        self.store.readable()?;
         let pool = self.store.pool.as_ref();
         let matching = match proof {
             UsageProof::NewSession { session_id } => read_marker(pool, session_id)

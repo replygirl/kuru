@@ -1021,11 +1021,8 @@ async fn lost_annotation_reply_reconciles_the_exact_session_without_replaying_ef
     .await
     .unwrap()
     .unwrap();
-    // The sibling's read proves the commit; the held reply frame proves the
-    // owner settled the receipt that the engine's one reconcile will query.
-    tokio::time::timeout(std::time::Duration::from_secs(10), barrier.wait_replied())
-        .await
-        .expect("owner did not settle and reply to the paused annotation write");
+    // The sibling's read proves the commit and therefore the registered
+    // request; the owner answers the engine's one reconcile definitively.
     lose_reply.send(()).unwrap();
     let (mut harness, first) = tokio::time::timeout(std::time::Duration::from_secs(20), turn)
         .await

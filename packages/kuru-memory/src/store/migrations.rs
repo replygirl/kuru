@@ -3991,9 +3991,6 @@ mod tests {
                 })
                 .await
                 .context("migrated safe-journal resume was not committed before reply loss")??;
-                tokio::time::timeout(std::time::Duration::from_secs(10), barrier.wait_replied())
-                    .await
-                    .context("owner did not settle and reply to the paused migrated safe-journal resume")?;
                 resume.abort();
                 ensure!(
                     tokio::time::timeout(std::time::Duration::from_secs(5), resume)

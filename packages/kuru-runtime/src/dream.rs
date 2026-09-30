@@ -1070,17 +1070,10 @@ mod cancellation_tests {
                 sibling.close_transport_for_test().await?;
                 kuru_memory::test_support::retire_idle_service(&options).await?;
             }
-            tokio::time::timeout(std::time::Duration::from_secs(20), async {
-                loop {
-                    match harness.reconcile().await {
-                        Ok(()) => break Ok::<(), anyhow::Error>(()),
-                        Err(error) if error.to_string().contains("remains uncertain") => {
-                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-            }).await.context("managed typed promotion proof did not settle")??;
+            harness
+                .reconcile()
+                .await
+                .context("managed typed promotion proof was not definite on the first reconcile")?;
             assert_eq!(harness.topology.parts.len(), original_parts + 1);
             assert!(harness.pending_candidate.is_none());
             assert!(harness.pending_publication.is_none());

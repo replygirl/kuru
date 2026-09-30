@@ -287,4 +287,6 @@ Within Kuru, dropping or explicitly closing a managed memory view releases that
 client attachment; it never abandons a candidate or kills the shared owner. If a
 write reply is interrupted, Kuru checks the durable typed receipt before
 proceeding; reconnect alone never turns uncertainty into success or replays the
-write.
+write. Kuru answers from the durable receipt as soon as it exists, and
+otherwise waits for the interrupted write to finish, within the existing
+operation deadline.

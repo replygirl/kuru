@@ -83,6 +83,7 @@ async fn lost_receipt_reply_settles_and_remains_indexed_after_later_write() -> R
         "lost acknowledgement",
         Mutation::State(vec![("second".into(), "2".into())]),
         None,
+        None,
     )
     .await?;
     let second_revision = store.revision().await?;

@@ -3098,9 +3098,6 @@ mod tests {
                         })
                         .await
                         .context("owner did not commit paused create")??;
-                        tokio::time::timeout(Duration::from_secs(10), create_pause.replied.notified())
-                            .await
-                            .context("owner did not settle and reply to the paused create")?;
                         create.abort();
                         ensure!(
                             tokio::time::timeout(Duration::from_secs(5), create)
@@ -3180,9 +3177,6 @@ mod tests {
                             sibling.revision().await? == before_stale,
                             "definite lifecycle refusal changed the view"
                         );
-                        tokio::time::timeout(Duration::from_secs(10), pause.replied.notified())
-                            .await
-                            .context("owner did not settle and reply to the paused rename")?;
                         rename.abort();
                         let stopped = tokio::time::timeout(Duration::from_secs(5), rename)
                             .await
@@ -3245,9 +3239,6 @@ mod tests {
                         })
                         .await
                         .context("owner did not commit paused remove")??;
-                        tokio::time::timeout(Duration::from_secs(10), remove_pause.replied.notified())
-                            .await
-                            .context("owner did not settle and reply to the paused remove")?;
                         remove.abort();
                         ensure!(
                             tokio::time::timeout(Duration::from_secs(5), remove)
@@ -3324,9 +3315,6 @@ mod tests {
                         })
                         .await
                         .context("owner did not commit paused restore")??;
-                        tokio::time::timeout(Duration::from_secs(10), restore_pause.replied.notified())
-                            .await
-                            .context("owner did not settle and reply to the paused restore")?;
                         restore.abort();
                         ensure!(
                             tokio::time::timeout(Duration::from_secs(5), restore)
@@ -3627,9 +3615,6 @@ mod tests {
                         })
                         .await
                         .context("owner did not commit the paused fork publication")??;
-                        tokio::time::timeout(Duration::from_secs(10), pause.replied.notified())
-                            .await
-                            .context("owner did not settle and reply to the paused fork")?;
                         fork.abort();
                         let stopped = tokio::time::timeout(Duration::from_secs(5), fork)
                             .await
@@ -3878,9 +3863,6 @@ mod tests {
                 })
                 .await
                 .context("owner did not commit paused mode and state")??;
-                tokio::time::timeout(Duration::from_secs(10), barrier.wait_replied())
-                    .await
-                    .context("owner did not settle and reply to the paused mode checkpoint")?;
                 change.abort();
                 ensure!(
                     tokio::time::timeout(Duration::from_secs(5), change)
@@ -4017,9 +3999,6 @@ mod tests {
                         })
                         .await
                         .context("owner did not commit the paused public-turn admission")??;
-                        tokio::time::timeout(Duration::from_secs(10), pause.replied.notified())
-                            .await
-                            .context("owner did not settle and reply to the paused public-turn admission")?;
                         admission.abort();
                         ensure!(
                             tokio::time::timeout(Duration::from_secs(5), admission)
@@ -4097,9 +4076,6 @@ mod tests {
                         })
                         .await
                         .context("owner did not commit the paused public-turn settlement")??;
-                        tokio::time::timeout(Duration::from_secs(10), settlement_barrier.wait_replied())
-                            .await
-                            .context("owner did not settle and reply to the paused public-turn settlement")?;
                         settlement.abort();
                         ensure!(
                             tokio::time::timeout(Duration::from_secs(5), settlement)
@@ -4289,9 +4265,6 @@ mod tests {
                         })
                         .await
                         .context("owner did not commit older continuation before reply loss")??;
-                        tokio::time::timeout(Duration::from_secs(10), continuation_barrier.wait_replied())
-                            .await
-                            .context("owner did not settle and reply to the paused older continuation")?;
                         continuation.abort();
                         ensure!(
                             tokio::time::timeout(Duration::from_secs(5), continuation)
@@ -4528,9 +4501,6 @@ mod tests {
                         })
                         .await
                         .context("owner did not commit the paused legacy continuation")??;
-                        tokio::time::timeout(Duration::from_secs(10), barrier.wait_replied())
-                            .await
-                            .context("owner did not settle and reply to the paused legacy continuation")?;
                         resume.abort();
                         ensure!(
                             tokio::time::timeout(Duration::from_secs(5), resume)
@@ -4656,21 +4626,10 @@ mod tests {
                         );
                         ensure!(memory.clone().put("blocked", &json!(true)).await.is_err());
                         sibling.put("later-sibling", &json!(2)).await?;
-                        tokio::time::timeout(Duration::from_secs(10), async {
-                    loop {
-                        match memory.reconcile().await {
-                            Ok(Some(true)) => break Ok::<(), anyhow::Error>(()),
-                            Err(error) if error.to_string().contains("remains uncertain") => {
-                                tokio::time::sleep(Duration::from_millis(20)).await;
-                            }
-                            other => {
-                                bail!("accepted cancelled write had unexpected outcome: {other:?}")
-                            }
-                        }
-                    }
-                })
-                .await
-                .context("cancelled write indexed-outcome deadline")??;
+                        ensure!(
+                            memory.reconcile().await? == Some(true),
+                            "the first reconcile of the accepted cancelled write was not definite"
+                        );
                         ensure!(memory.get("accepted-lost-reply").await? == Some(json!(1)));
                         memory.put("after-proof", &json!(3)).await?;
                         memory.close().await?;
@@ -4789,21 +4748,10 @@ mod tests {
                         .is_err(),
                     "a cancelled summary receipt failed to fence further mutations"
                 );
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    loop {
-                        match memory.reconcile().await {
-                            Ok(Some(true)) => break Ok::<(), anyhow::Error>(()),
-                            Err(error) if error.to_string().contains("remains uncertain") => {
-                                tokio::time::sleep(Duration::from_millis(20)).await;
-                            }
-                            other => {
-                                bail!("paused reasoning summary had unexpected outcome: {other:?}")
-                            }
-                        }
-                    }
-                })
-                .await
-                .context("reasoning summary indexed-outcome deadline")??;
+                ensure!(
+                    memory.reconcile().await? == Some(true),
+                    "the first reconcile of the paused reasoning summary batch was not definite"
+                );
                 memory
                     .put_reasoning_summaries(std::slice::from_ref(&record))
                     .await?;
@@ -5058,19 +5006,10 @@ mod tests {
                         .is_err(),
                     "lost checkpoint reply did not fence its session"
                 );
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    loop {
-                        match memory.reconcile().await {
-                            Ok(Some(true)) => break Ok::<(), anyhow::Error>(()),
-                            Err(error) if error.to_string().contains("remains uncertain") => {
-                                tokio::time::sleep(Duration::from_millis(20)).await;
-                            }
-                            other => bail!("context checkpoint had unexpected outcome: {other:?}"),
-                        }
-                    }
-                })
-                .await
-                .context("context checkpoint indexed-outcome deadline")??;
+                ensure!(
+                    memory.reconcile().await? == Some(true),
+                    "the first reconcile of the lost context checkpoint was not definite"
+                );
                 {
                     let _mutation = remote.session.mutations.lock().await;
                     let mut attachment = remote.attachment.lock().await;
@@ -5542,9 +5481,6 @@ mod tests {
                         .await
                         .context("owner did not commit the paused candidate write")??;
                         witness.close();
-                        tokio::time::timeout(Duration::from_secs(10), pause.replied.notified())
-                            .await
-                            .context("owner did not settle and reply to the paused candidate unit write")?;
                         writer.abort();
                         let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
                             .await
@@ -5681,6 +5617,167 @@ mod tests {
             root.release(outcome)?;
         }
         Ok(())
+    }
+
+    /// The definite-answer rule must not turn an outcome that no evidence
+    /// decides into a definite one. A candidate unit write commits and loses
+    /// its reply; a sibling then reclaims the exact ref through selected
+    /// abandonment, taking the receipt's only durable evidence with it. The
+    /// owner cannot say whether the write committed, so recovery fails and
+    /// every clone stays fenced with its pending receipt retained.
+    #[tokio::test]
+    async fn reclaimed_candidate_ref_keeps_the_unit_write_fence_uncertain() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "reclaimed candidate ref fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let executable = std::env::current_exe()?;
+                        let open = || {
+                            MemoryStore::open_managed_observed(
+                                options.clone(),
+                                project.clone(),
+                                executable.clone(),
+                            )
+                            .1
+                        };
+                        let memory = open().await?;
+                        let sibling = open().await?;
+                        let candidate = memory.begin_candidate("reclaimed private write").await?;
+                        let base = candidate.base().to_owned();
+                        let private = candidate.view();
+                        let Backend::Remote(remote) = &private.backend else {
+                            bail!("candidate unit fixture did not attach to the service")
+                        };
+                        let branch = remote.pinned_view.clone();
+                        let pause = Arc::new(service::rpc::ReplyPause::default());
+                        remote
+                            .attachment
+                            .lock()
+                            .await
+                            .pause_after_next_send(pause.clone());
+                        let writer = tokio::spawn({
+                            let private = private.clone();
+                            async move { private.put("accepted-private", &json!(1)).await }
+                        });
+                        let _writer_cleanup = AbortOnDrop(writer.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                            .await
+                            .context("candidate unit frame was not flushed")?;
+
+                        // The sibling's ref inspection is the visibility proof: the head
+                        // moves off the base only when the owner committed the write.
+                        let head = tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                let status = sibling.candidate_ref_status(&branch).await?;
+                                if let Some(head) = status.head.filter(|head| *head != base) {
+                                    break Ok::<String, anyhow::Error>(head);
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .context("owner did not commit the paused candidate write")??;
+                        writer.abort();
+                        let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
+                            .await
+                            .context("cancelled candidate writer did not end")?;
+                        ensure!(stopped.is_err_and(|error| error.is_cancelled()));
+                        ensure!(memory.put("fenced", &json!(true)).await.is_err());
+
+                        // Selected abandonment is refused while any other attachment
+                        // is live, before it changes anything. Release the writer's
+                        // transports; each refusal is a complete request/reply round
+                        // trip, so retrying it until the owner has seen them close
+                        // needs no timer.
+                        private.close_transport_for_test().await?;
+                        memory.close_transport_for_test().await?;
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                match sibling.abandon_candidate_ref(&branch, &base, &head).await {
+                                    Ok(()) => break Ok::<(), anyhow::Error>(()),
+                                    Err(error)
+                                        if error
+                                            .downcast_ref::<store::CandidateRefRejected>()
+                                            .is_some_and(|rejected| {
+                                                matches!(
+                                                    rejected.0,
+                                                    store::CandidateRefRefusal::Active
+                                                )
+                                            }) =>
+                                    {
+                                        tokio::task::yield_now().await;
+                                    }
+                                    Err(error) => break Err(error),
+                                }
+                            }
+                        })
+                        .await
+                        .context("sibling could not abandon the exact candidate ref")??;
+                        ensure!(
+                            sibling.candidate_ref_status(&branch).await?.state
+                                == store::CandidateRefState::Missing,
+                            "selected abandonment did not reclaim the exact ref"
+                        );
+
+                        for attempt in ["first", "second"] {
+                            let error = private.recover_candidate_unit().await.err().with_context(
+                                || format!("{attempt} recovery reported a definite outcome"),
+                            )?;
+                            ensure!(
+                                error
+                                    .to_string()
+                                    .contains("candidate unit outcome remains uncertain"),
+                                "{attempt} recovery failed for another reason: {error:#}"
+                            );
+                        }
+                        for clone in [&private, &memory] {
+                            let error = clone.put("after-uncertain", &json!(2)).await.unwrap_err();
+                            ensure!(
+                                error.to_string().contains("cannot issue another mutation"),
+                                "a clone was not fenced by the uncertain outcome: {error:#}"
+                            );
+                        }
+
+                        memory.close().await?;
+                        sibling.close().await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            Duration::from_secs(10),
+                            "reclaimed candidate ref fixture owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(outcome)
     }
 
     #[tokio::test]
