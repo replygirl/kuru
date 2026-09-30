@@ -15,7 +15,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use kuru_platform::fs::{Directory, NameRetention, Privacy};
+use kuru_platform::fs::{Directory, NameRetention, Privacy, Publication, PublicationPhase};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -1923,13 +1923,26 @@ impl EndpointRecord {
     }
 
     pub fn read(data_dir: &Path, scope: &str) -> Result<Option<Self>> {
+        Self::read_then(data_dir, scope, || {})
+    }
+
+    /// [`Self::read`] with a hook where a concurrent retirement can land
+    /// between reading the held record and verifying its name.
+    fn read_then(data_dir: &Path, scope: &str, between: impl FnOnce()) -> Result<Option<Self>> {
         let path = Self::path(data_dir, scope)?;
-        let bytes = match crate::files::read_bytes(&path, HANDSHAKE_LIMIT as u64) {
+        let bytes = match crate::files::read_bytes_then(&path, HANDSHAKE_LIMIT as u64, between) {
             Ok(bytes) => bytes,
-            Err(error)
-                if error
-                    .downcast_ref::<io::Error>()
-                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+            Err(error) if is_not_found(&error) => return Ok(None),
+            // Retirement renames the record away before its object can be
+            // marked for deletion, so a read that failed only because it met
+            // a retiring owner (on Windows, a held handle that became
+            // delete-pending) finds the name absent here. Any other state,
+            // including a present name, keeps the original error.
+            Err(_)
+                if matches!(
+                    crate::files::read(&path, Privacy::OwnerOnly),
+                    Err(probe) if is_not_found(&probe)
+                ) =>
             {
                 return Ok(None);
             }
@@ -1981,10 +1994,48 @@ impl EndpointRecord {
                 && current.authority.connection_secret == self.authority.connection_secret,
             "service endpoint generation changed during retirement"
         );
-        directory.remove_file(name, file)?;
+        // Move the record off its discovery name before deleting it. On
+        // Windows a deleted name stays occupied while any reader still holds
+        // it, and later opens of it are denied; a client reading discovery
+        // at this moment must instead find no record. The fixed stage name
+        // replaces any stage an interrupted retirement left behind.
+        directory.rename_file(
+            &directory,
+            name,
+            &file,
+            OsStr::new(RETIRED_ENDPOINT),
+            Publication::ReplaceRegular,
+        )?;
+        match directory.read(name) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => bail!("service endpoint name was occupied during retirement"),
+        }
+        match directory.remove_file(OsStr::new(RETIRED_ENDPOINT), file) {
+            Ok(()) => {}
+            // The deletion was requested but a reader still holds the staged
+            // record, so Windows removes it when that reader closes. It is
+            // off the discovery name and its generation no longer listens.
+            Err(error) if error.phase == PublicationPhase::Uncertain => {
+                tracing::warn!(
+                    error = %error,
+                    "retired memory service endpoint removal awaits a concurrent reader"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
         owner.verify()?;
         Ok(())
     }
+}
+
+/// Private stage for a record leaving discovery; never read as an endpoint.
+const RETIRED_ENDPOINT: &str = "endpoint.retired";
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3708,6 +3759,104 @@ mod tests {
         );
         later.retire(data.path(), &owner).unwrap();
         assert!(EndpointRecord::read(data.path(), &scope).unwrap().is_none());
+    }
+
+    /// A client holding the record open, as discovery does while it reads,
+    /// must not turn retirement into an error on either side. On Windows a
+    /// deleted name stays occupied while any handle holds it and later opens
+    /// are denied (native error 5), so deleting the record in place failed
+    /// both the owner's absence check and the client's next read.
+    #[tokio::test]
+    async fn retirement_under_a_held_reader_leaves_no_discoverable_record() -> Result<()> {
+        let _gate = crate::spawn_gate::locking_async().await;
+        let data = tempfile::tempdir()?;
+        let scope = format!("project/{}", "c".repeat(64));
+        let owner = ServiceLock::try_acquire(data.path(), &scope, ServiceLockKind::Owner)?
+            .context("fixture did not acquire service owner lock")?;
+        let mut record = EndpointRecord {
+            authority: authority(),
+            address: "socket-retiring".into(),
+        };
+        record.authority.project_scope = scope.clone();
+        record.publish(data.path(), &owner)?;
+        let reader = crate::files::read(
+            &EndpointRecord::path(data.path(), &scope)?,
+            Privacy::OwnerOnly,
+        )?;
+
+        record
+            .retire(data.path(), &owner)
+            .context("retirement failed while a client held the record open")?;
+        ensure!(
+            EndpointRecord::read(data.path(), &scope)
+                .context("discovery failed after retirement under a held reader")?
+                .is_none(),
+            "a retired record remained discoverable"
+        );
+        let observed =
+            try_attach_observed(data.path(), &scope, Path::new("/private/project"), None)
+                .await
+                .context("an electing client failed on a retiring owner")?;
+        ensure!(
+            matches!(observed, Err(AttachMiss::NoEndpoint)),
+            "an electing client did not read retirement as no endpoint"
+        );
+        ensure!(
+            request_idle_retirement(&crate::store::OpenOptions::new(
+                data.path().to_owned(),
+                scope.clone(),
+            ))
+            .await
+            .context("maintenance failed on a retiring owner")?
+            .is_none(),
+            "maintenance reached a retired owner"
+        );
+
+        drop(reader);
+        let stage = EndpointRecord::directory(data.path(), &scope)?.join(RETIRED_ENDPOINT);
+        ensure!(
+            matches!(
+                std::fs::symlink_metadata(&stage),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            ),
+            "the retired record's stage outlived its last reader"
+        );
+        drop(owner);
+        Ok(())
+    }
+
+    /// A discovery read that already holds the record when the owner retires
+    /// it finds no record. On Windows the held object is then delete-pending,
+    /// which the checked verification refuses as denied rather than missing;
+    /// only the absent discovery name shows the owner retired.
+    #[test]
+    fn a_read_that_meets_retirement_finds_no_record() {
+        let _gate = crate::spawn_gate::locking();
+        let data = tempfile::tempdir().unwrap();
+        let scope = format!("project/{}", "d".repeat(64));
+        let owner = ServiceLock::try_acquire(data.path(), &scope, ServiceLockKind::Owner)
+            .unwrap()
+            .unwrap();
+        let mut record = EndpointRecord {
+            authority: authority(),
+            address: "socket-retiring".into(),
+        };
+        record.authority.project_scope = scope.clone();
+        record.publish(data.path(), &owner).unwrap();
+
+        let mut retired = None;
+        let read = EndpointRecord::read_then(data.path(), &scope, || {
+            retired = Some(record.retire(data.path(), &owner));
+        });
+
+        retired
+            .expect("the hook ran between reading and verifying the record")
+            .expect("retirement failed while a discovery read held the record");
+        assert!(
+            read.expect("a discovery read failed only because it met retirement")
+                .is_none(),
+            "a discovery read that met retirement returned the retired record"
+        );
     }
 
     #[tokio::test]

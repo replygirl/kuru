@@ -86,6 +86,12 @@ pub(crate) fn read(path: &Path, privacy: Privacy) -> Result<(Directory, File)> {
 }
 
 pub(crate) fn read_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    read_bytes_then(path, limit, || {})
+}
+
+/// [`read_bytes`] with a hook between reading the held handle and verifying
+/// that its name still identifies it, where a concurrent retirement can land.
+pub(crate) fn read_bytes_then(path: &Path, limit: u64, between: impl FnOnce()) -> Result<Vec<u8>> {
     let (parent, mut file) = read(path, Privacy::OwnerOnly)?;
     let mut bytes = Vec::new();
     (&mut file).take(limit + 1).read_to_end(&mut bytes)?;
@@ -93,6 +99,7 @@ pub(crate) fn read_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
         bytes.len() as u64 <= limit,
         "private memory file exceeds size limit"
     );
+    between();
     parent.verify(name(path)?, &file)?;
     Ok(bytes)
 }
