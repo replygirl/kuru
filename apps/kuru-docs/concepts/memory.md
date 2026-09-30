@@ -148,7 +148,9 @@ History follows the Dolt commit graph from the current revision toward older
 ancestors, with a stable hash tie-break rather than wall-clock ordering. Kuru
 reconciles an interrupted write against its durable receipt before it continues,
 so it can distinguish no pending operation, a completed operation, and one that
-did not commit.
+did not commit. It answers from the receipt as soon as it exists, and otherwise
+waits for the interrupted write to finish, within the existing operation
+deadline.
 
 Current writable branches retain compact internal operation receipts for exact
 lost-reply reconciliation. Historical schema-1-through-4 branches keep their

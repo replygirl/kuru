@@ -490,15 +490,16 @@ take a shared one.
 A lost-reply test that pauses a request with the fixture reply pause
 (`ReplyPause`, or `test_support::ReplyBarrier` outside kuru-memory), cancels it
 and then expects one `reconcile` or recovery call to return a definite answer
-awaits the reply signal (`ReplyPause::replied`, `ReplyBarrier::wait_replied`)
-before it cancels. The owner answers an outcome query from its in-process
-receipt registry, which settles only when the original request's handler
-returns, and a sibling can read the committed row before then. A sibling's read
-therefore proves the commit but does not order the reconcile, which may still
-be answered `InFlight` and fail as uncertain. The paused client reads and holds
-the owner's reply frame, which the owner writes only after the receipt settled,
-and a released call returns that frame unchanged. Tests that poll `reconcile`
-until the outcome is definite do not need the signal.
+cancels once another attachment can read the committed effect. It needs no
+reply signal. The owner reports a visible main-view unit or usage ledger
+receipt as committed even while the original handler is still registered.
+For every other outcome it waits for that handler to settle, without holding
+the write guard, and answers from what it reads afterwards. A test that
+cancels at `sent` is not covered, because a request the owner never registered
+still answers uncertain. Tests of the in-flight answer set the owner's
+settlement wait to zero (`set_settlement_wait`), so they observe `InFlight`
+without a sleep. Tests that poll `reconcile` until the outcome is definite
+also still work.
 
 A record is keyed by the store directory's native identity and birth time, so
 it follows a rename, and releasing a root forgets the records beneath it, so a
@@ -1080,6 +1081,13 @@ Each typed memory service operation (`ServiceCall`, `ViewOperation` and
 `LedgerOperation` in `packages/kuru-memory/src/service/rpc.rs`) has one entry in
 its exhaustive `contract()` match. The entry states whether a lost reply may
 hide a write, which durable receipt proves the outcome, and the reply budget.
+An outcome query may wait for the original handler to settle, within
+`OPERATION_TIMEOUT` minus a reply margin (`REPLY_MARGIN`), and it ends the wait
+as soon as its client disconnects or cancels. The wait relies on the same
+assumption as the uncertain-write fence: Dolt removes a session's process-list
+entry only after the session's running command returns. The store test
+`receipt_is_hidden_before_dolt_commit_and_durable_without_sql_commit` measures
+the receipt visibility that the lock-free probe depends on.
 A new variant does not compile until it has an entry. A write must also carry a
 receipt; idle retirement is the only exception. Add the variant's sample and
 classification row to `service/rpc/contract_tests.rs`.

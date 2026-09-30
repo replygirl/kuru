@@ -23,11 +23,11 @@ Nothing below has been run. Every row is acceptance evidence authored before imp
 
 ## 4. Absence and the uncertain-write fence stay sound [critical]
 
-- [ ] 4.1 @regression (agent) T4 Absent only after settlement: a receipt-bearing `CheckpointContextSummary` whose `source_view != "main"` (rejected before any SQL write), paused at `RegisteredPause`; query awaits `Entered` -> after release the query returns `Absent`; the same request at zero budget returns `InFlight`. Waiting half red at HEAD.
+- [ ] 4.1 @regression (agent) T4 Absent only after settlement: a receipt-bearing `AppendMessage` with a blank namespace (rejected by validation before any SQL write), paused at `RegisteredPause`; query awaits `Entered` -> after release the query returns `Absent`; the same request at zero budget returns `InFlight`. Waiting half red at HEAD.
 - [ ] 4.2 @regression (agent) T10 dropped handler is not Completed: write paused at `RegisteredPause`; abort its serve task -> same-generation outcome for that ID is `StillUncertain`, not `Absent`. Red at HEAD.
 - [ ] 4.3 @unit (agent) T14 settlement bookkeeping on `ReceiptProgress` directly, no Dolt -> (a) A settles, B same key drops unsettled: `Unknown`, and a later settled C stays `Unknown`; (b) A and B concurrent, B drops unsettled, A settles last: `Unknown`; (c) overflow of the unsettled window makes an unrelated `Completed` key read `Unknown`; (d) every drop wakes a waiter. (a)-(c) red at HEAD.
 - [ ] 4.4 @integration (agent) T3 guard at zero budget: the existing `registered_in_flight_write_cannot_be_reported_absent` with `set_settlement_wait(ZERO)` before the query, body and assertions otherwise unchanged -> `InFlight`, then `Committed`. Guard: green before and after.
-- [ ] 4.5 @integration (agent) T9 fence trips on a genuinely uncertain outcome, `facade.rs` tests: a candidate unit write loses its reply; a sibling abandons and reclaims the exact ref through selected abandon -> recovery fails with "candidate unit outcome remains uncertain"; a following mutation on any clone fails at `ensure_mutation_allowed`; the pending receipt is retained. Guard: green before and after.
+- [ ] 4.5 @integration (agent) T9 fence trips on a genuinely uncertain outcome, `facade.rs` tests: a candidate unit write loses its reply; a sibling completes a selected abandon (retrying while the owner refuses `Active`) that reclaims the exact ref -> recovery fails with "candidate unit outcome remains uncertain"; a following mutation on any clone fails at `ensure_mutation_allowed`; the pending receipt is retained. Guard: green before and after.
 - [ ] 4.6 @integration (agent) existing still-uncertain coverage (at a96a16ae: `service.rs` 3418, 3984, 4118-4123, 4530 and `facade.rs` 5359-5375) -> unchanged and passing.
 
 ## 5. A waiting query blocks no one and releases on client exit (lead condition 1) [critical]
@@ -47,7 +47,7 @@ Nothing below has been run. Every row is acceptance evidence authored before imp
 ## 7. Repository gates
 
 - [ ] 7.1 @integration (agent) `mise run //packages/kuru-memory:test` and `mise run //packages/kuru-runtime:test` -> pass, no test excluded; counts recorded.
-- [ ] 7.2 @integration (agent) `mise run format:check`, `mise run lint` (includes the Windows target), `mise run typecheck`, `mise run docs:check`, `mise run cospec -- validate memory-definite-reconcile-answers --strict` -> all exit 0.
+- [ ] 7.2 @integration (agent) `mise run format:check`, `mise run lint`, `mise run lint:windows`, `mise run typecheck`, `mise run docs:check`, `mise run cospec -- validate memory-definite-reconcile-answers --strict` -> all exit 0.
 - [ ] 7.3 @integration (agent) `mise run coverage` -> workspace lines at or above 90% with no exclusions; percentage recorded.
 - [ ] 7.4 @runtime (agent) CI at the pushed head: Ubuntu, macOS, Windows (x64 and arm64) and Linux arm64 native memory partitions -> green; run ids recorded.
 - [ ] 7.5 @benchmark (agent) repeated-run flake measurement of the new service tests (T1-T13) -> no failures across the recorded iteration count; command and counts recorded.
