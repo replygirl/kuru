@@ -113,6 +113,10 @@ pub struct OpenOptions {
     pub config: MemoryConfig,
     pub read_only: bool,
     pub supervisor: Option<PathBuf>,
+    /// Identifies the client that spawns a service owner. The owner retires
+    /// on its own only after an attachment has presented this token; it is
+    /// not a secret and grants nothing else.
+    pub(crate) starter_token: Option<Uuid>,
     #[cfg(test)]
     migration_hooks: Option<Arc<migrations::MigrationRunnerHooks>>,
     #[cfg(test)]
@@ -130,6 +134,7 @@ impl OpenOptions {
             config: MemoryConfig::default(),
             read_only: false,
             supervisor: None,
+            starter_token: None,
             #[cfg(test)]
             migration_hooks: None,
             #[cfg(test)]
