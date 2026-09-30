@@ -12063,7 +12063,7 @@ mod tests {
                     .await?,
                 "receipt disappeared after the session ended without SQL COMMIT"
             );
-            ensure!(store.history("publication", 10).await? == [message.clone()]);
+            ensure!(store.history("publication", 10).await? == std::slice::from_ref(&message));
             Ok::<(), anyhow::Error>(())
         }
         .await;
