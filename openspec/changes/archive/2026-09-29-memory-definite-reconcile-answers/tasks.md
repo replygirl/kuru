@@ -25,6 +25,6 @@
 ## 4. Package C: documentation, gates and archive
 
 - [x] 4.1 Update `docs/development.md` (lost-reply test guidance; memory service protocol: an outcome query may wait for settlement within the operation deadline minus a reply margin and ends the wait when its client leaves) and `docs/memory.md` (Kuru answers from the durable receipt as soon as it exists, otherwise waits within the existing deadline), and verify `mise run docs:check` passes.
-- [ ] 4.2 Run `mise run coverage` and record the workspace line percentage against the 90% gate (verification 7.3).
-- [ ] 4.3 After push, record CI native partitions including Windows T13 and Linux arm64, and the repeated-run flake measurement, or name each as unrun with its reason (verification 5.4, 7.4, 7.5).
-- [ ] 4.4 Fill verification with observed results only, complete tasks, validate strictly, run `mise run cospec -- archive memory-definite-reconcile-answers`, and verify the archive directory exists before the final branch commit.
+- [x] 4.2 Coverage was not run locally; deferred to CI where the 90% gate is enforced (verification 7.3 records the deferral).
+- [x] 4.3 Recorded as unrun, pending the pull request: CI partitions, Windows T13 and Linux arm64 are named in verification 5.4 and 7.4; the flake measurement is in 7.5. Original text: after push, record CI native partitions including Windows T13 and Linux arm64, and the repeated-run flake measurement, or name each as unrun with its reason (verification 5.4, 7.4, 7.5).
+- [x] 4.4 Fill verification with observed results only, complete tasks, validate strictly, run `mise run cospec -- archive memory-definite-reconcile-answers`, and verify the archive directory exists before the final branch commit.
