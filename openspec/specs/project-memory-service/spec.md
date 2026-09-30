@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the per-project private memory service that owns writable Dolt lifetime, validates compatible local attachments, retains idle service authority safely, and exposes exact candidate recovery without granting concurrent conversation-driving authority.
+Define the per-project private memory service that owns writable Dolt lifetime, validates compatible local attachments, retains service authority only while attached clients or pending work exist, and exposes exact candidate recovery without granting concurrent conversation-driving authority.
 
 ## Requirements
 
@@ -32,7 +32,7 @@ The service SHALL expose only private local IPC and SHALL require a bounded, ver
 
 ### Requirement: Idle shutdown and safe recovery
 
-After the final attachment and accepted operation settle, the service SHALL wait a documented idle interval before shutdown; a valid reconnect during that interval SHALL cancel shutdown. Explicit maintenance MAY ask an otherwise idle owner to retire early while retaining the starter election gate. It SHALL close pools, await its owned supervisor and Dolt reap, retire its endpoint, and release leases in that order. Following crash, a successor SHALL use the existing lifecycle locks and uncertain-operation reconciliation before further mutation, and SHALL never infer authority to kill a process from a stale PID or occupied port.
+After the final attachment has released and every accepted operation has settled, the service SHALL shut down immediately, without an idle interval; a newly started service first waits, within the startup budget, for the client that started it. Explicit maintenance MAY ask an owner with no other attachment to retire while retaining the starter election gate. It SHALL stop accepting and retire its endpoint, close pools, await its owned supervisor and Dolt reap, and release leases in that order. A client that arrives during shutdown SHALL either attach to the still-live generation or wait for complete owned shutdown and start or attach to a successor within its startup budget; meeting a retiring owner SHALL NOT by itself produce an error. Following crash, a successor SHALL use the existing lifecycle locks and uncertain-operation reconciliation before further mutation, and SHALL never infer authority to kill a process from a stale PID or occupied port.
 
 #### Scenario: Abandoned client
 - **WHEN** a client crashes without explicit detach while another remains attached
@@ -79,16 +79,16 @@ The managed owner SHALL expose a bounded read-only inventory and status for vali
 - **THEN** explicit abandonment refuses without replaying promotion or deleting any candidate ref, and reports the unresolved state for later exact inspection
 
 #### Scenario: Reconnect races idle shutdown
-- **WHEN** a client reconnects as the idle interval expires
-- **THEN** it either attaches to the still-live generation or safely starts/attaches to a successor after complete owned shutdown, with no simultaneous owners
+- **WHEN** a client attaches as the last attachment releases
+- **THEN** it either attaches to the still-live generation or, within its startup budget, starts or attaches to a successor after complete owned shutdown, with no simultaneous owners and no error caused only by the retiring owner
 
 #### Scenario: Service or engine crash
 - **WHEN** the service or its Dolt engine exits during an uncertain operation
 - **THEN** the next owner waits for retained cleanup, reconciles the durable receipt, and does not duplicate a committed effect
 
 #### Scenario: Maintenance after the final client exits
-- **WHEN** an authorized purge starts during the warm idle interval with no other attachment
-- **THEN** the owner retires and reaps early, purge retains the starter and owner gates through its directory work, and no replacement can race it
+- **WHEN** an authorized purge starts while the previous owner is shutting down or after it has retired
+- **THEN** it waits for the owner lock, retains the starter and owner gates through its directory work, and no replacement can race it
 
 #### Scenario: Maintenance while a client remains active
 - **WHEN** an authorized purge encounters a service with another live attachment
