@@ -1,9 +1,10 @@
 # Verification
 
 Local evidence: macOS 27.0 arm64, debug profile, pinned Dolt 2.3.5, run with
-`mise run //packages/kuru-memory:test -- --lib template_` (all 15 template
-tests, 38.8 s for the ten engine tests) on the implementation commit. Linux and
-Windows evidence comes only from CI on the pull request; none is claimed here.
+`mise run //packages/kuru-memory:test -- --lib template_` (38.8 s for the ten
+engine tests) on the implementation commit, and again after the review fixes
+(18 tests matching `template_`, 0 failed, 43.2 s). Linux and Windows evidence
+comes only from CI on the pull request; none is claimed here.
 
 ## 1. Adoption gives a copy its own independent identity [critical]
 
@@ -23,13 +24,13 @@ Windows evidence comes only from CI on the pull request; none is claimed here.
 
 ## 4. The template-shape check catches a replaced or non-empty tree before activation [critical]
 
-- [x] 4.1 @integration (agent) run `template_shape_violation_prevents_ready_marker` against a real stage engine, injecting an extra row, an extra commit and an extra branch one at a time -> each fails S1 with the typed verdict, stage preserved, no active directory produced. Observed: passed, and a view as a fourth case; the placeholder form of the same check runs in every test's template build and passed.
+- [x] 4.1 @integration (agent) run `template_shape_violation_prevents_ready_marker` against a real stage engine, injecting an extra row, an extra commit and an extra branch one at a time -> each fails S1 with the typed verdict, stage preserved, no active directory produced. Observed: passed, and a view as a fourth case; the placeholder form of the same check runs in every test's template build and passed. After review, a fifth case adds 257 empty tables to the usage branch: the check reads one row past its 256-table bound and reports "more than 256 tables" as a verdict. Mutation check: ignoring that bound let the stage publish `ready.json` ("table overflow: the stage was marked ready"), because a truncated table list left the remaining tables unchecked. The branch list uses the same one-past-the-bound read.
 
 ## 5. Cold stores and older binaries are unaffected
 
-- [x] 5.1 @unit (agent) run `cold_identity_record_bytes_are_unchanged` -> a cold-built store's identity.json bytes are byte-identical to before this change. Observed: passed; a record type without the field refuses a template-born record, as an older binary does.
+- [x] 5.1 @unit (agent) run `cold_identity_record_bytes_are_unchanged` -> a cold-built store's identity.json bytes are byte-identical to before this change. Observed: passed; a record type without the field refuses a template-born record, as an older binary does. After review, `stage_template_key_reads_the_identity_record` also refuses keys that are not one portable path component (uppercase, `/`, `\`, `..`, `.`, space, non-ASCII) and accepts a 64-character hex key and a key at the 128-byte bound.
 - [x] 5.2 @integration (agent) run `adopted_store_opens_under_a_later_key` -> a store adopted under compiled key K1 opens writable and read-only once its identity names another key, and a ready template stage naming another key is reused through the existing inspection path. Observed: passed; the marker is not rewritten by either open. A failed comparison would refuse the open, so no separate counter was added.
-- [x] 5.3 @integration (agent) run `ready_template_stage_is_reused` -> existing marker Before/After boundaries and reuse path activate a ready template-born stage unchanged, without re-running adoption. Observed: passed; after the After boundary the open activates the same directory at its initial revision with one adoption commit (9 on `main`) and one inspection plus one active start.
+- [x] 5.3 @integration (agent) run `ready_template_stage_is_reused` -> existing marker Before/After boundaries and reuse path activate a ready template-born stage unchanged, without re-running adoption. Observed: passed; after the After boundary the open activates the same directory at its initial revision with one adoption commit (`main`'s length equals the compiled registries' count plus the adoption commit, derived by `template_shape::compiled_commits`; 9 at schema 7) and one inspection plus one active start.
 
 ## 6. No caller regression: the template path stays unreachable in this change
 

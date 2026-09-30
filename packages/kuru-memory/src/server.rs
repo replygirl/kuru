@@ -85,8 +85,10 @@ pub(crate) const TEMPLATE_INSTANCE: &str = "00000000-0000-0000-0000-000000000000
 /// passes every scope check a project identity does and names no project.
 pub(crate) const TEMPLATE_SCOPE: &str =
     "project/611dd11842f30482f942494b150ce33784d70efdf91d47c7a9f498d95c81662d";
-/// Bound on the `template` key an identity record may carry.
-const TEMPLATE_KEY_LIMIT: usize = 256;
+/// Bound on the `template` key an identity record may carry. The template
+/// cache names directories after the key (`.rejected-<key>-<uuid>` is the
+/// longest), so a key of this length still fits one 255-byte path component.
+const TEMPLATE_KEY_LIMIT: usize = 128;
 /// The permanent usage branch, adopted before `main`.
 pub(crate) const USAGE_DATABASE: &str = "kuru/kuru_usage_v1";
 const ADOPTION_MESSAGE: &str = "Adopt Kuru memory template";
@@ -1469,12 +1471,22 @@ fn validate_identity(identity: &Identity) -> Result<()> {
         );
     }
     ensure!(
-        identity.template.as_deref().is_none_or(|key| {
-            !key.is_empty() && key.len() <= TEMPLATE_KEY_LIMIT && !key.chars().any(char::is_control)
-        }),
+        identity.template.as_deref().is_none_or(valid_template_key),
         "invalid memory template identity"
     );
     Ok(())
+}
+
+/// A template key is one portable, case-distinct path component: `[a-z0-9_-]`,
+/// at most [`TEMPLATE_KEY_LIMIT`] bytes. The template cache names its key
+/// lock, template and build directories after it, so no separator, dot,
+/// uppercase letter or other byte a filesystem could reinterpret is accepted.
+fn valid_template_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= TEMPLATE_KEY_LIMIT
+        && key.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
 }
 
 /// The store template key a staging directory's identity record names, if

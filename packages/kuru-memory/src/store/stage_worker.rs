@@ -18,9 +18,14 @@
 //!
 //! Every job receives the startup lock and returns it only after its engine
 //! has been reaped: the lock is each server's reap guard, so a cancelled
-//! opener never releases it before the supervisor reaps. A failed job
-//! preserves an unready stage under `interrupted/`. Quiescence, the move onto
-//! the active path and the active start stay with the caller.
+//! opener never releases it before the supervisor reaps. A job that fails
+//! after its engine and main pool are open preserves the unready stage under
+//! `interrupted/` itself. A failure before that (the engine start, including
+//! its bootstrap and therefore adoption and any template verdict, or the main
+//! pool) leaves the stage in place; the next open's recovery preserves it,
+//! and for a template stage (Class U) does so without an engine start.
+//! Quiescence, the move onto the active path and the active start stay with
+//! the caller.
 use super::*;
 
 /// One staging engine start. Each keeps its own startup and pool error text.

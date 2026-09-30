@@ -76,6 +76,14 @@ fn stage_template_key_reads_the_identity_record() -> Result<()> {
     assert_eq!(stage_template_key(&directory)?, None);
     write_record(&record, &identity(Some("key-1")))?;
     assert_eq!(stage_template_key(&directory)?.as_deref(), Some("key-1"));
+    // A SHA-256 hex key at the longest bound is one valid path component.
+    for valid in [
+        "0123456789abcdef".repeat(4),
+        "k_".repeat(TEMPLATE_KEY_LIMIT / 2),
+    ] {
+        write_record(&record, &identity(Some(&valid)))?;
+        assert_eq!(stage_template_key(&directory)?, Some(valid));
+    }
 
     for invalid in [
         b"{not json".to_vec(),
@@ -83,6 +91,13 @@ fn stage_template_key_reads_the_identity_record() -> Result<()> {
         serde_json::to_vec(&identity(Some("")))?,
         serde_json::to_vec(&identity(Some("line\nbreak")))?,
         serde_json::to_vec(&identity(Some(&"k".repeat(TEMPLATE_KEY_LIMIT + 1))))?,
+        serde_json::to_vec(&identity(Some("Key")))?,
+        serde_json::to_vec(&identity(Some("a/b")))?,
+        serde_json::to_vec(&identity(Some("a\\b")))?,
+        serde_json::to_vec(&identity(Some("..")))?,
+        serde_json::to_vec(&identity(Some("key.lock")))?,
+        serde_json::to_vec(&identity(Some("with space")))?,
+        serde_json::to_vec(&identity(Some("kéy")))?,
         serde_json::to_vec(&Identity {
             instance: "not-a-uuid".into(),
             ..identity(Some("key"))

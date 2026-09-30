@@ -1165,9 +1165,12 @@ async fn ready_template_stage_is_reused() -> Result<()> {
                         .fetch_one(store.pool.as_ref()),
                     )
                     .await?;
+                    let (adopted_main, _) =
+                        migrations::template_shape::compiled_commits(true)?;
                     ensure!(
-                        history == 9 && adoptions == 1,
-                        "reuse changed main's history: {history} commits, {adoptions} adoptions"
+                        u64::try_from(history).ok() == Some(adopted_main) && adoptions == 1,
+                        "reuse changed main's history: {history} commits (expected \
+                         {adopted_main}), {adoptions} adoptions"
                     );
                     // One inspection start and one active start, after the job's.
                     ensure!(
@@ -1198,9 +1201,11 @@ async fn ready_template_stage_is_reused() -> Result<()> {
 
 /// The template shape on the stage engine refuses a copy whose bytes hold
 /// more than the template may: a commit beyond the compiled history, a
-/// branch outside the compiled set, a project-data row, or a view. Each is a
-/// typed verdict after adoption and before `ready.json`, the job preserves
-/// the unready stage, and no active directory appears.
+/// branch outside the compiled set, a project-data row, a view, or more
+/// tables than the check reads (which a truncated read would leave
+/// unchecked). Each is a typed verdict after adoption and before
+/// `ready.json`, the job preserves the unready stage, and no active
+/// directory appears.
 #[tokio::test]
 async fn template_shape_violation_prevents_ready_marker() -> Result<()> {
     let root = fixture_root()?;
@@ -1240,6 +1245,18 @@ async fn template_shape_violation_prevents_ready_marker() -> Result<()> {
                     amend.clone(),
                 ],
                 "VIEW",
+            ),
+            (
+                "table overflow",
+                std::iter::once("USE `kuru/kuru_usage_v1`".to_owned())
+                    .chain(
+                        (0..=256).map(|index| {
+                            format!("CREATE TABLE extra_{index:03} (id INT PRIMARY KEY)")
+                        }),
+                    )
+                    .chain(std::iter::once(amend.clone()))
+                    .collect(),
+                "more than 256 tables",
             ),
         ];
         for (index, (label, statements, expected)) in cases.iter().enumerate() {

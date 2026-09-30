@@ -7441,9 +7441,13 @@ async fn recover_staging(
             activation.is_none() && copy_remnant(&stage)?
         };
         if template_stage {
+            let found = if identity_exists {
+                "an unready memory template stage"
+            } else {
+                "an interrupted memory template copy"
+            };
             eprintln!(
-                "Found an unready memory template stage at {}; preserving it without starting \
-                 its engine",
+                "Found {found} at {}; preserving it without starting its engine",
                 stage.display()
             );
         } else if identity_exists {

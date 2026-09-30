@@ -61,7 +61,9 @@ engine start.
 
 A staging directory copied from a machine's store template SHALL carry an
 optional `template` field in its activation identity record naming the
-template it was copied from. A store that was not copied from a template
+template it was copied from. A template key is one portable path component of
+lowercase ASCII letters, digits, `_` and `-`, at most 128 bytes; an identity
+record naming any other key is invalid. A store that was not copied from a template
 SHALL serialize its identity record with no such field present, byte-for-byte
 as before this requirement existed, and the identity record format SHALL
 continue to reject an unrecognized field so that a binary predating this
@@ -99,10 +101,18 @@ with clean working sets; commit counts on both refs derived from the compiled
 migration registries plus one adoption commit each; the adopted identity as
 the only identity row on both refs; no rows in any project-data table; and no
 views, triggers, routines, stored schema objects, stored procedures or ignore
-rules. The same check, with the placeholder identity and no adoption commits,
-SHALL be the one a template build runs. A completed shape query that returns
-another value is a verdict against the template's bytes; a query error or
-deadline is not.
+rules. A branch or table list that holds more entries than the check reads is
+a verdict, never a silently truncated set. The same check, with the
+placeholder identity and no adoption commits, SHALL be the one a template
+build runs. A completed shape query that returns another value is a verdict
+against the template's bytes; a query error or deadline is not. The shape
+check classifies each retained `main` migration branch from `main`; retained
+usage-branch migration branches are only counted there, and are classified by
+the usage-branch validation that a template build runs and that every
+writable open runs when it establishes the usage ledger. The compiled usage
+registry retains no such branch while it ends at the schema a usage branch is
+anchored at; a usage schema step beyond it MUST first make the template build
+and a copy's first engine classify those branches before `ready.json`.
 
 A completed comparison that finds the row, the working set, the count of
 rows a rewrite affected, or the template shape to be something other than
@@ -112,9 +122,21 @@ from a client-side startup error, which the opening client MUST surface as
 the same typed verdict. An
 engine failure, a lost or malformed reply, a deadline, an authentication
 failure, a SQL error unrelated to the expected row or count, or a mismatched
-compiled template key MUST NOT be reported through that verdict response and
-MUST leave the staging directory preserved exactly as an ordinary failed
-staging attempt is preserved today.
+compiled template key MUST NOT be reported through that verdict response.
+A copy whose `kuru` database or usage branch is missing fails adoption with a
+SQL error, so it is an ordinary failure rather than a verdict; the template
+cache's structural check before any stage is copied, not adoption, MUST be
+what detects that corruption of a template.
+
+Every adoption failure, verdict or not, fails the copy's engine start. That
+failure, or a failure to open the started engine's main pool, stops and reaps
+the engine and leaves the unready stage in place, as a failed first staging
+start is left today, and the next open's recovery
+preserves it under the interrupted-stage protocol without starting an engine
+against it. A failure after the engine has started and adopted the copy
+(validation, the template shape check or publication of `ready.json`) is
+preserved by the staging job itself, as any failed validation of a stage is.
+In neither case is adoption retried.
 
 Stores copied from the same machine's template for the same template key
 SHALL share that template's pre-adoption history with identical commit
@@ -140,17 +162,17 @@ SHALL be that main adoption commit.
 #### Scenario: A verdict against the template's bytes is typed and distinct
 
 - **WHEN** the placeholder row adoption expects is not present unchanged on either branch, either working set is dirty, or a rewrite affects a count of rows other than the one expected
-- **THEN** Kuru reports the distinct verdict response before either branch is rewritten where the comparison precedes the rewrites, and the staging directory is preserved without adoption having been retried.
+- **THEN** Kuru reports the distinct verdict response before either branch is rewritten where the comparison precedes the rewrites, the unready staging directory is left in place and preserved by the next open's recovery without an engine start, and adoption is never retried.
 
 #### Scenario: A template shape violation prevents the ready marker
 
-- **WHEN** an adopted copy holds an extra commit, an extra branch, a project-data row or a view
-- **THEN** its engine reports the typed verdict before `ready.json`, the unready stage is preserved under the interrupted-stage protocol, and no active project directory appears.
+- **WHEN** an adopted copy holds an extra commit, an extra branch, a project-data row, a view or more tables than the check reads
+- **THEN** its engine reports the typed verdict before `ready.json`, the staging job preserves the unready stage under the interrupted-stage protocol, and no active project directory appears.
 
 #### Scenario: An engine failure during adoption is not a verdict
 
-- **WHEN** adoption meets an engine crash, a lost commit reply, a bootstrap deadline, an authentication failure, or a mismatch between the staging directory's named template and the supervisor's own compiled template key
-- **THEN** Kuru reports an ordinary failure, not the distinct verdict response, and the staging directory is preserved exactly as an ordinary failed staging attempt is preserved today.
+- **WHEN** adoption meets an engine crash, a lost commit reply, a bootstrap deadline, an authentication failure, a missing `kuru` database or usage branch, or a mismatch between the staging directory's named template and the supervisor's own compiled template key
+- **THEN** Kuru reports an ordinary failure, not the distinct verdict response, the unready staging directory is left in place, and the next open's recovery preserves it under the interrupted-stage protocol without starting an engine against it.
 
 #### Scenario: An initialized template-born store opens under a later compiled key
 

@@ -39,8 +39,13 @@ const USAGE_ANCHOR: i32 = 4;
 /// Tables whose rows are schema, receipt and identity authority. Every other
 /// table on `main` and on the usage branch is project data and must be empty.
 const AUTHORITY_TABLES: [&str; 3] = ["kuru_instance", "kuru_migrations", "kuru_schema"];
-/// Bound on the branches read: the two refs and one attempt per step.
-const BRANCH_LIMIT: i64 = 2 * DEFINITION_LIMIT as i64 + 3;
+/// The most branches a template may hold: the two refs and one retained
+/// attempt per step of each registry. One more is read, so an overflow is a
+/// verdict rather than a silently truncated branch set.
+const BRANCH_LIMIT: usize = 2 * DEFINITION_LIMIT + 2;
+/// The most tables a ref of a template may hold. One more is read, so a table
+/// beyond the bound is a verdict rather than one the check never counted.
+const TABLE_LIMIT: usize = 256;
 
 /// The identity row the shape requires on `main` and on the usage branch.
 #[derive(Clone, Copy, Debug)]
@@ -110,6 +115,31 @@ fn verdict(reason: String) -> anyhow::Error {
     TemplateVerdict::new(format!("memory store template shape: {reason}")).into()
 }
 
+/// The `LIMIT` bound for a list that may hold at most `limit` rows: one more,
+/// so [`within`] can tell a complete list from a truncated one.
+fn read_limit(limit: usize) -> Result<i64> {
+    Ok(i64::try_from(limit)?.saturating_add(1))
+}
+
+/// A completed list read with [`read_limit`] that returned more than `limit`
+/// rows holds more than a template may: a verdict, never a truncation.
+fn within(found: usize, limit: usize, what: &str, reference: &str) -> Result<()> {
+    if found > limit {
+        return Err(verdict(format!(
+            "{reference} holds more than {limit} {what}"
+        )));
+    }
+    Ok(())
+}
+
+/// Commits on `main` and on the usage branch that the compiled registries
+/// expect, before (`adopted == false`) or after adoption.
+#[cfg(test)]
+pub(in crate::store) fn compiled_commits(adopted: bool) -> Result<(u64, u64)> {
+    let expected = expected(REGISTRY, USAGE_REGISTRY, USAGE_ANCHOR, adopted)?;
+    Ok((expected.main_commits, expected.usage_commits))
+}
+
 /// An engine-supplied name, bounded for a verdict message.
 fn shown(name: &str) -> String {
     format!("{:?}", name.chars().take(64).collect::<String>())
@@ -172,10 +202,11 @@ pub(in crate::store) async fn check(main: &MySqlPool, row: Row<'_>) -> Result<()
 async fn branches(main: &MySqlPool, expected: &Expected) -> Result<()> {
     let rows: Vec<(String, bool)> = bounded_query(
         sqlx::query_as("SELECT name, dirty FROM dolt_branches ORDER BY name LIMIT ?")
-            .bind(BRANCH_LIMIT)
+            .bind(read_limit(BRANCH_LIMIT)?)
             .fetch_all(main),
     )
     .await?;
+    within(rows.len(), BRANCH_LIMIT, "branches", "the store")?;
     let mut refs = BTreeSet::new();
     let mut main_attempts = Vec::new();
     let mut usage_attempts = Vec::new();
@@ -267,11 +298,13 @@ async fn reference_shape(
     }
     let tables: Vec<(String, String)> = bounded_query(
         sqlx::query_as(
-            "SELECT CAST(table_name AS CHAR), CAST(table_type AS CHAR) FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name LIMIT 257",
+            "SELECT CAST(table_name AS CHAR), CAST(table_type AS CHAR) FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name LIMIT ?",
         )
+        .bind(read_limit(TABLE_LIMIT)?)
         .fetch_all(&mut *connection),
     )
     .await?;
+    within(tables.len(), TABLE_LIMIT, "tables", reference)?;
     for (table, kind) in tables {
         if kind != "BASE TABLE" {
             return Err(verdict(format!(
@@ -398,16 +431,46 @@ mod tests {
         assert_eq!(Ref::Main.select(), format!("USE `{DATABASE}`"));
         // The anchor is the schema a new usage branch is created at.
         assert_eq!(V5.from, USAGE_ANCHOR);
-        // The compiled registries: the shape a cold store was measured with
-        // (eight commits on main, five on the usage branch, attempts 2..=7).
+        // The compiled registries are consecutive from schema 1 (their
+        // `validate`), so each ref holds the base and one commit per version
+        // step to its current schema, whatever the current schemas are. The
+        // cold store the counts were measured on (eight commits on `main`,
+        // five on the usage branch) is the build of every template test.
         let compiled = expected(REGISTRY, USAGE_REGISTRY, USAGE_ANCHOR, false)?;
-        assert_eq!(compiled.main_commits, 8);
-        assert_eq!(compiled.usage_commits, 5);
+        let steps = |current: i32| u64::try_from(current - 1);
+        assert_eq!(
+            compiled.main_commits,
+            BASE_COMMITS + steps(CURRENT_VERSION)?
+        );
+        assert_eq!(
+            compiled.usage_commits,
+            BASE_COMMITS + steps(USAGE_CURRENT_VERSION)?
+        );
         assert_eq!(
             compiled.main_attempts,
             (2..=CURRENT_VERSION).collect::<Vec<_>>()
         );
-        assert!(compiled.usage_attempts.is_empty());
+        assert_eq!(
+            compiled_commits(true)?,
+            (compiled.main_commits + 1, compiled.usage_commits + 1)
+        );
+        // `check` counts retained usage attempts but classifies only main
+        // attempts; usage attempts are classified by `validate_usage` from
+        // the usage pool. None exists while the usage registry ends at its
+        // anchor. A usage step beyond it must first make the build and the
+        // stage engine run that classification before `ready.json`.
+        assert!(
+            compiled.usage_attempts.is_empty(),
+            "a usage schema step now leaves retained usage attempts: classify them \
+             (validate_usage) in the template build and the stage engine first"
+        );
+
+        // A list read one row past its bound is a verdict, not a truncation.
+        assert!(within(TABLE_LIMIT, TABLE_LIMIT, "tables", "main").is_ok());
+        let overflow = within(TABLE_LIMIT + 1, TABLE_LIMIT, "tables", "main")
+            .expect_err("an overflowing list was accepted");
+        assert!(TemplateVerdict::find(&overflow).is_some());
+        assert_eq!(read_limit(BRANCH_LIMIT)?, 2 * DEFINITION_LIMIT as i64 + 3);
 
         // An invalid registry is refused rather than counted.
         let broken = Registry {
