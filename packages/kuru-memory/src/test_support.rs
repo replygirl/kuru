@@ -30,6 +30,10 @@ pub use fixture_dir::{CreatorTeardown, TempDir, release_after_creator_exit};
 mod served_owner;
 #[cfg(test)]
 pub(crate) use served_owner::{FixtureDeadline, serve_without_deadline};
+/// Data-tree copy, byte scan and cross-OS capture format for the engine
+/// contract tests.
+#[cfg(test)]
+pub(crate) mod engine_contract;
 /// Process-local live-owner and quiescence records the fixture guard reads.
 pub(crate) mod engine_ledger;
 /// Env-gated lifecycle ordering measurement trace (inert unless enabled).

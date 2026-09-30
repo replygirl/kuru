@@ -553,6 +553,17 @@ inert unless `KURU_TEST_DOLT_LOG_DIR` names a directory, so neither runs in
 receives their CSV rows, and
 `KURU_TEST_LIFECYCLE_MEASURE_ITERATIONS` (default 300) sets the loop count.
 
+`store::engine_contract_tests` pins the Dolt behaviours that creating stores
+from a pre-migrated template relies on: root creation and bootstrap on a
+copied data directory, identity commits on two refs, main-pool reads of
+branch state and history, commit hash shape and the bytes a stopped data
+tree holds. They run in the ordinary `test` task. Their cross-OS case runs
+only when `KURU_ENGINE_CONTRACT_CROSS_OS_CAPTURE` names a capture directory
+(`capture.json` beside a `data/` tree) produced on another operating system;
+otherwise it prints and asserts a not-run result. Setting
+`KURU_ENGINE_CONTRACT_REQUIRE_CROSS_OS=1` turns that not-run result into a
+failure, for a job that consumes such a capture.
+
 Development and test builds optimize only the pinned SHA-2 0.11.0 dependency to
 keep repeated full-executable update verification responsive. Cargo requires
 this version-specific profile override in the workspace root. Workspace code,
