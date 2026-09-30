@@ -23,18 +23,33 @@
 //!
 //! S8 inventory: the inline checks of `classify_historical_attempts_in`
 //! (`store/migrations.rs`), and the main-pool equivalent each was tested
-//! against (see [`record_classification_checks_have_main_pool_equivalents`]):
+//! against (see [`record_classification_checks_have_main_pool_equivalents`]).
+//! "Same answer" is asserted on a migrated store and, where the branch pool
+//! can no longer open, on an adopted copy:
 //!
-//! | Inline check (branch or commit pool) | Main-pool equivalent tested |
-//! |---|---|
-//! | head: `DOLT_HASHOF('HEAD')` on the branch pool | `dolt_branches.hash` |
-//! | head schema version: `kuru_schema AS OF 'HEAD'` | `kuru_schema AS OF '<head>'` |
-//! | dirty count: `dolt_status` on the branch pool | `dolt_branches.dirty`; `` `kuru/<branch>`.dolt_status `` |
-//! | receipt: `kuru_migrations` on the branch pool | `kuru_migrations AS OF '<head>'` |
-//! | sole parent: `dolt_commit_ancestors` on the branch pool | `dolt_commit_ancestors` on main |
-//! | parent schema validation: full validation on a pool at the parent | `kuru_schema AS OF '<parent>'` version; `SHOW CREATE TABLE ... AS OF '<parent>'` text; `information_schema` of the revision database |
-//! | head and parent in main's `dolt_log` | unchanged: it already runs on main |
-//! | "names active main only when current" | `dolt_branches.hash` against main's head |
+//! | Inline check (branch or commit pool) | Main-pool equivalent tested | Same answer |
+//! |---|---|---|
+//! | head: `DOLT_HASHOF('HEAD')` on the branch pool | `dolt_branches.hash` | yes |
+//! | head schema version: `kuru_schema AS OF 'HEAD'` | `kuru_schema AS OF '<head>'` | yes |
+//! | dirty count: `dolt_status` on the branch pool | `dolt_branches.dirty`; `` `kuru/<branch>`.dolt_status `` | yes |
+//! | clean arm, head: full `validate_version_with` on the branch pool | version `AS OF '<head>'`; `SHOW TABLES` / `SHOW CREATE TABLE ... AS OF '<head>'` | definitions yes; `information_schema` **no** (0 columns for `kuru/<branch>` and `kuru/<head>` from main) |
+//! | clean arm, receipt: `kuru_migrations` on the branch pool | `kuru_migrations AS OF '<head>'` | yes |
+//! | clean arm, sole parent: `dolt_commit_ancestors` on the branch pool | `dolt_commit_ancestors` on main | yes |
+//! | clean arm, parent: full validation on a pool at the parent | version `AS OF '<parent>'`; `SHOW TABLES` / `SHOW CREATE TABLE ... AS OF '<parent>'` | definitions yes; `information_schema` **no** (0 columns for `kuru/<parent>` from main) |
+//! | clean arm: head and parent in main's `dolt_log` | unchanged: it already runs on main | yes |
+//! | dirty arm, head version: `kuru_schema AS OF 'HEAD'` | `kuru_schema AS OF '<head>'` | yes |
+//! | dirty arm, head: full validation on a pool at the head commit | as the clean arm's head row | definitions yes; `information_schema` **no** |
+//! | dirty arm, `retained_failed_shape`: `(table_name, staged, status)` of `dolt_status` on the branch pool | `` `kuru/<branch>`.dolt_status `` | yes (synthetic working set) |
+//! | dirty arm: head in main's `dolt_log` | unchanged: it already runs on main | yes |
+//! | "names active main only when current" | `dolt_branches.hash` against main's head | yes |
+//!
+//! Full schema validation, at the head as at the parent, is the one check
+//! with no drop-in main-pool form: it reads `information_schema` of
+//! `DATABASE()`, which main's `information_schema` does not describe for a
+//! revision database. The dirty arm is exercised on a synthetic working set
+//! (an unstaged new table and a staged modification), not a genuinely failed
+//! migration attempt: producing one needs the process-loss fixture of
+//! `recovery_tests.rs`, and the queries compared are the same either way.
 use super::*;
 use crate::test_support::{
     TempDir,
@@ -230,6 +245,46 @@ async fn hostname(pool: &MySqlPool) -> Result<String> {
         sqlx::query_scalar("SELECT @@hostname").fetch_one(pool),
     )
     .await
+}
+
+/// The host name as the operating system reports it, for S7. Dolt 2.3.5
+/// builds with Go 1.26.2 (`go/go.mod` at the pinned commit), whose
+/// `os.Hostname` reads the `uname` node name (falling back to
+/// `/proc/sys/kernel/hostname`) on Linux, the `kern.hostname` sysctl on macOS
+/// (what `/bin/hostname` prints) and the physical DNS host name on Windows
+/// (<https://github.com/golang/go/blob/go1.26.2/src/os/sys_linux.go>,
+/// `sys_bsd.go`, `sys_windows.go`). That the engine's `@@hostname` is that
+/// value is inferred, and asserted on Unix by S7. Without a new dependency,
+/// Windows exposes only the NetBIOS `COMPUTERNAME`, which can differ in case
+/// and length, so there it is an extra needle rather than an equality.
+#[cfg(target_os = "linux")]
+async fn os_hostname() -> Result<String> {
+    Ok(String::from_utf8(files::read_bytes(
+        Path::new("/proc/sys/kernel/hostname"),
+        1024,
+    )?)?
+    .trim()
+    .to_owned())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+async fn os_hostname() -> Result<String> {
+    let output = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        tokio::process::Command::new("/bin/hostname")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("/bin/hostname: deadline exceeded")??;
+    ensure!(output.status.success(), "/bin/hostname failed: {output:?}");
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+#[cfg(windows)]
+async fn os_hostname() -> Result<String> {
+    std::env::var("COMPUTERNAME").context("COMPUTERNAME is not set")
 }
 
 async fn stop(options: &OpenOptions, store: MemoryStore) -> Result<Stopped> {
@@ -1103,7 +1158,9 @@ fn report(label: &str, entries: &[Entry], hits: &[Hit]) {
 /// S7. A stopped store's `data/`, and a copy of it after one more served
 /// start, hold no absolute path of either store, no host name and no secret
 /// of either store in any byte sequence the scan can see. The inventory,
-/// including the statistics store under `.dolt/stats`, is printed.
+/// including the statistics store under `.dolt/stats`, is printed. The host
+/// name needles are the engine's `@@hostname` and the operating system's
+/// host name ([`os_hostname`]); both are printed, and on Unix asserted equal.
 ///
 /// Positive controls bound what "can see" means. Chunk records are
 /// compressed, so the scan is only evidence for strings that stay literal:
@@ -1153,6 +1210,17 @@ async fn stopped_data_tree_holds_no_host_path_or_secret_bytes() -> Result<()> {
             !source.hostname.is_empty(),
             "the engine reported no host name"
         );
+        let os_host = os_hostname().await?;
+        eprintln!(
+            "engine contract S7 host name needles: engine @@hostname {:?}, operating system {os_host:?}",
+            source.hostname
+        );
+        if cfg!(unix) {
+            assert_eq!(
+                source.hostname, os_host,
+                "@@hostname differs from the operating system's host name"
+            );
+        }
         // The instance UUID is hex and can repeat a 4-byte run of its own,
         // so the control asks for any 9-character fragment of it; the whole
         // UUID is only observed.
@@ -1173,7 +1241,10 @@ async fn stopped_data_tree_holds_no_host_path_or_secret_bytes() -> Result<()> {
         let mut needles = scan_needles(
             "source",
             &source,
-            &[("fixture container", container.clone())],
+            &[
+                ("fixture container", container.clone()),
+                ("operating system host name", os_host.clone()),
+            ],
         );
         for (label, value) in &controls {
             needles.extend(contract::needles(label, value));
@@ -1292,6 +1363,13 @@ async fn classify_with_branch_pools(
                 .fetch_one(attempt_pool.as_ref()),
         )
         .await?;
+        // `validate_version_with` at the head: full schema validation on the
+        // branch pool, whose `information_schema` queries use `DATABASE()`.
+        let validated = migrations::validate_supported(&attempt_pool).await?;
+        ensure!(
+            validated == head_version,
+            "{name}: full validation read version {validated}, AS OF 'HEAD' {head_version}"
+        );
         let parents = sole_parent_on(&attempt_pool, &head).await?;
         ensure!(parents.len() == 1, "{name} has parents {parents:?}");
         Ok::<_, anyhow::Error>((head, head_version, dirty, receipt, parents[0].clone()))
@@ -1398,6 +1476,134 @@ async fn schema_text(pool: &MySqlPool, as_of: &str) -> Result<Vec<(String, Strin
     Ok(definitions)
 }
 
+/// One revision's schema read through a pool opened on `target` (a branch
+/// or a commit hash) and from main: the table definitions must be equal
+/// (`AS OF hash` from main), and the `information_schema` column counts are
+/// returned for the pool and, from main, for `kuru/<target>` and
+/// `kuru/<hash>`.
+async fn revision_schema(
+    server: &Server,
+    main: &MySqlPool,
+    target: &str,
+    hash: &str,
+) -> Result<(i64, BTreeMap<String, i64>)> {
+    let pool = server.pool(target).await?;
+    let at_pool = async {
+        Ok::<_, anyhow::Error>((
+            schema_text(&pool, "").await?,
+            column_count(&pool, None).await?,
+        ))
+    }
+    .await;
+    pool.close().await;
+    let (definitions, columns) = at_pool?;
+    let through_main = schema_text(main, &as_of(hash)?).await?;
+    assert_eq!(
+        through_main, definitions,
+        "{target}: table definitions differ AS OF {hash}"
+    );
+    let mut from_main = BTreeMap::new();
+    for database in [target, hash] {
+        let database = format!("kuru/{database}");
+        let count = column_count(main, Some(&database)).await?;
+        from_main.insert(database, count);
+    }
+    Ok((columns, from_main))
+}
+
+/// A branch's working-set inventory, as `retained_failed_shape` reads it:
+/// through a pool on the branch (`branch` `None`) or, from main, through the
+/// revision-qualified `` `kuru/<branch>`.dolt_status ``.
+async fn status_rows(pool: &MySqlPool, branch: Option<&str>) -> Result<Vec<(String, i64, String)>> {
+    let table = match branch {
+        Some(branch) => format!("`kuru/{branch}`.dolt_status"),
+        None => "dolt_status".to_owned(),
+    };
+    let rows = bounded(
+        "read a working-set inventory",
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT table_name, staged, status FROM {table} ORDER BY BINARY table_name, staged, BINARY status LIMIT 16"
+        )))
+        .fetch_all(pool),
+    )
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok((
+                row.try_get("table_name")?,
+                row.try_get("staged")?,
+                row.try_get("status")?,
+            ))
+        })
+        .collect()
+}
+
+/// Run `statements` on `branch`'s working set from a detached root session
+/// on main.
+async fn on_branch(pool: &MySqlPool, branch: &str, statements: &[&str]) -> Result<()> {
+    let mut connection = pool.acquire().await?.detach();
+    let written = async {
+        use_database(&mut connection, &format!("kuru/{branch}")).await?;
+        for statement in statements {
+            bounded(
+                statement,
+                sqlx::query(sqlx::AssertSqlSafe(*statement)).fetch_all(&mut connection),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    .await;
+    connection.close().await?;
+    written
+}
+
+/// The dirty arm of `classify_historical_attempts_in` on a dirtied retained
+/// branch: the head, `kuru_schema AS OF 'HEAD'` and the working-set
+/// inventory through a pool on the branch, against `dolt_branches`,
+/// `AS OF '<head>'` and the revision-qualified `dolt_status` from main.
+async fn dirty_arm_matches(server: &Server, main: &MySqlPool, name: &str) -> Result<()> {
+    let attempt_pool = server.pool(name).await?;
+    let today = async {
+        let head = revision(&attempt_pool).await?;
+        let version: i32 = bounded(
+            "dirty branch schema",
+            sqlx::query_scalar("SELECT version FROM kuru_schema AS OF 'HEAD' WHERE id = 1")
+                .fetch_one(attempt_pool.as_ref()),
+        )
+        .await?;
+        Ok::<_, anyhow::Error>((head, version, status_rows(&attempt_pool, None).await?))
+    }
+    .await;
+    attempt_pool.close().await;
+    let today = today?;
+    let reference = refs(main)
+        .await?
+        .remove(name)
+        .context("dirtied branch is missing")?;
+    let version: i32 = bounded(
+        "dirty branch schema AS OF its head",
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT version FROM kuru_schema {} WHERE id = 1",
+            as_of(&reference.hash)?
+        )))
+        .fetch_one(main),
+    )
+    .await?;
+    let through_main = (
+        reference.hash.clone(),
+        version,
+        status_rows(main, Some(name)).await?,
+    );
+    eprintln!("engine contract S8 dirty arm {name}: branch pool {today:?}, main {through_main:?}");
+    assert!(reference.dirty, "{name}: dolt_branches.dirty is false");
+    assert_eq!(
+        through_main, today,
+        "{name}: dirty-arm answers differ from the branch pool"
+    );
+    Ok(())
+}
+
 async fn column_count(pool: &MySqlPool, schema: Option<&str>) -> Result<i64> {
     let query = match schema {
         Some(schema) => sqlx::query_scalar(
@@ -1412,21 +1618,28 @@ async fn column_count(pool: &MySqlPool, schema: Option<&str>) -> Result<i64> {
 }
 
 /// S8. Every inline check of `classify_historical_attempts_in` except full
-/// parent schema validation has a main-pool equivalent that returns the same
-/// answer, on the migrated source and, unchanged, on an adopted copy whose
-/// main instance row differs from every retained branch's; there today's
-/// classifier fails closed on identity. Parent schema: `AS OF` gives the
-/// version and `SHOW TABLES` / `SHOW CREATE TABLE ... AS OF` give the same
-/// definitions as a pool at the parent, but main's `information_schema`
-/// returns no columns for the revision database `kuru/<parent>`, which
-/// today's validator queries. A dirtied branch and a moved ref change the
-/// main-pool answers, so a record check built on them fails closed.
+/// schema validation, at the head and at the parent, has a main-pool
+/// equivalent that returns the same answer, on the migrated source and,
+/// unchanged, on an adopted copy whose main instance row differs from every
+/// retained branch's; there today's classifier fails closed on identity.
+/// Full validation: `AS OF` gives the version and `SHOW TABLES` /
+/// `SHOW CREATE TABLE ... AS OF` give the same definitions as a pool on the
+/// head or at the parent, but main's `information_schema` returns no columns
+/// for the revision databases `kuru/<branch>`, `kuru/<head>` and
+/// `kuru/<parent>`, which today's validator queries through `DATABASE()`.
+/// The dirty arm (head version, full validation at the head and the
+/// working-set inventory `retained_failed_shape` reads) is compared on a
+/// synthetic dirty working set on the source, then restored; a genuinely
+/// failed attempt needs the process-loss fixture of `recovery_tests.rs` and
+/// is out of scope. A dirtied branch and a moved ref change the main-pool
+/// answers, so a record check built on them fails closed.
 ///
 /// Upstream: system tables and `AS OF` as cited on S3 and S4;
 /// `SHOW CREATE TABLE ... AS OF` and `SHOW TABLES AS OF`
 /// (<https://www.dolthub.com/docs/sql-reference/version-control/querying-history>).
 /// Dolt 2.3.5. Where an equivalent is missing, the record design must bind
-/// that fact at publication time instead of re-deriving it on open.
+/// that fact at publication time instead of re-deriving it on open, or
+/// compare `SHOW CREATE TABLE ... AS OF` output with the expected definitions.
 #[tokio::test]
 async fn record_classification_checks_have_main_pool_equivalents() -> Result<()> {
     let root = fixture_root()?;
@@ -1449,30 +1662,56 @@ async fn record_classification_checks_have_main_pool_equivalents() -> Result<()>
                 );
                 assert!(today.head_in_main && today.parent_in_main, "{today:?}");
 
-                let parent_pool = server.pool(&today.parent).await?;
-                let at_parent = async {
-                    Ok::<_, anyhow::Error>((
-                        schema_text(&parent_pool, "").await?,
-                        column_count(&parent_pool, None).await?,
-                    ))
+                for (role, target, hash) in [
+                    ("head", name.as_str(), today.head.as_str()),
+                    ("parent", today.parent.as_str(), today.parent.as_str()),
+                ] {
+                    let (pool_columns, from_main) =
+                        revision_schema(server, &store.pool, target, hash).await?;
+                    eprintln!(
+                        "engine contract S8 {name} {role}: information_schema columns at a pool on it {pool_columns}, through main {from_main:?}"
+                    );
+                    // Observed at the head and at the parent alike: main's
+                    // information_schema describes neither the branch nor the
+                    // commit revision database, so today's full validation
+                    // (information_schema WHERE table_schema = DATABASE()) has
+                    // no drop-in main-pool form; the definitions AS OF do.
+                    assert!(pool_columns > 0, "{name} {role}: no columns at its pool");
+                    assert!(
+                        from_main.values().all(|count| *count == 0),
+                        "{name} {role}: main's information_schema now describes a revision: {from_main:?}"
+                    );
                 }
-                .await;
-                parent_pool.close().await;
-                let (at_parent, parent_columns) = at_parent?;
-                let through_main = schema_text(&store.pool, &as_of(&today.parent)?).await?;
-                assert_eq!(through_main, at_parent, "{name}: parent definitions differ AS OF");
-                let revision_columns =
-                    column_count(&store.pool, Some(&format!("kuru/{}", today.parent))).await?;
-                eprintln!(
-                    "engine contract S8 {name}: parent columns at the parent pool {parent_columns}, through main's information_schema for kuru/<parent> {revision_columns}"
-                );
-                // Observed: main's information_schema does not describe a
-                // revision database, so today's information_schema-based
-                // validation has no drop-in main-pool form.
-                assert!(parent_columns > 0);
-                assert_eq!(revision_columns, 0);
                 baseline.push(today);
             }
+            // The dirty arm, on one branch dirtied like a failed attempt (a
+            // new unstaged table and a staged change), then restored.
+            let (dirtied, _) = &branches[0];
+            on_branch(
+                &store.pool,
+                dirtied,
+                &[
+                    "CREATE TABLE engine_contract_probe (id INT PRIMARY KEY)",
+                    "INSERT INTO state (`key`, value) VALUES ('engine-contract-dirty', '1')",
+                    "CALL DOLT_ADD('state')",
+                ],
+            )
+            .await?;
+            dirty_arm_matches(server, &store.pool, dirtied).await?;
+            on_branch(
+                &store.pool,
+                dirtied,
+                &[
+                    "DROP TABLE engine_contract_probe",
+                    "CALL DOLT_RESET('--hard')",
+                ],
+            )
+            .await?;
+            assert_eq!(
+                migration_branches(&refs(&store.pool).await?),
+                branches,
+                "the dirty-arm probe was not restored"
+            );
             Ok(baseline)
         }
         .await;
@@ -1537,7 +1776,7 @@ async fn consume_and_adopt(root: &Path, capture: &Path) -> Result<Capture> {
     let data_dir = root.join("consumer");
     let record = contract::read_capture_record(capture)?;
     let (store, directory) = store_directory(&data_dir, &record.project_scope)?;
-    let record = contract::read_capture(capture, &directory)?;
+    contract::read_capture_tree(capture, &record, &directory)?;
     let served = serve_data(&data_dir, store, &record.project_scope, &record.instance).await?;
     let main = served.server.pool("main").await?;
     let checked = async {
@@ -1621,7 +1860,9 @@ async fn produce_capture(root: &Path, destination: &Path) -> Result<Capture> {
 /// S5 (conditional on a later decision). A `data/` tree captured on one OS
 /// is served, validated and adopted on another. It runs only when
 /// `KURU_ENGINE_CONTRACT_CROSS_OS_CAPTURE` names a capture produced on a
-/// different OS; otherwise it asserts and prints an explicit not-run result.
+/// different OS; otherwise it prints an explicit not-run result with a fixed
+/// token (`[no-capture]` or `[same-os-capture]`) and asserts that the token
+/// is the one the environment implies.
 /// `KURU_ENGINE_CONTRACT_REQUIRE_CROSS_OS=1` makes not-run a failure, for a
 /// CI consuming job. The consumer itself is exercised on this OS by
 /// [`same_os_capture_opens_and_adopts_through_the_cross_os_consumer`].
@@ -1634,10 +1875,18 @@ async fn produce_capture(root: &Path, destination: &Path) -> Result<Capture> {
 #[tokio::test]
 async fn data_tree_captured_on_one_os_opens_and_adopts_on_another() -> Result<()> {
     let require = std::env::var_os(contract::REQUIRE_CROSS_OS).is_some_and(|value| value == "1");
-    match contract::cross_os_plan(std::env::var_os(contract::CROSS_OS_CAPTURE), require)? {
+    let provided = std::env::var_os(contract::CROSS_OS_CAPTURE);
+    let expected = if provided.is_some() {
+        "same-os-capture"
+    } else {
+        "no-capture"
+    };
+    match contract::cross_os_plan(provided, require)? {
         CrossOs::NotRun(reason) => {
-            eprintln!("engine contract S5 NOT RUN: {reason}");
-            assert!(!reason.is_empty());
+            eprintln!("engine contract S5 NOT RUN {reason}");
+            // The cause follows from the environment: no capture named, or
+            // one named that this OS produced. Any other pairing is a defect.
+            assert_eq!(reason.token(), expected, "{reason}");
             Ok(())
         }
         CrossOs::Run { capture, record } => {

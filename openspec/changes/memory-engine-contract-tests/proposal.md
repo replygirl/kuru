@@ -56,6 +56,25 @@ design instead of surfacing as a production defect.
 - Update `docs/development.md` and `packages/kuru-memory` test registration
   only as needed to name the new module; no other doc changes.
 
+## Cross-OS run wiring (S5, not added by this change)
+
+A real cross-OS run needs, in a later change that owns the workflow edit:
+
+1. A producing job on one OS (for example ubuntu-latest in `native-tests`)
+   that writes a capture to a named directory. Today the producer is
+   `produce_capture` inside the same-OS test; it needs a small entrypoint,
+   such as an ignored test driven by an output environment variable or a
+   `kuru-memory` test-support subcommand.
+2. `actions/upload-artifact`, pinned by commit SHA, uploading that directory.
+3. On each consuming native job on the other OSes, `actions/download-artifact`
+   (pinned), then `KURU_ENGINE_CONTRACT_CROSS_OS_CAPTURE=<dir>` and
+   `KURU_ENGINE_CONTRACT_REQUIRE_CROSS_OS=1` before
+   `mise run //packages/kuru-memory:test -- data_tree_captured_on_one_os`, so
+   a missing (`[no-capture]`) or same-OS (`[same-os-capture]`) capture fails
+   instead of reporting not-run.
+4. The consumer compares only the OS family; add an architecture comparison
+   if the arm64/x64 split must also be established.
+
 ## Impact
 
 - `packages/kuru-memory/src/store.rs`: one new `#[path]`-registered test

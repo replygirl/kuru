@@ -13,7 +13,7 @@
 //!   directory and file is created fresh and owner-only.
 //! - [`scan`] byte-scans every file below a directory for labelled needles.
 //! - The cross-OS capture format ([`Capture`], [`write_capture`],
-//!   [`read_capture`], [`cross_os_plan`]): a directory holding
+//!   [`read_capture_record`], [`read_capture_tree`], [`cross_os_plan`]): a directory holding
 //!   `capture.json` and a `data/` tree. The record holds only relative path
 //!   components, sizes and SHA-256 digests, the producing OS and
 //!   architecture, the engine version, the project scope and instance, and
@@ -310,22 +310,59 @@ pub(crate) fn read_capture_record(capture: &Path) -> Result<Capture> {
 }
 
 /// Copy a capture's `data/` tree into the private store directory `store`
-/// (which must not yet hold `data/`) and verify it against the record.
-pub(crate) fn read_capture(capture: &Path, store: &Directory) -> Result<Capture> {
-    let record = read_capture_record(capture)?;
+/// (which must not yet hold `data/`) and verify it against `record`, the
+/// record [`read_capture_record`] returned for the same capture.
+pub(crate) fn read_capture_tree(capture: &Path, record: &Capture, store: &Directory) -> Result<()> {
     let tree = store.create_private_directory(OsStr::new(CAPTURE_DATA))?;
     let entries = copy_data_tree(&capture.join(CAPTURE_DATA), &tree)?;
     ensure!(
         entries == record.entries,
         "engine contract capture tree does not match its record"
     );
-    Ok(record)
+    Ok(())
+}
+
+/// Why the cross-OS consumer did not run. Each cause prints a fixed token,
+/// so a CI log (which captures the test's standard error) tells a missing
+/// capture from a same-OS one without parsing prose.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum NotRun {
+    /// No capture directory was provided.
+    NoCapture,
+    /// The provided capture was produced on this OS (named).
+    SameOs(String),
+}
+
+impl NotRun {
+    pub(crate) fn token(&self) -> &'static str {
+        match self {
+            Self::NoCapture => "no-capture",
+            Self::SameOs(_) => "same-os-capture",
+        }
+    }
+}
+
+impl std::fmt::Display for NotRun {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoCapture => write!(
+                formatter,
+                "[{}] {CROSS_OS_CAPTURE} names no capture directory produced on another OS",
+                self.token()
+            ),
+            Self::SameOs(os) => write!(
+                formatter,
+                "[{}] the provided capture was produced on this OS ({os}); a cross-OS run needs another",
+                self.token()
+            ),
+        }
+    }
 }
 
 /// Whether the cross-OS consumer runs, and why not when it does not.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CrossOs {
-    NotRun(String),
+    NotRun(NotRun),
     Run {
         capture: PathBuf,
         record: Box<Capture>,
@@ -337,18 +374,13 @@ pub(crate) enum CrossOs {
 /// result; `require` turns that into an error.
 pub(crate) fn cross_os_plan(provided: Option<OsString>, require: bool) -> Result<CrossOs> {
     let plan = match provided {
-        None => CrossOs::NotRun(format!(
-            "no cross-OS capture: {CROSS_OS_CAPTURE} names no capture directory produced on another OS"
-        )),
+        None => CrossOs::NotRun(NotRun::NoCapture),
         Some(path) => {
             let capture = PathBuf::from(path);
             let record = read_capture_record(&capture)
                 .with_context(|| format!("read cross-OS capture {}", capture.display()))?;
             if record.os == std::env::consts::OS {
-                CrossOs::NotRun(format!(
-                    "the provided capture was produced on this OS ({}); a cross-OS run needs another",
-                    record.os
-                ))
+                CrossOs::NotRun(NotRun::SameOs(record.os))
             } else {
                 CrossOs::Run {
                     capture,
@@ -469,7 +501,9 @@ mod tests {
             "capture record holds an absolute path: {text}"
         );
         let store = files::ensure_private_directory(&root.path().join("consumer"))?;
-        assert_eq!(read_capture(&capture, &store)?, written);
+        let read = read_capture_record(&capture)?;
+        assert_eq!(read, written);
+        read_capture_tree(&capture, &read, &store)?;
         assert_eq!(
             fs::read(root.path().join("consumer/data/journal"))?,
             b"prefix KURU-CONTRACT-MARKER suffix"
@@ -481,17 +515,25 @@ mod tests {
         file.write_all(b"PREFIX")?;
         drop(file);
         let store = files::ensure_private_directory(&root.path().join("tampered"))?;
-        let error = read_capture(&capture, &store).unwrap_err();
+        let error =
+            read_capture_tree(&capture, &read_capture_record(&capture)?, &store).unwrap_err();
         assert!(
             format!("{error:#}").contains("does not match its record"),
             "{error:#}"
         );
 
-        assert!(
-            matches!(cross_os_plan(None, false)?, CrossOs::NotRun(reason) if reason.contains(CROSS_OS_CAPTURE))
-        );
+        match cross_os_plan(None, false)? {
+            CrossOs::NotRun(reason) => {
+                assert_eq!(reason, NotRun::NoCapture);
+                assert_eq!(reason.token(), "no-capture");
+                assert!(reason.to_string().starts_with("[no-capture] "), "{reason}");
+                assert!(reason.to_string().contains(CROSS_OS_CAPTURE), "{reason}");
+            }
+            other => panic!("no capture must not run: {other:?}"),
+        }
         let error = cross_os_plan(None, true).unwrap_err();
         assert!(format!("{error:#}").contains(REQUIRE_CROSS_OS), "{error:#}");
+        assert!(format!("{error:#}").contains("[no-capture]"), "{error:#}");
         match cross_os_plan(Some(capture.clone().into_os_string()), true)? {
             CrossOs::Run {
                 capture: path,
@@ -506,10 +548,22 @@ mod tests {
         let mut local = record();
         local.os = std::env::consts::OS.into();
         write_capture(&data, &same, local)?;
-        assert!(matches!(
-            cross_os_plan(Some(same.into_os_string()), false)?,
-            CrossOs::NotRun(reason) if reason.contains("this OS")
-        ));
+        match cross_os_plan(Some(same.clone().into_os_string()), false)? {
+            CrossOs::NotRun(reason) => {
+                assert_eq!(reason, NotRun::SameOs(std::env::consts::OS.into()));
+                assert_eq!(reason.token(), "same-os-capture");
+                assert!(
+                    reason.to_string().starts_with("[same-os-capture] "),
+                    "{reason}"
+                );
+            }
+            other => panic!("a same-OS capture must not run: {other:?}"),
+        }
+        let error = cross_os_plan(Some(same.into_os_string()), true).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("[same-os-capture]"),
+            "{error:#}"
+        );
         let mut bad = record();
         bad.format = CAPTURE_FORMAT + 1;
         files::write(&capture.join(CAPTURE_RECORD), &serde_json::to_vec(&bad)?)?;
