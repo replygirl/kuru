@@ -976,25 +976,28 @@ fn missing_and_busy_connects_preserve_distinct_terminal_states() {
             .unwrap();
         runtime.block_on(async {
             let address = format!(r"\\.\pipe\kuru-{}", uuid::Uuid::new_v4());
-            assert_eq!(
-                pipe::connect(OsStr::new(&address), SHORT)
-                    .await
-                    .err()
-                    .unwrap()
-                    .kind(),
-                io::ErrorKind::NotFound
-            );
+            let missing = pipe::connect(OsStr::new(&address), SHORT)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+            assert!(!pipe::is_no_free_instance(&missing));
 
+            // The only instance is connected, so every retry sees a busy pipe.
             let listener = PrivateListener::bind().unwrap();
             let first = pipe::connect(listener.address(), LIMIT).await.unwrap();
-            assert_eq!(
-                pipe::connect(listener.address(), SHORT)
-                    .await
-                    .err()
-                    .unwrap()
-                    .kind(),
-                io::ErrorKind::TimedOut
-            );
+            let busy = pipe::connect(listener.address(), SHORT)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(busy.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(busy.to_string(), "private pipe connect timed out");
+            assert!(pipe::is_no_free_instance(&busy));
+            // The marker is the typed payload, never the kind or the text.
+            assert!(!pipe::is_no_free_instance(&io::Error::new(
+                io::ErrorKind::TimedOut,
+                "private pipe connect timed out",
+            )));
             drop(first);
             drop(listener);
         });
