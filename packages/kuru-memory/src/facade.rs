@@ -112,18 +112,21 @@ struct ReplaceAbandoned {
 }
 
 impl ReplaceAbandoned {
-    /// Armed only for a retaining attachment with a live stream: a call that
-    /// must first reconnect lazily is itself the replacement attempt.
-    fn new(
-        session: &Arc<RemoteSession>,
-        primary: &Arc<AsyncMutex<ServiceAttachment>>,
-        attachment: &ServiceAttachment,
-    ) -> Self {
+    /// Starts unarmed. `checked_call` arms it once the call's stream is live,
+    /// including a stream its lazy connect has just opened. A lazy connect
+    /// that fails or is cancelled leaves it unarmed: that connect was itself
+    /// the replacement attempt, and nothing retries it.
+    fn new(session: &Arc<RemoteSession>, primary: &Arc<AsyncMutex<ServiceAttachment>>) -> Self {
         Self {
             session: Arc::downgrade(session),
             primary: Arc::downgrade(primary),
-            armed: attachment.retains_after_abandon() && attachment.has_complete_exchange(),
+            armed: false,
         }
+    }
+
+    /// Arm for a retaining attachment whose stream is live.
+    fn arm(&mut self, attachment: &ServiceAttachment) {
+        self.armed = attachment.retains_after_abandon() && attachment.has_complete_exchange();
     }
 
     fn disarm(&mut self) {
@@ -1054,10 +1057,13 @@ impl RemoteView {
         Ok(())
     }
 
+    /// `replace` is the primary's replacement guard, armed here once the
+    /// stream this call will use is live.
     async fn checked_call(
         &self,
         attachment: &mut ServiceAttachment,
         call: ServiceCall,
+        replace: Option<&mut ReplaceAbandoned>,
     ) -> Result<ServiceValue> {
         let mutating = call.may_mutate();
         let _mutation = if mutating {
@@ -1065,7 +1071,47 @@ impl RemoteView {
         } else {
             None
         };
+        if let Some(replace) = replace {
+            self.ensure_connected(attachment, mutating).await?;
+            replace.arm(attachment);
+        }
         self.checked_call_locked(attachment, call).await
+    }
+
+    /// Check the session, then reconnect an attachment whose last exchange
+    /// did not complete, to the same generation.
+    async fn ensure_connected(
+        &self,
+        attachment: &mut ServiceAttachment,
+        mutating: bool,
+    ) -> Result<()> {
+        if mutating {
+            self.session.ensure_mutation_allowed()?;
+        } else {
+            self.session.ensure_open()?;
+        }
+        if !attachment.has_complete_exchange() {
+            ensure!(
+                self.candidate.is_none(),
+                "candidate attachment was lost; inspect the durable candidate ref before continuing"
+            );
+            // Build before assigning: a held stream is dropped only once its
+            // replacement exists, and the replacement keeps the primary's rule.
+            let mut replacement = self.session.factory.connect().await.map_err(|error| {
+                if self.read_only {
+                    error.context(
+                        "the memory service ended while this read-only command was disconnected; run the command again",
+                    )
+                } else {
+                    error
+                }
+            })?;
+            if attachment.retains_after_abandon() {
+                replacement.retain_after_abandon();
+            }
+            *attachment = replacement;
+        }
+        Ok(())
     }
 
     /// Candidate transitions hold the shared lock across target capture and
@@ -1114,32 +1160,7 @@ impl RemoteView {
             } => Some((branch, base, target)),
             _ => None,
         };
-        if mutating {
-            self.session.ensure_mutation_allowed()?;
-        } else {
-            self.session.ensure_open()?;
-        }
-        if !attachment.has_complete_exchange() {
-            ensure!(
-                self.candidate.is_none(),
-                "candidate attachment was lost; inspect the durable candidate ref before continuing"
-            );
-            // Build before assigning: a held stream is dropped only once its
-            // replacement exists, and the replacement keeps the primary's rule.
-            let mut replacement = self.session.factory.connect().await.map_err(|error| {
-                if self.read_only {
-                    error.context(
-                        "the memory service ended while this read-only command was disconnected; run the command again",
-                    )
-                } else {
-                    error
-                }
-            })?;
-            if attachment.retains_after_abandon() {
-                replacement.retain_after_abandon();
-            }
-            *attachment = replacement;
-        }
+        self.ensure_connected(attachment, mutating).await?;
         let candidate_begin = matches!(&call, ServiceCall::BeginCandidate { .. });
         if let Some((method, argument_digest)) = receipt {
             *self
@@ -1273,9 +1294,10 @@ impl RemoteView {
                 self.session.ensure_open()?;
                 // Declared after the lock guard, so on cancellation it drops
                 // first and its task can take the lock only once released.
-                let mut replace =
-                    ReplaceAbandoned::new(&self.session, &self.attachment, &attachment);
-                let result = self.checked_call(&mut attachment, call).await;
+                let mut replace = ReplaceAbandoned::new(&self.session, &self.attachment);
+                let result = self
+                    .checked_call(&mut attachment, call, Some(&mut replace))
+                    .await;
                 if attachment.has_complete_exchange() {
                     replace.disarm();
                 }
@@ -1293,11 +1315,11 @@ impl RemoteView {
             self.session.register(&attachment)?;
             let mut attachment = attachment.lock().await;
             self.session.ensure_open()?;
-            return self.checked_call(&mut attachment, call).await;
+            return self.checked_call(&mut attachment, call, None).await;
         }
         let mut attachment = self.attachment.lock().await;
         self.session.ensure_open()?;
-        self.checked_call(&mut attachment, call).await
+        self.checked_call(&mut attachment, call, None).await
     }
 
     async fn fork(&self) -> Result<Self> {
@@ -7345,6 +7367,81 @@ mod tests {
         .await
         .with_context(|| {
             format!("refused-replacement fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
+    // T8e
+    #[tokio::test]
+    async fn call_cancelled_after_a_lazy_reconnect_starts_its_replacement() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let (_root, project, options) = retiring_fixture()?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+            let dispatch = Arc::new(service::rpc::DispatchPause::default());
+            let (served, mut events) = serve_retiring(owner, Some(dispatch.clone()));
+            let memory = open_retiring(&options, &project).await?;
+            let generation = primary_generation(&memory).await?;
+            let hook = observe_replacement(&memory, false)?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    EnteredEmpty { reached: false },
+                    AttachmentAccepted { active: 1 },
+                ],
+            )
+            .await?;
+            // Another client keeps the owner while the primary has no stream.
+            let bare = service::attach_existing(&options, &project)
+                .await?
+                .context("a bare attachment found no owner")?;
+            expect_serve_events(&mut events, &[AttachmentAccepted { active: 2 }]).await?;
+            memory.close_transport_for_test().await?;
+            expect_serve_events(&mut events, &[AttachmentJoined { remaining: 1 }]).await?;
+            // The next call reconnects lazily inside `checked_call`, and the
+            // owner holds that call's request undispatched.
+            cancel_after(
+                {
+                    let memory = memory.clone();
+                    async move { memory.revision().await }
+                },
+                dispatch.entered.notified(),
+            )
+            .await?;
+            // The lazily opened stream is held, and its replacement starts at
+            // cancel time like any other primary's.
+            expect_serve_events(
+                &mut events,
+                &[
+                    AttachmentAccepted { active: 2 },
+                    AttachmentAccepted { active: 3 },
+                ],
+            )
+            .await?;
+            hook.installed.notified().await;
+            dispatch.release.notify_one();
+            expect_serve_events(&mut events, &[AttachmentJoined { remaining: 2 }]).await?;
+            ensure!(
+                !memory.revision().await?.is_empty(),
+                "the next call after a cancelled lazy reconnect did not succeed"
+            );
+            ensure!(
+                primary_generation(&memory).await? == generation,
+                "the replacement reached another owner generation"
+            );
+            expect_no_serve_event(&mut events, "a client whose call was cancelled")?;
+            drop(bare);
+            expect_serve_events(&mut events, &[AttachmentJoined { remaining: 1 }]).await?;
+            memory.close().await?;
+            expect_retired(&mut events, served).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("lazy-reconnect cancel fixture exceeded its {deadline:?} deadline")
         })??;
         Ok(())
     }
