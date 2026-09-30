@@ -63,6 +63,8 @@ design instead of surfacing as a production defect.
 - `packages/kuru-memory/src/store/engine_contract_tests.rs`: new file.
 - `packages/kuru-memory/src/test_support/`: new test-support helper file(s)
   only, no product code.
+- `docs/development.md`: one paragraph naming the tests and the two
+  test-only S5 environment variables.
 - No product code, workflow file, dependency, or mise task changes. Adds
   wall-clock time to `mise run //packages/kuru-memory:test` (real Dolt
   subprocess starts per spike item); no new CI job.
