@@ -76,12 +76,13 @@ pub fn describe(root: u32) -> String {
 /// [`describe`] through an explicit `ps` executable.
 pub fn describe_with(program: &Path, root: u32) -> String {
     match tree_with(program, root) {
-        Ok(rows) => format_rows(root, &rows),
+        Ok(rows) => describe_rows(root, &rows),
         Err(error) => format!("snapshot unavailable: {error}"),
     }
 }
 
-fn format_rows(root: u32, rows: &[ProcessRow]) -> String {
+/// Diagnostic text for rows a caller already recorded with [`tree`].
+pub fn describe_rows(root: u32, rows: &[ProcessRow]) -> String {
     let mut text = format!("process tree of {root} ({} rows): [", rows.len());
     for (index, row) in rows.iter().take(ROW_LIMIT).enumerate() {
         if index > 0 {
@@ -94,6 +95,54 @@ fn format_rows(root: u32, rows: &[ProcessRow]) -> String {
     }
     text.push(']');
     text
+}
+
+/// Which of the `recorded` rows a fresh listing still shows, as text. A row
+/// matches on process ID and command, so a reused ID running another program is
+/// not reported as a survivor. The result is a diagnostic reading, never a
+/// basis for signalling: a coincidental match can only mislabel a row.
+pub fn describe_still_listed(recorded: &[ProcessRow]) -> String {
+    describe_still_listed_with(Path::new(PS), recorded)
+}
+
+/// [`describe_still_listed`] through an explicit `ps` executable.
+pub fn describe_still_listed_with(program: &Path, recorded: &[ProcessRow]) -> String {
+    match list(program).and_then(|output| parse(&output)) {
+        Ok(rows) => {
+            let live = retain_listed(rows, recorded);
+            if live.is_empty() {
+                format!(
+                    "none of {} recorded processes remain listed",
+                    recorded.len()
+                )
+            } else {
+                format!(
+                    "{} of {} recorded processes remain listed: [{}]",
+                    live.len(),
+                    recorded.len(),
+                    live.iter()
+                        .take(ROW_LIMIT)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            }
+        }
+        Err(error) => format!("snapshot unavailable: {error}"),
+    }
+}
+
+fn retain_listed(listed: Vec<ProcessRow>, recorded: &[ProcessRow]) -> Vec<ProcessRow> {
+    let mut live: Vec<_> = listed
+        .into_iter()
+        .filter(|row| {
+            recorded
+                .iter()
+                .any(|before| before.pid == row.pid && before.command == row.command)
+        })
+        .collect();
+    live.sort_by_key(|row| row.pid);
+    live
 }
 
 fn select(rows: Vec<ProcessRow>, root: u32) -> Vec<ProcessRow> {
@@ -312,11 +361,24 @@ mod tests {
     }
 
     #[test]
+    fn still_listed_matches_recorded_processes_by_id_and_command() {
+        let recorded = vec![row(10, 1, 10), row(11, 10, 10), row(12, 10, 10)];
+        let mut reused = row(12, 1, 12);
+        reused.command = "another program".to_owned();
+        let listed = vec![row(11, 1, 10), reused, row(99, 1, 99)];
+        let live: Vec<_> = retain_listed(listed, &recorded)
+            .iter()
+            .map(|row| row.pid)
+            .collect();
+        assert_eq!(live, [11]);
+    }
+
+    #[test]
     fn formatting_bounds_rows() {
         let rows: Vec<_> = (1..=ROW_LIMIT as u32 + 2)
             .map(|pid| row(pid, 0, 1))
             .collect();
-        let text = format_rows(1, &rows);
+        let text = describe_rows(1, &rows);
         assert!(text.starts_with(&format!("process tree of 1 ({} rows): [", rows.len())));
         assert!(text.ends_with("; 2 more omitted]"), "{text}");
     }

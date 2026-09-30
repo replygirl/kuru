@@ -88,3 +88,32 @@ fn snapshot_helper_is_bounded_when_ps_does_not_finish() {
         "{elapsed:?}"
     );
 }
+
+#[test]
+fn still_listed_reports_recorded_processes_until_they_are_gone() {
+    // No shell: the ID and command are final the moment `spawn` returns.
+    let mut root = Command::new("/bin/sleep")
+        .arg("37")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let id = root.id();
+    let recorded = snapshot::tree(id).unwrap();
+    assert!(recorded.iter().any(|row| row.pid == id));
+    let live = snapshot::describe_still_listed(&recorded);
+    kill_process_group(Pid::from_raw(id as i32).unwrap(), Signal::KILL).unwrap();
+    root.wait().unwrap();
+    let gone = snapshot::describe_still_listed(&recorded);
+
+    assert!(live.contains("recorded processes remain listed"), "{live}");
+    assert!(live.contains(&format!("pid={id} ")), "{live}");
+    assert!(
+        gone.starts_with(&format!("none of {} recorded processes", recorded.len())),
+        "{gone}"
+    );
+    let failed = snapshot::describe_still_listed_with(Path::new("/nonexistent/kuru-ps"), &recorded);
+    assert!(failed.starts_with("snapshot unavailable: "), "{failed}");
+}
