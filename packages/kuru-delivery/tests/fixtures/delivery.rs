@@ -39,8 +39,7 @@ async fn main() -> io::Result<()> {
                 .find(|arguments| arguments[0] == "--db")
                 .map(|arguments| std::path::PathBuf::from(&arguments[1]))
                 .ok_or_else(|| io::Error::other("audit fixture did not receive --db"))?;
-            let mut command = kuru_delivery::command::rooted(&database, "git");
-            command.args([
+            let git_arguments = [
                 "-c",
                 "user.name=fixture",
                 "-c",
@@ -51,17 +50,27 @@ async fn main() -> io::Result<()> {
                 "--allow-empty",
                 "-m",
                 "controlled scanner changed advisory HEAD",
-            ]);
+            ];
+            let mut command = kuru_delivery::command::rooted(&database, "git");
+            command.args(git_arguments);
+            let started = std::time::Instant::now();
             let output = kuru_delivery::command::bounded_output(
                 &mut command,
                 std::time::Duration::from_secs(10),
                 64 * 1024,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "controlled scanner git {git_arguments:?} in {database:?} failed after {:?}: {error}",
+                    started.elapsed()
+                ))
+            })?;
             if !output.status.success() {
-                return Err(io::Error::other(
-                    "controlled scanner could not advance advisory HEAD",
-                ));
+                return Err(io::Error::other(format!(
+                    "controlled scanner could not advance advisory HEAD: git {git_arguments:?} in {database:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
             }
         }
         if std::env::var_os("KURU_AUDIT_FAIL").is_some() {

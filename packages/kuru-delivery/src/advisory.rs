@@ -520,6 +520,7 @@ pub async fn scan(database: &Path, audit_binary: &Path) -> Result<DatabaseRevisi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     async fn git(directory: &Path, arguments: &[&str]) {
         let environment = GitEnvironment::new().unwrap();
@@ -533,13 +534,19 @@ mod tests {
             .env("GIT_CONFIG_VALUE_0", "foreign-hooks");
         environment.configure_git(&mut command);
         command.args(arguments);
+        let started = Instant::now();
         let output =
             crate::command::bounded_output(&mut command, Duration::from_secs(10), OUTPUT_LIMIT)
                 .await
-                .unwrap();
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "git {arguments:?} in {directory:?} failed after {:?}: {error}",
+                        started.elapsed()
+                    )
+                });
         assert!(
             output.status.success(),
-            "{}",
+            "git {arguments:?} in {directory:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
@@ -553,15 +560,56 @@ mod tests {
         let mut command = crate::command::rooted(directory, "git");
         environment_settings.configure_git(&mut command);
         command.args(arguments).envs(environment.iter().copied());
+        let started = Instant::now();
         let output =
             crate::command::bounded_output(&mut command, Duration::from_secs(10), OUTPUT_LIMIT)
                 .await
-                .unwrap();
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "git {arguments:?} in {directory:?} failed after {:?}: {error}",
+                        started.elapsed()
+                    )
+                });
         assert!(
             output.status.success(),
-            "{}",
+            "git {arguments:?} in {directory:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    // A missing working directory fails the launch at once, so the helpers'
+    // failure text is checked without waiting for their 10-second deadline.
+    async fn failure_message(task: impl Future<Output = ()> + Send + 'static) -> String {
+        let panic = tokio::spawn(task).await.unwrap_err().into_panic();
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .expect("helper panics with a formatted message")
+    }
+
+    #[tokio::test]
+    async fn git_helpers_name_arguments_directory_and_elapsed_time_when_the_launch_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("absent");
+        let message = failure_message({
+            let missing = missing.clone();
+            async move { git(&missing, &["status", "--short"]).await }
+        })
+        .await;
+        for required in [
+            r#"git ["status", "--short"]"#,
+            &format!("in {missing:?} failed after "),
+        ] {
+            assert!(message.contains(required), "missing {required}: {message}");
+        }
+        let message = failure_message({
+            let missing = missing.clone();
+            async move { git_with_environment(&missing, &["log"], &[("GIT_PAGER", "cat")]).await }
+        })
+        .await;
+        for required in [r#"git ["log"]"#, &format!("in {missing:?} failed after ")] {
+            assert!(message.contains(required), "missing {required}: {message}");
+        }
     }
 
     async fn database() -> tempfile::TempDir {

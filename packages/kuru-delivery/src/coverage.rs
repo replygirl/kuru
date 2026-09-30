@@ -4399,20 +4399,44 @@ mod tests {
         assert_eq!(child.presence_after_reap().as_deref(), Some("Absent"));
     }
 
+    async fn git(root: &Path, args: &[&str]) -> std::process::Output {
+        let mut command = crate::command::rooted(root, "git");
+        command.args(["-c", "commit.gpgSign=false"]).args(args);
+        let started = std::time::Instant::now();
+        crate::command::bounded_output(&mut command, std::time::Duration::from_secs(30), 64 * 1024)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "git {args:?} in {root:?} failed after {:?}: {error}",
+                    started.elapsed()
+                )
+            })
+    }
+
+    // A missing working directory fails the launch at once, so the helper's
+    // failure text is checked without waiting for its 30-second deadline.
+    #[tokio::test]
+    async fn git_helper_names_arguments_directory_and_elapsed_time_when_the_launch_fails() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("absent");
+        let panic = tokio::spawn({
+            let missing = missing.clone();
+            async move { git(&missing, &["rev-parse", "HEAD"]).await }
+        })
+        .await
+        .unwrap_err()
+        .into_panic();
+        let message = panic.downcast_ref::<String>().cloned().unwrap();
+        for required in [
+            r#"git ["rev-parse", "HEAD"]"#,
+            &format!("in {missing:?} failed after "),
+        ] {
+            assert!(message.contains(required), "missing {required}: {message}");
+        }
+    }
+
     #[tokio::test]
     async fn modified_tracked_source_cannot_claim_head_identity() {
-        async fn git(root: &Path, args: &[&str]) -> std::process::Output {
-            let mut command = crate::command::rooted(root, "git");
-            command.args(["-c", "commit.gpgSign=false"]).args(args);
-            crate::command::bounded_output(
-                &mut command,
-                std::time::Duration::from_secs(30),
-                64 * 1024,
-            )
-            .await
-            .unwrap()
-        }
-
         let temp = TempDir::new().unwrap();
         let root = temp.path();
         for args in [
