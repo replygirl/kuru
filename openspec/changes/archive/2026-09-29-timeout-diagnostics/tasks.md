@@ -10,7 +10,7 @@
 ## 2. Install family helpers
 
 - [x] 2.1 In `embedded_runtime.rs` `execute` (Unix), take the descendant snapshot before `child.kill()`, re-check the recorded processes after the pipe grace, and add the command, arguments and working directory; verify with a tiny-deadline negative test.
-- [ ] 2.2 Add step and argument context to the nine bare `execute` sites and the Windows `execute`, and fix the misleading "installed Kuru" text at the pre-install selected-binary site; verify no deadline or assertion changed.
+- [x] 2.2 Add step and argument context to the nine bare `execute` sites and the Windows `execute`, and fix the misleading "installed Kuru" text at the pre-install selected-binary site; verify no deadline or assertion changed.
 - [ ] 2.3 Add context to `windows_cli.rs` `success()` and the six direct `.output()` sites; verify by a Windows-native tiny-deadline test in CI.
 
 ## 3. Git child family helpers
@@ -28,7 +28,7 @@
 
 ## 6. Verification
 
-- [ ] 6.1 Run `//packages/kuru-platform`, `//packages/kuru-delivery` and `//apps/kuru-tui` tests, `format:check`, lint (including the Windows-target lint), `typecheck`, `lint:tooling`, `docs:check` and `cospec validate --strict`, and record observed results and any unrun checks with reasons.
+- [x] 6.1 Run `//packages/kuru-platform`, `//packages/kuru-delivery` and `//apps/kuru-tui` tests, `format:check`, lint (including the Windows-target lint), `typecheck`, `lint:tooling`, `docs:check` and `cospec validate --strict`, and record observed results and any unrun checks with reasons.
 - [ ] 6.2 Confirm in CI that the Windows tests ran natively on windows-latest and windows-11-arm, and record the run ids.
 
 ## Audit
