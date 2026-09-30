@@ -25,9 +25,9 @@ Work packages own disjoint files (design D13 and the revised unit 1 design, sect
 
 ## 4. WP3 client side (`facade.rs`)
 
-- [ ] 4.1 Add the session's primary `Weak`, the replacement guard and task, flag inheritance on the lazy path, the read-only rule and its error context, and the replacement test hook; verify T8, T8b, T8c, T8d, T9, T10
-- [ ] 4.2 Add `RemoteSession.successor` and use it in every successor branch and in `reopen_after_checked_recovery`; analyse and test its effect on `active == 1` and `MAX_ATTACHMENTS`; verify T11 and T11a
-- [ ] 4.3 Audit facade fixtures that relied on idle expiry and retire them explicitly; verify the kuru-memory suite passes
+- [x] 4.1 Add the session's primary `Weak`, the replacement guard and task, flag inheritance on the lazy path, the read-only rule and its error context, and the replacement test hook; verify T8, T8b, T8c, T8d, T9, T10 Observed 2026-09-29 (macOS): all six passed; each was shown red by a targeted mutation (verification 4.1-4.6). The guard holds `Weak`s to the session and to the view's primary rather than a session field, and arms only for a retaining attachment with a live stream at lock time.
+- [x] 4.2 Add `RemoteSession.successor` and use it in every successor branch and in `reopen_after_checked_recovery`; analyse and test its effect on `active == 1` and `MAX_ATTACHMENTS`; verify T11 and T11a Observed 2026-09-29 (macOS): T11 (reopen and explicit-close endings) and T11a passed, and failed with the slot disabled (verification 5.1, 5.2). The reopen drains first and takes the slot after, so a reopen cancelled in its drain keeps it (design D10).
+- [x] 4.3 Audit facade fixtures that relied on idle expiry and retire them explicitly; verify the kuru-memory suite passes Observed 2026-09-29 (macOS): no facade fixture relied on idle expiry (in-process owners are served never-reached and retired by maintenance). One fixture relied on a cancelled primary call dropping its connection: `selected_abandon_lost_reply_proves_staged_but_not_empty_ref` now releases the client transport with `close_transport_for_test` before its owner restart (it failed `memory service has active clients` without it). `mise run //packages/kuru-memory:test` then exited 0 (lib 364 passed, 3 ignored; other targets 10, 5, 12, 1).
 
 ## 5. WP4 test support (`test_support.rs`, `served_owner.rs`, `spawn_gate.rs`)
 
