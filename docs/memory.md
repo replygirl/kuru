@@ -256,10 +256,11 @@ A copy whose bytes differ from what this build expects is refused with a
 distinct template verdict; an engine, SQL, I/O or deadline failure, or a copy
 made for a different Kuru build, is an ordinary error. Either way the unready
 copy is left in its staging directory, never at the project's active path, and
-is never activated. If a crash interrupts a copy before or during adoption, the next open moves it under `memory/interrupted/` without starting
-its database and builds the store afresh; a copy already marked ready is
-activated like any completed stage. A copy is compared with the Kuru build
-only before adoption, so an adopted store keeps opening under later releases. A release
+is never activated. If a crash interrupts a copy before or during adoption,
+the next open moves it under `memory/interrupted/` without starting its
+database and builds the store afresh; a copy already marked ready is activated
+like any completed stage. A copy is compared with the Kuru build only before
+adoption, so an adopted store keeps opening under later releases. A release
 without this support fails closed on a template-born store's identity record
 rather than misreading it.
 
