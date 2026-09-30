@@ -38,7 +38,7 @@
 
 ## Observed evidence
 
-2026-09-29, work package P (macOS arm64 host, commits `875d7a4d`, `7b91d257`):
+2026-09-29, work package P (macOS arm64 host, commits `875d7a4d`, `7b91d257` and the follow-up test commit):
 
 - 1.1 and 1.2 are implemented (`NativeChild::diagnostic_snapshot`, `TreeSnapshot`;
   the Windows arm appends `command=… arguments=… directory=…; tree before cleanup: …`
@@ -54,7 +54,7 @@
   in an `ubuntu:24.04` container, not run through Rust.
 - 1.4: `snapshot_failure_is_reported_as_text` (missing `ps` path and a failing `ps`
   stand-in) and the snapshot unit tests passed in `mise run //packages/kuru-platform:test`
-  (51 passed, 0 failed). The delivery arm appends the snapshot after the original
+  (52 passed, 0 failed, including `snapshot_helper_is_bounded_when_ps_does_not_finish`). The delivery arm appends the snapshot after the original
   error and cleanup text by construction.
 - Sampling inside short deadlines: `SAMPLE_INTERVAL` and the skipped first tick are
   unchanged; the snapshot adds one final root sample and one sample per Job member
