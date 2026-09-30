@@ -4,7 +4,7 @@ Evidence below was observed on macOS 27.0 arm64 (Darwin), Dolt 2.3.5, in the
 worktree `tmp/worktrees/test-memory-engine-contract`, with the focused run
 `mise run //packages/kuru-memory:test -- engine_contract -- --nocapture`
 (12 tests: 9 engine contract tests and 3 unit tests of the test-support
-module). Linux and Windows results come only from CI and are not recorded here.
+module). Linux and Windows results come only from CI and are recorded in 10.4.
 
 ## 1. Test module scaffolding
 
@@ -79,8 +79,8 @@ module). Linux and Windows results come only from CI and are not recorded here.
   Evidence: every engine fixture root is `TempDir::new(...).with_depth_budget(16)`.
 - [x] 10.3 Verify no test changes the test runner's global environment (child fixtures only), and that any instrumented child fixture retains the runner's `LLVM_PROFILE_FILE` destination when clearing its own environment.
   Evidence: the tests only read the two S5 variables; every engine starts through `Server::open`, which retains `LLVM_PROFILE_FILE`.
-- [ ] 10.4 Verify every test in this change passes on Linux, macOS and Windows through the existing per-OS native test jobs, without a rerun; where a spike item's assertion differs by OS (e.g., host name bytes, path separators), the test accounts for it directly rather than being skipped on any OS.
-  Pending CI: only macOS arm64 was run locally. Path needles cover both separators, UTF-16LE and the Windows verbatim prefix; `lint:windows` passed.
+- [x] 10.4 Verify every test in this change passes on Linux, macOS and Windows through the existing per-OS native test jobs, without a rerun; where a spike item's assertion differs by OS (e.g., host name bytes, path separators), the test accounts for it directly rather than being skipped on any OS.
+  Evidence: CI run 36658415680 (attempt 1, head `693feaae`, conclusion success) ran all 12 tests of this change, each `ok`, on ubuntu-latest and macos-latest (coverage partitions), windows-latest (coverage partitions), windows-11-arm (behavior partitions) and ubuntu-24.04-arm (native memory partitions), counted from each partition's job log; S7 ran in jobs 109708390326 (ubuntu-latest), 109708390167 (macos-latest), 109708390121 (windows-latest), 109709383278 (windows-11-arm) and 109708389298 (ubuntu-24.04-arm). The preceding run 36656647566 (head `6dd17cfb`) failed S7 on both Linux jobs, because the review follow-up read `/proc/sys/kernel/hostname` through the private-object reader; `693feaae` fixed that and was not a rerun. Path needles cover both separators, UTF-16LE and the Windows verbatim prefix; the host-name comparison is Unix-only and Windows scans `COMPUTERNAME` instead. Partitions capture test output, so the S5 token and S7 host-name lines appear in CI logs only when a test fails.
 
 ## 11. Acceptance evidence to collect (not yet run)
 
