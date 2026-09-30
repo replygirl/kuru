@@ -71,6 +71,14 @@ impl ReplyBarrier {
         self.inner.sent.notified().await;
     }
 
+    /// Wait until the owner's reply frame has arrived and is held. The owner
+    /// writes it only after the request's handler returned and its receipt
+    /// settled, so a call cancelled after this leaves the owner with no
+    /// request in hand. It is not needed for a definite reconcile.
+    pub async fn wait_replied(&self) {
+        self.inner.replied.notified().await;
+    }
+
     pub fn promotion_sent(&self) -> bool {
         self.inner
             .promotion_sent
