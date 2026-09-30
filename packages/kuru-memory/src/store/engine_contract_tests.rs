@@ -1067,14 +1067,23 @@ fn scan_needles(label: &str, source: &Stopped, extra: &[(&str, String)]) -> Vec<
     needles
 }
 
+/// A random uppercase canary with no repeated 4-byte run, so neither its
+/// own text nor the lowercase, digit and hex content around it can give a
+/// compressor a back-reference that splits it.
 fn canary(kind: &str) -> String {
-    let letters: String = Uuid::new_v4()
-        .as_bytes()
-        .iter()
-        .chain(Uuid::new_v4().as_bytes())
-        .map(|byte| char::from(b'A' + byte % 26))
-        .collect();
-    format!("KURUCONTRACT{kind}{letters}")
+    loop {
+        let letters: String = Uuid::new_v4()
+            .as_bytes()
+            .iter()
+            .chain(Uuid::new_v4().as_bytes())
+            .map(|byte| char::from(b'A' + byte % 26))
+            .collect();
+        let candidate = format!("KURUCONTRACT{kind}{letters}");
+        let runs: BTreeSet<&[u8]> = candidate.as_bytes().windows(4).collect();
+        if runs.len() == candidate.len() - 3 {
+            return candidate;
+        }
+    }
 }
 
 fn report(label: &str, entries: &[Entry], hits: &[Hit]) {
@@ -1098,9 +1107,10 @@ fn report(label: &str, entries: &[Entry], hits: &[Hit]) {
 ///
 /// Positive controls bound what "can see" means. Chunk records are
 /// compressed, so the scan is only evidence for strings that stay literal:
-/// the instance UUID (a short column of the identity row) and a random
-/// canary in the `VARBINARY` message namespace must be found; whether a
-/// canary in a `LONGTEXT` value is visible is printed, not asserted. A
+/// a 9-character fragment of the instance UUID (a short column of the
+/// identity row) and a repeat-free canary in the `VARBINARY` message
+/// namespace must be found; whether the whole UUID and a canary in a
+/// `LONGTEXT` value are visible is printed, not asserted. A
 /// negative for a secret or path written only inside compressed or
 /// out-of-band values is therefore not established by this test.
 ///
@@ -1143,11 +1153,23 @@ async fn stopped_data_tree_holds_no_host_path_or_secret_bytes() -> Result<()> {
             !source.hostname.is_empty(),
             "the engine reported no host name"
         );
-        let controls = [
-            ("control: instance", source.identity.instance.clone()),
-            ("control: inline canary", inline.clone()),
-            ("observed: LONGTEXT canary", text.clone()),
+        // The instance UUID is hex and can repeat a 4-byte run of its own,
+        // so the control asks for any 9-character fragment of it; the whole
+        // UUID is only observed.
+        let mut controls = vec![
+            (
+                "observed: instance".to_owned(),
+                source.identity.instance.clone(),
+            ),
+            ("control: inline canary".to_owned(), inline.clone()),
+            ("observed: LONGTEXT canary".to_owned(), text.clone()),
         ];
+        for (index, fragment) in source.identity.instance.as_bytes().chunks(9).enumerate() {
+            controls.push((
+                format!("control: instance fragment {index}"),
+                String::from_utf8_lossy(fragment).into_owned(),
+            ));
+        }
         let mut needles = scan_needles(
             "source",
             &source,
@@ -1163,10 +1185,12 @@ async fn stopped_data_tree_holds_no_host_path_or_secret_bytes() -> Result<()> {
                     "{label}: positive control {control} was not found by the scan"
                 );
             }
-            eprintln!(
-                "engine contract S7 {label}: LONGTEXT canary visible: {}",
-                hits.iter().any(|hit| hit.label.starts_with("observed:"))
-            );
+            for observed in ["observed: instance", "observed: LONGTEXT canary"] {
+                eprintln!(
+                    "engine contract S7 {label}: {observed} visible: {}",
+                    hits.iter().any(|hit| hit.label.starts_with(observed))
+                );
+            }
             let leaks: Vec<_> = hits
                 .iter()
                 .filter(|hit| {

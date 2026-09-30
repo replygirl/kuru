@@ -9,7 +9,7 @@ module). Linux and Windows results come only from CI and are not recorded here.
 ## 1. Test module scaffolding
 
 - [x] 1.1 Register `packages/kuru-memory/src/store/engine_contract_tests.rs` from `store.rs` with `#[path = "store/engine_contract_tests.rs"] mod engine_contract_tests;`, alongside the existing `open_pool_budget_tests`/`recovery_tests`/`template_tests` registrations, and verify `mise run //packages/kuru-memory:test` discovers and runs the new module's tests.
-  Evidence: the focused test task ran 12 tests, 12 passed, in five consecutive runs (20.0 s, 18.4 s, 15.6 s, 13.3 s, 13.2 s).
+  Evidence: on the final code the focused test task ran 12 tests and 12 passed in three consecutive runs (14.6 s, 14.4 s, 19.1 s). Five earlier runs of near-final code also passed. They preceded the clippy fixes and the S7 control hardening, and the first of them had different S7 canaries.
 - [x] 1.2 Give the module a doc comment citing this change's slug, the design doc it verifies (`tmp/roadmap/store-creation-design-2026-09-29.md` sections 2-7, 13), the pinned engine (Dolt 2.3.5, upstream commit `ad65af6cc937d10fa3c88e2041fed4325968b581`, `packages/kuru-memory/support/dolt-assets.json`), and that these are contract tests: they change no product behavior and an honest failing result is a valid, reportable outcome.
 - [x] 1.3 Each test function's own doc comment cites the specific upstream URL (or, where upstream is silent, the pinned-commit source path/line) and Dolt version its assertion rests on, and states in one sentence what the store-creation design must do instead if the assertion fails.
 
@@ -56,7 +56,7 @@ module). Linux and Windows results come only from CI and are not recorded here.
 ## 8. S7 — no origin-identifying bytes in a copied store
 
 - [x] 8.1 Add `stopped_data_tree_holds_no_host_path_or_secret_bytes`: enumerate every file under a stopped, copied store's `data/` (including `.dolt/stats` if the pinned engine creates one), and byte-scan each for: the source directory's absolute path, the local host name, the source store's root secret, and the source store's `kuru_reader` secret. Verify none appear in any file.
-  Evidence: passed. `data/` holds 10 files, 5 of them in `kuru/.dolt/stats`. No path, host name, container name or secret (whole or 16-character fragment) was found in the source tree or in the served copy. Positive controls: the instance UUID and an uppercase canary in the message namespace were found; a `LONGTEXT` canary was also found. A first run's canary that repeated its own key text was not found, so the scan only proves the absence of literal occurrences.
+  Evidence: passed. `data/` holds 10 files, 5 of them in `kuru/.dolt/stats`. No path, host name, container name or secret (whole or 16-character fragment) was found in the source tree or in the served copy. Asserted positive controls: a 9-character fragment of the instance UUID and a repeat-free uppercase canary in the message namespace were found. The whole UUID and a `LONGTEXT` canary were also found, and these two are printed, not asserted. A first run's canary that repeated its own key text was not found, so the scan only proves the absence of literal occurrences.
 - [x] 8.2 Add the byte-scan helper under `test_support/` only if no existing helper does this scan; exercise it directly with a unit test asserting it detects an injected marker, so the helper itself is covered.
   Evidence: `scan_detects_an_injected_marker_and_skips_lock_files` passed.
 
