@@ -10,7 +10,7 @@ Work packages own disjoint files (design D13 and the revised unit 1 design, sect
 
 ## 2. WP1 Windows pipe marker (`packages/kuru-platform`)
 
-- [ ] 2.1 Add `NoFreeInstance` and `pub fn is_no_free_instance` to `src/windows/pipe.rs`, keeping kind `TimedOut` and the exact message, and verify T14's platform half compiles under `mise run lint` (Windows target) and passes in native Windows CI
+- [ ] 2.1 Add `NoFreeInstance` and `pub fn is_no_free_instance` to `src/windows/pipe.rs`, keeping kind `TimedOut` and the exact message, and verify T14's platform half compiles under `mise run lint` (Windows target) and passes in native Windows CI. Progress 2026-09-29 (macOS, commit a498b6a2): added; the connect's busy-deadline branch returns `io::Error::new(TimedOut, NoFreeInstance)` whose `Display` is the shared message constant, a timeout with no retry observation keeps the plain string payload, and `is_no_free_instance` checks the payload type only. T14's platform half extends `missing_and_busy_connects_preserve_distinct_terminal_states` (missing -> `NotFound`, marker false; busy -> `TimedOut`, exact message, marker true; a plain `TimedOut` with the same text -> marker false). Red before the change: `//packages/kuru-platform:typecheck:windows` failed E0425 `cannot find function is_no_free_instance in module pipe` (3 sites). Green after: `typecheck:windows`, `lint:windows`, `lint:windows-arm64` exit 0. Not executed: native Windows CI is still required; the service seam in `service.rs` still returns false (task 3.5).
 
 ## 3. WP2 owner lifetime (`service.rs`, `service/rpc.rs`, `store.rs`)
 
