@@ -32,8 +32,8 @@
 
 ## 5. `new-project` case: a warm-engine baseline for the template cache
 
-- [ ] 5.1 Write the harness and fixture tests first for a `new-project` case (a second, different project created in the same scratch root right after `first-launch`, with its own stage partition and expected engine-start count) and verify they fail on stubs
-- [ ] 5.2 Add `Case::NewProject`, run it between `first-launch` and `cold-existing` with its own retirement wait before `cold-existing` starts (so `cold-existing` keeps measuring what it measures today: no live owner from an unrelated project), and extend `report::derive`'s milestone chain and `Counts` so its partition and engine-start count are reported like the other cases
+- [ ] 5.1 Write the harness and fixture tests first for a `new-project` case (a second, different project created in the same scratch root, with its own stage partition and expected engine-start count) and verify they fail on stubs
+- [ ] 5.2 Add `Case::NewProject` and run it after the three existing cases and their own retirement wait, with a retirement wait of its own: first-launch, then cold-existing, then warm-reopen, then retire, then new-project, then retire. This is append-only: first-launch, cold-existing and warm-reopen keep the same predecessor and gap they have today (so cold-existing still runs right after first-launch, page cache warm, per the non-goal that nothing about the existing cases' measurement changes), and new-project still sees a warm engine cache with nothing else in between. Extend `report::derive`'s milestone chain and `Counts` so `new-project`'s partition and engine-start count are reported like the other cases
 - [ ] 5.3 Verify the tests pass and record a local smoke run showing 4 engine starts for `new-project` today (expected to drop to 2 once the template cache lands, per `store-creation-design-machine-cache-2026-09-29.md` section 11's P0 row)
 
 ## 6. Second readiness signal: `kuru-open-marker`
