@@ -1221,8 +1221,9 @@ async fn ready_template_stage_is_reused() -> Result<()> {
 }
 
 /// The template shape on the stage engine refuses a copy whose bytes hold
-/// more than the template may: a commit beyond the compiled history, a
-/// branch outside the compiled set, a project-data row, a view, or more
+/// more than the template may: a dirty retained attempt, a commit beyond the
+/// compiled history, a branch outside the compiled set, a project-data row,
+/// a view, or more
 /// tables than the check reads (which a truncated read would leave
 /// unchecked). Each is a typed verdict after adoption and before
 /// `ready.json`, the job preserves the unready stage, and no active
@@ -1236,7 +1237,23 @@ async fn template_shape_violation_prevents_ready_marker() -> Result<()> {
         let amend = format!(
             "CALL DOLT_COMMIT('-A', '--amend', '-m', 'amended', '--author', {VARIANT_AUTHOR})"
         );
+        // A retained main attempt at a completed step. Classification would
+        // refuse it dirty with an ordinary error; the shape check judges the
+        // branch set, dirtiness included, before it classifies.
+        let attempt = template
+            .refs
+            .keys()
+            .find(|name| name.starts_with("kuru_migration_"))
+            .context("the template retains no main attempt branch")?;
         let cases = [
+            (
+                "dirty retained attempt",
+                vec![
+                    format!("USE `kuru/{attempt}`"),
+                    "CREATE TABLE dirty_attempt (id INT PRIMARY KEY)".to_owned(),
+                ],
+                "has uncommitted changes",
+            ),
             (
                 "extra commit",
                 vec![format!(
