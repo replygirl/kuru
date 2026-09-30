@@ -391,8 +391,10 @@ fn a_single_sighting_has_no_lower_bound_and_a_bracketed_upper_bound() {
 
 /// Real observations from the local smoke run of the release binary at
 /// a8ce468b (the first iteration of the main series and the control's first
-/// launch) and, for `new-project`, the first iteration of the smoke run at
-/// b3ca1d02's product code, trimmed to what [`derive`] reads.
+/// launch) and, for `new-project`, iteration 1 of the first smoke attempt at
+/// b3ca1d02's product code (12:28 CDT on 2026-09-30; that attempt stopped at
+/// iteration 3, but its iterations 1 and 2 were clean), trimmed to what
+/// [`derive`] reads.
 #[test]
 fn recorded_observations_are_partitioned_exactly() {
     #[derive(serde::Deserialize)]
