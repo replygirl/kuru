@@ -16,10 +16,10 @@ pub use image::{CurrentImage, current_image};
 use std::{
     cmp::Ordering,
     ffi::{OsStr, OsString, c_void},
-    io,
+    fmt, io,
     mem::{self, size_of},
     os::windows::{
-        ffi::OsStrExt,
+        ffi::{OsStrExt, OsStringExt},
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
         process::ExitStatusExt,
     },
@@ -30,9 +30,9 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, FILETIME, GENERIC_READ,
-        GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_MORE_DATA, FILETIME,
+        GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+        SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Globalization::{CSTR_EQUAL, CSTR_LESS_THAN, CompareStringOrdinal},
     Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
@@ -44,7 +44,8 @@ use windows_sys::Win32::{
         JobObjects::{
             CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+            JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
             JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
             TerminateJobObject,
         },
@@ -55,8 +56,9 @@ use windows_sys::Win32::{
             CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
             EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessId,
             GetProcessTimes, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
-            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, STARTF_USESHOWWINDOW,
+            OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+            PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, STARTF_USESHOWWINDOW,
             STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
             WaitForSingleObject,
         },
@@ -438,26 +440,42 @@ impl NativeChild {
             }
             self.status = Some(ExitStatus::from_raw(code));
         }
-        if let Some(job) = &self.job {
-            // SAFETY: zeroable output buffer with the exact declared size/class.
-            let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { mem::zeroed() };
-            if unsafe {
-                QueryInformationJobObject(
-                    job.as_raw_handle(),
-                    JobObjectBasicAccountingInformation,
-                    (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
-                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                    ptr::null_mut(),
-                )
-            } == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            if accounting.ActiveProcesses != 0 {
-                return Ok(None);
-            }
+        if let Some(job) = &self.job
+            && job_accounting(job)?.ActiveProcesses != 0
+        {
+            return Ok(None);
         }
         Ok(self.status)
+    }
+
+    /// A read-only, point-in-time description of this child and its owned Job
+    /// for failure diagnostics. It neither caches status nor signals or waits.
+    ///
+    /// Job members are listed by numeric ID and, best effort, image name and
+    /// resource sample through a query-only handle. An ID can be reused
+    /// between listing and opening; a reopened process outside this Job is
+    /// reported as such rather than named. The IDs are text only and confer
+    /// no authority: termination remains with the retained Job handle.
+    pub fn diagnostic_snapshot(&self) -> TreeSnapshot {
+        let root = process_is_running(&self.process).and_then(|running| {
+            if running {
+                return Ok(RootObservation::Running);
+            }
+            let mut code = 0;
+            // SAFETY: retained process handle; code points to writable output.
+            if unsafe { GetExitCodeProcess(self.process.as_raw_handle(), &mut code) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(RootObservation::Exited(code))
+        });
+        TreeSnapshot {
+            root_id: self.id,
+            root,
+            // The creation handle carries query rights; this is a final sample
+            // regardless of how short the caller's deadline was.
+            root_sample: sample_process(&self.process),
+            job: self.job.as_ref().map(job_snapshot),
+        }
     }
 
     pub async fn wait(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
@@ -514,6 +532,234 @@ impl NativeChild {
         }
         Ok(())
     }
+}
+
+/// Root state observed without reaping or caching it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootObservation {
+    Running,
+    Exited(u32),
+}
+
+/// See [`NativeChild::diagnostic_snapshot`]. Diagnostics only: never
+/// consulted for control flow, only appended to failure text.
+#[derive(Debug)]
+pub struct TreeSnapshot {
+    pub root_id: u32,
+    pub root: io::Result<RootObservation>,
+    pub root_sample: io::Result<ProcessSample>,
+    /// `None` when this child has no owned Job.
+    pub job: Option<io::Result<JobSnapshot>>,
+}
+
+/// Owned Job accounting and its listed members at one instant.
+#[derive(Debug)]
+pub struct JobSnapshot {
+    pub active_processes: u32,
+    pub total_processes: u32,
+    pub terminated_processes: u32,
+    /// Members the Job reported; more than `members.len()` when capped.
+    pub assigned_processes: u32,
+    pub members: Vec<JobMember>,
+}
+
+#[derive(Debug)]
+pub struct JobMember {
+    pub id: u32,
+    /// Executable file name, without its directory.
+    pub image: io::Result<OsString>,
+    pub sample: io::Result<ProcessSample>,
+}
+
+/// Bound on listed members; further members are only counted.
+const JOB_MEMBER_LIMIT: usize = 256;
+
+impl fmt::Display for TreeSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "root pid={} ", self.root_id)?;
+        match &self.root {
+            Ok(RootObservation::Running) => write!(formatter, "state=running")?,
+            Ok(RootObservation::Exited(code)) => write!(formatter, "state=exited({code})")?,
+            Err(error) => write!(formatter, "state_error={error}")?,
+        }
+        write_sample(formatter, &self.root_sample)?;
+        match &self.job {
+            None => write!(formatter, "; job=none"),
+            Some(Err(error)) => write!(formatter, "; job_error={error}"),
+            Some(Ok(job)) => {
+                write!(
+                    formatter,
+                    "; job active={} total={} terminated={} listed={}/{} members=[",
+                    job.active_processes,
+                    job.total_processes,
+                    job.terminated_processes,
+                    job.members.len(),
+                    job.assigned_processes
+                )?;
+                for (index, member) in job.members.iter().enumerate() {
+                    if index > 0 {
+                        write!(formatter, "; ")?;
+                    }
+                    write!(formatter, "pid={} ", member.id)?;
+                    match &member.image {
+                        Ok(image) => write!(formatter, "image={}", image.to_string_lossy())?,
+                        Err(error) => write!(formatter, "image_error={error}")?,
+                    }
+                    write_sample(formatter, &member.sample)?;
+                }
+                write!(formatter, "]")
+            }
+        }
+    }
+}
+
+fn write_sample(
+    formatter: &mut fmt::Formatter<'_>,
+    sample: &io::Result<ProcessSample>,
+) -> fmt::Result {
+    match sample {
+        Ok(sample) => write!(
+            formatter,
+            " cpu={}ms working_set={}B",
+            (sample.kernel_time + sample.user_time).as_millis(),
+            sample.working_set_bytes
+        ),
+        Err(error) => write!(formatter, " sample_error={error}"),
+    }
+}
+
+fn job_accounting(job: &OwnedHandle) -> io::Result<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION> {
+    // SAFETY: zeroable output buffer with the exact declared size/class.
+    let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { mem::zeroed() };
+    if unsafe {
+        QueryInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectBasicAccountingInformation,
+            (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+            size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(accounting)
+}
+
+fn job_snapshot(job: &OwnedHandle) -> io::Result<JobSnapshot> {
+    let accounting = job_accounting(job)?;
+    let (assigned_processes, ids) = job_process_ids(job)?;
+    let mut image = vec![0u16; 32 * 1024];
+    let members = ids
+        .into_iter()
+        .map(|id| {
+            let (image, sample) = match open_member(job, id) {
+                Ok(process) => (image_name(&process, &mut image), sample_process(&process)),
+                Err(error) => (Err(error), Err(io::Error::other("member not opened"))),
+            };
+            JobMember { id, image, sample }
+        })
+        .collect();
+    Ok(JobSnapshot {
+        active_processes: accounting.ActiveProcesses,
+        total_processes: accounting.TotalProcesses,
+        terminated_processes: accounting.TotalTerminatedProcesses,
+        assigned_processes,
+        members,
+    })
+}
+
+/// The variable-length ID list grows once to the reported member count and
+/// is otherwise capped; a still-longer list is returned truncated.
+fn job_process_ids(job: &OwnedHandle) -> io::Result<(u32, Vec<u32>)> {
+    let header = mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
+    let header_words = header.div_ceil(size_of::<usize>());
+    let mut capacity = 64usize;
+    for attempt in 0..2 {
+        let mut buffer = vec![0usize; header_words + capacity];
+        // SAFETY: the usize buffer is suitably aligned for the list header and
+        // its array, and the declared length is exactly its size in bytes.
+        let result = unsafe {
+            QueryInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectBasicProcessIdList,
+                buffer.as_mut_ptr().cast(),
+                mem::size_of_val(buffer.as_slice()) as u32,
+                ptr::null_mut(),
+            )
+        };
+        let truncated = if result == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
+                return Err(error);
+            }
+            true
+        } else {
+            false
+        };
+        // SAFETY: the buffer begins with the list's two u32 counters, which
+        // the query initializes on success and on ERROR_MORE_DATA.
+        let (assigned, listed) = unsafe {
+            let counters = buffer.as_ptr().cast::<u32>();
+            (*counters, *counters.add(1))
+        };
+        let wanted = (assigned as usize).saturating_add(16).min(JOB_MEMBER_LIMIT);
+        if truncated && attempt == 0 && wanted > capacity {
+            capacity = wanted;
+            continue;
+        }
+        let listed = (listed as usize).min(capacity);
+        let ids = buffer[header_words..header_words + listed]
+            .iter()
+            .map(|&id| id as u32)
+            .collect();
+        return Ok((assigned, ids));
+    }
+    Err(io::Error::other(
+        "Job process list changed during its bounded query",
+    ))
+}
+
+/// Open a listed ID with query rights only, and confirm the opened process is
+/// still in this Job, so a reused ID cannot be named as a member.
+fn open_member(job: &OwnedHandle, id: u32) -> io::Result<OwnedHandle> {
+    // SAFETY: query-only access to a listed ID; a null result is an error.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, id) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful OpenProcess transfers one owned handle, closed on drop.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut member = 0;
+    // SAFETY: both handles are retained for the call; member is writable.
+    if unsafe { IsProcessInJob(process.as_raw_handle(), job.as_raw_handle(), &mut member) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if member == 0 {
+        return Err(io::Error::other("ID now names a process outside this Job"));
+    }
+    Ok(process)
+}
+
+fn image_name(process: &OwnedHandle, buffer: &mut [u16]) -> io::Result<OsString> {
+    let mut length = buffer.len() as u32;
+    // SAFETY: the retained query handle and writable buffer outlive the call;
+    // length carries the buffer capacity in UTF-16 units and receives the result.
+    if unsafe {
+        QueryFullProcessImageNameW(
+            process.as_raw_handle(),
+            PROCESS_NAME_WIN32,
+            buffer.as_mut_ptr(),
+            &mut length,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let path = PathBuf::from(OsString::from_wide(&buffer[..length as usize]));
+    Ok(path
+        .file_name()
+        .map_or_else(|| path.clone().into_os_string(), OsStr::to_os_string))
 }
 
 /// Retain a real handle to this process, rather than inheriting a pseudo-handle.

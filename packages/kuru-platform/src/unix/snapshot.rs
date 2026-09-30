@@ -1,0 +1,323 @@
+//! Read-only, bounded process-tree description for failure diagnostics.
+//!
+//! One stock `ps` invocation lists every process; the rows are filtered in Rust
+//! to a root, the members of the process group it leads and the parent-ID
+//! closure of both. A descendant reparented after its parent exited is still
+//! found through its group. `ps -g` is avoided because its meaning differs
+//! between BSD and procps.
+//!
+//! The result is point-in-time text. Numeric IDs are printed, never signalled,
+//! waited for or otherwise acted on, so a reused ID can only mislabel a row.
+//! Callers take the snapshot while they still anchor the root's identity, for
+//! example before reaping it, and only on a failure path.
+
+use std::{
+    collections::BTreeSet,
+    fmt,
+    io::{self, Read},
+    path::Path,
+    process::{Command, Stdio},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
+
+/// Stock location on macOS and on usrmerged Linux distributions.
+pub const PS: &str = "/bin/ps";
+
+/// Bound for the complete `ps` run, including draining its pipes.
+pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+
+const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
+const ROW_LIMIT: usize = 64;
+const COMMAND_LIMIT: usize = 512;
+
+/// One process as `ps` reported it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessRow {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgid: u32,
+    pub state: String,
+    /// Cumulative CPU time in `ps`'s own `time` format.
+    pub cpu_time: String,
+    pub rss_kib: u64,
+    /// Command and arguments, truncated for diagnostics.
+    pub command: String,
+}
+
+impl fmt::Display for ProcessRow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "pid={} ppid={} pgid={} stat={} time={} rss={}KiB args={}",
+            self.pid, self.ppid, self.pgid, self.state, self.cpu_time, self.rss_kib, self.command
+        )
+    }
+}
+
+/// Rows for `root`, its led group and their descendants, ordered by ID.
+pub fn tree(root: u32) -> io::Result<Vec<ProcessRow>> {
+    tree_with(Path::new(PS), root)
+}
+
+/// [`tree`] through an explicit `ps` executable; a test seam for failures.
+pub fn tree_with(program: &Path, root: u32) -> io::Result<Vec<ProcessRow>> {
+    Ok(select(parse(&list(program)?)?, root))
+}
+
+/// Diagnostic text for `root`'s tree. A snapshot failure becomes
+/// `snapshot unavailable: <reason>` so callers can append it to an original
+/// error without ever replacing that error.
+pub fn describe(root: u32) -> String {
+    describe_with(Path::new(PS), root)
+}
+
+/// [`describe`] through an explicit `ps` executable.
+pub fn describe_with(program: &Path, root: u32) -> String {
+    match tree_with(program, root) {
+        Ok(rows) => format_rows(root, &rows),
+        Err(error) => format!("snapshot unavailable: {error}"),
+    }
+}
+
+fn format_rows(root: u32, rows: &[ProcessRow]) -> String {
+    let mut text = format!("process tree of {root} ({} rows): [", rows.len());
+    for (index, row) in rows.iter().take(ROW_LIMIT).enumerate() {
+        if index > 0 {
+            text.push_str("; ");
+        }
+        text.push_str(&row.to_string());
+    }
+    if rows.len() > ROW_LIMIT {
+        text.push_str(&format!("; {} more omitted", rows.len() - ROW_LIMIT));
+    }
+    text.push(']');
+    text
+}
+
+fn select(rows: Vec<ProcessRow>, root: u32) -> Vec<ProcessRow> {
+    let mut members: BTreeSet<u32> = rows
+        .iter()
+        .filter(|row| row.pid == root || row.pgid == root)
+        .map(|row| row.pid)
+        .collect();
+    loop {
+        let before = members.len();
+        members.extend(
+            rows.iter()
+                .filter(|row| members.contains(&row.ppid))
+                .map(|row| row.pid)
+                .collect::<Vec<_>>(),
+        );
+        if members.len() == before {
+            break;
+        }
+    }
+    let mut selected: Vec<_> = rows
+        .into_iter()
+        .filter(|row| members.contains(&row.pid))
+        .collect();
+    selected.sort_by_key(|row| row.pid);
+    selected
+}
+
+fn parse(output: &str) -> io::Result<Vec<ProcessRow>> {
+    let mut rows = Vec::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let mut fields = line.split_whitespace();
+        let mut next = |name: &str| {
+            fields
+                .next()
+                .ok_or_else(|| io::Error::other(format!("ps row lacks {name}: {line:?}")))
+        };
+        let number = |name: &str, value: &str| {
+            value
+                .parse::<u64>()
+                .map_err(|_| io::Error::other(format!("ps row has invalid {name}: {line:?}")))
+        };
+        let pid = number("pid", next("pid")?)?;
+        let ppid = number("ppid", next("ppid")?)?;
+        let pgid = number("pgid", next("pgid")?)?;
+        let state = next("stat")?.to_owned();
+        let cpu_time = next("time")?.to_owned();
+        let rss_kib = number("rss", next("rss")?)?;
+        let mut command = fields.collect::<Vec<_>>().join(" ");
+        if command.len() > COMMAND_LIMIT {
+            let mut end = COMMAND_LIMIT;
+            while !command.is_char_boundary(end) {
+                end -= 1;
+            }
+            command.truncate(end);
+            command.push_str("...");
+        }
+        let id = |value: u64, name: &str| {
+            u32::try_from(value)
+                .map_err(|_| io::Error::other(format!("ps row {name} exceeds range: {line:?}")))
+        };
+        rows.push(ProcessRow {
+            pid: id(pid, "pid")?,
+            ppid: id(ppid, "ppid")?,
+            pgid: id(pgid, "pgid")?,
+            state,
+            cpu_time,
+            rss_kib,
+            command,
+        });
+    }
+    Ok(rows)
+}
+
+fn list(program: &Path) -> io::Result<String> {
+    let mut child = Command::new(program)
+        .args(["-A", "-o", "pid=,ppid=,pgid=,stat=,time=,rss=,args="])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| io::Error::new(error.kind(), format!("spawn {program:?}: {error}")))?;
+    let (sender, receiver) = mpsc::channel();
+    let drain = |pipe: Option<Box<dyn Read + Send>>, stream: &'static str| {
+        let sender = sender.clone();
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = match pipe {
+                Some(pipe) => pipe
+                    .take(OUTPUT_LIMIT + 1)
+                    .read_to_end(&mut bytes)
+                    .map(|_| ()),
+                None => Err(io::Error::other(format!("missing ps {stream}"))),
+            };
+            let _ = sender.send(());
+            (result, bytes)
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+        "stdout",
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+        "stderr",
+    );
+    drop(sender);
+    // Both readers report EOF through the channel; the root is polled between
+    // those bounded receives, and at the same interval once both have ended.
+    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
+    let mut finished = 0;
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if finished == 2 && status.is_some() {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let interval = remaining.min(Duration::from_millis(10));
+        if finished < 2 {
+            if receiver.recv_timeout(interval).is_ok() {
+                finished += 1;
+            }
+        } else {
+            thread::sleep(interval);
+        }
+    }
+    let timed_out = status.is_none() || finished < 2;
+    if status.is_none() {
+        // The owned child handle, not a numeric ID, stops the helper; `ps`
+        // starts no descendants, so its pipes close once it is reaped.
+        let _ = child.kill();
+        status = Some(child.wait()?);
+    }
+    let (stdout_result, stdout_bytes) = stdout
+        .join()
+        .map_err(|_| io::Error::other("ps stdout reader panicked"))?;
+    let (stderr_result, stderr_bytes) = stderr
+        .join()
+        .map_err(|_| io::Error::other("ps stderr reader panicked"))?;
+    if timed_out {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{program:?} did not finish within {SNAPSHOT_TIMEOUT:?}"),
+        ));
+    }
+    stdout_result?;
+    stderr_result?;
+    if stdout_bytes.len() as u64 > OUTPUT_LIMIT {
+        return Err(io::Error::other("ps output exceeds limit"));
+    }
+    let status = status.expect("status is observed before readers are joined");
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "{program:?} failed with {status}: {}",
+            String::from_utf8_lossy(&stderr_bytes[..stderr_bytes.len().min(1024)]).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&stdout_bytes).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(pid: u32, ppid: u32, pgid: u32) -> ProcessRow {
+        ProcessRow {
+            pid,
+            ppid,
+            pgid,
+            state: "S".to_owned(),
+            cpu_time: "0:00.00".to_owned(),
+            rss_kib: 1,
+            command: format!("process {pid}"),
+        }
+    }
+
+    #[test]
+    fn selection_follows_group_and_parent_closure() {
+        let rows = vec![
+            row(1, 0, 1),
+            row(10, 1, 10),
+            // Reparented to init after its parent exited; kept by its group.
+            row(12, 1, 10),
+            // Left the group; kept by its parent.
+            row(13, 12, 13),
+            row(14, 13, 13),
+            row(20, 1, 20),
+        ];
+        let pids: Vec<_> = select(rows, 10).iter().map(|row| row.pid).collect();
+        assert_eq!(pids, [10, 12, 13, 14]);
+    }
+
+    #[test]
+    fn parse_keeps_spaced_arguments_and_rejects_malformed_rows() {
+        let rows = parse("  7   1   7 Ss   0:01.50  2048 /bin/sh -c sleep 60\n\n").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].command, "/bin/sh -c sleep 60");
+        assert_eq!(rows[0].rss_kib, 2048);
+        assert!(parse("7 1\n").is_err());
+        assert!(parse("x 1 7 S 0:00 1 cmd\n").is_err());
+        let long = format!("8 1 8 S 0:00 1 {}", "é".repeat(COMMAND_LIMIT));
+        assert!(parse(&long).unwrap()[0].command.ends_with("..."));
+    }
+
+    #[test]
+    fn formatting_bounds_rows() {
+        let rows: Vec<_> = (1..=ROW_LIMIT as u32 + 2)
+            .map(|pid| row(pid, 0, 1))
+            .collect();
+        let text = format_rows(1, &rows);
+        assert!(text.starts_with(&format!("process tree of 1 ({} rows): [", rows.len())));
+        assert!(text.ends_with("; 2 more omitted]"), "{text}");
+    }
+}
