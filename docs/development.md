@@ -381,10 +381,11 @@ removes them.
 
 Ordinary application opens start or attach to the internal per-project memory
 service from the same Kuru executable. The service owns the prepared Dolt child
-and may remain alive for its 30-second idle grace after the last client exits;
-it is not an installed system daemon. CLI and PTY fixtures that use a temporary
-project must explicitly retire that idle service before removing their fixture
-directory. The application still holds the project conversation-driver lease,
+and shuts down as soon as its last client and accepted work have drained; it is
+not an installed system daemon. The command that exits does not wait for that
+close, so CLI and PTY fixtures that use a temporary project await the owner's
+exit (`test_support::await_owner_release`, below) or its quiescence before
+removing their fixture directory. The application still holds the project conversation-driver lease,
 so this service boundary does not make simultaneous conversation tests valid.
 
 Dolt panics at close when its data directory disappears before it exits, so a
@@ -401,8 +402,8 @@ and written only on evidence this process observed itself:
 - Closing a store records it. Every Dolt supervisor the test process spawns
   stays live in the ledger until the process reaps that supervisor, and the
   reap records the store.
-- `test_support::await_managed_quiescence(&options)` retires the idle managed
-  owner, then waits for the lifecycle lease of the project store, of each of
+- `test_support::await_managed_quiescence(&options)` retires a managed owner
+  that is still running, then waits for the lifecycle lease of the project store, of each of
   its `<hash>.staging-<uuid>` siblings and of each stage preserved under
   `interrupted/` (bounded by the supervisor's reap allowance; a timeout fails
   the test) and records each while its lease is held. Managed fixtures call it
@@ -481,11 +482,55 @@ busy lock although no owner exists. `ServedOwner::restart` retires, opens and
 serves a successor this way, and `spawn_gate::excluding_spawns` covers any other
 sequence; both take the caller's shared guard and hand the exclusive guard
 back down to it atomically, because a successor served inside the restart
-starts its idle timer at once and must not wait for the gate afterwards.
+is served inside the restart and must not wait for the gate afterwards.
 `ServiceOwner::open` stays one-shot and a fixture never retries it. The gate is
 fair, so a restart waits for every running spawner to drop its shared guard,
 within the fixture's own deadline, and code under the exclusive guard must not
 take a shared one.
+
+An owner ends itself when its last attachment releases, so a fixture that
+needs a running owner chooses its lifetime policy. `ServeKnobs`
+(`service.rs`) carries the admission rule, the first-attachment deadline, the
+lock recheck interval and the test hooks. `Admission` is `Starter(token)`
+(retire only after the attachment presenting that token has attached),
+`AnyAttachment` (the mixed-version fallback for an owner started without a
+token) or `Never`. `ServedOwner::serve` uses `Never` with no deadline, so an
+in-process fixture owner ends only by maintenance retirement, `restart` or lock
+loss; `ServedOwner::serve_with(owner, knobs)` and `ServiceOwner::serve_with`
+choose another policy, and the retire-on-last-detach path is covered by
+tests with a really spawned owner and by the command-line tests. Tests never
+sleep for an owner's lifetime; they follow events:
+
+- The serve-loop observer (`ServeKnobs::observer`, an ordered unbounded channel
+  of `ServeEvent`) reports `AttachmentAccepted { active }`,
+  `AttachmentJoined { remaining }`, `EnteredEmpty { reached }` and
+  `LockRechecked`. Events are sent before the loop acts on them, so an early
+  retirement always appears in order before any later event. The consumers
+  `observed`, `next_event`, `expect_events` and `expect_no_event` live in
+  `test_support/served_owner.rs`.
+- `ClosePause` (`ClosePoint::BeforeListenerDrop`, `AfterListenerDrop`,
+  `AfterEndpointRetire`, `AfterReap`) holds a closing owner at those points, as
+  `ReplyPause` holds a reply, to test racing clients, close order and
+  maintenance. `DispatchPause` holds the next request of any kind before
+  dispatch; unlike `RegisteredPause` it also pauses reads.
+- `test_support::await_owner_release(&options)` waits for a spawned owner in
+  another process by taking and releasing its Owner lock (a blocking lock in
+  `spawn_blocking`, no deadline of its own). The wait cannot be cancelled, so a
+  caller bounds it from outside, as the application's `await_owner_exit` does,
+  and calls it only while nothing is electing. With the `test-support` feature,
+  `KURU_TEST_MEMORY_OWNER_DIAGNOSTIC` names an existing file that a command's
+  spawned owner appends its standard error to.
+- The `RemoteSession` replacement hook (`installed`, `discarded`, `failed` and a
+  pause after connect) observes the replacement connection a cancelled call
+  starts; it is `cfg(test)` inside `facade.rs`.
+
+The starter token is a random UUID the starting client passes to the owner it
+spawns as an optional tenth service argument and presents in its handshake hello.
+Only an attachment presenting it marks the owner as reached by its starter, so
+a `kuru memory status` or a second client cannot retire a new owner before its
+starter attaches. An owner started without one (a client from before the token,
+after an update replaced the executable) treats any authenticated attachment as
+reaching it.
 
 A lost-reply test that pauses a request with the fixture reply pause
 (`ReplyPause`, or `test_support::ReplyBarrier` outside kuru-memory), cancels it
@@ -1110,7 +1155,8 @@ transitions, transcript positions, usage proofs, price terms and export cursor
 phases. Every optional field in a sample is populated. Response and
 unit-valued enums are pinned only by their variant names, and a
 free-form JSON value shows only its sampled shape. The handshake hello is not
-pinned. Shared `kuru-core` types that
+pinned. Its optional starter token is additive, skipped when absent, and
+needs no `PROTOCOL_MINOR` bump (see the starter token below). Shared `kuru-core` types that
 travel on the wire are included. When the pin fails, bump `PROTOCOL_MINOR`.
 Older owners then refuse the newer client at the handshake, which is clearer
 than a decode failure. Regenerate the fixture with

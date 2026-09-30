@@ -4,8 +4,8 @@ Kuru uses full Dolt for local, versioned memory. Each canonical project director
 has a separate database and revision history. Parts and relationships retain their
 private namespaces inside that database. The SQL server binds to loopback with
 generated local credentials. A private per-project memory service owns Dolt,
-allows checked Kuru clients to attach, and remains available for a bounded idle
-interval after the last attachment closes.
+allows checked Kuru clients to attach, and stops once no client is attached and
+accepted work has settled.
 
 ```sh
 kuru memory status
@@ -97,7 +97,7 @@ network, compiler or separate engine installation. The cache is `tools/dolt`
 inside the Kuru data directory; `memory.cache_dir` selects another location.
 Subsequent runs read every cached engine and license byte for its pinned digest,
 revalidate the checked names and identities, run the exact-version probe and then
-reuse the engine. Independent warm opens perform those checks concurrently; the
+reuse the engine. Independent opens perform those checks concurrently; the
 exclusive installation lock is reserved for missing-cache extraction and atomic
 publication. Corrupt existing caches fail before execution and remain preserved
 for inspection.
@@ -112,10 +112,47 @@ standard output, and library callers do not receive progress messages.
 Writable runtime commands attach to the private project memory service while
 retaining the existing one-conversation driver lease. This phase does not admit
 simultaneous conversations. Attachments do not own the service process and an
-inspection handle cannot stop it. When the last attachment closes, the service
-waits through its bounded idle interval, drains accepted work, reaps its exact
-Dolt child, and only then releases lifecycle authority. A later command during
-that interval can reuse the same checked service generation.
+inspection handle cannot stop it. When the last attachment closes and accepted
+work has drained, the service stops accepting, retires its endpoint, reaps its
+exact Dolt child and only then releases lifecycle authority. There is no idle
+interval: a later command starts a new service after that shutdown completes, so
+each command that follows another opens the existing project again instead of
+attaching to a running service.
+
+A service that a command started waits for that command to attach before it may
+retire, so another client that attaches and detaches first does not end it. If
+the command never attaches, for example because it died first, the service keeps
+serving other clients and exits at its first empty moment once
+`memory.startup_timeout_secs` has passed since it published its endpoint, with a
+warning in its log. A command that starts while the previous service is still
+shutting down waits for that shutdown and then starts or attaches to a
+successor, within the same timeout; meeting a retiring service is not an error
+in itself. If the shutdown outlasts the timeout, the error says the previous
+service was still shutting down.
+
+A writable session keeps at least one attachment across a cancelled or failed
+memory call. Kuru does not resend the request; the reply is still recovered from
+its durable receipt. When a call on the session's main connection is cancelled or
+fails, the client keeps that connection open, unused, and opens a replacement to
+the same service generation. It closes the old connection only after the
+replacement has completed its handshake, so pressing Esc during a memory call
+does not stop the service under a running session. A replacement never elects or
+starts a service. Read-only commands hold no such connection: a read-only call
+that was cancelled after the service retired reports "the memory service ended
+while this read-only command was disconnected; run the command again". Read-only
+commands never start a service, and a writable command's service retires as soon
+as the command exits.
+
+This covers the cases where the client can keep the service. Three cases it does
+not cover fail the next call with a truthful error instead of hiding the fault:
+the service closes a live client's only connection on its own, for example after
+a malformed request frame; the replacement connection is refused (the service is
+at its attachment limit, or is settling an explicit candidate abandonment) and
+the service then ends the abandoned connection after its 35-second operation
+timeout; and a call dropped outside an async runtime, which opens no
+replacement until the next call. An explicit candidate abandonment issued from
+the same session in the moments after a cancelled call can be refused as active
+until the cancelled request finishes; running it again succeeds.
 
 After the first conversation/runtime command (`kuru run`, `kuru dream`,
 `kuru undo-dream`, the TUI, or `kuru serve`) opens a writable project store, the
@@ -278,7 +315,7 @@ lockfile or replace the directory while a process is using it.
 Inspection commands attach read-only to an active memory service. Without one,
 they use an explicitly local read-only open and never elect an owner. Normal
 runtime command exit awaits attachment cleanup, including when the command
-reports an error; the service may remain warm through its idle interval.
+reports an error; its service retires once its last attachment closes.
 Migration, recovery, purge, and other maintenance use explicit quiescence gates
 and hold the lifecycle lock through directory activation, so an active database
 cannot be moved underneath another process.
