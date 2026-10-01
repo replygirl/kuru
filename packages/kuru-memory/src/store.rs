@@ -147,7 +147,8 @@ pub struct OpenOptions {
 /// Whether a test-support fixture's options went through the template cache
 /// warm-up ([`crate::test_support::warmed_open_options`],
 /// [`OpenOptions::warmed`]). A writable open of an absent store with
-/// [`Fixture::Unwarmed`] options in the shared test cache fails at once, so
+/// [`Fixture::Unwarmed`] options in the shared test cache fails at once,
+/// before the startup lock wait and before provisioning, so
 /// every fixture that could build the store template inside its open is
 /// found on its first run, whatever the test order or cache state.
 #[cfg(any(test, feature = "test-support"))]
@@ -217,7 +218,7 @@ impl OpenOptions {
 
     /// A writable fresh open of fixture options that were never warmed, in
     /// the shared test cache, would be the first to need the store template:
-    /// fail it before any engine start.
+    /// fail it before the startup lock wait, provisioning or any engine start.
     #[cfg(any(test, feature = "test-support"))]
     fn refuse_unwarmed_fixture(&self) -> Result<()> {
         ensure!(
@@ -227,6 +228,23 @@ impl OpenOptions {
                 && self.config.cache_dir.as_deref() == Some(test_cache().as_path())),
             UNWARMED_FIXTURE
         );
+        Ok(())
+    }
+
+    /// The guard's first check, before the open creates a directory, waits
+    /// for the startup lock or provisions the engine: refuse only when the
+    /// store is plainly absent. An unreadable or purge-blocked store falls
+    /// through to the ordinary open, which reports its own error.
+    #[cfg(any(test, feature = "test-support"))]
+    fn refuse_unwarmed_fixture_early(&self) -> Result<()> {
+        if self.refuse_unwarmed_fixture().is_err()
+            && matches!(
+                MemoryStore::exists(&self.data_dir, &self.project_scope),
+                Ok(false)
+            )
+        {
+            self.refuse_unwarmed_fixture()?;
+        }
         Ok(())
     }
 }
@@ -1812,6 +1830,8 @@ impl MemoryStore {
     ) -> Result<Self> {
         options.config.validate()?;
         let directory = project_directory(&options.data_dir, &options.project_scope)?;
+        #[cfg(any(test, feature = "test-support"))]
+        options.refuse_unwarmed_fixture_early()?;
         #[cfg(not(windows))]
         private_dir(&options.data_dir)?;
         #[cfg(windows)]
@@ -1866,6 +1886,8 @@ impl MemoryStore {
                 !options.read_only,
                 "project memory has not been migrated or initialized; open Kuru normally first"
             );
+            // The early guard ran before the lock; this backstop covers a
+            // store that went absent while the open waited for it.
             #[cfg(any(test, feature = "test-support"))]
             options.refuse_unwarmed_fixture()?;
             let data = options.data_dir.clone();

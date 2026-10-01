@@ -1601,14 +1601,12 @@ async fn unwarmed_fixture_open_fails_the_guard_before_any_start() -> Result<()> 
         engine_ledger::with(|ledger| ledger.live_under(&canonical)).is_empty(),
         "an engine started"
     );
-    let memory = data.join("memory");
-    let stores: Vec<String> = fs::read_dir(&memory)?
-        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|name| name != "locks" && name != "lifecycles")
-        .collect();
-    ensure!(stores.is_empty(), "the refused open left {stores:?}");
+    // Refused before the open created a directory or took the startup lock.
+    ensure!(
+        !data.exists(),
+        "the refused open created {}",
+        data.display()
+    );
     // The predicate alone: only unwarmed, writable, shared-cache options.
     let mut cases = Vec::new();
     let mut warmed = unwarmed.clone();
@@ -1680,7 +1678,77 @@ fn fixture_open_that_builds_a_template_fails_the_guard() -> Result<()> {
 
 const CHILD_OUTCOME: &str = "KURU_TEST_TEMPLATE_CACHE_CHILD_OUTCOME";
 const CHILD_TEST: &str = "store::creation_template::tests::child_process_warms_its_template_cache";
+const UNWARMED_CHILD_TEST: &str =
+    "store::creation_template::tests::child_process_refuses_an_unwarmed_fixture_in_a_cold_cache";
 const CHILD_DEADLINE: Duration = Duration::from_secs(600);
+
+/// Runs only as a child of
+/// `unwarmed_fixture_open_in_a_cold_cache_fails_before_provisioning`, whose
+/// environment names a private, empty cache as this process's shared test
+/// cache: an unwarmed fixture's fresh open is refused, and nothing in the
+/// process started an engine.
+#[tokio::test]
+async fn child_process_refuses_an_unwarmed_fixture_in_a_cold_cache() -> Result<()> {
+    let Some(outcome) = std::env::var_os(CHILD_OUTCOME) else {
+        return Ok(());
+    };
+    let root = crate::test_support::tempdir()?;
+    let canonical = fs::canonicalize(root.path())?;
+    let data = root.path().join("private");
+    let scope = format!("project/{}", "8".repeat(64));
+    let options = crate::test_support::open_options(data.clone(), scope)?;
+    let refused = match MemoryStore::open(options).await {
+        Ok(store) => {
+            store.close().await?;
+            "opened".to_owned()
+        }
+        Err(error) => format!(
+            "refused={}",
+            format!("{error:#}").contains(crate::store::UNWARMED_FIXTURE)
+        ),
+    };
+    let live = engine_ledger::with(|ledger| ledger.live_under(&canonical)).len();
+    files::write(
+        Path::new(&outcome),
+        format!("{refused} live={live} created={}", data.exists()).as_bytes(),
+    )?;
+    root.release(Ok(()))
+}
+
+/// The guard rejects an unwarmed fixture's fresh open before the startup
+/// lock wait and before provisioning: in a cold cache, the refused open
+/// extracts no engine, so no version probe or supervisor can have started.
+#[tokio::test]
+async fn unwarmed_fixture_open_in_a_cold_cache_fails_before_provisioning() -> Result<()> {
+    let fixture = fixture()?;
+    let cache = fixture.path().join("cache");
+    files::private_dir(&cache)?;
+    let outcome = fixture.path().join("outcome");
+    let log = fixture.path().join("child.log");
+    let child = spawn_child(UNWARMED_CHILD_TEST, &cache, &outcome, &log).await?;
+    let status = wait_child(child).await?;
+    let diagnostics = format!(
+        "stdout: {}\nstderr: {}",
+        fs::read_to_string(&log).unwrap_or_default(),
+        fs::read_to_string(log.with_extension("stderr")).unwrap_or_default()
+    );
+    ensure!(status.success(), "child failed ({status}): {diagnostics}");
+    // Provisioning extracts the engine into the cache before any version
+    // probe or supervisor start, so an empty cache shows neither ran.
+    let cached = fs::read_dir(&cache)?
+        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        cached.is_empty(),
+        "the refused open provisioned into the cold cache: {cached:?}"
+    );
+    assert_eq!(
+        String::from_utf8(files::read_bytes(&outcome, 256)?)?,
+        "refused=true live=0 created=false",
+        "{diagnostics}"
+    );
+    fixture.release(Ok(()))
+}
 
 /// Runs only as a child of
 /// `warm_runtime_cache_builds_one_template_across_processes`: the first
@@ -1707,10 +1775,15 @@ async fn child_process_warms_its_template_cache() -> Result<()> {
 }
 
 #[cfg(unix)]
-async fn spawn_child(cache: &Path, outcome: &Path, log: &Path) -> Result<tokio::process::Child> {
+async fn spawn_child(
+    test: &str,
+    cache: &Path,
+    outcome: &Path,
+    log: &Path,
+) -> Result<tokio::process::Child> {
     let mut command = tokio::process::Command::new(std::env::current_exe()?);
     command
-        .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env(CHILD_OUTCOME, outcome)
@@ -1742,6 +1815,7 @@ async fn wait_child(mut child: tokio::process::Child) -> Result<std::process::Ex
 
 #[cfg(windows)]
 async fn spawn_child(
+    test: &str,
     cache: &Path,
     outcome: &Path,
     log: &Path,
@@ -1755,7 +1829,7 @@ async fn spawn_child(
         std::env::current_exe()?,
         cache.parent().context("cache has no parent")?.to_owned(),
     );
-    command.args = ["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"]
+    command.args = ["--exact", test, "--nocapture", "--test-threads=1"]
         .into_iter()
         .map(Into::into)
         .collect();
@@ -1809,7 +1883,11 @@ async fn warm_runtime_cache_builds_one_template_across_processes() -> Result<()>
     for name in ["first", "second"] {
         let outcome = fixture.path().join(format!("{name}-outcome"));
         let log = fixture.path().join(format!("{name}.log"));
-        children.push((spawn_child(&cache, &outcome, &log).await?, outcome, log));
+        children.push((
+            spawn_child(CHILD_TEST, &cache, &outcome, &log).await?,
+            outcome,
+            log,
+        ));
     }
     let mut outcomes = Vec::new();
     for (child, outcome, log) in children {
