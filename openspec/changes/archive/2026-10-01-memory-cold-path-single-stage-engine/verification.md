@@ -1,5 +1,14 @@
 # Verification
 
+> Rows below citing base `46c2d60c` and head `ef86dc74` were recorded by the
+> prior implementing session before this branch was rebased onto
+> `origin/main` (one upstream commit, `70fa6c0a`, no conflicts). The PR's
+> actual commits are `099ee396`, `5fd94113` and `1244b41e`. CI run
+> `36863567899` on the rebased head `1244b41e` is green (after one stated
+> rerun of three unrelated Windows coverage partitions — see tasks.md 5.1 for
+> per-OS coverage), the first independent re-confirmation of this ledger on
+> the PR's actual commits.
+
 ## 1. Cold staged build runs on one engine instead of three [critical]
 
 - [x] 1.1 @unit (agent) run `cold_stage_initializes_migrates_and_validates_on_one_engine` (legacy import and `Creation::Cold`, counted through `test_support::engine_ledger`) -> observed: base `46c2d60c` failed with 3 starts at the ready marker; head `ef86dc74` passes with 1 start live at the marker, 2 starts per creation, 1 for the existing-project reopen
@@ -13,4 +22,4 @@
 - [x] 2.3 @unit (agent) run `cancelled_cold_open_after_migration_reaps_before_lock_release` -> observed: lock held while the worker is paused, a second opener acquires it only with no live engine, next open reuses the ready stage
 - [x] 2.4 @unit (agent) run `active_open_validates_after_reload` -> observed: the probe records the stage directory and then the active directory, same native identity, 2 starts
 - [x] 2.5 @regression (agent) confirm FreshOpen::Template (2 starts) and FreshOpen::FirstProject (3 starts) budgets and their covering tests are untouched by this change -> observed: `fresh_open_budgets_follow_each_creation_path` asserts (2,1), (3,2), (2,1); template open_tests pass; release harness counts first-launch 3, new-project 2, cold-existing 1 on base and head
-- [ ] 2.6 @manual (human) re-read versioned-memory spec.md's "Store creation path selection" and "Current-schema staging and preserved failures" requirements after the change -> both still read true with no edit needed, confirming this ships as perf with no requirement-text delta
+- [x] 2.6 @manual (human) re-read versioned-memory spec.md's "Store creation path selection" and "Current-schema staging and preserved failures" requirements after the change -> both still read true with no edit needed, confirming this ships as perf with no requirement-text delta. Observed by the orchestrating session, 2026-10-01: no spec text names three staging sessions or a restart before validation; the requirement that the owned live staging session validates, publishes the activation record, then stops and reaps stays true.

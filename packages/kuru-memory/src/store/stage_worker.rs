@@ -1276,4 +1276,80 @@ mod tests {
         .await;
         root.release(outcome)
     }
+
+    /// In-process cold-path open timing (not an assertion): times a plain
+    /// `Creation::Cold` open and a one-message legacy-import open through
+    /// `test_support::spawn_gated_open`, the harness behind the proposal's
+    /// benchmark rows. Run explicitly, alone (one engine start competes for
+    /// the host with another):
+    ///
+    /// ```text
+    /// KURU_TEST_COLD_OPEN_MEASURE_DIR=<dir> KURU_TEST_COLD_OPEN_MEASURE_ITERATIONS=<n> \
+    ///   cargo test -p kuru-memory --lib --all-features --locked \
+    ///   stage_worker::tests::measure_cold_open_latency -- --ignored --test-threads=1
+    /// ```
+    ///
+    /// Each iteration opens a fresh store in its own directory, times the
+    /// open to a ready `MemoryStore`, then closes it. Rows are written as
+    /// CSV beneath the measurement directory; nothing is printed, so the
+    /// test is safe beside PTY fixtures. This reproduces the shape of the
+    /// base/head comparison in `proposal.md`'s Benchmarks table (run once
+    /// per checkout and diff the summaries) without committing two
+    /// executables; it is not itself an interleaved base-vs-head run.
+    #[tokio::test]
+    #[ignore = "measurement: run explicitly with --ignored (see doc comment)"]
+    async fn measure_cold_open_latency() -> Result<()> {
+        use std::{fmt::Write as _, io::Write as _};
+
+        let directory = std::env::var_os("KURU_TEST_COLD_OPEN_MEASURE_DIR")
+            .filter(|value| !value.is_empty())
+            .map_or_else(
+                || std::env::temp_dir().join("kuru-cold-open-measurements"),
+                PathBuf::from,
+            );
+        fs::create_dir_all(&directory)?;
+        let iterations: usize = std::env::var("KURU_TEST_COLD_OPEN_MEASURE_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10);
+        let stamp = crate::test_support::lifecycle_trace::nanos();
+        let mut csv = fs::File::create(directory.join(format!("cold-open-{stamp}.csv")))?;
+        writeln!(csv, "kind,iteration,elapsed_ms")?;
+        let mut summary = String::new();
+        let root = crate::test_support::tempdir()?;
+        for (name, legacy) in [("cold", false), ("legacy", true)] {
+            let mut millis = Vec::with_capacity(iterations);
+            for index in 0..iterations {
+                let data = root.path().join(format!("{name}-{index}"));
+                let scope = format!("project/{index:064x}");
+                if legacy {
+                    legacy_source(&data, &scope)?;
+                }
+                let mut options =
+                    crate::test_support::warmed_open_options(data.clone(), scope).await?;
+                if !legacy {
+                    options.creation = Creation::Cold;
+                }
+                let started = Instant::now();
+                let store = crate::test_support::spawn_gated_open(options).await?;
+                let elapsed = started.elapsed();
+                store.close().await?;
+                writeln!(csv, "{name},{index},{}", elapsed.as_millis())?;
+                millis.push(elapsed.as_millis());
+            }
+            millis.sort_unstable();
+            let p50 = millis.get(millis.len() / 2).copied().unwrap_or_default();
+            let _ = writeln!(
+                summary,
+                "kind={name} iterations={iterations} min={} p50={p50} max={}",
+                millis.first().copied().unwrap_or_default(),
+                millis.last().copied().unwrap_or_default(),
+            );
+        }
+        fs::write(
+            directory.join(format!("cold-open-{stamp}-summary.txt")),
+            summary,
+        )?;
+        Ok(())
+    }
 }

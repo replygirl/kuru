@@ -1,5 +1,14 @@
 # Tasks
 
+> Evidence below citing base `46c2d60c` and head `ef86dc74` was recorded by
+> the prior implementing session before this branch was rebased onto
+> `origin/main` (one upstream commit, `70fa6c0a`). The rebase was mechanical
+> (no conflicts) and touched neither `stage_worker.rs` nor `store.rs` beyond
+> context; the PR's actual commits are `099ee396`, `5fd94113` and
+> `1244b41e`. CI on the rebased head `1244b41e` (run `36863567899`, green
+> after one stated rerun of three unrelated Windows coverage partitions) is
+> the first independent re-run confirmation of that evidence; see task 5.1.
+
 ## 1. Single-engine cold staging job
 
 - [x] 1.1 Replace `StageWorker::init`, `StageWorker::migrate` and
@@ -148,13 +157,18 @@
 
 ## 5. Coverage and lint
 
-- [ ] 5.1 Run `mise run //packages/kuru-memory:coverage` and verify the
+- [x] 5.1 Run `mise run //packages/kuru-memory:coverage` and verify the
       90% workspace line coverage gate still holds with the changed
       `stage_worker.rs` and `store.rs`.
-      Not run here: no package-scoped coverage task exists; the root
+      Not run locally: no package-scoped coverage task exists; the root
       `coverage` task instruments every package's suite, which the shared,
-      disk-limited host could not take alongside other builds. CI enforces
-      the gate.
+      disk-limited host could not take alongside other builds.
+      Evidence: CI run `36863567899` at head `1244b41e` (green after one
+      stated rerun of three unrelated Windows coverage partitions), merge
+      job logs — macOS 94.64% (113283/119694 lines), Ubuntu 94.65%
+      (113199/119585 lines), Windows 93.58% (114496/122347 lines), all
+      against the 90% gate; the "Require native coverage and installation
+      checks" gate job passed on each OS.
 - [x] 5.2 Run `mise run lint ::: lint:windows ::: typecheck` and verify
       they pass clean, including the Windows-target lint pass over
       `stage_worker.rs`.
