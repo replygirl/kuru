@@ -1918,6 +1918,12 @@ impl MemoryStore {
                 // A copy of the store template: 2 engine starts, or 3 when
                 // this open builds the template first.
                 let staging = new_stage();
+                // Stands in for the report each stage-worker engine start makes
+                // on the cold path: the creation worker's starts report
+                // silently, from its own task. Reported before any engine has
+                // started. Keep it: the terminal keeps the creating sentence
+                // on it (rule R7), and clients that show stages see the open
+                // leave preparation.
                 progress.report(MemoryOpenStage::OpeningDatabase);
                 let job = creation_worker::TemplateCreation {
                     root,

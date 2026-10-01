@@ -27,14 +27,21 @@
 //! for the cold path, never failing the open: a busy key lock, a lock-file
 //! error, or a verdict or I/O error before or during the copy. A copy that
 //! wrote anything is preserved first under `interrupted/` without an engine
-//! start (recovery's Class R); an empty stage is removed. An engine-side
-//! failure of the template build, and any failure of the stage's own engine
-//! start, returns its error with no retry: a verdict there (adoption or the
-//! template shape) also quarantines the template the copy came from,
-//! identity-bound and best-effort, and every other failure leaves every
-//! template untouched.
+//! start (recovery's Class R); an empty stage is removed. Only a failed
+//! preservation fails the open there.
+//!
+//! Any failure of this open's template build (its engine, its own
+//! assertions, its capture or its publication) and any failure of the
+//! stage's own engine start return their error with no retry, on either
+//! path: the chain is never paid twice in one open. A verdict on the stage's
+//! engine (adoption or the template shape) also quarantines the template the
+//! copy came from, identity-bound and best-effort; every other failure
+//! leaves every template untouched. A failed stage start leaves the unready
+//! stage in place for the next open's recovery to preserve without an engine
+//! start (Class U); a failure after the stage's engine served preserves it
+//! at once.
 use super::*;
-use creation_template::{Created, CreationFailure};
+use creation_template::{CreateError, Created};
 
 /// The template root a new store is created from, or `None` for the cold
 /// staged build.
@@ -156,8 +163,13 @@ impl TemplateCreation {
                 self.set_aside(stage).await?;
                 return Ok((startup, Outcome::Cold(self.marker_pause)));
             }
-            Err(CreationFailure::Engine(error)) => {
-                let error = error.context("build the memory store template");
+            // The build ran, or tried to run, the chain: a cold retry would
+            // pay it again inside the same deadline. Its verdicts are against
+            // its own unpublished bytes, so nothing is quarantined.
+            Err(CreateError::Build(failure)) => {
+                let error = failure
+                    .into_error()
+                    .context("build the memory store template");
                 return match self.set_aside(stage).await {
                     Ok(()) => Err(error),
                     Err(preserve) => Err(error.context(format!(
@@ -165,7 +177,7 @@ impl TemplateCreation {
                     ))),
                 };
             }
-            Err(failure) => {
+            Err(CreateError::Use(failure)) => {
                 tracing::warn!(
                     failure = %failure,
                     "store template unusable; creating the store without it"
@@ -178,11 +190,18 @@ impl TemplateCreation {
         // Last: a stage without its identity record is an interrupted copy.
         #[cfg(test)]
         creation_template::hooks::identity_written(&self.stage);
-        if let Err(error) = crate::server::write_template_stage_identity(
-            &self.stage,
-            &self.project_scope,
-            creation_template::compiled_key(),
-        ) {
+        #[cfg(test)]
+        let substituted = creation_template::hooks::stage_key();
+        #[cfg(test)]
+        let key = match substituted.as_deref() {
+            Some(key) => key,
+            None => creation_template::compiled_key(),
+        };
+        #[cfg(not(test))]
+        let key = creation_template::compiled_key();
+        if let Err(error) =
+            crate::server::write_template_stage_identity(&self.stage, &self.project_scope, key)
+        {
             tracing::warn!(
                 error = %format!("{error:#}"),
                 "store template stage identity unwritten; creating the store without it"
@@ -231,7 +250,19 @@ impl TemplateCreation {
     /// remove it when nothing was copied into it, or preserve the copy
     /// remnant under `interrupted/`.
     async fn set_aside(&self, stage: Directory) -> Result<()> {
-        let empty = fs::read_dir(stage.path())?.next().is_none();
+        // A stage that cannot be listed may hold a copy: preserve it rather
+        // than fail the fallback. Only preservation itself can fail the open.
+        let empty = match fs::read_dir(stage.path()) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(error) => {
+                tracing::warn!(
+                    stage = %self.stage.display(),
+                    error = %error,
+                    "a memory template stage could not be listed; preserving it"
+                );
+                false
+            }
+        };
         if !empty {
             drop(stage);
             return self.preserve().await;

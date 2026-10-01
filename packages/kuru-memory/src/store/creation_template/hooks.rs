@@ -76,6 +76,10 @@ pub(crate) struct Hooks {
     /// build store's own path into a new file of its `data/`, as a leak the
     /// byte scan must find.
     pub(crate) plant_leak: bool,
+    /// The template key a project stage's identity record names in place
+    /// of the compiled one: a stage the supervisor refuses before adoption,
+    /// as a stage copied by another build would be.
+    pub(crate) stage_key: Option<String>,
 }
 
 /// The file [`Hooks::plant_leak`] writes, relative to the build store's
@@ -104,6 +108,12 @@ pub(in crate::store) fn identity_written(stage: &Path) {
             .expect("hook events")
             .push(Event::Identity(stage.to_owned()));
     }
+}
+
+/// The key to write into a project stage's identity record instead of the
+/// compiled one, when scoped.
+pub(in crate::store) fn stage_key() -> Option<String> {
+    current().and_then(|hooks| hooks.stage_key)
 }
 
 pub(super) fn lock_fault(step: LockStep) -> Result<()> {
@@ -168,11 +178,20 @@ pub(super) fn manifest_written() {
     }
 }
 
+/// Run `statements` in order on one connection of `main`, so session state
+/// such as `USE` carries from one to the next. A caller that changes the
+/// session's database restores it last: the connection returns to the pool.
 async fn execute(main: &MySqlPool, statements: &[String]) -> Result<()> {
+    if statements.is_empty() {
+        return Ok(());
+    }
+    let mut connection = tokio::time::timeout(QUERY_TIMEOUT, main.acquire())
+        .await
+        .context("injected build statement connection deadline exceeded")??;
     for statement in statements {
         tokio::time::timeout(
             QUERY_TIMEOUT,
-            sqlx::query(sqlx::AssertSqlSafe(statement.clone())).execute(main),
+            sqlx::query(sqlx::AssertSqlSafe(statement.clone())).execute(&mut *connection),
         )
         .await
         .context("injected build statement deadline exceeded")??;

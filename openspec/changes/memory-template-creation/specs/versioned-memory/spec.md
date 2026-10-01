@@ -54,9 +54,12 @@ an engine start; only a verdict quarantines the template. A different project
 opened while a build for the same key is in progress MUST take the cold path
 at once and MUST NOT read any unpublished build or capture stage.
 
-A failure of the template build's engine, and any failure of the copied
-stage's own engine start, MUST fail the open with its error and MUST NOT be
-retried in that open, on the template path or the cold path. When that
+Any failure of a template build the open started (its engine, its own
+validation and shape assertions, its capture and byte scan, or its
+publication when no verified stage remains to copy from), and any failure of
+the copied stage's own engine start, MUST fail the open with its error and
+MUST NOT be retried in that open, on the template path or the cold path, so
+the schema chain never runs twice in one open. When that
 failure is a verdict against the template's bytes (adoption's placeholder,
 working-set or rewrite comparison, or the template shape), Kuru MUST also
 quarantine the published template the copy was taken from, bound to the
@@ -108,6 +111,14 @@ staging job itself after.
   store appears at the project's active path, the unready stage is preserved,
   and the template it was copied from is quarantined; an engine failure of
   that start instead leaves the template untouched.
+
+#### Scenario: A failed template build fails the open without a cold retry
+
+- **WHEN** a new project's open builds the template for its key and that
+  build's validation, shape assertion or byte scan refuses its result
+- **THEN** the open fails with that error after the build engine's single
+  start, makes no other engine start, runs no cold staged build, publishes
+  and quarantines nothing, and leaves no store at the project's active path.
 
 #### Scenario: A concurrent new project never waits on another project's template build
 

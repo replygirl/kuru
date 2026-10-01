@@ -349,11 +349,21 @@ database refuses after copying it: adoption finds an identity other than the
 template's placeholder, or the shape check finds anything but the expected
 branches, commits, schema and placeholder identity. That open fails with a
 template verdict naming what differed, nothing appears at the project's path,
-the unready copy is preserved under `memory/interrupted/`, and the template is
-moved aside. Opening again builds a new template and creates the project from
-it. Any other failure of that database start (a crash, a deadline, a lost
-reply) fails the open the same way but leaves the template in place, and
-retrying copies it again. Kuru never retries inside the same open.
+and the template is moved aside. Any other failure of that database start (a
+crash, a deadline, a lost reply, or a copy made for a different Kuru build)
+fails the open the same way but leaves the template in place. Either way the
+unready copy is preserved under `memory/interrupted/`: at once when the
+failure came after its database was serving (the shape check, validation or
+marking it ready), and otherwise by the next open of the project, before it
+starts anything and without starting the copy's database. That next open then
+creates the project again: from the template when it is still in place, or by
+building a new one when it was moved aside.
+
+A failure of the template build that a first launch runs (its database, its
+own checks, or saving its result) also fails that open, with the build's error;
+no template is moved aside, and opening again tries again.
+Kuru never retries inside the same open, so the schema steps never run twice
+in one open.
 
 The template lives beside the engine it was built with, in the engine cache
 (`tools/dolt` in the data directory, or `memory.cache_dir`):
@@ -429,11 +439,13 @@ that it holds nothing but the expected branches, commits, schema and identity.
 A copy whose bytes differ from what this build expects is refused with a
 distinct template verdict; an engine, SQL, I/O or deadline failure, or a copy
 made for a different Kuru build, is an ordinary error. Either way the unready
-copy is left in its staging directory, never at the project's active path, and
-is never activated. If a crash interrupts a copy before or during adoption,
-the next open moves it under `memory/interrupted/` without starting its
-database and builds the store afresh; a copy already marked ready is activated
-like any completed stage. A copy is compared with the Kuru build only before
+copy is never placed at the project's active path and is never activated: a
+failure after its database was serving preserves it under `memory/interrupted/`
+at once, and one before leaves it in its staging directory for the next open.
+If a crash or such a failure interrupts a copy before or during adoption, the
+next open moves it under `memory/interrupted/` without starting its database
+and creates the store afresh; a copy already marked ready is activated like
+any completed stage. A copy is compared with the Kuru build only before
 adoption, so an adopted store keeps opening under later releases. A release
 without this support fails closed on a template-born store's identity record
 rather than misreading it.

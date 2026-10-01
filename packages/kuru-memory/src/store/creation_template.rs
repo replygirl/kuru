@@ -310,6 +310,13 @@ impl CreationFailure {
         }
     }
 
+    /// The underlying error, with any [`TemplateVerdict`] still in its chain.
+    pub(crate) fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::TemplateVerdict(error) | Self::Engine(error) | Self::Io(error) => error,
+        }
+    }
+
     fn context(self, context: String) -> Self {
         match self {
             Self::TemplateVerdict(error) => Self::TemplateVerdict(error.context(context)),
@@ -1642,6 +1649,56 @@ pub(crate) enum Created {
     Unavailable(Unavailable),
 }
 
+/// How [`create_in`] failed, by the phase that failed. The caller's action
+/// depends on the phase, not on the kind of evidence.
+#[derive(Debug)]
+pub(crate) enum CreateError {
+    /// Using a template failed: its structural check or a copy, including
+    /// the copy from a template this call has just built. A verdict among
+    /// them already quarantined the judged template. The caller creates the
+    /// store cold.
+    Use(CreationFailure),
+    /// This call's template build failed: its engine, its own assertions
+    /// (a shape verdict there is against the build's unpublished bytes), its
+    /// capture or its publication. Nothing usable was published, and the
+    /// chain may already have run, so the caller fails the open with this
+    /// error and runs no other creation in it, as it would not rebuild after
+    /// a verdict.
+    Build(CreationFailure),
+}
+
+#[cfg(test)]
+impl CreateError {
+    pub(crate) fn failure(&self) -> &CreationFailure {
+        match self {
+            Self::Use(failure) | Self::Build(failure) => failure,
+        }
+    }
+
+    pub(crate) fn is_verdict(&self) -> bool {
+        self.failure().is_verdict()
+    }
+}
+
+impl From<CreationFailure> for CreateError {
+    fn from(failure: CreationFailure) -> Self {
+        Self::Use(failure)
+    }
+}
+
+impl fmt::Display for CreateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Use(failure) => write!(formatter, "{failure}"),
+            Self::Build(failure) => {
+                write!(formatter, "the store template build failed: {failure}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CreateError {}
+
 /// [`copy_into`] on a blocking thread, which also holds the key lock `lock`
 /// for as long as the copy writes: a cancelled caller cannot release the
 /// lock under a copy in flight. The lock comes back with the outcome; a copy
@@ -1695,29 +1752,35 @@ async fn copy_blocking(
 /// none is published and the exclusive key lock is free. It never waits for
 /// a lock. A verdict against a published template quarantines that template
 /// (identity-bound, best-effort) and is returned; every other failure is
-/// returned and leaves every template untouched. On any failure the partial
-/// copy stays in `stage` for the caller to preserve. Each copy runs on a
-/// blocking thread that holds the key lock until it returns.
+/// returned and leaves every template untouched. A failure of the build is
+/// returned as [`CreateError::Build`], every other one as
+/// [`CreateError::Use`]. On any failure the partial copy stays in `stage`
+/// for the caller to preserve. Each copy runs on a blocking thread that
+/// holds the key lock until it returns.
 pub(crate) async fn create_in(
     root: &Path,
     engine: &Engine,
     stage: &Directory,
-) -> Result<Created, CreationFailure> {
+) -> Result<Created, CreateError> {
     let key = compiled_key();
     let directory = match open_root(root) {
         Ok(directory) => directory,
-        Err(error) => return lock_unavailable(Wait::Never, error, Created::Unavailable),
+        Err(error) => {
+            return lock_unavailable(Wait::Never, error, Created::Unavailable).map_err(Into::into);
+        }
     };
     let root = &directory;
     match try_key_lock(root, key, Mode::Shared) {
-        Err(error) => return lock_unavailable(Wait::Never, error, Created::Unavailable),
+        Err(error) => {
+            return lock_unavailable(Wait::Never, error, Created::Unavailable).map_err(Into::into);
+        }
         Ok(None) => return Ok(Created::Unavailable(Unavailable::Busy)),
         Ok(Some(shared)) => {
             let judged = match inspect(root, key) {
                 Ok(Inspection::Valid(judged)) => Some(Ok(judged)),
                 Ok(Inspection::Absent) => None,
                 Ok(Inspection::Condemned { identity, failure }) => Some(Err((identity, failure))),
-                Err(failure) => return Err(failure),
+                Err(failure) => return Err(failure.into()),
             };
             match judged {
                 None => drop(shared),
@@ -1733,20 +1796,22 @@ pub(crate) async fn create_in(
                         }),
                         Err(failure) => {
                             condemn(root, key, Some(identity), &failure, stage).await;
-                            Err(failure)
+                            Err(failure.into())
                         }
                     };
                 }
                 Some(Err((identity, failure))) => {
                     drop(shared);
                     condemn(root, key, identity, &failure, stage).await;
-                    return Err(failure);
+                    return Err(failure.into());
                 }
             }
         }
     }
     let lock = match try_key_lock(root, key, Mode::Exclusive) {
-        Err(error) => return lock_unavailable(Wait::Never, error, Created::Unavailable),
+        Err(error) => {
+            return lock_unavailable(Wait::Never, error, Created::Unavailable).map_err(Into::into);
+        }
         Ok(None) => return Ok(Created::Unavailable(Unavailable::Busy)),
         Ok(Some(lock)) => lock,
     };
@@ -1766,11 +1831,11 @@ pub(crate) async fn create_in(
                 }
             }
             drop(lock);
-            copied.map(|()| Created::Copied {
+            Ok(copied.map(|()| Created::Copied {
                 built: false,
                 published: true,
                 judged: Some(identity),
-            })
+            })?)
         }
         Inspection::Condemned { identity, failure } => {
             if let Some(identity) = identity {
@@ -1779,7 +1844,7 @@ pub(crate) async fn create_in(
             }
             sweep_held(root, key).await;
             drop(lock);
-            Err(failure)
+            Err(failure.into())
         }
         Inspection::Absent => match Box::pin(build(root, key, lock, engine)).await {
             Ok((lock, template, report)) => {
@@ -1795,15 +1860,15 @@ pub(crate) async fn create_in(
                 let judged = report.published.then_some(template.identity);
                 let (lock, copied) = copy_blocking(template, stage, lock).await;
                 drop(lock);
-                copied.map(|()| Created::Copied {
+                Ok(copied.map(|()| Created::Copied {
                     built: true,
                     published: report.published,
                     judged,
-                })
+                })?)
             }
             Err((lock, failure)) => {
                 drop(lock);
-                Err(failure)
+                Err(CreateError::Build(failure))
             }
         },
     }

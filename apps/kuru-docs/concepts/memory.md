@@ -230,10 +230,14 @@ If the template is busy (another Kuru process is building it) or cannot be
 used, the new project is simply built directly, with a warning in the memory
 service log; you do not need to do anything. If a copy turns out to be damaged
 once its own database has started, that open fails with a template error,
-nothing appears at the project's path, the copy is set aside under
-`memory/interrupted/`, and the damaged template is moved aside: opening again
-builds a fresh template. A copy interrupted by a crash is set aside the same
-way, without being started. See
+nothing appears at the project's path, and the damaged template is moved
+aside: opening again builds a fresh template. The unready copy is set aside
+under `memory/interrupted/`, at once if its database had started serving and
+otherwise when you open the project again, without starting it; a copy
+interrupted by a crash is set aside the same way. If the first launch's
+template build itself fails, that open fails with the build's error and
+opening again retries the build; Kuru never runs the schema steps twice in one
+open. See
 [memory storage](https://github.com/replygirl/kuru/blob/main/docs/memory.md#new-projects-and-the-store-template)
 for the details. If Kuru keeps warning that it cannot read a template, delete
 that template's directory under `templates/` while Kuru is not running; it is

@@ -45,7 +45,7 @@ fn no_engine() -> Engine {
     }
 }
 
-pub(super) fn failure(failure: CreationFailure) -> anyhow::Error {
+pub(super) fn failure(failure: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
     anyhow::Error::from(failure)
 }
 
@@ -57,11 +57,7 @@ pub(super) async fn ensure(root: &Path, engine: &Engine) -> Result<Ensured, Crea
 }
 
 /// `create_in` into `stage`, under the spawn gate.
-async fn create(
-    root: &Path,
-    engine: &Engine,
-    stage: &Directory,
-) -> Result<Created, CreationFailure> {
+async fn create(root: &Path, engine: &Engine, stage: &Directory) -> Result<Created, CreateError> {
     let _gate = crate::spawn_gate::spawning().await;
     create_in(root, engine, stage).await
 }
@@ -1040,7 +1036,10 @@ async fn template_failing_structure_is_quarantined() -> Result<()> {
         .scope(hooks, create_in(&root, &no_engine(), &destination))
         .await
         .expect_err("a manifest read error was accepted");
-    ensure!(matches!(error, CreationFailure::Io(_)), "{error}");
+    ensure!(
+        matches!(error, CreateError::Use(CreationFailure::Io(_))),
+        "{error}"
+    );
     assert_eq!(published(&root), Some(identity));
     ensure!(rejected(&root)?.is_empty());
     // Verdicts: each quarantines the template it judged, and no copy starts.
@@ -1121,7 +1120,10 @@ async fn template_byte_corruption_mid_copy_preserves_remnant_and_quarantines() -
         .await
         .expect_err("an injected read error was accepted");
     ensure!(fault.fired(), "the read fault never fired");
-    ensure!(matches!(error, CreationFailure::Io(_)), "{error}");
+    ensure!(
+        matches!(error, CreateError::Use(CreationFailure::Io(_))),
+        "{error}"
+    );
     assert_eq!(published(&root), Some(identity));
     ensure!(rejected(&root)?.is_empty());
     ensure!(
