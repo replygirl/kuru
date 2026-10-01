@@ -33,13 +33,15 @@ or existence alone.
   window between a step's own publication and its record: both ride the same
   commit and the same `DOLT_MERGE --ff-only`.
 - A later open verifies each recorded branch independently from the pool the
-  caller already holds (no branch or commit pool is opened): ref hash equals
-  the recorded head, the head's sole parent equals the recorded base, both
-  head and base are ancestors of main, and an `AS OF` read of the head matches
-  the record's version and receipt operation. Any mismatch — a moved ref, a
-  dirty recorded branch, a record whose branch is outside main's history, or a
-  digest/operation mismatch — fails the open closed, with no fallback to full
-  classification and no mutation. A branch with no record still gets today's
+  caller already holds (no branch or commit pool is opened): the record does
+  not store a head (it cannot live inside its own commit), so the branch's
+  own live head is read from `dolt_branches`, its sole parent equals the
+  recorded base, both head and base are ancestors of main, and an `AS OF`
+  read of the head matches the record's version and receipt operation. Any
+  mismatch — a moved ref, a dirty recorded branch, a record whose branch is
+  outside main's history, or a digest/operation mismatch — fails the open
+  closed, with no fallback to full classification and no mutation. A branch
+  with no record still gets today's
   full classification.
 - `validate_attempt` checks the in-progress attempt's own row the same way,
   and the schema-authority join (`authority_working_set` /
