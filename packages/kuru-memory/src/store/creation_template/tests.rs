@@ -62,6 +62,17 @@ async fn create(root: &Path, engine: &Engine, stage: &Directory) -> Result<Creat
     create_in(root, engine, stage).await
 }
 
+/// `create_in` with no engine, holding the lock gate throughout. The call
+/// takes, releases and retakes key locks (a verdict reached under the shared
+/// lock retakes it exclusively to quarantine), and a sibling test's spawn
+/// would otherwise keep a just-released description locked until its exec
+/// (see `crate::spawn_gate`): the quarantine would be skipped, or the next
+/// shared lock reported busy.
+async fn create_unspawned(root: &Path, stage: &Directory) -> Result<Created, CreationFailure> {
+    let _gate = crate::spawn_gate::locking_async().await;
+    create_in(root, &no_engine(), stage).await
+}
+
 /// A new private destination stage beneath the fixture.
 fn stage(fixture: &TempDir, name: &str) -> Result<Directory> {
     files::ensure_private_directory(&fixture.path().join(name))
@@ -769,9 +780,7 @@ async fn second_creator_goes_cold_at_once_while_a_build_is_in_progress() -> Resu
     };
     ensure!(report.published);
     let third = stage(&fixture, "third")?;
-    let copied = create_in(&root, &no_engine(), &third)
-        .await
-        .map_err(failure)?;
+    let copied = create_unspawned(&root, &third).await.map_err(failure)?;
     ensure!(
         matches!(
             copied,
@@ -1033,7 +1042,7 @@ async fn template_failing_structure_is_quarantined() -> Result<()> {
         ..Hooks::default()
     };
     let error = HOOKS
-        .scope(hooks, create_in(&root, &no_engine(), &destination))
+        .scope(hooks, create_unspawned(&root, &destination))
         .await
         .expect_err("a manifest read error was accepted");
     ensure!(
@@ -1077,7 +1086,7 @@ async fn template_failing_structure_is_quarantined() -> Result<()> {
         let judged = published(&root).context("no template")?;
         damage()?;
         let destination = stage(&fixture, &format!("copy-{}", case.replace(' ', "-")))?;
-        let error = create_in(&root, &no_engine(), &destination)
+        let error = create_unspawned(&root, &destination)
             .await
             .expect_err("a damaged template was accepted");
         ensure!(error.is_verdict(), "{case}: {error}");
@@ -1116,7 +1125,7 @@ async fn template_byte_corruption_mid_copy_preserves_remnant_and_quarantines() -
         ..Hooks::default()
     };
     let error = HOOKS
-        .scope(hooks, create_in(&root, &no_engine(), &destination))
+        .scope(hooks, create_unspawned(&root, &destination))
         .await
         .expect_err("an injected read error was accepted");
     ensure!(fault.fired(), "the read fault never fired");
@@ -1175,18 +1184,25 @@ async fn template_byte_corruption_mid_copy_preserves_remnant_and_quarantines() -
         files::private_dir(&outside)?;
         damage(&largest_file(&root.join(key()))?, &outside)?;
         let destination = stage(&fixture, &format!("copy-{}", case.replace(' ', "-")))?;
-        let error = create_in(&root, &no_engine(), &destination)
+        let error = create_unspawned(&root, &destination)
             .await
             .expect_err("a damaged template was copied");
         ensure!(error.is_verdict(), "{case}: {error}");
         // The outside link goes before a later quarantine removes this one.
         let _ = fs::remove_file(outside.join("alias"));
+        // A skipped quarantine leaves the judged template published beside
+        // the previous case's quarantined directory: say so, rather than
+        // comparing that older directory with this case's judged one.
+        ensure!(published(&root).is_none(), "{case}: not quarantined");
         let quarantined = rejected(&root)?;
         let [only] = quarantined.as_slice() else {
             bail!("{case}: not exactly one quarantined directory: {quarantined:?}");
         };
-        assert_eq!(files::directory(&root.join(only))?.identity(), judged);
-        ensure!(published(&root).is_none(), "{case}: not quarantined");
+        assert_eq!(
+            files::directory(&root.join(only))?.identity(),
+            judged,
+            "{case}: another directory was quarantined"
+        );
         ensure!(
             destination.path().join(DATA).is_dir(),
             "{case}: the partial copy was not left"
@@ -1223,7 +1239,7 @@ async fn quarantine_is_bound_to_the_judged_template() -> Result<()> {
     };
     let destination = stage(&fixture, "copy")?;
     let error = HOOKS
-        .scope(hooks, create_in(&root, &no_engine(), &destination))
+        .scope(hooks, create_unspawned(&root, &destination))
         .await
         .expect_err("a template with another key was accepted");
     ensure!(error.is_verdict(), "{error}");
@@ -1236,6 +1252,90 @@ async fn quarantine_is_bound_to_the_judged_template() -> Result<()> {
     let Inspection::Valid(_) = inspect(&open_root(&root)?, key()).map_err(failure)? else {
         bail!("the fresh template is not valid");
     };
+    fixture.release(Ok(()))
+}
+
+/// A quarantine that finds the key lock busy is skipped, never waited for:
+/// the judged template stays published and the older quarantined directory
+/// is kept; the next verdict, with the lock free, quarantines it. A sibling
+/// test's spawn holding a duplicate of the just-released shared lock has this
+/// effect, so tests that expect a quarantine hold the lock gate
+/// ([`create_unspawned`]).
+#[tokio::test]
+async fn a_busy_key_lock_skips_the_quarantine_and_keeps_the_older_one() -> Result<()> {
+    let fixture = fixture()?;
+    let root = fixture.path().join("templates");
+    let template = root.join(key());
+    let damage = || -> Result<()> {
+        let mut manifest = read_manifest(&template)?;
+        manifest.key = "f".repeat(64);
+        write_manifest(&template, &manifest)
+    };
+    // An earlier verdict leaves one quarantined directory.
+    let older = clone_shared(&root).await?;
+    damage()?;
+    let error = create_unspawned(&root, &stage(&fixture, "first")?)
+        .await
+        .expect_err("a template with another key was accepted");
+    ensure!(error.is_verdict(), "{error}");
+    let quarantined = rejected(&root)?;
+    let [first] = quarantined.as_slice() else {
+        bail!("not exactly one quarantined directory: {quarantined:?}");
+    };
+    assert_eq!(files::directory(&root.join(first))?.identity(), older);
+    // The next verdict: between it and the quarantine another description
+    // holds the key lock shared, as a child's duplicate of the released
+    // shared lock would until its exec.
+    let judged = clone_shared(&root).await?;
+    damage()?;
+    let holder: Arc<StdMutex<Option<File>>> = Arc::default();
+    let hooks = Hooks {
+        before_quarantine: Some(Arc::new({
+            let (root, holder) = (root.clone(), holder.clone());
+            move || {
+                let lock = open_root(&root)
+                    .and_then(|root| Ok(root.lock_file(OsStr::new(&lock_name(key())))?))
+                    .expect("open the key lock");
+                lock.try_lock_shared().expect("hold the key lock shared");
+                *holder.lock().expect("the lock holder") = Some(lock);
+            }
+        })),
+        ..Hooks::default()
+    };
+    let error = HOOKS
+        .scope(hooks, create_unspawned(&root, &stage(&fixture, "second")?))
+        .await
+        .expect_err("a template with another key was accepted");
+    ensure!(error.is_verdict(), "{error}");
+    let held = holder
+        .lock()
+        .expect("the lock holder")
+        .take()
+        .context("the key lock was never held")?;
+    release(held).await;
+    assert_eq!(
+        published(&root),
+        Some(judged),
+        "a busy lock was not skipped"
+    );
+    assert_eq!(
+        rejected(&root)?,
+        quarantined,
+        "the older quarantine changed"
+    );
+    // The lock is free again: this verdict quarantines the judged template
+    // and removes the older quarantined directory.
+    let error = create_unspawned(&root, &stage(&fixture, "third")?)
+        .await
+        .expect_err("a template with another key was accepted");
+    ensure!(error.is_verdict(), "{error}");
+    ensure!(published(&root).is_none(), "not quarantined");
+    let replaced = rejected(&root)?;
+    let [only] = replaced.as_slice() else {
+        bail!("not exactly one quarantined directory: {replaced:?}");
+    };
+    ensure!(only != first, "the older quarantine was kept");
+    assert_eq!(files::directory(&root.join(only))?.identity(), judged);
     fixture.release(Ok(()))
 }
 
