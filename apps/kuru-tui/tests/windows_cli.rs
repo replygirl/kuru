@@ -1075,7 +1075,9 @@ fn source_install_entrypoint_supplies_its_stock_commands_without_module_auto_dis
     // any entrypoint command reached through auto-discovery is refused
     // (command-not-found) instead of scanning the module path, so this fails
     // deterministically, without a deadline, unless the entrypoint's exact
-    // PSHOME imports supply its stock commands.
+    // PSHOME imports supply its stock commands. The probe first proves that
+    // discovery is refused in its session, so a pass cannot come from
+    // autoloading that was silently still enabled.
     let root = tempfile::tempdir().unwrap();
     let entrypoint = source_entrypoint_checkout(root.path());
     let probe = root.path().join("source-entrypoint-autoload-probe.ps1");
@@ -1083,6 +1085,9 @@ fn source_install_entrypoint_supplies_its_stock_commands_without_module_auto_dis
         &probe,
         r#"$ErrorActionPreference = 'Stop'
 $PSModuleAutoLoadingPreference = 'None'
+$discovered = $true
+try { $null = Get-Acl -Path $PSHOME } catch [System.Management.Automation.CommandNotFoundException] { $discovered = $false }
+if ($discovered) { throw 'module auto-discovery was not refused in this session' }
 & $env:KURU_ENTRYPOINT_SCRIPT -Source -InstallDir $env:KURU_ENTRYPOINT_INSTALL
 foreach ($name in @('Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility')) {
     $expected = [IO.Path]::Combine($PSHOME, 'Modules', $name, "$name.psd1")
