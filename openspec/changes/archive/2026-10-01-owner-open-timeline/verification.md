@@ -19,7 +19,7 @@ Authored 2026-10-01 before implementation; rows are ticked as evidence lands, wi
 - [x] 3.1 @integration (agent) test 7 a directory occupying the file name -> `serve_with` returns `Ok`, endpoint retired, quiescence passes, lock free, the directory untouched; Observed 2026-10-01 (macOS arm64): `a_failed_record_write_leaves_the_close_unchanged` ok
 - [x] 3.2 @unit (agent) test 1 four threads, four tasks and a blocking task stamping 10,000 times -> offsets non-decreasing, `entries + dropped = 10,000`, capacity unchanged; with capacity 64 and 200 stamps, 64 entries, `dropped = 136`, no panic; Observed 2026-10-01 (macOS arm64): `concurrent_stamps_stay_ordered_and_never_grow_the_log`, `a_full_log_counts_drops_without_growing` ok
 - [x] 3.3 @unit (agent) test 2 stamps after `endpoint-published` -> not stored and `late` counts them; Observed 2026-10-01 (macOS arm64): `stamps_after_endpoint_publication_are_counted_late` ok
-- [ ] 3.4 @benchmark (agent) fresh-store A/B, 20 runs ABBA with the variable on and off, observer row Dolt endpoint first seen to service endpoint first seen -> on-minus-off median inside the +/-2 ms bracket, otherwise the gap is reported as the instrument's cost; not yet run -> defer: needs the release build and the macOS series (work package 4)
+- [~] 3.4 @benchmark (agent) fresh-store A/B, 20 runs ABBA with the variable on and off, observer row Dolt endpoint first seen to service endpoint first seen (expects on-minus-off median inside the +/-2 ms bracket, otherwise the gap is reported as the instrument's cost) -> defer: the 20-run ABBA observer-row A/B was not run; only a 10-pair wall-time A/B was (on 1.512 s vs off 1.446 s median, noise under concurrent load), see the notes
 
 ## 4. The record carries no sensitive content
 

@@ -1,6 +1,6 @@
 # Tasks
 
-Work in `tmp/worktrees/perf-owner-start-split` (branch `perf/owner-start-split`, from `origin/main` 1c93476f). WP1, WP2 and WP3 own disjoint files. Never commit `mise.lock`; never bypass hk hooks. Nothing from R1-R3 is implemented. Tasks are ticked as evidence lands (see `verification.md`).
+Work in `tmp/worktrees/perf-owner-start-split` (branch `perf/owner-start-split`, from `origin/main`, rebased onto b3f20731). WP1, WP2 and WP3 own disjoint files. Never commit `mise.lock`; never bypass hk hooks. Nothing from R1-R3 is implemented. Tasks are ticked as evidence lands (see `verification.md`).
 
 ## 1. Change artifacts (WP0)
 
@@ -26,8 +26,8 @@ Work in `tmp/worktrees/perf-owner-start-split` (branch `perf/owner-start-split`,
 
 ## 5. Measurement and report (WP4, WP5: outside the repository)
 
-- [ ] 5.1 Build the release binary and run the macOS series (fresh and aged cases, 10 interleaved samples each, plus the instrument A/B), and verify every number in the notes traces to a record under `tmp/roadmap/unit6b-evidence/macos/`.
-- [ ] 5.2 Append the ranking, the growing rows and the one-paragraph unit note for each growing row to `tmp/roadmap/unit6b-notes-2026-10-01.md`, with measured and inferred labelled and unrun checks named.
+- [x] 5.1 Build the release binary and run the macOS series (fresh and aged cases, 10 interleaved samples each, plus the instrument A/B), and verify every number in the notes traces to a record under `tmp/roadmap/unit6b-evidence/macos/`. Observed 2026-10-01 (macOS arm64): release series run, fresh/1k/5k n=10, 20k n=2 (8 of 10 clients hit the 30 s startup deadline); the 20-run ABBA observer-row A/B was not run, only a 10-pair wall-time A/B (66 ms median gap, noise under concurrent load).
+- [x] 5.2 Append the ranking, the growing rows and the one-paragraph unit note for each growing row to `tmp/roadmap/unit6b-notes-2026-10-01.md`, with measured and inferred labelled and unrun checks named. Observed 2026-10-01: appended to the notes; usage-scan-1 and usage-scan-2 grow super-linearly and are the only growing rows in the stage.
 
 ## 6. Archive
 
