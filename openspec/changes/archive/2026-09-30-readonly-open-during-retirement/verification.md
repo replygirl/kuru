@@ -20,7 +20,7 @@ All local evidence below is macOS arm64 (Darwin 27.0.0), debug, 2026-09-30, unle
 ## 2. Contract and same-class sites
 
 - [x] 2.1 @unit (agent) `mise run format:check`, `mise run lint`, `mise run lint:windows`, `mise run typecheck`, `mise run docs:check` -> all exit 0; `mise run //packages/kuru-memory:test` -> exit 0 (lib 421 passed, 4 ignored); `kuru-runtime` `ordinary_context_refuses_a_cursor_advanced_after_its_prior_summary_read` -> passed
-- [ ] 2.2 @manual (human) review that `terminal.rs` live-owner borrows are unchanged -> not yet run (agent note: `InvalidSessionCatalogMode::inject` still uses the direct read-only open, unchanged)
+- [x] 2.2 @manual (human) review that `terminal.rs` live-owner borrows are unchanged -> reviewed in the independent PR review (no code read changed): `InvalidSessionCatalogMode::inject` still uses the direct read-only open, unchanged
 
 ## 3. Platforms
 
