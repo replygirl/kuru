@@ -58,12 +58,12 @@ The record commit registers its Pending before its transaction begins, so every 
 
 ### D6. What an older binary can do with a ledger written by the new one
 
-It can do everything it could before. Read from the older code (`0.9.0`, design anchor section 7; not yet checked by running an older binary):
+It can do everything it could before. Read from the older code (`0.9.0`, design anchor section 7), then checked by running an origin/main `0e562595` release build, which writes no record, against a ledger written by this change (verification 3.3; no `0.9.0` release binary was run):
 - The trailer is a message line in commits whose subjects are unchanged for ledger writes; the validation commit is empty. No DDL, no schema version change, no new table, no receipt format.
 - Nothing in older code parses a usage commit message outside the template shape check (`migrations/template_shape.rs`), which runs only on template builds and copies before any ledger write, so it never sees a ledger-written branch.
 - Older migration classification reads `dolt_log` and `dolt_commit_ancestors` by commit hash only and concerns attempt heads, so a validation commit on top of a migration head changes no result.
 - Its writable open runs its own full scan on every open and its writes ignore HEAD's message, so it validates and writes exactly as before. Its commits carry no trailer, so a newer binary pays one scan and re-records afterward. This is sound in both directions.
-Acceptance runs the `0.9.0` release binary, or an origin/main build, against a ledger written by this change once and records it (verification 3.3).
+Verification 3.3 records that run: the older build opened, scanned every row (record-carrying commits included) and wrote, and this binary's next open scanned once and recorded.
 
 ## Risks / Trade-offs
 

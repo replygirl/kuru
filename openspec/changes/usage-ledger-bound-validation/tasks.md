@@ -27,4 +27,4 @@
 ## 6. Verification
 
 - [x] 6.1 Run `format:check`, `lint`, `//packages/kuru-memory:lint:windows`, `typecheck`, `lint:tooling` and the kuru-memory and kuru-delivery tests, and record the results
-- [ ] 6.2 Record the measurements listed in verification.md section 4 and the older-binary open in section 3, then validate, apply and archive with cospec
+- [x] 6.2 Record the measurements listed in verification.md section 4 and the older-binary open in section 3, then validate, apply and archive with cospec
