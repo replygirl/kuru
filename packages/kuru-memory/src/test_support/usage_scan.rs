@@ -629,15 +629,30 @@ struct SealedSize {
     age_elapsed_ms: u64,
 }
 
-#[derive(Deserialize)]
-struct AgeReport {
-    format: String,
-    format_version: u32,
-    seed: u64,
-    conversations: u64,
-    turns: u32,
-    usage_rows: u64,
-    elapsed_ms: u64,
+#[derive(Debug, Deserialize)]
+pub struct AgeReport {
+    pub format: String,
+    pub format_version: u32,
+    pub seed: u64,
+    pub conversations: u64,
+    pub turns: u32,
+    pub usage_rows: u64,
+    pub elapsed_ms: u64,
+}
+
+/// The one `kuru.aged-store` line in captured standard output. The mise task
+/// that ages a store also prints its dependency's output first (the prepared
+/// bundle path), so other lines are skipped, but exactly one report must be
+/// present.
+pub fn age_report(output: &[u8]) -> Result<AgeReport> {
+    let text = std::str::from_utf8(output).context("age-store output is not UTF-8")?;
+    let mut reports = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<AgeReport>(line.trim()).ok())
+        .filter(|report| report.format == REPORT_FORMAT);
+    let report = reports.next().context("no kuru.aged-store line")?;
+    ensure!(reports.next().is_none(), "several kuru.aged-store lines");
+    Ok(report)
 }
 
 fn read_small(path: &Path) -> Result<Vec<u8>> {
@@ -699,8 +714,8 @@ pub fn seal(layout: &Layout, spec: &Spec) -> Result<()> {
             "fixture store for {n} conversations holds open timelines {names:?}; build fixtures without KURU_OPEN_TIMELINE"
         );
         let path = layout.age_report(n);
-        let report: AgeReport = serde_json::from_slice(&read_small(&path)?)
-            .with_context(|| format!("{} is not an age-store report", path.display()))?;
+        let report = age_report(&read_small(&path)?)
+            .with_context(|| format!("{} holds no age-store report", path.display()))?;
         let expected = Counts::expected(&spec.plan(n));
         ensure!(
             report.format == REPORT_FORMAT

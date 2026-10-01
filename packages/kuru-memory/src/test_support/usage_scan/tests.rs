@@ -243,6 +243,33 @@ fn ambiguous_timelines_are_refused() {
 }
 
 #[test]
+fn the_age_report_is_the_one_aged_store_line_of_the_task_output() -> Result<()> {
+    let line = super::super::aged_store::report_line(Counts::expected(&CI.plan(1_000)), 1234)?;
+    let output = format!("/target/kuru-bundles/ad1e.archive\n{line}\n");
+    let report = age_report(output.as_bytes())?;
+    assert_eq!(
+        (report.conversations, report.usage_rows, report.elapsed_ms),
+        (1_000, 4_000, 1234)
+    );
+    for (output, expected) in [
+        (
+            "/target/kuru-bundles/ad1e.archive\n".to_owned(),
+            "no kuru.aged-store line",
+        ),
+        (format!("{line}\n{line}\n"), "several"),
+        (
+            "{\"format\":\"other\"}\n".to_owned(),
+            "no kuru.aged-store line",
+        ),
+    ] {
+        let error = age_report(output.as_bytes()).unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+    }
+    assert!(age_report(&[0xff]).is_err());
+    Ok(())
+}
+
+#[test]
 fn the_median_needs_an_odd_sample() {
     assert_eq!(median(&[5, 1, 3]).unwrap(), 3);
     assert_eq!(median(&[7]).unwrap(), 7);
