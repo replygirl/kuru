@@ -139,6 +139,9 @@ struct KeyInputs<'a> {
     target: &'a str,
     schema: i32,
     usage_schema: i32,
+    /// The format of a migration publication record, which a template's
+    /// `main` carries one of per retained attempt.
+    record_format: i8,
     /// Receipt digests of the main and the usage registries, in order.
     definitions: &'a [Vec<String>; 2],
     statements: &'a [&'a str],
@@ -158,6 +161,7 @@ fn compose(inputs: &KeyInputs<'_>) -> String {
     frame(&mut hash, inputs.target.as_bytes());
     frame(&mut hash, &inputs.schema.to_be_bytes());
     frame(&mut hash, &inputs.usage_schema.to_be_bytes());
+    frame(&mut hash, &inputs.record_format.to_be_bytes());
     for registry in inputs.definitions {
         frame(&mut hash, &(registry.len() as u64).to_be_bytes());
         for definition in registry {
@@ -209,6 +213,7 @@ pub(crate) fn compiled_key() -> &'static str {
             target: crate::catalog::BUNDLED_ASSET.target,
             schema: migrations::CURRENT_VERSION,
             usage_schema: migrations::USAGE_CURRENT_VERSION,
+            record_format: migrations::PUBLICATION_RECORD_FORMAT,
             definitions: &migrations::template_key_definitions(),
             statements: &creation_statements(),
         })

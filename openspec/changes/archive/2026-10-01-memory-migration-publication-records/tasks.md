@@ -1,0 +1,86 @@
+# Tasks
+
+## 1. Schema V8: the publications table and record format
+
+- [x] 1.1 Add `const V8: Definition` to `store/migrations.rs` (`from: 7, to: 8`) creating table `kuru_migration_publications` (`version INT PRIMARY KEY`, `branch VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL UNIQUE`, `base CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL`, `operation CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL`, `definition_digest CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL`, `record_format TINYINT NOT NULL`); add it to `DEFINITIONS`/`REGISTRY` so `CURRENT_VERSION` becomes 8; verify with `cargo test -p kuru-memory migrations::` that the DDL applies cleanly on a fresh store.
+  - Done: `V8` in `DEFINITIONS`; `CURRENT_VERSION` = 8; `validate_publication_shape` checks the six columns and both unique indexes for schema 8 and above.
+- [x] 1.2 Define a `record_format` constant (e.g. `PUBLICATION_RECORD_FORMAT: i32 = 1`) alongside the existing `*_RECORD_FORMAT` constants in the crate, following the pattern of `SESSION_CATALOG_RECORD_FORMAT`; verify by grep that every writer of the table uses the same constant.
+  - Done: `PUBLICATION_RECORD_FORMAT: i8 = 1` in `store/migrations.rs` (TINYINT column); its only writer is `Record::of`, used by `build_attempt` and `validate_attempt`, and `creation_template.rs` keys it.
+
+## 2. Writing the record inside the attempt commit
+
+- [x] 2.1 Change `build_attempt`'s signature to accept `branch: &str` and `base: &str`; thread them from its one caller in `upgrade_in` (both values already exist in that scope); verify with `cargo build -p kuru-memory` that every call site compiles.
+  - Done: `build_attempt` takes an `AttemptRecord { branch, base, published }` (built in `upgrade_in`); `discover_current_attempt_in` takes a `StepBase { base, published }`.
+- [x] 2.2 Inside `build_attempt`'s existing transaction, after the `ATTEMPT_RECEIPT` insert and before `ATTEMPT_COMMIT`, insert one row into `kuru_migration_publications` for every step with `definition.to >= 8`: `(definition.to, branch, base, operation.hyphenated(), digest(definition), PUBLICATION_RECORD_FORMAT)`; verify with a new test `publication_record_is_in_the_attempt_commit_and_reaches_main_with_the_fast_forward` that inspects the attempt branch's commit before `publish` runs and finds the row already present, uncommitted-on-main.
+  - Done: the rows are inserted with the keyed constant `ATTEMPT_RECORD` after the receipt and before `hooks.reach(BeforeCommit)` and `DOLT_COMMIT`. Covered by `publication_record_is_in_the_attempt_commit_and_reaches_main_with_the_fast_forward`.
+- [x] 2.3 Confirm (by reading `publish`) that no change is needed there: the existing `DOLT_MERGE --ff-only` already moves the whole attempt commit, record included, onto main in one ref update; verify by the same test asserting the row appears on `main` only after `publish` returns, never before.
+  - Confirmed: `publish` is unchanged. The same test shows main has no table and stays at schema 7 while paused before publication, and holds exactly the attempt commit's records afterwards.
+
+## 3. V8's own backfill of v2..v7
+
+- [x] 3.1 Refactor `classify_retained_attempts` (and its thin wrapper `classify_historical_attempts_in`) to optionally collect and return the `(name, head, parent)` of every branch it accepts on the clean-completed path, without changing its existing `ensure!`-based rejection behavior; verify with `cargo test -p kuru-memory` that every existing classification test still passes unchanged.
+  - Done: `classify_retained_attempts` returns `Classification { published, by_record, full }`. The rejection paths are unchanged, and the callers that only need a verdict map it to `()`.
+- [x] 3.2 In `upgrade_in`'s loop, when the step about to run is V8, capture that accepted set (from the classification the loop already runs via `classify_historical_attempts_in` at the top of the iteration) and pass it into `build_attempt` so V8's own transaction additionally inserts one row per accepted branch, keyed by each branch's own `to`; verify with `v8_backfills_every_published_branch_from_classification`: a store with v2..v7 attempt branches upgraded to V8 ends with exactly one publication row per published branch and none for any dirty/failed attempt.
+  - Done: `upgrade_in` passes the loop-top classification's `published` to `discover_current_attempt_in`, `build_attempt` and `validate_attempt`. Covered by `v8_backfills_every_published_branch_from_classification`.
+- [x] 3.3 Add `reused_completed_v8_attempt_with_disagreeing_backfill_fails_closed`: a discovered completed V8 attempt (`discover_current_attempt_in`'s ready-shape reuse path) whose backfill rows disagree with the current classification fails `validate_attempt` without mutating main or the attempt branch.
+  - Done: `reused_completed_v8_attempt_with_disagreeing_backfill_fails_closed`.
+
+## 4. Validating a record: the in-progress attempt and later opens
+
+- [x] 4.1 Extend `validate_attempt` so that, for `definition.to >= 8`, it reads the attempt's own row from `kuru_migration_publications` (via the attempt's pool, at its own head) and requires `branch` to equal the attempt name, `base` to equal the already-computed sole parent, `operation` to equal the receipt, and `definition_digest` to equal the compiled digest; verify with `validate_attempt_rejects_record_that_disagrees_with_name_base_receipt_or_digest`.
+  - Done: `validate_attempt` requires the attempt's whole table to equal the base's records (or, for V8, the backfill) plus its own row. Covered by `validate_attempt_rejects_record_that_disagrees_with_name_base_receipt_or_digest` (wrong branch, base and backfill variants), plus the static digest and format checks in `verified_records`.
+- [x] 4.2 Add the independent per-branch record verification to `classify_retained_attempts`: for a branch with a `kuru_migration_publications` row, check (one batched query per axis, through the caller's existing pool) `dolt_branches.dirty = 0`, the sole parent via `dolt_commit_ancestors` equals the recorded base, both head and base appear in `dolt_log` as ancestors of main, and one `AS OF` read of the head matches the record's version and receipt operation; accept the branch as historical on full agreement without running the existing `AS OF`/sole-parent/ancestry sequence for it. A branch with no record keeps that existing sequence unchanged. Every recorded `base`/head value read back from `dolt_branches` or `kuru_migration_publications` and interpolated into `AS OF` SQL text MUST pass the existing `commit_hash()` 32-character-base32 check first (the store.rs:7001-7019 discipline PR #141 already applies elsewhere), and every recorded `branch` name used in SQL text MUST pass the same alphabet check `WorkingSet::status_table` already applies before formatting. Verify with `recorded_branches_open_no_branch_or_commit_pools` (a counting hook on `Server::pool` across a classification pass with every branch recorded), with a test that a malformed/foreign-alphabet recorded hash or branch name is rejected before being placed in SQL text, and with the parity test in task 7.3.
+  - Done: `verified_records`. The base and head hashes pass `commit_hash()` and the branch passes `parse_attempt` before any SQL use; only the head is formatted into `AS OF`, everything else is bound. Covered by `malformed_record_values_never_reach_sql_text`. The P2 `verdicts` helper also asserts that by-record classification requests no pool, standing in for the separate `recorded_branches_open_no_branch_or_commit_pools`.
+- [x] 4.3 Fail the open closed, without mutation and without falling back to full classification, on each of: a moved recorded ref (head or base not in main's ancestry, or parent differs from the recorded base), a dirty recorded branch, an `AS OF` receipt or schema mismatch, and a record/digest/operation mismatch; verify with `moved_recorded_ref_fails_closed_without_mutation`, `dirty_recorded_branch_fails_closed`, `record_outside_main_history_fails_closed`, `as_of_receipt_mismatch_fails_closed`.
+  - Done: `record_mismatches_fail_closed_without_mutation_or_fallback` (moved ref, dirty branch, base outside history, AS OF mismatch, digest, operation, format) and `dirty_recorded_branch_fails_the_open_closed` (through `MemoryStore::open`).
+- [x] 4.4 Verify a record whose named branch no longer exists is tolerated as long as its `base` is still in main's history (matching today's behavior of only iterating existing branches): `recorded_branch_deleted_is_tolerated`.
+  - Done: `recorded_branch_deleted_is_tolerated`, plus the P2 parity state "recorded branch deleted".
+- [x] 4.5 Verify an unrecorded branch (a failed or dirty attempt, or a branch above `CURRENT_VERSION`) still receives full classification unchanged: `unrecorded_failed_attempt_is_still_fully_classified`.
+  - Done: `unrecorded_failed_attempt_is_still_fully_classified`.
+
+## 5. Schema authority and the template-shape check
+
+- [x] 5.1 Add `kuru_migration_publications` to `authority_working_set`'s checked table set (alongside `kuru_schema`/`kuru_migrations`) so a working change to it is rejected as an authority violation; verify with `publication_table_change_is_a_schema_authority_violation`.
+  - Done: `publication_table_change_is_a_schema_authority_violation`.
+- [x] 5.2 Add `kuru_migration_publications` to `template_shape.rs`'s `AUTHORITY_TABLES`, so the shape check's zero-rows rule for project-data tables exempts it, and extend the shape check to require a publication record for every retained branch a template-era store carries; verify with a test asserting a template built by this change's updated producer passes the shape check with its records intact (reuse/extend the existing template-shape test suite rather than adding a new standalone one if an existing test already exercises `AUTHORITY_TABLES`).
+  - Done: `template_shape::publication_records`, run by `check`. Covered by `template_born_store_carries_records_and_passes_the_shape_check` and by the existing template build and copy tests, which run `check`.
+- [x] 5.3 Confirm (read, no code change expected) that `template_shape.rs`'s derived commit-count formulas (`BASE_COMMITS + REGISTRY.definitions.len()`) need no edit for V8, since they are generic over `DEFINITIONS` length; note the confirmation in the PR description.
+  - Confirmed: no edit was needed.
+- [x] 5.4 Add a `record_format: i32` field to `creation_template.rs`'s `KeyInputs` and frame it in `compose()` (a new `frame(&mut hash, &inputs.record_format.to_be_bytes())` line), fed from the new `PUBLICATION_RECORD_FORMAT` constant (task 1.2) at `compiled_key()`'s call site; `CURRENT_VERSION` already changes with V8, so this does not change whether the key changes for this PR, but it means a future record-format bump with no schema bump still changes the key, as the store-creation design's section 3.2 key-inputs table requires. Verify with a test asserting `compose()` output differs when only `record_format` differs, holding every other `KeyInputs` field equal.
+  - Done: the `record_format` variant in the key composition test.
+
+## 6. One-time upgrade for existing stores
+
+- [x] 6.1 Confirm (read, no code change expected unless a gap is found) that `upgrade_in`'s existing loop structure already produces the one-time-upgrade behavior for V8: a store below V8 gets one full classification pass (today's behavior, run by the loop's existing call to `classify_historical_attempts_in` before each step), then the V8 step applies with its backfill; verify with `v7_store_upgrades_once_with_two_starts_then_uses_records` (generalizing the existing `upgrade_main_to_v3_fixture` pattern): starts counted via `test_support::engine_ledger` equal 2, and a second open of the now-V8 store does zero full classifications (counted via a hook), using records instead.
+  - Done: `v7_store_upgrades_once_with_two_starts_then_uses_records`.
+- [x] 6.2 Confirm the existing read-only-refusal path (`options.read_only && found < CURRENT_VERSION`, "memory schema version N requires writable upgrade to N+1") already covers a V8-behind store with no change; verify with `read_only_open_of_v7_store_requires_writable_upgrade` that the message and behavior are unchanged from today.
+  - Done: `read_only_open_of_v7_store_requires_writable_upgrade`.
+- [x] 6.3 Verify a ready stage left by a prior binary at schema 7 is still classified in full at its own version, then activated and upgraded, per the existing "Previous binary left a ready stage" scenario: `ready_v7_stage_from_previous_binary_is_classified_then_upgraded`.
+  - Done: `ready_v7_stage_from_previous_binary_is_classified_then_upgraded`.
+
+## 7. Test-only V8 fixture renumbered to V9
+
+- [x] 7.1 Rename the test-only `const V8: Definition` (`id: "kuru.memory.test-marker.v8"`, table `kuru_migration_test_v8`) to `V9` (`id: "kuru.memory.test-marker.v9"`, table `kuru_migration_test_v9`, `from: 8, to: 9`); update `TEST_DEFINITIONS` to include the real `V8` ahead of the renumbered test step and set `TEST_REGISTRY { current: 9, .. }`; verify with `cargo test -p kuru-memory` that every test referencing `TEST_REGISTRY`/`CURRENT_VERSION` in `migrations.rs` compiles and passes under the new numbering.
+  - Done: renamed to `V9`; `TEST_REGISTRY` current is 9.
+- [x] 7.2 Update any other `CURRENT_VERSION = 8` assumption in `migration_lifecycle_tests.rs` or elsewhere to reflect the real V8 and the renumbered test V9; verify by `cargo test -p kuru-memory` passing with no leftover reference to the old test-marker-v8 id or table name (`rg "test-marker.v8|kuru_migration_test_v8"` returns nothing under `packages/kuru-memory`).
+  - Done: `rg "test-marker.v8|kuru_migration_test_v8" packages/kuru-memory` finds nothing.
+- [x] 7.3 Add the gating parity test `template_born_store_verdicts_match_full_classification` (or extend the existing P2 parity test if one already compares by-record vs. full-classification verdicts): on a migrated (V8+) store, record-based verdicts equal full-classification verdicts for every retained-branch state the existing parity coverage exercises (clean completed, dirty failed, deleted branch, branch above current version).
+  - Done: extended the P2 test `main_pool_classification_agrees_with_branch_pool_classification` (the third column checks by-record pass/fail; added the deleted-branch and above-current states).
+
+## 8. Spec and documentation
+
+- [x] 8.1 Confirm the spec delta already authored in this change (`specs/versioned-memory/spec.md`) matches the shipped behavior once implementation lands — amend only if implementation diverges from the delta; verify with `mise run cospec -- validate memory-migration-publication-records --strict`.
+  - Done: the delta was amended to list the checks actually made (and a deleted recorded branch); validate --strict passes.
+- [x] 8.2 Update `docs/memory.md` and `apps/kuru-docs/concepts/memory.md`: what a user sees on the first writable open after the update (one writable open upgrades silently), and that a read-only command run before that upgrade reports the existing "requires writable upgrade" version message; verify by reading the rendered section against the actual error string in `store.rs`.
+  - Done: docs/memory.md and apps/kuru-docs/concepts/memory.md.
+- [x] 8.3 Update `docs/development.md`: note that fixtures are now at schema 8, and that the embedded template rebuilds once for the new key (no manual step — `bundle:prepare`/`template:prepare` already handle a key change); verify by `mise run docs:check` (or the project's doc-check task) passing.
+  - Done: docs/development.md, plus the key paragraph in docs/memory.md.
+
+## 9. Full verification
+
+- [x] 9.1 Run `mise run //packages/kuru-memory:test` (or the project's equivalent granular test task) and confirm every new and existing test listed above passes; record the observed pass/fail, not an assumed one.
+  - See the verification ledger for the observed results.
+- [x] 9.2 Run `mise run lint:rust`, `mise run lint:windows` and `mise run typecheck` (or their package-scoped equivalents) on the touched crates, so `cfg(windows)` code in the touched files is checked along with the host target; record results.
+  - See the verification ledger.
+- [x] 9.3 Run `mise run cospec -- validate memory-migration-publication-records --strict` and record the exit code.
+  - See the verification ledger.

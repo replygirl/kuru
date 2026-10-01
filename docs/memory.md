@@ -299,6 +299,32 @@ memory namespace. It keeps the current session's cursor-selected summary
 separate, omits older shared summaries whole when the model budget requires it,
 and never substitutes another session's raw rows or private reasoning sidecars.
 
+Schema 8 records each published schema step. Every opening checks the retained
+upgrade branches, and before schema 8 it checked each one in full: its committed
+schema, receipt, parent and place in history. From schema 8, the commit that
+publishes a step also records the step's branch, the commit it was built on,
+its receipt and its definition in `kuru_migration_publications`. Later opens
+check a recorded branch against that record, from `main`'s own history, instead
+of checking it in full. Every check still has to pass: the branch has no
+uncommitted changes, its head's only parent is the recorded base, both are in
+`main`'s history, and the head carries the recorded schema and receipt. A
+recorded branch that has since been deleted is accepted while its recorded base
+is still in that history. A branch without a record, such as a failed attempt,
+is still checked in full. If a record disagrees with the store in any way, the
+open fails without changing anything and without falling back to the full check.
+No record is ever inferred from a branch's name.
+
+The first writable open after updating to a release with schema 8 upgrades an
+existing project once. That open checks the retained branches in full one last
+time, and the schema-8 step records every branch that check accepted, in the
+same commit. Like any schema upgrade, this open starts the database twice: once
+to upgrade, and once to reopen the upgraded store. Until that writable open
+happens, a read-only command on the project, such as inspection or export,
+fails with `memory schema version 7 requires writable upgrade to 8`.
+This is the same refusal every pending schema step produces, and it changes
+nothing. Projects created from the store template after the update start at
+schema 8 with their records and never need this upgrade.
+
 The SQL schema version is independent from the format-1 `ready.json` activation
 record, the database identity record, and the supervisor protocol. An old dream
 candidate stays on its recorded historical schema and remains stale if `main`
@@ -381,9 +407,12 @@ project that shares the cache can therefore share it, and purging a project
 
 The key in its name covers exactly what decides a fresh store's bytes: the
 template format, the pinned engine version and this platform's engine digest,
-the schema versions and every schema step, and the statements and settings
-that create a store. A release that changes any of them uses a new key and
-builds a new template once; old templates stay, as old engine versions do.
+the schema versions and every schema step, the format of the migration
+publication records, and the statements and settings that create a store. A
+release that changes any of them uses a new key and builds a new template once;
+old templates stay, as old engine versions do. The release that adds schema 8
+is one of these: the first new project after updating builds the template
+once, running every schema step once.
 Nothing removes a template or its lock file during ordinary use.
 
 A template is built only by the holder of its key's exclusive lock, and is

@@ -220,6 +220,7 @@ fn template_key_tracks_schema_engine_statements_and_format_only() {
         target: "aarch64-apple-darwin",
         schema: 7,
         usage_schema: 4,
+        record_format: 1,
         definitions: &definitions,
         statements: &statements,
     };
@@ -248,6 +249,11 @@ fn template_key_tracks_schema_engine_statements_and_format_only() {
             ..base
         },
         KeyInputs { schema: 8, ..base },
+        // A record-format change alone, with no schema change, is keyed.
+        KeyInputs {
+            record_format: 2,
+            ..base
+        },
         KeyInputs {
             usage_schema: 5,
             ..base
@@ -305,12 +311,13 @@ fn template_key_tracks_schema_engine_statements_and_format_only() {
             target: crate::catalog::BUNDLED_ASSET.target,
             schema: migrations::CURRENT_VERSION,
             usage_schema: migrations::USAGE_CURRENT_VERSION,
+            record_format: migrations::PUBLICATION_RECORD_FORMAT,
             definitions: &migrations::template_key_definitions(),
             statements: &creation_statements(),
         })
     );
     let [main, usage] = migrations::template_key_definitions();
-    assert_eq!(main.len(), 6, "every main definition is keyed");
+    assert_eq!(main.len(), 7, "every main definition is keyed");
     assert_eq!(usage.len(), 3, "every usage definition is keyed");
 }
 
