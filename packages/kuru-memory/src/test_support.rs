@@ -449,6 +449,12 @@ pub use crate::service::FixtureLoggedOwner;
 #[cfg(feature = "test-support")]
 pub use crate::service::OWNER_DIAGNOSTIC_ENV;
 
+/// Owner open-activity hooks, read by the owner process itself, so a test
+/// sets them on the command-line child whose owner it observes (Windows
+/// owners receive them by explicit forwarding). Inert when unset.
+#[cfg(feature = "test-support")]
+pub use crate::service::activity::{OPEN_HOLD_DIR_ENV, WRITE_FAILURE_ENV};
+
 /// Start the actual service executable with one caller-owned private stderr
 /// file, and wait for its authenticated endpoint. The returned fixture holds
 /// the attachment of the fixture that started it, which is the owner's

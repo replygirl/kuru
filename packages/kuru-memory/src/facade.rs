@@ -1450,13 +1450,15 @@ impl MemoryStore {
     ) {
         let (progress, mut reporter) = ProgressReporter::observed();
         let opening = async move {
-            reporter.report(MemoryOpenStage::WaitingForProjectOwnership);
+            // A waiting stage is reported only where a wait is observed.
             let attachment = if options.read_only {
-                match service::attach_existing(&options, &project).await? {
+                match service::attach_existing_observed(&options, &project, &mut reporter).await? {
                     Some(attachment) => attachment,
                     None => {
-                        let local = store::MemoryStore::open(options).await?;
-                        reporter.report(MemoryOpenStage::Ready);
+                        // Forwards this process's own stages, ready included.
+                        let local =
+                            service::activity::open_local_forwarding(options, &mut reporter)
+                                .await?;
                         return Ok(Self {
                             backend: Backend::Local(local),
                             #[cfg(any(test, feature = "test-support"))]
@@ -1465,7 +1467,8 @@ impl MemoryStore {
                     }
                 }
             } else {
-                service::attach_or_start(&options, &project, &executable).await?
+                service::attach_or_start_observed(&options, &project, &executable, &mut reporter)
+                    .await?
             };
             let remote = RemoteSession::new_view(attachment, options, project, executable)?;
             reporter.report(MemoryOpenStage::Ready);

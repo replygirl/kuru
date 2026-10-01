@@ -43,7 +43,7 @@ impl MemoryOpenStage {
     /// Every stage, in declaration order. The assertion below keeps this list
     /// within the channel's capacity and the `sent` mask, so adding a stage
     /// past either bound fails to compile instead of dropping observations.
-    const ALL: [Self; 13] = [
+    pub(crate) const ALL: [Self; 13] = [
         Self::WaitingForProjectOwnership,
         Self::WaitingForRuntimeCache,
         Self::VerifyingRuntimeCache,
@@ -134,10 +134,6 @@ impl ProgressReporter {
 
     /// Whether a reader is still attached, so a caller can skip work that
     /// exists only to feed it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the open-activity publisher and reader call it")
-    )]
     pub(crate) fn is_observed(&self) -> bool {
         self.sender
             .as_ref()

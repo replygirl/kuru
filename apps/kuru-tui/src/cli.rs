@@ -768,7 +768,14 @@ impl MemoryProgressOutput {
     }
 
     fn stage(&mut self, stage: MemoryOpenStage) {
-        if !self.enabled || stage == MemoryOpenStage::Ready {
+        // Interim, until the open-activity sentences replace these labels:
+        // the service start has no label of its own.
+        if !self.enabled
+            || matches!(
+                stage,
+                MemoryOpenStage::Ready | MemoryOpenStage::StartingMemoryService
+            )
+        {
             return;
         }
         let text = memory_open_label(stage);
@@ -935,6 +942,10 @@ async fn open_memory(options: MemoryOptions, project: &Path) -> Result<MemorySto
         MemoryStore::open_managed_observed(options, project.to_owned(), executable);
     let mut opening = Box::pin(opening);
     let mut output = MemoryProgressOutput::new();
+    // Interim, until the open-activity sentences replace these labels: memory
+    // reports a wait only where one is observed, and this keeps the
+    // established first line.
+    output.stage(MemoryOpenStage::WaitingForProjectOwnership);
     let mut observed_ready = false;
     let mut retained_install_stage = None;
     let mut progress_open = true;
