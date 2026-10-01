@@ -1636,6 +1636,14 @@ mod usage_ledger;
 pub use export::{ActiveExportSnapshot, ExportCursor, ExportPage, ExportProvenance, StorageRecord};
 pub use usage_ledger::{UsageLedger, UsageProof};
 
+/// The main and usage-branch schema versions this build writes, read by the
+/// usage-scan fixture key so a restored fixture never measures a migration.
+#[cfg(all(unix, feature = "test-support"))]
+pub(crate) const SCHEMA_VERSIONS: [i32; 2] = [
+    migrations::CURRENT_VERSION,
+    migrations::USAGE_CURRENT_VERSION,
+];
+
 impl MemoryStore {
     pub(crate) fn ensure_project_scope(&self, scope: &str) -> Result<()> {
         ensure!(

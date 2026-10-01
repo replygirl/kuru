@@ -2234,7 +2234,7 @@ impl EndpointRecord {
         })
     }
 
-    fn directory(data_dir: &Path, scope: &str) -> Result<PathBuf> {
+    pub(crate) fn directory(data_dir: &Path, scope: &str) -> Result<PathBuf> {
         let project = crate::store::project_directory(data_dir, scope)?;
         let hash = project.file_name().context("project store has no name")?;
         Ok(data_dir.join("memory/services").join(hash))

@@ -2000,7 +2000,7 @@ fn arm64_memory_suite_runs_as_gated_uninstrumented_partitions() {
             .starts_with("      - name: Require every memory partition job to have succeeded\n")
     );
     assert!(ci.contains(
-        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
+        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling]"
     ));
 }
 
@@ -2008,7 +2008,7 @@ fn arm64_memory_suite_runs_as_gated_uninstrumented_partitions() {
 fn native_platform_runs_windows_on_arm_as_separately_named_behavioral_evidence() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
-    let job = workflow_job(&ci, "native-platform", "ci-gate");
+    let job = workflow_job(&ci, "native-platform", "usage-scan-scaling");
     // One job, two legs: the x64 leg keeps the 90% platform gate and Windows
     // on Arm runs the distinct uninstrumented task under its own name.
     for required in [
@@ -2056,7 +2056,108 @@ fn native_platform_runs_windows_on_arm_as_separately_named_behavioral_evidence()
     );
     assert!(!job.contains("KURU_COVERAGE_"));
     assert!(ci.contains(
-        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
+        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling]"
+    ));
+}
+
+/// The usage-scan scaling check gates CI from the day it lands: a required
+/// Ubuntu job imports the run's verified engine inputs, restores its aged
+/// fixture by exact key only (saved from main only), ages in-job on a miss
+/// and asserts the provisional bounds, uploading its evidence on any outcome.
+#[test]
+fn usage_scan_scaling_is_a_required_job_with_an_exact_key_fixture() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let job = workflow_job(&ci, "usage-scan-scaling", "ci-gate");
+    for required in [
+        "    name: Usage scan scaling (ubuntu-latest, provisional bounds)\n",
+        "    needs: bundle-inputs\n",
+        "    runs-on: ubuntu-latest\n",
+        "    timeout-minutes: 45\n",
+        "      KURU_DOLT_BUNDLE_OFFLINE: \"true\"\n",
+        "          install_args: rust\n",
+        "          shared-key: usage-scan-scaling\n",
+        "          save-if: ${{ github.ref == 'refs/heads/main' }}\n",
+        "printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles-usage-scan-${{ github.run_attempt }}\\n' \"$RUNNER_TEMP\"\n",
+        "name: ci-usage-scan-attempt-${{ github.run_attempt }}\n",
+    ] {
+        assert!(job.contains(required), "usage-scan-scaling lost {required}");
+    }
+    for forbidden in ["continue-on-error", "restore-keys:", "KURU_OPEN_TIMELINE"] {
+        assert!(
+            !job.contains(forbidden),
+            "usage-scan-scaling uses {forbidden}"
+        );
+    }
+    let steps = workflow_steps(job);
+    let position = |name: &str| {
+        steps
+            .iter()
+            .position(|step| step.contains(&format!("name: {name}\n")))
+            .unwrap_or_else(|| panic!("missing step {name}"))
+    };
+    let imported = position("Import the run's verified bundle inputs");
+    let keyed = position("Build the release tooling and compute the aged fixture key");
+    let restored = position("Restore the aged fixture");
+    let aged = position("Age the fixture stores in-job (cache miss)");
+    let saved = position("Save the aged fixture");
+    let measured = position("Measure and assert the usage scan growth (provisional bounds)");
+    let uploaded = position("Upload the usage scan records and timelines");
+    assert!(
+        imported < keyed
+            && keyed < restored
+            && restored < aged
+            && aged < saved
+            && saved < measured
+            && measured < uploaded
+    );
+    assert!(
+        steps[keyed]
+            .contains("mise run //packages/kuru-memory:measure:usage-scan:fixture -- key --root")
+    );
+    // Exact key only, and the same paths on restore and save.
+    let paths = "          path: |\n            ${{ runner.temp }}/kuru-usage-scan/fixture.json\n            ${{ runner.temp }}/kuru-usage-scan/data-1000/memory\n            ${{ runner.temp }}/kuru-usage-scan/data-5000/memory\n          key: ${{ steps.key.outputs.key }}";
+    assert!(steps[restored].contains(
+        "uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n"
+    ));
+    assert!(steps[restored].contains(paths));
+    assert!(
+        steps[saved].contains(
+            "uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n"
+        )
+    );
+    assert!(steps[saved].contains(paths));
+    assert!(steps[saved].contains(
+        "if: github.ref == 'refs/heads/main' && steps.fixture.outputs.cache-hit != 'true'\n"
+    ));
+    // A miss ages in-job and never skips the measurement.
+    assert!(steps[aged].contains("if: steps.fixture.outputs.cache-hit != 'true'\n"));
+    assert!(
+        steps[aged]
+            .contains("mise run //packages/kuru-memory:measure:age-store -- --profile release")
+    );
+    assert!(steps[aged].contains("-- seal --root"));
+    assert!(!steps[measured].contains("\n        if:"));
+    assert!(
+        steps[measured].contains("mise run //packages/kuru-memory:measure:usage-scan -- --root")
+    );
+    assert!(steps[measured].contains("--samples 5 --assert"));
+    assert!(steps[uploaded].contains("if: always()\n"));
+    // The measuring task alone sets the gate; the fixture task never does.
+    let mise = fs::read_to_string(root.join("packages/kuru-memory/mise.toml")).unwrap();
+    let task = |name: &str| {
+        mise.split(&format!("[tasks.\"{name}\"]\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing task {name}"))
+            .split("\n[")
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(task("measure:usage-scan").contains("env.KURU_OPEN_TIMELINE = \"1\"\n"));
+    assert!(!task("measure:usage-scan:fixture").contains("KURU_OPEN_TIMELINE"));
+    assert!(ci.contains(
+        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling]"
     ));
 }
 
@@ -2099,7 +2200,7 @@ fn windows_only_rust_is_linted_by_a_required_static_job() {
             .contains("rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1\n")
     );
     assert!(ci.contains(
-        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform]"
+        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling]"
     ));
 
     // The root task aggregates package-owned tasks, and every package with

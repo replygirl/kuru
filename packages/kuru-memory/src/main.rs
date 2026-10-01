@@ -33,8 +33,24 @@ async fn main() -> anyhow::Result<()> {
         Some("age-store") => {
             kuru_memory::test_support::aged_store::main(std::env::args_os().skip(2)).await
         }
+        #[cfg(all(unix, feature = "test-support"))]
+        Some("usage-scan-fixture") => {
+            kuru_memory::test_support::usage_scan::fixture_main(std::env::args_os().skip(2)).await
+        }
+        #[cfg(all(unix, feature = "test-support"))]
+        Some("measure-usage-scan") => {
+            kuru_memory::test_support::usage_scan::measure_main(std::env::args_os().skip(2)).await
+        }
+        #[cfg(all(not(unix), feature = "test-support"))]
+        Some("usage-scan-fixture" | "measure-usage-scan") => {
+            anyhow::bail!(
+                "the usage-scan check runs on Unix only; the owner open timeline is inert on Windows"
+            )
+        }
         #[cfg(feature = "test-support")]
-        _ => anyhow::bail!("expected prefetch, age-store or an internal service entry"),
+        _ => anyhow::bail!(
+            "expected prefetch, age-store, usage-scan-fixture, measure-usage-scan or an internal service entry"
+        ),
         #[cfg(not(feature = "test-support"))]
         _ => anyhow::bail!("expected an internal service entry"),
     }

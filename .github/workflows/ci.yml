@@ -539,9 +539,190 @@ jobs:
           path: target/kuru-platform-coverage.lcov
           if-no-files-found: error
 
+  usage-scan-scaling:
+    # Gating check that the usage-ledger startup scan grows at most linearly
+    # with ledger size: cold gated owner opens of aged stores at 1,000 and
+    # 5,000 conversations (4,000 and 20,000 usage rows), timed from the owner
+    # open timeline (usage-pool to usage-scan-1). The bounds are provisional
+    # until the validation-record change lands calibrated bounds with their
+    # derivation. Unix only: the owner timeline is inert on Windows.
+    name: Usage scan scaling (ubuntu-latest, provisional bounds)
+    needs: bundle-inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      # Import the run's verified bundle inputs; never download them here.
+      KURU_DOLT_BUNDLE_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Select private bundle build inputs and the fixture root
+        shell: bash
+        # Leave the leaf absent so the preparer creates this runner's private ACLs.
+        # Cargo's restored target/ cache must not supply these directory grants.
+        # The fixture root is one fixed path: the owner binds each store's
+        # scope to its project's canonical path, which the cache key names.
+        run: |
+          {
+            printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles-usage-scan-${{ github.run_attempt }}\n' "$RUNNER_TEMP"
+            printf 'KURU_USAGE_SCAN_ROOT=%s/kuru-usage-scan\n' "$RUNNER_TEMP"
+            printf 'KURU_USAGE_SCAN_EVIDENCE=%s/kuru-usage-scan-evidence\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
+      - name: Reserve space for the aged fixtures and the release build
+        shell: bash
+        run: |
+          # This Rust job does not use the hosted image's mobile or Swift SDKs.
+          df -h /
+          for sdk in /usr/local/lib/android /usr/share/swift; do
+            if [ -d "$sdk" ]; then
+              sudo du -sh "$sdk"
+              sudo rm -rf -- "$sdk"
+            fi
+          done
+          df -h /
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.18
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      # The save-time cleanup keeps only build, .fingerprint and deps in each
+      # profile directory, so no private kuru-test-supervisors snapshot under
+      # target/release is ever archived.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: usage-scan-scaling
+          # Restrict saves to main so PR runs never thrash the shared cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Download the run's verified bundle inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci-bundle-inputs-ubuntu-latest
+          path: ${{ runner.temp }}/bundle-inputs
+      - name: Import the run's verified bundle inputs
+        shell: bash
+        run: |
+          # bundle:prepare checks each archive against its committed pin again.
+          cd -- "$RUNNER_TEMP/bundle-inputs"
+          shopt -s nullglob
+          archives=(*.archive)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo 'The verified bundle input artifact holds no archive' >&2
+            exit 1
+          fi
+          cd -- "$GITHUB_WORKSPACE"
+          for archive in "${archives[@]}"; do
+            mise run //packages/kuru-memory:bundle:prepare -- --target "${archive%.archive}" --archive "$RUNNER_TEMP/bundle-inputs/$archive" --offline
+          done
+      # Builds the release kuru-memory test-support tooling once; every later
+      # step reuses it. The key comes from compiled constants, never from YAML.
+      - id: key
+        name: Build the release tooling and compute the aged fixture key
+        shell: bash
+        run: |
+          started=$(date +%s)
+          mise run //packages/kuru-memory:measure:usage-scan:fixture -- key --root "$KURU_USAGE_SCAN_ROOT" --output "$RUNNER_TEMP/kuru-usage-scan-key"
+          echo "Release tooling build and key: $(( $(date +%s) - started )) s"
+          printf 'key=%s\n' "$(cat -- "$RUNNER_TEMP/kuru-usage-scan-key")" >> "$GITHUB_OUTPUT"
+          printf 'KURU_USAGE_SCAN_RESTORE_STARTED=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
+      # Exact key only, with no prefix fallback: an older-schema fixture would
+      # measure a migration open instead. The extracted engine under
+      # data-<n>/tools is not cached; the first (warm-up) open extracts it.
+      - id: fixture
+        name: Restore the aged fixture
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/kuru-usage-scan/fixture.json
+            ${{ runner.temp }}/kuru-usage-scan/data-1000/memory
+            ${{ runner.temp }}/kuru-usage-scan/data-5000/memory
+          key: ${{ steps.key.outputs.key }}
+      - name: Report the fixture restore
+        shell: bash
+        env:
+          KURU_USAGE_SCAN_CACHE_HIT: ${{ steps.fixture.outputs.cache-hit }}
+        run: |
+          seconds=$(( $(date +%s) - KURU_USAGE_SCAN_RESTORE_STARTED ))
+          hit=${KURU_USAGE_SCAN_CACHE_HIT:-false}
+          line="Aged fixture ${{ steps.key.outputs.key }}: exact-key hit=$hit, restore step ${seconds} s (decision rule: fall back to a bulk-seeded fixture if a restore exceeds 120 s)"
+          echo "$line"
+          printf '%s\n\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+      # On a miss the job ages in-job; it never skips the check. Sequential,
+      # so the 5k ageing time is a clean number for the decision rule.
+      - name: Age the fixture stores in-job (cache miss)
+        if: steps.fixture.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          root=$KURU_USAGE_SCAN_ROOT
+          mkdir -p -- "$KURU_USAGE_SCAN_EVIDENCE"
+          for n in 1000 5000; do
+            mise run //packages/kuru-memory:measure:usage-scan:fixture -- create --root "$root" --conversations "$n"
+          done
+          for n in 1000 5000; do
+            if ! mise run //packages/kuru-memory:measure:age-store -- --profile release \
+              --data-dir "$root/data-$n" --conversations "$n" --turns 1 --seed 1 \
+              > "$root/age-$n.json" 2> "$KURU_USAGE_SCAN_EVIDENCE/age-$n.log"; then
+              tail -n 50 -- "$KURU_USAGE_SCAN_EVIDENCE/age-$n.log" >&2
+              exit 1
+            fi
+            cat -- "$root/age-$n.json"
+          done
+          mise run //packages/kuru-memory:measure:usage-scan:fixture -- seal --root "$root"
+          # Each file also holds the task's dependency output before the report.
+          elapsed() {
+            jq -enR '[inputs | fromjson? | select(.format? == "kuru.aged-store") | .elapsed_ms] | if length == 1 then .[0] else error("expected one kuru.aged-store line") end' "$1"
+          }
+          small=$(elapsed "$root/age-1000.json")
+          large=$(elapsed "$root/age-5000.json")
+          verdict=keep
+          if [ "$large" -gt 1200000 ]; then verdict='switch to a bulk-seeded fixture'; fi
+          line="Cold in-job ageing on ubuntu-latest: 1000 conversations ${small} ms, 5000 conversations ${large} ms (decision rule: fall back to a bulk-seeded fixture if 5000 exceeds 1200000 ms): ${verdict}"
+          echo "$line"
+          printf '%s\n\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+          du -sh -- "$root"/data-*/memory
+      # Saved before any measuring open, so the archive holds no timeline.
+      - name: Save the aged fixture
+        if: github.ref == 'refs/heads/main' && steps.fixture.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/kuru-usage-scan/fixture.json
+            ${{ runner.temp }}/kuru-usage-scan/data-1000/memory
+            ${{ runner.temp }}/kuru-usage-scan/data-5000/memory
+          key: ${{ steps.key.outputs.key }}
+      # Prints the per-size scan rows, the ratio and the provisional bounds on
+      # every run, and every timeline on a failed assertion. After the
+      # validation-record change it also asserts that a recorded reopen
+      # decodes 0 usage rows; not asserted now, because every writable open
+      # scans until then.
+      - name: Measure and assert the usage scan growth (provisional bounds)
+        shell: bash
+        run: |
+          mise run //packages/kuru-memory:measure:usage-scan -- --root "$KURU_USAGE_SCAN_ROOT" \
+            --evidence "$KURU_USAGE_SCAN_EVIDENCE" --samples 5 --assert \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - name: Require unchanged dependency locks
+        run: git diff --exit-code -- mise.lock Cargo.lock
+      - name: Upload the usage scan records and timelines
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-usage-scan-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/kuru-usage-scan-evidence
+            ${{ runner.temp }}/kuru-usage-scan/fixture.json
+            ${{ runner.temp }}/kuru-usage-scan/age-*.json
+            ${{ runner.temp }}/kuru-usage-scan/create-*.log
+          if-no-files-found: warn
+
   ci-gate:
     if: always()
-    needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform]
+    needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling]
     runs-on: ubuntu-latest
     steps:
       - name: Require every static and native check
