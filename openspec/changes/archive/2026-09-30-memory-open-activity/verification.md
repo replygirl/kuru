@@ -67,3 +67,7 @@ Authored 2026-09-30 before implementation. Rows are ticked as evidence lands, wi
 ## Rebased onto origin/main 52f9869d (2026-09-30, macOS, MISE_LOCKED=1)
 
 Measured: `//packages/kuru-memory:test` 469 passed, 0 failed, 4 ignored, exit 0; `//apps/kuru-tui:test` exit 0, 0 failed; `lint`, `lint:windows`, `format:check`, `typecheck`, `docs:check` exit 0; `cospec validate --strict` 0 errors, 0 warnings. Not run: native Linux/macOS/Windows CI, Windows behaviour, release-smoke medians (9.1), manual terminal check (6.3). Rows 4.6, 6.3, 9.1 and 10.1 stay open and are deferred at archive.
+
+## Review follow-up (2026-10-01, macOS, MISE_LOCKED=1)
+
+Docs only: the output rule in `apps/kuru-docs/concepts/memory.md`, `apps/kuru-docs/reference/configuration.md` and `docs/configuration.md` now states the non-terminal line case and the interactive redirected-stderr case, matching `docs/memory.md`. Measured: `docs:check`, `format:check`, `lint`, `typecheck` exit 0. No Rust changed; package tests not rerun.

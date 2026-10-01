@@ -70,8 +70,11 @@ this project's memory…" after an update, or "Waiting for another copy of Kuru 
 finish with this project's memory…" while another copy of Kuru still holds it.
 On a terminal the sentence is rewritten in place and erased when memory is
 ready; when standard error is not a terminal, each new sentence is written once
-on its own line. It is not a timer or proof that a step succeeded. Command
-output, including JSON, remains on standard output.
+on its own line. An interactive session whose standard error is redirected but
+whose standard output is a terminal shows the sentence on that terminal instead,
+rewritten in place and erased before the interface opens. It is not a timer or
+proof that a step succeeded. Command output, including JSON, remains on standard
+output and never receives the sentence.
 
 The first conversation/runtime command (`kuru run`, `kuru dream`, `kuru
 undo-dream`, the TUI, or `kuru serve`) that opens a writable project store also
