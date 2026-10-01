@@ -323,7 +323,10 @@ the native PowerShell entrypoint from the checkout:
 
 The owning mise task builds the explicit MSVC target with a static CRT. To set
 the destination, pass `-InstallDir` or set `KURU_INSTALL_DIR`; release-selection
-options are not source-build options.
+options are not source-build options. Like the bootstrap it forwards to, the
+checkout entrypoint loads PowerShell's own Management and Utility modules
+directly from `$PSHOME` before its first command instead of searching every
+installed module on first use.
 
 The source installer prepares the pinned Rust toolchain and verified engine
 archive through package-owned mise tasks. It installs into `~/.local/bin` on

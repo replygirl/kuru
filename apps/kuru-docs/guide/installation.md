@@ -136,7 +136,7 @@ To choose another destination:
 KURU_INSTALL_DIR="$HOME/.local/bin" bash scripts/install.sh --source
 ```
 
-On Windows, use `& .\scripts\install.ps1 -Source -InstallDir C:\Tools\kuru\bin`. Release-selection options do not apply to source builds. The Windows task builds the explicit MSVC target with a static C runtime.
+On Windows, use `& .\scripts\install.ps1 -Source -InstallDir C:\Tools\kuru\bin`. Release-selection options do not apply to source builds. The Windows task builds the explicit MSVC target with a static C runtime. Like the release installer, the checkout entrypoint loads PowerShell's own Management and Utility modules directly from `$PSHOME` before its first command, so a fresh Windows profile does not search every installed module.
 
 The source installer builds the locked release profile for the current host and replaces the executable atomically. It refuses a symlink or directory at the destination and uses the current checkout revision. From a configured maintainer checkout, `mise run install` performs the same source installation. Source installation prepares only its required tooling; it does not require the full maintainer setup.
 
