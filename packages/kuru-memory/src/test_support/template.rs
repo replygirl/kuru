@@ -955,11 +955,15 @@ mod tests {
         let container = crate::test_support::tempdir()?.with_depth_budget(TEMPLATE_FIXTURE_DEPTH);
         let outcome = async {
             let template = published()?;
-            let source = |path: &Path| {
-                path.components().any(|part| {
-                    part.as_os_str()
-                        .to_string_lossy()
-                        .starts_with("kuru-memory-template-")
+            // A source store of a finished build: `build` removes its
+            // `kuru-memory-template-*` directory only after the source open
+            // and close completed, so a build still running beside this one
+            // (whose count is not final yet) keeps its directory.
+            let finished_source = |path: &Path| {
+                path.ancestors().any(|ancestor| {
+                    ancestor.file_name().is_some_and(|name| {
+                        name.to_string_lossy().starts_with("kuru-memory-template-")
+                    }) && fs::symlink_metadata(ancestor).is_err()
                 })
             };
             let before = crate::test_support::engine_ledger::with(|ledger| ledger.start_counts());
@@ -970,11 +974,12 @@ mod tests {
                 "the test template was not built"
             );
             // Builds of other test templates running beside this one take
-            // the same path, so every new source store must show two starts.
+            // the same path, so every new source store whose build finished,
+            // this test's own included, must show two starts.
             let built = crate::test_support::engine_ledger::with(|ledger| ledger.start_counts())
                 .into_iter()
                 .filter(|(directory, _)| {
-                    source(directory) && !before.iter().any(|(seen, _)| seen == directory)
+                    finished_source(directory) && !before.iter().any(|(seen, _)| seen == directory)
                 })
                 .collect::<Vec<_>>();
             ensure!(
