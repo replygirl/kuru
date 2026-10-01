@@ -220,6 +220,16 @@ impl Layout {
         self.root.join(format!("data-{n}"))
     }
 
+    /// The data directory for size `n`, created owner-private when absent.
+    /// The memory open refuses any other mode, so a fixture restored from a
+    /// cache must land in directories created here first: an archive that
+    /// carries only `data-<n>/memory` leaves its parent's mode alone.
+    pub fn private_data(&self, n: u64) -> Result<PathBuf> {
+        let data = self.data(n);
+        crate::files::private_dir(&data)?;
+        Ok(data)
+    }
+
     pub fn age_report(&self, n: u64) -> PathBuf {
         self.root.join(format!("age-{n}.json"))
     }
@@ -837,7 +847,7 @@ pub async fn create(layout: &Layout, spec: &Spec, n: u64, engine: &Engine) -> Re
     );
     let project = layout.project(n)?;
     let scope = project_scope(&project);
-    let data = layout.data(n);
+    let data = layout.private_data(n)?;
     let existing = super::managed_store_scopes(&data)?;
     ensure!(
         existing.is_empty(),
@@ -914,7 +924,7 @@ pub async fn measure(
             size.project.display(),
             project.display()
         );
-        let data = layout.data(n);
+        let data = layout.private_data(n)?;
         require_store(&data, &size.scope, &project)?;
         let options = engine.options(data, size.scope.clone());
         let mut measured = SizeSamples {
@@ -1147,6 +1157,11 @@ pub async fn fixture_main(args: impl IntoIterator<Item = OsString>) -> Result<()
     match parse_fixture(args)? {
         FixtureCommand::Key { root, output } => {
             let layout = Layout::open(&root)?;
+            // Before any cache restore, so the restored stores land in
+            // owner-private data directories.
+            for &n in CI.sizes {
+                layout.private_data(n)?;
+            }
             let key = compiled_key(&CI, layout.root());
             if let Some(output) = output {
                 std::fs::write(&output, &key)?;

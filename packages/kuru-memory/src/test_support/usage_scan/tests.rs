@@ -582,6 +582,30 @@ fn a_seal_from_another_root_build_or_plan_is_refused() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn data_directories_are_created_private_and_a_widened_one_is_refused() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir()?;
+    let layout = Layout::open(&root.path().join("fixture"))?;
+    let data = layout.private_data(1_000)?;
+    assert_eq!(data, layout.data(1_000));
+    assert_eq!(
+        std::fs::metadata(&data)?.permissions().mode() & 0o777,
+        0o700
+    );
+    // As a cache restore would leave a parent it created itself.
+    let widened = layout.data(5_000);
+    std::fs::create_dir(&widened)?;
+    std::fs::set_permissions(&widened, std::fs::Permissions::from_mode(0o755))?;
+    let error = layout.private_data(5_000).unwrap_err();
+    assert!(format!("{error:#}").contains("owner-private"), "{error:#}");
+    assert_eq!(
+        std::fs::metadata(&widened)?.permissions().mode() & 0o777,
+        0o755
+    );
+    Ok(())
+}
+
 /// The spec the real-engine test ages: 2 and 6 conversations, so 8 and 24
 /// owned usage rows at one turn.
 const TINY: Spec = Spec {
