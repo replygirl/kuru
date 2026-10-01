@@ -25,9 +25,27 @@ const OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const RECEIPT_LIMIT: usize = 64 * 1024;
 const RECEIPT_SCHEMA: u32 = 2;
 /// The exact mise release every workflow's `jdx/mise-action` `version:` installs.
-const WORKFLOW_MISE_VERSION: &str = "2026.9.18";
+pub const WORKFLOW_MISE_VERSION: &str = "2026.9.18";
+/// A publication time old enough for every release-age policy (mise's own e2e
+/// fixture uses the same instant), so an isolated update check never depends
+/// on the wall clock.
+const MISE_RELEASE_INDEX_PUBLISHED: i64 = 946_684_800;
 /// PE optional headers follow a bounded DOS stub; a larger offset is malformed.
 const PE_HEADER_LIMIT: usize = 64 * 1024;
+/// The release that `mise --version` reports on stdout: its first field, as in
+/// `2026.9.18 windows-x64 (2026-09-30)`. The remaining fields name the build
+/// platform and date; update notices are written to stderr.
+pub fn reported_mise_version(stdout: &str) -> Option<&str> {
+    stdout.split_whitespace().next()
+}
+
+/// A one-release body for the index mise's default-source update check fetches
+/// from `https://mise.jdx.dev/releases.tsv` since 2026.9.17 (jdx/mise#13782):
+/// one `v`-prefixed release tag and its Unix publication seconds per row.
+pub fn mise_release_index(version: &str) -> String {
+    format!("v{version}\t{MISE_RELEASE_INDEX_PUBLISHED}\n")
+}
+
 const MISE_CONFIG: &str = r#"[settings]
 use_versions_host=false
 use_versions_host_track=false
@@ -867,7 +885,7 @@ pub async fn run(options: Options) -> Result<()> {
     let verified: Result<Receipt> = async {
         let mise_version = install.success("mise-version", &["--version"]).await?;
         ensure!(
-            mise_version.split_whitespace().next() == Some(WORKFLOW_MISE_VERSION)
+            reported_mise_version(&mise_version) == Some(WORKFLOW_MISE_VERSION)
                 && mise_version.trim().len() <= 256,
             "workflow mise version differs from {WORKFLOW_MISE_VERSION}"
         );
@@ -1104,6 +1122,49 @@ mod tests {
     use super::*;
     use crate::published::ReleaseAsset;
     use serde_json::json;
+
+    /// Captured from CI run 36828480881: the Windows x64 runner's
+    /// `mise --version` stdout for the workflow pin.
+    const CI_MISE_VERSION_STDOUT: &str = "2026.9.18 windows-x64 (2026-09-30)\n";
+
+    #[test]
+    fn reported_mise_version_is_the_exact_first_field() {
+        assert_eq!(
+            reported_mise_version(CI_MISE_VERSION_STDOUT),
+            Some(WORKFLOW_MISE_VERSION)
+        );
+        assert_ne!(
+            reported_mise_version("2026.9.180 windows-x64 (2026-09-30)\n"),
+            Some(WORKFLOW_MISE_VERSION)
+        );
+        assert_ne!(
+            reported_mise_version("v2026.9.18 windows-x64\n"),
+            Some(WORKFLOW_MISE_VERSION)
+        );
+        assert_eq!(reported_mise_version(""), None);
+    }
+
+    #[test]
+    fn mise_release_index_matches_the_documented_row_format() {
+        let version = reported_mise_version(CI_MISE_VERSION_STDOUT).unwrap();
+        let index = mise_release_index(version);
+        let rows = index.lines().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        let fields = rows[0].split_whitespace().collect::<Vec<_>>();
+        assert_eq!(fields.len(), 2);
+        let tag = fields[0].strip_prefix('v').unwrap();
+        assert_eq!(tag, WORKFLOW_MISE_VERSION);
+        let parts = tag.split('.').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 3);
+        assert!(
+            parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        );
+        // Eligible under mise's default 24h release age at the captured CI run
+        // (2026-10-01T07:15:50Z), so the check selects the pinned release.
+        assert!(fields[1].parse::<i64>().unwrap() <= 1_790_838_950 - 24 * 60 * 60);
+    }
 
     fn published(
         version: &str,

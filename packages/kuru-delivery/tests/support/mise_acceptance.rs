@@ -34,6 +34,8 @@ mod previous_updater;
 
 const DEADLINE: Duration = Duration::from_secs(180);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Fixture route for mise's own release index (its update notification).
+const MISE_RELEASE_INDEX: &str = "/mise-releases.tsv";
 // The acceptance executable is native, so its compiled catalog target is the
 // runner's Windows target and the staged archive it installs.
 static TARGET: LazyLock<&'static str> = LazyLock::new(|| {
@@ -141,13 +143,15 @@ async fn serve(
     {
         rejected = Some("unexpected authentication header".to_owned());
         Vec::new()
-    } else if method == Method::GET && path == "/mise-version" && query.is_none() {
+    } else if method == Method::GET && path == MISE_RELEASE_INDEX && query.is_none() {
         // `mise --version` also checks its own latest version outside CI. Our
         // intentionally cleared environment has no CI flag or version cache.
-        // Keep that exact notification request local without disabling release
-        // provenance, changing backend behavior, or accepting arbitrary traffic.
+        // Since 2026.9.17 that check reads mise's release index instead of its
+        // VERSION file (jdx/mise#13782). Keep that exact notification request
+        // local without disabling release provenance, changing backend
+        // behavior, or accepting arbitrary traffic.
         content_type = "text/plain";
-        b"2026.9.18\n".to_vec()
+        published_windows::mise_release_index(published_windows::WORKFLOW_MISE_VERSION).into_bytes()
     } else if method == Method::GET
         && path == "/api/repos/replygirl/kuru/releases"
         && matches!(query, None | Some("per_page=100"))
@@ -719,7 +723,7 @@ oauth_client_id=""
 'regex:^https://api\.github\.com/?$'='FIXTURE_BASE/api'
 'regex:^https://api\.github\.com/repos/replygirl/kuru(/|$)'='FIXTURE_BASE/api/repos/replygirl/kuru$1'
 'regex:^https://github\.com/replygirl/kuru/releases/download/'='FIXTURE_BASE/download/'
-'regex:^https://mise\.jdx\.dev/VERSION$'='FIXTURE_BASE/mise-version'
+'regex:^https://mise\.jdx\.dev/releases\.tsv$'='FIXTURE_BASE/mise-releases.tsv'
 'regex:^(https?://.*)'='FIXTURE_BASE/unexpected/$1'
 "#;
 
@@ -764,24 +768,27 @@ async fn run_archive(
         let server = Server::new(&bytes, scenario).await?;
         let mut installed = Installation::new(&mise, &server.base)?;
         ensure!(
-            installed
-                .success(&["--version"])
-                .await?
-                .split_whitespace()
-                .next()
-                == Some("2026.9.18"),
+            published_windows::reported_mise_version(&installed.success(&["--version"]).await?)
+                == Some(published_windows::WORKFLOW_MISE_VERSION),
             "unexpected mise version"
         );
-        ensure!(
-            server
-                .state
-                .lock()
-                .unwrap()
-                .requests
-                .iter()
-                .any(|request| request.method == Method::GET && request.path == "/mise-version"),
-            "the real mise version notification did not reach its isolated route"
-        );
+        {
+            let traffic = server.state.lock().unwrap();
+            ensure!(
+                traffic
+                    .requests
+                    .iter()
+                    .any(|request| request.method == Method::GET
+                        && request.path == MISE_RELEASE_INDEX),
+                "the real mise version notification did not reach its isolated route; requests {:?}, rejected {:?}",
+                traffic
+                    .requests
+                    .iter()
+                    .map(|request| format!("{} {}", request.method, request.path))
+                    .collect::<Vec<_>>(),
+                traffic.rejected
+            );
+        }
         if index == 0 {
             installed.isolation().await?;
             ensure!(
