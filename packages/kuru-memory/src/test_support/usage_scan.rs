@@ -5,10 +5,13 @@
 //! a spawned owner inherits `KURU_OPEN_TIMELINE`; the timeline is inert on
 //! Windows. Two subcommands of this package's own binary reach it:
 //!
-//! - `usage-scan-fixture key|create|seal` (`measure:usage-scan:fixture`):
-//!   print the fixture's cache key from compiled constants, create one empty
-//!   project store per size with one ungated owner open, and seal the stores
-//!   once `measure:age-store` has aged them.
+//! - `usage-scan-fixture create|seal` (`measure:usage-scan:fixture`): create
+//!   one empty project store per size with one ungated owner open, and seal
+//!   the stores once `measure:age-store` has aged them. The seal records a
+//!   key over the compiled constants that decide what the stores measure, so
+//!   a measurement refuses stores sealed by a different build or at another
+//!   root. CI ages the fixture in-job on every run and never caches it: even
+//!   after `DOLT_GC` the two stores exceed the shared Actions cache budget.
 //! - `measure-usage-scan` (`measure:usage-scan`, which alone sets the gate):
 //!   per size, one warm-up and then `--samples` cold owner opens, each a real
 //!   spawned owner whose timeline gives the first usage scan's duration
@@ -16,9 +19,9 @@
 //!
 //! Layout under the fixture root, whose canonical path is part of the key
 //! because the owner binds its scope to the project's canonical path:
-//! `project-<n>/` (empty project directories), `data-<n>/` (data directories;
-//! only `data-<n>/memory` is cached), `age-<n>.json` (the `age-store`
-//! report lines), `create-<n>.log` and `fixture.json` (the seal).
+//! `project-<n>/` (empty project directories), `data-<n>/` (data
+//! directories), `age-<n>.json` (the `age-store` report lines),
+//! `create-<n>.log` and `fixture.json` (the seal).
 //!
 //! The bounds are provisional: the validation-record change replaces them
 //! with calibrated bounds and their derivation, and adds the assertion that
@@ -112,7 +115,7 @@ pub const PROVISIONAL: Bounds = Bounds {
 
 // --- Fixture key ---------------------------------------------------------------
 
-/// Every input that decides what a restored fixture measures.
+/// Every input that decides what a sealed fixture measures.
 #[derive(Clone, Copy, Debug)]
 pub struct KeyInputs<'a> {
     pub fixture_format: u32,
@@ -220,10 +223,8 @@ impl Layout {
         self.root.join(format!("data-{n}"))
     }
 
-    /// The data directory for size `n`, created owner-private when absent.
-    /// The memory open refuses any other mode, so a fixture restored from a
-    /// cache must land in directories created here first: an archive that
-    /// carries only `data-<n>/memory` leaves its parent's mode alone.
+    /// The data directory for size `n`, created owner-private when absent;
+    /// the memory open refuses any other mode.
     pub fn private_data(&self, n: u64) -> Result<PathBuf> {
         let data = self.data(n);
         crate::files::private_dir(&data)?;
@@ -685,7 +686,7 @@ fn require_store(data: &Path, scope: &str, project: &Path) -> Result<()> {
     ensure!(
         scopes == [scope],
         "fixture data directory {} holds stores {scopes:?}, not the one built for project path {}; \
-         a restored fixture must sit at the root it was built for",
+         a sealed fixture must sit at the root it was built for",
         data.display(),
         project.display()
     );
@@ -763,7 +764,7 @@ pub fn seal(layout: &Layout, spec: &Spec) -> Result<()> {
     Ok(())
 }
 
-/// Read and check the seal of a built or restored fixture.
+/// Read and check the seal of a sealed fixture.
 fn read_seal(layout: &Layout, spec: &Spec) -> Result<Sealed> {
     let path = layout.seal();
     let sealed: Sealed = serde_json::from_slice(&read_small(&path)?)
@@ -777,14 +778,14 @@ fn read_seal(layout: &Layout, spec: &Spec) -> Result<Sealed> {
     );
     ensure!(
         sealed.root == layout.root(),
-        "restored fixture was built for root {}; this run uses {}",
+        "sealed fixture was built for root {}; this run uses {}",
         sealed.root.display(),
         layout.root().display()
     );
     let key = compiled_key(spec, layout.root());
     ensure!(
         sealed.key == key,
-        "restored fixture key {} differs from this build's {key}",
+        "sealed fixture key {} differs from this build's {key}",
         sealed.key
     );
     ensure!(
@@ -793,7 +794,7 @@ fn read_seal(layout: &Layout, spec: &Spec) -> Result<Sealed> {
             .iter()
             .map(|size| size.conversations)
             .eq(spec.sizes.iter().copied()),
-        "restored fixture sizes differ from the plan"
+        "sealed fixture sizes differ from the plan"
     );
     Ok(sealed)
 }
@@ -920,7 +921,7 @@ pub async fn measure(
         let project = layout.project(n)?;
         ensure!(
             project == size.project && project_scope(&project) == size.scope,
-            "restored fixture was built for project path {}; this run uses {}",
+            "sealed fixture was built for project path {}; this run uses {}",
             size.project.display(),
             project.display()
         );
@@ -1092,36 +1093,19 @@ pub fn parse_measure(args: impl IntoIterator<Item = OsString>) -> Result<Measure
 /// The fixture subcommand's mode and options.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FixtureCommand {
-    Key {
-        root: PathBuf,
-        output: Option<PathBuf>,
-    },
-    Create {
-        root: PathBuf,
-        conversations: u64,
-    },
-    Seal {
-        root: PathBuf,
-    },
+    Create { root: PathBuf, conversations: u64 },
+    Seal { root: PathBuf },
 }
 
-/// Parse `key --root <dir> [--output <file>]`, `create --root <dir>
-/// --conversations <n>` or `seal --root <dir>`.
+/// Parse `create --root <dir> --conversations <n>` or `seal --root <dir>`.
 pub fn parse_fixture(args: impl IntoIterator<Item = OsString>) -> Result<FixtureCommand> {
     const COMMAND: &str = "usage-scan-fixture";
     let mut args = args.into_iter();
     let mode = args
         .next()
         .and_then(|mode| mode.into_string().ok())
-        .context("usage-scan-fixture needs key, create or seal")?;
+        .context("usage-scan-fixture needs create or seal")?;
     Ok(match mode.as_str() {
-        "key" => {
-            let parsed = Arguments::parse(COMMAND, args, &["--root", "--output"], &[])?;
-            FixtureCommand::Key {
-                root: parsed.required_path(COMMAND, "--root")?,
-                output: parsed.path(COMMAND, "--output")?,
-            }
-        }
         "create" => {
             let parsed = Arguments::parse(COMMAND, args, &["--root", "--conversations"], &[])?;
             FixtureCommand::Create {
@@ -1137,7 +1121,7 @@ pub fn parse_fixture(args: impl IntoIterator<Item = OsString>) -> Result<Fixture
                 root: parsed.required_path(COMMAND, "--root")?,
             }
         }
-        other => bail!("usage-scan-fixture needs key, create or seal, not {other}"),
+        other => bail!("usage-scan-fixture needs create or seal, not {other}"),
     })
 }
 
@@ -1155,27 +1139,13 @@ fn cli_engine() -> Result<Engine> {
 /// The `usage-scan-fixture` subcommand.
 pub async fn fixture_main(args: impl IntoIterator<Item = OsString>) -> Result<()> {
     match parse_fixture(args)? {
-        FixtureCommand::Key { root, output } => {
-            let layout = Layout::open(&root)?;
-            // Before any cache restore, so the restored stores land in
-            // owner-private data directories.
-            for &n in CI.sizes {
-                layout.private_data(n)?;
-            }
-            let key = compiled_key(&CI, layout.root());
-            if let Some(output) = output {
-                std::fs::write(&output, &key)?;
-            }
-            println!("{key}");
-            Ok(())
-        }
         FixtureCommand::Create {
             root,
             conversations,
         } => {
             ensure!(
                 std::env::var_os(crate::open_timeline::ENV).is_none(),
-                "usage-scan-fixture create refuses {}: the cached fixture must hold no timeline",
+                "usage-scan-fixture create refuses {}: the sealed fixture must hold no timeline",
                 crate::open_timeline::ENV
             );
             let layout = Layout::open(&root)?;

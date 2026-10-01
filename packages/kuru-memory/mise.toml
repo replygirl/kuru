@@ -92,14 +92,14 @@ flag "--profile <profile>" default="dev"
 '''
 run = 'cargo run -p kuru-memory --features test-support --locked --profile "${usage_profile?}" -- age-store --data-dir "${usage_data_dir?}" --conversations "${usage_conversations?}" --turns "${usage_turns?}" --seed "${usage_seed?}"'
 
-# The usage-scan scaling check's aged fixture (Unix): print its cache key
-# from compiled constants (`key --root <dir> [--output <file>]`), create one
-# empty store per size (`create --root <dir> --conversations <n>`) and seal
-# the stores once measure:age-store has aged them (`seal --root <dir>`).
+# The usage-scan scaling check's aged fixture (Unix): create one empty store
+# per size (`create --root <dir> --conversations <n>`) and seal the stores
+# once measure:age-store has aged them (`seal --root <dir>`). CI ages it
+# in-job on every run and never caches it.
 # Never sets KURU_OPEN_TIMELINE, so the fixture holds no timeline. See
 # docs/development.md.
 [tasks."measure:usage-scan:fixture"]
-description = "Compute the usage-scan fixture key, create its stores or seal them (Unix)"
+description = "Create the usage-scan fixture stores or seal them (Unix)"
 depends = ["bundle:prepare"]
 run = "cargo run -p kuru-memory --features test-support --locked --profile release -- usage-scan-fixture"
 
