@@ -763,6 +763,28 @@ inert unless `KURU_TEST_DOLT_LOG_DIR` names a directory, so neither runs in
 receives their CSV rows, and
 `KURU_TEST_LIFECYCLE_MEASURE_ITERATIONS` (default 300) sets the loop count.
 
+To measure how an open changes as a store ages, `mise run
+//packages/kuru-memory:measure:age-store --data-dir <dir> --conversations <n>
+[--turns <n>] [--seed <n>]` (defaults: one turn, seed 1) grows the one
+existing project store under an absolute data directory. Create that store
+first with one ordinary `kuru` run against the same data directory; the task
+refuses a directory with no store or with several. It waits for any previous
+owner to exit, then holds the project's owner lock for the whole run, so no
+Kuru command can start an owner on the store meanwhile, and opens the store
+directly and offline with the engine already extracted under the data
+directory. Each conversation follows a runtime turn's write order through the
+memory facade: a new session and its usage marker, then per turn the public
+admission, the dispatch journal, the actor's input, one usage invocation
+(admit, a terminal observation, settle), the actor's output and the public
+settlement. That is `2 + 8 × turns` writes and `1 + 3 × turns` usage-ledger
+rows per conversation. The same seed, size and turn count give the same
+logical content (identifiers, transcripts, journals and usage numbers); Dolt
+commit hashes differ, because commits carry timestamps. Progress goes to
+standard error every 500 conversations, and one `kuru.aged-store` JSON line
+with the counts and `elapsed_ms` goes to standard output. It is a
+measurement aid built only with the package's test support, never part of
+`test`, coverage or CI.
+
 `store::engine_contract_tests` pins the Dolt behaviours that creating stores
 from a pre-migrated template relies on: root creation and bootstrap on a
 copied data directory, identity commits on two refs, main-pool reads of
