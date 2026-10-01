@@ -235,9 +235,10 @@ aside: opening again builds a fresh template. The unready copy is set aside
 under `memory/interrupted/`, at once if its database had started serving and
 otherwise when you open the project again, without starting it; a copy
 interrupted by a crash is set aside the same way. If the first launch's
-template build itself fails, that open fails with the build's error and
-opening again retries the build; Kuru never runs the schema steps twice in one
-open. See
+template build fails, or copying the project from the template it just built
+fails, that open fails with that error and opening again tries again (a copy
+that finds the new template damaged also moves it aside); Kuru never runs the
+schema steps twice in one open. See
 [memory storage](https://github.com/replygirl/kuru/blob/main/docs/memory.md#new-projects-and-the-store-template)
 for the details. If Kuru keeps warning that it cannot read a template, delete
 that template's directory under `templates/` while Kuru is not running; it is

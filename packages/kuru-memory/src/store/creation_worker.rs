@@ -25,18 +25,20 @@
 //!
 //! Where the template cannot be used the worker hands the startup lock back
 //! for the cold path, never failing the open: a busy key lock, a lock-file
-//! error, or a verdict or I/O error before or during the copy. A copy that
+//! error, or a verdict or I/O error before or during the copy from a
+//! template this open did not build. A copy that
 //! wrote anything is preserved first under `interrupted/` without an engine
 //! start (recovery's Class R); an empty stage is removed. Only a failed
 //! preservation fails the open there.
 //!
 //! Any failure of this open's template build (its engine, its own
-//! assertions, its capture or its publication) and any failure of the
-//! stage's own engine start return their error with no retry, on either
-//! path: the chain is never paid twice in one open. A verdict on the stage's
-//! engine (adoption or the template shape) also quarantines the template the
-//! copy came from, identity-bound and best-effort; every other failure
-//! leaves every template untouched. A failed stage start leaves the unready
+//! assertions, its capture or its publication) or of the copy from the
+//! template it built, and any failure of the stage's own engine start,
+//! return their error with no retry, on either path: the chain is never paid
+//! twice in one open. A verdict on that copy, or on the stage's engine
+//! (adoption or the template shape), also quarantines the template the copy
+//! came from, identity-bound and best-effort; every other failure leaves
+//! every template untouched. A failed stage start leaves the unready
 //! stage in place for the next open's recovery to preserve without an engine
 //! start (Class U); a failure after the stage's engine served preserves it
 //! at once.
@@ -110,7 +112,11 @@ pub(super) enum Outcome {
 
 /// Run `job` on its own task, which owns `startup` (and every lock and engine
 /// it takes) until its engines are reaped, and return its outcome with the
-/// startup lock. `Err` means every engine the worker started was reaped.
+/// startup lock. `Err` means the stage's own engine, when it started, was
+/// reaped. A template build's engine is guarded by the key lock instead: when
+/// a failed build could not confirm that engine's reap (its supervisor
+/// overran the shutdown allowance), its background reaper releases the key
+/// lock, possibly after this returns; the project's stage holds no engine.
 pub(super) async fn run(job: TemplateCreation, startup: File) -> Result<(File, Outcome)> {
     let (result, waiting) = tokio::sync::oneshot::channel();
     // Task-local hooks do not cross `tokio::spawn`.
@@ -164,8 +170,9 @@ impl TemplateCreation {
                 return Ok((startup, Outcome::Cold(self.marker_pause)));
             }
             // The build ran, or tried to run, the chain: a cold retry would
-            // pay it again inside the same deadline. Its verdicts are against
-            // its own unpublished bytes, so nothing is quarantined.
+            // pay it again inside the same deadline. Its own verdicts are
+            // against its unpublished bytes; a verdict on the copy from the
+            // template it published was already quarantined by `create_in`.
             Err(CreateError::Build(failure)) => {
                 let error = failure
                     .into_error()

@@ -16,10 +16,14 @@ pub(crate) enum LockStep {
     Verify,
 }
 
-/// One read error, injected once, on the first template file whose path
-/// ends with `suffix`.
+/// One read failure, injected once, on the first template file whose path
+/// ends with `suffix` and, when `under` is set, has a component named
+/// `under`: a published template's files lie beneath its key, and a build's
+/// capture and verification walks do not. An I/O error unless `verdict`.
 pub(crate) struct ReadFault {
     pub(crate) suffix: String,
+    under: Option<String>,
+    verdict: bool,
     fired: AtomicBool,
 }
 
@@ -27,6 +31,19 @@ impl ReadFault {
     pub(crate) fn new(suffix: &str) -> Arc<Self> {
         Arc::new(Self {
             suffix: suffix.to_owned(),
+            under: None,
+            verdict: false,
+            fired: AtomicBool::new(false),
+        })
+    }
+
+    /// The first read of any file beneath the published template named
+    /// `key` fails: with a byte verdict when `verdict`, else an I/O error.
+    pub(crate) fn published(key: &str, verdict: bool) -> Arc<Self> {
+        Arc::new(Self {
+            suffix: String::new(),
+            under: Some(key.to_owned()),
+            verdict,
             fired: AtomicBool::new(false),
         })
     }
@@ -130,12 +147,25 @@ pub(super) fn manifest_fault() -> Result<()> {
     Ok(())
 }
 
-pub(super) fn read_fault(object: &Path) -> Result<()> {
+pub(super) fn read_fault(object: &Path) -> Result<(), CreationFailure> {
     if let Some(fault) = current().and_then(|hooks| hooks.read)
         && object.to_string_lossy().ends_with(&fault.suffix)
+        && fault.under.as_deref().is_none_or(|under| {
+            object
+                .components()
+                .any(|component| component.as_os_str() == under)
+        })
         && !fault.fired.swap(true, Ordering::AcqRel)
     {
-        return Err(std::io::Error::other("injected template read error").into());
+        if fault.verdict {
+            return Err(CreationFailure::verdict(format!(
+                "injected digest mismatch on {}",
+                object.display()
+            )));
+        }
+        return Err(CreationFailure::io(std::io::Error::other(
+            "injected template read error",
+        )));
     }
     Ok(())
 }

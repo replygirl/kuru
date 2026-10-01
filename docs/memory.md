@@ -337,10 +337,10 @@ staging directory (four database starts), when:
   that moment: a new project never waits for another one's build;
 - the template's directory or lock file cannot be opened, locked or verified,
   which is logged as a warning in the memory service log; or
-- the template fails a check while it is copied. A partial copy is preserved
-  under `memory/interrupted/` without starting a database. A template whose
-  own bytes failed the check is moved aside, and the next new project builds a
-  fresh one; an I/O error leaves it in place.
+- a template this open did not build fails a check while it is copied. A
+  partial copy is preserved under `memory/interrupted/` without starting a
+  database. A template whose own bytes failed the check is moved aside, and the
+  next new project builds a fresh one; an I/O error leaves it in place.
 
 None of these is an error: the project opens as before, only more slowly.
 
@@ -360,8 +360,12 @@ creates the project again: from the template when it is still in place, or by
 building a new one when it was moved aside.
 
 A failure of the template build that a first launch runs (its database, its
-own checks, or saving its result) also fails that open, with the build's error;
-no template is moved aside, and opening again tries again.
+own checks, or saving its result), or of copying the project from the template
+it just built, also fails that open, with that error; opening again tries
+again. A partial copy is preserved under `memory/interrupted/` without starting
+a database. Only a copy that finds the new template's own bytes differ from its
+manifest moves that template aside, and the next new project builds it again;
+any other such failure moves no template aside.
 Kuru never retries inside the same open, so the schema steps never run twice
 in one open.
 

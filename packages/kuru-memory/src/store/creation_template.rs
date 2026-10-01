@@ -724,7 +724,7 @@ fn walk_into(
                 .transpose()
                 .map_err(CreationFailure::io)?;
             #[cfg(test)]
-            hooks::read_fault(&object).map_err(CreationFailure::Io)?;
+            hooks::read_fault(&object)?;
             let (bytes, sha256, kept) = copy_hashing(mode, &mut input, output.as_mut(), keep)?;
             directory
                 .verify(&name, &input)
@@ -1653,17 +1653,18 @@ pub(crate) enum Created {
 /// depends on the phase, not on the kind of evidence.
 #[derive(Debug)]
 pub(crate) enum CreateError {
-    /// Using a template failed: its structural check or a copy, including
-    /// the copy from a template this call has just built. A verdict among
-    /// them already quarantined the judged template. The caller creates the
-    /// store cold.
+    /// Using a template this call did not build failed: its structural check
+    /// or the copy from it. A verdict among them already quarantined the
+    /// judged template. The caller creates the store cold.
     Use(CreationFailure),
-    /// This call's template build failed: its engine, its own assertions
-    /// (a shape verdict there is against the build's unpublished bytes), its
-    /// capture or its publication. Nothing usable was published, and the
-    /// chain may already have run, so the caller fails the open with this
-    /// error and runs no other creation in it, as it would not rebuild after
-    /// a verdict.
+    /// This call's template build failed, or the copy from it: the build's
+    /// engine, its own assertions (a shape verdict there is against the
+    /// build's unpublished bytes), its capture, its publication, or this
+    /// project's copy from the template or verified stage it produced. A
+    /// verdict on that copy already quarantined the template this call
+    /// published. The chain may already have run, so the caller fails the
+    /// open with this error and runs no other creation in it, as it would
+    /// not rebuild after a verdict.
     Build(CreationFailure),
 }
 
@@ -1752,9 +1753,10 @@ async fn copy_blocking(
 /// none is published and the exclusive key lock is free. It never waits for
 /// a lock. A verdict against a published template quarantines that template
 /// (identity-bound, best-effort) and is returned; every other failure is
-/// returned and leaves every template untouched. A failure of the build is
-/// returned as [`CreateError::Build`], every other one as
-/// [`CreateError::Use`]. On any failure the partial copy stays in `stage`
+/// returned and leaves every template untouched. A failure of the build, or
+/// of the copy from the template it built, is returned as
+/// [`CreateError::Build`], every other one as [`CreateError::Use`]. On any
+/// failure the partial copy stays in `stage`
 /// for the caller to preserve. Each copy runs on a blocking thread that
 /// holds the key lock until it returns.
 pub(crate) async fn create_in(
@@ -1859,12 +1861,35 @@ pub(crate) async fn create_in(
                 // stage when publication failed; the chain is paid once.
                 let judged = report.published.then_some(template.identity);
                 let (lock, copied) = copy_blocking(template, stage, lock).await;
-                drop(lock);
-                Ok(copied.map(|()| Created::Copied {
-                    built: true,
-                    published: report.published,
-                    judged,
-                })?)
+                match copied {
+                    Ok(()) => {
+                        drop(lock);
+                        Ok(Created::Copied {
+                            built: true,
+                            published: report.published,
+                            judged,
+                        })
+                    }
+                    // The chain already ran in this open: a cold retry would
+                    // run it again, so the copy's failure fails the open as
+                    // the build's would. A verdict against the template this
+                    // open published moves it aside under the lock still
+                    // held; an unpublished verified stage is left for the
+                    // next exclusive holder's sweep.
+                    Err(failure) => {
+                        if failure.is_verdict()
+                            && let (Some(judged), Some(_)) = (judged, &lock)
+                        {
+                            let moved = quarantine_held(root, key, judged);
+                            account(root.path(), stage.path(), &moved);
+                            sweep_held(root, key).await;
+                        }
+                        drop(lock);
+                        Err(CreateError::Build(failure.context(
+                            "copy the new project from the store template this open built".into(),
+                        )))
+                    }
+                }
             }
             Err((lock, failure)) => {
                 drop(lock);

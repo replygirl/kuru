@@ -959,6 +959,102 @@ async fn failed_template_build_fails_the_open_without_a_cold_retry() -> Result<(
     fixture.release(outcome)
 }
 
+/// The copy a first launch makes from the template its own open just built
+/// fails the open like the build would, with no cold retry: the chain ran
+/// once and the build engine is the open's only start. A read error leaves
+/// the new template published for the next project, which copies it in two
+/// starts; a byte verdict moves it aside under the key lock the build still
+/// holds, and the next project builds again. Either way the copy remnant is
+/// preserved under `interrupted/` without an engine start.
+#[tokio::test]
+async fn failed_copy_after_the_build_fails_the_open_without_a_cold_retry() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        for (index, verdict) in [false, true].into_iter().enumerate() {
+            let label = if verdict { "verdict" } else { "read error" };
+            let root = fixture.path().join(format!("templates-{index}"));
+            let digit = char::from_digit(u32::try_from(index)? + 3, 16).context("digit")?;
+            let options = options_for(&fixture, &root, digit).await?;
+            let fault = ReadFault::published(key(), verdict);
+            let hooks = Hooks {
+                read: Some(fault.clone()),
+                ..Hooks::default()
+            };
+            let error = HOOKS
+                .scope(hooks, open(options.clone()))
+                .await
+                .err()
+                .with_context(|| format!("{label}: an open whose copy failed succeeded"))?;
+            let message = format!("{error:#}");
+            ensure!(
+                fault.fired()
+                    && message.contains("copy the new project from the store template")
+                    && TemplateVerdict::find(&error).is_some() == verdict,
+                "{label}: the open did not fail with its copy's failure: {message}"
+            );
+            let starts = starts_under(&options.data_dir)?;
+            ensure!(
+                starts == 0 && starts_under(&root)? == 1,
+                "{label}: the failed copy was followed by {starts} more engine starts"
+            );
+            if verdict {
+                ensure!(
+                    published(&root).is_none() && rejected(&root)?.len() == 1,
+                    "{label}: the template this open built was not quarantined"
+                );
+            } else {
+                ensure!(
+                    published(&root).is_some() && rejected(&root)?.is_empty(),
+                    "{label}: a read error changed the template this open built"
+                );
+            }
+            ensure!(
+                !active(&options)?.exists(),
+                "{label}: an active directory appeared"
+            );
+            ensure!(
+                stages(&options)?.is_empty(),
+                "{label}: the failed open left a stage beside its active path"
+            );
+            let remnants = interrupted(&options)?;
+            let [remnant] = remnants.as_slice() else {
+                bail!("{label}: not exactly one preserved remnant: {remnants:?}");
+            };
+            let lifecycles = cfg!(windows).then(|| options.data_dir.join("memory/lifecycles"));
+            crate::test_support::await_store_quiescence(remnant, lifecycles.as_deref()).await?;
+            let remnant_key = engine_ledger::key(remnant).context("no ledger key")?;
+            ensure!(
+                remnant.join(DATA).is_dir()
+                    && !remnant.join("identity.json").exists()
+                    && engine_ledger::with(|ledger| ledger.starts(&remnant_key)) == 0,
+                "{label}: the remnant {} is not an unstarted copy",
+                remnant.display()
+            );
+            // The next new project copies the intact template, or builds
+            // the quarantined one again; either way it is template-born.
+            let next_digit = char::from_digit(u32::try_from(index)? + 5, 16).context("digit")?;
+            let next = options_for(&fixture, &root, next_digit).await?;
+            let store = open(next.clone()).await?;
+            let checked = assert_template_born(&next, &store).await;
+            store.close().await?;
+            checked.with_context(|| format!("{label}: the next project"))?;
+            let next_starts = starts_under(&next.data_dir)?;
+            let builds = starts_under(&root)?;
+            let expected = if verdict { 2 } else { 1 };
+            ensure!(
+                next_starts == u64::from(FreshOpen::Template.starts())
+                    && builds == expected
+                    && published(&root).is_some(),
+                "{label}: the next project made {next_starts} starts in its directory and \
+                 {builds} template builds ran in all"
+            );
+        }
+        Ok(())
+    }
+    .await;
+    fixture.release(outcome)
+}
+
 /// While a first launch builds the template inside its open, the creating
 /// stage has already been reported, and no stage that changes the terminal's
 /// sentence follows it: the whole template path runs under "Creating this
