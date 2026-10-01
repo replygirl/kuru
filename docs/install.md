@@ -305,7 +305,7 @@ or operating-system service is installed. It exits once clients and accepted wor
 
 ## Build from source
 
-Building requires mise 2026.9.4 or later, a C compiler for the legacy SQLite
+Building requires mise 2026.9.13 or later (2026.9.18 recommended), a C compiler for the legacy SQLite
 importer, and standard platform build tools:
 
 ```sh

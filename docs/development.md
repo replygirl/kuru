@@ -860,12 +860,19 @@ dependency seed directory to import (below); leave it unset locally.
 
 Root mise routes Cargo through [mr-boxington](https://mr-boxington.jdx.dev)
 (`mbx`), pinned beside Rust, whenever it runs Cargo for `mise run`, `mise exec`,
-activated shells or mise shims. It needs mise 2026.9.4 or later, the root
-`min_version`. mbx stores compiled outputs in one content-addressed cache and
+activated shells or mise shims. It needs mise 2026.9.13 or later, the root
+`min_version` hard floor (2026.9.18, which CI runs, is recommended). mbx stores compiled outputs in one content-addressed cache and
 restores matching compilations into each checkout's own `target/`, so a new
 worktree mostly restores its dependencies instead of recompiling them while
 concurrent worktrees keep separate Cargo locks. Calling rustup's `cargo`
 directly bypasses the wrapper; use `mise exec -- cargo` from editors and agents.
+
+The root `min_version` is a table because the two floors answer different
+questions. The hard floor stays at 2026.9.13: a hard floor at the latest
+release would make a developer machine on the previous Homebrew stable refuse
+every mise task, including the git hooks. The soft floor tracks the latest
+release (currently 2026.9.18, the CI pin), so an older local mise gets a
+recommendation to upgrade rather than a refusal.
 Do not run `mbx setup`, which writes machine-wide Cargo and editor
 configuration.
 
@@ -1368,15 +1375,19 @@ Mise records a per-platform option as a second
 `options.asset_pattern`, its own `specifiers` and the `windows-arm64` row (see
 mise's [lockfile format](https://mise.jdx.dev/dev-tools/mise-lock.html), where
 one version can have several entries distinguished by `options`). Unlocked
-installs, including the nested `mise install node npm` behind
-`//apps/kuru-docs:setup:tools` that `format:check`, `docs:*` and the hk hooks
-reach, rewrite each per-project lockfile from the host's resolved toolset.
-They drop that non-host element, and mise's best-effort auto-lock may then
-re-add the `windows-arm64` row without `specifiers` or, when the GitHub API
-refuses the query, not at all. Only `mise lock` restores it. Run every
-command other than an intentional lock refresh with `MISE_LOCKED=1`, which
-stops automatic lockfile updates and fails on a missing entry instead of
-resolving it ([strict lockfile mode](https://mise.jdx.dev/dev-tools/mise-lock.html)).
+installs (including a reinstall of an installed tool) and `mise exec` or
+`mise run` auto-installs rewrite each per-project lockfile from the host's
+resolved toolset. They drop that element's `specifiers`, add rows for other
+host variants (`macos-x64` rows on an Arm64 Mac), and, when the GitHub API refuses the
+query, may omit the `windows-arm64` row. Only `mise lock` restores it. This
+behavior is the same in mise 2026.9.4, 2026.9.13 and 2026.9.18. Repository
+tasks that install tools therefore install with `--locked`: the docs app's
+`setup:tools` (`mise install --locked node npm`, which `format:check`,
+`docs:*` and the hk hooks reach) and the delivery package's cargo-audit setup.
+The hk hooks run without `MISE_LOCKED=1`. Run ad hoc installs or `mise exec`
+outside an intentional lock refresh with `MISE_LOCKED=1`, which stops
+automatic lockfile updates and fails on a missing entry instead of resolving it
+([strict lockfile mode](https://mise.jdx.dev/dev-tools/mise-lock.html)).
 The refresh commands above still write with `MISE_LOCKED=1` set. CI
 already exports `MISE_LOCKED=1`. The repository check in `lint:tooling`
 (`mise run //packages/kuru-delivery:check:repo`) fails unless the lock holds, for
@@ -1403,9 +1414,13 @@ MISE_OS=windows MISE_ARCH=aarch64 mise -C packages/kuru-delivery lock github:jdx
 
 Review the resulting `provenance_verified` metadata alongside URLs and checksums.
 This also keeps CI installation from creating uncommitted verification metadata.
-Run these lock refreshes with the CI-pinned mise version. Releases after
-2026.9.4 no longer add `provenance_verified`, so a lock produced by a newer local
-mise would be rewritten by CI's installation and fail its lock drift check.
+Run these lock refreshes with the CI-pinned mise version (2026.9.18) without
+`--upgrade`: per the 2026.9.7 and 2026.9.16 release notes, lockfile revisions 2
+and 3 are unreadable by older mise, including the root `min_version` hard floor. mise 2026.9.18 keeps
+existing `provenance_verified` lines but did not add one to a cospec entry
+from which they were removed, where 2026.9.4 did. CI installs with
+`MISE_LOCKED=1` and never rewrites the lock, and `check:repo` reads no
+provenance field, so that difference does not fail CI.
 See mise's [lockfile provenance contract](https://mise.jdx.dev/dev-tools/mise-lock.html#provenance-and-security)
 and [task tool configuration](https://mise.jdx.dev/tasks/task-configuration.html#tools).
 

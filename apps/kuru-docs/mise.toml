@@ -15,7 +15,7 @@ outputs = [
 
 [tasks."setup:tools"]
 description = "Install only the app-owned Node/npm pins"
-run = "mise install node npm"
+run = "mise install --locked node npm"
 
 [tasks."check:toolchain"]
 description = "Require the exact selected Node/npm versions, including cached setup"

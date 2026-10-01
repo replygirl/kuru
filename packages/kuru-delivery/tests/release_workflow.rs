@@ -237,7 +237,7 @@ fn required_release_checks_precede_the_only_publication_job() {
         "runs-on: ${{ matrix.os }}",
         "timeout-minutes: 45",
         "ref: ${{ needs.bump.outputs.sha }}",
-        "version: 2026.9.4",
+        "version: 2026.9.18",
         "name: ${{ needs.assemble-candidate.outputs.artifact_name }}",
         "path: candidate",
         "KURU_STAGED_WINDOWS_ARCHIVE: ${{ github.workspace }}/candidate/dist/kuru-${{ needs.plan.outputs.version }}-${{ matrix.target }}.zip",

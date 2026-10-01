@@ -566,8 +566,8 @@ fn incident_exec_auto_install_workflow_is_rejected() {
     );
     repo.replace(
         ".github/workflows/ci.yml",
-        "        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles\\n' \"$RUNNER_TEMP\" >> \"$GITHUB_ENV\"\n      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0\n        with:\n          experimental: true\n          version: 2026.9.4\n          install_args: rust\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n        with:\n          cache-bin: false\n          shared-key: bundle-inputs",
-        "        run: echo 'MISE_EXEC_AUTO_INSTALL=true' >> \"$GITHUB_ENV\"\n      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0\n        with:\n          experimental: true\n          version: 2026.9.4\n          install_args: rust\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n        with:\n          cache-bin: false\n          shared-key: bundle-inputs",
+        "        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles\\n' \"$RUNNER_TEMP\" >> \"$GITHUB_ENV\"\n      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0\n        with:\n          experimental: true\n          version: 2026.9.18\n          install_args: rust\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n        with:\n          cache-bin: false\n          shared-key: bundle-inputs",
+        "        run: echo 'MISE_EXEC_AUTO_INSTALL=true' >> \"$GITHUB_ENV\"\n      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0\n        with:\n          experimental: true\n          version: 2026.9.18\n          install_args: rust\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n        with:\n          cache-bin: false\n          shared-key: bundle-inputs",
     );
     assert_eq!(
         repo.workflow_errors(),
@@ -623,7 +623,7 @@ fn mise_steps_must_name_the_tools_they_install() {
         ]
     );
     // Options, their values and prefixes do not hide a bare install. The
-    // value options are mise 2026.9.4's global `-C/--cd`, `-E/--env` and
+    // value options are mise 2026.9.18's global `-C/--cd`, `-E/--env` and
     // `-j/--jobs`, and install's `-j/--jobs`, `--minimum-release-age` and
     // `--shared`.
     let script = |command: &str| {
@@ -675,7 +675,7 @@ fn mise_steps_must_name_the_tools_they_install() {
         assert!(repo.errors().is_empty(), "{named}: {:?}", repo.errors());
     }
     // `upgrade` and `bootstrap` also install every configured tool when
-    // given none (mise 2026.9.4 `docs/cli/upgrade.md`, `docs/cli/bootstrap.md`:
+    // given none (mise 2026.9.18 `docs/cli/upgrade.md`, `docs/cli/bootstrap.md`:
     // phase 6, versioned tools).
     for (bare, subcommand) in [
         ("mise upgrade", "upgrade"),

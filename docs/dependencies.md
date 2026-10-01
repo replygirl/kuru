@@ -93,21 +93,26 @@ license. The connector package carries the crate and asset MIT attributions in
 | `oxlint` (docs app) | `1.85.0` |
 | Cocogitto (delivery package) | `7.0.0` |
 | Communiqué (delivery package) | `1.4.2` |
-| mise (root `min_version` and CI) | `2026.9.4` |
+| mise (CI; root `min_version` soft) | `2026.9.18` |
 
 mr-boxington's exact pin and signed lock entries cover every supported platform.
 
-mise stays at `2026.9.4`, behind its current release, 2026.9.14 (2026-09-25).
-Homebrew's `mise` formula was 2026.9.13 on the check date, so a higher root
-`min_version` would reject that installation. The lockfile procedure also relies
-on 2026.9.4 writing `provenance_verified`; see
+Every workflow installs exactly mise `2026.9.18`, the current release
+(2026-09-30). Root `min_version` is `{ hard = "2026.9.13", soft = "2026.9.18" }`:
+Homebrew's `mise` formula was 2026.9.15 on 2026-10-01, so a hard 2026.9.18
+floor would reject a package-manager installation, and lockfile behavior was
+measured identical from 2026.9.13 through 2026.9.18. The locks stay at lockfile
+revision 1 so that floor can read them; see
 [dependency and release updates](development.md#dependency-and-release-updates).
 Raise mise in its own change, updating these together: the root `mise.toml`
-`min_version`; every `jdx/mise-action` `version:` input in the CI, quality,
-native-tests and release workflows; the workflow mise-version check and fixture
-in `packages/kuru-delivery/src/published_windows.rs`; the delivery tests
-`tests/release_workflow.rs` and `tests/support/mise_acceptance.rs`; and the
-minimum mise version stated in development and installation docs.
+`min_version`; every `jdx/mise-action` `version:` input in the bundle-build, CI,
+quality, native-tests and release workflows; `WORKFLOW_MISE_VERSION` in
+`packages/kuru-delivery/src/published_windows.rs`; the delivery tests
+`tests/release_workflow.rs`, `tests/support/mise_acceptance.rs` and the
+`tests/repo_validation.rs` workflow fixtures; the mise CLI citations in
+`src/repo/workflows.rs` after rechecking them; every `mise.lock` through the
+documented refresh; and the minimum mise version stated in development and
+installation docs.
 
 Cospec is `0.8.2`, confirmed by its [GitHub release](https://github.com/aligned-team/cospec/releases/tag/v0.8.2). Its standalone executable embeds its supported OpenSpec version, 1.13.1 for this release. No project OpenSpec, Bun or Python dependency is required. The task-scoped compatibility preload remains necessary; see [development](development.md).
 

@@ -74,7 +74,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.4
+          version: 2026.9.18
           # Cospec is exercised by delivery's real standalone contract tests.
           install_args: rust github:aligned-team/cospec
         env:
@@ -197,7 +197,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.4
+          version: 2026.9.18
           install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -230,7 +230,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.4
+          version: 2026.9.18
           install_args: rust aqua:jdx/hk
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -301,7 +301,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.4
+          version: 2026.9.18
           install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -391,7 +391,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.4
+          version: 2026.9.18
           install_args: rust aqua:jdx/hk
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -427,7 +427,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.4
+          version: 2026.9.18
           install_args: rust aqua:jdx/hk
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -490,7 +490,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.4
+          version: 2026.9.18
           install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -564,7 +564,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.4
+          version: 2026.9.18
           install_args: rust aqua:jdx/hk
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -626,7 +626,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.4
+          version: 2026.9.18
           install_args: rust aqua:jdx/hk
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -666,7 +666,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.4
+          version: 2026.9.18
           install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
