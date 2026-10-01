@@ -110,8 +110,21 @@ impl Sandbox {
         Self::with_cache(&kuru_memory::test_support::warmed_cache_dir().await?)
     }
 
+    /// A sandbox with its own empty engine and store template cache, as on a
+    /// machine where Kuru has never run, and that cache's path.
+    fn fresh_cache() -> Result<(Self, PathBuf)> {
+        // The cache, one level down, receives the store template.
+        let root = kuru_memory::test_support::tempdir()?
+            .with_depth_budget(1 + kuru_memory::test_support::TEMPLATE_DEPTH);
+        let cache = root.path().join("fresh cache");
+        Ok((Self::in_root(root, &cache)?, cache))
+    }
+
     fn with_cache(cache: &std::path::Path) -> Result<Self> {
-        let root = kuru_memory::test_support::tempdir()?;
+        Self::in_root(kuru_memory::test_support::tempdir()?, cache)
+    }
+
+    fn in_root(root: kuru_memory::test_support::TempDir, cache: &std::path::Path) -> Result<Self> {
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project)?;
@@ -2393,6 +2406,46 @@ fn primary_screen_bytes(output: &[u8]) -> Result<&[u8]> {
     Ok(&output[..alternate])
 }
 
+/// Whether `directory` lists an entry whose name satisfies `matches`. Only
+/// the directory itself is listed and none of its entries is entered: an open
+/// renames or removes the stages and build stores this looks for.
+fn lists(directory: &std::path::Path, matches: impl Fn(&str) -> bool) -> Result<bool> {
+    let entries = match std::fs::read_dir(directory) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        entries => entries?,
+    };
+    for entry in entries {
+        if matches(&entry?.file_name().to_string_lossy()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The store template root of an engine cache.
+fn template_root(cache: &std::path::Path) -> PathBuf {
+    cache
+        .join(kuru_memory::provision::DOLT_VERSION)
+        .join("templates")
+}
+
+/// Fails unless the creating sentence was written and no other sentence was
+/// written after it: the creating sentence stays up for the rest of the open.
+fn assert_creating_kept(output: &[u8]) -> Result<()> {
+    use kuru::memory_activity::{CREATING, SENTENCES};
+    let creating = output
+        .windows(CREATING.len())
+        .position(|bytes| bytes == CREATING.as_bytes())
+        .context("the creating sentence was never written")?;
+    for sentence in SENTENCES.iter().filter(|sentence| **sentence != CREATING) {
+        ensure!(
+            !contains_bytes(&output[creating..], sentence.as_bytes()),
+            "{sentence:?} replaced the creating sentence"
+        );
+    }
+    Ok(())
+}
+
 /// After the last sentence the line is padded, then erased with `\r`, spaces
 /// and `\r`; no sentence bytes follow that erase. Other bytes, such as the
 /// first-run notice, may follow it.
@@ -2446,6 +2499,20 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
             |terminal| Ok(contains_bytes(&terminal.output, CREATING.as_bytes())),
         )?;
         std::fs::remove_file(&hold)?;
+        // The shared cache holds a warm store template, so the new project
+        // is copied from it into a stage that its first engine adopts: the
+        // creating sentence stays up through the copy and the adoption.
+        let memory = sandbox.data.join("memory");
+        terminal.wait(
+            "the new project's stage holding its template copy",
+            sandbox.startup_timeout,
+            |_| lists(&memory, |name| name.contains(".staging-")),
+        )?;
+        ensure!(
+            terminal.screen().contains(CREATING),
+            "the creating sentence is not on the screen during the copy"
+        );
+        assert_creating_kept(&terminal.output)?;
     }
     let expected = if expect_notice {
         vec!["KURU", "enter send", "Memory is ready at"]
@@ -2475,7 +2542,9 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
         contains_bytes(startup, CREATING.as_bytes()) == expect_notice,
         "the creating sentence belongs to the first run only"
     );
-    if !expect_notice {
+    if expect_notice {
+        assert_creating_kept(startup)?;
+    } else {
         // A reopen after the previous owner exited shows nothing else.
         for sentence in SENTENCES.iter().filter(|sentence| **sentence != OPENING) {
             ensure!(
@@ -2688,6 +2757,67 @@ fn real_pty_accepts_chat_navigation_commands_and_restores_terminal() -> Result<(
             .any(|session| { session.label == "hello from a terminal" && session.turns >= 1 })
     );
     Ok(())
+}
+
+/// The first launch on a machine with an empty cache builds the store
+/// template inside its open, then copies the new project from it. The owner
+/// is held where creation begins until the creating sentence is on the
+/// terminal; once released, the sentence stays up while the template's build
+/// store exists, and no other sentence replaces it before memory is ready and
+/// the line is erased.
+#[test]
+fn real_pty_first_launch_shows_the_creating_sentence_while_the_template_builds() -> Result<()> {
+    use kuru::memory_activity::CREATING;
+    let (sandbox, cache) = Sandbox::fresh_cache()?;
+    let templates = template_root(&cache);
+    let holds = sandbox.root.path().join("holds");
+    let hold = holds.join("CreatingDatabase.hold");
+    std::fs::create_dir(&holds)?;
+    std::fs::write(&hold, b"")?;
+    let mut command = sandbox.command("demo");
+    command.env(kuru_memory::test_support::OPEN_HOLD_DIR_ENV, &holds);
+    let mut terminal = Terminal::spawn(command, 35, 120)?;
+    terminal.wait(
+        "the creating sentence on the terminal",
+        sandbox.startup_timeout,
+        |terminal| Ok(contains_bytes(&terminal.output, CREATING.as_bytes())),
+    )?;
+    ensure!(
+        !lists(&templates, |_| true)?,
+        "the store template cache was used before creation began"
+    );
+    std::fs::remove_file(&hold)?;
+    terminal.wait(
+        "the store template's build store",
+        sandbox.startup_timeout,
+        |_| lists(&templates, |name| name.starts_with(".build-")),
+    )?;
+    ensure!(
+        terminal.screen().contains(CREATING),
+        "the creating sentence is not on the screen while the template builds"
+    );
+    assert_creating_kept(&terminal.output)?;
+    terminal.wait_composer_frame(&["KURU", "enter send"], sandbox.startup_timeout)?;
+    let startup = primary_screen_bytes(&terminal.output)?;
+    assert_creating_kept(startup)?;
+    assert_sentence_erased(startup)?;
+    ensure!(
+        !lists(&templates, |name| name.starts_with('.'))?,
+        "the template build left a transient entry"
+    );
+    let published = std::fs::read_dir(&templates)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|path| path.join("manifest.json").is_file())
+        .count();
+    ensure!(
+        published == 1,
+        "the first launch did not publish one store template"
+    );
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
 }
 
 #[derive(Clone)]

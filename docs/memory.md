@@ -320,6 +320,13 @@ starts. That first open does about as much work as building the store directly;
 every later new project skips the schema steps. The template is shared by every
 data directory that uses the same engine cache.
 
+While a new project is created, whether it is copied from the template, the
+template is built first, or the project is built directly, Kuru shows
+`Creating this project's memory…` (after `Getting Kuru's memory ready on this
+computer…` while a first launch unpacks the engine). Building the template is
+part of creating the project, so the sentence stays the same throughout and
+no other sentence is shown for it.
+
 A new project is built directly instead, running every schema step in its own
 staging directory (four database starts), when:
 

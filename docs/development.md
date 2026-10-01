@@ -410,7 +410,12 @@ Tests that pause or delay a cold staging job (migration hooks, the migrated
 stage pool delay) set `Creation::Cold`, since a template copy runs no
 migration. Tests of an empty, busy or damaged template set
 `OpenOptions::template_root` to a private root, so the shared template other
-fixtures copy is never disturbed.
+fixtures copy is never disturbed. A spawned-binary fixture that gives Kuru
+its own empty `memory.cache_dir` (a first launch on a fresh machine) has its
+first new project build the store template in that cache; the template's
+captured database repository belongs to no store, so the fixture root's
+depth budget (`TempDir::with_depth_budget`) is the cache directory's own depth
+plus `test_support::TEMPLATE_DEPTH`.
 
 `test_support::warm_runtime_cache()` warms both halves of the shared cache
 once per test process, before any fixture deadline: it provisions the engine,

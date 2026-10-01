@@ -55,9 +55,10 @@ deadlines or retries are part of this change.
   on a first launch never sees S3 clear or revert to another sentence while
   the template builds; no new sentence or stage. Add one real-PTY test for a
   first launch with an empty, unwarmed template cache showing S3 held through
-  the build, and confirm the already-landed warm-template case's PTY coverage
-  (`real_pty_accepts_chat_navigation_commands_and_restores_terminal`) still
-  shows S3 through the copy and adoption start.
+  the build, and extend the warm-template case's PTY coverage
+  (`real_pty_accepts_chat_navigation_commands_and_restores_terminal`) to
+  assert S3 while the copy's stage exists and that no later sentence replaces
+  it.
 
 ## Capabilities
 
@@ -92,8 +93,13 @@ None.
 - `docs/memory.md`, `apps/kuru-docs/concepts/memory.md`,
   `docs/development.md`: creation-path and fixture-budget documentation.
 - `apps/kuru-tui/tests/terminal.rs`: one new real-PTY test for the
-  first-launch build-then-copy path's activity sentence; no change to
+  first-launch build-then-copy path's activity sentence and a stronger
+  warm-copy assertion in `smoke`; no change to
   `apps/kuru-tui/src/memory_activity.rs` (no new sentence or stage).
+- `apps/kuru-tui/tests/cli.rs`, `trust.rs`, `embedded_runtime.rs` and
+  `test_support::TEMPLATE_DEPTH`: spawned-binary fixtures that give Kuru its
+  own empty engine cache now get the store template there, and raise their
+  fixture-guard depth budget for its captured repository.
 - No schema change, no new environment variable, no change to timeouts,
   deadlines, retries or the cold path's own start count (still 4, pending the
   separate restart-removal change).

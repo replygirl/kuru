@@ -1379,8 +1379,12 @@ const ENGINE_WARM_UP_TIMEOUT: Duration = Duration::from_secs(100);
 /// unfinished stage, at most 95 of the 4096-entry budget; CI's violations on
 /// Linux, macOS and Windows named the same 9-level `staging` and
 /// `eventsData`. A store's database repository, `data/kuru/.dolt`, is
-/// skipped once its store is recognised and needs no budget here.
-const FIXTURE_DEPTH_BUDGET: usize = 10;
+/// skipped once its store is recognised and needs no budget here. The first
+/// new project in that empty cache also builds the store template in it, at
+/// `<version>/templates/<key>/data`, a captured database repository that
+/// belongs to no store: the cache is three levels down, so the template's
+/// deepest directory is `3 + TEMPLATE_DEPTH` levels down, the deepest of all.
+const FIXTURE_DEPTH_BUDGET: usize = 3 + kuru_memory::test_support::TEMPLATE_DEPTH;
 
 #[cfg(windows)]
 async fn warm_up_powershell_engine(

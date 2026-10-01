@@ -156,27 +156,43 @@ lock; no new listener, process topology or binary version is introduced.
   for "this project's database is being created," including by a
   machine-first template build.
 
-- **Test coverage reuses #148's hold hook and PTY fixture; one new test, one
-  confirmed-sufficient existing test.** `real_pty_accepts_chat_navigation_commands_and_restores_terminal`
-  (`apps/kuru-tui/tests/terminal.rs`, via its `smoke(..., expect_notice: true)`
-  helper) already runs against `Sandbox::new()`, which warms the shared
-  engine *and* template cache synchronously
-  (`test_support::cache_dir` → `warm_runtime_cache` →
-  `warm_template_in`), holds the open at `CreatingDatabase` with
-  `KURU_TEST_MEMORY_OPEN_HOLD_DIR`/`CreatingDatabase.hold`, and asserts the
-  `CREATING` sentence is on the terminal before releasing the hold — this is
-  already the warm-template copy-and-adoption case for this change's
-  activity-sentence goal; it needs no new test, only re-running after this
-  change lands to confirm it still exercises the two-start path (not a
-  rewrite of the test). The build-then-copy (first launch, empty template
-  cache) case has no existing coverage: no PTY test in
-  `apps/kuru-tui/tests/terminal.rs` opens against an unwarmed, private cache
-  directory. This change adds one: a private `tempdir`-backed cache (not
-  `test_support::cache_dir()`'s shared warmed one), the same
-  `CreatingDatabase.hold` mechanism, and the same assertion that `CREATING`
-  is on the terminal while the hold is held, synchronized on a completed
-  frame per `AGENTS.md`; it releases the hold and lets the build-then-copy
-  path (three starts) finish to a ready frame.
+- **Test coverage reuses #148's hold hook and PTY fixture, and synchronises
+  on the creation's own directories.** Both PTY assertions hold the owner at
+  `CreatingDatabase` (`KURU_TEST_MEMORY_OPEN_HOLD_DIR`/`CreatingDatabase.hold`)
+  until the complete `CREATING` bytes are on the terminal, release it, then
+  wait until the creation is observably in progress by listing only the
+  parent directory (never entering a stage or build store, which an open
+  renames or removes): a `.build-*` entry in the private cache's
+  `<engine version>/templates/` for the first launch
+  (`real_pty_first_launch_shows_the_creating_sentence_while_the_template_builds`,
+  new, with a private empty cache), and a `*.staging-*` entry beside the
+  project store for the warm-template copy (`smoke(..., expect_notice: true)`
+  in `real_pty_accepts_chat_navigation_commands_and_restores_terminal`,
+  extended). At that point the screen shows `CREATING` and no other sentence
+  was written after it; once the composer frame is complete the startup bytes
+  still hold no later sentence and the line is erased. The first-launch test
+  also checks the template was published and nothing transient remains. The
+  existing non-PTY `cli_new_project_shows_engine_preparation_then_creation_and_keeps_json_on_stdout`
+  now also runs through the build (its empty cache) and still ends on
+  `CREATING`. The cold fallback after `Outcome::Cold` reports only
+  `OpeningDatabase` (R7, keep) and, for a recovered older stage,
+  `UpgradingDatabase` (R6 keeps S3), so it shows no other sentence either.
+  No chat-harness spec delta: its S3 condition, "the project has no active
+  memory and Kuru creates it", already covers a template build inside that
+  creation.
+
+- **Spawned-binary fixtures with their own empty cache raise their depth
+  budget.** The first new project in such a cache builds the template there,
+  and its captured database repository belongs to no store, so the fixture
+  guard's scan descends into it: `<version>/templates/<key>/data/kuru/.dolt/stats/.dolt/noms/oldgen`,
+  ten levels below the cache. `test_support::TEMPLATE_DEPTH` names that
+  depth; kuru-tui's fresh-cache sandboxes (`cli.rs`, `terminal.rs`), the
+  trust sandbox (`trust.rs`, whose engine cache is the data directory's
+  default `tools/dolt`) and the packaged acceptance fixture
+  (`embedded_runtime.rs`) add it to their cache's own depth. Without it those fixtures failed teardown on this branch with
+  "deeper than the scan's 8-level depth budget". Rejected: teaching the scan
+  to skip `templates/`, which would stop it seeing a build store left by a
+  failed build.
 
 ## Risks / Trade-offs
 

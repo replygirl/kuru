@@ -619,4 +619,109 @@ mod tests {
     async fn cancelled_open_during_template_copy_keeps_startup_lock_until_reap() -> Result<()> {
         cancel_at_the_ready_marker('8', Creation::Default).await
     }
+
+    /// The first project for a key is cancelled while its creation worker is
+    /// inside the template build. The worker owns the startup lock and runs
+    /// on: it publishes the template, copies the project from it, adopts and
+    /// marks the stage ready, and returns the lock only after its engines
+    /// were reaped. The next open reuses that ready stage.
+    #[tokio::test]
+    async fn cancelled_open_during_template_build_finishes_and_leaves_a_ready_stage() -> Result<()>
+    {
+        use crate::store::creation_template::hooks::{HOOKS, Hooks, Pause};
+        // The private templates root, one level down, holds the template's
+        // captured database repository.
+        let root = crate::test_support::tempdir()?
+            .with_depth_budget(1 + crate::test_support::TEMPLATE_DEPTH);
+        let canonical = fs::canonicalize(root.path())?;
+        let templates = root.path().join("templates");
+        let mut options = crate::test_support::warmed_open_options(
+            root.path().join("data"),
+            format!("project/{}", "9".repeat(64)),
+        )
+        .await?;
+        options.template_root = Some(templates.clone());
+        let bound =
+            crate::test_support::fresh_open_budget_of(crate::test_support::FreshOpen::FirstProject);
+        let pause = Arc::new(Pause::default());
+        let hooks = Hooks {
+            pause: Some(pause.clone()),
+            ..Hooks::default()
+        };
+        let opening = tokio::spawn(HOOKS.scope(
+            hooks,
+            crate::test_support::spawn_gated_open(options.clone()),
+        ));
+        if tokio::time::timeout(bound, pause.reached.notified())
+            .await
+            .is_err()
+        {
+            opening.abort();
+            let _ = opening.await;
+            bail!("the first project did not reach its template build's pause in {bound:?}");
+        }
+        opening.abort();
+        let cancelled = opening.await.is_err_and(|error| error.is_cancelled());
+        // Probe the lock before resuming, so the worker is still paused.
+        let held = try_startup_lock(&options, &canonical)
+            .await
+            .map(|acquired| acquired.is_none());
+        pause.resume.notify_one();
+        let acquired = second_opener_acquires(&options, &canonical, bound).await;
+        let reaped = await_reaped(&canonical, bound).await;
+        ensure!(
+            cancelled,
+            "the opener finished instead of being cancelled in the build"
+        );
+        ensure!(
+            held?,
+            "the startup lock was free while the creation worker was inside the build"
+        );
+        let live = acquired?;
+        reaped?;
+        ensure!(
+            live.is_empty(),
+            "a second opener acquired the startup lock before the creation worker's engines \
+             were reaped: {live:?}"
+        );
+        let key = super::super::creation_template::compiled_key();
+        ensure!(
+            templates.join(key).join("manifest.json").is_file(),
+            "the cancelled opener's worker did not publish the template"
+        );
+        let directory = project_directory(&options.data_dir, &options.project_scope)?;
+        let name = format!(
+            "{}.staging-",
+            directory
+                .file_name()
+                .context("project store has no name")?
+                .to_string_lossy()
+        );
+        let stages = fs::read_dir(directory.parent().context("project store has no parent")?)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|stage| stage.to_string_lossy().starts_with(&name))
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            matches!(stages.as_slice(), [stage] if stage.join("ready.json").is_file()),
+            "the worker did not leave one ready stage: {stages:?}"
+        );
+        let store = tokio::time::timeout(
+            bound,
+            crate::test_support::spawn_gated_open(options.clone()),
+        )
+        .await
+        .context("the open after a cancelled template build did not finish")??;
+        store.close().await?;
+        let template = crate::server::read_identity_view(&directory)?.template;
+        ensure!(
+            template.as_deref() == Some(key) && !directory.with_file_name("interrupted").exists(),
+            "the next open did not reuse the ready template stage (store template {template:?})"
+        );
+        Ok(())
+    }
 }

@@ -2,39 +2,53 @@
 
 ## 1. A new project with a warm template opens with two engine starts [critical]
 
-- [ ] 1.1 @integration (agent) run `warm_template_new_project_uses_two_engine_starts_and_no_migration` against a real Dolt engine with a pre-published template for the process's compiled key -> `engine_ledger` records exactly 2 starts, no new `kuru_migration_*` branch is created, and `Ready` is reported once.
-- [ ] 1.2 @integration (agent) run `second_project_reuses_template_without_build` immediately after 1.1 in the same shared cache -> no `.build-*` directory is created for the second project, and its own ledger also shows 2 starts.
+- [x] 1.1 @integration (agent) run `warm_template_new_project_uses_two_engine_starts_and_no_migration` against a real Dolt engine with the warmed shared template -> `engine_ledger` records exactly 2 starts under the fixture, the store's histories equal the template's plus one adoption commit per ref (no migration ran), no template-era revision is pooled, `Ready` is reported once and the shared template is unchanged; observed 2026-10-01 on macOS: passed
+- [x] 1.2 @integration (agent) run `second_project_reuses_template_without_build` against a private template root the first project built -> the second project records 2 starts, no further build start under the template root, and the template root's entries and published identity are unchanged; observed 2026-10-01 on macOS: passed
 
 ## 2. The first project on a fresh machine builds the template once, in three starts [critical]
 
-- [ ] 2.1 @integration (agent) run `first_project_builds_template_once_and_copies_with_three_starts` against a real engine with an empty, private template root -> `engine_ledger` records exactly 3 starts and the schema-migration chain executes exactly once.
-- [ ] 2.2 @integration (agent) run `concurrent_new_projects_never_wait_for_a_template_build` with P1 paused inside its build via an injected hook -> P2 (a different project needing the same key) completes on the cold path, with the cold path's own start count, and never observes a `.build-*` or `.stage-*` directory belonging to P1.
+- [x] 2.1 @integration (agent) run `first_project_builds_template_once_and_copies_with_three_starts` with an empty, private template root -> `engine_ledger` records exactly 3 starts, exactly 1 of them under the template root (one build engine, chain once), the store is template-born, and the root holds only the published template and its lock file; observed 2026-10-01 on macOS: passed
+- [x] 2.2 @integration (agent) run `concurrent_new_projects_never_wait_for_a_template_build` with P1 paused inside its build engine -> P2 (a different project, same key) completes on the cold path with 4 starts and cold histories while P1 is still paused, leaves the template root's entries exactly as it found them (P1's `.build-*` included) and preserves no stage; P1 then publishes and completes with 3 starts; observed 2026-10-01 on macOS: passed
 
 ## 3. Ineligible and failing templates fall back to the cold path without a caller-visible error [critical]
 
-- [ ] 3.1 @integration (agent) run `template_lock_errors_send_the_opener_cold` with an injected lock-open error, a `TryLockError::Error`, and an identity-verification failure, each on a real engine -> each open completes on the cold path with the cold path's own start count and returns `Ready`, never a template-specific error.
-- [ ] 3.2 @integration (agent) run `template_failing_structure_is_quarantined_and_open_goes_cold` with a manifest that fails its structural check -> the open completes on the cold path, and a manifest *read* error (not a verdict) leaves the template in place untouched.
-- [ ] 3.3 @integration (agent) run a legacy-import and a configured-`dolt_binary` open against a machine whose cache already holds a published template for the compiled key -> `engine_ledger` shows no `templates/` filesystem access for either open and both take the unchanged cold path.
+- [x] 3.1 @integration (agent) run `template_lock_errors_and_busy_locks_send_the_opener_cold` with an injected lock-file open error, `TryLockError::Error`, lock verification failure, manifest read error, and a key lock held exclusively by another holder -> each open succeeds on the cold path with 4 starts and cold histories, the published template is unchanged and nothing is quarantined or preserved; observed 2026-10-01 on macOS: passed
+- [x] 3.2 @integration (agent) run `damaged_templates_send_the_opener_cold_and_preserve_copy_remnants` with a structural verdict, a digest mismatch mid-copy and an injected read error mid-copy -> each open succeeds cold with 4 starts; the structural verdict quarantines before any copy and preserves nothing; the digest mismatch preserves one unstarted copy remnant (no identity, 0 starts) and quarantines; the read error preserves the remnant and leaves the template published; observed 2026-10-01 on macOS: passed
+- [x] 3.3 @integration (agent) run `legacy_import_and_configured_binary_take_cold_path` -> a configured `dolt_binary` and a legacy import each open cold with 4 starts, the import is recorded in the activation record, and the private template root is never created; observed 2026-10-01 on macOS: passed
 
-## 4. Locks are released only after the creation worker's engine is reaped
+## 4. Locks are released only after the creation worker's engines are reaped [critical]
 
-- [ ] 4.1 @integration (agent) run `cancelled_open_during_template_copy_keeps_startup_lock_until_reap` (open cancelled mid-copy, real engine) -> a second opener of the same project acquires the startup lock only after the ledger records the first worker's engine reap.
-- [ ] 4.2 @integration (agent) run the equivalent cancellation test for the build-then-copy path -> the template key's exclusive lock is likewise held until the build engine's reap, and the next exclusive-lock holder sweeps the abandoned build directory rather than waiting on it.
+- [x] 4.1 @integration (agent) run `cancelled_open_during_template_copy_keeps_startup_lock_until_reap` (opener cancelled at the copy's ready-marker boundary) -> a second opener acquires the startup lock only when the ledger shows no live engine under the fixture, and the next open preserves the unready stage; observed 2026-10-01 on macOS: passed
+- [x] 4.2 @integration (agent) run `cancelled_open_during_template_build_finishes_and_leaves_a_ready_stage` (first project's opener cancelled while its worker is paused inside the build engine) -> the startup lock is held while paused; after resuming, the worker publishes the template and leaves one ready stage, a second opener acquires the startup lock only after every engine is reaped, and the next open reuses the ready stage (template-born, nothing preserved); observed 2026-10-01 on macOS: passed
+- [x] 4.3 @integration (agent) run the existing `cancelled_build_releases_key_lock_only_after_reap` (#147, the build called directly) -> the key's exclusive lock is acquirable only once the build engine was reaped; observed 2026-10-01 on macOS: passed
 
-## 5. Unwarmed and build-inside-open fixtures are caught, not masked
+## 5. Verdicts on the copy's own engine and engine failures
 
-- [ ] 5.1 @integration (agent) extend the fixture teardown class-guard test to an unopted-in fixture whose open takes the new build-then-copy path -> the guard fails that fixture, naming the build, exactly as it already does for the existing warm-copy case.
-- [ ] 5.2 @unit (agent) run the extended `fresh_open_budget` and `fixture_deadline` unit tests covering the new 2-start and 3-start cases -> both pass with the new budget constants and the existing 4-start cold-path case unchanged.
+- [x] 5.1 @integration (agent) run `shape_verdict_on_the_copy_fails_the_open_and_quarantines_the_template` with a published template holding an extra branch -> the open fails with the typed `TemplateVerdict` ("unexpected branch") after 1 start, no active directory, the unready template stage preserved, the judged template quarantined; the next new project rebuilds and copies (2 starts in its own directory); observed 2026-10-01 on macOS: passed
+- [x] 5.2 @integration (agent) run `engine_failure_on_the_copy_preserves_the_stage_and_keeps_the_template` (ready-marker observer closed before release) -> the open fails without a verdict, the unready stage is preserved, the template is published unchanged and nothing quarantined; the next new project copies with 2 starts; observed 2026-10-01 on macOS: passed
 
-## 6. No regression to existing-project or cold-path behavior
+## 6. Fixture class guards are live
 
-- [ ] 6.1 @regression (agent) run the full existing `packages/kuru-memory` test suite (`mise run //packages/kuru-memory:test`) after the selector lands -> every existing-project-open and cold-path test (including `temporary_cold()` call sites) passes with its start count unchanged.
+- [x] 6.1 @integration (agent) run `fixture_open_that_builds_the_shared_template_fails_teardown` (child process with a private shared cache, options claiming a warm-up) -> the child's open builds the shared template in 3 starts (2 in the project, 1 build) and its fixture root's teardown fails naming the build; observed 2026-10-01 on macOS: passed
+- [x] 6.2 @integration (agent) run `test_template_build_copies_the_store_template_with_two_starts` -> every new test-template source store opens with 2 starts and the shared store template is unchanged; observed 2026-10-01 on macOS: passed
+- [x] 6.3 @unit (agent) run `fresh_open_budgets_follow_each_creation_path` and `single_stall_defaults_match_the_reviewed_bounds` -> (starts, closes) are (2,1), (3,2), (4,3); each path's budget adds one start and close; the default fresh-open budget and `fixture_deadline` keep the cold four-start values; observed 2026-10-01 on macOS: passed
 
 ## 7. Activity sentence covers the template path [critical]
 
-- [ ] 7.1 @integration (agent) run the new first-launch real-PTY test (task 8.2, private unwarmed cache) -> the terminal frame contains `Creating this project's memory…` while the hold file is present and the build-then-copy path has not yet reached `ready.json`, the sentence is erased by the ready frame, and no other sentence from `memory_activity::SENTENCES` appears before it.
-- [ ] 7.2 @integration (agent) re-run `real_pty_accepts_chat_navigation_commands_and_restores_terminal` (its `expect_notice: true` `smoke` call) -> the terminal frame still contains `Creating this project's memory…` across the warm-template copy-and-adoption start (two engine starts via the warmed shared cache), confirming the existing coverage from #148 remains valid against this change's selector.
+- [x] 7.1 @e2e (agent) run `real_pty_first_launch_shows_the_creating_sentence_while_the_template_builds` (real PTY, private empty cache, owner held at `CreatingDatabase`) -> after release, while the cache's `templates/` lists a `.build-*` entry, the screen shows `Creating this project's memory…` and no other sentence was written after it; at the completed composer frame the startup bytes hold no later sentence, the line is erased, one template is published and no transient entry remains; observed 2026-10-01 on macOS: passed
+- [x] 7.2 @e2e (agent) run `real_pty_accepts_chat_navigation_commands_and_restores_terminal` with `smoke` extended -> on the first run (warmed shared cache), while the project's `*.staging-*` copy exists the screen shows `Creating this project's memory…` and no later sentence replaces it before the erase; observed 2026-10-01 on macOS: passed
+- [x] 7.3 @e2e (agent) mutation check: report `WaitingForProjectOwnership` in place of `OpeningDatabase` before the creation worker, then run 7.1 -> the test fails naming the waiting sentence as having replaced the creating sentence; observed 2026-10-01 on macOS: failed as expected ("Waiting for another copy of Kuru to finish with this project's memory…" replaced the creating sentence), mutation reverted
+- [x] 7.4 @integration (agent) run `cli_new_project_shows_engine_preparation_then_creation_and_keeps_json_on_stdout` (empty cache, now building the template) -> the last sentence before ready is still `Creating this project's memory…`; observed 2026-10-01 on macOS: passed
 
-## 8. Documentation describes the new creation path
+## 8. No regression to existing-project, cold-path or spawned-binary fixtures
 
-- [ ] 8.1 @manual (human) review `docs/memory.md`, `apps/kuru-docs/concepts/memory.md` and the fixture-expectations section of `docs/development.md` against the merged selector behavior -> each accurately states where a new project's data comes from, what the first launch per machine and key pays, and the new 2-start/3-start fixture budgets.
+- [x] 8.1 @regression (agent) run `mise run //packages/kuru-memory:test` -> every test passes; observed 2026-10-01 on macOS: exit 0, lib 515 passed, 0 failed, 4 ignored
+- [x] 8.2 @regression (agent) run `mise run //apps/kuru-tui:test` and `mise run //packages/kuru-runtime:test` -> every test passes, including the fresh-cache fixtures whose depth budgets now cover the store template; observed 2026-10-01 on macOS: both exit 0 (kuru-runtime 220 passed; kuru-tui every target passed after the trust fixture depth fix)
+
+## 9. Documentation describes the new creation path
+
+- [~] 9.1 @manual (human) review `docs/memory.md`, `apps/kuru-docs/concepts/memory.md` and the fixture section of `docs/development.md` expecting: each states where a new project's data comes from, what the first launch per machine and key pays, the sentence a user sees, what a damaged template does, and the fixture start counts. -> defer: the maintainer reviews the docs in the pull request
+
+## 10. Open-time harness (release build)
+
+- [ ] 10.1 @benchmark (agent) run the `ci/open-time-report` harness N=10 against release builds of the base and head -> engine starts per case go from 4/1/0/4 to 3/1/0/2 (first-launch, cold-existing, warm-reopen, new-project).

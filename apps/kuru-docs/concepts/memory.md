@@ -222,7 +222,9 @@ after an update that changes the schema or the engine, builds the template
 before copying from it, which takes about as long as building a store directly
 did. Every later new project opens faster, with two database starts instead of
 four. A project that imports older SQLite data, or a configured development
-engine (`memory.dolt_binary`), is still built directly.
+engine (`memory.dolt_binary`), is still built directly. Whichever way a new
+project is created, including while the first launch builds the template,
+Kuru shows "Creating this project's memory…" until it is ready.
 
 If the template is busy (another Kuru process is building it) or cannot be
 used, the new project is simply built directly, with a warning in the memory

@@ -126,6 +126,15 @@ pub fn tempdir() -> Result<TempDir> {
     TempDir::new("kuru-fixture-", None)
 }
 
+/// The directory levels a store template occupies beneath the engine cache
+/// that holds it, down to its deepest captured directory:
+/// `<engine version>/templates/<key>/data/kuru/.dolt/stats/.dolt/noms/oldgen`.
+/// The first new project in an empty engine cache builds the template there,
+/// so a fixture root that holds its own cache raises its depth budget
+/// ([`TempDir::with_depth_budget`]) to the cache directory's own depth plus
+/// this.
+pub const TEMPLATE_DEPTH: usize = 10;
+
 /// Warm the shared test cache once per test process, before any fixture's
 /// own deadline: provision the bundled Dolt runtime, then make sure this
 /// build's store template is published beside it. Returns the engine.
