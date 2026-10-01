@@ -13,13 +13,19 @@ use kuru_core::Mode;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Executor, MySql, MySqlConnection, MySqlPool, Row};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 use crate::server::Server;
 
-pub(super) const CURRENT_VERSION: i32 = 7;
+pub(super) const CURRENT_VERSION: i32 = 8;
 pub(super) const USAGE_CURRENT_VERSION: i32 = 4;
+/// The main schema step that introduces publication records: every main step
+/// at or above it records its own publication inside its attempt commit.
+const PUBLICATION_VERSION: i32 = 8;
+/// The format of a `kuru_migration_publications` row. The store template key
+/// covers it, so a format change alone also rebuilds the template.
+pub(super) const PUBLICATION_RECORD_FORMAT: i8 = 1;
 /// The engine database every branch and revision database name qualifies.
 const DATABASE: &str = "kuru";
 const RESERVED_PREFIX: &str = "kuru_migration_";
@@ -37,17 +43,21 @@ const ATTEMPT_BEGIN: &str = "START TRANSACTION";
 const ATTEMPT_ADVANCE: &str = "UPDATE kuru_schema SET version = ? WHERE id = 1 AND version = ?";
 const ATTEMPT_RECEIPT: &str =
     "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (?, ?, ?, ?)";
+/// One publication record, written in the attempt's own transaction after its
+/// receipt so it reaches main only with the step's exact-base fast-forward.
+const ATTEMPT_RECORD: &str = "INSERT INTO kuru_migration_publications (version, branch, base, operation, definition_digest, record_format) VALUES (?, ?, ?, ?, ?, ?)";
 const ATTEMPT_COMMIT: &str = "CALL DOLT_COMMIT('-Am', ?, '--author', ?)";
 /// The attempt commit message around its target version and operation.
 const ATTEMPT_MESSAGE: [&str; 3] = ["Upgrade Kuru memory schema ", " [", "]"];
 const ATTEMPT_END: &str = "COMMIT";
 const PUBLISH_MERGE: &str = "CALL DOLT_MERGE(?, '--ff-only')";
 /// Every migration-path statement and name the store template key covers.
-pub(super) const TEMPLATE_KEY_STATEMENTS: [&str; 14] = [
+pub(super) const TEMPLATE_KEY_STATEMENTS: [&str; 15] = [
     BRANCH_CREATE,
     ATTEMPT_BEGIN,
     ATTEMPT_ADVANCE,
     ATTEMPT_RECEIPT,
+    ATTEMPT_RECORD,
     ATTEMPT_COMMIT,
     ATTEMPT_MESSAGE[0],
     ATTEMPT_MESSAGE[1],
@@ -487,7 +497,23 @@ const V7: Definition = Definition {
     ],
 };
 
-const DEFINITIONS: &[Definition] = &[V2, V3, V4, V5, V6, V7];
+const V8: Definition = Definition {
+    from: 7,
+    to: 8,
+    id: "kuru.memory.migration-publications.v8",
+    sql: &[
+        "CREATE TABLE kuru_migration_publications (version INT PRIMARY KEY, branch VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL UNIQUE, base CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, operation CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, definition_digest CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, record_format TINYINT NOT NULL)",
+    ],
+    transform: "published main branches this open fully classified acquire publication records; no record is inferred from a branch name",
+    postcondition: "version=8;one publication record per published main step;v7 session lifecycle and v4 usage registry retained",
+    failed_status: &[StatusRow {
+        table: "kuru_migration_publications",
+        staged: 0,
+        status: "new table",
+    }],
+};
+
+const DEFINITIONS: &[Definition] = &[V2, V3, V4, V5, V6, V7, V8];
 
 #[derive(Clone, Copy)]
 struct Registry {
@@ -805,15 +831,55 @@ async fn validate_schema_on(
     if found >= 7 {
         validate_session_lifecycle_shape(connection).await?;
     }
+    if found >= PUBLICATION_VERSION {
+        validate_publication_shape(connection).await?;
+    }
     #[cfg(test)]
-    if registry.current >= 8 && found >= 8 {
+    if registry.current >= 9 && found >= 9 {
         bounded_query(
-            sqlx::query("SELECT marker FROM kuru_migration_test_v8 LIMIT 0")
+            sqlx::query("SELECT marker FROM kuru_migration_test_v9 LIMIT 0")
                 .fetch_all(&mut *connection),
         )
         .await?;
     }
     Ok(())
+}
+
+async fn validate_publication_shape(connection: &mut MySqlConnection) -> Result<()> {
+    bounded_query(
+        sqlx::query("SELECT version, branch, base, operation, definition_digest, record_format FROM kuru_migration_publications LIMIT 0")
+            .fetch_all(&mut *connection),
+    )
+    .await?;
+    validate_columns(
+        connection,
+        "kuru_migration_publications",
+        &[
+            ("version", "int", None, false),
+            ("branch", "varchar", Some(128), false),
+            ("base", "char", Some(32), false),
+            ("operation", "char", Some(36), false),
+            ("definition_digest", "char", Some(64), false),
+            ("record_format", "tinyint", None, false),
+        ],
+    )
+    .await?;
+    validate_index(
+        connection,
+        "kuru_migration_publications",
+        "PRIMARY",
+        true,
+        &["version"],
+    )
+    .await?;
+    validate_index(
+        connection,
+        "kuru_migration_publications",
+        "branch",
+        true,
+        &["branch"],
+    )
+    .await
 }
 
 async fn validate_session_lifecycle_shape(connection: &mut MySqlConnection) -> Result<()> {
@@ -1343,13 +1409,14 @@ async fn clean(pool: &MySqlPool) -> Result<()> {
 async fn authority_working_set(pool: &MySqlPool) -> Result<()> {
     let rows = bounded_query(
         sqlx::query(
-            "SELECT table_name, staged, status FROM dolt_status WHERE BINARY table_name = BINARY 'kuru_schema' OR BINARY table_name = BINARY 'kuru_migrations' ORDER BY BINARY table_name, staged, BINARY status LIMIT 3",
+            "SELECT table_name, staged, status FROM dolt_status WHERE BINARY table_name = BINARY 'kuru_schema' OR BINARY table_name = BINARY 'kuru_migrations' OR BINARY table_name = BINARY 'kuru_migration_publications' ORDER BY BINARY table_name, staged, BINARY status LIMIT 4",
         )
         .fetch_all(pool),
     )
     .await?;
     ensure!(
         rows.is_empty(),
+        // Publication records are receipt authority: one message covers them.
         "Dolt memory schema or migration receipt authority has uncommitted changes"
     );
     Ok(())
@@ -1549,6 +1616,7 @@ pub(super) async fn validate_usage(usage: &MySqlPool) -> Result<()> {
         USAGE_RESERVED_PREFIX,
     )
     .await
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -1579,7 +1647,9 @@ async fn upgrade_in(
     loop {
         let found = validate_supported_with(registry, main).await?;
         inventory_in(registry, main, prefix).await?;
-        classify_historical_attempts_in(registry, main, found, prefix).await?;
+        // The step that introduces publication records records every branch
+        // this classification accepted as published, and nothing else.
+        let classified = classify_historical_attempts_in(registry, main, found, prefix).await?;
         if found == registry.current {
             return Ok(());
         }
@@ -1593,14 +1663,31 @@ async fn upgrade_in(
         if prefix == RESERVED_PREFIX && definition.to == V5.to {
             ensure_usage_branch_at_v4(main, &base).await?;
         }
-        let (branch, operation, ready) =
-            discover_current_attempt_in(registry, server, main, definition, &base, hooks, prefix)
-                .await?;
+        let published = classified.published.as_slice();
+        let (branch, operation, ready) = discover_current_attempt_in(
+            registry,
+            server,
+            main,
+            definition,
+            &StepBase {
+                base: &base,
+                published,
+            },
+            hooks,
+            prefix,
+        )
+        .await?;
+        let attempt_record = AttemptRecord {
+            branch: &branch,
+            base: &base,
+            published,
+        };
         if ready {
             let attempt = server.pool(&branch).await?;
             let inspected = async {
                 let target = revision(&attempt).await?;
-                validate_attempt(registry, &attempt, definition, operation, &base).await?;
+                validate_attempt(registry, &attempt, definition, operation, &attempt_record)
+                    .await?;
                 Ok(target)
             }
             .await;
@@ -1611,9 +1698,17 @@ async fn upgrade_in(
         let attempt = server.pool(&branch).await?;
         let built = async {
             hooks.reach(MigrationBoundary::BeforeDdl).await?;
-            build_attempt(registry, &attempt, definition, operation, hooks).await?;
+            build_attempt(
+                registry,
+                &attempt,
+                definition,
+                operation,
+                &attempt_record,
+                hooks,
+            )
+            .await?;
             let target = revision(&attempt).await?;
-            validate_attempt(registry, &attempt, definition, operation, &base).await?;
+            validate_attempt(registry, &attempt, definition, operation, &attempt_record).await?;
             Ok(target)
         }
         .await;
@@ -1653,7 +1748,66 @@ async fn classify_historical_attempts(
     main: &MySqlPool,
     current: i32,
 ) -> Result<()> {
-    classify_historical_attempts_in(registry, main, current, RESERVED_PREFIX).await
+    classify_historical_attempts_in(registry, main, current, RESERVED_PREFIX)
+        .await
+        .map(|_| ())
+}
+
+/// A retained main attempt that classification accepted as a clean, published
+/// step: the evidence a publication record is written from.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct Published {
+    version: i32,
+    branch: String,
+    /// The head's sole parent: the exact base the step was built on.
+    base: String,
+    operation: Uuid,
+}
+
+/// One `kuru_migration_publications` row, as stored.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct Record {
+    version: i32,
+    branch: String,
+    base: String,
+    operation: String,
+    definition_digest: String,
+    record_format: i8,
+}
+
+impl Record {
+    /// The record a published step carries.
+    fn of(registry: Registry, published: &Published) -> Result<Self> {
+        Ok(Self {
+            version: published.version,
+            branch: published.branch.clone(),
+            base: published.base.clone(),
+            operation: published.operation.hyphenated().to_string(),
+            definition_digest: digest(registry.definition(published.version)?),
+            record_format: PUBLICATION_RECORD_FORMAT,
+        })
+    }
+}
+
+/// Whether classification verifies a recorded branch by its record. Only the
+/// parity and measurement fixtures ignore records, to reach the verdict full
+/// classification gives the same store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Records {
+    Use,
+    #[cfg(test)]
+    Ignore,
+}
+
+/// What one classification pass accepted and how.
+#[derive(Debug, Default)]
+struct Classification {
+    /// Every clean completed branch accepted as published, by version.
+    published: Vec<Published>,
+    /// Branches accepted by their publication record.
+    by_record: usize,
+    /// Branches classified in full.
+    full: usize,
 }
 
 /// Classify every retained attempt at or below `current` from the caller's
@@ -1667,10 +1821,20 @@ async fn classify_historical_attempts_in(
     main: &MySqlPool,
     current: i32,
     prefix: &str,
-) -> Result<()> {
+) -> Result<Classification> {
+    classify_historical_attempts_with(registry, main, current, prefix, Records::Use).await
+}
+
+async fn classify_historical_attempts_with(
+    registry: Registry,
+    main: &MySqlPool,
+    current: i32,
+    prefix: &str,
+    records: Records,
+) -> Result<Classification> {
     let mut revisions = RevisionReader::default();
     let classified =
-        classify_retained_attempts(registry, main, &mut revisions, current, prefix).await;
+        classify_retained_attempts(registry, main, &mut revisions, current, prefix, records).await;
     after_cleanup(classified, revisions.close().await)
 }
 
@@ -1680,9 +1844,21 @@ async fn classify_retained_attempts(
     revisions: &mut RevisionReader,
     current: i32,
     prefix: &str,
-) -> Result<()> {
+    records: Records,
+) -> Result<Classification> {
     let main_head = revision(main).await?;
-    for name in reserved_names_in(main, prefix).await? {
+    let refs = reserved_refs_in(main, prefix).await?;
+    // Records exist on main from the step that introduces them; a usage
+    // ledger's own attempts never carry one.
+    let recorded =
+        if records == Records::Use && prefix == RESERVED_PREFIX && current >= PUBLICATION_VERSION {
+            verified_records(registry, main, current, &refs).await?
+        } else {
+            BTreeMap::new()
+        };
+    let mut classification = Classification::default();
+    for reference in refs {
+        let name = reference.name;
         let (target, operation) = parse_attempt_in(prefix, &name)?;
         ensure!(
             target <= current + 1,
@@ -1691,12 +1867,28 @@ async fn classify_retained_attempts(
         if target > current {
             continue;
         }
+        if let Some(record) = recorded.get(&name) {
+            // `verified_records` bound this ref to its published head.
+            ensure!(
+                reference.hash != main_head || target == current,
+                "historical Dolt migration branch unexpectedly names active main"
+            );
+            classification.by_record += 1;
+            classification.published.push(Published {
+                version: target,
+                branch: name,
+                base: record.base.clone(),
+                operation,
+            });
+            continue;
+        }
+        classification.full += 1;
         let definition = registry.definition(target)?;
         let working_set = WorkingSet::Branch(&name);
         let head = branch_head(main, &name).await?;
         let head_version = version_as_of(main, &head).await?;
         let dirty = working_set_changes(main, working_set).await?;
-        let outcome = if dirty == 0 {
+        let (outcome, published) = if dirty == 0 {
             // A clean branch's working set is its head commit.
             revisions
                 .validate(main, registry, &head, definition.to)
@@ -1710,7 +1902,10 @@ async fn classify_retained_attempts(
             revisions
                 .validate(main, registry, &parent, definition.from)
                 .await?;
-            ancestor(main, &head).await? && ancestor(main, &parent).await?
+            (
+                ancestor(main, &head).await? && ancestor(main, &parent).await?,
+                Some(parent),
+            )
         } else {
             ensure!(
                 head_version == definition.from,
@@ -1723,7 +1918,7 @@ async fn classify_retained_attempts(
                 retained_failed_shape_in(main, working_set, definition).await?,
                 "dirty historical Dolt migration branch has an unexpected working set"
             );
-            ancestor(main, &head).await?
+            (ancestor(main, &head).await?, None)
         };
         ensure!(
             outcome,
@@ -1733,8 +1928,285 @@ async fn classify_retained_attempts(
             head != main_head || target == current,
             "historical Dolt migration branch unexpectedly names active main"
         );
+        if let Some(base) = published {
+            classification.published.push(Published {
+                version: target,
+                branch: name,
+                base,
+                operation,
+            });
+        }
     }
-    Ok(())
+    classification.published.sort();
+    ensure!(
+        classification
+            .published
+            .windows(2)
+            .all(|pair| pair[0].version < pair[1].version),
+        "multiple retained Dolt migration branches are published for one step"
+    );
+    Ok(classification)
+}
+
+/// A reserved branch as `dolt_branches` lists it.
+struct ReservedRef {
+    name: String,
+    hash: String,
+    dirty: bool,
+}
+
+/// [`reserved_names_in`] with each branch's head and whether its working set
+/// differs from that head.
+async fn reserved_refs_in(pool: &MySqlPool, prefix: &str) -> Result<Vec<ReservedRef>> {
+    let rows: Vec<(String, String, bool)> = bounded_query(
+        sqlx::query_as(
+            "SELECT name, hash, dirty FROM dolt_branches WHERE LEFT(BINARY name, ?) = BINARY ? LIMIT 65",
+        )
+        .bind(i64::try_from(prefix.len())?)
+        .bind(prefix)
+        .fetch_all(pool),
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(name, hash, dirty)| ReservedRef { name, hash, dirty })
+        .collect())
+}
+
+const RECORDS_QUERY: &str = "SELECT version, branch, base, operation, definition_digest, record_format FROM kuru_migration_publications";
+
+fn records_from(rows: Vec<sqlx::mysql::MySqlRow>) -> Result<Vec<Record>> {
+    ensure!(
+        rows.len() <= DEFINITION_LIMIT,
+        "Dolt migration publication records exceed the registry bound"
+    );
+    rows.iter()
+        .map(|row| {
+            Ok(Record {
+                version: row.try_get(0)?,
+                branch: row.try_get(1)?,
+                base: row.try_get(2)?,
+                operation: row.try_get(3)?,
+                definition_digest: row.try_get(4)?,
+                record_format: row.try_get(5)?,
+            })
+        })
+        .collect()
+}
+
+/// Every publication record of the database `pool` serves, by version.
+async fn records_in(pool: &MySqlPool) -> Result<Vec<Record>> {
+    let rows = bounded_query(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{RECORDS_QUERY} ORDER BY version LIMIT ?"
+        )))
+        .bind(i64::try_from(DEFINITION_LIMIT + 1)?)
+        .fetch_all(pool),
+    )
+    .await?;
+    records_from(rows)
+}
+
+/// Every publication record at one commit, by version.
+async fn records_as_of(pool: &MySqlPool, commit: &str) -> Result<Vec<Record>> {
+    let rows = bounded_query(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{RECORDS_QUERY} AS OF '{}' ORDER BY version LIMIT ?",
+            commit_hash(commit)?
+        )))
+        .bind(i64::try_from(DEFINITION_LIMIT + 1)?)
+        .fetch_all(pool),
+    )
+    .await?;
+    records_from(rows)
+}
+
+fn record_mismatch(detail: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("migration publication record does not match active history: {detail}")
+}
+
+/// `?, ?, ...` for `count` bind parameters; never data.
+fn placeholders(count: usize) -> String {
+    vec!["?"; count].join(", ")
+}
+
+/// Verify every publication record of main independently, from main's own
+/// pool, and return the records by branch name. A record never vouches for
+/// another: each is checked against main's receipts and the compiled
+/// definition, and each present branch against its own ref, working set,
+/// sole parent, ancestry and `AS OF` content. A record whose branch was
+/// deleted keeps only its base's place in main's history to check. Any
+/// disagreement fails closed; nothing falls back to full classification.
+async fn verified_records(
+    registry: Registry,
+    main: &MySqlPool,
+    current: i32,
+    refs: &[ReservedRef],
+) -> Result<BTreeMap<String, Record>> {
+    let records = records_in(main).await?;
+    let receipts: BTreeMap<i32, String> = bounded_query(
+        sqlx::query_as("SELECT version, operation FROM kuru_migrations ORDER BY version LIMIT ?")
+            .bind(i64::try_from(DEFINITION_LIMIT + 1)?)
+            .fetch_all(main),
+    )
+    .await?
+    .into_iter()
+    .collect();
+    let mut verified = BTreeMap::new();
+    let mut heads = Vec::new();
+    for record in records {
+        ensure!(
+            (2..=current).contains(&record.version),
+            record_mismatch(format!(
+                "record for schema {} is outside the store's schema",
+                record.version
+            ))
+        );
+        let definition = registry.definition(record.version).map_err(|_| {
+            record_mismatch(format!(
+                "record for schema {} names no registered step",
+                record.version
+            ))
+        })?;
+        let (target, operation) = parse_attempt(&record.branch).map_err(|_| {
+            record_mismatch(format!(
+                "record for schema {} names a malformed branch",
+                record.version
+            ))
+        })?;
+        ensure!(
+            target == record.version && operation.hyphenated().to_string() == record.operation,
+            record_mismatch(format!(
+                "record for schema {} disagrees with its branch name",
+                record.version
+            ))
+        );
+        ensure!(
+            receipts.get(&record.version) == Some(&record.operation),
+            record_mismatch(format!(
+                "record for schema {} disagrees with main's receipt",
+                record.version
+            ))
+        );
+        ensure!(
+            record.definition_digest == digest(definition),
+            record_mismatch(format!(
+                "record for schema {} names another definition",
+                record.version
+            ))
+        );
+        ensure!(
+            record.record_format == PUBLICATION_RECORD_FORMAT,
+            record_mismatch(format!(
+                "record for schema {} has format {}",
+                record.version, record.record_format
+            ))
+        );
+        commit_hash(&record.base).map_err(|_| {
+            record_mismatch(format!(
+                "record for schema {} names a malformed base",
+                record.version
+            ))
+        })?;
+        if let Some(reference) = refs
+            .iter()
+            .find(|reference| reference.name == record.branch)
+        {
+            ensure!(
+                !reference.dirty,
+                "published migration branch has uncommitted changes"
+            );
+            commit_hash(&reference.hash)?;
+            heads.push((record.clone(), reference.hash.clone()));
+        }
+        verified.insert(record.branch.clone(), record);
+    }
+    // One batched read per axis: each head's parents, then which heads and
+    // bases main's history holds.
+    if !heads.is_empty() {
+        let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(format!(
+            "SELECT commit_hash, parent_hash FROM dolt_commit_ancestors WHERE commit_hash IN ({}) LIMIT ?",
+            placeholders(heads.len())
+        )));
+        for (_, head) in &heads {
+            query = query.bind(head.as_str());
+        }
+        let parents = bounded_query(
+            query
+                .bind(i64::try_from(2 * heads.len() + 1)?)
+                .fetch_all(main),
+        )
+        .await?;
+        for (record, head) in &heads {
+            let found: Vec<&str> = parents
+                .iter()
+                .filter(|(commit, _)| commit == head)
+                .map(|(_, parent)| parent.as_str())
+                .collect();
+            ensure!(
+                found == [record.base.as_str()],
+                record_mismatch(format!(
+                    "branch for schema {} is not the sole child of its recorded base",
+                    record.version
+                ))
+            );
+        }
+    }
+    let commits: BTreeSet<&str> = heads
+        .iter()
+        .map(|(_, head)| head.as_str())
+        .chain(verified.values().map(|record| record.base.as_str()))
+        .collect();
+    if !commits.is_empty() {
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+            "SELECT commit_hash FROM dolt_log WHERE commit_hash IN ({}) LIMIT ?",
+            placeholders(commits.len())
+        )));
+        for commit in &commits {
+            query = query.bind(*commit);
+        }
+        let found: BTreeSet<String> = bounded_query(
+            query
+                .bind(i64::try_from(commits.len() + 1)?)
+                .fetch_all(main),
+        )
+        .await?
+        .into_iter()
+        .collect();
+        for record in verified.values() {
+            let head = heads
+                .iter()
+                .find(|(recorded, _)| recorded.branch == record.branch)
+                .map(|(_, head)| head.as_str());
+            ensure!(
+                found.contains(&record.base) && head.is_none_or(|head| found.contains(head)),
+                record_mismatch(format!(
+                    "record for schema {} is outside main's history",
+                    record.version
+                ))
+            );
+        }
+    }
+    for (record, head) in &heads {
+        let (version, operation): (Option<i32>, Option<String>) = bounded_query(
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT (SELECT version FROM kuru_schema AS OF '{0}' WHERE id = 1), (SELECT operation FROM kuru_migrations AS OF '{0}' WHERE version = ?)",
+                commit_hash(head)?
+            )))
+            .bind(record.version)
+            .fetch_one(main),
+        )
+        .await?;
+        ensure!(
+            version == Some(record.version)
+                && operation.as_deref() == Some(record.operation.as_str()),
+            record_mismatch(format!(
+                "branch for schema {} does not carry its recorded schema and receipt",
+                record.version
+            ))
+        );
+    }
+    Ok(verified)
 }
 
 /// Dolt's commit hash: 20 bytes as 32 characters of base32 `{0-9,a-v}`.
@@ -1957,10 +2429,11 @@ async fn discover_current_attempt_in(
     server: &Server,
     main: &MySqlPool,
     definition: &Definition,
-    base: &str,
+    step: &StepBase<'_>,
     hooks: &MigrationRunnerHooks,
     prefix: &str,
 ) -> Result<(String, Uuid, bool)> {
+    let StepBase { base, published } = *step;
     let names = reserved_names_in(main, prefix).await?;
     let inventory_len = names.len();
     let mut reusable = None;
@@ -1986,7 +2459,12 @@ async fn discover_current_attempt_in(
                 validate_version_with(registry, &attempt, definition.from).await?;
                 Ok(Some(false)) // pristine
             } else if dirty == 0 && head_version == definition.to {
-                validate_attempt(registry, &attempt, definition, operation, base).await?;
+                let record = AttemptRecord {
+                    branch: &name,
+                    base,
+                    published,
+                };
+                validate_attempt(registry, &attempt, definition, operation, &record).await?;
                 Ok(Some(true))
             } else if head == base && dirty > 0 && head_version == definition.from {
                 validate_commit_version(registry, server, &head, definition.from).await?;
@@ -2062,13 +2540,89 @@ async fn discover_current_attempt_in(
     }
 }
 
+/// The exact base a step builds on and the publications the same open's
+/// classification accepted.
+#[derive(Clone, Copy)]
+struct StepBase<'a> {
+    base: &'a str,
+    published: &'a [Published],
+}
+
+/// What an attempt at or above [`PUBLICATION_VERSION`] records: its own
+/// branch and exact base, and for the step that introduces records, every
+/// branch the same open's classification accepted as published.
+struct AttemptRecord<'a> {
+    branch: &'a str,
+    base: &'a str,
+    published: &'a [Published],
+}
+
+impl AttemptRecord<'_> {
+    /// Every record the attempt's commit must hold, by version: the base's
+    /// own records (or, for the introducing step, the backfill) and its own.
+    async fn expected(
+        &self,
+        registry: Registry,
+        pool: &MySqlPool,
+        definition: &Definition,
+        operation: Uuid,
+    ) -> Result<Vec<Record>> {
+        let mut expected = if definition.to == PUBLICATION_VERSION {
+            self.backfill(registry, definition)?
+        } else {
+            records_as_of(pool, self.base).await?
+        };
+        expected.push(self.own(registry, definition, operation)?);
+        expected.sort();
+        Ok(expected)
+    }
+
+    fn own(&self, registry: Registry, definition: &Definition, operation: Uuid) -> Result<Record> {
+        Record::of(
+            registry,
+            &Published {
+                version: definition.to,
+                branch: self.branch.to_owned(),
+                base: self.base.to_owned(),
+                operation,
+            },
+        )
+    }
+
+    /// The introducing step's records of earlier published branches.
+    fn backfill(&self, registry: Registry, definition: &Definition) -> Result<Vec<Record>> {
+        self.published
+            .iter()
+            .map(|published| {
+                ensure!(
+                    published.version < definition.to,
+                    "Dolt migration backfill names a step at or after its own"
+                );
+                Record::of(registry, published)
+            })
+            .collect()
+    }
+}
+
 async fn build_attempt(
     registry: Registry,
     pool: &MySqlPool,
     definition: &Definition,
     operation: Uuid,
+    record: &AttemptRecord<'_>,
     hooks: &MigrationRunnerHooks,
 ) -> Result<()> {
+    let records = if definition.to >= PUBLICATION_VERSION {
+        let mut records = if definition.to == PUBLICATION_VERSION {
+            record.backfill(registry, definition)?
+        } else {
+            Vec::new()
+        };
+        records.push(record.own(registry, definition, operation)?);
+        records
+    } else {
+        Vec::new()
+    };
     let source_revision = if definition.to == V7.to {
         Some(revision(pool).await?)
     } else {
@@ -2106,6 +2660,19 @@ async fn build_attempt(
                 .execute(&mut connection),
         )
         .await?;
+        for record in &records {
+            bounded_query(
+                sqlx::query(ATTEMPT_RECORD)
+                    .bind(record.version)
+                    .bind(&record.branch)
+                    .bind(&record.base)
+                    .bind(&record.operation)
+                    .bind(&record.definition_digest)
+                    .bind(record.record_format)
+                    .execute(&mut connection),
+            )
+            .await?;
+        }
         hooks.reach(MigrationBoundary::BeforeCommit).await?;
         let [before, middle, after] = ATTEMPT_MESSAGE;
         bounded_query(
@@ -2297,8 +2864,9 @@ async fn validate_attempt(
     pool: &MySqlPool,
     definition: &Definition,
     operation: Uuid,
-    base: &str,
+    record: &AttemptRecord<'_>,
 ) -> Result<()> {
+    let base = record.base;
     clean(pool).await?;
     validate_version_with(registry, pool, definition.to).await?;
     let actual: String = bounded_query(
@@ -2317,6 +2885,15 @@ async fn validate_attempt(
         parent == base,
         "Dolt migration target does not have its exact sole base parent"
     );
+    if definition.to >= PUBLICATION_VERSION {
+        let expected = record
+            .expected(registry, pool, definition, operation)
+            .await?;
+        ensure!(
+            records_in(pool).await? == expected,
+            "Dolt migration attempt's publication records differ from its branch, base, receipt, definition or classified publications"
+        );
+    }
     Ok(())
 }
 
@@ -2373,6 +2950,9 @@ async fn publish(
 #[cfg(test)]
 mod main_pool_classification_tests;
 
+#[cfg(test)]
+mod publication_record_tests;
+
 pub(super) mod template_shape;
 
 #[cfg(test)]
@@ -2389,21 +2969,23 @@ mod tests {
     }
 
     #[derive(Debug, Eq, PartialEq)]
-    struct DurableSnapshot {
+    pub(super) struct DurableSnapshot {
         head: String,
         refs: Vec<(String, String)>,
         status: Vec<(String, i64, String)>,
     }
 
-    const V8: Definition = Definition {
-        from: 7,
-        to: 8,
-        id: "kuru.memory.test-marker.v8",
-        sql: &["CREATE TABLE kuru_migration_test_v8 (marker INT PRIMARY KEY)"],
+    /// A test-only step after the real publication-record step: it records
+    /// its own publication like every later main step.
+    const V9: Definition = Definition {
+        from: 8,
+        to: 9,
+        id: "kuru.memory.test-marker.v9",
+        sql: &["CREATE TABLE kuru_migration_test_v9 (marker INT PRIMARY KEY)"],
         transform: "none",
-        postcondition: "version=8;test marker table exists;v7 session lifecycle remains exact",
+        postcondition: "version=9;test marker table exists;v8 publication records remain exact",
         failed_status: &[StatusRow {
-            table: "kuru_migration_test_v8",
+            table: "kuru_migration_test_v9",
             staged: 0,
             status: "new table",
         }],
@@ -2415,11 +2997,16 @@ mod tests {
         super::V5,
         super::V6,
         super::V7,
-        V8,
+        super::V8,
+        V9,
     ];
-    const TEST_REGISTRY: Registry = Registry {
-        current: 8,
+    pub(super) const TEST_REGISTRY: Registry = Registry {
+        current: 9,
         definitions: TEST_DEFINITIONS,
+    };
+    pub(super) const RELEASED_V7_REGISTRY: Registry = Registry {
+        current: 7,
+        definitions: &[V2, super::V3, super::V4, super::V5, super::V6, super::V7],
     };
     const RELEASED_V3_DEFINITIONS: &[Definition] = &[V2, super::V3];
     const RELEASED_V3_REGISTRY: Registry = Registry {
@@ -2477,14 +3064,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v6_registry_rejects_v7_store_without_mutating_it() -> Result<()> {
+    async fn v7_registry_rejects_v8_store_without_mutating_it() -> Result<()> {
         let store = super::super::MemoryStore::temporary_cold().await?;
         let before = durable_snapshot(&store.pool).await?;
-        let error = validate_active_with(RELEASED_V6_REGISTRY, &store.pool)
+        let error = validate_active_with(RELEASED_V7_REGISTRY, &store.pool)
             .await
-            .expect_err("a v6 binary must reject v7 memory before opening it for writes");
+            .expect_err("a v7 binary must reject v8 memory before opening it for writes");
         assert!(
-            format!("{error:#}").contains("unsupported Dolt memory schema version 7"),
+            format!("{error:#}").contains("unsupported Dolt memory schema version 8"),
             "unexpected older-registry refusal: {error:#}"
         );
         assert_eq!(durable_snapshot(&store.pool).await?, before);
@@ -2723,7 +3310,7 @@ mod tests {
         Ok(())
     }
 
-    async fn durable_snapshot(pool: &MySqlPool) -> Result<DurableSnapshot> {
+    pub(super) async fn durable_snapshot(pool: &MySqlPool) -> Result<DurableSnapshot> {
         let ref_rows = bounded_query(
             sqlx::query("SELECT name, hash FROM dolt_branches ORDER BY BINARY name LIMIT 129")
                 .fetch_all(pool),
@@ -2763,7 +3350,7 @@ mod tests {
         })
     }
 
-    async fn commit_fixture(pool: &MySqlPool, message: &str) -> Result<()> {
+    pub(super) async fn commit_fixture(pool: &MySqlPool, message: &str) -> Result<()> {
         bounded_query(
             sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
                 .bind(message)
@@ -2774,7 +3361,7 @@ mod tests {
         clean(pool).await
     }
 
-    async fn assert_failed_runner_unchanged(
+    pub(super) async fn assert_failed_runner_unchanged(
         registry: Registry,
         server: &Server,
         main: &MySqlPool,
@@ -2793,7 +3380,7 @@ mod tests {
         Ok(())
     }
 
-    async fn snapshot_attempts(
+    pub(super) async fn snapshot_attempts(
         server: &Server,
         names: &[String],
     ) -> Result<Vec<(String, DurableSnapshot)>> {
@@ -2807,7 +3394,7 @@ mod tests {
         Ok(snapshots)
     }
 
-    async fn assert_attempts_unchanged(
+    pub(super) async fn assert_attempts_unchanged(
         server: &Server,
         before: Vec<(String, DurableSnapshot)>,
     ) -> Result<()> {
@@ -3084,8 +3671,13 @@ mod tests {
                         let built = build_attempt(
                             TEST_REGISTRY,
                             &attempt,
-                            &V8,
+                            &V9,
                             *operation,
+                            &AttemptRecord {
+                                branch: name,
+                                base: &base,
+                                published: &[],
+                            },
                             &MigrationRunnerHooks::none(),
                         )
                         .await;
@@ -3099,8 +3691,13 @@ mod tests {
                     let built = build_attempt(
                         TEST_REGISTRY,
                         &attempt,
-                        &V8,
+                        &V9,
                         mismatched,
+                        &AttemptRecord {
+                            branch: &attempts[0].0,
+                            base: &base,
+                            published: &[],
+                        },
                         &MigrationRunnerHooks::none(),
                     )
                     .await;
@@ -3208,7 +3805,7 @@ mod tests {
             )
             .await?;
             let attempt = server.pool(&name).await?;
-            let prepared = bounded_query(sqlx::query(V8.sql[0]).execute(attempt.as_ref())).await;
+            let prepared = bounded_query(sqlx::query(V9.sql[0]).execute(attempt.as_ref())).await;
             after_cleanup(prepared.map(|_| ()), close_branch_pool(&attempt).await)?;
             names.push(name);
         }
@@ -3294,7 +3891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v8_receipt_order_and_operation_uniqueness_are_enforced() -> Result<()> {
+    async fn test_v9_receipt_order_and_operation_uniqueness_are_enforced() -> Result<()> {
         for repeated_operation in [false, true] {
             let store = super::super::MemoryStore::temporary_cold().await?;
             upgrade_with(
@@ -3316,7 +3913,7 @@ mod tests {
                 )
                 .await?;
                 bounded_query(
-                    sqlx::query("UPDATE kuru_migrations SET operation = ? WHERE version = 8")
+                    sqlx::query("UPDATE kuru_migrations SET operation = ? WHERE version = 9")
                         .bind(operation)
                         .execute(store.pool.as_ref()),
                 )
@@ -3472,15 +4069,21 @@ mod tests {
         )
         .await?;
         let non_ancestral = server.pool(&non_ancestral_name).await?;
+        let record = AttemptRecord {
+            branch: &non_ancestral_name,
+            base: &divergent_head,
+            published: &[],
+        };
         build_attempt(
             REGISTRY,
             &non_ancestral,
             &V2,
             operation,
+            &record,
             &MigrationRunnerHooks::none(),
         )
         .await?;
-        validate_attempt(REGISTRY, &non_ancestral, &V2, operation, &divergent_head).await?;
+        validate_attempt(REGISTRY, &non_ancestral, &V2, operation, &record).await?;
         let non_ancestral_before = durable_snapshot(&non_ancestral).await?;
         non_ancestral.close().await;
         drop(non_ancestral);
@@ -3533,10 +4136,9 @@ mod tests {
         completed.close().await;
         drop(completed);
         let before = durable_snapshot(&store.pool).await?;
-        let expected = format!(
-            "schema version {CURRENT_VERSION}, expected {}",
-            CURRENT_VERSION - 1
-        );
+        // The advanced branch is recorded: its head is no longer the sole
+        // child of the recorded base, so its record fails closed.
+        let expected = "not the sole child of its recorded base".to_owned();
         assert_failed_runner_unchanged(
             TEST_REGISTRY,
             &store.shared.server,
@@ -3579,7 +4181,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_v2_attempts_and_candidate_survive_test_v8_progression() -> Result<()> {
+    async fn retained_v2_attempts_and_candidate_survive_test_v9_progression() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let mut options = crate::test_support::warmed_open_options(
             root.path().join("private"),
@@ -3594,10 +4196,10 @@ mod tests {
         store
             .append("conversation", "user", "written after the v2 upgrade")
             .await?;
-        let candidate = store.begin_candidate("pre-v8 candidate").await?;
+        let candidate = store.begin_candidate("pre-v9 candidate").await?;
         candidate
             .view()
-            .append("candidate", "assistant", "kept on schema v7")
+            .append("candidate", "assistant", "kept on schema v8")
             .await?;
         let candidate_head = candidate.view().revision().await?;
 
@@ -3635,13 +4237,13 @@ mod tests {
         failed.close().await;
         drop(failed);
 
-        assert_eq!(validate_ready_with(TEST_REGISTRY, &store.pool).await?, 7);
-        let v8_operation = Uuid::new_v4();
-        let v8_name = attempt_name(8, v8_operation);
+        assert_eq!(validate_ready_with(TEST_REGISTRY, &store.pool).await?, 8);
+        let v9_operation = Uuid::new_v4();
+        let v9_name = attempt_name(9, v9_operation);
         let current_base = store.revision().await?;
         bounded_query(
             sqlx::query("CALL DOLT_BRANCH(?, ?)")
-                .bind(&v8_name)
+                .bind(&v9_name)
                 .bind(&current_base)
                 .fetch_all(store.pool.as_ref()),
         )
@@ -3650,7 +4252,7 @@ mod tests {
             validate_ready_with(TEST_REGISTRY, &store.pool)
                 .await
                 .is_err(),
-            "a ready v8 stage must reject while an earlier failed attempt remains"
+            "a ready v9 stage must reject while an earlier failed attempt remains"
         );
 
         upgrade_with(
@@ -3661,25 +4263,25 @@ mod tests {
         )
         .await?;
         validate_active_with(TEST_REGISTRY, &store.pool).await?;
-        assert_eq!(version(&store.pool).await?, 8);
-        let v8_attempt = store.shared.server.pool(&v8_name).await?;
-        assert_eq!(revision(&v8_attempt).await?, store.revision().await?);
-        let v8_receipt: String = bounded_query(
-            sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = 8")
-                .fetch_one(v8_attempt.as_ref()),
+        assert_eq!(version(&store.pool).await?, 9);
+        let v9_attempt = store.shared.server.pool(&v9_name).await?;
+        assert_eq!(revision(&v9_attempt).await?, store.revision().await?);
+        let v9_receipt: String = bounded_query(
+            sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = 9")
+                .fetch_one(v9_attempt.as_ref()),
         )
         .await?;
-        assert_eq!(v8_receipt, v8_operation.hyphenated().to_string());
-        v8_attempt.close().await;
-        drop(v8_attempt);
+        assert_eq!(v9_receipt, v9_operation.hyphenated().to_string());
+        v9_attempt.close().await;
+        drop(v9_attempt);
         assert_eq!(
             reserved_names(&store.pool)
                 .await?
                 .into_iter()
-                .filter(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 8))
+                .filter(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 9))
                 .count(),
             1,
-            "the pristine exact-base v8 attempt must be reused"
+            "the pristine exact-base v9 attempt must be reused"
         );
         // This is a synthetic future schema, beyond the current store API's
         // validated open contract. Inspect the test-registry-backed SQL view.
@@ -3711,7 +4313,7 @@ mod tests {
         );
         assert_eq!(
             old_view.history("candidate", 10).await?[0].plain_text(),
-            Some("kept on schema v7")
+            Some("kept on schema v8")
         );
         let before_stale_merge = durable_snapshot(&store.pool).await?;
         assert!(
@@ -3722,11 +4324,11 @@ mod tests {
             )
             .await
             .is_err(),
-            "pre-v8 candidate unexpectedly fast-forwarded into v8 main"
+            "pre-v9 candidate unexpectedly fast-forwarded into v9 main"
         );
         assert_eq!(durable_snapshot(&store.pool).await?, before_stale_merge);
 
-        // Model a future v8 writer through its test registry and SQL view.
+        // Model a future v9 writer through its test registry and SQL view.
         // Released-v5 reopen refusal is checked in the separate old-registry fixture.
         let fresh_name = format!("candidate_{}", Uuid::new_v4().simple());
         let fresh_base = revision(&store.pool).await?;
@@ -3738,15 +4340,15 @@ mod tests {
         )
         .await?;
         let fresh = store.shared.server.pool(&fresh_name).await?;
-        assert_eq!(validate_supported_with(TEST_REGISTRY, &fresh).await?, 8);
+        assert_eq!(validate_supported_with(TEST_REGISTRY, &fresh).await?, 9);
         bounded_query(
             sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
-                .bind(b"post-v8".as_slice())
+                .bind(b"post-v9".as_slice())
                 .bind(json!({"preserved": true}).to_string())
                 .execute(fresh.as_ref()),
         )
         .await?;
-        commit_fixture(&fresh, "Test future-v8 candidate write").await?;
+        commit_fixture(&fresh, "Test future-v9 candidate write").await?;
         let fresh_head = revision(&fresh).await?;
         fresh.close().await;
         drop(fresh);
@@ -3764,16 +4366,16 @@ mod tests {
             .bind(b"conversation".as_slice())
             .bind(b"assistant".as_slice())
             .bind("text-v1")
-            .bind("written after schema v8")
+            .bind("written after schema v9")
             .execute(store.pool.as_ref()),
         )
         .await?;
-        commit_fixture(&store.pool, "Test future-v8 conversation write").await?;
+        commit_fixture(&store.pool, "Test future-v9 conversation write").await?;
         validate_active_with(TEST_REGISTRY, &store.pool).await?;
-        assert_eq!(version(&store.pool).await?, 8);
+        assert_eq!(version(&store.pool).await?, 9);
         let promoted_value: String = bounded_query(
             sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
-                .bind(b"post-v8".as_slice())
+                .bind(b"post-v9".as_slice())
                 .fetch_one(store.pool.as_ref()),
         )
         .await?;
@@ -3833,11 +4435,11 @@ mod tests {
         .await?;
         assert_eq!(
             messages,
-            ["written after the v2 upgrade", "written after schema v8"]
+            ["written after the v2 upgrade", "written after schema v9"]
         );
         let value: String = bounded_query(
             sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
-                .bind(b"post-v8".as_slice())
+                .bind(b"post-v9".as_slice())
                 .fetch_one(main.as_ref()),
         )
         .await?;
@@ -3870,7 +4472,7 @@ mod tests {
                 .fetch_one(old_candidate.as_ref()),
         )
         .await?;
-        assert_eq!(old_content, "kept on schema v7");
+        assert_eq!(old_content, "kept on schema v8");
         old_candidate.close().await;
         drop(old_candidate);
         main.close().await;
@@ -4502,12 +5104,12 @@ mod tests {
         )));
         let before_refusal = durable_snapshot(&store.pool).await?;
         let exported_before_refusal = serde_json::to_value(&records)?;
-        let error = validate_active_with(RELEASED_V6_REGISTRY, &store.pool)
+        let error = validate_active_with(RELEASED_V7_REGISTRY, &store.pool)
             .await
-            .expect_err("a v6 validator must refuse this populated v7 store");
+            .expect_err("a v7 validator must refuse this populated v8 store");
         assert!(
-            format!("{error:#}").contains("unsupported Dolt memory schema version 7"),
-            "unexpected v6-validator refusal: {error:#}"
+            format!("{error:#}").contains("unsupported Dolt memory schema version 8"),
+            "unexpected v7-validator refusal: {error:#}"
         );
         assert_eq!(durable_snapshot(&store.pool).await?, before_refusal);
         let after_refusal = store.begin_active_export().await?;

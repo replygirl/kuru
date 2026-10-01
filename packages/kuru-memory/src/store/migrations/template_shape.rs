@@ -53,9 +53,15 @@ const DOLT_INITIAL_MESSAGE: &str = "Initialize data repository";
 /// The schema version at which a new usage branch is anchored: main's clean
 /// schema-4 head, before main takes schema 5 (`ensure_usage_branch_at_v4`).
 const USAGE_ANCHOR: i32 = 4;
-/// Tables whose rows are schema, receipt and identity authority. Every other
-/// table on `main` and on the usage branch is project data and must be empty.
-const AUTHORITY_TABLES: [&str; 3] = ["kuru_instance", "kuru_migrations", "kuru_schema"];
+/// Tables whose rows are schema, receipt, publication-record and identity
+/// authority. Every other table on `main` and on the usage branch is project
+/// data and must be empty.
+const AUTHORITY_TABLES: [&str; 4] = [
+    "kuru_instance",
+    "kuru_migration_publications",
+    "kuru_migrations",
+    "kuru_schema",
+];
 /// The most branches a template may hold: the two refs and one retained
 /// attempt per step of each registry. One more is read, so an overflow is a
 /// verdict rather than a silently truncated branch set.
@@ -202,6 +208,7 @@ pub(in crate::store) async fn check(main: &MySqlPool, row: Row<'_>) -> Result<()
     let expected = expected(REGISTRY, USAGE_REGISTRY, USAGE_ANCHOR, row.adopted())?;
     let attempts = branches(main, &expected).await?;
     classify_historical_attempts(REGISTRY, main, REGISTRY.current).await?;
+    publication_records(main, &attempts).await?;
     let mut connection = acquire(main).await?.detach();
     let checked = async {
         for (reference, commits) in [
@@ -232,9 +239,9 @@ pub(in crate::store) async fn check(main: &MySqlPool, row: Row<'_>) -> Result<()
 
 /// The operations of the retained attempt branches, by target version.
 #[derive(Debug, Default)]
-struct Attempts {
-    main: BTreeMap<i32, Uuid>,
-    usage: BTreeMap<i32, Uuid>,
+pub(super) struct Attempts {
+    pub(super) main: BTreeMap<i32, Uuid>,
+    pub(super) usage: BTreeMap<i32, Uuid>,
 }
 
 /// The exact branch set: `main`, the usage branch and one clean retained
@@ -292,6 +299,43 @@ async fn branches(main: &MySqlPool, expected: &Expected) -> Result<Attempts> {
         main: main_attempts.into_iter().collect(),
         usage: usage_attempts.into_iter().collect(),
     })
+}
+
+/// Exactly one publication record per retained main attempt, naming that
+/// attempt: a template-era branch is accepted on later opens by its record,
+/// so a template without one for every retained branch is refused. The
+/// records themselves were verified against main's history by the
+/// classification `check` ran first.
+pub(super) async fn publication_records(main: &MySqlPool, attempts: &Attempts) -> Result<()> {
+    let expected: Vec<(i32, String)> = attempts
+        .main
+        .iter()
+        .map(|(target, operation)| {
+            (
+                *target,
+                attempt_name_in(RESERVED_PREFIX, *target, *operation),
+            )
+        })
+        .collect();
+    let found: Vec<(i32, String)> = records_in(main)
+        .await?
+        .into_iter()
+        .map(|record| (record.version, record.branch))
+        .collect();
+    if found != expected {
+        return Err(verdict(format!(
+            "publication records name {:?}, not one per retained attempt {:?}",
+            found
+                .iter()
+                .map(|(version, branch)| format!("{version}:{}", shown(branch)))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(version, _)| *version)
+                .collect::<Vec<_>>()
+        )));
+    }
+    Ok(())
 }
 
 /// One `dolt_log` row as read: committer, email, author, author email and

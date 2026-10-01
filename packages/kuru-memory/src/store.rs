@@ -10738,9 +10738,15 @@ mod tests {
         .bind(&fifth_parent)
         .fetch_one(store.pool.as_ref())
         .await?;
+        let seventh_parent: String = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+        )
+        .bind(&sixth_parent)
+        .fetch_one(store.pool.as_ref())
+        .await?;
         assert_eq!(
-            sixth_parent, base,
-            "v1 to v7 must contain six ordered upgrades"
+            seventh_parent, base,
+            "v1 to v8 must contain seven ordered upgrades"
         );
         let commits: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'",
@@ -10778,6 +10784,12 @@ mod tests {
         .fetch_one(store.pool.as_ref())
         .await?;
         assert_eq!(public_turn_commits, 1);
+        let publication_commits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 8%'",
+        )
+        .fetch_one(store.pool.as_ref())
+        .await?;
+        assert_eq!(publication_commits, 1);
         store.close().await?;
 
         let reopened = MemoryStore::open(options).await?;
@@ -10809,6 +10821,7 @@ mod tests {
             ("v5 attempt", Some(5), false),
             ("v6 attempt", Some(6), false),
             ("v7 attempt", Some(7), false),
+            ("v8 attempt", Some(8), false),
             ("future schema", None, true),
         ] {
             let root = crate::test_support::tempdir()?;
@@ -10829,7 +10842,7 @@ mod tests {
                     Some(name)
                 }
                 None if future_schema => {
-                    sqlx::query("UPDATE kuru_schema SET version = 8 WHERE id = 1")
+                    sqlx::query("UPDATE kuru_schema SET version = 9 WHERE id = 1")
                         .execute(pool.as_ref())
                         .await?;
                     None
@@ -10856,7 +10869,8 @@ mod tests {
                 (Some(5), false) => "attempt newer than its schema",
                 (Some(6), false) => "attempt newer than its schema",
                 (Some(7), false) => "attempt newer than its schema",
-                (None, true) => "unsupported Dolt memory schema version 8",
+                (Some(8), false) => "attempt newer than its schema",
+                (None, true) => "unsupported Dolt memory schema version 9",
                 _ => unreachable!(),
             };
             assert!(rendered.contains(expected), "{case}: {rendered}");
@@ -11079,7 +11093,10 @@ mod tests {
         let error = MemoryStore::open(readonly).await.unwrap_err();
         let error = format!("{error:#}");
         assert!(
-            error.contains("version 1 requires writable upgrade to 7"),
+            error.contains(&format!(
+                "version 1 requires writable upgrade to {}",
+                migrations::CURRENT_VERSION
+            )),
             "unexpected read-only v1 open error: {error}"
         );
         assert_eq!(fs::read(directory.join("ready.json"))?, marker);
@@ -11145,9 +11162,15 @@ mod tests {
         .bind(&fifth_parent)
         .fetch_one(store.pool.as_ref())
         .await?;
+        let seventh_parent: String = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+        )
+        .bind(&sixth_parent)
+        .fetch_one(store.pool.as_ref())
+        .await?;
         assert_eq!(
-            sixth_parent, base,
-            "upgrade must retain all six ordered commits"
+            seventh_parent, base,
+            "upgrade must retain all seven ordered commits"
         );
         assert_eq!(
             sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, String)>(
@@ -11181,7 +11204,7 @@ mod tests {
         .await?;
         assert_eq!(
             receipt.iter().map(|row| row.0).collect::<Vec<_>>(),
-            [2, 3, 4, 5, 6, 7]
+            [2, 3, 4, 5, 6, 7, 8]
         );
         assert!(receipt.iter().all(|row| Uuid::parse_str(&row.3).is_ok()));
         store.close().await?;

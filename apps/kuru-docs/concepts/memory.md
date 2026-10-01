@@ -258,6 +258,18 @@ Startup also stops if retained migration attempts are ambiguous or exceed its
 bounded inventory. It keeps that history and reports the condition for recovery
 rather than deleting or resetting branches.
 
+Schema 8 records each published upgrade in the same commit that publishes it.
+Later opens check a recorded upgrade branch against its record and `main`'s
+history, without checking the branch in full each time. A record that disagrees
+with the store stops the open without changing anything. A branch without a
+record is still checked in full. The first writable open after updating
+upgrades an existing project once: it checks every retained branch in full one
+last time, records the ones it accepted, then reopens the upgraded store. Until
+that writable open, a read-only command reports
+`memory schema version 7 requires writable upgrade to 8` and changes nothing,
+just as it does for any pending schema step. Projects created after the update
+start at schema 8.
+
 Revision history shares the database's disk. For a backup, close all Kuru processes using the data directory, let their database processes finish, then copy the entire data directory. Restore the copy into a separate location and open it with `--data-dir`. Keep the same canonical workspace path to retain the project identity. Do not copy a live `.dolt` directory or remove a held lockfile.
 
 See [sessions and dreaming](./sessions) for resuming a transcript and changing the pool's membership.

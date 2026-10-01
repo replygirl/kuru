@@ -36,26 +36,41 @@ enum Expect {
     Fail(&'static str),
 }
 
-/// The branch-pool oracle's and the main-pool classifier's verdicts on the
+/// The branch-pool oracle's verdict, the main-pool classifier's in full
+/// (publication records ignored) and the record-aware classifier's, on the
 /// same store, through the same role's server and pool.
 async fn verdicts(
     registry: Registry,
     server: &Server,
     main: &MySqlPool,
     prefix: &str,
-) -> (Verdict, Verdict) {
+) -> (Verdict, Verdict, Verdict) {
     let oracle = verdict(
         classify_with_branch_pools_in(registry, server, main, registry.current, prefix).await,
     );
     let requested = server.pool_requests();
-    let main_pool =
-        verdict(classify_historical_attempts_in(registry, main, registry.current, prefix).await);
+    let main_pool = verdict(
+        classify_historical_attempts_with(
+            registry,
+            main,
+            registry.current,
+            prefix,
+            Records::Ignore,
+        )
+        .await
+        .map(|_| ()),
+    );
+    let by_record = verdict(
+        classify_historical_attempts_in(registry, main, registry.current, prefix)
+            .await
+            .map(|_| ()),
+    );
     assert_eq!(
         server.pool_requests(),
         requested,
         "main-pool classification requested a pool"
     );
-    (oracle, main_pool)
+    (oracle, main_pool, by_record)
 }
 
 fn assert_expected(label: &str, role: &str, observed: &Verdict, expect: Expect) {
@@ -66,7 +81,9 @@ fn assert_expected(label: &str, role: &str, observed: &Verdict, expect: Expect) 
     }
 }
 
-/// Both roles agree with the oracle, and the verdict is the state's own.
+/// Both roles agree with the oracle, the verdict is the state's own, and
+/// verification by publication record accepts or refuses exactly what full
+/// classification does (its refusal may name the record instead).
 async fn assert_parity(
     label: &str,
     roles: &[(&str, &Server, &MySqlPool)],
@@ -74,13 +91,21 @@ async fn assert_parity(
 ) -> Vec<String> {
     let mut rows = Vec::new();
     for (role, server, main) in roles {
-        let (oracle, main_pool) = verdicts(REGISTRY, server, main, RESERVED_PREFIX).await;
+        let (oracle, main_pool, by_record) =
+            verdicts(REGISTRY, server, main, RESERVED_PREFIX).await;
         assert_eq!(
             main_pool, oracle,
             "{label} ({role}): main-pool verdict differs from the branch-pool oracle"
         );
         assert_expected(label, role, &main_pool, expect);
-        rows.push(format!("{label} ({role}): {main_pool:?}"));
+        assert_eq!(
+            by_record.is_ok(),
+            main_pool.is_ok(),
+            "{label} ({role}): verdict by record {by_record:?} differs from full classification {main_pool:?}"
+        );
+        rows.push(format!(
+            "{label} ({role}): full {main_pool:?}; by record {by_record:?}"
+        ));
     }
     rows
 }
@@ -255,9 +280,10 @@ async fn main_pool_classification_agrees_with_branch_pool_classification() -> Re
         // Clean published branches, on main and on the usage ledger.
         rows.extend(assert_parity("clean published", &roles, Expect::Pass).await);
         let usage = root_server.pool(super::super::usage_ledger::BRANCH).await?;
-        let (oracle, main_pool) =
+        let (oracle, main_pool, by_record) =
             verdicts(USAGE_REGISTRY, root_server, &usage, USAGE_RESERVED_PREFIX).await;
         assert_eq!(main_pool, oracle, "usage ledger: verdicts differ");
+        assert_eq!(by_record, main_pool, "usage ledger: no record applies");
         assert_expected("usage ledger", "root", &main_pool, Expect::Pass);
         rows.push(format!("usage ledger clean (root): {main_pool:?}"));
 
@@ -330,7 +356,8 @@ async fn main_pool_classification_agrees_with_branch_pool_classification() -> Re
             assert_parity(
                 "ref force-moved to main",
                 &roles,
-                Expect::Fail("schema version 7, expected 3"),
+                // The current schema's head, checked as v3.
+                Expect::Fail("schema version 8, expected 3"),
             )
             .await,
         );
@@ -452,6 +479,21 @@ async fn main_pool_classification_agrees_with_branch_pool_classification() -> Re
         );
         delete_branch(&store, &name).await?;
         assert_eq!(refs(&store.pool).await?, baseline, "schema fixtures not removed");
+
+        // A recorded branch deleted: its record still names a base in main's
+        // history, and full classification has no ref to classify.
+        delete_branch(&store, &v3).await?;
+        rows.extend(assert_parity("recorded branch deleted", &roles, Expect::Pass).await);
+        branch_call(&store, &[&v3, &v3_ref.hash]).await?;
+        assert_eq!(refs(&store.pool).await?, baseline, "deleted branch not restored");
+
+        // A pristine attempt for the step after the current schema: neither
+        // classifier evaluates it, and it carries no record.
+        let above = attempt_name(REGISTRY.current + 1, Uuid::new_v4());
+        branch_call(&store, &[&above, &main_head]).await?;
+        rows.extend(assert_parity("branch above the current schema", &roles, Expect::Pass).await);
+        delete_branch(&store, &above).await?;
+        assert_eq!(refs(&store.pool).await?, baseline, "future attempt not removed");
         rows.extend(assert_parity("clean after restore", &roles, Expect::Pass).await);
         eprintln!("P2 parity:\n{}", rows.join("\n"));
         Ok::<_, anyhow::Error>(())
@@ -535,10 +577,11 @@ async fn adopted_store_classifies_retained_branches_from_main() -> Result<()> {
     // identity: a cold store, not a template copy.
     options.creation = crate::store::Creation::Cold;
     let store = crate::test_support::spawn_gated_open(options.clone()).await?;
-    let (source_oracle, source_main_pool) =
+    let (source_oracle, source_main_pool, source_by_record) =
         verdicts(REGISTRY, &store.shared.server, &store.pool, RESERVED_PREFIX).await;
     assert_eq!(source_oracle, Ok(()), "source oracle verdict");
     assert_eq!(source_main_pool, Ok(()), "source main-pool verdict");
+    assert_eq!(source_by_record, Ok(()), "source verdict by record");
     let branches: Vec<(String, String)> = refs(&store.pool)
         .await?
         .into_iter()
@@ -584,7 +627,7 @@ async fn adopted_store_classifies_retained_branches_from_main() -> Result<()> {
                 "{name} carries main's adopted instance, not the old one"
             );
         }
-        let (oracle, main_pool) = verdicts(
+        let (oracle, main_pool, by_record) = verdicts(
             REGISTRY,
             &reopened.shared.server,
             &reopened.pool,
@@ -594,6 +637,10 @@ async fn adopted_store_classifies_retained_branches_from_main() -> Result<()> {
         assert_eq!(
             main_pool, source_oracle,
             "adopted main-pool verdict differs from the oracle's on the same branches before adoption"
+        );
+        assert_eq!(
+            by_record, source_oracle,
+            "adopted verdict by record differs from the oracle's on the same branches before adoption"
         );
         let refused = oracle.expect_err("branch pools classified an adopted store");
         ensure!(

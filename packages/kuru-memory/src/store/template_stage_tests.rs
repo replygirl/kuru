@@ -1472,6 +1472,8 @@ struct Shape {
     indexes: Vec<String>,
     receipts: Vec<String>,
     usage_receipts: Vec<String>,
+    /// Publication records without their branch names, bases or operations.
+    records: Vec<String>,
     branches: Vec<String>,
     versions: (i64, i64),
     data_rows: Vec<String>,
@@ -1496,6 +1498,10 @@ async fn shape(store: &MemoryStore) -> Result<(Shape, (i64, i64))> {
     .await?;
     let receipts = text(
         "SELECT CAST(CONCAT_WS('|', version, id, digest) AS CHAR) FROM kuru_migrations ORDER BY version",
+    )
+    .await?;
+    let records = text(
+        "SELECT CAST(CONCAT_WS('|', version, definition_digest, record_format) AS CHAR) FROM kuru_migration_publications ORDER BY version",
     )
     .await?;
     let usage_receipts = text(
@@ -1534,7 +1540,7 @@ async fn shape(store: &MemoryStore) -> Result<(Shape, (i64, i64))> {
     for table in tables {
         if matches!(
             table.as_str(),
-            "kuru_instance" | "kuru_migrations" | "kuru_schema"
+            "kuru_instance" | "kuru_migration_publications" | "kuru_migrations" | "kuru_schema"
         ) {
             continue;
         }
@@ -1560,6 +1566,7 @@ async fn shape(store: &MemoryStore) -> Result<(Shape, (i64, i64))> {
             indexes,
             receipts,
             usage_receipts,
+            records,
             branches,
             versions,
             data_rows,

@@ -390,7 +390,11 @@ lives beside the engine in the shared test cache: `KURU_DOLT_CACHE`, or
 `<cache>/<engine version>/templates/<key>/`. It holds a captured `data/` tree
 only, keyed by the schema, the engine and the creation statements, not by the
 supervisor executable, so an instrumented and an ordinary supervisor build
-interchangeable templates. It differs from the test template above, which is
+interchangeable templates. The key also covers the migration publication
+record format. Fixtures are at schema 8, whose step records each published
+migration branch, so a change that adds a schema step or changes the record
+format changes the key. The next `prefetch` or first fixture open then builds
+the template once more; nothing has to be removed by hand. It differs from the test template above, which is
 a whole closed store keyed by supervisor bytes, sources and scope; the test
 template's own source open runs after the production template is warm, so it
 copies the production template.
