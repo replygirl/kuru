@@ -670,6 +670,34 @@ unused, so a measurement that repeats commands must await the previous owner's
 exit (as `await_owner_exit` does in the command-line tests); otherwise the next
 open waits for it and shows the waiting sentence.
 
+With `KURU_OPEN_TIMELINE=1` (exactly `1`; unset or any other value changes
+nothing) the project memory service owner records where its own open spends
+its time. Like the markers, this is a release-binary feature documented here
+only. Only the owner process reads the variable, once at its start; on Unix it
+inherits it from the command that started it, and the engine supervisor, whose
+environment is cleared, never sees it. Windows is not supported: its owner is
+started with an explicit environment that does not carry the variable. The
+owner stamps named events as nanosecond offsets from one monotonic anchor, in a
+bounded log sealed when its endpoint is published, and writes the log once,
+after its close has released the owner lock, to
+`memory/services/<hash>/open-timeline-<service-generation>.json` in the data
+directory. The write is owner-private, create-only and deliberately not durable
+(no sync); a failed open writes nothing, and a failed write never fails the
+open, serve or close. The write never delays the open, serve or a successor's
+lock wait; a gated close returns after that one small write. The file (`format` `kuru.open-timeline`,
+`format_version` 1) holds `kuru_version`, `service_generation`, one wall-clock
+`anchor_unix_ns`, `events` as `{event, ns}` pairs, `counts.usage_rows` (the
+first usage-ledger scan's row count, or `null`), `dropped` and `late`; never a
+path, scope, SQL, identity, credential or content. An existing-project open
+records, in order: `owner-main`, `owner-lock`, `cache-verify-start`,
+`cache-verify-end`, `supervisor-ready`, `probe-verified`, `main-pool`,
+`version-read`, `validate-active`, `candidate-recovery`, `usage-pool`,
+`usage-scan-1`, `usage-upgrade`, `usage-validate`, `usage-scan-2`,
+`store-ready`, `listener-bound` and `endpoint-published`; creation and upgrade
+opens repeat some of them. Each gated owner run leaves one file of a few
+kilobytes. Nothing in Kuru reads, lists or removes these files, so delete them
+by hand, or measure in a scratch data directory.
+
 A lost-reply test that pauses a request with the fixture reply pause
 (`ReplyPause`, or `test_support::ReplyBarrier` outside kuru-memory), cancels it
 and then expects one `reconcile` or recovery call to return a definite answer
@@ -735,6 +763,28 @@ inert unless `KURU_TEST_DOLT_LOG_DIR` names a directory, so neither runs in
 `kuru-lifecycle-measurements/m1` under the system temporary directory)
 receives their CSV rows, and
 `KURU_TEST_LIFECYCLE_MEASURE_ITERATIONS` (default 300) sets the loop count.
+
+To measure how an open changes as a store ages, `mise run
+//packages/kuru-memory:measure:age-store --data-dir <dir> --conversations <n>
+[--turns <n>] [--seed <n>]` (defaults: one turn, seed 1) grows the one
+existing project store under an absolute data directory. Create that store
+first with one ordinary `kuru` run against the same data directory; the task
+refuses a directory with no store or with several. It waits for any previous
+owner to exit, then holds the project's owner lock for the whole run, so no
+Kuru command can start an owner on the store meanwhile, and opens the store
+directly and offline with the engine already extracted under the data
+directory. Each conversation follows a runtime turn's write order through the
+memory facade: a new session and its usage marker, then per turn the public
+admission, the dispatch journal, the actor's input, one usage invocation
+(admit, a terminal observation, settle), the actor's output and the public
+settlement. That is `2 + 8 × turns` writes and `1 + 3 × turns` usage-ledger
+rows per conversation. The same seed, size and turn count give the same
+logical content (identifiers, transcripts, journals and usage numbers); Dolt
+commit hashes differ, because commits carry timestamps. Progress goes to
+standard error every 500 conversations, and one `kuru.aged-store` JSON line
+with the counts and `elapsed_ms` goes to standard output. It is a
+measurement aid built only with the package's test support, never part of
+`test`, coverage or CI.
 
 `store::engine_contract_tests` pins the Dolt behaviours that creating stores
 from a pre-migrated template relies on: root creation and bootstrap on a

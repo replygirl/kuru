@@ -388,12 +388,15 @@ fn destination_exists(path: &Path) -> Result<bool> {
 }
 
 async fn verify_existing_cache(destination: &Path, asset: Asset<'_>) -> Result<PathBuf> {
-    verified_cache(destination, asset).await.with_context(|| {
+    crate::open_timeline::stamp(crate::open_timeline::Event::CacheVerifyStart);
+    let verified = verified_cache(destination, asset).await.with_context(|| {
         format!(
             "Dolt cache is invalid at {}; preserve or remove that version directory and retry",
             destination.display()
         )
-    })
+    });
+    crate::open_timeline::stamp(crate::open_timeline::Event::CacheVerifyEnd);
+    verified
 }
 
 async fn verified_cache(directory: &Path, asset: Asset<'_>) -> Result<PathBuf> {

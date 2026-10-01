@@ -771,6 +771,7 @@ impl Server {
         };
         let (endpoint, owned) = match response {
             Response::Ready { endpoint, owned } => {
+                crate::open_timeline::stamp(crate::open_timeline::Event::SupervisorReady);
                 if !owned && !options.read_only {
                     return Err(startup_failure(
                         &mut owner,
@@ -846,7 +847,10 @@ impl Server {
         }
         .await;
         let identity = match verified {
-            Ok(identity) => identity,
+            Ok(identity) => {
+                crate::open_timeline::stamp(crate::open_timeline::Event::ProbeVerified);
+                identity
+            }
             Err(error) => {
                 return Err(startup_failure(&mut owner, error).await);
             }

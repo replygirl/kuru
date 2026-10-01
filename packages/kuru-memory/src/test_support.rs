@@ -33,6 +33,8 @@ pub(crate) use served_owner::{
     FixtureDeadline, ServeEvents, expect_events, expect_no_event, next_event, observed,
     serve_without_deadline,
 };
+/// Opt-in aged-store fixture for open-time measurement (`age-store`).
+pub mod aged_store;
 /// Data-tree copy, byte scan and cross-OS capture format for the engine
 /// contract tests.
 #[cfg(test)]
