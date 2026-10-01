@@ -133,8 +133,9 @@ ready, so nothing remains. When standard error is not a terminal, each new
 sentence is written once, whole, on its own line. An interactive session whose
 standard error is redirected but whose standard output is a terminal still shows
 the sentence on that terminal before the interface takes the screen; it is
-erased before the interface opens. Standard output never receives it, so JSON
-and other command output are unchanged, and library callers receive nothing.
+erased before the interface opens. That is the only case in which it goes
+through standard output; command output, including JSON, never receives it, and
+library callers receive nothing.
 The sentence does not estimate time and does not prove a stage succeeded; the
 command's ordinary result remains authoritative. The sentence cannot fail or
 delay the open: the owner publishes what it is doing in a small activity record

@@ -8,7 +8,7 @@ The command line should instead say, in one plain sentence, what Kuru is doing a
 
 ## What Changes
 
-- The command line shows one of five fixed plain sentences while memory opens, with no title, label, jargon or elapsed counter. On a terminal it is rewritten in place and erased at ready; otherwise each new sentence is written once on its own line; nothing goes to standard output; `--json` is unchanged. Every `Memory:` string and the `ready` line are removed.
+- The command line shows one of five fixed plain sentences while memory opens, with no title, label, jargon or elapsed counter. On a terminal it is rewritten in place and erased at ready; otherwise each new sentence is written once on its own line; command output never receives it, and it goes through standard output only for an interactive session whose standard error is redirected, before the interface opens; `--json` is unchanged. Every `Memory:` string and the `ready` line are removed.
 - Three internal stages are added (`CreatingDatabase`, `UpgradingDatabase`, `StartingMemoryService`); `WaitingForProjectOwnership` is reported only when a lock is actually busy.
 - The owner publishes a private activity record (`activity.json`) beside `endpoint.json`, tagged with a SHA-256 derived value of the starter token that unit 1 already passes; the client forwards its new stages between readiness polls. The record carries no authority, never fails or slows the open, and is retired by rename then removal inside the owner's close and on both error returns of the owner's open.
 - Opt-in marker lines (`KURU_OPEN_MARKERS=1`, stderr, `kuru-open-marker v1 <event> <monotonic_ns>`) replace the `Memory: ready.` signal for the open-time harness.

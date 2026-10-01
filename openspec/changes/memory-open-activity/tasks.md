@@ -33,7 +33,7 @@ Work packages own disjoint files (reanchor section 6); work in `tmp/worktrees/fe
 
 - [x] 6.1 Replace `assert_memory_progress`, `expected_startup_line`, `assert_expected_startup_notice` and the `Memory:` block of `smoke`, and verify T14, T15, T16, T17 and T18, with T15 and T17's second run awaiting the previous owner's exit first.
 - [x] 6.2 Add the marker child test (`KURU_OPEN_MARKERS=1 kuru run --json` on a new project, stderr not a terminal; and unset) and verify its assertions.
-- [x] 6.3 Update `docs/memory.md` (five sentences, when each appears, terminal and non-terminal behaviour, nothing at ready, stdout never used, the previous-owner wait), `docs/configuration.md`, `apps/kuru-docs/concepts/memory.md`, `apps/kuru-docs/reference/configuration.md`, the "startup notice when the engine was published" lines, and `docs/development.md` (markers and the two hooks only there); verify with `mise run docs:check` and `mise run docs:build`.
+- [x] 6.3 Update `docs/memory.md` (five sentences, when each appears, terminal and non-terminal behaviour, nothing at ready, command output never receives it and stdout is used only for an interactive session with redirected stderr before the interface opens, the previous-owner wait), `docs/configuration.md`, `apps/kuru-docs/concepts/memory.md`, `apps/kuru-docs/reference/configuration.md`, the "startup notice when the engine was published" lines, and `docs/development.md` (markers and the two hooks only there); verify with `mise run docs:check` and `mise run docs:build`.
 
 ## 7. Integration and close-out
 
