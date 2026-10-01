@@ -2,6 +2,8 @@
 
 #[path = "support/powershell_diagnostic.rs"]
 mod powershell_diagnostic;
+#[path = "support/stock_powershell.rs"]
+mod stock_powershell;
 
 #[test]
 fn actual_wrapped_native_acl_error_is_decoded_without_progress_or_warning_text() {
@@ -266,6 +268,41 @@ fn source_entrypoint_imports_pshome_modules_before_any_discovered_command() {
         &script,
         &["split-path", "join-path"],
     );
+}
+
+#[test]
+fn test_shell_prelude_matches_the_installer_imports_and_precedes_any_discovered_command() {
+    // Test-authored stock shells share the installers' exact imports, so a
+    // drift in either is caught here on every host, not only on Windows.
+    let prelude = stock_powershell::MODULE_PRELUDE;
+    let lines: Vec<&str> = prelude.split_inclusive('\n').collect();
+    assert_eq!(lines.len(), 2, "{prelude}");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for script in ["support/install.ps1", "../../scripts/install.ps1"] {
+        let source = std::fs::read_to_string(root.join(script)).unwrap();
+        for line in &lines {
+            assert!(
+                source.contains(&format!("\n{line}")),
+                "{script} no longer performs the test prelude's import {line:?}"
+            );
+        }
+    }
+    let script = stock_powershell::with_module_prelude(
+        "Write-Output (Microsoft.PowerShell.Utility\\Get-Date | ConvertTo-Json)\n",
+    );
+    assert!(script.starts_with(prelude));
+    assert_pshome_imports_precede_discovered_commands(
+        "test prelude",
+        &script,
+        &["write-output", "get-date", "convertto-json"],
+    );
+}
+
+#[test]
+#[should_panic(expected = "reaches write-output before its exact PSHOME module imports")]
+fn discovered_command_ahead_of_the_test_shell_prelude_is_rejected() {
+    let script = format!("Write-Output 'early'\n{}", stock_powershell::MODULE_PRELUDE);
+    assert_pshome_imports_precede_discovered_commands("misordered", &script, &["write-output"]);
 }
 
 /// One package coverage task's manifest table.

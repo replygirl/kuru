@@ -44,6 +44,8 @@ const TIMEOUT: Duration = Duration::from_secs(180);
 
 #[path = "support/powershell_diagnostic.rs"]
 mod powershell_diagnostic;
+#[path = "support/stock_powershell.rs"]
+mod stock_powershell;
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -1230,7 +1232,8 @@ async fn bootstrap_selects_the_native_machine_target_whatever_the_architecture_e
         ("KURU-NOT-A-MACHINE", "unknown"),
     ] {
         let destination = fixture.root.path().join(format!("reported {label}"));
-        let mut command = fixture.script(&format!(
+        // `Write-Output` (Utility) runs before the bootstrap's own imports.
+        let mut command = fixture.script(&stock_powershell::with_module_prelude(&format!(
             r#"
 $ErrorActionPreference = 'Stop'
 $reported = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE', 'Process')
@@ -1240,7 +1243,7 @@ Write-Output "observed-wow64=[$wow64]"
 & $env:KURU_BOOTSTRAP_SCRIPT -Version '{VERSION}' -InstallDir $env:KURU_TEST_DESTINATION
 Write-Output "native=$([Kuru.Bootstrap.Native]::MachineTarget([Kuru.Bootstrap.Native]::NativeMachine()))"
 "#
-        ));
+        )));
         command
             .env("PROCESSOR_ARCHITECTURE", reported)
             .env("PROCESSOR_ARCHITEW6432", reported)
