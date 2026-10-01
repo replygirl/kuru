@@ -1,6 +1,6 @@
 # Tasks
 
-Work in `tmp/worktrees/perf-owner-start-split` (branch `perf/owner-start-split`, from `origin/main`, rebased onto b3f20731). WP1, WP2 and WP3 own disjoint files. Never commit `mise.lock`; never bypass hk hooks. Nothing from R1-R3 is implemented. Tasks are ticked as evidence lands (see `verification.md`).
+Work in `tmp/worktrees/perf-owner-start-split` (branch `perf/owner-start-split`, from `origin/main`, rebased onto 76ca2b5a). WP1, WP2 and WP3 own disjoint files. Never commit `mise.lock`; never bypass hk hooks. Nothing from R1-R3 is implemented. Tasks are ticked as evidence lands (see `verification.md`).
 
 ## 1. Change artifacts (WP0)
 
@@ -31,4 +31,4 @@ Work in `tmp/worktrees/perf-owner-start-split` (branch `perf/owner-start-split`,
 
 ## 6. Archive
 
-- [ ] 6.1 Complete the tasks above, run `mise run cospec -- validate owner-open-timeline --strict`, run `mise run cospec -- archive owner-open-timeline`, and verify the archive directory exists and no active record remains on the branch before merge.
+- [x] 6.1 Complete the tasks above, run `mise run cospec -- validate owner-open-timeline --strict`, run `mise run cospec -- archive owner-open-timeline`, and verify the archive directory exists and no active record remains on the branch before merge.
