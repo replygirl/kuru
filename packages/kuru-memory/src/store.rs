@@ -7803,11 +7803,14 @@ async fn acquire_lock_reporting(
     progress: &mut ProgressReporter,
 ) -> Result<File> {
     let deadline = Instant::now() + duration;
+    let mut reported = false;
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(file),
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                progress.report(MemoryOpenStage::WaitingForProjectOwnership);
+                if !std::mem::replace(&mut reported, true) {
+                    progress.report(MemoryOpenStage::WaitingForProjectOwnership);
+                }
                 tokio::time::sleep(Duration::from_millis(25)).await
             }
             Err(error) => {
