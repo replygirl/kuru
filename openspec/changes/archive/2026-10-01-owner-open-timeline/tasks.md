@@ -26,7 +26,7 @@ Work in `tmp/worktrees/perf-owner-start-split` (branch `perf/owner-start-split`,
 
 ## 5. Measurement and report (WP4, WP5: outside the repository)
 
-- [x] 5.1 Build the release binary and run the macOS series (fresh and aged cases, 10 interleaved samples each, plus the instrument A/B), and verify every number in the notes traces to a record under `tmp/roadmap/unit6b-evidence/macos/`. Observed 2026-10-01 (macOS arm64): release series run, fresh/1k/5k n=10, 20k n=2 (8 of 10 clients hit the 30 s startup deadline); the 20-run ABBA observer-row A/B was not run, only a 10-pair wall-time A/B (66 ms median gap, noise under concurrent load).
+- [x] 5.1 Build the release binary and run the macOS series (fresh and aged cases, 10 interleaved samples each, plus the instrument A/B), and verify every number in the notes traces to a record under `tmp/roadmap/unit6-evidence/macos-6b/`. Observed 2026-10-01 (macOS arm64, release `kuru 0.9.0` rebuilt on origin/main 76ca2b5a plus this branch): fresh/1k/5k/20k n=10 each with the timeline on and every timeline collected after owner exit (5k: 1 client hit the 30 s startup deadline; 20k: all 10 did, their timelines are still complete), and a 10-on/10-off fresh A/B on observer rows (dolt endpoint to service endpoint median 254.7 ms off, 254.8 ms on). This supersedes the earlier partial series under `unit6b-evidence/macos/`.
 - [x] 5.2 Append the ranking, the growing rows and the one-paragraph unit note for each growing row to `tmp/roadmap/unit6b-notes-2026-10-01.md`, with measured and inferred labelled and unrun checks named. Observed 2026-10-01: appended to the notes; usage-scan-1 and usage-scan-2 grow super-linearly and are the only growing rows in the stage.
 
 ## 6. Archive
