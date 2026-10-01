@@ -523,7 +523,7 @@ async fn ordinary_open_never_pools_a_pre_adoption_revision() -> Result<()> {
 }
 
 /// T15: a legacy import and a configured engine binary keep the cold staged
-/// build, with its four starts, and never open the template root.
+/// build, with its two starts, and never open the template root.
 #[tokio::test]
 async fn legacy_import_and_configured_binary_take_cold_path() -> Result<()> {
     let fixture = fixture()?;

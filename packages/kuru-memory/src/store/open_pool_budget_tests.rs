@@ -9,11 +9,12 @@ fn pool_timed_out(error: &anyhow::Error) -> bool {
     })
 }
 
-/// The migrated staged reopen is the second Dolt start of a fresh open. Its
-/// main pool continues that start's deadline; a post-open pool is ordinary.
+/// The cold stage's one engine start is the first Dolt start of a fresh
+/// open. Its main pool continues that start's deadline; a post-open pool is
+/// ordinary.
 #[tokio::test]
-async fn migrated_stage_pool_uses_remaining_startup_budget_and_post_open_pools_stay_ordinary()
--> Result<()> {
+async fn stage_pool_uses_remaining_startup_budget_and_post_open_pools_stay_ordinary() -> Result<()>
+{
     // Past the ordinary per-attempt window, well inside the startup budget.
     let beyond_ordinary = crate::server::ORDINARY_POOL_WINDOW * 3 / 2;
 
@@ -24,13 +25,13 @@ async fn migrated_stage_pool_uses_remaining_startup_budget_and_post_open_pools_s
     )
     .await?;
     let entered = Arc::new(AtomicBool::new(false));
-    // The delayed pool is the cold staged build's validation start.
+    // The delayed pool is the cold staged build's one stage start.
     options.creation = Creation::Cold;
-    options.migrated_stage_pool_delay = Some((beyond_ordinary, entered.clone()));
+    options.stage_pool_delay = Some((beyond_ordinary, entered.clone()));
     let store = crate::test_support::spawn_gated_open(options).await?;
     assert!(
         entered.load(Ordering::SeqCst),
-        "migrated staged main-pool authentication was not delayed"
+        "staged main-pool authentication was not delayed"
     );
 
     // Once ready, a fresh branch pool gets exactly the ordinary window.
@@ -72,15 +73,15 @@ async fn migrated_stage_pool_uses_remaining_startup_budget_and_post_open_pools_s
     .await?;
     let startup_budget = crate::test_support::server_start_budget();
     let entered = Arc::new(AtomicBool::new(false));
-    // The delayed pool is the cold staged build's validation start.
+    // The delayed pool is the cold staged build's one stage start.
     options.creation = Creation::Cold;
-    options.migrated_stage_pool_delay = Some((startup_budget, entered.clone()));
+    options.stage_pool_delay = Some((startup_budget, entered.clone()));
     let error = crate::test_support::spawn_gated_open(options)
         .await
         .expect_err("an expired open-sequence pool cannot open memory");
     assert!(
         entered.load(Ordering::SeqCst),
-        "migrated staged main-pool authentication was not delayed"
+        "staged main-pool authentication was not delayed"
     );
     assert!(
         pool_timed_out(&error),

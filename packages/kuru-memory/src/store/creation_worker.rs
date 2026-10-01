@@ -3,8 +3,9 @@
 //!
 //! [`select`] runs once, after recovery found no stage to reuse. A legacy
 //! import, a configured engine binary and the test-support `Creation::Cold`
-//! keep the open on the cold staged build (`MemoryStore::create_cold`, four
-//! engine starts). Every other new store is created from the template.
+//! keep the open on the cold staged build (`MemoryStore::create_cold`, two
+//! engine starts: the stage's one start, which runs the schema chain, and
+//! the active start). Every other new store is created from the template.
 //!
 //! [`run`] hands the startup lock to a creation worker task, the ownership
 //! shape of the migration worker: the opener's frame holds no lock while the
@@ -233,9 +234,7 @@ impl TemplateCreation {
             project_scope: &self.project_scope,
             legacy: None,
             #[cfg(test)]
-            migration_hooks: None,
-            #[cfg(test)]
-            migrated_stage_pool_delay: None,
+            hooks: stage_worker::StageHooks::default(),
         };
         let mut progress = ProgressReporter::silent();
         match worker

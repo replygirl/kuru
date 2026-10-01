@@ -127,7 +127,9 @@ pub struct OpenOptions {
     #[cfg(test)]
     candidate_cleanup_failure: Option<Arc<AtomicBool>>,
     #[cfg(test)]
-    migrated_stage_pool_delay: Option<(Duration, Arc<AtomicBool>)>,
+    stage_pool_delay: Option<(Duration, Arc<AtomicBool>)>,
+    #[cfg(test)]
+    validation_probe: Option<stage_worker::ValidationProbe>,
     /// Test-support creation path: `Cold` keeps a fixture on the cold staged
     /// build; see [`Creation`].
     #[cfg(any(test, feature = "test-support"))]
@@ -178,8 +180,8 @@ pub(crate) const UNWARMED_FIXTURE: &str = "fixture opened a fresh store without 
 pub(crate) enum Creation {
     /// The ordinary creation path.
     Default,
-    /// Always the cold staged build: initialization, every migration, staged
-    /// validation and activation.
+    /// Always the cold staged build: initialization, every migration and
+    /// staged validation on the stage's one engine start, then activation.
     Cold,
 }
 
@@ -199,7 +201,9 @@ impl OpenOptions {
             #[cfg(test)]
             candidate_cleanup_failure: None,
             #[cfg(test)]
-            migrated_stage_pool_delay: None,
+            stage_pool_delay: None,
+            #[cfg(test)]
+            validation_probe: None,
             #[cfg(any(test, feature = "test-support"))]
             creation: Creation::Default,
             #[cfg(any(test, feature = "test-support"))]
@@ -1894,12 +1898,14 @@ impl MemoryStore {
                 if Self::legacy_import_suppressed(&options.data_dir, &options.project_scope)? {
                     None
                 } else {
-                    tokio::task::spawn_blocking(move || migration::prepare(&data, &scope)).await??
+                    tokio::task::spawn_blocking(move || migration::prepare(&data, &scope))
+                        .await??
+                        .map(Arc::new)
                 };
             let recovered = recover_staging(
                 &directory,
                 &options.project_scope,
-                legacy.as_ref(),
+                legacy.as_deref(),
                 &make_options,
                 &mut lock,
                 progress,
@@ -1956,7 +1962,7 @@ impl MemoryStore {
                             parent,
                             lifecycle_root.as_deref(),
                             &options,
-                            legacy.as_ref(),
+                            legacy.clone(),
                             &mut lock,
                             &mut marker_pause,
                             progress,
@@ -1971,7 +1977,7 @@ impl MemoryStore {
                     parent,
                     lifecycle_root.as_deref(),
                     &options,
-                    legacy.as_ref(),
+                    legacy,
                     &mut lock,
                     &mut marker_pause,
                     progress,
@@ -2046,6 +2052,10 @@ impl MemoryStore {
         let validated = if options.read_only {
             migrations::validate_inspection(&pool).await
         } else {
+            #[cfg(test)]
+            if let Some(probe) = &options.validation_probe {
+                probe.validating(&directory);
+            }
             migrations::validate_active(&pool).await
         };
         if let Err(error) = validated {
@@ -2097,10 +2107,11 @@ impl MemoryStore {
 
     /// The cold staged build of a new store in `staging`: initialization and
     /// the optional legacy import, every migration, then validation and the
-    /// ready marker, each on its own engine start under the startup lock.
+    /// ready marker, all on the stage's one engine start under the startup
+    /// lock.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the cold staging jobs share the open's own inputs"
+        reason = "the cold staging job shares the open's own inputs"
     )]
     async fn create_cold(
         make_options: &(impl Fn(PathBuf, bool) -> ServerOptions + Sync),
@@ -2108,7 +2119,7 @@ impl MemoryStore {
         parent: &Path,
         lifecycle_root: Option<&Path>,
         options: &OpenOptions,
-        legacy: Option<&LegacyImport>,
+        legacy: Option<Arc<LegacyImport>>,
         lock: &mut Option<File>,
         marker_pause: &mut Option<marker_fixture::ReadyMarkerPause>,
         progress: &mut ProgressReporter,
@@ -2123,19 +2134,17 @@ impl MemoryStore {
             project_scope: &options.project_scope,
             legacy,
             #[cfg(test)]
-            migration_hooks: options.migration_hooks.clone(),
-            #[cfg(test)]
-            migrated_stage_pool_delay: options.migrated_stage_pool_delay.clone(),
+            hooks: stage_worker::StageHooks {
+                migration: options.migration_hooks.clone(),
+                pool_delay: options.stage_pool_delay.clone(),
+                validation: options.validation_probe.clone(),
+            },
         };
-        // Each job's engine holds the startup lock as its reap guard and
-        // returns it only after that engine has been reaped.
-        let returned_lock = worker
-            .init(lock.take().expect("startup lock"), progress)
-            .await?;
-        let returned_lock = worker.migrate(returned_lock, progress).await?;
+        // The stage's one engine holds the startup lock as its reap guard,
+        // and the job returns it only after that engine has been reaped.
         *lock = Some(
             worker
-                .validate_and_mark(returned_lock, marker_pause, progress)
+                .build_cold(lock.take().expect("startup lock"), marker_pause, progress)
                 .await?,
         );
         let lease = Server::quiescence_at(staging, lifecycle_root, timeout).await?;

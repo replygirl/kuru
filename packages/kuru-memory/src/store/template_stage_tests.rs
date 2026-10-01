@@ -292,8 +292,7 @@ async fn adopt(
         timeout: base.timeout,
         project_scope: scope,
         legacy: None,
-        migration_hooks: None,
-        migrated_stage_pool_delay: None,
+        hooks: stage_worker::StageHooks::default(),
     };
     let _gate = crate::spawn_gate::spawning().await;
     let lock = startup_lock(&active).await?;

@@ -327,8 +327,12 @@ computer…` while a first launch unpacks the engine). Building the template is
 part of creating the project, so the sentence stays the same throughout and
 no other sentence is shown for it.
 
-A new project is built directly instead, running every schema step in its own
-staging directory (four database starts), when:
+A new project is built directly instead, in its own staging directory, also
+with two database starts: one that initializes the store, imports any legacy
+data, runs every schema step, validates the result and marks it ready in its
+staging directory, and the ordinary start at the project's own path, which
+validates it again. It is slower than a copy only because it runs the schema
+steps. A project is built directly when:
 
 - it imports legacy SQLite data (the import runs before the schema steps);
 - `memory.dolt_binary` names a development engine, because the template's key
