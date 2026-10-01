@@ -7357,6 +7357,144 @@ mod tests {
         Ok(())
     }
 
+    // T7i: a read-only inspection that arrives while the last client's owner
+    // retires, as a fixture or CLI inspection does right after a command
+    // exits. The service record is already gone but the store's own Dolt
+    // endpoint stays published until the reap, so only the owner lock tells
+    // that generation is still closing.
+    #[tokio::test]
+    async fn managed_inspection_meeting_a_retiring_owner_waits_for_its_reap_and_reads_its_own_generation()
+    -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner, and the inspection's local
+        // reopen after that owner released its lock. The borrowing open
+        // starts no Dolt.
+        let deadline = crate::test_support::fixture_deadline(1, 1);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let mut inspection = options.clone();
+            inspection.read_only = true;
+            let dolt_endpoint =
+                crate::store::project_directory(&data, &scope)?.join("endpoint.json");
+            let gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let pause =
+                ClosePause::at_each(&[ClosePoint::AfterEndpointRetire, ClosePoint::AfterReap]);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &scope, None).await?);
+            pause.entered.notified().await;
+
+            ensure!(
+                EndpointRecord::read(&data, &scope)?.is_none(),
+                "the service endpoint outlived its retirement step"
+            );
+            ensure!(
+                !owner_lock_free(&options)?,
+                "the owner lock was released before the reap"
+            );
+            ensure!(
+                !lifecycle_lease_free(&options)?,
+                "the lifecycle lease was released before the store closed"
+            );
+            ensure!(
+                dolt_endpoint.exists(),
+                "the store's Dolt endpoint was retired before the reap"
+            );
+
+            let mut managed = Box::pin(
+                crate::MemoryStore::open_managed_observed(
+                    inspection.clone(),
+                    project.clone(),
+                    crate::store::test_supervisor()?,
+                )
+                .1,
+            );
+            // Control, driven alongside the managed inspection: the direct
+            // open consults no service authority, so it borrows the retiring
+            // generation's still-published Dolt and reads through it. The
+            // managed inspection, polled first, must still be waiting after
+            // that complete borrowing open and read.
+            let control = async {
+                let borrowed = crate::MemoryStore::open(inspection.clone())
+                    .await
+                    .context("the direct read-only open did not borrow the retiring Dolt")?;
+                let revision = borrowed.revision().await;
+                Ok::<_, anyhow::Error>((borrowed, revision))
+            };
+            let (borrowed, revision) = tokio::select! {
+                biased;
+                opened = managed.as_mut() => {
+                    let outcome = opened.map(|_| ());
+                    bail!("the managed inspection opened while the retiring owner held its lock: {outcome:?}");
+                }
+                control = control => control?,
+            };
+            let revision = revision.context("the borrowed view did not read the retiring Dolt")?;
+            pause.release.notify_one();
+            tokio::select! {
+                biased;
+                () = pause.entered.notified() => {}
+                opened = managed.as_mut() => {
+                    let outcome = opened.map(|_| ());
+                    bail!("the managed inspection opened before the owner reaped: {outcome:?}");
+                }
+            }
+            ensure!(
+                lifecycle_lease_free(&options)?,
+                "the reap did not release the lifecycle lease"
+            );
+            ensure!(
+                !dolt_endpoint.exists(),
+                "the reap left the store's Dolt endpoint published"
+            );
+            ensure!(
+                !owner_lock_free(&options)?,
+                "the owner lock was released before the owner finished closing"
+            );
+            ensure!(
+                futures::poll!(managed.as_mut()).is_pending(),
+                "a managed inspection opened while the reaped owner still held its lock"
+            );
+            // No Dolt runs now: the borrowed view outlived the generation it
+            // read, while the managed inspection has not started its own.
+            ensure!(
+                borrowed.revision().await.is_err(),
+                "a borrowed read-only view still read after its generation was reaped"
+            );
+            let _ = borrowed.close().await;
+
+            // The owner lock release and the inspection's reacquisition of the
+            // store's locks run with every other in-binary spawn excluded.
+            let (memory, _gate) = crate::spawn_gate::excluding_spawns(gate, async {
+                pause.release.notify_one();
+                served.await??;
+                managed.await
+            })
+            .await
+            .context("the managed inspection failed after the owner released its lock")?;
+            ensure!(
+                format!("{memory:?}").contains(r#"backend: "local""#),
+                "the inspection attached instead of opening its own generation: {memory:?}"
+            );
+            let read = memory.revision().await;
+            let closed = memory.close().await;
+            ensure!(
+                read? == revision,
+                "the inspection read another revision than the retired generation committed"
+            );
+            closed?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("retiring-owner inspection fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
     // T12
     #[tokio::test]
     async fn inspection_skips_the_owner_probe_while_an_election_is_held() -> Result<()> {
