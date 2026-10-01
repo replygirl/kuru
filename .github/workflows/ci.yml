@@ -541,12 +541,16 @@ jobs:
 
   usage-scan-scaling:
     # Gating check that the usage-ledger startup scan grows at most linearly
-    # with ledger size: cold gated owner opens of aged stores at 1,000 and
-    # 5,000 conversations (4,000 and 20,000 usage rows), timed from the owner
-    # open timeline (usage-pool to usage-scan-1). The bounds are provisional
-    # until the validation-record change lands calibrated bounds with their
-    # derivation. Unix only: the owner timeline is inert on Windows.
-    name: Usage scan scaling (ubuntu-latest, provisional bounds)
+    # with ledger size and that a recorded reopen decodes no usage row: cold
+    # gated owner opens of aged stores at 1,000 and 5,000 conversations
+    # (4,000 and 20,000 usage rows), timed from the owner open timeline
+    # (usage-pool to usage-scan-1). Before each full open the driver forces
+    # the full validation; the open after it finds the record. The bounds
+    # (K=6 over a 100 ms floor, a 1 s ceiling) are calibrated from four
+    # Ubuntu runs of the earlier provisional bounds; the arithmetic is in the
+    # check's output and in docs/development.md. Unix only: the owner timeline
+    # is inert on Windows.
+    name: Usage scan scaling (ubuntu-latest, calibrated bounds)
     needs: bundle-inputs
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -660,12 +664,12 @@ jobs:
           echo "$line"
           printf '%s\n\n' "$line" >> "$GITHUB_STEP_SUMMARY"
           du -sh -- "$root"/data-*/memory
-      # Prints the per-size scan rows, the ratio and the provisional bounds on
-      # every run, and every timeline on a failed assertion. After the
-      # validation-record change it also asserts that a recorded reopen
-      # decodes 0 usage rows; not asserted now, because every writable open
-      # scans until then.
-      - name: Measure and assert the usage scan growth (provisional bounds)
+      # Prints the per-size full and recorded-reopen scan rows, the ratio, the
+      # calibrated bounds and their derivation on every run, and every
+      # timeline on a failed assertion. It asserts the planned rows on every
+      # forced full open, the growth bounds, and 0 usage rows decoded on every
+      # recorded reopen.
+      - name: Measure and assert the usage scan growth (calibrated bounds)
         shell: bash
         run: |
           mise run //packages/kuru-memory:measure:usage-scan -- --root "$KURU_USAGE_SCAN_ROOT" \

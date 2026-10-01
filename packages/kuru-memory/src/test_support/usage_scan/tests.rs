@@ -301,6 +301,7 @@ fn sizes(small_ms: f64, large_ms: f64) -> Vec<SizeSamples> {
                 sample(median, rows),
                 sample(median * 0.9, rows),
             ],
+            bound: vec![sample(20.0, 0), sample(21.0, 0), sample(19.0, 0)],
         })
         .collect()
 }
@@ -315,25 +316,27 @@ fn check<'a>(verdict: &'a Verdict, name: &str) -> &'a Check {
 
 #[test]
 fn linear_growth_passes_and_quadratic_growth_fails_with_both_numbers() -> Result<()> {
-    let linear = evaluate(&sizes(120.0, 600.0), PROVISIONAL, "provisional")?;
+    let linear = evaluate(&sizes(120.0, 450.0), CALIBRATED, CALIBRATED_LABEL)?;
     assert!(linear.pass, "{}", render_lines(&linear));
-    assert!((linear.ratio - 5.0).abs() < 1e-6, "{}", linear.ratio);
+    assert!((linear.ratio - 3.75).abs() < 1e-6, "{}", linear.ratio);
     assert_eq!(linear.sizes[0].scan1_median_ns, 120_000_000);
     assert_eq!(linear.sizes[1].scan1_ns.len(), 3);
-    let quadratic = evaluate(&sizes(500.0, 12_500.0), PROVISIONAL, "provisional")?;
+    assert_eq!(linear.sizes[1].bound_scan1_ns.len(), 3);
+    assert_eq!(linear.sizes[1].bound_scan1_median_ns, 20_000_000);
+    let quadratic = evaluate(&sizes(500.0, 12_500.0), CALIBRATED, CALIBRATED_LABEL)?;
     assert!(!quadratic.pass);
     let ratio = check(&quadratic, "ratio");
     assert!(!ratio.pass);
     assert_eq!(
         ratio.detail,
         "usage scan grew faster than linear: T(20000 rows)=12500.0 ms, T(4000 rows)=500.0 ms, \
-         ratio 25.00 > 8 (provisional bound; floor 100 ms)"
+         ratio 25.00 > 6 (calibrated bound; floor 100 ms)"
     );
     let ceiling = check(&quadratic, "ceiling");
     assert!(!ceiling.pass);
     assert_eq!(
         ceiling.detail,
-        "usage scan exceeded its ceiling: T(20000 rows)=12500.0 ms > 3000 ms (provisional bound)"
+        "usage scan exceeded its ceiling: T(20000 rows)=12500.0 ms > 1000 ms (calibrated bound)"
     );
     assert!(check(&quadratic, "rows").pass);
     Ok(())
@@ -341,22 +344,22 @@ fn linear_growth_passes_and_quadratic_growth_fails_with_both_numbers() -> Result
 
 #[test]
 fn the_floor_keeps_a_fast_small_size_from_failing_the_ratio() -> Result<()> {
-    // 700 / max(10, 100) = 7 passes; 900 / 100 = 9 fails; neither is quadratic.
-    let under = evaluate(&sizes(10.0, 700.0), PROVISIONAL, "provisional")?;
+    // 550 / max(10, 100) = 5.5 passes; 650 / 100 = 6.5 fails; neither is quadratic.
+    let under = evaluate(&sizes(10.0, 550.0), CALIBRATED, CALIBRATED_LABEL)?;
     assert!(under.pass, "{}", render_lines(&under));
-    assert!((under.ratio - 7.0).abs() < 1e-6);
-    let over = evaluate(&sizes(10.0, 900.0), PROVISIONAL, "provisional")?;
+    assert!((under.ratio - 5.5).abs() < 1e-6);
+    let over = evaluate(&sizes(10.0, 650.0), CALIBRATED, CALIBRATED_LABEL)?;
     assert!(!check(&over, "ratio").pass);
     assert!(check(&over, "ceiling").pass);
     // Above the floor the measured small size is the denominator.
-    let measured = evaluate(&sizes(200.0, 1_000.0), PROVISIONAL, "provisional")?;
+    let measured = evaluate(&sizes(200.0, 1_000.0), CALIBRATED, CALIBRATED_LABEL)?;
     assert!((measured.ratio - 5.0).abs() < 1e-6);
     Ok(())
 }
 
 #[test]
 fn a_ceiling_breach_alone_fails() -> Result<()> {
-    let verdict = evaluate(&sizes(500.0, 3_500.0), PROVISIONAL, "provisional")?;
+    let verdict = evaluate(&sizes(300.0, 1_500.0), CALIBRATED, CALIBRATED_LABEL)?;
     assert!(check(&verdict, "ratio").pass);
     assert!(!check(&verdict, "ceiling").pass);
     assert!(!verdict.pass);
@@ -368,14 +371,43 @@ fn a_row_count_mismatch_fails_in_a_warmup_or_a_sample() -> Result<()> {
     let mut measured = sizes(100.0, 500.0);
     measured[0].warmups[0].usage_rows = 3_999;
     measured[1].samples[2].usage_rows = 0;
-    let verdict = evaluate(&measured, PROVISIONAL, "provisional")?;
+    let verdict = evaluate(&measured, CALIBRATED, CALIBRATED_LABEL)?;
     let rows = check(&verdict, "rows");
     assert!(!rows.pass && !verdict.pass);
     assert_eq!(
         rows.detail,
-        "usage scan row count differs: 1000 conversations open 0 decoded 3999 rows, expected 4000; \
+        "usage scan row count differs (a forced full open must decode every owned row): \
+         1000 conversations open 0 decoded 3999 rows, expected 4000; \
          5000 conversations open 3 decoded 0 rows, expected 20000"
     );
+    assert!(check(&verdict, "bound-rows").pass);
+    Ok(())
+}
+
+#[test]
+fn a_recorded_reopen_that_decodes_rows_fails_by_name() -> Result<()> {
+    let clean = evaluate(&sizes(100.0, 500.0), CALIBRATED, CALIBRATED_LABEL)?;
+    let bound = check(&clean, "bound-rows");
+    assert!(bound.pass, "{}", render_lines(&clean));
+    assert_eq!(bound.detail, "every recorded reopen decoded 0 usage rows");
+    let mut measured = sizes(100.0, 500.0);
+    measured[0].bound[1].usage_rows = 4_000;
+    measured[1].bound[2].usage_rows = 1;
+    let verdict = evaluate(&measured, CALIBRATED, CALIBRATED_LABEL)?;
+    let bound = check(&verdict, "bound-rows");
+    assert!(!bound.pass && !verdict.pass);
+    assert_eq!(
+        bound.detail,
+        "a recorded reopen decoded usage rows (the validation record did not bind it): \
+         1000 conversations recorded reopen 1 decoded 4000 rows, expected 0; \
+         5000 conversations recorded reopen 2 decoded 1 rows, expected 0"
+    );
+    // Growth and full-open rows are judged apart from the recorded series.
+    assert!(check(&verdict, "ratio").pass && check(&verdict, "rows").pass);
+    // The 0-rows check does not look at the recorded series' timing.
+    let mut slow = sizes(100.0, 500.0);
+    slow[1].bound[0] = sample(900.0, 0);
+    assert!(evaluate(&slow, CALIBRATED, CALIBRATED_LABEL)?.pass);
     Ok(())
 }
 
@@ -383,37 +415,50 @@ fn a_row_count_mismatch_fails_in_a_warmup_or_a_sample() -> Result<()> {
 fn evaluation_needs_two_ascending_sizes_with_odd_samples() {
     let mut one = sizes(1.0, 2.0);
     one.pop();
-    assert!(evaluate(&one, PROVISIONAL, "provisional").is_err());
+    assert!(evaluate(&one, CALIBRATED, CALIBRATED_LABEL).is_err());
     let mut reversed = sizes(1.0, 2.0);
     reversed.reverse();
-    assert!(evaluate(&reversed, PROVISIONAL, "provisional").is_err());
+    assert!(evaluate(&reversed, CALIBRATED, CALIBRATED_LABEL).is_err());
     let mut even = sizes(1.0, 2.0);
     even[0].samples.pop();
-    assert!(evaluate(&even, PROVISIONAL, "provisional").is_err());
+    assert!(evaluate(&even, CALIBRATED, CALIBRATED_LABEL).is_err());
+    let mut even_bound = sizes(1.0, 2.0);
+    even_bound[1].bound.pop();
+    assert!(evaluate(&even_bound, CALIBRATED, CALIBRATED_LABEL).is_err());
+    let mut no_bound = sizes(1.0, 2.0);
+    no_bound[0].bound.clear();
+    assert!(evaluate(&no_bound, CALIBRATED, CALIBRATED_LABEL).is_err());
 }
 
 #[test]
-fn every_report_names_the_provisional_bounds_rows_and_ratio() -> Result<()> {
+fn every_report_names_the_calibrated_bounds_their_derivation_rows_and_ratio() -> Result<()> {
     for verdict in [
-        evaluate(&sizes(120.0, 600.0), PROVISIONAL, "provisional")?,
-        evaluate(&sizes(500.0, 12_500.0), PROVISIONAL, "provisional")?,
+        evaluate(&sizes(120.0, 600.0), CALIBRATED, CALIBRATED_LABEL)?,
+        evaluate(&sizes(500.0, 12_500.0), CALIBRATED, CALIBRATED_LABEL)?,
     ] {
         let lines = render_lines(&verdict);
         assert!(
             lines.starts_with(
-                "usage-scan check: PROVISIONAL bounds (K=8, floor=100 ms, ceiling=3000 ms at the largest size)"
+                "usage-scan check: CALIBRATED bounds (K=6, floor=100 ms, ceiling=1000 ms at the largest size); derivation: 4 Ubuntu runs"
             ),
             "{lines}"
         );
+        assert!(lines.contains(DERIVATION), "{lines}");
+        assert!(!lines.contains("PROVISIONAL") && !lines.contains("not yet asserted"));
         assert!(lines.contains("1000   4000   "), "{lines}");
         assert!(lines.contains("5000   20000  "), "{lines}");
-        assert!(lines.contains("not yet asserted: 0 rows decoded on a recorded reopen"));
+        assert!(
+            lines.contains("recorded reopens (no row decoded"),
+            "{lines}"
+        );
         assert!(lines.ends_with(&format!("verdict  {}", verdict_word(verdict.pass))));
-        for name in ["rows", "ratio", "ceiling"] {
-            assert!(lines.contains(&format!("\n{name:<8} ")), "{lines}");
+        for name in ["rows", "ratio", "ceiling", "bound-rows"] {
+            assert!(lines.contains(&format!("\n{name:<10} ")), "{lines}");
         }
         let summary = render_summary(&verdict);
-        assert!(summary.contains("Bounds are **provisional**"), "{summary}");
+        assert!(summary.contains("Bounds are **calibrated**"), "{summary}");
+        assert!(summary.contains(DERIVATION), "{summary}");
+        assert!(summary.contains("| bound-rows | "), "{summary}");
         assert!(summary.contains("| 5000 | 20000 |"), "{summary}");
         assert!(summary.contains("| ratio | "), "{summary}");
     }
@@ -609,11 +654,14 @@ const TINY: Spec = Spec {
     sizes: &[2, 6],
 };
 
-/// The row-count assertion against real Dolt: two tiny stores created with
-/// an ungated owner, aged through the real write paths and sealed, then one
-/// warm-up and one gated owner open each, whose timeline row counts equal
-/// the plan's. The owners inherit the gate only through the task-local
-/// owner environment, never the runner's own.
+/// The row-count assertions against real Dolt: two tiny stores created with
+/// an ungated owner, aged through the real write paths and sealed. An unforced
+/// gated open of an aged store is bound and decodes no row, because its last
+/// write recorded the validated state. The measurement then forces the full
+/// validation before each cycle: its warm-up and full opens decode the plan's
+/// rows and the recorded reopen after each decodes none. The owners inherit
+/// the gate only through the task-local owner environment, never the
+/// runner's own.
 #[tokio::test]
 async fn gated_opens_of_sealed_aged_stores_count_the_planned_rows() -> Result<()> {
     warm_runtime_cache().await?;
@@ -624,11 +672,12 @@ async fn gated_opens_of_sealed_aged_stores_count_the_planned_rows() -> Result<()
         supervisor: crate::store::test_supervisor()?,
         cache_dir: Some(crate::store::test_cache()),
     };
-    // Per size: a creating owner, the direct ageing open and two gated
-    // owners; then one ungated owner.
+    // Per size: a creating owner, the direct ageing open, one unforced gated
+    // owner, two forcing opens and three gated owners; then a forcing open and
+    // one ungated owner.
     let count = TINY.sizes.len() as u32;
     let deadline = FixtureDeadline::start(
-        fixture_deadline(count, 3 * count + 1),
+        fixture_deadline(count, 7 * count + 2),
         "usage scan row count fixture",
     );
     let evidence = root.path().join("evidence");
@@ -668,26 +717,58 @@ async fn gated_opens_of_sealed_aged_stores_count_the_planned_rows() -> Result<()
             ensure!(format!("{error:#}").contains("not 3"), "{error:#}");
             seal(&layout, &TINY)?;
             let gate = vec![(OsString::from("KURU_OPEN_TIMELINE"), OsString::from("1"))];
+            // Unforced, the aged store is bound: no row is decoded.
+            for &n in TINY.sizes {
+                let project = layout.project(n)?;
+                let options = engine.options(layout.data(n), project_scope(&project));
+                let log = evidence.join(format!("unforced-{n}.log"));
+                std::fs::create_dir_all(&evidence)?;
+                let (unforced, _) = crate::service::activity::with_owner_environment(
+                    gate.clone(),
+                    measured_open(&options, &project, &engine.executable, &log),
+                )
+                .await?;
+                ensure!(
+                    unforced.usage_rows == 0,
+                    "an unforced open of the aged store with {n} conversations decoded {} rows",
+                    unforced.usage_rows
+                );
+            }
             let (measured, opened) = crate::service::activity::with_owner_environment(
                 gate,
                 measure(&layout, &TINY, &engine, 1, 1, &evidence),
             )
             .await?;
-            ensure!(opened.len() == 4, "{} opens", opened.len());
+            ensure!(opened.len() == 6, "{} opens", opened.len());
             for (size, rows) in measured.iter().zip([8, 24]) {
                 ensure!(size.expected_rows == rows);
                 ensure!(size.expected_rows == TINY.expected_rows(size.conversations));
+                ensure!(size.warmups.len() == 1 && size.samples.len() == 1);
                 for sample in size.warmups.iter().chain(&size.samples) {
                     ensure!(
                         sample.usage_rows == rows,
-                        "{} conversations decoded {} rows",
+                        "{} conversations decoded {} rows on a forced full open",
+                        size.conversations,
+                        sample.usage_rows
+                    );
+                }
+                ensure!(size.bound.len() == 1);
+                for sample in &size.bound {
+                    ensure!(
+                        sample.usage_rows == 0,
+                        "{} conversations decoded {} rows on a recorded reopen",
                         size.conversations,
                         sample.usage_rows
                     );
                 }
             }
-            let verdict = evaluate(&measured, PROVISIONAL, "provisional")?;
+            let verdict = evaluate(&measured, CALIBRATED, CALIBRATED_LABEL)?;
             ensure!(check(&verdict, "rows").pass, "{}", render_lines(&verdict));
+            ensure!(
+                check(&verdict, "bound-rows").pass,
+                "{}",
+                render_lines(&verdict)
+            );
             ensure!(
                 verdict
                     .sizes
@@ -696,7 +777,18 @@ async fn gated_opens_of_sealed_aged_stores_count_the_planned_rows() -> Result<()
                     .eq([2, 6])
             );
             let records = std::fs::read_to_string(evidence.join("records.jsonl"))?;
-            ensure!(records.lines().count() == 4, "{records}");
+            ensure!(records.lines().count() == 6, "{records}");
+            let series = records
+                .lines()
+                .map(|line| {
+                    let record: serde_json::Value = serde_json::from_str(line)?;
+                    Ok(record["series"].as_str().unwrap_or_default().to_owned())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(
+                series == ["full", "full", "bound", "full", "full", "bound"],
+                "{series:?}"
+            );
             for open in &opened {
                 ensure!(std::fs::read(&open.timeline_path)? == open.timeline);
             }

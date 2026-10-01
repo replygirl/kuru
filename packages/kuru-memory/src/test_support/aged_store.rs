@@ -190,9 +190,9 @@ pub async fn main(args: impl IntoIterator<Item = OsString>) -> Result<()> {
 /// The store this run ages, with its project owner lock held, so no managed
 /// owner can start on it until the run releases it.
 pub struct Claim {
-    data_dir: PathBuf,
-    scope: String,
-    lock: super::HeldOwnerLock,
+    pub(super) data_dir: PathBuf,
+    pub(super) scope: String,
+    pub(super) lock: super::HeldOwnerLock,
 }
 
 impl Claim {

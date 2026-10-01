@@ -2062,7 +2062,7 @@ fn native_platform_runs_windows_on_arm_as_separately_named_behavioral_evidence()
 
 /// The usage-scan scaling check gates CI from the day it lands: a required
 /// Ubuntu job imports the run's verified engine inputs, ages its fixture
-/// in-job on every run and asserts the provisional bounds, uploading its
+/// in-job on every run and asserts the calibrated bounds, uploading its
 /// evidence on any outcome. The aged fixture never enters the shared Actions
 /// cache: even after DOLT_GC it exceeds the cache budget.
 #[test]
@@ -2071,7 +2071,7 @@ fn usage_scan_scaling_is_a_required_job_that_ages_its_fixture_uncached() {
     let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     let job = workflow_job(&ci, "usage-scan-scaling", "ci-gate");
     for required in [
-        "    name: Usage scan scaling (ubuntu-latest, provisional bounds)\n",
+        "    name: Usage scan scaling (ubuntu-latest, calibrated bounds)\n",
         "    needs: bundle-inputs\n",
         "    runs-on: ubuntu-latest\n",
         "    timeout-minutes: 45\n",
@@ -2110,7 +2110,7 @@ fn usage_scan_scaling_is_a_required_job_that_ages_its_fixture_uncached() {
     let imported = position("Import the run's verified bundle inputs");
     let created = position("Build the release tooling and create the fixture stores");
     let aged = position("Age the fixture stores in-job");
-    let measured = position("Measure and assert the usage scan growth (provisional bounds)");
+    let measured = position("Measure and assert the usage scan growth (calibrated bounds)");
     let uploaded = position("Upload the usage scan records and timelines");
     assert!(imported < created && created < aged && aged < measured && measured < uploaded);
     assert!(

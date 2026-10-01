@@ -1679,6 +1679,31 @@ pub(crate) const SCHEMA_VERSIONS: [i32; 2] = [
 ];
 
 impl MemoryStore {
+    /// Usage-scan driver forcing step: give the usage branch one empty commit
+    /// whose message carries no validation record, as a binary that does not
+    /// write one would leave it. The next writable open then finds no record
+    /// for the head, runs the full validation and records again. No row, no
+    /// schema and no in-memory state changes, so this store stays writable.
+    #[cfg(all(unix, feature = "test-support"))]
+    pub(crate) async fn commit_unrecorded_usage_head(&self) -> Result<()> {
+        let _guard = self.shared.write.lock().await;
+        self.writable()?;
+        let pool = self
+            .shared
+            .usage_pool
+            .lock()
+            .expect("usage pool lock")
+            .clone()
+            .context("usage ledger is unavailable in this read-only or pre-ledger store")?;
+        sqlx::query("CALL DOLT_COMMIT('--allow-empty', '--message', ?, '--author', ?)")
+            .bind("foreign commit without a usage validation record")
+            .bind(AUTHOR)
+            .fetch_all(pool.as_ref())
+            .await
+            .context("commit the unrecorded usage head")?;
+        Ok(())
+    }
+
     pub(crate) fn ensure_project_scope(&self, scope: &str) -> Result<()> {
         ensure!(
             self.shared.fixture_unbound_scope || self.shared.project_scope == scope,
