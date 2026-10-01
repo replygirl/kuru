@@ -199,6 +199,15 @@ unchanged; correct that exact path before retrying.
 
 An interrupted import can resume after validation. Partial imports are stopped and preserved under `memory/interrupted/`; a failed import never becomes the active store. Keep the original and snapshots until you have checked every project you want to retain.
 
+Kuru is being prepared to create new project stores by copying a pre-built,
+schema-only template instead of running every schema upgrade. No release
+creates stores this way yet, so nothing changes for you today. When it does,
+each copy takes its own identity and credentials on first start, shares only
+schema history with other copies, and is set aside under `memory/interrupted/`
+without being started if a crash interrupts it. See
+[memory storage](https://github.com/replygirl/kuru/blob/main/docs/memory.md#template-born-stores)
+for the details.
+
 Kuru also applies compatible database schema upgrades automatically when a
 writable project opens. Each upgrade is prepared on an internal isolated branch
 and is fast-forwarded only after its committed receipt and schema validate.

@@ -1,0 +1,220 @@
+# Tasks
+
+## 1. Identity marker
+
+- [x] 1.1 Add an optional `template: Option<String>` field to `Identity` in
+      `server.rs` with `#[serde(default, skip_serializing_if = "Option::is_none")]`,
+      keeping `deny_unknown_fields`, and verify by a unit test asserting a
+      cold-built store's serialized `identity.json` bytes are unchanged
+      (`cold_identity_record_bytes_are_unchanged`). Evidence: the test
+      compares the serialized record with the pre-field record type's bytes,
+      reads an old record back without a template, and shows a record type
+      without the field refusing a template-born record; passed locally
+      (`server::template_identity_tests`).
+- [x] 1.2 Add `pub(crate) fn stage_template_key(directory: &Path) -> Result<Option<String>>`
+      in `server.rs` that reads `identity.json` through the same checked
+      reader and struct `load_identity` uses, without a second struct, and
+      verify by a unit test reading a hand-written template-marked
+      `identity.json` and a hand-written cold `identity.json` and asserting
+      `Some`/`None` respectively, plus a parse-failure case returning an
+      error. Evidence: `stage_template_key_reads_the_identity_record` also
+      covers a missing record (`None`), an unknown field, an empty, control
+      or over-long key and a malformed instance (errors), and the two
+      writers (`write_template_stage_identity`, `write_template_build_identity`)
+      refusing to replace a record; passed locally.
+
+## 2. Adoption in the Dolt bootstrap
+
+- [x] 2.1 Add the compiled-placeholder-key comparison at the top of the
+      `!identity.initialized` branch of `initialize_database`, behind a
+      single function so it can be replaced when P4b supplies the real key
+      computation, running for both a build identity (instance =
+      `TEMPLATE_INSTANCE`, not exercised by this change's callers but not
+      excluded by the check) and a copy identity (`template` set, instance
+      differs from `TEMPLATE_INSTANCE`), and verify by
+      `adoption_verdicts_are_typed_and_engine_failures_are_not`'s key-mismatch
+      case: a stale/foreign compiled key yields `Response::Failed` naming
+      both keys, with no adoption SQL executed. Evidence: the key is
+      `server::compiled_template_key()`; the test fixture's template build
+      itself runs the build-identity path (placeholder row written by the
+      existing bootstrap insert); the key-mismatch case is `Failed` naming
+      both keys in-process and a non-verdict client error through the
+      spawned supervisor; `adoption_requires_compiled_key_and_placeholder_on_both_refs`
+      shows no ref moved (heads read on a served copy); passed locally.
+- [x] 2.2 Add the adoption group: gated on `!identity.initialized && identity.template.is_some()`,
+      on one acquired connection, `USE` the usage branch, verify the
+      placeholder instance/scope row, `UPDATE` it to the new identity with a
+      guard clause on the placeholder values, assert exactly one row
+      affected, `CALL DOLT_COMMIT('-am', ..., '--author', AUTHOR)`; then the
+      same four steps on `main`; then the existing `kuru_reader` creation and
+      row-verification extended to check the adopted row on both refs before
+      `initialized: true` is written. Verify by
+      `adopted_copy_has_own_instance_scope_credentials_and_initial_revision`:
+      two independently adopted copies of the same template-like source end
+      with distinct instance, secrets and heads, the other copy's reader
+      secret is refused, and pre-adoption commit hashes are equal between the
+      two copies. Evidence: implemented with both refs verified (clean
+      working set, placeholder as the only row) before either is rewritten,
+      as the spec delta requires; the test also shows each adoption commit's
+      sole parent is the template head, retained branch heads equal the
+      template's, the initial revision is the `main` adoption head, and each
+      copy refuses the other's root and reader secrets (MySQL 1045); passed
+      locally.
+- [x] 2.3 Add `Response::TemplateRejected(String)` beside `Response::Failed`
+      in the `Response` enum (`deny_unknown_fields` preserved), and wire
+      `supervisor_request` to send it only when the bootstrap error downcasts
+      to the adoption group's own verdict type (placeholder row mismatch on
+      either ref before rewrite, or an affected-row count other than one),
+      mapping every other bootstrap error — including the key mismatch from
+      2.1 — to `Response::Failed`. Verify by
+      `adoption_verdicts_are_typed_and_engine_failures_are_not`'s full matrix:
+      a placeholder mismatch on either ref and a wrong `UPDATE` count each
+      produce `Response::TemplateRejected`; a key mismatch, an injected
+      bootstrap deadline and a killed engine each produce `Response::Failed`
+      or a client-side startup error; the client-side discriminant the caller
+      observes matches which bucket the server reported. Evidence: the
+      verdict type is `server::TemplateVerdict`, found through contexts by
+      `TemplateVerdict::find`; the client turns `TemplateRejected` back into
+      it. In-process (Unix): foreign usage row, foreign main row, dirty
+      working set and a zero-row rewrite are `TemplateRejected`; key
+      mismatch, a stall to the bootstrap deadline after the usage commit and
+      a SIGKILL of the owned engine after the usage commit are `Failed`.
+      Through the spawned supervisor (all OSes): foreign row is a client
+      verdict; key mismatch and a missing usage branch (SQL error) are not;
+      passed locally on macOS.
+
+## 3. Shared template-shape check
+
+- [x] 3.1 Write one function, parameterized by the expected identity row and
+      by branch-set/commit-count expectations derived from the compiled
+      migration registries (never hardcoded), that checks: the branch set
+      equals main plus the usage branch plus the retained migration
+      branches; every retained branch is clean and classified as published;
+      working sets are clean; every project-data table is empty on main and
+      the usage branch; views, triggers, procedures and `dolt_ignore` rules
+      are empty or absent on both refs; the instance row equals the expected
+      identity on both refs; and commit counts on both refs equal the
+      registry-derived expectation. Verify by unit test
+      `template_shape_counts_derive_from_registries` (synthetic registries,
+      asserting the formula, not a fixed number) and by exercising it from
+      the S1 call site in task 3.2. Evidence: `store/migrations/template_shape.rs`,
+      `check(main, Row::{Placeholder, Adopted})`; the base of two commits was
+      measured on Dolt 2.3.5 from a cold store's `dolt_log` (main 8, usage 5)
+      and is one constant; retained usage attempts are counted by the branch
+      set and classified by `validate_usage` from the usage pool, not here;
+      the unit test covers a usage-only step beyond the anchor, adoption's
+      extra commits and an invalid registry; the fixture template build runs
+      the placeholder form and passed; passed locally.
+- [x] 3.2 Call that function from the adoption path on the stage engine after
+      the commits of task 2.2 and before `ready.json`, with the adopted
+      identity and the post-adoption commit counts as its expected values,
+      and treat a failing query result as the typed verdict of task 2.3 while
+      a query error or timeout stays an ordinary failure. Verify by
+      `template_shape_violation_prevents_ready_marker`: an extra row, an
+      extra commit and an extra branch, injected one at a time into an
+      otherwise-adopted stage, each fail S1 with the typed verdict, leave the
+      stage preserved, and produce no active directory. Evidence: the call
+      site is `StageWorker::adopt_and_mark` (no product caller until the
+      template cache lands); the test also covers a view; each case is a
+      `TemplateVerdict` naming the violated property, the adopted unready
+      stage is under `interrupted/`, and no active directory exists; passed
+      locally.
+
+## 4. Recovery classes R and U
+
+- [x] 4.1 In `recover_staging` (`store.rs`), before the existing branch that
+      starts a writable engine on an identity-without-marker stage
+      (store.rs:7443-7454), add Class R: no `identity.json`, `data/` present,
+      and every top-level entry in `{data/, staging/ holding only temporary
+      record files, lifecycle.lock}`; wait for quiescence within the existing
+      bound, then preserve under `interrupted/` with no engine start. Verify
+      by `copy_remnant_without_identity_is_preserved_without_engine_start`:
+      the engine start ledger shows 0 starts for the stage and it ends under
+      `interrupted/`. Evidence: `copy_remnant` (bounded entry reads;
+      `lifecycle.lock` allowed on Unix only); the ledger gained a per-directory
+      start count (`Ledger::starts`, test-only); two remnants (bare, and with
+      an interrupted identity write's `record-<uuid>.tmp`) end preserved with
+      0 starts, and the open then creates a cold store; passed locally.
+- [x] 4.2 Add Class U immediately after: `identity.json` present with
+      `stage_template_key` returning `Some` and no `ready.json`; wait for
+      quiescence within the existing bound, then preserve under
+      `interrupted/` with no engine start and no adoption SQL run from
+      recovery. Verify by
+      `unready_template_stage_is_preserved_without_engine_start` with hooks
+      before S1 starts, after the usage-branch commit, after the main-branch
+      commit, and after `initialized` is set but before `ready.json` — each
+      hook point ends preserved with 0 starts — and by
+      `template_stage_is_classified_before_the_writable_recovery_start`
+      proving Class U's check precedes the existing store.rs:7443-7454
+      branch. Evidence: one open preserves all four stages with no start
+      beyond each stage's own earlier ones; the two mid-adoption hooks run
+      an in-process supervisor with an injected failure and are Unix-only
+      (Windows runs the other two), and a served copy confirms each hook's
+      ref state; the ordering test adds the contrast that the same stage
+      without the `template` field takes today's writable recovery start
+      (1 start, identity mismatch). Mutation check: forcing both classes off
+      made all three recovery tests fail; passed locally with them on.
+- [x] 4.3 Confirm `ready_template_stage_is_reused` needs no new code: a
+      template-born stage that already reached `ready.json` follows today's
+      existing-ready-stage reuse path unchanged (marker Before/After
+      boundaries, `validate_ready`, rename). Verify by that test asserting
+      the marker boundaries and that the existing reuse path activates the
+      stage without re-running adoption. Evidence: no reuse code changed;
+      after the After boundary the next open activates the same directory at
+      its initial revision with exactly one adoption commit (9 commits on
+      `main`) and exactly one inspection plus one active start; after the
+      Before boundary the job preserves the stage and the open builds
+      another store; passed locally.
+- [x] 4.4 Keep the "unrecognized interrupted import without server identity"
+      refusal for entries that remain genuinely unknown after classes R and
+      U are added. Verify: a test fails closed on fabricated unknown shapes
+      and none of them is started or moved. Evidence: no existing test
+      exercised that refusal, so `unrecognized_stage_without_identity_still_fails_closed`
+      was added: `data/` plus a foreign file, `data/` plus a non-temporary
+      record in `staging/`, and `staging/` without `data/` are each refused
+      with 0 starts and left in place; passed locally.
+
+## 5. Cross-cutting adoption test
+
+- [x] 5.1 Add `adopted_store_opens_under_a_later_key`: a store adopted under
+      compiled key K1 opens writable and read-only once its identity names a
+      different key K2 (the store's view of a supervisor compiled to another
+      key), proving the "only while `!initialized`" rule of task 2.1, and a
+      ready K1 template stage whose identity names K2 is reused through the
+      existing inspection path. Verify by both opens succeeding at the same
+      head without the marker being rewritten, and by the reuse reaching the
+      stage's initial revision; a failed comparison would refuse the open,
+      so no separate counter is added. Evidence: passed locally.
+
+## 6. Docs
+
+- [x] 6.1 Add a short passage to `docs/memory.md` and
+      `apps/kuru-docs/concepts/memory.md` on template-born stores' identity
+      marker and recovery classes, stating plainly that no open path takes
+      this route yet and nothing user-visible changes. Verify: `mise run
+      docs:check` passes and the passage names the `template` field, the
+      typed verdict, and classes R/U without promising a creation path that
+      does not exist yet. Evidence: `docs/memory.md` "Template-born stores"
+      and a public paragraph linking to it; `mise run docs:check` exited 0.
+
+## 7. Full verification
+
+- [x] 7.1 Run `mise run //packages/kuru-memory:test` and confirm all ten P4a
+      tests (section 9 of the design) plus the updated existing tests pass,
+      and confirm no other test's engine-start count changed (nothing yet
+      selects the template path). Verify: recorded command output showing
+      the new tests passing and the full package suite green. Evidence: on
+      macOS the full task exited 0: library 392 passed, 0 failed, 4 ignored
+      (558 s), and every integration target passed (10, 5, 12, 1). The
+      existing start-count and pool-budget tests are unchanged and passed;
+      no open selects the template path. Linux and Windows run in CI only.
+- [x] 7.2 Run `mise run lint`, `mise run format:check` and `mise run
+      typecheck` (or the equivalent package-scoped `//packages/kuru-memory:*`
+      addresses) and confirm clean, including Windows-target lint on the new
+      `cfg`-gated code if any. Verify: each command's exit code and a note of
+      any warnings addressed. Evidence: `//packages/kuru-memory:lint`,
+      `//packages/kuru-memory:lint:windows` and `//packages/kuru-memory:typecheck`
+      exited 0; `format:check` passed after `format:fix`; a clippy
+      `type_complexity` finding in the test cases was fixed with a struct;
+      unused P4b entry points carry `expect(dead_code, reason = ...)` only
+      outside tests.

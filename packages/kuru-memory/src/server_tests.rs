@@ -11,6 +11,7 @@ fn identity() -> Identity {
         password: secret(),
         reader_password: secret(),
         initialized: false,
+        template: None,
     }
 }
 
@@ -681,7 +682,9 @@ async fn selected_port_takeover_retries_actual_dolt_without_touching_holder() ->
             assert!(owned, "collision recovery borrowed an unrelated lifetime");
             endpoint
         }
-        Response::Failed(message) => bail!("actual Dolt did not recover: {message}"),
+        Response::Failed(message) | Response::TemplateRejected(message) => {
+            bail!("actual Dolt did not recover: {message}")
+        }
     };
     let ports = chosen.lock().unwrap().clone();
     assert_eq!(

@@ -148,6 +148,11 @@ impl Record {
 pub(crate) struct Ledger {
     live: HashMap<u64, LiveOwner>,
     records: HashMap<Key, Record>,
+    /// Supervisors this process started, per store directory, with the
+    /// canonical directory of the first, for tests that prove a path starts
+    /// no engine on a directory.
+    #[cfg(test)]
+    starts: HashMap<Key, (PathBuf, u64)>,
 }
 
 static LEDGER: Mutex<Option<Ledger>> = Mutex::new(None);
@@ -277,6 +282,16 @@ impl Ledger {
     pub(crate) fn forget_under(&mut self, root: &Path) {
         self.records
             .retain(|_, record| !record.directory.starts_with(root));
+        #[cfg(test)]
+        self.starts
+            .retain(|_, (directory, _)| !directory.starts_with(root));
+    }
+
+    /// How many supervisors this process has started for the store directory
+    /// `key` names. The key follows the directory through a rename.
+    #[cfg(test)]
+    pub(crate) fn starts(&self, key: &Key) -> u64 {
+        self.starts.get(key).map_or(0, |(_, starts)| *starts)
     }
 
     /// Live owners whose store lies beneath `root` (canonical), for a failure
@@ -311,6 +326,14 @@ pub(crate) struct LiveEngine {
 pub(crate) fn register(directory: &Path) -> LiveEngine {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     with(|ledger| {
+        #[cfg(test)]
+        if let Some(key) = key(directory) {
+            ledger
+                .starts
+                .entry(key)
+                .or_insert_with(|| (directory.to_path_buf(), 0))
+                .1 += 1;
+        }
         let owner = LiveOwner {
             directory: directory.to_path_buf(),
             key: key(directory),

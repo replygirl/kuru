@@ -52,11 +52,14 @@ mod open_pool_budget_tests;
 #[path = "store/operational_gc_tests.rs"]
 mod operational_gc_tests;
 #[cfg(test)]
+#[path = "store/template_stage_tests.rs"]
+pub(crate) mod template_stage_tests;
+#[cfg(test)]
 #[path = "store/template_tests.rs"]
 mod template_tests;
 
 pub(crate) const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
-const AUTHOR: &str = "Kuru <memory@kuru.local>";
+pub(crate) const AUTHOR: &str = "Kuru <memory@kuru.local>";
 const CANDIDATE_PREFIX: &str = "candidate_";
 const PROMOTING_PREFIX: &str = "kuru_candidate_promoting_";
 const ABANDONED_PREFIX: &str = "kuru_candidate_abandoned_";
@@ -7432,7 +7435,27 @@ async fn recover_staging(
             .then(|| read_activation(&stage, scope))
             .transpose()?;
         let identity_exists = fs::symlink_metadata(stage.join("identity.json")).is_ok();
-        if identity_exists {
+        // A stage copied from a store template is classified before any class
+        // that starts an engine, and never starts one: an interrupted copy
+        // (Class R) or an unready copy, whatever point its adoption reached
+        // (Class U), is preserved below after quiescence. Adoption is never
+        // replayed from recovery.
+        let template_stage = if identity_exists {
+            activation.is_none() && crate::server::stage_template_key(&stage)?.is_some()
+        } else {
+            activation.is_none() && copy_remnant(&stage)?
+        };
+        if template_stage {
+            let found = if identity_exists {
+                "an unready memory template stage"
+            } else {
+                "an interrupted memory template copy"
+            };
+            eprintln!(
+                "Found {found} at {}; preserving it without starting its engine",
+                stage.display()
+            );
+        } else if identity_exists {
             // A completed stage may attach read-only to another owner, while
             // an incomplete bootstrap always owns one. In either case this
             // opener retains the startup lock before its first await.
@@ -7536,6 +7559,62 @@ async fn recover_staging(
         }
     }
     Ok(recovered)
+}
+
+/// Entries read from a stage, or its record staging directory, before it is
+/// judged not to be an interrupted template copy.
+const REMNANT_ENTRY_LIMIT: usize = 16;
+
+/// Whether a stage without an identity record is what an interrupted copy
+/// from a store template leaves: a `data/` directory, and nothing else but a
+/// `staging/` directory holding only temporary record files (an interrupted
+/// identity write) and, on Unix, the stage's lifecycle lock. A supervisor
+/// writes the identity record before it creates `data/`, and refuses `data/`
+/// without one, so no engine start leaves this shape.
+fn copy_remnant(stage: &Path) -> Result<bool> {
+    let mut data = false;
+    for (index, entry) in fs::read_dir(stage)?.enumerate() {
+        if index >= REMNANT_ENTRY_LIMIT {
+            return Ok(false);
+        }
+        let entry = entry?;
+        let name = entry.file_name();
+        let kind = entry.file_type()?;
+        let allowed = match name.to_str() {
+            Some("data") if kind.is_dir() => {
+                data = true;
+                true
+            }
+            Some("staging") if kind.is_dir() => temporary_records_only(&entry.path())?,
+            Some("lifecycle.lock") => cfg!(unix) && kind.is_file(),
+            _ => false,
+        };
+        if !allowed {
+            return Ok(false);
+        }
+    }
+    Ok(data)
+}
+
+/// Whether a record staging directory holds only `record-<uuid>.tmp` files,
+/// the temporary names `files::write` publishes from.
+fn temporary_records_only(staging: &Path) -> Result<bool> {
+    for (index, entry) in fs::read_dir(staging)?.enumerate() {
+        if index >= REMNANT_ENTRY_LIMIT {
+            return Ok(false);
+        }
+        let entry = entry?;
+        let name = entry.file_name();
+        let temporary = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("record-"))
+            .and_then(|name| name.strip_suffix(".tmp"))
+            .is_some_and(|uuid| Uuid::parse_str(uuid).is_ok());
+        if !temporary || !entry.file_type()?.is_file() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn preserve_unready_stage(

@@ -75,6 +75,69 @@ pub(crate) const SUPERVISOR_REAP_ALLOWANCE: Duration = CLOSE_GRACE
 /// rather than defining a separate budget.
 const DROPPED_REAP_WARNING_MARGIN: Duration = Duration::from_secs(1);
 
+/// The instance a store template's identity row holds on `main` and on the
+/// usage branch until a copy adopts it: the nil UUID, which no generated
+/// instance (a random version-4 UUID) can equal. It is also the instance of a
+/// template build's own identity record.
+pub(crate) const TEMPLATE_INSTANCE: &str = "00000000-0000-0000-0000-000000000000";
+/// The project scope a store template's identity row holds until adoption:
+/// `project/` and the SHA-256 of `kuru-memory-store-template-scope-v1`. It
+/// passes every scope check a project identity does and names no project.
+pub(crate) const TEMPLATE_SCOPE: &str =
+    "project/611dd11842f30482f942494b150ce33784d70efdf91d47c7a9f498d95c81662d";
+/// Bound on the `template` key an identity record may carry. The template
+/// cache names directories after the key (`.rejected-<key>-<uuid>` is the
+/// longest), so a key of this length still fits one 255-byte path component.
+const TEMPLATE_KEY_LIMIT: usize = 128;
+/// The permanent usage branch, adopted before `main`.
+pub(crate) const USAGE_DATABASE: &str = "kuru/kuru_usage_v1";
+const ADOPTION_MESSAGE: &str = "Adopt Kuru memory template";
+
+/// The store template key this supervisor was compiled to trust.
+///
+/// A placeholder until the template cache computes the real key from the
+/// schema, engine and creation statements; that change replaces only this
+/// function. A stage whose pending identity names another key is refused
+/// before any write, and the refusal is not a verdict against its bytes.
+pub(crate) fn compiled_template_key() -> &'static str {
+    "kuru-memory-store-template-placeholder"
+}
+
+/// A completed comparison found a store template's bytes other than this
+/// build expects: a placeholder row that is missing, foreign or repeated, a
+/// guarded rewrite that changed a count of rows other than one, an adopted
+/// row that differs from the new identity, or a template shape other than
+/// the compiled one.
+///
+/// Only this error is a verdict against a template. Engine exits, SQL and
+/// transport errors, I/O errors, deadlines, authentication failures and a
+/// template key other than the compiled one say nothing about the bytes and
+/// are never wrapped in it. The supervisor reports it as
+/// [`Response::TemplateRejected`], and the client turns that response back
+/// into this type, so a caller finds it with [`TemplateVerdict::find`] on
+/// either side of the process boundary.
+#[derive(Debug)]
+pub(crate) struct TemplateVerdict(String);
+
+impl TemplateVerdict {
+    pub(crate) fn new(reason: impl Into<String>) -> Self {
+        Self(reason.into())
+    }
+
+    /// The verdict anywhere in `error`'s chain of causes and contexts.
+    pub(crate) fn find(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
+impl fmt::Display for TemplateVerdict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TemplateVerdict {}
+
 /// Worst-case owned close, as bounded by `close_pools_and_owner`: the first
 /// graceful pool drain, the Windows lifetime close, the supervisor reap
 /// allowance in `finish_owner`, and the post-reap pool drain.
@@ -297,6 +360,15 @@ struct Identity {
     password: String,
     reader_password: String,
     initialized: bool,
+    /// The store template key a stage copied from a template was created
+    /// under, or a template build's own key. Kept for the store's life: it
+    /// marks a template-born stage for recovery, and while `initialized` is
+    /// false it must equal [`compiled_template_key`]. A store created
+    /// directly or by import has none and never serializes the field, so its
+    /// record keeps its bytes; a binary that predates the field fails closed
+    /// on a record carrying it (`deny_unknown_fields`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    template: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -320,8 +392,16 @@ struct Request {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Response {
-    Ready { endpoint: Endpoint, owned: bool },
+    Ready {
+        endpoint: Endpoint,
+        owned: bool,
+    },
     Failed(String),
+    /// Startup failed on a [`TemplateVerdict`]. Every other failure is
+    /// [`Response::Failed`]. Only a same-build client creates template
+    /// stages, and a supervisor of another build refuses them on the key
+    /// before this can be sent, so an older client never receives it.
+    TemplateRejected(String),
 }
 
 async fn drain_closed_pools(pools: &[Arc<MySqlPool>]) {
@@ -680,6 +760,16 @@ impl Server {
                 return Err(startup_failure(
                     &mut owner,
                     anyhow!("memory server startup failed: {message}"),
+                )
+                .await);
+            }
+            Response::TemplateRejected(message) => {
+                return Err(startup_failure(
+                    &mut owner,
+                    TemplateVerdict::new(format!(
+                        "memory server startup rejected the store template: {message}"
+                    ))
+                    .into(),
                 )
                 .await);
             }
@@ -1418,15 +1508,184 @@ fn load_identity(directory: &Path, project_scope: &str) -> Result<Option<Identit
             identity.version == 1 && identity.project_scope == project_scope,
             "memory project identity mismatch"
         );
-        Uuid::parse_str(&identity.instance).context("invalid memory instance identity")?;
-        for secret in [&identity.password, &identity.reader_password] {
-            ensure!(
-                valid_secret(secret),
-                "invalid private memory credential record"
-            );
-        }
+        validate_identity(identity)?;
     }
     Ok(identity)
+}
+
+fn validate_identity(identity: &Identity) -> Result<()> {
+    ensure!(identity.version == 1, "memory project identity mismatch");
+    Uuid::parse_str(&identity.instance).context("invalid memory instance identity")?;
+    for secret in [&identity.password, &identity.reader_password] {
+        ensure!(
+            valid_secret(secret),
+            "invalid private memory credential record"
+        );
+    }
+    ensure!(
+        identity.template.as_deref().is_none_or(valid_template_key),
+        "invalid memory template identity"
+    );
+    Ok(())
+}
+
+/// A template key is one portable, case-distinct path component: `[a-z0-9_-]`,
+/// at most [`TEMPLATE_KEY_LIMIT`] bytes. The template cache names its key
+/// lock, template and build directories after it, so no separator, dot,
+/// uppercase letter or other byte a filesystem could reinterpret is accepted.
+fn valid_template_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= TEMPLATE_KEY_LIMIT
+        && key.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+/// The store template key a staging directory's identity record names, if
+/// any, read through the same checked reader and record type as every other
+/// identity read. `None` when the stage has no identity record or its record
+/// names no template; an unreadable or invalid record is an error.
+pub(crate) fn stage_template_key(directory: &Path) -> Result<Option<String>> {
+    let Some(identity) = read_record::<Identity>(&directory.join("identity.json"))? else {
+        return Ok(None);
+    };
+    validate_identity(&identity)?;
+    Ok(identity.template)
+}
+
+/// Publish the identity record of a stage whose `data/` was just copied from
+/// the store template `template`: a new instance, new secrets, the project's
+/// own scope and `initialized: false`, so the stage's first engine start
+/// adopts the copy. It must be the last file written into the stage.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no open creates a template stage until the template cache lands"
+    )
+)]
+pub(crate) fn write_template_stage_identity(
+    directory: &Path,
+    project_scope: &str,
+    template: &str,
+) -> Result<()> {
+    let identity = Identity {
+        version: 1,
+        instance: Uuid::new_v4().to_string(),
+        project_scope: project_scope.to_owned(),
+        password: secret(),
+        reader_password: secret(),
+        initialized: false,
+        template: Some(template.to_owned()),
+    };
+    validate_identity(&identity)?;
+    ensure!(
+        read_record::<Identity>(&directory.join("identity.json"))?.is_none(),
+        "memory template stage already has an identity"
+    );
+    write_record(&directory.join("identity.json"), &identity)
+}
+
+/// Publish the identity record of a new store template build: the
+/// placeholder instance and scope, new secrets and the template key, so its
+/// first engine start writes the placeholder identity row instead of a
+/// project's. Opened with [`TEMPLATE_SCOPE`] as its project scope.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no open builds a store template until the template cache lands"
+    )
+)]
+pub(crate) fn write_template_build_identity(directory: &Path, template: &str) -> Result<()> {
+    let identity = Identity {
+        version: 1,
+        instance: TEMPLATE_INSTANCE.to_owned(),
+        project_scope: TEMPLATE_SCOPE.to_owned(),
+        password: secret(),
+        reader_password: secret(),
+        initialized: false,
+        template: Some(template.to_owned()),
+    };
+    validate_identity(&identity)?;
+    ensure!(
+        read_record::<Identity>(&directory.join("identity.json"))?.is_none(),
+        "memory template build already has an identity"
+    );
+    write_record(&directory.join("identity.json"), &identity)
+}
+
+/// A test's view of one identity record, without its secrets' values.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IdentityView {
+    pub(crate) instance: String,
+    pub(crate) project_scope: String,
+    pub(crate) initialized: bool,
+    pub(crate) template: Option<String>,
+    /// The root and reader secrets, for credential tests only.
+    pub(crate) secrets: (String, String),
+}
+
+#[cfg(test)]
+impl From<&Identity> for IdentityView {
+    fn from(identity: &Identity) -> Self {
+        Self {
+            instance: identity.instance.clone(),
+            project_scope: identity.project_scope.clone(),
+            initialized: identity.initialized,
+            template: identity.template.clone(),
+            secrets: (identity.password.clone(), identity.reader_password.clone()),
+        }
+    }
+}
+
+/// Read one store directory's identity record in a test.
+#[cfg(test)]
+pub(crate) fn read_identity_view(directory: &Path) -> Result<IdentityView> {
+    let identity = read_record::<Identity>(&directory.join("identity.json"))?
+        .context("memory identity record is missing")?;
+    validate_identity(&identity)?;
+    Ok(IdentityView::from(&identity))
+}
+
+/// Rewrite one identity record's instance, scope, initialization and
+/// template in a test, keeping its secrets.
+#[cfg(test)]
+pub(crate) fn edit_identity(directory: &Path, edit: impl FnOnce(&mut IdentityView)) -> Result<()> {
+    let mut identity = read_record::<Identity>(&directory.join("identity.json"))?
+        .context("memory identity record is missing")?;
+    let mut view = IdentityView::from(&identity);
+    edit(&mut view);
+    identity.instance = view.instance;
+    identity.project_scope = view.project_scope;
+    identity.initialized = view.initialized;
+    identity.template = view.template;
+    validate_identity(&identity)?;
+    write_record(&directory.join("identity.json"), &identity)
+}
+
+/// Publish an initialized identity record with new secrets in a test, for a
+/// copied `data/` whose `main` identity row holds `instance` and `scope`:
+/// the next start authenticates root from the new secret (no `config/` is
+/// copied) and changes no row.
+#[cfg(test)]
+pub(crate) fn write_initialized_identity(
+    directory: &Path,
+    instance: &str,
+    project_scope: &str,
+) -> Result<()> {
+    let identity = Identity {
+        version: 1,
+        instance: instance.to_owned(),
+        project_scope: project_scope.to_owned(),
+        password: secret(),
+        reader_password: secret(),
+        initialized: true,
+        template: None,
+    };
+    validate_identity(&identity)?;
+    write_record(&directory.join("identity.json"), &identity)
 }
 
 fn secret() -> String {
@@ -1876,7 +2135,12 @@ async fn supervisor_request<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         // No credentials are ever serialized in the response. SQL bootstrap
         // credential-setting failures are deliberately reported without SQL text.
         let message = format!("{error:#}");
-        let _ = timeout(KILL_GRACE, write_frame(output, &Response::Failed(message))).await;
+        let response = if TemplateVerdict::find(&error).is_some() {
+            Response::TemplateRejected(message)
+        } else {
+            Response::Failed(message)
+        };
+        let _ = timeout(KILL_GRACE, write_frame(output, &response)).await;
         return Err(error);
     }
     Ok(())
@@ -1968,6 +2232,7 @@ async fn supervise_with_port_hook<
                 password: secret(),
                 reader_password: secret(),
                 initialized: false,
+                template: None,
             };
             write_record(&request.directory.join("identity.json"), &identity)?;
             identity
@@ -2311,6 +2576,8 @@ async fn start_database(
         )
         .await
         {
+            #[cfg(all(test, unix))]
+            adoption_fault::engine_started(child);
             let mut phase = "checking the bootstrap data directory";
             let initialized = timeout(
                 deadline.saturating_duration_since(Instant::now()),
@@ -2342,7 +2609,35 @@ async fn initialize_database(
             .with_context(|| format!("resolve Dolt bootstrap datadir {datadir:?}"))?,
         "Dolt bootstrap data directory mismatch"
     );
-    if !identity.initialized {
+    // A pending template identity names the key it was created under. Only
+    // while the store is uninitialized is that key compared, before any
+    // write: once adopted, the key is provenance, and a later build opens the
+    // store whatever key it was compiled with.
+    let adopting = match (&identity.template, identity.initialized) {
+        (Some(key), false) => {
+            *phase = "comparing the store template key";
+            let compiled = compiled_template_key();
+            ensure!(
+                key == compiled,
+                "memory store template key {key:?} differs from this supervisor's compiled \
+                 template key {compiled:?}; its data was not written"
+            );
+            if identity.instance == TEMPLATE_INSTANCE {
+                // A template build: today's bootstrap writes the placeholder.
+                ensure!(
+                    identity.project_scope == TEMPLATE_SCOPE,
+                    "a memory template build identity must use the template scope"
+                );
+                false
+            } else {
+                true
+            }
+        }
+        _ => false,
+    };
+    if adopting {
+        adopt_template(pool, identity, phase).await?;
+    } else if !identity.initialized {
         *phase = "creating the project database";
         sqlx::query("CREATE DATABASE IF NOT EXISTS kuru")
             .execute(pool)
@@ -2356,6 +2651,8 @@ async fn initialize_database(
         if existing == 0 {
             sqlx::query("INSERT INTO kuru.kuru_instance (singleton, instance_id, project_scope) VALUES (1, ?, ?)").bind(&identity.instance).bind(&identity.project_scope).execute(pool).await?;
         }
+    }
+    if !identity.initialized {
         // Dolt's CREATE USER parser rejects bind parameters. Only our generated
         // 64-character hex credential can enter this literal; never user input.
         ensure!(
@@ -2376,6 +2673,30 @@ async fn initialize_database(
             .execute(pool)
             .await?;
     }
+    if adopting {
+        // Both adopted rows, before the identity is marked initialized.
+        for (query, reference) in [
+            (
+                "SELECT instance_id, project_scope FROM `kuru/kuru_usage_v1`.kuru_instance WHERE singleton = 1",
+                "usage branch",
+            ),
+            (
+                "SELECT instance_id, project_scope FROM kuru.kuru_instance WHERE singleton = 1",
+                "main",
+            ),
+        ] {
+            *phase = "verifying the adopted project identity";
+            let rows = sqlx::query(query).fetch_all(pool).await?;
+            if !identity_rows_are(&rows, &identity.instance, &identity.project_scope)? {
+                return Err(TemplateVerdict::new(format!(
+                    "the adopted {reference} identity row differs from the new project \
+                     identity ({} rows)",
+                    rows.len()
+                ))
+                .into());
+            }
+        }
+    }
     *phase = "verifying the project identity";
     let row = sqlx::query(
         "SELECT instance_id, project_scope FROM kuru.kuru_instance WHERE singleton = 1",
@@ -2393,6 +2714,261 @@ async fn initialize_database(
         write_record(&directory.join("identity.json"), identity)?;
     }
     Ok(())
+}
+
+/// Whether `rows` is exactly one identity row holding `instance` and `scope`.
+fn identity_rows_are(rows: &[sqlx::mysql::MySqlRow], instance: &str, scope: &str) -> Result<bool> {
+    let [row] = rows else {
+        return Ok(false);
+    };
+    Ok(row.try_get::<String, _>("instance_id")? == instance
+        && row.try_get::<String, _>("project_scope")? == scope)
+}
+
+/// Give a copied template stage its own identity, once, on one session.
+///
+/// First, on the usage branch and on `main`, the working set must be clean
+/// and the compiled placeholder must be the only identity row. Only then is
+/// either ref rewritten: the usage branch first, so `main` is never adopted
+/// while the usage branch still holds the placeholder, then `main`, each by
+/// one guarded rewrite that must change exactly one row and one Dolt commit.
+/// A completed comparison with another result is a [`TemplateVerdict`];
+/// every SQL, transport or engine failure is an ordinary error. Nothing
+/// reconciles a partial adoption: recovery preserves the stage without
+/// starting an engine on it.
+async fn adopt_template(
+    pool: &MySqlPool,
+    identity: &Identity,
+    phase: &mut &'static str,
+) -> Result<()> {
+    *phase = "opening the template adoption session";
+    // The bootstrap pool holds one connection: detach it, so pool queries
+    // after adoption open their own session instead of waiting for this one.
+    let mut connection = pool.acquire().await?.detach();
+    let adopted = adopt_on(&mut connection, identity, phase).await;
+    let closed = sqlx::Connection::close(connection)
+        .await
+        .context("close the template adoption session");
+    match (adopted, closed) {
+        (Ok(()), closed) => closed,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close)) => Err(error.context(format!(
+            "template adoption session close also failed: {close:#}"
+        ))),
+    }
+}
+
+/// The two adopted refs, in adoption order.
+const ADOPTED_REFS: [(&str, &str); 2] = [(USAGE_DATABASE, "usage branch"), ("kuru", "main")];
+
+async fn adopt_on(
+    connection: &mut sqlx::MySqlConnection,
+    identity: &Identity,
+    phase: &mut &'static str,
+) -> Result<()> {
+    use sqlx::Executor;
+    for (database, reference) in ADOPTED_REFS {
+        *phase = if database == USAGE_DATABASE {
+            "verifying the store template placeholder on the usage branch"
+        } else {
+            "verifying the store template placeholder on main"
+        };
+        // Both names are constants of this module; `USE` takes no parameter.
+        connection
+            .execute(sqlx::AssertSqlSafe(format!("USE `{database}`")))
+            .await?;
+        let changes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status")
+            .fetch_one(&mut *connection)
+            .await?;
+        if changes != 0 {
+            return Err(TemplateVerdict::new(format!(
+                "the {reference} working set holds {changes} uncommitted changes"
+            ))
+            .into());
+        }
+        let rows =
+            sqlx::query("SELECT instance_id, project_scope FROM kuru_instance WHERE singleton = 1")
+                .fetch_all(&mut *connection)
+                .await?;
+        if !identity_rows_are(&rows, TEMPLATE_INSTANCE, TEMPLATE_SCOPE)? {
+            return Err(TemplateVerdict::new(format!(
+                "the {reference} identity row is not the compiled template placeholder ({} rows)",
+                rows.len()
+            ))
+            .into());
+        }
+    }
+    for (database, reference) in ADOPTED_REFS {
+        let usage = database == USAGE_DATABASE;
+        *phase = if usage {
+            "adopting the store template on the usage branch"
+        } else {
+            "adopting the store template on main"
+        };
+        connection
+            .execute(sqlx::AssertSqlSafe(format!("USE `{database}`")))
+            .await?;
+        #[cfg(all(test, unix))]
+        let guard_scope = adoption_fault::guard_scope(usage);
+        #[cfg(not(all(test, unix)))]
+        let guard_scope = TEMPLATE_SCOPE;
+        let updated = sqlx::query(
+            "UPDATE kuru_instance SET instance_id = ?, project_scope = ? WHERE singleton = 1 AND instance_id = ? AND project_scope = ?",
+        )
+        .bind(&identity.instance)
+        .bind(&identity.project_scope)
+        .bind(TEMPLATE_INSTANCE)
+        .bind(guard_scope)
+        .execute(&mut *connection)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            return Err(TemplateVerdict::new(format!(
+                "the guarded {reference} identity rewrite changed {updated} rows instead of one"
+            ))
+            .into());
+        }
+        sqlx::query("CALL DOLT_COMMIT('-am', ?, '--author', ?)")
+            .bind(ADOPTION_MESSAGE)
+            .bind(crate::store::AUTHOR)
+            .fetch_all(&mut *connection)
+            .await?;
+        #[cfg(all(test, unix))]
+        adoption_fault::reach(if usage {
+            adoption_fault::Point::AfterUsageCommit
+        } else {
+            adoption_fault::Point::AfterMainCommit
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+/// Test-only faults inside the adoption group of an in-process supervisor.
+/// A test scopes one with [`adoption_fault::FAULT`] around `supervise`; the
+/// bootstrap runs in that task. Ordinary supervisors run without one.
+#[cfg(all(test, unix))]
+pub(crate) mod adoption_fault {
+    use super::*;
+
+    /// A point in the adoption group, after the named ref's commit.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Point {
+        AfterUsageCommit,
+        AfterMainCommit,
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) enum Fault {
+        /// No fault: the bootstrap runs as it does in a spawned supervisor.
+        Nothing,
+        /// Fail the bootstrap at the point: the stage is left as a crash
+        /// there would leave it.
+        FailAt(Point),
+        /// Wait at the point until the bootstrap deadline ends the start.
+        StallAt(Point),
+        /// Kill the owned Dolt child at the point. The supervisor has not
+        /// reaped it, so its process ID still names it.
+        KillEngineAt(Point, Arc<StdMutex<Option<u32>>>),
+        /// Guard the usage branch rewrite with a scope no row holds, so the
+        /// engine reports zero changed rows.
+        MissUsageRewrite,
+    }
+
+    tokio::task_local! {
+        pub(crate) static FAULT: Fault;
+    }
+
+    fn current() -> Option<Fault> {
+        FAULT.try_with(Clone::clone).ok()
+    }
+
+    pub(super) fn guard_scope(usage: bool) -> &'static str {
+        if usage && matches!(current(), Some(Fault::MissUsageRewrite)) {
+            "project/0000000000000000000000000000000000000000000000000000000000000000"
+        } else {
+            TEMPLATE_SCOPE
+        }
+    }
+
+    /// Record the owned engine's process ID for [`Fault::KillEngineAt`].
+    pub(super) fn engine_started(child: &Child) {
+        if let Some(Fault::KillEngineAt(_, engine)) = current() {
+            *engine.lock().expect("engine slot") = child.id();
+        }
+    }
+
+    /// How an in-process supervisor's startup ended.
+    #[derive(Debug)]
+    pub(crate) enum Outcome {
+        Ready,
+        Failed(String),
+        TemplateRejected(String),
+    }
+
+    /// Run one supervisor for `options` in this process with `fault` scoped
+    /// around its bootstrap, read its startup response, then close its
+    /// lifetime and wait, bounded, for it to reap Dolt and release the stage's
+    /// lifecycle lease. The response is exactly the frame an owning client
+    /// would read. Nothing here registers in the engine ledger: the caller
+    /// records the stage's quiescence itself.
+    pub(crate) async fn supervise_once(options: &ServerOptions, fault: Fault) -> Result<Outcome> {
+        let request = Request {
+            binary: options.binary.clone(),
+            directory: fs::canonicalize(&options.directory)?,
+            project_scope: options.project_scope.clone(),
+            timeout_millis: options.timeout.as_millis().try_into()?,
+            read_only: options.read_only,
+            lifecycle_root: options.lifecycle_root.clone(),
+        };
+        let bound = options.timeout + SUPERVISOR_REAP_ALLOWANCE + SUPERVISOR_TRANSPORT_ALLOWANCE;
+        let (parent, mut input) = tokio::io::duplex(1024);
+        let (mut output, mut response) = tokio::io::duplex(64 * 1024);
+        let mut supervisor = tokio::spawn(async move {
+            // Held across the real Dolt spawn; see `crate::spawn_gate`.
+            let _gate = crate::spawn_gate::spawning().await;
+            FAULT
+                .scope(fault, supervisor_request(request, &mut input, &mut output))
+                .await
+        });
+        let read = timeout(bound, read_frame::<_, Response>(&mut response)).await;
+        // Closing the lifetime stops a ready engine; a failed start has
+        // already stopped and reaped its engine before it answered.
+        drop(parent);
+        let finished = timeout(bound, &mut supervisor).await;
+        if finished.is_err() {
+            supervisor.abort();
+            let _ = supervisor.await;
+            bail!("in-process memory supervisor did not finish within {bound:?}");
+        }
+        let outcome = match read.context("in-process supervisor response deadline exceeded")?? {
+            Response::Ready { .. } => Outcome::Ready,
+            Response::Failed(message) => Outcome::Failed(message),
+            Response::TemplateRejected(message) => Outcome::TemplateRejected(message),
+        };
+        Ok(outcome)
+    }
+
+    pub(super) async fn reach(point: Point) -> Result<()> {
+        match current() {
+            Some(Fault::FailAt(at)) if at == point => {
+                bail!("injected template adoption failure at {point:?}")
+            }
+            Some(Fault::StallAt(at)) if at == point => std::future::pending().await,
+            Some(Fault::KillEngineAt(at, engine)) if at == point => {
+                let pid = engine
+                    .lock()
+                    .expect("engine slot")
+                    .context("the owned engine's process ID was not recorded")?;
+                nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(i32::try_from(pid)?),
+                    nix::sys::signal::Signal::SIGKILL,
+                )?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 async fn stop_child(child: &mut Child) -> Result<crate::engine::StopOutcome> {
@@ -2415,6 +2991,7 @@ mod stale_endpoint_tests {
             password: secret(),
             reader_password: secret(),
             initialized: true,
+            template: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -2455,6 +3032,9 @@ mod branch_procedure_tests;
 #[cfg(test)]
 #[path = "server/startup_budget_tests.rs"]
 mod startup_budget_tests;
+#[cfg(test)]
+#[path = "server/template_identity_tests.rs"]
+mod template_identity_tests;
 #[cfg(all(test, unix))]
 #[path = "server_tests.rs"]
 mod tests;
