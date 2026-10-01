@@ -127,6 +127,40 @@
       (`test_support::TEMPLATE_DEPTH`; `cli.rs`, `terminal.rs`, `trust.rs`,
       `embedded_runtime.rs`).
 
+## 9. Review fixes (pull request #151)
+
+- [x] 9.1 A failed template build fails the open instead of going cold:
+      `create_in` returns `CreateError::Build` for every failure of the build
+      it started (engine, own validation or shape refusal, capture, byte
+      scan, uncertain publication) and `CreateError::Use` for structural,
+      copy and lock failures; the creation worker fails the open on `Build`.
+      Verify with `failed_template_build_fails_the_open_without_a_cold_retry`
+      (one engine start, nothing published, quarantined or left behind).
+- [x] 9.2 A stage that cannot be listed while it is set aside is preserved
+      instead of failing the cold fallback.
+- [x] 9.3 T11 compares synced paths within the stage by its unique name, so
+      it holds on Windows, where the copy's handle paths are not the
+      verbatim canonical form.
+- [x] 9.4 Open-level start failures before the stage serves: verify with
+      `failed_stage_start_leaves_the_copy_for_the_next_open_to_preserve`
+      (another build's key; ordinary error naming both keys, template
+      untouched, stage left in place, next open preserves it with no start
+      and copies in two) and
+      `adoption_verdict_quarantines_and_leaves_the_stage_in_place` (foreign
+      usage placeholder row; typed verdict, judged template quarantined,
+      stage left in place).
+- [x] 9.5 The quarantine class guard through a real open: verify with
+      `fixture_open_that_quarantines_the_shared_template_fails_teardown`
+      (child process, damaged manifest in its shared cache, cold open, the
+      teardown names the quarantine).
+- [x] 9.6 The creating stage precedes the template build on every operating
+      system: verify with
+      `first_project_reports_creation_before_its_template_build`.
+- [x] 9.7 Docs: the unready copy is preserved at once only after its engine
+      served, otherwise by the next open; a failed first-launch build fails
+      that open. Spec delta: the build-failure requirement names every
+      build phase, with a scenario.
+
 ## Evidence (2026-10-01, macOS arm64, shared loaded host, `MISE_LOCKED=1`)
 
 - `//packages/kuru-memory:test`: exit 0; lib 515 passed, 0 failed, 4 ignored;
