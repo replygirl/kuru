@@ -471,10 +471,23 @@ mod tests {
         values.iter().map(OsString::from).collect()
     }
 
+    /// A path that is absolute on the host: `/` is not absolute on Windows,
+    /// where a path needs a drive prefix, and the parser must keep refusing
+    /// relative paths on both.
+    fn absolute(name: &str) -> String {
+        #[cfg(windows)]
+        const ROOT: &str = "C:\\";
+        #[cfg(not(windows))]
+        const ROOT: &str = "/";
+        format!("{ROOT}{name}")
+    }
+
     #[test]
     fn parse_reads_flags_and_defaults() -> Result<()> {
-        let (data, plan) = parse(args(&["--data-dir", "/d", "--conversations", "5"]))?;
-        assert_eq!(data, PathBuf::from("/d"));
+        let d = absolute("d");
+        let d = d.as_str();
+        let (data, plan) = parse(args(&["--data-dir", d, "--conversations", "5"]))?;
+        assert_eq!(data, PathBuf::from(d));
         assert_eq!(
             plan,
             Plan {
@@ -491,7 +504,7 @@ mod tests {
             "--conversations",
             "2",
             "--data-dir",
-            "/d",
+            d,
         ]))?;
         assert_eq!(
             plan,
@@ -506,47 +519,42 @@ mod tests {
 
     #[test]
     fn parse_refuses_malformed_arguments() {
+        let (d, e) = (absolute("d"), absolute("e"));
+        let (d, e) = (d.as_str(), e.as_str());
         for (input, expected) in [
             (vec!["--conversations", "1"], "needs --data-dir"),
-            (vec!["--data-dir", "/d"], "needs --conversations"),
+            (vec!["--data-dir", d], "needs --conversations"),
             (
                 vec!["--data-dir", "relative", "--conversations", "1"],
                 "absolute",
             ),
-            (vec!["--data-dir", "/d", "--conversations", "0"], "between"),
-            (vec!["--data-dir", "/d", "--conversations", "x"], "integer"),
-            (vec!["--data-dir", "/d", "--conversations", "-1"], "integer"),
+            (vec!["--data-dir", d, "--conversations", "0"], "between"),
+            (vec!["--data-dir", d, "--conversations", "x"], "integer"),
+            (vec!["--data-dir", d, "--conversations", "-1"], "integer"),
             (
-                vec!["--data-dir", "/d", "--conversations", "1", "--turns", "0"],
+                vec!["--data-dir", d, "--conversations", "1", "--turns", "0"],
                 "between",
             ),
             (
-                vec!["--data-dir", "/d", "--conversations", "1", "--turns", "65"],
+                vec!["--data-dir", d, "--conversations", "1", "--turns", "65"],
                 "between",
             ),
             (
-                vec!["--data-dir", "/d", "--conversations", "1", "--seed"],
+                vec!["--data-dir", d, "--conversations", "1", "--seed"],
                 "needs a value",
             ),
             (
-                vec!["--data-dir", "/d", "--conversations", "1", "--bogus", "1"],
+                vec!["--data-dir", d, "--conversations", "1", "--bogus", "1"],
                 "does not accept",
             ),
             (
-                vec![
-                    "--data-dir",
-                    "/d",
-                    "--data-dir",
-                    "/e",
-                    "--conversations",
-                    "1",
-                ],
+                vec!["--data-dir", d, "--data-dir", e, "--conversations", "1"],
                 "twice",
             ),
             (
                 vec![
                     "--data-dir",
-                    "/d",
+                    d,
                     "--conversations",
                     "1",
                     "--conversations",
@@ -569,7 +577,7 @@ mod tests {
             assert!(format!("{error:#}").contains("UTF-8"), "{error:#}");
             let error = parse(vec![
                 "--data-dir".into(),
-                "/d".into(),
+                d.into(),
                 "--conversations".into(),
                 invalid,
             ])
