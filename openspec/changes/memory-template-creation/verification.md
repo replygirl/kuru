@@ -51,4 +51,4 @@
 
 ## 10. Open-time harness (release build)
 
-- [ ] 10.1 @benchmark (agent) run the `ci/open-time-report` harness N=10 against release builds of the base and head -> engine starts per case go from 4/1/0/4 to 3/1/0/2 (first-launch, cold-existing, warm-reopen, new-project).
+- [x] 10.1 @benchmark (agent) run the `ci/open-time-report` harness N=10 against release builds of the base and head -> engine starts per case go from 4/1/0/4 to 3/1/0/2 (first-launch, cold-existing, warm-reopen, new-project); observed 2026-10-01 on macOS (1-min load below 14 throughout): base 1c93476f 4/1/1/4, head 3587b4c1 3/1/1/2 (warm-reopen starts one engine in both because the owner now retires immediately); open p50 first-launch 5615 -> 6188 ms, cold-existing 536 -> 536 ms, new-project 2507 -> 1262 ms
