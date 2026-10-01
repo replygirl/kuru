@@ -29,7 +29,7 @@ Tests are numbered as in `tmp/roadmap/unit7-usage-scan-design-2026-10-01.md` sec
 
 - [ ] 4.1 @benchmark (agent) the first open after an upgrade at 20k conversations, end to end, release build -> not yet run; recorded in the PR body
 - [ ] 4.2 @benchmark (agent) age-scaling re-run at 1k, 5k and 20k conversations -> not yet run; scan rows are 0 on a recorded reopen at every size and the first-open row is one linear scan
-- [ ] 4.3 @runtime (agent) the `usage-scan-scaling` job on this PR's CI run -> not yet run; full series passes the calibrated ratio and ceiling, bound series shows 0 rows and at most 50 ms, the derivation arithmetic of design D7 is restated with the observed numbers
+- [ ] 4.3 @runtime (agent) the `usage-scan-scaling` job on this PR's CI run -> not yet run; every full open decodes its size's rows, the full series passes the calibrated ratio (K = 6 over the 100 ms floor) and ceiling (1 s), every recorded reopen decodes 0 rows (its timing printed, not bounded, per design D7), and the derivation arithmetic of design D7 is restated with the observed numbers
 - [ ] 4.4 @unit (agent) the driver unit tests and the real-engine row-count test -> not yet run; the forcing step gives planned rows on full samples and 0 on bound ones, the 0-rows assertion fails on a nonzero bound sample
 
 ## 5. Static checks

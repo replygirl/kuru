@@ -18,7 +18,7 @@
 ## 4. CI
 
 - [x] 4.1 Add the forcing step and the full and bound series to the usage-scan driver, adapt `gated_opens_of_sealed_aged_stores_count_the_planned_rows` and the verdict and report tests, enable the 0-rows assertion, and verify with the driver unit tests and the real-engine row-count test
-- [x] 4.2 Set the calibrated bounds with the derivation of design D7 (K, floor, ceiling; the bound series' timing is printed and not bounded until an Ubuntu run measures it), update the job name, comments and printed labels in `ci.yml` and the `release_workflow` shape test, and verify with `mise run //packages/kuru-delivery:test` and `lint:tooling`
+- [x] 4.2 Set the calibrated bounds with the derivation of design D7 (K = 6, floor 100 ms, ceiling 1,000 ms from the four Ubuntu runs; the bound series asserts 0 rows and its timing is printed and not bounded until an Ubuntu run measures it), update the job name, comments and printed labels in `ci.yml` and the `release_workflow` shape test, and verify with `mise run //packages/kuru-delivery:test` and `lint:tooling`
 
 ## 5. Documentation
 
