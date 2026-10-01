@@ -398,36 +398,25 @@ fn expected_receipt() -> String {
 
 fn assert_expected_startup_notice(stderr: &[u8]) -> Result<()> {
     let stderr = std::str::from_utf8(stderr).context("startup stderr is not UTF-8")?;
+    // Interim (unit 2 WP-C): the plain open sentences, until WP-D's
+    // assertions replace these.
     let lines: Vec<_> = stderr.lines().collect();
     ensure!(
-        lines.first() == Some(&"Memory: waiting for project ownership…"),
+        lines.first() == Some(&kuru::memory_activity::OPENING),
         "normal kuru run changed first startup frame: {stderr:?}"
     );
     let ready = lines
         .iter()
-        .position(|line| *line == "Memory: ready.")
-        .context("normal kuru run omitted ready startup frame")?;
-    let mut previous = 0;
-    for expected in [
-        "Memory: waiting for verified runtime cache…",
-        "Memory: extracting embedded runtime…",
-        "Memory: verifying cached runtime…",
-        "Memory: checking runtime version…",
-        "Memory: preparing database…",
-        "Memory: opening database…",
-    ] {
-        if let Some(position) = lines.iter().position(|line| *line == expected) {
-            ensure!(
-                position > previous && position < ready,
-                "normal kuru run reordered startup frame {expected:?}: {stderr:?}"
-            );
-            previous = position;
-        }
-    }
-    let notice = lines
-        .get(ready + 1)
-        .copied()
+        .position(|line| line.starts_with("Memory is ready at "))
         .context("normal kuru run omitted first-run notice")?;
+    ensure!(
+        lines[..ready]
+            .iter()
+            .all(|line| kuru::memory_activity::SENTENCES.contains(line))
+            && lines[..ready].windows(2).all(|pair| pair[0] != pair[1]),
+        "normal kuru run wrote an unexpected startup frame: {stderr:?}"
+    );
+    let notice = lines[ready];
     ensure!(
         notice.starts_with("Memory is ready at ")
             && notice.contains("Memory and chat do not expire automatically.")
@@ -438,7 +427,7 @@ fn assert_expected_startup_notice(stderr: &[u8]) -> Result<()> {
         "normal kuru run changed first-run notice: {notice:?}"
     );
     ensure!(
-        lines.len() == ready + 2,
+        lines.len() == ready + 1,
         "normal kuru run emitted unexpected stderr after startup and notice: {stderr:?}"
     );
     Ok(())

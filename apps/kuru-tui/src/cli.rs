@@ -18,8 +18,8 @@ use kuru_core::{
     ProjectPreferences, SafeManifest,
 };
 use kuru_memory::{
-    CandidateRefRejected, CandidateRefState, MemoryOpenStage, MemoryStore,
-    OpenOptions as MemoryOptions, SelectedAbandonResolution, SelectedAbandonUncertain,
+    CandidateRefRejected, CandidateRefState, MemoryStore, OpenOptions as MemoryOptions,
+    SelectedAbandonResolution, SelectedAbandonUncertain,
 };
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use kuru_runtime::{
@@ -718,283 +718,21 @@ pub fn validate_effort(models: &[ModelInfo], model: &str, effort: Option<&str>) 
     Ok(())
 }
 
-/// The real stderr sink: each write locks stderr for the call, matching the
-/// prior direct-`io::stderr()` behavior exactly.
-struct StderrSink;
-
-impl Write for StderrSink {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        io::stderr().lock().write(buffer)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        io::stderr().lock().flush()
-    }
-}
-
-struct MemoryProgressOutput {
-    sink: Box<dyn Write + Send>,
-    terminal: bool,
-    enabled: bool,
-    width: usize,
-}
-
-impl MemoryProgressOutput {
-    fn new() -> Self {
-        Self::with_sink(Box::new(StderrSink), io::stderr().is_terminal())
-    }
-
-    fn with_sink(sink: Box<dyn Write + Send>, terminal: bool) -> Self {
-        Self {
-            sink,
-            terminal,
-            enabled: true,
-            width: 0,
-        }
-    }
-
-    /// Write one already-formatted line as a single buffered call, so the
-    /// real stderr sink locks exactly once per line regardless of how many
-    /// fragments the caller's format string had.
-    fn write_line(&mut self, line: &str) {
-        if self
-            .sink
-            .write_all(line.as_bytes())
-            .and_then(|()| self.sink.flush())
-            .is_err()
-        {
-            self.enabled = false;
-        }
-    }
-
-    fn stage(&mut self, stage: MemoryOpenStage) {
-        // Interim, until the open-activity sentences replace these labels:
-        // the service start has no label of its own.
-        if !self.enabled
-            || matches!(
-                stage,
-                MemoryOpenStage::Ready | MemoryOpenStage::StartingMemoryService
-            )
-        {
-            return;
-        }
-        let text = memory_open_label(stage);
-        let line = if self.terminal {
-            let padding = " ".repeat(self.width.saturating_sub(text.len()));
-            format!("\r{text}{padding}")
-        } else {
-            format!("{text}\n")
-        };
-        self.write_line(&line);
-        if self.enabled {
-            self.width = self.width.max(text.len());
-        }
-    }
-
-    fn complete(&mut self) {
-        if !self.enabled {
-            return;
-        }
-        let text = memory_open_label(MemoryOpenStage::Ready);
-        let line = if self.terminal {
-            let padding = " ".repeat(self.width.saturating_sub(text.len()));
-            format!("\r{text}{padding}\n")
-        } else {
-            format!("{text}\n")
-        };
-        self.write_line(&line);
-    }
-
-    fn abandon(&mut self) {
-        if !self.enabled || !self.terminal || self.width == 0 {
-            return;
-        }
-        self.write_line(&format!("\r{}\r", " ".repeat(self.width)));
-    }
-
-    /// A retained line printed after the terminal `Memory: ready.` line, never
-    /// overwritten by a later transient stage. Stdout stays untouched; this is
-    /// stderr only and never runs when the open failed.
-    fn notice(&mut self, text: &str) {
-        if !self.enabled {
-            return;
-        }
-        self.write_line(&format!("{text}\n"));
-    }
-}
-
-fn memory_open_label(stage: MemoryOpenStage) -> &'static str {
-    match stage {
-        MemoryOpenStage::WaitingForProjectOwnership => "Memory: waiting for project ownership…",
-        MemoryOpenStage::WaitingForRuntimeCache => "Memory: waiting for verified runtime cache…",
-        MemoryOpenStage::VerifyingRuntimeCache => "Memory: verifying cached runtime…",
-        MemoryOpenStage::ExtractingEmbeddedRuntime => "Memory: extracting embedded runtime…",
-        MemoryOpenStage::CheckingRuntimeVersion => "Memory: checking runtime version…",
-        MemoryOpenStage::PreparingDatabase => "Memory: preparing database…",
-        MemoryOpenStage::OpeningDatabase => "Memory: opening database…",
-        MemoryOpenStage::Ready => "Memory: ready.",
-        MemoryOpenStage::RetainedInstallStage => {
-            "Memory: retained an install stage for later cleanup."
-        }
-        MemoryOpenStage::RetainedUnreceiptedInstallStage => {
-            "Memory: retained an install stage, but could not record it; \
-             it needs manual removal (see --debug diagnostics)."
-        }
-        _ => "Memory: preparing database…",
-    }
-}
-
-#[cfg(test)]
-mod memory_progress_output_tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Clone, Default)]
-    struct BufferSink(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for BufferSink {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buffer);
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn captured(output: MemoryProgressOutput, buffer: &Arc<Mutex<Vec<u8>>>) -> String {
-        drop(output);
-        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
-    }
-
-    #[test]
-    fn retained_install_stage_has_its_own_notice_text_distinct_from_every_other_label() {
-        let text = memory_open_label(MemoryOpenStage::RetainedInstallStage);
-        assert_eq!(text, "Memory: retained an install stage for later cleanup.");
-        for stage in [
-            MemoryOpenStage::WaitingForProjectOwnership,
-            MemoryOpenStage::WaitingForRuntimeCache,
-            MemoryOpenStage::VerifyingRuntimeCache,
-            MemoryOpenStage::ExtractingEmbeddedRuntime,
-            MemoryOpenStage::CheckingRuntimeVersion,
-            MemoryOpenStage::PreparingDatabase,
-            MemoryOpenStage::OpeningDatabase,
-            MemoryOpenStage::Ready,
-            MemoryOpenStage::RetainedUnreceiptedInstallStage,
-        ] {
-            assert_ne!(memory_open_label(stage), text);
-        }
-    }
-
-    #[test]
-    fn an_unreceipted_retained_stage_never_promises_a_later_cleanup() {
-        let text = memory_open_label(MemoryOpenStage::RetainedUnreceiptedInstallStage);
-        assert!(
-            !text.contains("for later cleanup"),
-            "an uncollectable stage must not be announced as scheduled: {text}"
-        );
-        assert!(text.contains("manual removal"), "{text}");
-    }
-
-    #[test]
-    fn notice_is_retained_after_the_terminal_ready_line_on_one_non_terminal_stream() {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let mut output =
-            MemoryProgressOutput::with_sink(Box::new(BufferSink(buffer.clone())), false);
-        output.stage(MemoryOpenStage::WaitingForProjectOwnership);
-        output.complete();
-        output.notice(memory_open_label(MemoryOpenStage::RetainedInstallStage));
-        let rendered = captured(output, &buffer);
-        assert_eq!(
-            rendered,
-            concat!(
-                "Memory: waiting for project ownership…\n",
-                "Memory: ready.\n",
-                "Memory: retained an install stage for later cleanup.\n",
-            )
-        );
-    }
-
-    #[test]
-    fn notice_never_writes_once_the_sink_has_failed() {
-        struct FailingSink;
-        impl Write for FailingSink {
-            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-                Err(io::Error::other("fixture sink failure"))
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut output = MemoryProgressOutput::with_sink(Box::new(FailingSink), false);
-        output.complete();
-        assert!(!output.enabled, "a failed write must disable this output");
-        // Disabled output takes no further action; this only proves `notice`
-        // does not panic or attempt a write once disabled.
-        output.notice("must not be sent to a disabled sink");
-    }
-}
-
-async fn open_memory(options: MemoryOptions, project: &Path) -> Result<MemoryStore> {
+async fn open_memory(
+    options: MemoryOptions,
+    project: &Path,
+    interactive: bool,
+) -> Result<MemoryStore> {
+    crate::memory_activity::start_clock();
+    let markers = crate::memory_activity::markers_enabled(
+        std::env::var_os(crate::memory_activity::MARKERS_ENV).as_deref(),
+    );
+    let configured_cache = options.config.cache_dir.is_some();
     let executable = std::env::current_exe().context("locate the current Kuru executable")?;
-    let (mut progress, opening) =
+    let (progress, opening) =
         MemoryStore::open_managed_observed(options, project.to_owned(), executable);
-    let mut opening = Box::pin(opening);
-    let mut output = MemoryProgressOutput::new();
-    // Interim, until the open-activity sentences replace these labels: memory
-    // reports a wait only where one is observed, and this keeps the
-    // established first line.
-    output.stage(MemoryOpenStage::WaitingForProjectOwnership);
-    let mut observed_ready = false;
-    let mut retained_install_stage = None;
-    let mut progress_open = true;
-    let result = loop {
-        tokio::select! {
-            result = &mut opening => break result,
-            stage = progress.recv(), if progress_open => match stage {
-                Some(MemoryOpenStage::Ready) => observed_ready = true,
-                Some(stage @ (MemoryOpenStage::RetainedInstallStage
-                    | MemoryOpenStage::RetainedUnreceiptedInstallStage)) => {
-                    retained_install_stage = Some(stage);
-                }
-                Some(stage) => output.stage(stage),
-                None => progress_open = false,
-            },
-        }
-    };
-    drop(opening);
-    while let Some(stage) = progress.recv().await {
-        match stage {
-            MemoryOpenStage::Ready => observed_ready = true,
-            stage @ (MemoryOpenStage::RetainedInstallStage
-            | MemoryOpenStage::RetainedUnreceiptedInstallStage) => {
-                retained_install_stage = Some(stage);
-            }
-            stage => output.stage(stage),
-        }
-    }
-    match result {
-        Ok(store) => {
-            // Ready is emitted only with a completed usable store. Keeping this
-            // check makes a future memory stage addition unable to create a
-            // synthetic success line by itself.
-            debug_assert!(observed_ready, "successful observed open must report ready");
-            output.complete();
-            // Retained only after the terminal ready line, and only on a
-            // successful open: stdout stays JSON-clean, and an abandoned open
-            // never prints this notice.
-            // The unreceipted case says so: nothing will collect that stage.
-            if let Some(stage) = retained_install_stage {
-                output.notice(memory_open_label(stage));
-            }
-            Ok(store)
-        }
-        Err(error) => {
-            output.abandon();
-            Err(error)
-        }
-    }
+    let mut output = crate::memory_activity::ActivityOutput::for_process(interactive, markers);
+    crate::memory_activity::drive(opening, progress, &mut output, configured_cache).await
 }
 
 async fn settle_selected_candidate_abandon(
@@ -1265,7 +1003,9 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         return Ok(());
     }
 
-    if cli.command.is_none() && !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+    // Past this check an interactive session has terminal stdin and stdout.
+    let interactive = cli.command.is_none();
+    if interactive && !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
         bail!("interactive mode requires a terminal; use kuru run PROMPT");
     }
 
@@ -1436,7 +1176,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         let mut options = MemoryOptions::new(data.clone(), scope.clone());
         options.config = memory_config.clone();
         options.read_only = !writer && !migrate;
-        Ok(Some(open_memory(options, &cwd).await?))
+        Ok(Some(open_memory(options, &cwd, interactive).await?))
     }
     .await
     {
@@ -1699,7 +1439,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             None => {
                 let mut options = MemoryOptions::new(data.clone(), scope);
                 options.config = memory_config;
-                open_memory(options, &cwd).await?
+                open_memory(options, &cwd, interactive).await?
             }
         };
         memory_to_close = Some(memory.clone());

@@ -948,31 +948,21 @@ fn service_cleanup_release_attaches_its_failure_to_the_fixture_outcome() {
         .unwrap();
 }
 
+/// Interim (unit 2 WP-C): the plain open sentences, until WP-D's T14-T17
+/// assertions replace this helper.
 fn assert_memory_progress(stderr: &str) {
+    use kuru::memory_activity::{OPENING, SENTENCES};
     let lines: Vec<_> = stderr.lines().collect();
-    assert_eq!(
-        lines.first(),
-        Some(&"Memory: waiting for project ownership…"),
+    assert_eq!(lines.first(), Some(&OPENING), "{stderr}");
+    assert!(!stderr.contains("Memory:"), "{stderr}");
+    let sentences: Vec<_> = lines
+        .iter()
+        .filter(|line| SENTENCES.contains(line))
+        .collect();
+    assert!(
+        sentences.windows(2).all(|pair| pair[0] != pair[1]),
         "{stderr}"
     );
-    let ready = lines
-        .iter()
-        .position(|line| *line == "Memory: ready.")
-        .expect("memory startup omitted ready progress");
-    let mut previous = 0;
-    for stage in [
-        "Memory: waiting for verified runtime cache…",
-        "Memory: extracting embedded runtime…",
-        "Memory: verifying cached runtime…",
-        "Memory: checking runtime version…",
-        "Memory: preparing database…",
-        "Memory: opening database…",
-    ] {
-        if let Some(position) = lines.iter().position(|line| *line == stage) {
-            assert!(position > previous && position < ready, "{stderr}");
-            previous = position;
-        }
-    }
 }
 
 #[tokio::test]

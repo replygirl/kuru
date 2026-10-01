@@ -2401,40 +2401,19 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
         .position(|bytes| bytes == b"\x1b[?1049h")
         .context("terminal did not enter its alternate screen")?;
     let startup = &terminal.output[..alternate];
-    let waiting = b"Memory: waiting for project ownership";
-    let ready = b"Memory: ready.";
-    let waiting_at = startup
-        .windows(waiting.len())
-        .position(|bytes| bytes == waiting)
-        .context("memory startup did not report project-ownership wait before the first completed TUI frame")?;
-    let ready_at = startup
-        .windows(ready.len())
-        .position(|bytes| bytes == ready)
-        .context("memory startup did not report ready before the first completed TUI frame")?;
+    // Interim (unit 2 WP-C): the opening sentence precedes the interface
+    // and no labelled line remains, until WP-D's T17 replaces this.
+    let opening = kuru::memory_activity::OPENING.as_bytes();
+    startup
+        .windows(opening.len())
+        .position(|bytes| bytes == opening)
+        .context(
+            "memory startup did not show its opening sentence before the first completed TUI frame",
+        )?;
     assert!(
-        waiting_at < ready_at,
-        "memory startup reported ready before ownership wait"
+        !startup.windows(7).any(|bytes| bytes == b"Memory:"),
+        "memory startup still wrote a labelled line"
     );
-    let mut previous = waiting_at;
-    for stage in [
-        b"Memory: waiting for verified runtime cache".as_slice(),
-        b"Memory: extracting embedded runtime",
-        b"Memory: verifying cached runtime".as_slice(),
-        b"Memory: checking runtime version",
-        b"Memory: preparing database",
-        b"Memory: opening database",
-    ] {
-        if let Some(position) = startup
-            .windows(stage.len())
-            .position(|bytes| bytes == stage)
-        {
-            assert!(
-                position > previous && position < ready_at,
-                "memory startup reordered {stage:?} before the first completed TUI frame"
-            );
-            previous = position;
-        }
-    }
     assert!(
         terminal
             .output
