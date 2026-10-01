@@ -17,4 +17,4 @@
 
 - [x] 4.1 Run `format:check`, `lint`, `//packages/kuru-memory:lint:windows`, `typecheck`, `lint:tooling` and the kuru-memory and kuru-delivery tests covering the change, and record the results
 - [x] 4.2 Run the driver locally on freshly aged 1k and 5k stores with `--assert` and record rows, ratio and timing
-- [ ] 4.3 Record the first hosted run of `usage-scan-scaling` (verification 1.1 and 1.2)
+- [x] 4.3 Record the first hosted run of `usage-scan-scaling` (verification 1.1 and 1.2)
