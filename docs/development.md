@@ -866,6 +866,13 @@ restores matching compilations into each checkout's own `target/`, so a new
 worktree mostly restores its dependencies instead of recompiling them while
 concurrent worktrees keep separate Cargo locks. Calling rustup's `cargo`
 directly bypasses the wrapper; use `mise exec -- cargo` from editors and agents.
+
+The root `min_version` is a table because the two floors answer different
+questions. The hard floor stays at 2026.9.13: a hard floor at the latest
+release would make a developer machine on the previous Homebrew stable refuse
+every mise task, including the git hooks. The soft floor tracks the latest
+release (currently 2026.9.18, the CI pin), so an older local mise gets a
+recommendation to upgrade rather than a refusal.
 Do not run `mbx setup`, which writes machine-wide Cargo and editor
 configuration.
 
