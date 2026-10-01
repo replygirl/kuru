@@ -824,35 +824,44 @@ timeline to standard error. The records (`records.jsonl`, `verdict.json`),
 timelines, owner logs and ageing logs are uploaded as
 `ci-usage-scan-attempt-<n>` on any outcome.
 
-**The fixture cache.**
-- **Key.** `usage-scan-fixture-v1-<sha256>`, printed by `usage-scan-fixture
-  key` from compiled constants, so the workflow repeats none of them. It
-  covers the fixture format version, seed, turns and sizes, the aged-store
-  report format version, `CURRENT_VERSION` and `USAGE_CURRENT_VERSION`, the
-  bundled Dolt version, its archive and executable digests and target, and
-  the fixture root's canonical path. The path is needed because an owner
-  binds a store's scope to its project's canonical path; the job pins the
-  root at `$RUNNER_TEMP/kuru-usage-scan`.
-- **Contents.** Only `fixture.json` and each `data-<n>/memory` are cached.
-  The first, warm-up open extracts the engine again. The `key` step creates
-  each `data-<n>` owner-private before the restore, because the memory open
-  refuses a data directory with any other mode, and an archive that carries
-  only `data-<n>/memory` would otherwise leave its parent at the runner's
-  default mode.
-- **Restore.** Pull requests restore by the exact key only, with no
-  `restore-keys`, because an older-schema fixture would measure a migration
-  open instead.
-- **Save.** Only `main` saves, before any measuring open, so the cache holds
-  no timeline.
-- **Miss.** A miss ages both stores in-job, one after the other, and never
-  skips the check.
-- **Cold rebuild.** Bump `FIXTURE_FORMAT_VERSION` in
-  `test_support/usage_scan.rs`, or delete the entry from the repository's
-  Actions caches.
+**The fixture is aged in-job on every run and never cached.**
+- **Rule.** The fixture may occupy the repository's shared Actions cache
+  only if, after `CALL DOLT_GC()` on each store, both stores together stay
+  under about 1 GB on disk.
+- **Measured (2026-10-01).** On macOS arm64, freshly aged stores measured
+  with `du -sk data-<n>/memory`:
 
-**Decision rule.** The job prints the restore time and hit, and on a miss
-each size's ageing time. If cold 5k ageing on Ubuntu exceeds 20 minutes, or
-a restore exceeds 2 minutes, the fixture switches to a bulk-seeded ledger
+  | Stores | Before GC | After `DOLT_GC()` | After `DOLT_GC('--full')` |
+  | --- | --- | --- | --- |
+  | 1k | 259,908 KiB | 222,420 KiB | 209,212 KiB |
+  | 5k | 1,450,004 KiB | 1,425,852 KiB | 1,366,200 KiB |
+  | Total | 1.63 GiB | 1.57 GiB (1.69 GB) | 1.50 GiB |
+
+  Almost all of it is live history in `noms/oldgen`. The engine already runs
+  with automatic GC, so a manual GC reclaims only 2 to 4%. Before GC, the
+  ubuntu-latest stores are larger still: 335 to 340 MB at 1k and 2.1 GB at
+  5k. The total is over the budget, so the job keeps no cache entry for the
+  fixture.
+- **Stored size.** The one entry `main` saved before this decision held the
+  pre-GC Ubuntu fixture in 495,129,806 bytes, compressed. At the time, the
+  repository's caches held 63.79 GB in 490 entries; before that save,
+  61.84 GB in 475. The decision applies the rule to on-disk size, not to
+  that compressed size.
+- **Cost.** Every run creates and ages both stores, one after the other.
+  `main`'s first run took 13 min 40 s for the whole job. Of that, 171 s went
+  to the release build and 7 min 41 s to ageing (5k: 380,384 ms). That stays
+  under the 14 to 17 minutes of the slowest native partition.
+- **Seal.** `fixture.json` still records a key over the compiled constants
+  that decide what the stores measure. These are the fixture format, the
+  seed, turns and sizes, the aged-store report format, `CURRENT_VERSION` and
+  `USAGE_CURRENT_VERSION`, the bundled Dolt version, digests and target, and
+  the root's canonical path. A measurement therefore refuses a reused local
+  root sealed by another build or moved elsewhere. The job pins the root at
+  `$RUNNER_TEMP/kuru-usage-scan`, because an owner binds a store's scope to
+  its project's canonical path.
+
+**Decision rule.** The job prints each size's ageing time. If cold 5k ageing
+on Ubuntu exceeds 20 minutes, the fixture switches to a bulk-seeded ledger
 written with the ledger's own encoders in batched commits.
 
 **Running it locally** on Unix, with an absolute scratch root `<root>`:

@@ -456,13 +456,6 @@ fn command_lines_parse_and_refuse_malformed_input() -> Result<()> {
         }
     );
     assert_eq!(
-        parse_fixture(os(&["key", "--root", "/r", "--output", "/k"]))?,
-        FixtureCommand::Key {
-            root: "/r".into(),
-            output: Some("/k".into()),
-        }
-    );
-    assert_eq!(
         parse_fixture(os(&["create", "--conversations", "1000", "--root", "/r"]))?,
         FixtureCommand::Create {
             root: "/r".into(),
@@ -501,11 +494,13 @@ fn command_lines_parse_and_refuse_malformed_input() -> Result<()> {
         );
     }
     for (input, expected) in [
-        (vec![], "needs key, create or seal"),
+        (vec![], "needs create or seal"),
         (vec!["age"], "not age"),
+        // The cache key subcommand left with the fixture cache.
+        (vec!["key", "--root", "/r"], "not key"),
         (vec!["create", "--root", "/r"], "needs --conversations"),
         (vec!["seal"], "needs --root"),
-        (vec!["key", "--root", "/r", "--assert"], "does not accept"),
+        (vec!["seal", "--root", "/r", "--assert"], "does not accept"),
     ] {
         let error = parse_fixture(os(&input)).unwrap_err();
         assert!(
@@ -556,7 +551,7 @@ fn a_seal_from_another_root_build_or_plan_is_refused() -> Result<()> {
     write(&elsewhere)?;
     let error = read_seal(&layout, &CI).unwrap_err();
     assert!(
-        format!("{error:#}").contains("restored fixture was built for root /elsewhere"),
+        format!("{error:#}").contains("sealed fixture was built for root /elsewhere"),
         "{error:#}"
     );
     write(&Sealed {
@@ -593,7 +588,7 @@ fn data_directories_are_created_private_and_a_widened_one_is_refused() -> Result
         std::fs::metadata(&data)?.permissions().mode() & 0o777,
         0o700
     );
-    // As a cache restore would leave a parent it created itself.
+    // As a copied or hand-made fixture root could leave it.
     let widened = layout.data(5_000);
     std::fs::create_dir(&widened)?;
     std::fs::set_permissions(&widened, std::fs::Permissions::from_mode(0o755))?;

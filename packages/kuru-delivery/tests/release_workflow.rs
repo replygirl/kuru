@@ -2061,11 +2061,12 @@ fn native_platform_runs_windows_on_arm_as_separately_named_behavioral_evidence()
 }
 
 /// The usage-scan scaling check gates CI from the day it lands: a required
-/// Ubuntu job imports the run's verified engine inputs, restores its aged
-/// fixture by exact key only (saved from main only), ages in-job on a miss
-/// and asserts the provisional bounds, uploading its evidence on any outcome.
+/// Ubuntu job imports the run's verified engine inputs, ages its fixture
+/// in-job on every run and asserts the provisional bounds, uploading its
+/// evidence on any outcome. The aged fixture never enters the shared Actions
+/// cache: even after DOLT_GC it exceeds the cache budget.
 #[test]
-fn usage_scan_scaling_is_a_required_job_with_an_exact_key_fixture() {
+fn usage_scan_scaling_is_a_required_job_that_ages_its_fixture_uncached() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     let job = workflow_job(&ci, "usage-scan-scaling", "ci-gate");
@@ -2083,7 +2084,17 @@ fn usage_scan_scaling_is_a_required_job_with_an_exact_key_fixture() {
     ] {
         assert!(job.contains(required), "usage-scan-scaling lost {required}");
     }
-    for forbidden in ["continue-on-error", "restore-keys:", "KURU_OPEN_TIMELINE"] {
+    for forbidden in [
+        "continue-on-error",
+        "restore-keys:",
+        "KURU_OPEN_TIMELINE",
+        "actions/cache/restore@",
+        "actions/cache/save@",
+        "actions/cache@",
+        "steps.fixture",
+        "cache-hit",
+        "-- key --root",
+    ] {
         assert!(
             !job.contains(forbidden),
             "usage-scan-scaling uses {forbidden}"
@@ -2097,47 +2108,25 @@ fn usage_scan_scaling_is_a_required_job_with_an_exact_key_fixture() {
             .unwrap_or_else(|| panic!("missing step {name}"))
     };
     let imported = position("Import the run's verified bundle inputs");
-    let keyed = position("Build the release tooling and compute the aged fixture key");
-    let restored = position("Restore the aged fixture");
-    let aged = position("Age the fixture stores in-job (cache miss)");
-    let saved = position("Save the aged fixture");
+    let created = position("Build the release tooling and create the fixture stores");
+    let aged = position("Age the fixture stores in-job");
     let measured = position("Measure and assert the usage scan growth (provisional bounds)");
     let uploaded = position("Upload the usage scan records and timelines");
+    assert!(imported < created && created < aged && aged < measured && measured < uploaded);
     assert!(
-        imported < keyed
-            && keyed < restored
-            && restored < aged
-            && aged < saved
-            && saved < measured
-            && measured < uploaded
-    );
-    assert!(
-        steps[keyed]
-            .contains("mise run //packages/kuru-memory:measure:usage-scan:fixture -- key --root")
-    );
-    // Exact key only, and the same paths on restore and save.
-    let paths = "          path: |\n            ${{ runner.temp }}/kuru-usage-scan/fixture.json\n            ${{ runner.temp }}/kuru-usage-scan/data-1000/memory\n            ${{ runner.temp }}/kuru-usage-scan/data-5000/memory\n          key: ${{ steps.key.outputs.key }}";
-    assert!(steps[restored].contains(
-        "uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n"
-    ));
-    assert!(steps[restored].contains(paths));
-    assert!(
-        steps[saved].contains(
-            "uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n"
+        steps[created].contains(
+            "mise run //packages/kuru-memory:measure:usage-scan:fixture -- create --root"
         )
     );
-    assert!(steps[saved].contains(paths));
-    assert!(steps[saved].contains(
-        "if: github.ref == 'refs/heads/main' && steps.fixture.outputs.cache-hit != 'true'\n"
-    ));
-    // A miss ages in-job and never skips the measurement.
-    assert!(steps[aged].contains("if: steps.fixture.outputs.cache-hit != 'true'\n"));
+    // Every run ages in-job and never skips the measurement.
+    for step in [created, aged, measured] {
+        assert!(!steps[step].contains("\n        if:"));
+    }
     assert!(
         steps[aged]
             .contains("mise run //packages/kuru-memory:measure:age-store -- --profile release")
     );
     assert!(steps[aged].contains("-- seal --root"));
-    assert!(!steps[measured].contains("\n        if:"));
     assert!(
         steps[measured].contains("mise run //packages/kuru-memory:measure:usage-scan -- --root")
     );

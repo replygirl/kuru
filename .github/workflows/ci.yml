@@ -564,7 +564,7 @@ jobs:
         # Leave the leaf absent so the preparer creates this runner's private ACLs.
         # Cargo's restored target/ cache must not supply these directory grants.
         # The fixture root is one fixed path: the owner binds each store's
-        # scope to its project's canonical path, which the cache key names.
+        # scope to its project's canonical path, which the seal records.
         run: |
           {
             printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles-usage-scan-${{ github.run_attempt }}\n' "$RUNNER_TEMP"
@@ -619,50 +619,25 @@ jobs:
           for archive in "${archives[@]}"; do
             mise run //packages/kuru-memory:bundle:prepare -- --target "${archive%.archive}" --archive "$RUNNER_TEMP/bundle-inputs/$archive" --offline
           done
-      # Builds the release kuru-memory test-support tooling once; every later
-      # step reuses it. The key comes from compiled constants, never from YAML.
-      - id: key
-        name: Build the release tooling and compute the aged fixture key
+      # Builds the release kuru-memory test-support tooling once, through the
+      # first store's creation; every later step reuses it.
+      - name: Build the release tooling and create the fixture stores
         shell: bash
         run: |
           started=$(date +%s)
-          mise run //packages/kuru-memory:measure:usage-scan:fixture -- key --root "$KURU_USAGE_SCAN_ROOT" --output "$RUNNER_TEMP/kuru-usage-scan-key"
-          echo "Release tooling build and key: $(( $(date +%s) - started )) s"
-          printf 'key=%s\n' "$(cat -- "$RUNNER_TEMP/kuru-usage-scan-key")" >> "$GITHUB_OUTPUT"
-          printf 'KURU_USAGE_SCAN_RESTORE_STARTED=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
-      # Exact key only, with no prefix fallback: an older-schema fixture would
-      # measure a migration open instead. The extracted engine under
-      # data-<n>/tools is not cached; the first (warm-up) open extracts it.
-      - id: fixture
-        name: Restore the aged fixture
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ${{ runner.temp }}/kuru-usage-scan/fixture.json
-            ${{ runner.temp }}/kuru-usage-scan/data-1000/memory
-            ${{ runner.temp }}/kuru-usage-scan/data-5000/memory
-          key: ${{ steps.key.outputs.key }}
-      - name: Report the fixture restore
-        shell: bash
-        env:
-          KURU_USAGE_SCAN_CACHE_HIT: ${{ steps.fixture.outputs.cache-hit }}
-        run: |
-          seconds=$(( $(date +%s) - KURU_USAGE_SCAN_RESTORE_STARTED ))
-          hit=${KURU_USAGE_SCAN_CACHE_HIT:-false}
-          line="Aged fixture ${{ steps.key.outputs.key }}: exact-key hit=$hit, restore step ${seconds} s (decision rule: fall back to a bulk-seeded fixture if a restore exceeds 120 s)"
-          echo "$line"
-          printf '%s\n\n' "$line" >> "$GITHUB_STEP_SUMMARY"
-      # On a miss the job ages in-job; it never skips the check. Sequential,
-      # so the 5k ageing time is a clean number for the decision rule.
-      - name: Age the fixture stores in-job (cache miss)
-        if: steps.fixture.outputs.cache-hit != 'true'
+          for n in 1000 5000; do
+            mise run //packages/kuru-memory:measure:usage-scan:fixture -- create --root "$KURU_USAGE_SCAN_ROOT" --conversations "$n"
+          done
+          echo "Release tooling build and store creation: $(( $(date +%s) - started )) s"
+      # The fixture is never cached: even after DOLT_GC the two aged stores
+      # exceed the shared Actions cache budget (see docs/development.md), so
+      # every run ages them here and never skips the check. Sequential, so the
+      # 5k ageing time is a clean number for the decision rule.
+      - name: Age the fixture stores in-job
         shell: bash
         run: |
           root=$KURU_USAGE_SCAN_ROOT
           mkdir -p -- "$KURU_USAGE_SCAN_EVIDENCE"
-          for n in 1000 5000; do
-            mise run //packages/kuru-memory:measure:usage-scan:fixture -- create --root "$root" --conversations "$n"
-          done
           for n in 1000 5000; do
             if ! mise run //packages/kuru-memory:measure:age-store -- --profile release \
               --data-dir "$root/data-$n" --conversations "$n" --turns 1 --seed 1 \
@@ -685,16 +660,6 @@ jobs:
           echo "$line"
           printf '%s\n\n' "$line" >> "$GITHUB_STEP_SUMMARY"
           du -sh -- "$root"/data-*/memory
-      # Saved before any measuring open, so the archive holds no timeline.
-      - name: Save the aged fixture
-        if: github.ref == 'refs/heads/main' && steps.fixture.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ${{ runner.temp }}/kuru-usage-scan/fixture.json
-            ${{ runner.temp }}/kuru-usage-scan/data-1000/memory
-            ${{ runner.temp }}/kuru-usage-scan/data-5000/memory
-          key: ${{ steps.key.outputs.key }}
       # Prints the per-size scan rows, the ratio and the provisional bounds on
       # every run, and every timeline on a failed assertion. After the
       # validation-record change it also asserts that a recorded reopen
