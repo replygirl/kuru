@@ -1546,6 +1546,405 @@ mod tests {
         Ok(())
     }
 
+    const SEEDED_SESSION: &str = "seeded-session";
+    const SEEDED_INVOCATION: &str = "seeded-invocation";
+
+    /// A closed store whose usage branch holds one row of each owned class,
+    /// all written by the ledger's own write path, and the values it wrote.
+    struct Seeded {
+        _root: crate::test_support::TempDir,
+        options: OpenOptions,
+        usage_head: String,
+        marker: String,
+        record: String,
+        observation: String,
+        index: String,
+    }
+
+    async fn seeded() -> Result<Seeded> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::warmed_open_options(
+            root.path().to_owned(),
+            format!("project/{}", "0".repeat(64)),
+        )
+        .await?;
+        let store = MemoryStore::open(options.clone()).await?;
+        let ledger = store.usage_ledger()?;
+        ledger.mark_new_session(SEEDED_SESSION).await?;
+        ledger
+            .admit(start(SEEDED_SESSION, SEEDED_INVOCATION))
+            .await?;
+        ledger
+            .observe(
+                SEEDED_INVOCATION,
+                UsageObservation {
+                    sequence: 1,
+                    terminal: true,
+                    usage: Usage {
+                        input_tokens: Some(5),
+                        ..Usage::default()
+                    },
+                },
+            )
+            .await?;
+        ledger
+            .settle(SEEDED_INVOCATION, InvocationOutcome::Succeeded)
+            .await?;
+        let pool = ledger.store.pool.clone();
+        let owned = |key: String| {
+            let pool = pool.clone();
+            async move {
+                read_state(pool.as_ref(), &key)
+                    .await?
+                    .with_context(|| format!("the write path did not produce {key}"))
+            }
+        };
+        let seeded = Seeded {
+            usage_head: revision(pool.as_ref()).await?,
+            marker: owned(session_key(SEEDED_SESSION)).await?,
+            record: owned(record_key(SEEDED_INVOCATION)).await?,
+            observation: owned(observation_key(SEEDED_INVOCATION, 1)).await?,
+            index: owned(session_index_key(SEEDED_SESSION, SEEDED_INVOCATION)).await?,
+            options,
+            _root: root,
+        };
+        drop(pool);
+        drop(ledger);
+        store.close().await?;
+        Ok(seeded)
+    }
+
+    /// Reset the closed store's usage branch to the seeded head, then commit
+    /// `rows` there as a foreign writer would: through a released server and
+    /// raw SQL, never through `UsageLedger`.
+    async fn plant(seeded: &Seeded, rows: &[(Vec<u8>, String)]) -> Result<()> {
+        let server = super::super::tests::released_server(&seeded.options).await?;
+        let pool = server.pool(BRANCH).await?;
+        let planted = async {
+            sqlx::query("CALL DOLT_RESET('--hard', ?)")
+                .bind(&seeded.usage_head)
+                .fetch_all(pool.as_ref())
+                .await?;
+            ensure!(
+                revision(pool.as_ref()).await? == seeded.usage_head,
+                "the usage branch did not return to its seeded head"
+            );
+            if rows.is_empty() {
+                return Ok(());
+            }
+            for (key, value) in rows {
+                sqlx::query(
+                    "INSERT INTO state (`key`, value) VALUES (?, ?) \
+                     ON DUPLICATE KEY UPDATE value = VALUES(value)",
+                )
+                .bind(key.as_slice())
+                .bind(value)
+                .execute(pool.as_ref())
+                .await?;
+            }
+            sqlx::query("CALL DOLT_COMMIT('-Am', 'foreign usage write', '--author', ?)")
+                .bind(AUTHOR)
+                .fetch_all(pool.as_ref())
+                .await?;
+            // A dirty working set would refuse the reopen before the owned
+            // scan, so every refusal below must come from the scan itself.
+            let dirty: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status")
+                .fetch_one(pool.as_ref())
+                .await?;
+            ensure!(
+                dirty == 0,
+                "the foreign usage write left a dirty working set"
+            );
+            Ok(())
+        }
+        .await;
+        pool.close().await;
+        let closed = server.close().await;
+        planted.and(closed)
+    }
+
+    /// Plant `rows`, then require the writable reopen to refuse with
+    /// `expected` while a read-only open of the same store still succeeds.
+    async fn assert_reopen_refuses(
+        seeded: &Seeded,
+        case: &str,
+        rows: &[(Vec<u8>, String)],
+        expected: &str,
+    ) -> Result<()> {
+        plant(seeded, rows).await?;
+        match MemoryStore::open(seeded.options.clone()).await {
+            Ok(store) => {
+                store.close().await?;
+                bail!("{case}: the writable reopen activated an invalid usage ledger");
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                ensure!(
+                    error.contains(expected),
+                    "{case}: expected a refusal containing {expected:?}, got: {error}"
+                );
+            }
+        }
+        let mut read_only = seeded.options.clone();
+        read_only.read_only = true;
+        let reader = MemoryStore::open(read_only)
+            .await
+            .with_context(|| format!("{case}: the read-only open was refused"))?;
+        reader.revision().await?;
+        ensure!(
+            reader.usage_ledger().is_err(),
+            "{case}: a read-only open exposed the usage ledger"
+        );
+        reader.close().await
+    }
+
+    /// The seeded rows are intact: a writable reopen activates the ledger and
+    /// folds the seeded usage back.
+    async fn assert_seeded_usage_reads_back(seeded: &Seeded) -> Result<()> {
+        let store = MemoryStore::open(seeded.options.clone()).await?;
+        let ledger = store.usage_ledger()?;
+        let usage = ledger.session(SEEDED_SESSION).await?;
+        ensure!(usage.historical_complete && usage.invocation_count == 1);
+        ensure!(usage.known_usage.input_tokens == Some(5));
+        drop(ledger);
+        store.close().await
+    }
+
+    fn row(key: impl Into<Vec<u8>>, value: impl Into<String>) -> Vec<(Vec<u8>, String)> {
+        vec![(key.into(), value.into())]
+    }
+
+    fn with_field(value: &str, field: &str, replacement: Value) -> Result<String> {
+        let mut value: Value = serde_json::from_str(value)?;
+        value
+            .as_object_mut()
+            .context("an owned usage value is not an object")?
+            .insert(field.into(), replacement);
+        Ok(serde_json::to_string(&value)?)
+    }
+
+    #[tokio::test]
+    async fn malformed_owned_values_refuse_writable_reopen() -> Result<()> {
+        let seeded = seeded().await?;
+        let mut observation_zero: Value = serde_json::from_str(&seeded.observation)?;
+        observation_zero["observation"]["sequence"] = Value::from(0);
+        let classes = [
+            (
+                "session marker",
+                session_key(SEEDED_SESSION),
+                &seeded.marker,
+                "usage session marker is malformed",
+                with_field(&seeded.marker, "format", Value::from(2))?,
+                "usage session marker format is unsupported",
+            ),
+            (
+                "invocation record",
+                record_key(SEEDED_INVOCATION),
+                &seeded.record,
+                "usage ledger record is malformed",
+                with_field(&seeded.record, "last_usage_sequence", Value::from(0))?,
+                "usage ledger sequence is invalid",
+            ),
+            (
+                "observation",
+                observation_key(SEEDED_INVOCATION, 1),
+                &seeded.observation,
+                "usage observation is malformed",
+                serde_json::to_string(&observation_zero)?,
+                "usage sequence must start at one",
+            ),
+            (
+                "session index",
+                session_index_key(SEEDED_SESSION, SEEDED_INVOCATION),
+                &seeded.index,
+                "usage session index is malformed",
+                with_field(&seeded.index, "format", Value::from(2))?,
+                "usage session index format is unsupported",
+            ),
+        ];
+        for (class, key, value, malformed, invalid, invalid_message) in classes {
+            assert_reopen_refuses(
+                &seeded,
+                &format!("{class}: not JSON"),
+                &row(key.clone(), "{\"format\":"),
+                malformed,
+            )
+            .await?;
+            assert_reopen_refuses(
+                &seeded,
+                &format!("{class}: unknown field"),
+                &row(
+                    key.clone(),
+                    with_field(value, "unrecognized", Value::Bool(true))?,
+                ),
+                malformed,
+            )
+            .await?;
+            assert_reopen_refuses(
+                &seeded,
+                &format!("{class}: failed field validation"),
+                &row(key, invalid),
+                invalid_message,
+            )
+            .await?;
+        }
+        plant(&seeded, &[]).await?;
+        assert_seeded_usage_reads_back(&seeded).await
+    }
+
+    #[tokio::test]
+    async fn owned_values_under_noncanonical_keys_refuse_writable_reopen() -> Result<()> {
+        let seeded = seeded().await?;
+        let uppercase_record = format!(
+            "{RECORD_PREFIX}{}",
+            key_digest(SEEDED_INVOCATION).to_uppercase()
+        );
+        // Each value is the write path's own bytes; only its key is foreign.
+        // The canonical row stays in place beside the copy.
+        let cases = [
+            (
+                "session marker under another session's key",
+                session_key("other-session"),
+                &seeded.marker,
+                "usage marker key is not canonical",
+            ),
+            (
+                "invocation record under another invocation's key",
+                record_key("other-invocation"),
+                &seeded.record,
+                "usage ledger record key does not match its invocation",
+            ),
+            (
+                "invocation record under an uppercase digest",
+                uppercase_record,
+                &seeded.record,
+                "usage ledger record key does not match its invocation",
+            ),
+            (
+                "observation under another sequence",
+                observation_key(SEEDED_INVOCATION, 2),
+                &seeded.observation,
+                "usage observation key does not match its value",
+            ),
+            (
+                "session index under another session",
+                session_index_key("other-session", SEEDED_INVOCATION),
+                &seeded.index,
+                "usage session index is not canonical",
+            ),
+        ];
+        for (case, key, value, expected) in cases {
+            assert_reopen_refuses(&seeded, case, &row(key, value.clone()), expected).await?;
+        }
+        plant(&seeded, &[]).await?;
+        assert_seeded_usage_reads_back(&seeded).await
+    }
+
+    #[tokio::test]
+    async fn foreign_keys_under_the_owned_prefix_refuse_writable_reopen() -> Result<()> {
+        let seeded = seeded().await?;
+        let foreign = "{\"foreign\":true}";
+        for key in [
+            "kuru.usage.v1/future/x",
+            "kuru.usage.v1/",
+            "kuru.usage.v1/record",
+        ] {
+            assert_reopen_refuses(
+                &seeded,
+                &format!("unknown class {key:?}"),
+                &row(key, foreign),
+                "usage ledger owns an unrecognized state key",
+            )
+            .await?;
+        }
+        assert_reopen_refuses(
+            &seeded,
+            "non-UTF-8 key under the prefix",
+            &row(b"kuru.usage.v1/\xff".to_vec(), foreign),
+            "usage ledger key is not UTF-8",
+        )
+        .await?;
+        plant(&seeded, &[]).await?;
+        assert_seeded_usage_reads_back(&seeded).await
+    }
+
+    #[tokio::test]
+    async fn keys_beside_the_owned_prefix_are_not_refused() -> Result<()> {
+        let seeded = seeded().await?;
+        // Not even JSON: rows outside the prefix are never decoded. They sort
+        // before (`.` is 0x2e), at (a proper prefix) and after (`0` is 0x30)
+        // the owned range `kuru.usage.v1/`.
+        let beside: Vec<(Vec<u8>, String)> =
+            ["kuru.usage.v1", "kuru.usage.v1.x", "kuru.usage.v10x"]
+                .into_iter()
+                .map(|key| (key.as_bytes().to_vec(), "not JSON".to_owned()))
+                .collect();
+        plant(&seeded, &beside).await?;
+        assert_seeded_usage_reads_back(&seeded).await?;
+        let mut read_only = seeded.options.clone();
+        read_only.read_only = true;
+        MemoryStore::open(read_only).await?.close().await?;
+        // The same bytes one key inside the range are refused, so the edge
+        // sits exactly at the prefix.
+        let mut inside = beside;
+        inside.push((b"kuru.usage.v1/".to_vec(), "not JSON".to_owned()));
+        assert_reopen_refuses(
+            &seeded,
+            "the bare owned prefix beside the boundary keys",
+            &inside,
+            "usage ledger owns an unrecognized state key",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn establish_publishes_no_usage_pool_over_an_invalid_owned_row() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let usage_pool = store
+            .shared
+            .usage_pool
+            .lock()
+            .expect("usage pool lock")
+            .take()
+            .context("usage ledger pool is unavailable")?;
+        sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+            .bind(b"kuru.usage.v1/future/x".as_slice())
+            .bind("{\"foreign\":true}")
+            .execute(usage_pool.as_ref())
+            .await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'foreign usage write', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(usage_pool.as_ref())
+            .await?;
+        drop(usage_pool);
+        let error = match establish(&store).await {
+            Ok(()) => {
+                store.close().await?;
+                bail!("establish activated an invalid usage ledger");
+            }
+            Err(error) => format!("{error:#}"),
+        };
+        ensure!(
+            error.contains("usage ledger owns an unrecognized state key"),
+            "establish refused for another reason: {error}"
+        );
+        ensure!(
+            store
+                .shared
+                .usage_pool
+                .lock()
+                .expect("usage pool lock")
+                .is_none(),
+            "a refused establish published its usage pool"
+        );
+        let unavailable = format!("{:#}", store.usage_ledger().unwrap_err());
+        ensure!(
+            unavailable.contains("usage ledger is unavailable"),
+            "unexpected ledger refusal: {unavailable}"
+        );
+        store.close().await
+    }
+
     #[test]
     fn reducer_preserves_absent_components_and_observed_zeroes() -> Result<()> {
         let marker = Some(SessionMarker {
