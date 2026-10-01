@@ -64,7 +64,15 @@ pub(crate) struct Hooks {
     pub(crate) before_shape: Vec<String>,
     pub(crate) pause: Option<Arc<Pause>>,
     pub(crate) events: Option<Arc<StdMutex<Vec<Event>>>>,
+    /// After the build engine is reaped and before the capture: write the
+    /// build store's own path into a new file of its `data/`, as a leak the
+    /// byte scan must find.
+    pub(crate) plant_leak: bool,
 }
+
+/// The file [`Hooks::plant_leak`] writes, relative to the build store's
+/// `data/`.
+pub(crate) const PLANTED_LEAK: &str = "kuru-planted-leak";
 
 tokio::task_local! {
     pub(crate) static HOOKS: Hooks;
@@ -118,6 +126,16 @@ pub(super) fn synced(path: &Path) {
             .expect("hook events")
             .push(Event::Synced(path.to_owned()));
     }
+}
+
+pub(super) fn before_capture(store: &Path) -> Result<()> {
+    if current().is_some_and(|hooks| hooks.plant_leak) {
+        let mut bytes = b"planted before ".to_vec();
+        bytes.extend_from_slice(store.to_string_lossy().as_bytes());
+        bytes.extend_from_slice(b" after");
+        files::write(&store.join(DATA).join(PLANTED_LEAK), &bytes)?;
+    }
+    Ok(())
 }
 
 pub(super) fn manifest_written() {

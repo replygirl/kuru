@@ -295,14 +295,32 @@ A template is built only by the holder of its key's exclusive lock, and is
 published only after its database validates, its shape matches exactly the
 schema, receipts and placeholder identity the schema steps produce, and a scan
 of its files finds none of the build directory's path, the build's database
-credentials or the host name. That scan sees literal bytes only (the engine
+credentials or the host name. The shape check also reads every commit on
+`main` and on the usage branch: the engine's own first commit under its fixed
+system account, then Kuru's commits under Kuru's fixed author with the
+messages the schema steps write. That scan sees literal bytes only (the engine
 compresses its storage), so the shape check, which reads the database itself,
-is the guarantee and the scan an extra precaution. Copying a template checks
+is the guarantee and the scan an extra precaution; it is what rules out a
+recorded host or operating-system user name. The scan skips host names
+shorter than four characters, and does not look for the user name at all,
+because such short sequences occur by chance in compressed files and would
+refuse sound builds. A build whose scan finds anything is refused and its
+capture is removed at once. Copying a template checks
 every file's size and digest against its manifest and refuses links. A
 template is moved aside as `.rejected-<key>-<id>` only when a check of its own
 bytes fails; an engine, I/O, lock or deadline failure leaves it in place. No
 caller ever waits for another process's build: a busy template means building
 the store without one.
+
+A template directory Kuru cannot read, for example one whose permissions are
+no longer private to your user, is an I/O failure rather than a verdict
+against its bytes, so it is never moved aside. Once new projects are created
+from the template, each one would then be built without it, with a warning,
+until the directory is fixed. To recover, delete `<cache>/<engine version>/templates/<key>/` while
+no Kuru process is running; the next new project builds it again. On Windows
+the same `templates/` directory also holds a small `lifecycles/` lease file per
+build; like the key lock files, these are permanent and go only with the cache
+directory.
 
 ## Template-born stores
 

@@ -41,15 +41,24 @@
 //! capture; every file and directory synced), byte-scanned for the build
 //! store's path, both build secrets and the host name, described by a synced
 //! manifest, verified, and published by a no-replace rename with a bounded
-//! retry. A capture stage that cannot be published stays verified for its
-//! builder's own use and is swept by the next exclusive holder.
+//! retry. A capture stage that fails its scan or its verification is removed
+//! at once (best-effort; a failed removal is left for the next exclusive
+//! holder's sweep). A capture stage that cannot be published stays verified
+//! for its builder's own use and is swept by the next exclusive holder.
 //!
 //! The byte scan finds literal occurrences only. Dolt stores chunks
 //! compressed, and a value repeated within a chunk can become a
 //! back-reference (engine contract finding S7), so the scan is defence in
 //! depth: the guarantee rests on the shape assertion, which checks at the SQL
 //! level that the template holds schema, receipts and the placeholder row,
-//! and nothing else.
+//! and nothing else, and that every commit on both refs carries the engine's
+//! fixed system account or Kuru's compiled author and the compiled messages.
+//! Host names shorter than [`HOSTNAME_NEEDLE_MIN`] are not scanned for: a
+//! two- or three-byte sequence occurs by chance in compressed chunks and
+//! would refuse sound builds. Nor is the operating-system user name scanned,
+//! for the same reason (short and common names such as `rg` or `data`): the
+//! engine runs with a cleared environment and a private home, and the commit
+//! assertions are what rule out a recorded identity.
 //!
 //! **Use.** A copier takes the shared key lock and never waits: the
 //! structural check ([`Judged`]) reads the manifest and the top-level names,
@@ -222,6 +231,14 @@ fn open_root(root: &Path) -> Result<Directory> {
 
 /// The external lifecycle root of build stores (Windows), outside every
 /// moved tree; Unix keeps its lease in the store.
+///
+/// Each build store leaves one small `<identity>.lock` lease file there.
+/// They are lock files, and lock files are permanent here (see "No garbage
+/// collection" above): removing a lock file another process may hold open
+/// leaves its name delete-pending on Windows. Product project leases under
+/// `memory/lifecycles` follow the same rule. A build happens once per key
+/// and machine, so the directory grows by one file per build; deleting the
+/// whole cache while nothing runs reclaims it.
 fn build_lifecycle_root(root: &Directory) -> Result<Option<PathBuf>> {
     #[cfg(unix)]
     {
@@ -1101,7 +1118,9 @@ async fn build(
 
 /// Capture the reaped build store's `data/` into a new capture stage, scan
 /// it, describe it and verify it, then remove the build store. Returns the
-/// verified stage and its manifest. A failure leaves both for a sweep.
+/// verified stage and its manifest. A failure removes the capture stage at
+/// once (best-effort, so a byte-scan hit does not stay in the cache) and
+/// leaves the build store for a sweep.
 async fn capture(
     root: &Directory,
     key: &str,
@@ -1121,9 +1140,56 @@ async fn capture(
         paths.push(canonical);
     }
     let needles = leak_needles(&paths, &secrets, &hostnames(hostname));
+    #[cfg(test)]
+    hooks::before_capture(store).map_err(CreationFailure::Io)?;
     let stage = root
         .create_private_directory(OsStr::new(&transient_name("stage", key)))
         .map_err(CreationFailure::io)?;
+    let manifest = match describe(root, key, store, &stage, &needles) {
+        Ok(manifest) => manifest,
+        Err(failure) => {
+            discard_stage(stage);
+            return Err(failure);
+        }
+    };
+    // The template is complete without the build store; a removal failure
+    // leaves it for a sweep.
+    let build = store.parent().map(Path::to_owned);
+    if let Some(build) = build
+        && let Err(error) = files::directory(&build).and_then(|build| Ok(build.remove_tree()?))
+    {
+        tracing::warn!(
+            build = %build.display(),
+            error = %format!("{error:#}"),
+            "store template build store left for a later sweep"
+        );
+    }
+    drop(lease);
+    Ok((stage, manifest, needles))
+}
+
+/// Remove a capture stage that failed, best-effort: a failed removal leaves
+/// it for the next exclusive holder's sweep.
+fn discard_stage(stage: Directory) {
+    let path = stage.path().to_owned();
+    if let Err(error) = stage.remove_tree() {
+        tracing::warn!(
+            stage = %path.display(),
+            error = %format!("{error:#}"),
+            "a failed store template capture stage was left for a later sweep"
+        );
+    }
+}
+
+/// Copy the build store's `data/` into `stage`, scan it, write its manifest
+/// and verify the stage against it.
+fn describe(
+    root: &Directory,
+    key: &str,
+    store: &Path,
+    stage: &Directory,
+    needles: &[Needle],
+) -> Result<Manifest, CreationFailure> {
     let data = stage
         .create_private_directory(OsStr::new(DATA))
         .map_err(CreationFailure::io)?;
@@ -1135,7 +1201,7 @@ async fn capture(
         &mut |_, _| Ok(()),
     )?;
     sync_directory(data.path()).map_err(CreationFailure::io)?;
-    let hits = scan(data.path(), &needles)?;
+    let hits = scan(data.path(), needles)?;
     if !hits.is_empty() {
         let shown = hits
             .iter()
@@ -1161,23 +1227,9 @@ async fn capture(
         sync_directory(root.path())
     })();
     written.map_err(CreationFailure::io)?;
-    let manifest = verify(&stage, key).map_err(|failure| {
+    verify(stage, key).map_err(|failure| {
         failure.context("verify the captured store template before publication".into())
-    })?;
-    // The template is complete without the build store; a removal failure
-    // leaves it for a sweep.
-    let build = store.parent().map(Path::to_owned);
-    if let Some(build) = build
-        && let Err(error) = files::directory(&build).and_then(|build| Ok(build.remove_tree()?))
-    {
-        tracing::warn!(
-            build = %build.display(),
-            error = %format!("{error:#}"),
-            "store template build store left for a later sweep"
-        );
-    }
-    drop(lease);
-    Ok((stage, manifest, needles))
+    })
 }
 
 /// Publish the verified capture stage as `<key>/` by a no-replace rename,
@@ -1406,7 +1458,11 @@ async fn busy(wait: Wait, root: &Directory, key: &str) -> Result<bool, CreationF
 /// With [`Wait::Never`] a busy or failing lock returns
 /// [`Ensured::Unavailable`]; with [`Wait::Until`] a busy lock is polled and a
 /// lock error is fatal. A structural verdict quarantines the judged template
-/// under the exclusive lock before a rebuild.
+/// under the exclusive lock (identity-bound, best-effort). With
+/// [`Wait::Never`] the verdict is then returned, so a caller never pays a
+/// rebuild on top of a damaged template; with [`Wait::Until`] (warm-up and
+/// prefetch) the quarantine is followed by a rebuild. A product opener uses
+/// [`create_in`], which never rebuilds after a verdict either.
 pub(crate) async fn ensure_in(
     root: &Path,
     engine: &Engine,
@@ -1451,6 +1507,12 @@ pub(crate) async fn ensure_in(
             Inspection::Absent => {}
             Inspection::Condemned { identity, failure } => {
                 let moved = identity.map(|identity| quarantine_held(&root, key, identity));
+                if matches!(wait, Wait::Never) {
+                    drop(lock);
+                    return Err(failure.context(
+                        "the published store template failed its structural check".into(),
+                    ));
+                }
                 if !matches!(moved, Some(Quarantine::Moved(_))) {
                     return Err(failure.context(
                         "the published store template failed its structural check and could not \

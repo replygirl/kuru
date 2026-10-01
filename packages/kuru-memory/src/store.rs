@@ -7373,6 +7373,9 @@ pub(crate) const INITIALIZE_STATEMENTS: [&str; 5] = [
 /// The commit that records schema 1, with its message; [`AUTHOR`] is bound.
 pub(crate) const INITIALIZE_COMMIT: &str =
     "CALL DOLT_COMMIT('-Am', 'Initialize Kuru memory schema 1', '--author', ?)";
+/// The message [`INITIALIZE_COMMIT`] records, which the template shape
+/// asserts.
+pub(crate) const INITIALIZE_MESSAGE: &str = "Initialize Kuru memory schema 1";
 async fn initialize(pool: &MySqlPool) -> Result<()> {
     // Initialization is only called in a new, unpublished staging directory.
     for statement in INITIALIZE_STATEMENTS {

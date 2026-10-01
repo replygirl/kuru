@@ -91,7 +91,9 @@ pub(crate) const TEMPLATE_SCOPE: &str =
 const TEMPLATE_KEY_LIMIT: usize = 128;
 /// The permanent usage branch, adopted before `main`.
 pub(crate) const USAGE_DATABASE: &str = "kuru/kuru_usage_v1";
-const ADOPTION_MESSAGE: &str = "Adopt Kuru memory template";
+/// The message of the adoption commit on each ref; [`crate::store::AUTHOR`]
+/// is its author.
+pub(crate) const ADOPTION_MESSAGE: &str = "Adopt Kuru memory template";
 
 /// The store template key this supervisor was compiled to trust: the
 /// template cache's key over the schema, the engine and the creation

@@ -437,8 +437,9 @@ quarantined `.rejected-*` directory.
 
 Nothing prunes the shared test cache. It keeps every engine version and
 every template key built on the machine, across worktrees; key lock files are
-permanent. Reclaim it by deleting the whole cache directory while no test
-runs anywhere on the machine.
+permanent, as are the Windows build-store leases under `templates/lifecycles/`
+(one small file per build). Reclaim it by deleting the whole cache directory
+while no test runs anywhere on the machine.
 
 Ordinary application opens start or attach to the internal per-project memory
 service from the same Kuru executable. The service owns the prepared Dolt child

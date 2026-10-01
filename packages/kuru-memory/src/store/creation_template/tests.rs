@@ -460,6 +460,301 @@ async fn template_builds_once_with_data_only_and_is_reused_without_build() -> Re
     fixture.release(Ok(()))
 }
 
+/// The byte scan's positive control: every spelling of every needle the
+/// capture derives (both encodings, both separators, a Windows verbatim
+/// prefix stripped, each secret whole and in fragments) is found in a file
+/// that holds it, and a clean file yields nothing. Host names shorter than
+/// the scanned minimum produce no needle.
+#[test]
+fn byte_scan_finds_every_spelling_of_every_needle() -> Result<()> {
+    let fixture = fixture()?;
+    let secrets = [
+        "root-secret-0123456789abcdefghijklmnopqrstuv".to_owned(),
+        "reader-secret-ZYXWVUTSRQPONMLKJIHGFEDCBA98".to_owned(),
+    ];
+    let paths = [
+        PathBuf::from(r"\\?\C:\Users\builder\kuru\.build-key\store"),
+        PathBuf::from("/private/var/kuru/.build-key/store"),
+    ];
+    let short = "abc";
+    assert!(short.len() < HOSTNAME_NEEDLE_MIN);
+    let needles = leak_needles(
+        &paths,
+        &secrets,
+        &["build-host-01".to_owned(), short.to_owned()],
+    );
+    let labels: BTreeSet<&str> = needles.iter().map(|needle| needle.label.as_str()).collect();
+    for expected in [
+        "the build store path (UTF-8)",
+        "the build store path (UTF-16LE)",
+        "the root secret (UTF-8)",
+        "the reader secret (UTF-16LE)",
+        "a 16-character fragment of the root secret (UTF-8)",
+        "a 16-character fragment of the reader secret (UTF-16LE)",
+        "the host name (UTF-8)",
+        "the host name (UTF-16LE)",
+    ] {
+        ensure!(
+            labels.contains(expected),
+            "no needle {expected}: {labels:?}"
+        );
+    }
+    let spelled = |text: &str| -> Vec<Vec<u8>> {
+        vec![
+            text.as_bytes().to_vec(),
+            text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        ]
+    };
+    let bytes: BTreeSet<Vec<u8>> = needles.iter().map(|needle| needle.bytes.clone()).collect();
+    for form in [
+        r"C:\Users\builder\kuru\.build-key\store",
+        "C:/Users/builder/kuru/.build-key/store",
+        "/private/var/kuru/.build-key/store",
+        r"\private\var\kuru\.build-key\store",
+        "build-host-01",
+        secrets[0].as_str(),
+        &secrets[1][..16],
+    ] {
+        for spelling in spelled(form) {
+            ensure!(
+                bytes.contains(&spelling),
+                "{form:?} is not a needle in every encoding"
+            );
+        }
+    }
+    ensure!(
+        !bytes.iter().any(|needle| needle.is_empty()),
+        "an empty needle would match nothing"
+    );
+    for spelling in spelled(short) {
+        ensure!(
+            !bytes.contains(&spelling),
+            "a short host name became a needle"
+        );
+    }
+    // One file per needle, each holding only that needle between filler
+    // bytes, and one clean file.
+    let tree = files::ensure_private_directory(&fixture.path().join("tree"))?;
+    let nested = tree.create_private_directory(OsStr::new("nested"))?;
+    for (index, needle) in needles.iter().enumerate() {
+        let parent = if index % 2 == 0 { &tree } else { &nested };
+        let mut file = parent.create_new(OsStr::new(&format!("n{index:03}")))?;
+        file.write_all(b"\x00filler before\xff")?;
+        file.write_all(&needle.bytes)?;
+        file.write_all(b"\xfefiller after\x00")?;
+        file.sync_all()?;
+    }
+    let mut clean = tree.create_new(OsStr::new("clean"))?;
+    clean.write_all(b"schema, receipts and the placeholder row")?;
+    clean.sync_all()?;
+    drop(clean);
+    let hits = scan(tree.path(), &needles).map_err(failure)?;
+    for (index, needle) in needles.iter().enumerate() {
+        let file = if index % 2 == 0 {
+            format!("n{index:03}")
+        } else {
+            format!("nested/n{index:03}")
+        };
+        ensure!(
+            hits.contains(&(file.clone(), needle.label.clone())),
+            "{} in {file} was not found: {hits:?}",
+            needle.label
+        );
+    }
+    ensure!(
+        !hits.iter().any(|(file, _)| file == "clean"),
+        "a clean file was reported: {hits:?}"
+    );
+    fixture.release(Ok(()))
+}
+
+/// A build whose captured bytes hold the build store's path is refused as
+/// an engine failure (never a verdict), publishes nothing and removes its
+/// capture stage at once; the key lock is free afterwards and the next
+/// exclusive holder sweeps the build store and publishes a clean build.
+#[tokio::test]
+async fn byte_scan_hit_refuses_publication_and_discards_the_stage() -> Result<()> {
+    let fixture = fixture()?;
+    let root = fixture.path().join("templates");
+    let engine = engine().await?;
+    let hooks = Hooks {
+        plant_leak: true,
+        ..Hooks::default()
+    };
+    let refused = HOOKS
+        .scope(hooks, ensure(&root, &engine))
+        .await
+        .expect_err("a build holding its own path was published");
+    let text = format!("{refused}");
+    ensure!(matches!(refused, CreationFailure::Engine(_)), "{text}");
+    ensure!(
+        text.contains("the build store path") && text.contains(hooks::PLANTED_LEAK),
+        "{text}"
+    );
+    ensure!(
+        published(&root).is_none(),
+        "the leaking build was published"
+    );
+    let names = entries_of(&root)?;
+    let builds: Vec<&String> = names
+        .iter()
+        .filter(|name| name.starts_with(&format!(".build-{}-", key())))
+        .collect();
+    ensure!(
+        !names
+            .iter()
+            .any(|name| name.starts_with(&format!(".stage-{}-", key()))),
+        "the leaking capture stage stayed in the cache: {names:?}"
+    );
+    let [build] = builds.as_slice() else {
+        bail!("not exactly one build store left for a sweep: {names:?}");
+    };
+    let build = (*build).clone();
+    release(hold(&root, Mode::Exclusive).await?).await;
+    let rebuilt = ensure(&root, &engine).await.map_err(failure)?;
+    let Ensured::Built(report) = rebuilt else {
+        bail!("no rebuild: {rebuilt:?}");
+    };
+    ensure!(report.published, "the clean build did not publish");
+    assert_eq!(report.swept.removed, [build]);
+    assert_eq!(entries_of(&root)?, [key().to_owned(), lock_name(key())]);
+    fixture.release(Ok(()))
+}
+
+/// Without waiting, a structural verdict quarantines the judged template
+/// and is returned: nothing is built in the same call. Warm-up (waiting)
+/// quarantines and then rebuilds.
+#[tokio::test]
+async fn structural_verdict_without_waiting_quarantines_and_never_rebuilds() -> Result<()> {
+    let fixture = fixture()?;
+    let root = fixture.path().join("templates");
+    let template = root.join(key());
+    let judged = clone_shared(&root).await?;
+    let mut manifest = read_manifest(&template)?;
+    manifest.format += 1;
+    write_manifest(&template, &manifest)?;
+    let refused = ensure_in(&root, &no_engine(), Wait::Never)
+        .await
+        .expect_err("a damaged template was accepted");
+    ensure!(refused.is_verdict(), "{refused}");
+    ensure!(published(&root).is_none(), "not quarantined");
+    let quarantined = rejected(&root)?;
+    let [only] = quarantined.as_slice() else {
+        bail!("not exactly one quarantined directory: {quarantined:?}");
+    };
+    assert_eq!(files::directory(&root.join(only))?.identity(), judged);
+    let names = entries_of(&root)?;
+    ensure!(
+        !names.iter().any(|name| name.starts_with(".build-")),
+        "a build started after the verdict: {names:?}"
+    );
+    // A warm-up quarantines and rebuilds.
+    let identity = clone_shared(&root).await?;
+    files::write(&template.join("extra"), b"extra")?;
+    let engine = engine().await?;
+    let warmed = {
+        let _gate = crate::spawn_gate::spawning().await;
+        let deadline = Instant::now() + crate::test_support::template_warm_up_bound();
+        ensure_in(&root, &engine, Wait::Until(deadline)).await
+    }
+    .map_err(failure)?;
+    ensure!(matches!(warmed, Ensured::Built(_)), "{warmed:?}");
+    let rebuilt = published(&root).context("the warm-up did not publish")?;
+    ensure!(
+        rebuilt != identity,
+        "the damaged template is still published"
+    );
+    let quarantined = rejected(&root)?;
+    let [only] = quarantined.as_slice() else {
+        bail!("not exactly one quarantined directory: {quarantined:?}");
+    };
+    assert_eq!(files::directory(&root.join(only))?.identity(), identity);
+    fixture.release(Ok(()))
+}
+
+/// Two projects created at once with no template (design 3.9, build side):
+/// while the first is inside its build engine, the second is told at once
+/// that no template is available, copies nothing and reads no unpublished
+/// name; once the first publishes, a later creator copies without a build.
+#[tokio::test]
+async fn second_creator_goes_cold_at_once_while_a_build_is_in_progress() -> Result<()> {
+    let fixture = fixture()?;
+    let root = fixture.path().join("templates");
+    let engine = engine().await?;
+    let pause = Arc::new(Pause::default());
+    let hooks = Hooks {
+        pause: Some(pause.clone()),
+        ..Hooks::default()
+    };
+    let first = tokio::spawn({
+        let (root, engine) = (root.clone(), engine.clone());
+        HOOKS.scope(hooks, async move { ensure(&root, &engine).await })
+    });
+    let bound = startup() + QUERY_TIMEOUT * 4;
+    tokio::time::timeout(bound, pause.reached.notified())
+        .await
+        .context("the first build did not reach its pause")?;
+    // The first creator is inside its build engine: a build store exists
+    // and nothing is published.
+    let names = entries_of(&root)?;
+    ensure!(
+        names
+            .iter()
+            .any(|name| name.starts_with(&format!(".build-{}-", key())))
+            && published(&root).is_none(),
+        "the first creator is not mid-build: {names:?}"
+    );
+    // The second creator takes no lock gate: the first holds the spawn
+    // gate through its pause, and the second never acquires a lock.
+    let second = stage(&fixture, "second")?;
+    let started = Instant::now();
+    let created = create_in(&root, &no_engine(), &second)
+        .await
+        .map_err(failure)?;
+    let ensured = ensure_in(&root, &no_engine(), Wait::Never)
+        .await
+        .map_err(failure)?;
+    let waited = started.elapsed();
+    ensure!(waited < PROMPT, "the second creator waited {waited:?}");
+    ensure!(
+        matches!(created, Created::Unavailable(Unavailable::Busy)),
+        "{created:?}"
+    );
+    ensure!(
+        matches!(ensured, Ensured::Unavailable(Unavailable::Busy)),
+        "{ensured:?}"
+    );
+    ensure!(
+        fs::read_dir(second.path())?.next().is_none(),
+        "the second creator copied while the first was building"
+    );
+    println!("second creator answered in {waited:?} while the first was building");
+    pause.resume.notify_one();
+    let built = tokio::time::timeout(bound, first)
+        .await
+        .context("the first build did not finish after its pause")??
+        .map_err(failure)?;
+    let Ensured::Built(report) = built else {
+        bail!("the first creator did not build: {built:?}");
+    };
+    ensure!(report.published);
+    let third = stage(&fixture, "third")?;
+    let copied = create_in(&root, &no_engine(), &third)
+        .await
+        .map_err(failure)?;
+    ensure!(
+        matches!(
+            copied,
+            Created::Copied {
+                built: false,
+                published: true
+            }
+        ),
+        "{copied:?}"
+    );
+    fixture.release(Ok(()))
+}
+
 /// A held key lock never makes a template caller wait: without waiting it
 /// is "no template now", and nothing unpublished is read or created.
 #[tokio::test]

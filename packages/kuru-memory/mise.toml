@@ -99,7 +99,7 @@ run = "CC_x86_64_pc_windows_msvc='{{config_root}}/../kuru-delivery/support/windo
 run_windows = "cargo clippy -p kuru-memory --target x86_64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings"
 
 [tasks.prefetch]
-description = "Extract and verify the bundled full-Dolt runtime for local tests"
+description = "Extract and verify the bundled full-Dolt runtime, then build or verify its store template, for local tests"
 depends = ["bundle:prepare"]
 run = "cargo run -p kuru-memory --features test-support --locked -- prefetch"
 

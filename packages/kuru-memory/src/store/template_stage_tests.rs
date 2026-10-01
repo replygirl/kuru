@@ -1223,8 +1223,8 @@ async fn ready_template_stage_is_reused() -> Result<()> {
 
 /// The template shape on the stage engine refuses a copy whose bytes hold
 /// more than the template may: a dirty retained attempt, a commit beyond the
-/// compiled history, a branch outside the compiled set, a project-data row,
-/// a view, or more
+/// compiled history, a commit with another message or author, a branch
+/// outside the compiled set, a project-data row, a view, or more
 /// tables than the check reads (which a truncated read would leave
 /// unchecked). Each is a typed verdict after adoption and before
 /// `ready.json`, the job preserves the unready stage, and no active
@@ -1235,8 +1235,11 @@ async fn template_shape_violation_prevents_ready_marker() -> Result<()> {
     let outcome = async {
         let template = build_template(&root.path().join("template")).await?;
         let data_dir = root.path().join("projects");
+        // Amending the usage branch's head keeps its message, so each case
+        // reaches the assertion it names rather than the history's.
+        let head_message = "SET @kuru_head_message = (SELECT message FROM dolt_log ORDER BY commit_order DESC LIMIT 1)";
         let amend = format!(
-            "CALL DOLT_COMMIT('-A', '--amend', '-m', 'amended', '--author', {VARIANT_AUTHOR})"
+            "CALL DOLT_COMMIT('-A', '--amend', '-m', @kuru_head_message, '--author', {VARIANT_AUTHOR})"
         );
         // A retained main attempt at a completed step. Classification would
         // refuse it dirty with an ordinary error; the shape check judges the
@@ -1263,6 +1266,25 @@ async fn template_shape_violation_prevents_ready_marker() -> Result<()> {
                 "commits, not",
             ),
             (
+                "another commit message",
+                vec![
+                    "USE `kuru/kuru_usage_v1`".to_owned(),
+                    format!(
+                        "CALL DOLT_COMMIT('--amend', '-m', 'amended', '--author', {VARIANT_AUTHOR})"
+                    ),
+                ],
+                "usage branch commit 5 has message \"amended\"",
+            ),
+            (
+                "another commit author",
+                vec![
+                    "USE `kuru/kuru_usage_v1`".to_owned(),
+                    head_message.to_owned(),
+                    "CALL DOLT_COMMIT('--amend', '-m', @kuru_head_message, '--author', 'Builder <builder@build-host>')".to_owned(),
+                ],
+                "usage branch commit 5 has",
+            ),
+            (
                 "extra branch",
                 vec!["CALL DOLT_BRANCH('extra_branch')".to_owned()],
                 "unexpected branch",
@@ -1272,6 +1294,7 @@ async fn template_shape_violation_prevents_ready_marker() -> Result<()> {
                 vec![
                     "USE `kuru/kuru_usage_v1`".to_owned(),
                     "INSERT INTO state (`key`, value) VALUES ('extra', 'row')".to_owned(),
+                    head_message.to_owned(),
                     amend.clone(),
                 ],
                 "rows of project data",
@@ -1281,6 +1304,7 @@ async fn template_shape_violation_prevents_ready_marker() -> Result<()> {
                 vec![
                     "USE `kuru/kuru_usage_v1`".to_owned(),
                     "CREATE VIEW extra_view AS SELECT 1 AS one".to_owned(),
+                    head_message.to_owned(),
                     amend.clone(),
                 ],
                 "VIEW",
@@ -1293,7 +1317,7 @@ async fn template_shape_violation_prevents_ready_marker() -> Result<()> {
                             format!("CREATE TABLE extra_{index:03} (id INT PRIMARY KEY)")
                         }),
                     )
-                    .chain(std::iter::once(amend.clone()))
+                    .chain([head_message.to_owned(), amend.clone()])
                     .collect(),
                 "more than 256 tables",
             ),
@@ -1305,7 +1329,8 @@ async fn template_shape_violation_prevents_ready_marker() -> Result<()> {
                 statements,
             )
             .await?;
-            let scope = format!("project/{}", format!("{:x}", index + 10).repeat(64));
+            // One distinct hexadecimal digit per case.
+            let scope = format!("project/{}", format!("{:x}", (index + 10) % 16).repeat(64));
             let stage = template_stage(&source, &data_dir, &scope)?;
             let error = adopt(&data_dir, &scope, &stage, &mut None)
                 .await
