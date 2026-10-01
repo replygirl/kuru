@@ -2456,7 +2456,8 @@ mod tests {
             b"\xff\xff".to_vec(),
         ];
         let mut fixture: Vec<Vec<u8>> = inside.into_iter().chain(beside).collect();
-        // 129 owned keys: one past the first page.
+        // Exactly one full page of owned keys, so the first page ends on the
+        // last key in range and the next page must come back empty.
         let owned_now = |fixture: &[Vec<u8>]| {
             owned_before
                 + fixture
@@ -2465,20 +2466,38 @@ mod tests {
                     .count()
         };
         let mut filler = 0;
-        while owned_now(&fixture) < 129 {
+        while owned_now(&fixture) < PAGE_SIZE as usize {
             fixture.push(format!("{OWNED_PREFIX}filler/{filler:05}").into_bytes());
             filler += 1;
         }
         put_raw_keys(pool.as_ref(), &fixture).await?;
         stored.extend(fixture);
+        assert_same_walk(pool.as_ref(), &stored, OWNED_PREFIX, false, 128).await?;
+
+        // 129 owned keys: one past the first page.
+        let mut add_filler = |count: usize| -> Vec<Vec<u8>> {
+            let keys = (filler..filler + count)
+                .map(|filler| format!("{OWNED_PREFIX}filler/{filler:05}").into_bytes())
+                .collect();
+            filler += count;
+            keys
+        };
+        let one = add_filler(1);
+        put_raw_keys(pool.as_ref(), &one).await?;
+        stored.extend(one);
         assert_same_walk(pool.as_ref(), &stored, OWNED_PREFIX, false, 129).await?;
 
+        // Exactly two full pages: the second page ends on the last key in
+        // range, and the third must come back empty.
+        let to_two_pages = add_filler(127);
+        put_raw_keys(pool.as_ref(), &to_two_pages).await?;
+        stored.extend(to_two_pages);
+        assert_same_walk(pool.as_ref(), &stored, OWNED_PREFIX, false, 256).await?;
+
         // 257 owned keys: one past the second page.
-        let more: Vec<Vec<u8>> = (filler..filler + 128)
-            .map(|filler| format!("{OWNED_PREFIX}filler/{filler:05}").into_bytes())
-            .collect();
-        put_raw_keys(pool.as_ref(), &more).await?;
-        stored.extend(more);
+        let one_more = add_filler(1);
+        put_raw_keys(pool.as_ref(), &one_more).await?;
+        stored.extend(one_more);
         assert_same_walk(pool.as_ref(), &stored, OWNED_PREFIX, false, 257).await?;
 
         // A session index spanning three pages, with its own edge keys, and

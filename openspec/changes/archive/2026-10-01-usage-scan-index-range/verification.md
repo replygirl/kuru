@@ -12,6 +12,7 @@
 - [x] 2.2 @equivalence (agent) `mise run //packages/kuru-memory:test` -> the `usage-ledger-guarantee-tests` reopen refusals and boundary-key tests, and every existing usage-ledger test, pass unchanged; observed exit 0 2026-10-01 on macOS arm64 (lib 535 passed, 4 ignored, 601.8 s; bundle_build 10, memory 5, server_lifecycle 12, supervisor_snapshot 1 passed)
 - [x] 2.3 @unit (agent) `session_pages_past_one_index_page_and_marks_refuse_recorded_sessions` -> `session()` folds 130 admitted invocations across two index pages; `mark_new_session` on a session with a foreign index row and no marker refuses with `usage session already has invocation records`; a session whose only neighbours are keys just outside its index range is marked new. Observed passing 2026-10-01
 - [x] 2.4 @regression (agent) `mise run format:check`, `mise run lint`, `mise run //packages/kuru-memory:lint:windows`, `mise run typecheck` -> clean exits; observed exit 0 for each 2026-10-01 on macOS
+- [x] 2.5 @equivalence (agent) `range_paging_visits_exactly_the_old_key_sequence` exact page multiples -> the same ordering test also walks the owned prefix at exactly 128 and exactly 256 owned rows, where the last full page ends on the last key in range and the following page must come back empty, as well as at 129 and 257; every walk equals the old query's key sequence; observed passing 2026-10-01 (`mise run //packages/kuru-memory:test -- --lib usage_ledger`, 19 passed)
 
 ## 3. Windows and Linux
 
