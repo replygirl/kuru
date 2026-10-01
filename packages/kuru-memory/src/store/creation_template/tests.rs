@@ -1302,10 +1302,15 @@ async fn a_busy_key_lock_skips_the_quarantine_and_keeps_the_older_one() -> Resul
         })),
         ..Hooks::default()
     };
-    let error = HOOKS
-        .scope(hooks, create_unspawned(&root, &stage(&fixture, "second")?))
-        .await
-        .expect_err("a template with another key was accepted");
+    // Bounded: the holder is released only after this returns, so a
+    // quarantine that waited for the exclusive lock would never finish.
+    let error = tokio::time::timeout(
+        PROMPT,
+        HOOKS.scope(hooks, create_unspawned(&root, &stage(&fixture, "second")?)),
+    )
+    .await
+    .context("a busy key lock was waited for instead of skipping the quarantine")?
+    .expect_err("a template with another key was accepted");
     ensure!(error.is_verdict(), "{error}");
     let held = holder
         .lock()

@@ -1,8 +1,9 @@
 # Tasks
 
 The fix is already implemented in `packages/kuru-memory/src/store/creation_template/tests.rs`
-(commit `c78b2b1c`). These tasks verify each part of it rather than author it
-from scratch.
+(`2f904264` after the rebase onto `76ca2b5a`, with the return-type
+correction in `8bd2f7ad`). These tasks verify each part of it rather than
+author it from scratch.
 
 ## 1. Lock-gate helper coverage
 
@@ -88,7 +89,12 @@ from scratch.
       and confirm it still reports zero violations — verify the new
       `spawn_gate::locking_async` usage introduces no scan violation.
       Observed: `spawn_gate::` 4/4 pass with `--nocapture`, printing
-      "125 spawn guards scanned, 0 violations".
+      "125 spawn guards scanned, 0 violations". This pass is vacuous for
+      the new sites: the scan tracks only `spawn_gate::spawning` bindings
+      and cannot see `locking_async`. That the write-guard sites cannot
+      deadlock rests on call-site review (1.1: no engine, no spawn under the
+      guard, no enclosing `spawning` guard in the same task), not on this
+      test.
 - [x] 4.3 Run `mise run //packages/kuru-memory:lint`,
       `//packages/kuru-memory:lint:windows`, `format:check`, and
       `typecheck`, and confirm hk pre-commit hooks pass — verify the
@@ -106,9 +112,11 @@ from scratch.
       open). The rebase applied cleanly with no conflicts, but the pre-push
       `typecheck` hook then failed: `create_unspawned`'s declared return
       type (`Result<Created, CreationFailure>`) did not match `create_in`'s
-      actual return type (`Result<Created, CreateError>`) — a pre-existing
-      mismatch in this branch's own helper, exposed once the rebase forced
-      a fresh `cargo check`. Fixed by changing `create_unspawned`'s
+      actual return type (`Result<Created, CreateError>`). The rebase
+      introduced this mismatch; it was not pre-existing: at the original
+      base `ad743791`, `create_in` returned `Result<Created, CreationFailure>`
+      and the helper matched it, and #151 (`76ca2b5a`) changed `create_in`
+      to return `Result<Created, CreateError>`. Fixed by changing `create_unspawned`'s
       signature to `Result<Created, CreateError>`, matching every call
       site's existing `CreateError::Use(CreationFailure::..)` matches and
       the `.map_err(failure)` use at the one call site that discards the
@@ -117,3 +125,19 @@ from scratch.
       exit 0), and `//packages/kuru-memory:test -- store::creation_template::`
       (exit 0, including the affected tests) after the fix. `mise.lock` was
       not modified by the rebase.
+- [x] 5.2 Bound the hooked `create_unspawned` in
+      `a_busy_key_lock_skips_the_quarantine_and_keeps_the_older_one` with
+      `tokio::time::timeout(PROMPT, ..)`, whose error names the designed
+      skip: the test's shared holder is released only after that call
+      returns, so a quarantine that waited for the exclusive lock would
+      otherwise hang the test instead of failing it. Verify by running the
+      test and the `store::creation_template::` module locally, and the
+      static gates.
+      Observed (local macOS arm64, private `KURU_DOLT_CACHE` in the session
+      scratchpad): `mise run //packages/kuru-memory:test -- store::creation_template::`
+      exit 0 (48 passed in the lib binary, `tests` and `open_tests`); the
+      bounded test `--exact` 5/5 pass (0.33-0.54 s);
+      `//packages/kuru-memory:typecheck`, `:lint` and `:lint:windows` exit
+      0; `mise run format:check` exit 0. The timeout's failure path was not
+      exercised: reaching it needs a product change that makes the
+      quarantine wait, which is out of scope.

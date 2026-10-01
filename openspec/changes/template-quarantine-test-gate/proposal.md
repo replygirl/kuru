@@ -17,8 +17,9 @@ skip as an identity mismatch. Product behaviour is correct and unchanged.
 
 ## What Changes
 
-- `packages/kuru-memory/src/store/creation_template/tests.rs` (commit
-  `c78b2b1c`, already applied in this branch):
+- `packages/kuru-memory/src/store/creation_template/tests.rs` (already
+  applied in this branch: the test change in `2f904264`, its post-rebase
+  return-type correction in `8bd2f7ad`):
   - Adds a `create_unspawned(root, stage)` helper that runs a no-engine
     `create_in` under `spawn_gate::locking_async`, so no sibling test's
     spawn can hold the key lock's `flock` through the exclusive try. Used
@@ -41,7 +42,10 @@ skip as an identity mismatch. Product behaviour is correct and unchanged.
     `before_quarantine` hook (after the copier drops its own shared lock,
     before the exclusive try) to pin the designed skip deterministically:
     the verdict is still returned, the judged template stays published,
-    and the older rejected directory is unchanged.
+    and the older rejected directory is unchanged. Its hooked
+    `create_in` is bounded by `PROMPT`: the shared holder is released only
+    after that call returns, so a quarantine that waited for the exclusive
+    lock fails the test with a diagnostic instead of hanging it.
 
 ## Impact
 
@@ -56,4 +60,25 @@ skip as an identity mismatch. Product behaviour is correct and unchanged.
   stands in for a before/after demonstration of the scheduling race, which
   is not reproducible on demand.
 - `spawn_gate::` source-scan test still passes (no new violations;
-  "125 spawn guards scanned, 0 violations" on the fixed binary).
+  "125 spawn guards scanned, 0 violations" on the fixed binary). That pass
+  says nothing about the new call sites: the scan
+  (`no_spawn_guard_encloses_a_test_cache_warm_up`) tracks only
+  `spawn_gate::spawning` bindings and cannot see `locking_async`. That no
+  new write-guard site deadlocks rests on call-site review: each
+  `create_unspawned` call passes no engine, so nothing spawns under the
+  write guard, and none runs while the same task holds a `spawning` guard.
+
+## Follow-ons (not in this change)
+
+- A test-only `Quarantine` outcome hook that would name the skip reason on
+  a future failure.
+- The same designed skip remains reachable from open tests that assert a
+  quarantine but cannot take the write guard, because the open itself
+  spawns (`spawn_gated_open` takes only the shared `spawning` guard,
+  `test_support/template.rs`): in `store/creation_template/open_tests.rs`,
+  `damaged_templates_send_the_opener_cold_and_preserve_copy_remnants`
+  (structure and digest cases),
+  `shape_verdict_on_the_copy_fails_the_open_and_quarantines_the_template`
+  and `adoption_verdict_quarantines_and_leaves_the_stage_in_place`. A
+  sibling spawn between the opener's shared-lock release and its exclusive
+  try would skip the quarantine there too; they need their own treatment.
