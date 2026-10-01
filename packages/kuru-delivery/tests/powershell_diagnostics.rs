@@ -178,20 +178,10 @@ fn command_tokens(source: &str) -> Vec<(usize, String)> {
     tokens
 }
 
-#[test]
-fn stock_installer_imports_pshome_modules_before_any_discovered_command() {
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("support/install.ps1"),
-    )
-    .unwrap();
-    // The native bridge's C# here-string is not PowerShell command text. Drop
-    // the whole `\n'@\n` closer too: left in place, its bare `'` would read
-    // as an unterminated quote to the string-literal scan below and desync
-    // quote tracking for the rest of the script.
-    let bridge = source.find("Add-Type -TypeDefinition @'\n").unwrap() + "Add-Type".len();
-    let bridge_end = bridge + source[bridge..].find("\n'@\n").unwrap() + "\n'@\n".len();
-    let script = format!("{}{}", &source[..bridge], &source[bridge_end..]);
-
+/// Requires both exact PSHOME Management/Utility imports in `script` and that
+/// every command outside `Microsoft.PowerShell.Core` and the script's own
+/// functions is in `imported` and occurs after those imports.
+fn assert_pshome_imports_precede_discovered_commands(label: &str, script: &str, imported: &[&str]) {
     let imports_end = ["Management", "Utility"]
         .map(|module| {
             let import = format!(
@@ -199,7 +189,7 @@ fn stock_installer_imports_pshome_modules_before_any_discovered_command() {
             );
             let offset = script
                 .find(&import)
-                .unwrap_or_else(|| panic!("install.ps1 must import exact PSHOME {module}"));
+                .unwrap_or_else(|| panic!("{label} must import exact PSHOME {module}"));
             offset + import.len()
         })
         .into_iter()
@@ -214,31 +204,68 @@ fn stock_installer_imports_pshome_modules_before_any_discovered_command() {
         .collect();
     // Loaded with the engine; never reached through module auto-discovery.
     let core = ["import-module", "set-strictmode"];
-    let imported = [
-        "join-path",
-        "add-type",
-        "convertfrom-json",
-        "convertto-json",
-        "write-output",
-        "write-verbose",
-        "write-warning",
-    ];
     let mut discovered = 0;
-    for (offset, command) in command_tokens(&mask_non_code(&script)) {
+    for (offset, command) in command_tokens(&mask_non_code(script)) {
         if functions.iter().any(|f| f == &command) || core.contains(&command.as_str()) {
             continue;
         }
         assert!(
             imported.contains(&command.as_str()),
-            "install.ps1 uses {command}; import its exact stock PSHOME module before first use"
+            "{label} uses {command}; import its exact stock PSHOME module before first use"
         );
         assert!(
             offset >= imports_end,
-            "install.ps1 reaches {command} before its exact PSHOME module imports"
+            "{label} reaches {command} before its exact PSHOME module imports"
         );
         discovered += 1;
     }
-    assert!(discovered > 0, "command inventory found no stock commands");
+    assert!(
+        discovered > 0,
+        "{label} command inventory found no stock commands"
+    );
+}
+
+#[test]
+fn stock_installer_imports_pshome_modules_before_any_discovered_command() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("support/install.ps1"),
+    )
+    .unwrap();
+    // The native bridge's C# here-string is not PowerShell command text. Drop
+    // the whole `\n'@\n` closer too: left in place, its bare `'` would read
+    // as an unterminated quote to the string-literal scan below and desync
+    // quote tracking for the rest of the script.
+    let bridge = source.find("Add-Type -TypeDefinition @'\n").unwrap() + "Add-Type".len();
+    let bridge_end = bridge + source[bridge..].find("\n'@\n").unwrap() + "\n'@\n".len();
+    let script = format!("{}{}", &source[..bridge], &source[bridge_end..]);
+    assert_pshome_imports_precede_discovered_commands(
+        "install.ps1",
+        &script,
+        &[
+            "join-path",
+            "add-type",
+            "convertfrom-json",
+            "convertto-json",
+            "write-output",
+            "write-verbose",
+            "write-warning",
+        ],
+    );
+}
+
+#[test]
+fn source_entrypoint_imports_pshome_modules_before_any_discovered_command() {
+    // The checkout entrypoint runs in the caller's session; a bare first
+    // stock cmdlet would enter module auto-discovery on a cold profile.
+    let script = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.ps1"),
+    )
+    .unwrap();
+    assert_pshome_imports_precede_discovered_commands(
+        "scripts/install.ps1",
+        &script,
+        &["split-path", "join-path"],
+    );
 }
 
 /// One package coverage task's manifest table.
