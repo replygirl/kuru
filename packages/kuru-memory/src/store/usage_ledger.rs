@@ -4046,4 +4046,36 @@ mod tests {
         drop(ledger);
         store.close().await
     }
+
+    // The Bound-path probe: a single primary-key range read that sees owned
+    // rows and nothing beside the prefix.
+    #[tokio::test]
+    async fn the_owned_row_probe_sees_only_the_owned_range() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let ledger = store.usage_ledger()?;
+        let pool = ledger.store.pool.clone();
+        ensure!(!any_owned(pool.as_ref()).await?);
+        for key in ["kuru.usage.v1", "kuru.usage.v10"] {
+            sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+                .bind(key.as_bytes())
+                .bind("beside")
+                .execute(pool.as_ref())
+                .await?;
+        }
+        ensure!(!any_owned(pool.as_ref()).await?);
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'beside the owned prefix', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(pool.as_ref())
+            .await?;
+        *store
+            .shared
+            .usage_validated
+            .lock()
+            .expect("usage validated lock") = Some(state_hash(pool.as_ref()).await?);
+        ledger.mark_new_session("probed").await?;
+        ensure!(any_owned(pool.as_ref()).await?);
+        drop(pool);
+        drop(ledger);
+        store.close().await
+    }
 }
