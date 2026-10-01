@@ -51,7 +51,7 @@ async fn interrupted_migration_close_handoff_retains_guard_until_supervisor_quie
     let data = root.path().join("data");
     Directory::ensure_private(&data)?;
     let scope = format!("project/{}", "c".repeat(64));
-    let options = crate::test_support::open_options(data, scope.clone())?;
+    let options = crate::test_support::warmed_open_options(data, scope.clone()).await?;
     let initialized = crate::test_support::spawn_gated_open(options.clone()).await?;
     initialized.close().await?;
 
@@ -218,7 +218,8 @@ async fn interrupted_migration_close_handoff_retains_guard_until_supervisor_quie
 async fn inspection_owned_old_schema_blocks_writer_without_mutation() -> Result<()> {
     let root = crate::test_support::tempdir()?;
     let scope = format!("project/{}", "7".repeat(64));
-    let mut options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+    let mut options =
+        crate::test_support::warmed_open_options(root.path().to_owned(), scope.clone()).await?;
     super::tests::released_v1(&options).await?;
     let directory = project_directory(&options.data_dir, &scope)?;
     let inspector = Server::open(ServerOptions {
@@ -294,7 +295,8 @@ async fn fresh_and_byte_sensitive_wal_import_publish_current_receipts_once() -> 
     let fresh_root = crate::test_support::tempdir()?;
     let fresh_scope = format!("project/{}", "8".repeat(64));
     let fresh_options =
-        crate::test_support::open_options(fresh_root.path().to_owned(), fresh_scope.clone())?;
+        crate::test_support::warmed_open_options(fresh_root.path().to_owned(), fresh_scope.clone())
+            .await?;
     let fresh = crate::test_support::spawn_gated_open(fresh_options.clone()).await?;
     assert_current_store(&fresh).await?;
     let fresh_activation = read_activation(
@@ -352,7 +354,9 @@ async fn fresh_and_byte_sensitive_wal_import_publish_current_receipts_once() -> 
         .context("fixture legacy database was not detected")?;
     let snapshot_bytes = fs::read(&prepared.receipt.snapshot)?;
 
-    let options = crate::test_support::open_options(import_root.path().to_owned(), scope.clone())?;
+    let options =
+        crate::test_support::warmed_open_options(import_root.path().to_owned(), scope.clone())
+            .await?;
     let imported = crate::test_support::spawn_gated_open(options.clone()).await?;
     assert_current_store(&imported).await?;
     assert_eq!(

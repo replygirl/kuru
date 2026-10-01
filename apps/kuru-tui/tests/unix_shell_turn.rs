@@ -51,16 +51,18 @@ struct Sandbox {
 }
 
 impl Sandbox {
-    fn new(provider_url: &str) -> Result<Self> {
-        Self::with_config(provider_url, "")
+    /// A sandbox for a test inside a Tokio runtime, which every caller is.
+    async fn warmed(provider_url: &str) -> Result<Self> {
+        Self::warmed_with_config(provider_url, "").await
     }
 
-    fn with_config(provider_url: &str, extra_config: &str) -> Result<Self> {
+    async fn warmed_with_config(provider_url: &str, extra_config: &str) -> Result<Self> {
+        let cache = kuru_memory::test_support::warmed_cache_dir().await?;
         let root = kuru_memory::test_support::tempdir()?;
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project)?;
-        memory::configuration(root.path())?;
+        memory::configuration_with(root.path(), &cache)?;
         let provider_config = root.path().join("fixture-responses.toml");
         std::fs::write(
             &provider_config,
@@ -351,7 +353,7 @@ async fn run_sandbox_with_capture_limit(
 }
 
 async fn run_cli(provider_url: String, debug: bool) -> Result<CliRun> {
-    run_sandbox(Sandbox::new(&provider_url)?, debug).await
+    run_sandbox(Sandbox::warmed(&provider_url).await?, debug).await
 }
 
 fn diagnostics(run: &CliRun) -> Result<String> {
@@ -673,10 +675,11 @@ async fn debug_cli_rotates_the_fixed_private_diagnostic_ring() -> Result<()> {
         .await
         .context("start rotating fake Responses server")?;
     let result = async {
-        let sandbox = Sandbox::with_config(
+        let sandbox = Sandbox::warmed_with_config(
             &server.url,
             &format!("max_tool_calls = {ROTATION_TOOL_CALLS}\n"),
         )
+        .await
         .context("prepare bounded tool-call CLI sandbox")?;
         let run = run_sandbox_with_capture_limit(sandbox, true, ROTATION_CAPTURE_LIMIT)
             .await
@@ -753,7 +756,7 @@ async fn debug_cli_rotates_the_fixed_private_diagnostic_ring() -> Result<()> {
 async fn debug_setup_refusal_is_bounded_before_provider_work() -> Result<()> {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-    let sandbox = Sandbox::new("http://127.0.0.1:9/v1")?;
+    let sandbox = Sandbox::warmed("http://127.0.0.1:9/v1").await?;
     std::fs::create_dir(&sandbox.data)?;
     std::fs::set_permissions(&sandbox.data, std::fs::Permissions::from_mode(0o700))?;
     let replacement = sandbox.root.path().join("outside-diagnostics");
@@ -816,7 +819,7 @@ async fn wait_for_provider_gate(gate: &Gate, worker: &JoinHandle<Result<CliRun>>
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diagnostic_write_failure_keeps_a_completed_cli_turn_authoritative() -> Result<()> {
     let (server, gate) = Server::start_gated().await?;
-    let sandbox = Sandbox::new(&server.url)?;
+    let sandbox = Sandbox::warmed(&server.url).await?;
     let data = sandbox.data.clone();
     let mut worker = tokio::spawn(run_sandbox(sandbox, true));
     let observation = async {

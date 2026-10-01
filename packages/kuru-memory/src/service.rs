@@ -4558,7 +4558,8 @@ mod tests {
                     .collect::<String>()
             );
             let data = root.path().join("private");
-            let options = crate::test_support::open_options(data.clone(), scope.clone())?;
+            let options =
+                crate::test_support::warmed_open_options(data.clone(), scope.clone()).await?;
             let gate = crate::spawn_gate::spawning().await;
             let owner = ServiceOwner::open(options, &project).await?;
             let authority = owner.authority().clone();
@@ -5688,7 +5689,8 @@ mod tests {
                     .collect::<String>()
             );
             let data = root.path().join("private");
-            let options = crate::test_support::open_options(data.clone(), scope.clone())?;
+            let options =
+                crate::test_support::warmed_open_options(data.clone(), scope.clone()).await?;
             let _gate = crate::spawn_gate::spawning().await;
             let mut owner = ServiceOwner::open(options.clone(), &project)
                 .await
@@ -5885,7 +5887,7 @@ mod tests {
             let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
             let scope = format!("project/{}", digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
             let data = root.path().join("private");
-            let options = crate::test_support::open_options(data.clone(), scope.clone())?;
+            let options = crate::test_support::warmed_open_options(data.clone(), scope.clone()).await?;
             let _gate = crate::spawn_gate::spawning().await;
             let mut owner = ServiceOwner::open(options.clone(), &project).await?;
             let original = owner.authority().clone();
@@ -5963,7 +5965,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let outcome = deadline.serve(async |served| {
             let _gate = crate::spawn_gate::spawning().await;
             let owner = ServiceOwner::open(options.clone(), &project).await?;
@@ -6167,7 +6170,8 @@ mod tests {
                     .collect::<String>()
             );
             let data = root.path().join("private");
-            let options = crate::test_support::open_options(data.clone(), scope.clone())?;
+            let options =
+                crate::test_support::warmed_open_options(data.clone(), scope.clone()).await?;
             let _gate = crate::spawn_gate::spawning().await;
             let mut owner = ServiceOwner::open(options.clone(), &project).await?;
             let authority = owner.authority().clone();

@@ -93,15 +93,37 @@ const TEMPLATE_KEY_LIMIT: usize = 128;
 pub(crate) const USAGE_DATABASE: &str = "kuru/kuru_usage_v1";
 const ADOPTION_MESSAGE: &str = "Adopt Kuru memory template";
 
-/// The store template key this supervisor was compiled to trust.
-///
-/// A placeholder until the template cache computes the real key from the
-/// schema, engine and creation statements; that change replaces only this
-/// function. A stage whose pending identity names another key is refused
-/// before any write, and the refusal is not a verdict against its bytes.
+/// The store template key this supervisor was compiled to trust: the
+/// template cache's key over the schema, the engine and the creation
+/// statements (`store::creation_template`). A stage whose pending identity
+/// names another key is refused before any write, and the refusal is not a
+/// verdict against its bytes.
 pub(crate) fn compiled_template_key() -> &'static str {
-    "kuru-memory-store-template-placeholder"
+    crate::store::creation_template::compiled_key()
 }
+
+/// The bootstrap statements a first engine start runs on a new store: its
+/// database, its identity table and, for a store that has none, its identity
+/// row. Every one shapes the bytes of a new store's `data/`, so the store
+/// template key (`store::creation_template`) covers them; call sites use
+/// these constants, never inline text.
+pub(crate) const BOOTSTRAP_CREATE_DATABASE: &str = "CREATE DATABASE IF NOT EXISTS kuru";
+pub(crate) const BOOTSTRAP_CREATE_IDENTITY: &str = "CREATE TABLE IF NOT EXISTS kuru.kuru_instance (singleton TINYINT PRIMARY KEY, instance_id VARCHAR(36) NOT NULL, project_scope TEXT NOT NULL)";
+pub(crate) const BOOTSTRAP_COUNT_IDENTITY: &str = "SELECT COUNT(*) FROM kuru.kuru_instance";
+pub(crate) const BOOTSTRAP_INSERT_IDENTITY: &str =
+    "INSERT INTO kuru.kuru_instance (singleton, instance_id, project_scope) VALUES (1, ?, ?)";
+/// The reader account statement around its generated secret. The secret is
+/// per store and never keyed: `config/`, where the account lives, is never
+/// part of a template.
+pub(crate) const BOOTSTRAP_READER_ACCOUNT: [&str; 2] = [
+    "CREATE USER IF NOT EXISTS 'kuru_reader'@'localhost' IDENTIFIED BY '",
+    "'",
+];
+pub(crate) const BOOTSTRAP_READER_GRANT: &str =
+    "GRANT SELECT ON kuru.* TO 'kuru_reader'@'localhost'";
+/// The `behavior:` block of every engine's `server.yaml`: the SQL settings
+/// under which bootstrap, initialization and migrations write a store.
+pub(crate) const SERVER_BEHAVIOR: &str = "behavior:\n  autocommit: true\n  dolt_transaction_commit: false\n  event_scheduler: \"OFF\"\n  auto_gc_behavior:\n    enable: true\n";
 
 /// A completed comparison found a store template's bytes other than this
 /// build expects: a placeholder row that is missing, foreign or repeated, a
@@ -141,7 +163,7 @@ impl std::error::Error for TemplateVerdict {}
 /// Worst-case owned close, as bounded by `close_pools_and_owner`: the first
 /// graceful pool drain, the Windows lifetime close, the supervisor reap
 /// allowance in `finish_owner`, and the post-reap pool drain.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn close_budget() -> Duration {
     CLOSE_GRACE
         .saturating_add(KILL_GRACE)
@@ -1533,7 +1555,7 @@ fn validate_identity(identity: &Identity) -> Result<()> {
 /// at most [`TEMPLATE_KEY_LIMIT`] bytes. The template cache names its key
 /// lock, template and build directories after it, so no separator, dot,
 /// uppercase letter or other byte a filesystem could reinterpret is accepted.
-fn valid_template_key(key: &str) -> bool {
+pub(crate) fn valid_template_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= TEMPLATE_KEY_LIMIT
         && key.bytes().all(|byte| {
@@ -1591,10 +1613,10 @@ pub(crate) fn write_template_stage_identity(
 /// first engine start writes the placeholder identity row instead of a
 /// project's. Opened with [`TEMPLATE_SCOPE`] as its project scope.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "test-support")),
     expect(
         dead_code,
-        reason = "no open builds a store template until the template cache lands"
+        reason = "only test-fixture warm-up builds a store template until creation uses it"
     )
 )]
 pub(crate) fn write_template_build_identity(directory: &Path, template: &str) -> Result<()> {
@@ -1613,6 +1635,30 @@ pub(crate) fn write_template_build_identity(directory: &Path, template: &str) ->
         "memory template build already has an identity"
     );
     write_record(&directory.join("identity.json"), &identity)
+}
+
+/// The root and reader secrets of a store template build, for the byte scan
+/// that refuses to publish a captured `data/` holding either. Only a build
+/// identity (the template instance and scope, uninitialized or initialized
+/// by its own build) is read; any other record is refused.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    expect(
+        dead_code,
+        reason = "only test-fixture warm-up builds a store template until creation uses it"
+    )
+)]
+pub(crate) fn template_build_secrets(directory: &Path) -> Result<[String; 2]> {
+    let identity = read_record::<Identity>(&directory.join("identity.json"))?
+        .context("memory template build identity is missing")?;
+    validate_identity(&identity)?;
+    ensure!(
+        identity.instance == TEMPLATE_INSTANCE
+            && identity.project_scope == TEMPLATE_SCOPE
+            && identity.template.is_some(),
+        "memory store is not a template build"
+    );
+    Ok([identity.password, identity.reader_password])
 }
 
 /// A test's view of one identity record, without its secrets' values.
@@ -2496,7 +2542,7 @@ fn server_yaml(directory: &Path, port: u16, startup_timeout: Duration) -> Result
     // read-only SQL variable from the same canonical path for identity probes.
     let quoted = |name: &str| serde_json::to_string(&directory.join(name));
     Ok(format!(
-        "log_level: warning\nlog_format: text\nbehavior:\n  autocommit: true\n  dolt_transaction_commit: false\n  event_scheduler: \"OFF\"\n  auto_gc_behavior:\n    enable: true\nlistener:\n  host: 127.0.0.1\n  port: {port}\n  max_connections: 32\n  max_connections_timeout_millis: 1000\n  read_timeout_millis: {read_timeout}\n  write_timeout_millis: 5000\n  allow_cleartext_passwords: false\ndata_dir: {}\ncfg_dir: {}\nprivilege_file: {}\nbranch_control_file: {}\nsystem_variables:\n  datadir: {}\n  secure_file_priv: {}\n",
+        "log_level: warning\nlog_format: text\n{SERVER_BEHAVIOR}listener:\n  host: 127.0.0.1\n  port: {port}\n  max_connections: 32\n  max_connections_timeout_millis: 1000\n  read_timeout_millis: {read_timeout}\n  write_timeout_millis: 5000\n  allow_cleartext_passwords: false\ndata_dir: {}\ncfg_dir: {}\nprivilege_file: {}\nbranch_control_file: {}\nsystem_variables:\n  datadir: {}\n  secure_file_priv: {}\n",
         quoted("data")?,
         quoted("config")?,
         quoted("config/privileges.db")?,
@@ -2639,17 +2685,19 @@ async fn initialize_database(
         adopt_template(pool, identity, phase).await?;
     } else if !identity.initialized {
         *phase = "creating the project database";
-        sqlx::query("CREATE DATABASE IF NOT EXISTS kuru")
-            .execute(pool)
-            .await?;
+        sqlx::query(BOOTSTRAP_CREATE_DATABASE).execute(pool).await?;
         *phase = "creating the project identity table";
-        sqlx::query("CREATE TABLE IF NOT EXISTS kuru.kuru_instance (singleton TINYINT PRIMARY KEY, instance_id VARCHAR(36) NOT NULL, project_scope TEXT NOT NULL)").execute(pool).await?;
+        sqlx::query(BOOTSTRAP_CREATE_IDENTITY).execute(pool).await?;
         *phase = "initializing the project identity";
-        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kuru.kuru_instance")
+        let existing: i64 = sqlx::query_scalar(BOOTSTRAP_COUNT_IDENTITY)
             .fetch_one(pool)
             .await?;
         if existing == 0 {
-            sqlx::query("INSERT INTO kuru.kuru_instance (singleton, instance_id, project_scope) VALUES (1, ?, ?)").bind(&identity.instance).bind(&identity.project_scope).execute(pool).await?;
+            sqlx::query(BOOTSTRAP_INSERT_IDENTITY)
+                .bind(&identity.instance)
+                .bind(&identity.project_scope)
+                .execute(pool)
+                .await?;
         }
     }
     if !identity.initialized {
@@ -2659,19 +2707,15 @@ async fn initialize_database(
             valid_secret(&identity.reader_password),
             "invalid private reader credential"
         );
-        let credential_sql = format!(
-            "CREATE USER IF NOT EXISTS 'kuru_reader'@'localhost' IDENTIFIED BY '{}'",
-            identity.reader_password
-        );
+        let [before, after] = BOOTSTRAP_READER_ACCOUNT;
+        let credential_sql = format!("{before}{}{after}", identity.reader_password);
         *phase = "configuring the private reader account";
         sqlx::query(sqlx::AssertSqlSafe(credential_sql))
             .execute(pool)
             .await
             .map_err(|_| anyhow!("configuring private read-only memory account failed"))?;
         *phase = "granting private reader access";
-        sqlx::query("GRANT SELECT ON kuru.* TO 'kuru_reader'@'localhost'")
-            .execute(pool)
-            .await?;
+        sqlx::query(BOOTSTRAP_READER_GRANT).execute(pool).await?;
     }
     if adopting {
         // Both adopted rows, before the identity is marked initialized.

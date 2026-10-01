@@ -343,6 +343,24 @@ async fn reference_shape(
             )));
         }
     }
+    for (objects, count) in non_table_objects(connection).await? {
+        if count != 0 {
+            return Err(verdict(format!("{reference} holds {count} {objects}")));
+        }
+    }
+    Ok(())
+}
+
+/// The non-table objects a template may not hold, counted on the ref the
+/// session is switched to: views, triggers and routines from
+/// `information_schema`, and the Dolt system tables that store schema
+/// objects, procedures and ignore rules. On the pinned engine every one of
+/// these reads answers on a store that never held such an object, so an
+/// absent object counts as zero; a read that fails is an ordinary error.
+pub(in crate::store) async fn non_table_objects(
+    connection: &mut MySqlConnection,
+) -> Result<Vec<(&'static str, i64)>> {
+    let mut counts = Vec::new();
     for (objects, query) in [
         (
             "views",
@@ -362,11 +380,9 @@ async fn reference_shape(
     ] {
         let count: i64 =
             bounded_query(sqlx::query_scalar(query).fetch_one(&mut *connection)).await?;
-        if count != 0 {
-            return Err(verdict(format!("{reference} holds {count} {objects}")));
-        }
+        counts.push((objects, count));
     }
-    Ok(())
+    Ok(counts)
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ use std::{
 use futures::{Stream, stream};
 use kuru_connectors::{DemoProvider, Provider, ProviderEvent, ProviderSink};
 use kuru_core::{Completion, CompletionRequest, Config, Mode, ModelInfo};
-use kuru_memory::{MemoryStore, StorageRecord, test_support::open_options};
+use kuru_memory::{MemoryStore, StorageRecord, test_support::warmed_open_options};
 use kuru_runtime::{CancellationToken, ControlledTurnOutput, Harness, ResponseOutcome, TurnOutput};
 use ratatui::{
     Terminal,
@@ -789,10 +789,11 @@ async fn persistent_store() -> (
     // A guarded root: its teardown fails the test if a Dolt it hosted is still live.
     let root = kuru_memory::test_support::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    let options = open_options(
+    let options = warmed_open_options(
         root.path().join("data"),
         kuru_runtime::project_scope(project.path()).unwrap(),
     )
+    .await
     .unwrap();
     let store = {
         // Held across the supervisor and engine spawns; see `crate::spawn_gate`.

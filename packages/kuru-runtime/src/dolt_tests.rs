@@ -612,10 +612,11 @@ async fn stale_promotion_keeps_later_live_data_and_discards_all_candidate_effect
 async fn undo_is_a_new_revision_that_preserves_later_chats_preferences_and_archived_history() {
     let project = tempfile::tempdir().unwrap();
     let data = kuru_memory::test_support::tempdir().unwrap();
-    let options = kuru_memory::test_support::open_options(
+    let options = kuru_memory::test_support::warmed_open_options(
         data.path().into(),
         crate::project_scope(project.path()).unwrap(),
     )
+    .await
     .unwrap();
     let memory = MemoryStore::open(options.clone()).await.unwrap();
     let mut harness = Harness::new(
@@ -710,10 +711,11 @@ async fn undo_is_a_new_revision_that_preserves_later_chats_preferences_and_archi
 async fn canonical_dream_additions_survive_promotion_stopped_reload_and_reversal() {
     let project = tempfile::tempdir().unwrap();
     let data = kuru_memory::test_support::tempdir().unwrap();
-    let options = kuru_memory::test_support::open_options(
+    let options = kuru_memory::test_support::warmed_open_options(
         data.path().into(),
         crate::project_scope(project.path()).unwrap(),
     )
+    .await
     .unwrap();
     let memory = MemoryStore::open(options.clone()).await.unwrap();
     let mut harness = Harness::new(

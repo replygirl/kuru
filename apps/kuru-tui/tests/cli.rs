@@ -45,14 +45,24 @@ struct Sandbox {
     data: PathBuf,
 }
 impl Sandbox {
+    /// A sandbox for a plain `fn` test: warms the shared cache synchronously.
     fn new() -> Self {
+        Self::with_cache(&kuru_memory::test_support::cache_dir().unwrap())
+    }
+
+    /// A sandbox for a test inside a Tokio runtime.
+    async fn warmed() -> Self {
+        Self::with_cache(&kuru_memory::test_support::warmed_cache_dir().await.unwrap())
+    }
+
+    fn with_cache(cache: &Path) -> Self {
         #[cfg(windows)]
         ensure_powershell_warm();
         let root = kuru_memory::test_support::tempdir().unwrap();
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project).unwrap();
-        memory::configuration(root.path()).unwrap();
+        memory::configuration_with(root.path(), cache).unwrap();
         Self {
             root: memory::ServiceCleanup::new(root, &data),
             project,
@@ -96,7 +106,7 @@ async fn cli_post_turn_failure_reports_separately_after_completed_json_answer() 
     use kuru_memory::{MemoryStore, PublicTranscriptEntry, PublicTurnSettlement};
     use kuru_runtime::project_scope;
 
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     let marker = env.project.join("post-turn-hook-ran");
     let config_path = env.root.path().join("config/kuru/config.toml");
     let mut config = std::fs::read_to_string(&config_path)?;
@@ -110,7 +120,7 @@ async fn cli_post_turn_failure_reports_separately_after_completed_json_answer() 
     // the completed public record can be read without a second cold start or
     // a direct local lock that excludes the CLI's own managed attachment.
     let scope = project_scope(&env.project)?;
-    let options = kuru_memory::test_support::open_options(env.data.clone(), scope)?;
+    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope).await?;
     let (_, opening) = MemoryStore::open_managed_observed(
         options,
         std::fs::canonicalize(&env.project)?,
@@ -405,7 +415,7 @@ client_id = "synthetic-native-client"
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_cli_device_login_status_logout_uses_synthetic_verified_https() {
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     let server = HttpsMcpFixture::start(env.root.path()).await;
     let config = env.root.path().join("config/kuru/config.toml");
     let mut text = std::fs::read_to_string(&config).unwrap();
@@ -565,7 +575,7 @@ async fn bounded_linux_cli_child(
 async fn mcp_cli_missing_secret_service_refuses_without_fallback_or_static_alias_loss()
 -> anyhow::Result<()> {
     use anyhow::ensure;
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     let server = HttpsMcpFixture::start(env.root.path()).await;
     let config = env.root.path().join("config/kuru/config.toml");
     let mut text = std::fs::read_to_string(&config).unwrap();
@@ -674,7 +684,7 @@ async fn mcp_cli_missing_secret_service_refuses_without_fallback_or_static_alias
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_cli_no_browser_prints_local_callback_guidance_and_settles_once() {
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     let server = HttpsMcpFixture::start(env.root.path()).await;
     let config = env.root.path().join("config/kuru/config.toml");
     let mut text = std::fs::read_to_string(&config).unwrap();
@@ -885,7 +895,7 @@ fn failed_service_cleanup_retains_the_fixture_at_its_original_path() {
 /// this process cannot record for itself, before its guarded root drops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn service_cleanup_awaits_a_store_that_exists_only_under_its_staging_name() {
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     env.success(&["run", "Seed a store another process's engine ran in"]);
     let scope = kuru_runtime::project_scope(&env.project).unwrap();
     // The CLI's service retires itself when the command exits; wait for its
@@ -967,9 +977,11 @@ fn assert_memory_progress(stderr: &str) {
 
 #[tokio::test]
 async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     let scope = kuru_runtime::project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::open_options(env.data.clone(), scope).unwrap();
+    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope)
+        .await
+        .unwrap();
     let memory = kuru_memory::test_support::open_fixture(options.clone())
         .await
         .unwrap();
@@ -1625,9 +1637,11 @@ async fn session_lifecycle_cli_is_provider_free_and_matches_resume_continue_and_
     use kuru_memory::MemoryStore;
     use kuru_runtime::project_scope;
 
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     let scope = project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
+        .await
+        .unwrap();
     let memory = MemoryStore::open(options).await.unwrap();
     memory
         .append(
@@ -1836,9 +1850,11 @@ async fn session_export_keeps_legacy_speaker_and_turn_unknown_in_both_formats() 
     };
     use kuru_runtime::project_scope;
 
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     let scope = project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
+        .await
+        .unwrap();
     let session = "00000000-0000-4000-8000-000000000031";
     let namespace = format!("{scope}/transcript/{session}");
     let memory = MemoryStore::open(options.clone()).await.unwrap();
@@ -1940,9 +1956,11 @@ async fn normal_cli_exports_large_parent_and_fork_in_complete_chronological_reco
     use kuru_runtime::project_scope;
     use std::io::{BufRead, BufReader};
 
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     let scope = project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
+        .await
+        .unwrap();
     let parent = "00000000-0000-4000-8000-000000000021";
     let child = "00000000-0000-4000-8000-000000000022";
     let large_answer = "🪶".repeat(8_192);
@@ -2209,7 +2227,7 @@ async fn cli_project_purge_preserves_shared_legacy_export_engine_and_other_proje
     use kuru_memory::MemoryStore;
     use std::io::Write;
 
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     let other_project = env.root.path().join("other-project");
     std::fs::create_dir(&other_project).unwrap();
     let scope = kuru_runtime::project_scope(&env.project).unwrap();
@@ -2244,7 +2262,9 @@ async fn cli_project_purge_preserves_shared_legacy_export_engine_and_other_proje
     let legacy_before = std::fs::read(&legacy_path).unwrap();
 
     let selected_options =
-        kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+        kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
+            .await
+            .unwrap();
     let selected = MemoryStore::open(selected_options.clone()).await.unwrap();
     assert_eq!(
         selected.get(&selected_key).await.unwrap(),
@@ -2252,7 +2272,9 @@ async fn cli_project_purge_preserves_shared_legacy_export_engine_and_other_proje
     );
     selected.close().await.unwrap();
     let other_options =
-        kuru_memory::test_support::open_options(env.data.clone(), other_scope.clone()).unwrap();
+        kuru_memory::test_support::warmed_open_options(env.data.clone(), other_scope.clone())
+            .await
+            .unwrap();
     let other = MemoryStore::open(other_options.clone()).await.unwrap();
     assert_eq!(
         other.get(&other_key).await.unwrap(),
@@ -2712,9 +2734,11 @@ async fn memory_export_is_provider_free_and_publishes_one_committed_snapshot() {
     use kuru_memory::MemoryStore;
     use kuru_runtime::project_scope;
 
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     let scope = project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::open_options(env.data.clone(), scope).unwrap();
+    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope)
+        .await
+        .unwrap();
     let memory = MemoryStore::open(options).await.unwrap();
     memory
         .append(
@@ -2814,9 +2838,11 @@ async fn malformed_export_fails_after_private_staging_without_publishing_a_parti
     use kuru_memory::MemoryStore;
     use kuru_runtime::project_scope;
 
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     let scope = project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::open_options(env.data.clone(), scope).unwrap();
+    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope)
+        .await
+        .unwrap();
     let memory = MemoryStore::open(options).await.unwrap();
     kuru_memory::test_support::commit_malformed_state(&memory, "export/malformed")
         .await
@@ -2855,9 +2881,11 @@ async fn notes_cli_reads_existing_modes_without_provider_or_legacy_import() {
     use kuru_memory::MemoryStore;
     use kuru_runtime::{Topology, project_scope};
 
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     let scope = project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
+        .await
+        .unwrap();
     let memory = MemoryStore::open(options).await.unwrap();
     let freudian = Topology {
         parts: Framework::builtin(Mode::Freudian).parts,
@@ -3013,7 +3041,7 @@ async fn notes_cli_reads_existing_modes_without_provider_or_legacy_import() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("between 1 and 1000"));
     }
 
-    let legacy = Sandbox::new();
+    let legacy = Sandbox::warmed().await;
     std::fs::create_dir(&legacy.data).unwrap();
     let original = b"legacy notes must not be imported";
     let path = legacy.data.join("memory.sqlite3");
@@ -3249,10 +3277,12 @@ fn headless_json_remains_machine_readable_when_old_context_is_omitted() {
 async fn cli_undo_dream_shows_one_notice_without_constructing_a_provider() {
     use kuru_memory::MemoryStore;
 
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     kuru_platform::fs::Directory::ensure_private(&env.data).unwrap();
     let scope = kuru_runtime::project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
+        .await
+        .unwrap();
     MemoryStore::open(options.clone())
         .await
         .unwrap()
@@ -3395,7 +3425,7 @@ fn cli_imports_a_real_legacy_wal_without_changing_its_layout() {
 /// asserted.
 #[tokio::test]
 async fn sequential_commands_start_a_fresh_owner_each_time() {
-    let env = Sandbox::new();
+    let env = Sandbox::warmed().await;
     let scope = kuru_runtime::project_scope(&env.project).unwrap();
     let store_path = env
         .data
@@ -3433,7 +3463,9 @@ async fn sequential_commands_start_a_fresh_owner_each_time() {
             "the owner released its lock before its supervisor released the lifecycle lease",
         );
     };
-    let options = kuru_memory::test_support::open_options(env.data.clone(), scope).unwrap();
+    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope)
+        .await
+        .unwrap();
     // Run one command, then await the exit of the owner it used. Records the
     // command's wall time and how long that owner took to finish closing after
     // the command exited. A writable command elects its own owner, so after

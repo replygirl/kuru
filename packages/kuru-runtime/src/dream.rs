@@ -999,10 +999,10 @@ mod cancellation_tests {
             let project = tempfile::tempdir()?;
             let project_path = project.path().canonicalize()?;
             let data = kuru_memory::test_support::tempdir()?;
-            let options = kuru_memory::test_support::open_options(
+            let options = kuru_memory::test_support::warmed_open_options(
                 data.path().to_owned(),
                 crate::project_scope(&project_path)?,
-            )?;
+            ).await?;
             let executable = options.supervisor.clone().context("fixture supervisor absent")?;
             let open = || MemoryStore::open_managed_observed(
                 options.clone(), project_path.clone(), executable.clone()

@@ -360,7 +360,7 @@ mod tests {
     const REAP: Duration = Duration::from_secs(10);
 
     /// A guarded root, a canonical project inside it and its options.
-    fn fixture() -> Result<(super::super::TempDir, PathBuf, OpenOptions)> {
+    async fn fixture() -> Result<(super::super::TempDir, PathBuf, OpenOptions)> {
         let root = super::super::tempdir()?;
         let project = root.path().join("project");
         std::fs::create_dir(&project)?;
@@ -373,7 +373,7 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = super::super::open_options(root.path().join("private"), scope)?;
+        let options = super::super::warmed_open_options(root.path().join("private"), scope).await?;
         Ok((root, project, options))
     }
 
@@ -407,7 +407,7 @@ mod tests {
         // Real lifecycles: one fresh service owner.
         let budget = super::super::fixture_deadline(1, 0);
         let deadline = FixtureDeadline::start(budget, "serve_with fixture");
-        let (root, project, options) = fixture()?;
+        let (root, project, options) = fixture().await?;
         let (knobs, mut events) = observed(Admission::AnyAttachment, None);
         let settled = deadline
             .serve(
@@ -467,7 +467,7 @@ mod tests {
         // Real lifecycles: one fresh service owner.
         let budget = super::super::fixture_deadline(1, 0);
         let deadline = FixtureDeadline::start(budget, "never reached fixture");
-        let (root, project, options) = fixture()?;
+        let (root, project, options) = fixture().await?;
         let (knobs, mut events) = observed(Admission::Never, None);
         let settled = deadline
             .serve(
@@ -572,7 +572,7 @@ mod tests {
         // Real lifecycles: one fresh service owner.
         let deadline =
             FixtureDeadline::start(super::super::fixture_deadline(1, 0), "served owner fixture");
-        let (root, project, options) = fixture()?;
+        let (root, project, options) = fixture().await?;
         let path = root.path().to_path_buf();
         let settled = deadline
             .serve(
@@ -616,7 +616,7 @@ mod tests {
         // Real lifecycles: one fresh service owner.
         let deadline =
             FixtureDeadline::start(super::super::fixture_deadline(1, 0), "served owner fixture");
-        let (root, project, options) = fixture()?;
+        let (root, project, options) = fixture().await?;
         let settled = deadline
             .serve(
                 async |served| {
@@ -665,7 +665,7 @@ mod tests {
             super::super::fixture_deadline(1, 0),
             "expiring served fixture's backstop",
         );
-        let (root, project, options) = fixture()?;
+        let (root, project, options) = fixture().await?;
         let path = root.path().to_path_buf();
         let (expire, expired) = tokio::sync::oneshot::channel::<()>();
         let outcome = backstop

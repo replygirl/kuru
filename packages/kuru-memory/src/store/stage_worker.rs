@@ -42,6 +42,14 @@ enum Start {
         )
     )]
     Adopt,
+    #[cfg_attr(
+        not(any(test, feature = "test-support")),
+        expect(
+            dead_code,
+            reason = "only test-fixture warm-up builds a store template until creation uses it"
+        )
+    )]
+    TemplateBuild,
 }
 
 impl Start {
@@ -51,6 +59,7 @@ impl Start {
             Self::Migrate => "reopen staged memory server for migration",
             Self::Validate => "reopen migrated staged memory server",
             Self::Adopt => "open and adopt the copied template stage",
+            Self::TemplateBuild => "open the store template build server",
         }
     }
 
@@ -59,6 +68,7 @@ impl Start {
             Self::Init | Self::Migrate => "open staged main pool",
             Self::Validate => "open migrated staged main pool",
             Self::Adopt => "open adopted template stage main pool",
+            Self::TemplateBuild => "open the store template build main pool",
         }
     }
 }
@@ -227,6 +237,66 @@ where
         );
         self.mark(startup, Start::Adopt, marker_pause, progress)
             .await
+    }
+
+    /// The one engine start of a store template build, whose identity names
+    /// the template key and the placeholder instance and scope. The `guard`
+    /// is the template key's exclusive lock: it is this engine's reap guard,
+    /// returned only after the engine was reaped. On that one engine the
+    /// bootstrap writes the placeholder row, then initialization, the
+    /// migration chain, the usage branch's chain and validation, validation of
+    /// `main` and the template shape with the placeholder row run. Returns the
+    /// engine's `@@hostname` for the capture's byte scan. A failure leaves the
+    /// build store where it is, for the next exclusive holder's sweep.
+    #[cfg_attr(
+        not(any(test, feature = "test-support")),
+        expect(
+            dead_code,
+            reason = "only test-fixture warm-up builds a store template until creation uses it"
+        )
+    )]
+    pub(super) async fn build_template(
+        &self,
+        guard: File,
+        progress: &mut ProgressReporter,
+    ) -> Result<(File, String)> {
+        ensure!(
+            self.legacy.is_none(),
+            "a legacy import never builds a store template"
+        );
+        let (server, pool) = self.start(guard, Start::TemplateBuild, progress).await?;
+        let built = async {
+            initialize(&pool).await?;
+            migrations::upgrade(&server, &pool).await?;
+            let usage = server.pool(usage_ledger::BRANCH).await?;
+            migrations::upgrade_usage(&server, &usage).await?;
+            migrations::validate_usage(&usage).await?;
+            // The shape check classifies the retained attempts itself.
+            migrations::validate_active_unclassified(&pool).await?;
+            #[cfg(test)]
+            super::creation_template::hooks::before_shape(&pool).await?;
+            migrations::template_shape::check(&pool, migrations::template_shape::Row::Placeholder)
+                .await?;
+            let hostname: String = tokio::time::timeout(
+                QUERY_TIMEOUT,
+                sqlx::query_scalar("SELECT @@hostname").fetch_one(pool.as_ref()),
+            )
+            .await
+            .context("store template build host name deadline exceeded")??;
+            Ok::<_, anyhow::Error>(hostname)
+        }
+        .await;
+        match (built, close_migration_worker(server, pool).await) {
+            (Ok(hostname), Ok(guard)) => Ok((guard, hostname)),
+            (Err(error), Ok(guard)) => {
+                drop(guard);
+                Err(error)
+            }
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(error), Err(cleanup)) => Err(error.context(format!(
+                "store template build cleanup also failed: {cleanup:#}"
+            ))),
+        }
     }
 
     async fn mark(
@@ -445,10 +515,11 @@ mod tests {
         {
             let root = crate::test_support::tempdir()?;
             let canonical = fs::canonicalize(root.path())?;
-            let mut options = crate::test_support::open_options(
+            let mut options = crate::test_support::warmed_open_options(
                 root.path().to_owned(),
                 format!("project/{}", "6".repeat(64)),
-            )?;
+            )
+            .await?;
             let deadline = observation_deadline(&options);
             let (hooks, control) =
                 migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::AfterDdl);
@@ -497,10 +568,11 @@ mod tests {
         {
             let root = crate::test_support::tempdir()?;
             let canonical = fs::canonicalize(root.path())?;
-            let options = crate::test_support::open_options(
+            let options = crate::test_support::warmed_open_options(
                 root.path().to_owned(),
                 format!("project/{}", "7".repeat(64)),
-            )?;
+            )
+            .await?;
             let deadline = observation_deadline(&options);
             let (observation, release, opening) = marker_fixture::prepare(options.clone(), false);
             let opening = tokio::spawn(async move {

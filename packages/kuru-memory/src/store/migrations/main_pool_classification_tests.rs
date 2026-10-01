@@ -207,10 +207,12 @@ async fn open_reader(store: &MemoryStore) -> Result<(Server, Arc<MySqlPool>)> {
         .and_then(Path::parent)
         .context("store directory has no data directory")?
         .to_owned();
+    // Warmed before the spawn gate is held; see `crate::spawn_gate`.
+    let binary = crate::test_support::warm_runtime_cache().await?;
     let server = {
         let _gate = crate::spawn_gate::spawning().await;
         Server::open(ServerOptions {
-            binary: crate::test_support::warm_runtime_cache().await?,
+            binary,
             directory,
             project_scope: store.shared.project_scope.clone(),
             supervisor: super::super::test_supervisor()?,
@@ -526,7 +528,9 @@ fn is_revision_pool(name: &str) -> bool {
 async fn adopted_store_classifies_retained_branches_from_main() -> Result<()> {
     let root = crate::test_support::tempdir()?;
     let scope = format!("project/{}", "e".repeat(64));
-    let options = crate::test_support::open_options(root.path().join("private"), scope.clone())?;
+    let options =
+        crate::test_support::warmed_open_options(root.path().join("private"), scope.clone())
+            .await?;
     let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     let (source_oracle, source_main_pool) =
         verdicts(REGISTRY, &store.shared.server, &store.pool, RESERVED_PREFIX).await;
@@ -605,10 +609,11 @@ async fn adopted_store_classifies_retained_branches_from_main() -> Result<()> {
 #[tokio::test]
 async fn historical_classification_opens_no_branch_or_commit_pools() -> Result<()> {
     let root = crate::test_support::tempdir()?;
-    let mut options = crate::test_support::open_options(
+    let mut options = crate::test_support::warmed_open_options(
         root.path().join("private"),
         format!("project/{}", "d".repeat(64)),
-    )?;
+    )
+    .await?;
     crate::test_support::spawn_gated_open(options.clone())
         .await?
         .close()

@@ -144,10 +144,37 @@ impl Record {
     }
 }
 
+/// Something an open did to the shared store template that test support
+/// charges to the fixture it opened for: a fixture's open never builds the
+/// shared template (warm-up does) and quarantines it only on a real verdict.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no open creates a store from the template cache until creation uses it"
+    )
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TemplateEvent {
+    /// The open built the store template under the shared test root.
+    Built,
+    /// The open quarantined the shared store template.
+    Quarantined,
+}
+
+/// One [`TemplateEvent`], by the canonical stage it was created for and the
+/// test that caused it.
+struct TemplateRecord {
+    stage: PathBuf,
+    event: TemplateEvent,
+    label: String,
+}
+
 #[derive(Default)]
 pub(crate) struct Ledger {
     live: HashMap<u64, LiveOwner>,
     records: HashMap<Key, Record>,
+    template_events: Vec<TemplateRecord>,
     /// Supervisors this process started, per store directory, with the
     /// canonical directory of the first, for tests that prove a path starts
     /// no engine on a directory.
@@ -218,7 +245,48 @@ pub(crate) fn record(directory: &Path) {
     });
 }
 
+/// Charge `event` on the shared store template to the fixture whose stage
+/// `stage` (beneath its root) was being created.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no open creates a store from the template cache until creation uses it"
+    )
+)]
+pub(crate) fn template_event(stage: &Path, event: TemplateEvent) {
+    let stage = fs::canonicalize(stage).unwrap_or_else(|_| stage.to_path_buf());
+    let label = super::lifecycle_trace::label();
+    with(|ledger| {
+        ledger.template_events.push(TemplateRecord {
+            stage,
+            event,
+            label,
+        });
+    });
+}
+
 impl Ledger {
+    /// The store template events charged to stages beneath `root`
+    /// (canonical), for a failure message.
+    pub(crate) fn template_events_under(&self, root: &Path) -> Vec<String> {
+        self.template_events
+            .iter()
+            .filter(|record| record.stage.starts_with(root))
+            .map(|record| {
+                let what = match record.event {
+                    TemplateEvent::Built => "built the shared store template",
+                    TemplateEvent::Quarantined => "quarantined the shared store template",
+                };
+                format!(
+                    "the open creating {} (by test {}) {what}",
+                    record.stage.display(),
+                    record.label
+                )
+            })
+            .collect()
+    }
+
     /// Store `record` unless the store already has a later one: a reaper's
     /// report is recorded after the fact, so an earlier reap can arrive after
     /// a later record.
@@ -282,6 +350,8 @@ impl Ledger {
     pub(crate) fn forget_under(&mut self, root: &Path) {
         self.records
             .retain(|_, record| !record.directory.starts_with(root));
+        self.template_events
+            .retain(|record| !record.stage.starts_with(root));
         #[cfg(test)]
         self.starts
             .retain(|_, (directory, _)| !directory.starts_with(root));

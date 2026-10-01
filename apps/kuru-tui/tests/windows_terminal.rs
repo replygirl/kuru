@@ -85,7 +85,18 @@ struct Sandbox {
 }
 
 impl Sandbox {
+    /// A sandbox for a plain `fn` test: warms the shared cache synchronously.
+    #[allow(dead_code, reason = "every current caller runs inside a Tokio runtime")]
     fn new() -> Result<Self> {
+        Self::with_cache(&kuru_memory::test_support::cache_dir()?)
+    }
+
+    /// A sandbox for a test inside a Tokio runtime.
+    async fn warmed() -> Result<Self> {
+        Self::with_cache(&kuru_memory::test_support::warmed_cache_dir().await?)
+    }
+
+    fn with_cache(cache: &std::path::Path) -> Result<Self> {
         let temporary = kuru_memory::test_support::tempdir()?;
         let parent = Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable)?;
         let root = parent
@@ -102,7 +113,7 @@ impl Sandbox {
         ] {
             std::fs::create_dir(path)?;
         }
-        let config = memory::configuration(&root)?;
+        let config = memory::configuration_with(&root, cache)?;
         let configuration: Config =
             toml::from_str(&std::fs::read_to_string(config.join("kuru/config.toml"))?)?;
         let system = kuru_platform::windows::process::system_directory()?;
@@ -223,7 +234,7 @@ impl Sandbox {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> Result<()> {
     let _serial = SERIAL.lock().await;
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let mut terminal = sandbox.start(
         "first",
         "app",
@@ -341,7 +352,7 @@ async fn native_conpty_trust_refusal_and_persistent_choice_precede_the_alternate
 -> Result<()> {
     let _serial = SERIAL.lock().await;
 
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     std::fs::create_dir(sandbox.root.join(".kuru"))?;
     std::fs::write(
         sandbox.root.join(".kuru/config.toml"),
@@ -373,7 +384,7 @@ async fn native_conpty_trust_refusal_and_persistent_choice_precede_the_alternate
         "trust refusal created memory after the declined choice"
     );
 
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     std::fs::create_dir(sandbox.root.join(".kuru"))?;
     std::fs::write(
         sandbox.root.join(".kuru/config.toml"),
@@ -430,7 +441,7 @@ async fn native_conpty_trust_refusal_and_persistent_choice_precede_the_alternate
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_console_modes_restore_after_partial_initialization_and_errors() -> Result<()> {
     let _serial = SERIAL.lock().await;
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     for mode in ["partial-error", "error-unwind"] {
         let mut terminal = sandbox.start(mode, mode, &[], true, "demo", &[])?;
         let report = terminal.finish(READY)?;
@@ -482,7 +493,7 @@ async fn native_conpty_error_drop_returns_while_console_close_is_delayed() -> Re
     }
 
     let _serial = SERIAL.lock().await;
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let mut terminal = sandbox.start("drop-error", "partial-error", &[], true, "demo", &[])?;
     let error = terminal
         .text(&["marker-the-error-fixture-never-renders"], READY)
@@ -579,7 +590,7 @@ impl Drop for ProviderServer {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_conpty_cancels_provider_work_without_losing_the_next_draft() -> Result<()> {
     let _serial = SERIAL.lock().await;
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let outcome = cancel_provider_work_and_keep_the_next_draft(&sandbox).await;
     sandbox.release(outcome)
 }

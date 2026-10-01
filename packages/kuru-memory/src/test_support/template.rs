@@ -631,7 +631,8 @@ mod tests {
 
     /// Open a copied store through the ordinary existing-store path.
     async fn open_copy(data: &Path) -> Result<()> {
-        let options: OpenOptions = crate::test_support::open_options(data.to_owned(), scope())?;
+        let options: OpenOptions =
+            crate::test_support::warmed_open_options(data.to_owned(), scope()).await?;
         let store = crate::test_support::open_local_fixture(options).await?;
         store.close().await
     }

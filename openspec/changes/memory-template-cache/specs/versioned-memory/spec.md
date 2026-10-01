@@ -48,8 +48,8 @@ A verified copy of a published template MUST be obtained only under that
 key's shared lock, and MUST independently verify, while copying, that the
 manifest parses to the expected format and key, that the top-level entries
 present are exactly the manifest's declared entries, and that every copied
-file matches the manifest's declared size and SHA-256 digest; a hard link, an
-extra hard link, or an entry of a different type than the manifest declares
+file matches the manifest's declared size and SHA-256 digest; a symbolic link,
+an extra hard link, or an entry of a different type than the manifest declares
 MUST cause the copy to fail rather than succeed silently. No part of this
 verification depends on the copying process's own trust of the manifest's
 origin: the manifest only names what to check, and the checks that decide
@@ -76,10 +76,10 @@ the exclusive lock cannot be acquired without waiting, or the move fails. At
 most one quarantined directory per key is kept; an older one MUST be removed,
 best-effort, before a new one is quarantined.
 
-No code that opens an existing project MUST wait for another process's
-template build or quarantine, remove another key's published template or
-quarantined directory, or remove any template lock file: lock files for this
-cache are permanent for the life of the cache directory. Any error
+Code that creates or opens a project MUST NOT wait for another process's
+template build or quarantine, MUST NOT remove another key's published template
+or quarantined directory, and MUST NOT remove any template lock file: lock
+files for this cache are permanent for the life of the cache directory. Any error
 encountered opening the `templates/` area, acquiring or verifying a key's own
 lock, or reading its manifest, MUST be treated the same as "no usable
 template for this key": the caller proceeds without one, not as an open

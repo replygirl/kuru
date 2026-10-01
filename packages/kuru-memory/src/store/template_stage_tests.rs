@@ -335,7 +335,8 @@ async fn preserved_quiescence(data_dir: &Path, stage: &Path) -> Result<PathBuf> 
 
 /// An ordinary open of `scope`, which runs recovery first.
 async fn open(data_dir: &Path, scope: &str) -> Result<MemoryStore> {
-    crate::test_support::spawn_gated_open(options(data_dir, scope)?).await
+    let options = options(data_dir, scope)?.warmed().await?;
+    crate::test_support::spawn_gated_open(options).await
 }
 
 async fn port(pool: &MySqlPool) -> Result<u16> {
@@ -1429,6 +1430,206 @@ async fn template_stage_is_classified_before_the_writable_recovery_start() -> Re
         ensure!(
             starts(&key) == 1 && format!("{error:#}").contains("identity mismatch"),
             "the unmarked stage did not take the writable recovery start: {error:#}"
+        );
+        Ok(())
+    }
+    .await;
+    root.release(outcome)
+}
+
+/// One store's comparable shape: its schema, its receipts without their
+/// operation identifiers, its branch version sets, both schema versions and
+/// the history lengths of `main` and the usage branch.
+#[derive(Debug, Eq, PartialEq)]
+struct Shape {
+    columns: Vec<String>,
+    indexes: Vec<String>,
+    receipts: Vec<String>,
+    usage_receipts: Vec<String>,
+    branches: Vec<String>,
+    versions: (i64, i64),
+    data_rows: Vec<String>,
+}
+
+/// Read `store`'s [`Shape`] and history lengths from its main pool.
+async fn shape(store: &MemoryStore) -> Result<(Shape, (i64, i64))> {
+    let pool = store.pool.as_ref();
+    let text = |query: &'static str| {
+        bounded(
+            query,
+            sqlx::query_scalar::<_, String>(query).fetch_all(pool),
+        )
+    };
+    let columns = text(
+        "SELECT CAST(CONCAT_WS('|', table_name, column_name, ordinal_position, IFNULL(column_default, 'NULL'), is_nullable, column_type, column_key, extra) AS CHAR) FROM information_schema.columns WHERE table_schema = 'kuru' ORDER BY 1",
+    )
+    .await?;
+    let indexes = text(
+        "SELECT CAST(CONCAT_WS('|', table_name, index_name, seq_in_index, column_name, non_unique) AS CHAR) FROM information_schema.statistics WHERE table_schema = 'kuru' ORDER BY 1",
+    )
+    .await?;
+    let receipts = text(
+        "SELECT CAST(CONCAT_WS('|', version, id, digest) AS CHAR) FROM kuru_migrations ORDER BY version",
+    )
+    .await?;
+    let usage_receipts = text(
+        "SELECT CAST(CONCAT_WS('|', version, id, digest) AS CHAR) FROM `kuru/kuru_usage_v1`.kuru_migrations ORDER BY version",
+    )
+    .await?;
+    // Retained attempts by namespace and target, without operation UUIDs.
+    let mut branches: Vec<String> = text("SELECT CAST(name AS CHAR) FROM dolt_branches")
+        .await?
+        .into_iter()
+        .map(|name| match name.rsplit_once('_') {
+            Some((attempt, operation)) if operation.len() == 32 => attempt.to_owned(),
+            _ => name,
+        })
+        .collect();
+    branches.sort();
+    let version =
+        |query: &'static str| bounded(query, sqlx::query_scalar::<_, i32>(query).fetch_one(pool));
+    let versions = (
+        i64::from(version("SELECT version FROM kuru_schema WHERE id = 1").await?),
+        i64::from(
+            version("SELECT version FROM `kuru/kuru_usage_v1`.kuru_schema WHERE id = 1").await?,
+        ),
+    );
+    let count =
+        |query: &'static str| bounded(query, sqlx::query_scalar::<_, i64>(query).fetch_one(pool));
+    let history = (
+        count("SELECT COUNT(*) FROM dolt_log").await?,
+        count("SELECT COUNT(*) FROM `kuru/kuru_usage_v1`.dolt_log").await?,
+    );
+    let tables = text(
+        "SELECT CAST(table_name AS CHAR) FROM information_schema.tables WHERE table_schema = 'kuru' AND table_type = 'BASE TABLE' ORDER BY 1",
+    )
+    .await?;
+    let mut data_rows = Vec::new();
+    for table in tables {
+        if matches!(
+            table.as_str(),
+            "kuru_instance" | "kuru_migrations" | "kuru_schema"
+        ) {
+            continue;
+        }
+        ensure!(
+            table
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+            "unexpected table name {table:?}"
+        );
+        let rows: i64 = bounded(
+            "count a data table",
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM `{table}`"
+            )))
+            .fetch_one(pool),
+        )
+        .await?;
+        data_rows.push(format!("{table}={rows}"));
+    }
+    Ok((
+        Shape {
+            columns,
+            indexes,
+            receipts,
+            usage_receipts,
+            branches,
+            versions,
+            data_rows,
+        },
+        history,
+    ))
+}
+
+/// T10 parity, gating in every native job: a store created from this
+/// build's store template (a verified copy of the shared, warmed template,
+/// adopted on its one stage start and activated by the ordinary open) has
+/// the schema, receipts, branch version sets, schema versions and empty
+/// data tables of a store the cold path built, and the history lengths the
+/// shape check derives from the registries: the cold store's measure the
+/// pre-step base the shape check compiles in.
+#[tokio::test]
+async fn template_born_store_matches_cold_store() -> Result<()> {
+    let root = fixture_root()?;
+    let outcome = async {
+        let engine = super::creation_template::Engine {
+            binary: crate::test_support::warm_runtime_cache().await?,
+            supervisor: test_supervisor()?,
+            timeout: Duration::from_secs(
+                OpenOptions::new(PathBuf::new(), String::new())
+                    .config
+                    .startup_timeout_secs,
+            ),
+        };
+        let born_dir = root.path().join("template-born");
+        let born_scope = scope('a');
+        let (_, stage) = stage_path(&born_dir, &born_scope)?;
+        let stage_directory = files::ensure_private_directory(&stage)?;
+        let created = {
+            let _gate = crate::spawn_gate::spawning().await;
+            super::creation_template::create_in(
+                &crate::test_support::shared_template_root()?,
+                &engine,
+                &stage_directory,
+            )
+            .await
+            .map_err(anyhow::Error::from)?
+        };
+        ensure!(
+            matches!(
+                created,
+                super::creation_template::Created::Copied { built: false, .. }
+            ),
+            "the warmed shared template was not copied: {created:?}"
+        );
+        drop(stage_directory);
+        write_template_stage_identity(&stage, &born_scope, compiled_template_key())?;
+        adopt(&born_dir, &born_scope, &stage, &mut None).await?;
+        let born = open(&born_dir, &born_scope).await?;
+        let born_shape = shape(&born).await;
+        born.close().await?;
+
+        let cold_dir = root.path().join("cold");
+        let mut cold_options =
+            crate::test_support::warmed_open_options(cold_dir.clone(), scope('b')).await?;
+        cold_options.creation = Creation::Cold;
+        let cold = crate::test_support::spawn_gated_open(cold_options).await?;
+        let cold_shape = shape(&cold).await;
+        cold.close().await?;
+
+        let (born_shape, born_history) = born_shape?;
+        let (cold_shape, cold_history) = cold_shape?;
+        assert_eq!(born_shape, cold_shape, "a template-born store differs from a cold store");
+        ensure!(
+            born_shape.data_rows.iter().all(|table| table.ends_with("=0")),
+            "a new store holds project data: {:?}",
+            born_shape.data_rows
+        );
+        let (main_steps, usage_steps) = (
+            i64::from(migrations::CURRENT_VERSION - 1),
+            i64::from(migrations::USAGE_CURRENT_VERSION - 1),
+        );
+        println!(
+            "T10: cold history main {} (base {}), usage {} (base {}); template-born main {}, usage {}",
+            cold_history.0,
+            cold_history.0 - main_steps,
+            cold_history.1,
+            cold_history.1 - usage_steps,
+            born_history.0,
+            born_history.1
+        );
+        let compiled = migrations::template_shape::compiled_commits(false)?;
+        assert_eq!(
+            (u64::try_from(cold_history.0)?, u64::try_from(cold_history.1)?),
+            compiled,
+            "the compiled pre-step base differs from a cold store's measured history"
+        );
+        let adopted = migrations::template_shape::compiled_commits(true)?;
+        assert_eq!(
+            (u64::try_from(born_history.0)?, u64::try_from(born_history.1)?),
+            adopted,
+            "a template-born store's history is not the template's plus one adoption commit per ref"
         );
         Ok(())
     }

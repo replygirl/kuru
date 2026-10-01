@@ -18,11 +18,14 @@ async fn main() -> anyhow::Result<()> {
         Some("prefetch") => {
             // Cargo may republish its top-level binary alias after this task
             // completes. Ordinary test processes use this immutable snapshot.
-            kuru_memory::test_support::prepare_supervisor()?;
+            let supervisor = kuru_memory::test_support::prepare_supervisor()?;
             let cache = std::env::var_os("KURU_DOLT_CACHE")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::env::temp_dir().join("kuru-dolt-test-cache"));
             let binary = kuru_memory::provision::provision(&Default::default(), &cache).await?;
+            // The store template beside the engine, built with the prepared
+            // snapshot, so dependent test processes find it warm.
+            kuru_memory::test_support::warm_template_cache(&cache, &binary, &supervisor).await?;
             println!("{}", binary.display());
             Ok(())
         }

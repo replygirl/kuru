@@ -1369,10 +1369,13 @@ mod tests {
     }
 
     async fn reopen(root: &crate::test_support::TempDir) -> Result<MemoryStore> {
-        MemoryStore::open(crate::test_support::open_options(
-            root.path().to_owned(),
-            format!("project/{}", "0".repeat(64)),
-        )?)
+        MemoryStore::open(
+            crate::test_support::warmed_open_options(
+                root.path().to_owned(),
+                format!("project/{}", "0".repeat(64)),
+            )
+            .await?,
+        )
         .await
     }
 

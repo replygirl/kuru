@@ -234,7 +234,8 @@ struct Stopped {
 
 async fn cold_open(data_dir: &Path, scope: &str) -> Result<(OpenOptions, MemoryStore)> {
     crate::test_support::warm_runtime_cache().await?;
-    let options = crate::test_support::open_options(data_dir.to_owned(), scope.to_owned())?;
+    let options =
+        crate::test_support::warmed_open_options(data_dir.to_owned(), scope.to_owned()).await?;
     let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     Ok((options, store))
 }

@@ -480,7 +480,7 @@ fn bounded_fixture_text(path: &std::path::Path) -> String {
 
 #[cfg(any(unix, windows))]
 async fn paused_process_loss_child(root: &std::path::Path, scope: String) -> Result<()> {
-    let mut options = crate::test_support::open_options(root.to_owned(), scope)?;
+    let mut options = crate::test_support::warmed_open_options(root.to_owned(), scope).await?;
     let observation_deadline = migration_observation_deadline(&options);
     let (hooks, control) =
         migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::AfterDdl);
@@ -575,10 +575,11 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
     }
 
     let root = Arc::new(crate::test_support::tempdir()?);
-    let options = crate::test_support::open_options(
+    let options = crate::test_support::warmed_open_options(
         root.path().to_owned(),
         format!("project/{}", "e".repeat(64)),
-    )?;
+    )
+    .await?;
     super::tests::released_v1(&options).await?;
     let server = super::tests::released_server(&options).await?;
     let main = server.pool("main").await?;
@@ -846,10 +847,11 @@ async fn fresh_staging_process_loss_after_ddl_is_preserved_and_never_reused() ->
         return paused_process_loss_child(std::path::Path::new(&root), scope).await;
     }
     let root = Arc::new(crate::test_support::tempdir()?);
-    let options = crate::test_support::open_options(
+    let options = crate::test_support::warmed_open_options(
         root.path().to_owned(),
         format!("project/{}", "f".repeat(64)),
-    )?;
+    )
+    .await?;
     let active = project_directory(&options.data_dir, &options.project_scope)?;
     let parent = active
         .parent()
@@ -1041,10 +1043,11 @@ async fn checked_working_status(pool: &MySqlPool) -> Result<Vec<(String, i64, St
 #[tokio::test]
 async fn process_loss_child_cleanup_runs_after_failed_observation() -> Result<()> {
     let root = Arc::new(crate::test_support::tempdir()?);
-    let options = crate::test_support::open_options(
+    let options = crate::test_support::warmed_open_options(
         root.path().to_owned(),
         format!("project/{}", "d".repeat(64)),
-    )?;
+    )
+    .await?;
     super::tests::released_v1(&options).await?;
     let server = super::tests::released_server(&options).await?;
     let main = server.pool("main").await?;
@@ -1140,10 +1143,11 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
         migrations::MigrationBoundary::BeforePublish,
     ] {
         let root = crate::test_support::tempdir()?;
-        let mut options = crate::test_support::open_options(
+        let mut options = crate::test_support::warmed_open_options(
             root.path().to_owned(),
             format!("project/{}", Uuid::new_v4().simple().to_string().repeat(2)),
-        )?;
+        )
+        .await?;
         super::tests::released_v1(&options).await?;
         let source = super::tests::released_server(&options).await?;
         let source_pool = source.pool("main").await?;
@@ -1366,10 +1370,11 @@ async fn in_flight_disconnect_waits_for_real_query_and_session_teardown() -> Res
 #[tokio::test]
 async fn post_reap_pool_drain_finishes_a_returned_real_connection() -> Result<()> {
     let root = crate::test_support::tempdir()?;
-    let options = crate::test_support::open_options(
+    let options = crate::test_support::warmed_open_options(
         root.path().to_path_buf(),
         format!("project/{}", "a".repeat(64)),
-    )?;
+    )
+    .await?;
     let store = crate::test_support::spawn_gated_open(options).await?;
     let directory = store.shared.directory.clone();
     let pool = store.pool.clone();
@@ -1401,10 +1406,11 @@ async fn post_reap_pool_drain_finishes_a_returned_real_connection() -> Result<()
 #[tokio::test]
 async fn post_reap_pool_drain_reports_a_connection_that_never_returns() -> Result<()> {
     let root = crate::test_support::tempdir()?;
-    let options = crate::test_support::open_options(
+    let options = crate::test_support::warmed_open_options(
         root.path().to_path_buf(),
         format!("project/{}", "b".repeat(64)),
-    )?;
+    )
+    .await?;
     let store = crate::test_support::spawn_gated_open(options).await?;
     let directory = store.shared.directory.clone();
     let pool = store.pool.clone();
@@ -1438,10 +1444,11 @@ async fn post_reap_pool_drain_reports_a_connection_that_never_returns() -> Resul
 #[tokio::test]
 async fn lost_commit_reply_recovers_one_durable_update_and_reopens_without_replay() {
     let directory = crate::test_support::tempdir().unwrap();
-    let options = crate::test_support::open_options(
+    let options = crate::test_support::warmed_open_options(
         directory.path().to_path_buf(),
         format!("project/{}", "e".repeat(64)),
     )
+    .await
     .unwrap();
     let store = crate::test_support::spawn_gated_open(options.clone())
         .await
@@ -1607,7 +1614,9 @@ async fn stopped_released_v1_store() -> MemoryStore {
     );
     let data = root.path().join("private");
     let options =
-        crate::test_support::open_options(data, format!("project/{}", "0".repeat(64))).unwrap();
+        crate::test_support::warmed_open_options(data, format!("project/{}", "0".repeat(64)))
+            .await
+            .unwrap();
     super::tests::released_v1(&options).await.unwrap();
     let directory = project_directory(&options.data_dir, &options.project_scope).unwrap();
     let server = Server::open(ServerOptions {
@@ -2140,10 +2149,11 @@ async fn lost_manual_dolt_commit_reply_reconciles_one_clean_schema_commit() {
 #[tokio::test]
 async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_ends() -> Result<()> {
     let root = crate::test_support::tempdir()?;
-    let mut options = crate::test_support::open_options(
+    let mut options = crate::test_support::warmed_open_options(
         root.path().to_owned(),
         format!("project/{}", "f".repeat(64)),
-    )?;
+    )
+    .await?;
     super::tests::released_v1(&options).await?;
     let server = super::tests::released_server(&options).await?;
     let main = server.pool("main").await?;
@@ -2227,10 +2237,11 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
 #[tokio::test]
 async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creation() -> Result<()> {
     let root = crate::test_support::tempdir()?;
-    let mut options = crate::test_support::open_options(
+    let mut options = crate::test_support::warmed_open_options(
         root.path().to_owned(),
         format!("project/{}", "b".repeat(64)),
-    )?;
+    )
+    .await?;
     super::tests::released_v1(&options).await?;
     let server = super::tests::released_server(&options).await?;
     let main = server.pool("main").await?;
@@ -2340,10 +2351,11 @@ async fn usage_upgrade_preserves_ready_attempt_when_publication_never_dispatches
 
 async fn usage_upgrade_publication_fixture(accepted: bool) -> Result<()> {
     let root = crate::test_support::tempdir()?;
-    let options = crate::test_support::open_options(
+    let options = crate::test_support::warmed_open_options(
         root.path().to_owned(),
         format!("project/{}", Uuid::new_v4().simple().to_string().repeat(2)),
-    )?;
+    )
+    .await?;
     super::tests::released_v1(&options).await?;
     let server = super::tests::released_server(&options).await?;
     let main = server.pool("main").await?;
@@ -2520,10 +2532,11 @@ async fn usage_upgrade_publication_fixture(accepted: bool) -> Result<()> {
 async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publication()
 -> Result<()> {
     let root = crate::test_support::tempdir()?;
-    let mut options = crate::test_support::open_options(
+    let mut options = crate::test_support::warmed_open_options(
         root.path().to_owned(),
         format!("project/{}", "c".repeat(64)),
-    )?;
+    )
+    .await?;
     super::tests::released_v1(&options).await?;
     let server = super::tests::released_server(&options).await?;
     let main = server.pool("main").await?;
@@ -2631,10 +2644,11 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
 #[tokio::test]
 async fn absent_fast_forward_keeps_the_same_ready_attempt_for_next_open() -> Result<()> {
     let root = crate::test_support::tempdir()?;
-    let mut options = crate::test_support::open_options(
+    let mut options = crate::test_support::warmed_open_options(
         root.path().to_owned(),
         format!("project/{}", "d".repeat(64)),
-    )?;
+    )
+    .await?;
     super::tests::released_v1(&options).await?;
     let server = super::tests::released_server(&options).await?;
     let main = server.pool("main").await?;

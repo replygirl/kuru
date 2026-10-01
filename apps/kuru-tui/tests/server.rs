@@ -71,7 +71,10 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
                 "127.0.0.1:0",
             ])
             .env("KURU_A2A_TOKEN", "integration-token-123456")
-            .env("XDG_CONFIG_HOME", memory::configuration(root.path())?)
+            .env(
+                "XDG_CONFIG_HOME",
+                memory::configuration_warmed(root.path()).await?,
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -141,7 +144,9 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
         spec.environment.extend([
             (
                 "XDG_CONFIG_HOME".into(),
-                memory::configuration(root.path())?.into_os_string(),
+                memory::configuration_warmed(root.path())
+                    .await?
+                    .into_os_string(),
             ),
             ("KURU_A2A_TOKEN".into(), "integration-token-123456".into()),
         ]);

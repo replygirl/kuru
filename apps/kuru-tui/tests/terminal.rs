@@ -100,12 +100,22 @@ struct Sandbox {
 }
 
 impl Sandbox {
+    /// A sandbox for a plain `fn` test: warms the shared cache synchronously.
     fn new() -> Result<Self> {
+        Self::with_cache(&kuru_memory::test_support::cache_dir()?)
+    }
+
+    /// A sandbox for a test inside a Tokio runtime.
+    async fn warmed() -> Result<Self> {
+        Self::with_cache(&kuru_memory::test_support::warmed_cache_dir().await?)
+    }
+
+    fn with_cache(cache: &std::path::Path) -> Result<Self> {
         let root = kuru_memory::test_support::tempdir()?;
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project)?;
-        let configuration = memory::configuration(root.path())?;
+        let configuration = memory::configuration_with(root.path(), cache)?;
         let config: Config = toml::from_str(&std::fs::read_to_string(
             configuration.join("kuru/config.toml"),
         )?)?;
@@ -797,7 +807,7 @@ fn real_pty_cost_inspection_survives_120_80_and_40_columns() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_commands_complete_and_clear_only_the_visible_conversation() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = Arc::clone(&requests);
     let app = Router::new()
@@ -1021,7 +1031,7 @@ async fn real_pty_commands_complete_and_clear_only_the_visible_conversation() ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_and_pty_session_actions_share_catalog_identity_and_public_transcript() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let created = sandbox
         .command("demo")
         .args(["run", "CLI-PARITY-ORIGIN", "--json"])
@@ -1417,7 +1427,7 @@ async fn cli_and_pty_session_actions_share_catalog_identity_and_public_transcrip
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_lifecycle_hooks_rewrite_and_annotate_without_exposing_hook_output() -> Result<()>
 {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = Arc::clone(&requests);
     let app = Router::new()
@@ -1539,7 +1549,7 @@ async fn real_pty_lifecycle_hooks_rewrite_and_annotate_without_exposing_hook_out
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_hook_refusals_and_speaker_stop_leave_the_session_usable() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = Arc::clone(&requests);
     let app = Router::new()
@@ -1646,7 +1656,7 @@ async fn real_pty_hook_refusals_and_speaker_stop_leave_the_session_usable() -> R
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hook_started_kuru_run_reaches_provider_without_reentering_hooks() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let nested_project = sandbox.root.path().join("nested-project");
     std::fs::create_dir(&nested_project)?;
     let config_path = sandbox.root.path().join("nested-hooks.toml");
@@ -1732,7 +1742,7 @@ async fn hook_started_kuru_run_reaches_provider_without_reentering_hooks() -> Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_custom_command_uses_reviewed_catalog_and_literal_arguments() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let custom = sandbox.project.join(".kuru/commands/review.md");
     std::fs::create_dir_all(custom.parent().context("command parent")?)?;
     std::fs::write(
@@ -1873,7 +1883,7 @@ async fn skill_selection_complete(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_skill_selection_reviews_body_before_provider_continuation() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let skill = sandbox.project.join(".agents/skills/review/SKILL.md");
     std::fs::create_dir_all(skill.parent().context("skill parent")?)?;
     std::fs::write(
@@ -2077,7 +2087,7 @@ fn parse_component_tokens(screen: &str, label: &str) -> Result<u64> {
 /// it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_status_bar_renders_known_cost_from_priced_invocation() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let app = Router::new()
         .route(
             "/v1/models",
@@ -2155,7 +2165,7 @@ async fn real_pty_status_bar_renders_known_cost_from_priced_invocation() -> Resu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_pty_reports_automatic_compaction_cost_once_and_reuses_its_summary() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = Arc::clone(&requests);
     let app = Router::new()
@@ -2547,7 +2557,7 @@ async fn complete(State(mut state): State<ProviderState>, Json(_): Json<Value>) 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_cancels_manual_compaction_before_later_identities() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let (release, receiver) = watch::channel(true);
     let started = Arc::new(AtomicBool::new(false));
     let requests = Arc::new(AtomicUsize::new(0));
@@ -2849,7 +2859,7 @@ async fn mixed_catalog_complete(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_mcp_catalog_parity_and_mixed_call_batch_are_fail_closed() -> Result<()> {
     const FIXTURE_SECRET: &str = "mcp-fixture-secret-must-not-render";
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     kuru_platform::fs::Directory::ensure_private(&sandbox.data)?;
     let stale = CatalogStdioPeer::new()?;
     stale.plan(concat!(
@@ -3148,7 +3158,7 @@ fn real_pty_mcp_oauth_status_uses_the_shared_command_family_without_network() ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_mcp_device_login_status_logout_matches_cli() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     kuru_platform::fs::Directory::ensure_private(&sandbox.data)?;
     let oauth = HttpsMcpFixture::start(sandbox.root.path()).await;
     let provider_calls = Arc::new(AtomicUsize::new(0));
@@ -3278,7 +3288,7 @@ async fn real_pty_mcp_device_login_status_logout_matches_cli() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_mcp_refusals_keep_composer_and_other_aliases_idle() -> Result<()> {
     const SECRET: &str = "recognizable-pty-refusal-client-secret";
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     kuru_platform::fs::Directory::ensure_private(&sandbox.data)?;
     let unrelated_stdio = CatalogStdioPeer::new()?;
     unrelated_stdio.plan("eof\n")?;
@@ -3516,7 +3526,7 @@ async fn real_pty_permission_choices_show_exact_file_scope_and_revoke_grants() -
         (b"\x1b3".as_slice(), (24, 80), true, true),
         (b"\x1b4".as_slice(), (35, 120), false, false),
     ] {
-        let sandbox = Sandbox::new()?;
+        let sandbox = Sandbox::warmed().await?;
         let marker = sandbox.project.join("literal[1].txt");
         let app = Router::new()
             .route(
@@ -3588,7 +3598,7 @@ async fn real_pty_permission_choices_show_exact_file_scope_and_revoke_grants() -
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fresh_resume_continue_and_fork_processes_reset_session_only_file_authority() -> Result<()>
 {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let marker = sandbox.project.join("literal[1].txt");
     let app = Router::new()
         .route(
@@ -3837,7 +3847,7 @@ async fn nested_read_search_complete(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_nested_read_and_search_activate_only_used_subtrees() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     for (directory, instruction, file) in [
         ("src", "src instruction", "one.txt"),
         ("sibling", "sibling instruction", "two.txt"),
@@ -3922,7 +3932,7 @@ async fn real_pty_nested_read_and_search_activate_only_used_subtrees() -> Result
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_nested_instruction_review_is_separate_and_precedes_write() -> Result<()> {
     for (answer, granted) in [(b"1".as_slice(), true), (b"3".as_slice(), false)] {
-        let sandbox = Sandbox::new()?;
+        let sandbox = Sandbox::warmed().await?;
         std::fs::create_dir(sandbox.project.join("src"))?;
         std::fs::write(
             sandbox.project.join("src/AGENTS.md"),
@@ -4035,7 +4045,7 @@ fn ensure_eq_marker(path: &std::path::Path, expected: bool) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_shell_permission_cancel_closes_reply_and_preserves_draft() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let marker = sandbox.project.join("shell-permission-marker");
     let app = Router::new()
         .route(
@@ -4113,7 +4123,7 @@ async fn real_pty_shell_permission_cancel_closes_reply_and_preserves_draft() -> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_long_literal_permission_scope_survives_resize_and_inspection() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let parent = "a".repeat(220);
     let leaf = "b".repeat(220);
     std::fs::create_dir(sandbox.project.join(&parent))?;
@@ -4369,7 +4379,7 @@ async fn tool_activity_complete(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_activity_line_tracks_a_streaming_tool_call() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let (release, receiver) = watch::channel(false);
     let started = Arc::new(AtomicBool::new(false));
     let app = Router::new()
@@ -4439,7 +4449,7 @@ async fn real_pty_activity_line_tracks_a_streaming_tool_call() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_previews_delayed_native_selected_stream_at_three_sizes() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let (release, receiver) = watch::channel(false);
     let selected_started = Arc::new(AtomicBool::new(false));
     let selected_requests = Arc::new(AtomicUsize::new(0));
@@ -4525,7 +4535,7 @@ async fn real_pty_previews_delayed_native_selected_stream_at_three_sizes() -> Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_cancels_provisional_stream_then_retries_only_completed_answer() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let (_release, receiver) = watch::channel(false);
     let selected_started = Arc::new(AtomicBool::new(false));
     let selected_requests = Arc::new(AtomicUsize::new(0));
@@ -4599,7 +4609,7 @@ fn ensure_eq_selected_requests(selected_requests: &AtomicUsize, expected: usize)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_turn() -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let (release, receiver) = watch::channel(false);
     let started = Arc::new(AtomicBool::new(false));
     let requests = Arc::new(AtomicUsize::new(0));
@@ -4806,6 +4816,8 @@ struct Selection<'a> {
     effort: Option<&'a str>,
 }
 
+/// Options for the store the application created: reopens are never
+/// refused for want of a warm-up.
 fn memory_options(sandbox: &Sandbox) -> Result<kuru_memory::OpenOptions> {
     kuru_memory::test_support::open_options(
         sandbox.data.clone(),
@@ -5016,7 +5028,7 @@ async fn preferences_session(
 #[tokio::test]
 async fn terminal_selections_survive_restarts_picker_changes_and_failed_database_writes()
 -> Result<()> {
-    let sandbox = Sandbox::new()?;
+    let sandbox = Sandbox::warmed().await?;
     let initial = sandbox.config()?;
     preferences_session(
         &sandbox,

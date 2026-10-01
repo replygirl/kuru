@@ -951,10 +951,11 @@ async fn lost_annotation_reply_reconciles_the_exact_session_without_replaying_ef
     let project = tempfile::tempdir().unwrap();
     let project_path = project.path().canonicalize().unwrap();
     let data = kuru_memory::test_support::tempdir().unwrap();
-    let options = kuru_memory::test_support::open_options(
+    let options = kuru_memory::test_support::warmed_open_options(
         data.path().to_owned(),
         crate::project_scope(&project_path).unwrap(),
     )
+    .await
     .unwrap();
     let executable = options.supervisor.clone().unwrap();
     let open = || {
