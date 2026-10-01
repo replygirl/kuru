@@ -449,42 +449,48 @@ async fn validate_branch(pool: &MemoryPool) -> Result<u64> {
         }
         decoded = decoded.saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
         for (key, value) in &rows {
-            let key = String::from_utf8(key.clone()).context("usage ledger key is not UTF-8")?;
-            if key.starts_with(SESSION_PREFIX) {
-                let marker = decode_marker(value)?;
-                ensure!(
-                    key == session_key(&marker.session_id),
-                    "usage marker key is not canonical"
-                );
-            } else if key.starts_with(RECORD_PREFIX) {
-                let record = decode_record(value)?;
-                ensure!(
-                    key == record_key(&record.start.invocation_id),
-                    "usage ledger record key does not match its invocation"
-                );
-            } else if key.starts_with(OBSERVATION_PREFIX) {
-                let observation = decode_observation(value)?;
-                ensure!(
-                    key == observation_key(
-                        &observation.invocation_id,
-                        observation.observation.sequence
-                    ),
-                    "usage observation key does not match its value"
-                );
-            } else if key.starts_with(SESSION_INDEX_PREFIX) {
-                let index = decode_session_index(value)?;
-                ensure!(
-                    key == session_index_key(&index.session_id, &index.invocation_id)
-                        && index.record_key == record_key(&index.invocation_id),
-                    "usage session index is not canonical"
-                );
-            } else {
-                bail!("usage ledger owns an unrecognized state key");
-            }
+            validate_owned_row(key, value)?;
         }
         after = rows.last().map(|(key, _)| key.clone());
     }
     Ok(decoded)
+}
+
+/// The one owned-row validator: the open scan calls it for every row under
+/// `kuru.usage.v1/`, and every ledger write calls it for each row it is about
+/// to `INSERT`. It is row-local by contract (see the module documentation):
+/// its verdict depends only on this key and value.
+fn validate_owned_row(key: &[u8], value: &str) -> Result<()> {
+    let key = std::str::from_utf8(key).context("usage ledger key is not UTF-8")?;
+    if key.starts_with(SESSION_PREFIX) {
+        let marker = decode_marker(value)?;
+        ensure!(
+            key == session_key(&marker.session_id),
+            "usage marker key is not canonical"
+        );
+    } else if key.starts_with(RECORD_PREFIX) {
+        let record = decode_record(value)?;
+        ensure!(
+            key == record_key(&record.start.invocation_id),
+            "usage ledger record key does not match its invocation"
+        );
+    } else if key.starts_with(OBSERVATION_PREFIX) {
+        let observation = decode_observation(value)?;
+        ensure!(
+            key == observation_key(&observation.invocation_id, observation.observation.sequence),
+            "usage observation key does not match its value"
+        );
+    } else if key.starts_with(SESSION_INDEX_PREFIX) {
+        let index = decode_session_index(value)?;
+        ensure!(
+            key == session_index_key(&index.session_id, &index.invocation_id)
+                && index.record_key == record_key(&index.invocation_id),
+            "usage session index is not canonical"
+        );
+    } else {
+        bail!("usage ledger owns an unrecognized state key");
+    }
+    Ok(())
 }
 
 async fn apply_change(
@@ -709,6 +715,9 @@ async fn put_state_tx<T: Serialize>(
         encoded.len() <= 64 * 1024,
         "usage ledger record exceeds its byte limit"
     );
+    // The same function the open scan applies: a write can never commit a
+    // row that a later full scan would refuse.
+    validate_owned_row(key.as_bytes(), &encoded)?;
     sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)")
         .bind(key.as_bytes())
         .bind(encoded)
@@ -2794,6 +2803,88 @@ mod tests {
             plan_nodes(&plan).any(|node| node == "Table"),
             "old record probe no longer reads the full table:\n{plan}"
         );
+        drop(pool);
+        drop(ledger);
+        store.close().await
+    }
+
+    /// Every owned row of `pool`'s state, in key order.
+    async fn owned_rows(pool: &MySqlPool) -> Result<Vec<(Vec<u8>, String)>> {
+        let owned = KeyRange::prefix(OWNED_PREFIX)?;
+        let mut rows = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = owned_state_page(pool, &owned, after.as_deref()).await?;
+            let Some((last, _)) = page.last() else {
+                return Ok(rows);
+            };
+            after = Some(last.clone());
+            rows.extend(page);
+        }
+    }
+
+    // T14 (same function): every row a scripted session writes passes the
+    // scan's validator, and a row it would refuse never reaches a commit.
+    #[tokio::test]
+    async fn writes_validate_each_row_with_the_scan_validator() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let ledger = store.usage_ledger()?;
+        ledger.mark_new_session("scripted").await?;
+        ledger.admit(start("scripted", "scripted-1")).await?;
+        for (sequence, terminal) in [(1, false), (2, false), (3, true)] {
+            ledger
+                .observe(
+                    "scripted-1",
+                    UsageObservation {
+                        sequence,
+                        terminal,
+                        usage: Usage {
+                            input_tokens: Some(sequence),
+                            ..Usage::default()
+                        },
+                    },
+                )
+                .await?;
+        }
+        ledger
+            .settle("scripted-1", InvocationOutcome::Succeeded)
+            .await?;
+        let pool = ledger.store.pool.clone();
+        let rows = owned_rows(pool.as_ref()).await?;
+        // One marker, one record, one index and three observations.
+        ensure!(rows.len() == 6, "{} owned rows", rows.len());
+        for (key, value) in &rows {
+            validate_owned_row(key, value)?;
+        }
+
+        // A value the scan would refuse (a marker under another session's
+        // key) is refused inside the write transaction, before its INSERT.
+        let head = revision(pool.as_ref()).await?;
+        let (mut connection, _) = owned_connection(&pool).await?;
+        let mut transaction = connection.begin().await?;
+        let refused = put_state_tx(
+            &mut transaction,
+            &session_key("another-session"),
+            &SessionMarker {
+                format: FORMAT,
+                session_id: "scripted".into(),
+                historical_complete: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        ensure!(
+            format!("{refused:#}").contains("usage marker key is not canonical"),
+            "{refused:#}"
+        );
+        transaction.rollback().await?;
+        drop(connection);
+        ensure!(
+            read_state(pool.as_ref(), &session_key("another-session"))
+                .await?
+                .is_none()
+        );
+        ensure!(revision(pool.as_ref()).await? == head);
         drop(pool);
         drop(ledger);
         store.close().await
