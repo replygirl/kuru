@@ -4383,11 +4383,15 @@ mod tests {
                 if (lower.contains("dolt_log") || lower.contains("dolt_commits"))
                     && lower.contains("message")
                 {
+                    // Joined with `/` on every OS, so the inventory below
+                    // compares equal on Windows too.
                     let relative = file
                         .strip_prefix(&workspace)
                         .unwrap_or(&file)
-                        .display()
-                        .to_string();
+                        .components()
+                        .map(|component| component.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/");
                     readers.push((relative, line.trim().to_owned()));
                 }
             }
