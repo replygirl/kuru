@@ -799,16 +799,20 @@ async fn bound_check(pool: &MemoryPool) -> Result<BoundCheck> {
     })
 }
 
-/// Reconcile the open's record commit: not committed while HEAD is still its
-/// base; committed when HEAD records exactly this content and its only
-/// parent is the base; anything else is ambiguous.
+/// Reconcile the open's record commit, after its SQL session has ended:
+/// committed only when HEAD records exactly this content under this
+/// validator and HEAD's only parent is the base. Anything else, HEAD still at
+/// the base or a head that diverged from both, is not proven and reads as a
+/// missing record, never an error: the record commit is empty, so its
+/// outcome changes no row and nothing replays it, and a missing record only
+/// means the next open scans and records again.
 pub(super) async fn validation_committed(
     pool: &MemoryPool,
     base_head: &str,
     state_hash: &str,
 ) -> Result<bool> {
     let check = bound_check(pool).await?;
-    if check.head == base_head {
+    if check.head == base_head || !check.bound || check.state_hash != state_hash {
         return Ok(false);
     }
     let parents: Vec<String> = tokio::time::timeout(
@@ -821,11 +825,7 @@ pub(super) async fn validation_committed(
     )
     .await
     .context("usage validation record parent deadline exceeded")??;
-    ensure!(
-        check.bound && check.state_hash == state_hash && parents == [base_head],
-        "cannot reconcile the usage validation record: the usage branch head diverged from both its base and the record"
-    );
-    Ok(true)
+    Ok(parents == [base_head])
 }
 
 /// After reconciliation settled a usage write or record commit, re-derive
@@ -3987,10 +3987,12 @@ mod tests {
 
     // T13 for the record commit: its receipt reconciles as not committed
     // while HEAD is its base, as committed when HEAD records exactly its
-    // content on top of the base, and as ambiguous otherwise.
+    // content on top of the base, and as not committed (a missing record,
+    // never an error) when HEAD diverged from both.
     #[tokio::test]
     async fn the_validation_record_receipt_reconciles() -> Result<()> {
-        let store = MemoryStore::temporary().await?;
+        let root = crate::test_support::tempdir()?;
+        let store = reopen(&root).await?;
         let ledger = store.usage_ledger()?;
         let pool = ledger.store.pool.clone();
         let base = revision(pool.as_ref()).await?;
@@ -4017,34 +4019,61 @@ mod tests {
         assert_eq!(ledger.store.reconcile().await?, Some(true));
         assert_eq!(validated(&store), Some(live.clone()));
         ledger.mark_new_session("after-record").await?;
+        let written = validated(&store).context("the write published no hash")?;
 
-        let error = {
-            set_pending(&ledger, finished().await?, receipt(&base));
-            ledger.store.reconcile().await.unwrap_err()
-        };
-        ensure!(
-            format!("{error:#}").contains("cannot reconcile the usage validation record"),
-            "{error:#}"
-        );
-        ensure!(
+        // Diverged from both, on a recorded head: settled as not committed,
+        // the Pending is cleared and the head's own record keeps the ledger
+        // writable.
+        set_pending(&ledger, finished().await?, receipt(&base));
+        assert_eq!(ledger.store.reconcile().await?, Some(false));
+        let pending = || {
             ledger
                 .store
                 .shared
                 .uncertain
                 .lock()
                 .expect("uncertain lock")
-                .is_some(),
-            "an ambiguous record outcome was cleared"
-        );
-        *ledger
-            .store
-            .shared
-            .uncertain
-            .lock()
-            .expect("uncertain lock") = None;
+                .is_some()
+        };
+        ensure!(!pending(), "a diverged record outcome stayed pending");
+        assert_eq!(validated(&store), Some(written));
+        ledger.mark_new_session("after-divergence").await?;
+        let written = validated(&store).context("the write published no hash")?;
+
+        // Diverged from both, on a head without a record (a foreign commit
+        // on top): still not committed and never an error. The live content
+        // is the validated content, so the ledger stays writable; the record
+        // is Missing, so the next open scans and records again.
+        sqlx::query("CALL DOLT_COMMIT('--allow-empty', '--message', ?, '--author', ?)")
+            .bind("foreign commit without a record")
+            .bind(AUTHOR)
+            .fetch_all(pool.as_ref())
+            .await?;
+        ensure!(!bound_check(pool.as_ref()).await?.bound);
+        set_pending(&ledger, finished().await?, receipt(&base));
+        assert_eq!(ledger.store.reconcile().await?, Some(false));
+        ensure!(!pending(), "a diverged record outcome stayed pending");
+        assert_eq!(validated(&store), Some(written));
         drop(pool);
         drop(ledger);
-        store.close().await
+        store.close().await?;
+
+        let reopened = reopen(&root).await?;
+        // 2 markers: "after-record" and "after-divergence".
+        assert_eq!(
+            usage_open(&reopened)?,
+            UsageOpen {
+                bound: false,
+                scanned: Some(2),
+                rescanned: None,
+                recorded: true,
+            }
+        );
+        reopened
+            .usage_ledger()?
+            .mark_new_session("after-rescan")
+            .await?;
+        reopened.close().await
     }
 
     // The Bound-path probe: a single primary-key range read that sees owned

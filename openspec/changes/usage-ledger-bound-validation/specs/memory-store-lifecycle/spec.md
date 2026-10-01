@@ -52,6 +52,10 @@ The usage branch's validation record SHALL be one trailer line in a commit messa
 - **WHEN** the head message carries a record with a wrong content hash, a non-head origin, a duplicated line, an oversize message or a malformed hash
 - **THEN** it reads as a missing record and the open validates every ledger-owned row before dispatch.
 
+#### Scenario: Unproven validation record commit
+- **WHEN** the reply to an open's validation record commit is lost and reconciliation, after the original SQL session ended, cannot prove that the branch head carries that record
+- **THEN** the record is treated as missing rather than refused: no later writer is blocked, the open keeps the content its full validation checked, and the next open validates every ledger-owned row and records again.
+
 #### Scenario: Empty ledger writes no record
 - **WHEN** a writable open finds a usage branch holding no ledger-owned row
 - **THEN** it adds no commit to the branch and the first ledger write carries the record.
