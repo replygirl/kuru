@@ -49,6 +49,15 @@ deadlines or retries are part of this change.
 - Update `docs/memory.md`, `apps/kuru-docs/concepts/memory.md` and
   `docs/development.md` to describe where new projects now come from, what
   the first launch on a machine pays, and the fixture start-count change.
+- Keep the whole template path — the build-then-copy case included — inside
+  the already-reported `CreatingDatabase` activity stage (`memory_activity.rs`
+  sentence S3, "Creating this project's memory…", landed in #148), so a user
+  on a first launch never sees S3 clear or revert to another sentence while
+  the template builds; no new sentence or stage. Add one real-PTY test for a
+  first launch with an empty, unwarmed template cache showing S3 held through
+  the build, and confirm the already-landed warm-template case's PTY coverage
+  (`real_pty_accepts_chat_navigation_commands_and_restores_terminal`) still
+  shows S3 through the copy and adoption start.
 
 ## Capabilities
 
@@ -82,13 +91,16 @@ None.
   build-then-copy paths.
 - `docs/memory.md`, `apps/kuru-docs/concepts/memory.md`,
   `docs/development.md`: creation-path and fixture-budget documentation.
+- `apps/kuru-tui/tests/terminal.rs`: one new real-PTY test for the
+  first-launch build-then-copy path's activity sentence; no change to
+  `apps/kuru-tui/src/memory_activity.rs` (no new sentence or stage).
 - No schema change, no new environment variable, no change to timeouts,
   deadlines, retries or the cold path's own start count (still 4, pending the
   separate restart-removal change).
 
 ## Surfaces
 
-- [ ] interactive
+- [x] interactive
 - [ ] deploy
 - [ ] integration
 - [ ] agent-behavior

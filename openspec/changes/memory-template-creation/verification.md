@@ -30,6 +30,11 @@
 
 - [ ] 6.1 @regression (agent) run the full existing `packages/kuru-memory` test suite (`mise run //packages/kuru-memory:test`) after the selector lands -> every existing-project-open and cold-path test (including `temporary_cold()` call sites) passes with its start count unchanged.
 
-## 7. Documentation describes the new creation path
+## 7. Activity sentence covers the template path [critical]
 
-- [ ] 7.1 @manual (human) review `docs/memory.md`, `apps/kuru-docs/concepts/memory.md` and the fixture-expectations section of `docs/development.md` against the merged selector behavior -> each accurately states where a new project's data comes from, what the first launch per machine and key pays, and the new 2-start/3-start fixture budgets.
+- [ ] 7.1 @integration (agent) run the new first-launch real-PTY test (task 8.2, private unwarmed cache) -> the terminal frame contains `Creating this project's memory…` while the hold file is present and the build-then-copy path has not yet reached `ready.json`, the sentence is erased by the ready frame, and no other sentence from `memory_activity::SENTENCES` appears before it.
+- [ ] 7.2 @integration (agent) re-run `real_pty_accepts_chat_navigation_commands_and_restores_terminal` (its `expect_notice: true` `smoke` call) -> the terminal frame still contains `Creating this project's memory…` across the warm-template copy-and-adoption start (two engine starts via the warmed shared cache), confirming the existing coverage from #148 remains valid against this change's selector.
+
+## 8. Documentation describes the new creation path
+
+- [ ] 8.1 @manual (human) review `docs/memory.md`, `apps/kuru-docs/concepts/memory.md` and the fixture-expectations section of `docs/development.md` against the merged selector behavior -> each accurately states where a new project's data comes from, what the first launch per machine and key pays, and the new 2-start/3-start fixture budgets.

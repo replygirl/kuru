@@ -38,6 +38,19 @@ guards that make the new start counts observable and regression-tested.
   cache mechanism, timeouts, deadlines or retries.
 - No change to an existing project's open path.
 
+## Operational surface
+
+The interactive surface this change touches is the existing command-line
+activity sentence (`apps/kuru-tui/src/memory_activity.rs`, landed in #148):
+this change adds no new sentence, stage, bind address, container/runner
+topology, required secret or connection limit. It keeps the build-then-copy
+and warm-copy creation paths inside the already-reported `CreatingDatabase`
+stage so the existing S3 sentence ("Creating this project's memory…") covers
+both without a wording or UI change. The creation worker starts the same
+owned, pinned full-Dolt binary the cold path already starts (two or three
+times instead of four), using the same per-project writer lease and startup
+lock; no new listener, process topology or binary version is introduced.
+
 ## Decisions
 
 - **Selector runs once, right after `recover_staging`, never mid-stage.**
@@ -119,6 +132,52 @@ guards that make the new start counts observable and regression-tested.
   starts: an open can still fall back to it until restart removal makes the
   cold path two starts. No deadline changes.
 
+- **The whole template path runs inside the already-reported `CreatingDatabase`
+  stage; no new sentence or stage is added.** `open_inner`'s `!Self::exists`
+  branch reports `MemoryOpenStage::CreatingDatabase`
+  (`packages/kuru-memory/src/store.rs:1890`) before `recover_staging`, before
+  `creation_worker::select` is even called (`store.rs:1917`), and before the
+  creation worker's `OpeningDatabase` report inside the template branch
+  (`store.rs:1921`). Under #148's stage-mapping decision D3
+  (`openspec/changes/archive/2026-09-30-memory-open-activity/design.md`), S3
+  ("Creating this project's memory…") is shown on `CreatingDatabase` (rule
+  R5) and *kept* on the following `OpeningDatabase` report (rule R7, "keep").
+  So the build-then-copy case (three engine starts: the build, the copy's
+  adoption start, the active start) and the warm-copy case (two starts: the
+  copy's adoption start, the active start) both run entirely after S3 is
+  shown and before any stage that would change or clear it. This satisfies
+  #148's own risk note ("Conflict with the template-copy change in
+  `open_inner`") without touching `memory_activity.rs`'s stage sites or
+  sentence table. Rejected: a new `BuildingTemplate` stage or sentence
+  distinguishing the build from an ordinary creation, which the maintainer
+  instruction for this change rules out (no new sentence, stage name or
+  wording change without agreeing it with assistant4, which this change does
+  not do) and which the existing mapping does not need — S3 is already true
+  for "this project's database is being created," including by a
+  machine-first template build.
+
+- **Test coverage reuses #148's hold hook and PTY fixture; one new test, one
+  confirmed-sufficient existing test.** `real_pty_accepts_chat_navigation_commands_and_restores_terminal`
+  (`apps/kuru-tui/tests/terminal.rs`, via its `smoke(..., expect_notice: true)`
+  helper) already runs against `Sandbox::new()`, which warms the shared
+  engine *and* template cache synchronously
+  (`test_support::cache_dir` → `warm_runtime_cache` →
+  `warm_template_in`), holds the open at `CreatingDatabase` with
+  `KURU_TEST_MEMORY_OPEN_HOLD_DIR`/`CreatingDatabase.hold`, and asserts the
+  `CREATING` sentence is on the terminal before releasing the hold — this is
+  already the warm-template copy-and-adoption case for this change's
+  activity-sentence goal; it needs no new test, only re-running after this
+  change lands to confirm it still exercises the two-start path (not a
+  rewrite of the test). The build-then-copy (first launch, empty template
+  cache) case has no existing coverage: no PTY test in
+  `apps/kuru-tui/tests/terminal.rs` opens against an unwarmed, private cache
+  directory. This change adds one: a private `tempdir`-backed cache (not
+  `test_support::cache_dir()`'s shared warmed one), the same
+  `CreatingDatabase.hold` mechanism, and the same assertion that `CREATING`
+  is on the terminal while the hold is held, synchronized on a completed
+  frame per `AGENTS.md`; it releases the hold and lets the build-then-copy
+  path (three starts) finish to a ready frame.
+
 ## Risks / Trade-offs
 
 - **[Risk] The selector regresses an existing project's open path** by
@@ -142,3 +201,12 @@ guards that make the new start counts observable and regression-tested.
   coverage to the new build-then-copy and warm-copy paths so a fixture that
   reaches either unwarmed still fails fast instead of masking a slow first
   open.
+
+- **[Risk] A future stage added to the template path (a new copy sub-stage,
+  a second adoption attempt) lands between `CreatingDatabase` and the next
+  stage this change's selector reports, and D3's rule R9 ("any other or
+  future stage: keep") means it would silently keep S3 even if it should
+  not.** → Mitigation: none needed for this change (it adds no new stage);
+  recorded so a later change that adds a stage inside the template path
+  re-reads #148's D3 table rather than assuming R9 is always correct for a
+  stage it did not evaluate.

@@ -97,3 +97,27 @@
 - [ ] 7.2 Run `format:check`, kuru-memory `lint`, `lint:windows` and
       `typecheck`, and `docs:check`.
 - [ ] 7.3 Record which checks ran and which are deferred to CI, with reasons.
+
+## 8. Activity sentence covers the template path
+
+- [ ] 8.1 Confirm (reviewed, not re-implemented) that `open_inner` reports
+      `MemoryOpenStage::CreatingDatabase` before `creation_worker::select` and
+      before the worker's own `OpeningDatabase` report, so #148's stage
+      mapping (D3: R5 shows S3 on `CreatingDatabase`, R7 keeps it on
+      `OpeningDatabase`) covers the build-then-copy and warm-copy paths with
+      no code change and no new sentence or stage; see design.md's "whole
+      template path" decision for the exact line references.
+- [ ] 8.2 Add one real-PTY test in `apps/kuru-tui/tests/terminal.rs` for a
+      first launch against a private, unwarmed template cache (not
+      `test_support::cache_dir()`'s shared warmed one): hold the open at
+      `CreatingDatabase` with the existing
+      `KURU_TEST_MEMORY_OPEN_HOLD_DIR`/`CreatingDatabase.hold` mechanism,
+      assert the `CREATING` sentence (`kuru::memory_activity::CREATING`) is
+      on the terminal while the hold is held (synchronized on a completed
+      frame), release the hold, and let the build-then-copy path reach a
+      ready frame with the sentence erased.
+- [ ] 8.3 Re-run the existing `real_pty_accepts_chat_navigation_commands_and_restores_terminal`
+      test (its `smoke(..., expect_notice: true)` call) after this change
+      lands and confirm it still shows `CREATING` through the warm-template
+      copy-and-adoption start; no new test needed for this case (see
+      design.md).
