@@ -5,6 +5,7 @@
 //! never gives a caller a mutable `MemoryStore` view of that branch.
 
 use super::*;
+use crate::open_timeline::{self, Event};
 use kuru_core::{
     InvocationOutcome, InvocationStart, InvocationUsage, MoneyEstimate, PriceBasis, SessionUsage,
     UnappliedPriceTerm, Usage, UsageCompleteness, UsageObservation,
@@ -389,15 +390,23 @@ pub(super) async fn establish(store: &MemoryStore) -> Result<()> {
         .context("usage ledger branch creation deadline exceeded")??;
     }
     let pool = store.shared.server.pool(BRANCH).await?;
-    validate_branch(pool.as_ref()).await?;
+    open_timeline::stamp(Event::UsagePool);
+    let rows = validate_branch(pool.as_ref()).await?;
+    open_timeline::usage_rows(rows);
+    open_timeline::stamp(Event::UsageScan1);
     migrations::upgrade_usage(&store.shared.server, pool.as_ref()).await?;
+    open_timeline::stamp(Event::UsageUpgrade);
     migrations::validate_usage(pool.as_ref()).await?;
+    open_timeline::stamp(Event::UsageValidate);
     validate_branch(pool.as_ref()).await?;
+    open_timeline::stamp(Event::UsageScan2);
     *store.shared.usage_pool.lock().expect("usage pool lock") = Some(pool);
     Ok(())
 }
 
-async fn validate_branch(pool: &MySqlPool) -> Result<()> {
+/// Validate the branch's working set, history and owned state; returns the
+/// number of owned-state rows decoded.
+async fn validate_branch(pool: &MySqlPool) -> Result<u64> {
     let dirty: i64 = tokio::time::timeout(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status").fetch_one(pool),
@@ -421,11 +430,13 @@ async fn validate_branch(pool: &MySqlPool) -> Result<()> {
     // Current usage receipts intentionally survive later ledger writes;
     // there is no one-row limit on an upgraded writable branch.
     let mut after = None;
+    let mut decoded = 0_u64;
     loop {
         let rows = owned_state_page(pool, after.as_deref()).await?;
         if rows.is_empty() {
             break;
         }
+        decoded = decoded.saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
         for (key, value) in &rows {
             let key = String::from_utf8(key.clone()).context("usage ledger key is not UTF-8")?;
             if key.starts_with(SESSION_PREFIX) {
@@ -466,7 +477,7 @@ async fn validate_branch(pool: &MySqlPool) -> Result<()> {
             .transpose()
             .context("usage ledger key is not UTF-8")?;
     }
-    Ok(())
+    Ok(decoded)
 }
 
 async fn apply_change(

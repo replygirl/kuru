@@ -618,6 +618,15 @@ pub(crate) fn owner_test_environment() -> Vec<(OsString, OsString)> {
         .unwrap_or_default()
 }
 
+/// Run `future` with `environment` added to every owner its opens spawn.
+#[cfg(test)]
+pub(crate) async fn with_owner_environment<F: std::future::Future>(
+    environment: Vec<(OsString, OsString)>,
+    future: F,
+) -> F::Output {
+    OWNER_TEST_ENVIRONMENT.scope(environment, future).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,13 +731,6 @@ mod tests {
             seen.push(stage);
         }
         opened
-    }
-
-    async fn with_owner_environment<F: Future>(
-        environment: Vec<(OsString, OsString)>,
-        future: F,
-    ) -> F::Output {
-        OWNER_TEST_ENVIRONMENT.scope(environment, future).await
     }
 
     #[test]

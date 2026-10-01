@@ -9,11 +9,11 @@ Work in `tmp/worktrees/perf-owner-start-split` (branch `perf/owner-start-split`,
 
 ## 2. Timeline module and stamp sites (WP1: `src/open_timeline.rs`, `lib.rs`, `service.rs`, `service/open_timeline_tests.rs`, `service/activity.rs` helper only, `server.rs`, `store.rs`, `store/usage_ledger.rs`, `provision.rs`)
 
-- [ ] 2.1 Add `open_timeline.rs` (gate, `Timeline`, bounded sealed log, `encode`, checked `write`) declared in `lib.rs`, and verify unit tests 1-5 (non-decreasing and bounded across threads and tasks, seal, gate values, encode schema and size, write modes and failures) pass using local `Timeline` values only.
-- [ ] 2.2 Install from the environment as the first statement of `service_entry` and place the 18 stamps at the sites in design D2 (one site per event, no `allow(dead_code)`), changing `validate_branch` to return its row count, and verify `mise run //packages/kuru-memory:test` still passes the unmodified stage-sequence tests.
-- [ ] 2.3 Write the timeline in `close_paused` after `lock.release()` with the `ServeKnobs.timeline` test knob, and verify test 6 (no file at any close pause, one file after) and test 7 (an occupied name leaves the close `Ok`).
-- [ ] 2.4 Make the owner-environment helper crate-visible and add `FixtureLoggedOwner::exited` (unix), and verify tests 8 (complete ordered record, no forbidden bytes) and 9 (unset writes nothing) pass.
-- [ ] 2.5 Verify `mise run //packages/kuru-memory:lint`, `lint:windows`, `format:check` and `typecheck` pass, so Windows-only code compiles.
+- [x] 2.1 Add `open_timeline.rs` (gate, `Timeline`, bounded sealed log, `encode`, checked `write`) declared in `lib.rs`, and verify unit tests 1-5 (non-decreasing and bounded across threads and tasks, seal, gate values, encode schema and size, write modes and failures) pass using local `Timeline` values only. Observed 2026-10-01 (macOS arm64): red with stub bodies (10 of the 11 `open_timeline::tests` failed; `an_uninstalled_process_records_nothing` passed, as an inert runner must), then green, 11 passed.
+- [x] 2.2 Install from the environment as the first statement of `service_entry` and place the 18 stamps at the sites in design D2 (one site per event, no `allow(dead_code)`), changing `validate_branch` to return its row count, and verify `mise run //packages/kuru-memory:test` still passes the unmodified stage-sequence tests. Observed 2026-10-01 (macOS arm64): full package suite 514 passed, 0 failed, 4 ignored (lib), every other target ok; `a_starter_forwards_only_its_own_owners_stages`, `_the_creation_of_a_new_project` and `_the_upgrade_of_a_released_store` ok.
+- [x] 2.3 Write the timeline in `close_paused` after `lock.release()` with the `ServeKnobs.timeline` test knob, and verify test 6 (no file at any close pause, one file after) and test 7 (an occupied name leaves the close `Ok`). Observed 2026-10-01 (macOS arm64): test 6 red (no file after close), then green; test 7 passed in both phases (nothing was written to fail before the write existed) and green after.
+- [x] 2.4 Make the owner-environment helper crate-visible and add `FixtureLoggedOwner::exited` (unix), and verify tests 8 (complete ordered record, no forbidden bytes) and 9 (unset writes nothing) pass. Observed 2026-10-01 (macOS arm64): test 8 red (no file), then green with the 18 canonical events in order from a real child owner; test 9 passed in both phases and green after.
+- [x] 2.5 Verify `mise run //packages/kuru-memory:lint`, `lint:windows`, `format:check` and `typecheck` pass, so Windows-only code compiles. Observed 2026-10-01 (macOS arm64): `//packages/kuru-memory:lint`, `//packages/kuru-memory:lint:windows`, root `lint`, `format:check` and `typecheck` exited 0.
 
 ## 3. Aged-store fixture (WP2: `src/test_support/aged_store.rs`, `src/test_support.rs`, `src/main.rs`, `packages/kuru-memory/mise.toml`)
 
@@ -22,7 +22,7 @@ Work in `tmp/worktrees/perf-owner-start-split` (branch `perf/owner-start-split`,
 
 ## 4. Documentation (WP3: `docs/development.md`)
 
-- [ ] 4.1 Document the variable, file, schema, 18 event names, accumulation, the Windows non-support and `measure:age-store`, and verify `mise run docs:check` passes.
+- [ ] 4.1 Document the variable, file, schema, 18 event names, accumulation, the Windows non-support and `measure:age-store`, and verify `mise run docs:check` passes. Partial, 2026-10-01: the owner open timeline paragraph landed (variable, file, schema, 18 names, accumulation, Windows) and `docs:check` exited 0; the `measure:age-store` lines remain with WP2.
 
 ## 5. Measurement and report (WP4, WP5: outside the repository)
 

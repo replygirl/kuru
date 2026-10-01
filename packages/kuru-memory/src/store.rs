@@ -24,6 +24,7 @@ use {std::sync::OnceLock, tokio::sync::Semaphore};
 use crate::{
     MemoryOpenProgress, MemoryOpenStage, files,
     migration::{self, LegacyImport, MigrationReceipt},
+    open_timeline,
     progress::ProgressReporter,
     provision,
     server::{BranchAdmission, LifecycleLease, Server, ServerOptions, SessionsEnded},
@@ -2003,6 +2004,7 @@ impl MemoryStore {
             Ok(pool) => pool,
             Err(error) => return Err(close_failed_open(&server, error).await),
         };
+        open_timeline::stamp(open_timeline::Event::MainPool);
         let inspected = async {
             let found = migrations::version(&pool).await?;
             if (options.read_only && found < migrations::CURRENT_VERSION)
@@ -2021,6 +2023,7 @@ impl MemoryStore {
             Ok(found) => found,
             Err(error) => return Err(close_failed_open(&server, error).await),
         };
+        open_timeline::stamp(open_timeline::Event::VersionRead);
         if options.read_only && found < migrations::CURRENT_VERSION {
             let lock: File = server.close_installed_guard().await?;
             drop(lock);
@@ -2061,6 +2064,7 @@ impl MemoryStore {
         if let Err(error) = validated {
             return Err(close_failed_open(&server, error).await);
         }
+        open_timeline::stamp(open_timeline::Event::ValidateActive);
         let shared = Arc::new(Shared {
             server,
             directory,
@@ -2088,6 +2092,7 @@ impl MemoryStore {
         if !options.read_only {
             // The recovery worker closes its server before reporting failure.
             run_candidate_recovery_worker(&store).await?;
+            open_timeline::stamp(open_timeline::Event::CandidateRecovery);
             if let Err(error) = usage_ledger::establish(&store).await {
                 // Recovery already released the startup guard to this store,
                 // so close the server itself rather than its installed guard.
@@ -2101,6 +2106,7 @@ impl MemoryStore {
         // Open-sequence pools, including recovery and the usage ledger above,
         // shared this server's startup deadline. Later pools are ordinary.
         store.shared.server.finish_opening();
+        open_timeline::stamp(open_timeline::Event::StoreReady);
         progress.report(MemoryOpenStage::Ready);
         Ok(store)
     }

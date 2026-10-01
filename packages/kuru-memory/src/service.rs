@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::open_timeline;
 use crate::progress::{MemoryOpenStage, ProgressReporter};
 
 pub(crate) mod activity;
@@ -137,6 +138,7 @@ fn fixture_startup_observations(
 /// Internal process entry used by both the ordinary executable and native
 /// fixtures. Paths arrive as native OS arguments so non-UTF-8 names survive.
 pub async fn service_entry(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
+    crate::open_timeline::install_from_env();
     let (project, options) = parse_service_arguments(arguments)?;
     ServiceOwner::open(options, &project).await?.serve().await
 }
@@ -1145,6 +1147,35 @@ impl FixtureLoggedOwner {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+
+    /// Release the starter's attachment, then await the owner process's own
+    /// exit within `deadline`, without polling. Everything the owner does in
+    /// its close, including writing an open timeline after its lock
+    /// release, precedes that exit.
+    #[cfg(unix)]
+    pub async fn exited(mut self, deadline: Duration) -> Result<()> {
+        self.attachment.close();
+        let mut child = self
+            .process
+            .0
+            .take()
+            .context("fixture memory owner was already observed")?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        // Detached, as in `ServiceProcess::drop`: an owner that never exits
+        // fails the deadline without holding up the runtime's shutdown.
+        std::thread::spawn(move || {
+            let _ = sender.send(child.wait());
+        });
+        let status = tokio::time::timeout(deadline, receiver)
+            .await
+            .context("fixture memory owner did not exit after retirement")?
+            .context("fixture memory owner exit waiter ended")??;
+        ensure!(
+            status.success(),
+            "fixture memory owner exited unsuccessfully"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -1243,6 +1274,10 @@ pub(crate) struct ServeKnobs {
     pub(crate) close_pause: Option<Arc<ClosePause>>,
     #[cfg(test)]
     pub(crate) dispatch_pause: Option<Arc<rpc::DispatchPause>>,
+    /// A test's own open timeline, written at close in place of the process
+    /// timeline, which a test runner never installs.
+    #[cfg(test)]
+    pub(crate) timeline: Option<Arc<crate::open_timeline::Timeline>>,
 }
 
 #[cfg(test)]
@@ -1257,6 +1292,7 @@ impl ServeKnobs {
             observer: None,
             close_pause: None,
             dispatch_pause: None,
+            timeline: None,
         }
     }
 
@@ -1375,16 +1411,19 @@ impl ServiceOwner {
         )?
         .context("project already has a memory service owner; wait for its validated endpoint")?;
         lock.verify()?;
+        open_timeline::stamp(open_timeline::Event::OwnerLock);
         // On failure the store open retires its own record before returning,
         // while this owner lock is still held.
         let (store, activity) = activity::open_owner_store(options.clone(), hooks).await?;
         let prepared = async {
             let (listener, address) =
                 ServiceListener::bind(&options.data_dir, &options.project_scope)?;
+            open_timeline::stamp(open_timeline::Event::ListenerBound);
             let record =
                 EndpointRecord::for_store(project_path, &options.project_scope, &store, address)
                     .await?;
             record.publish(&options.data_dir, &lock)?;
+            open_timeline::stamp(open_timeline::Event::EndpointPublished);
             Ok::<_, anyhow::Error>((listener, record))
         }
         .await;
@@ -1447,6 +1486,8 @@ impl ServiceOwner {
             close_pause: None,
             #[cfg(test)]
             dispatch_pause: None,
+            #[cfg(test)]
+            timeline: None,
         }
     }
 
@@ -1467,7 +1508,9 @@ impl ServiceOwner {
     async fn serve_knobs(mut self, knobs: ServeKnobs) -> Result<()> {
         let served = self.serve_until_retired(&knobs).await;
         #[cfg(test)]
-        let closed = self.close_paused(knobs.close_pause.as_deref()).await;
+        let closed = self
+            .close_paused(knobs.close_pause.as_deref(), knobs.timeline.as_deref())
+            .await;
         #[cfg(not(test))]
         let closed = self.close_paused().await;
         served.and(closed)
@@ -1627,13 +1670,17 @@ impl ServiceOwner {
     /// existing lifecycle authority.
     pub async fn close(self) -> Result<()> {
         #[cfg(test)]
-        let closed = self.close_paused(None).await;
+        let closed = self.close_paused(None, None).await;
         #[cfg(not(test))]
         let closed = self.close_paused().await;
         closed
     }
 
-    async fn close_paused(self, #[cfg(test)] pause: Option<&ClosePause>) -> Result<()> {
+    async fn close_paused(
+        self,
+        #[cfg(test)] pause: Option<&ClosePause>,
+        #[cfg(test)] timeline: Option<&crate::open_timeline::Timeline>,
+    ) -> Result<()> {
         let Self {
             lock,
             store,
@@ -1662,6 +1709,20 @@ impl ServiceOwner {
         #[cfg(test)]
         ClosePause::reached(pause, ClosePoint::AfterReap).await;
         let released = lock.release();
+        // Diagnostics only, after the release a successor's wait ends at: the
+        // name is this generation's own, and nothing here can fail, lengthen
+        // or reorder this close or a successor's open.
+        #[cfg(test)]
+        let timeline = timeline.or(open_timeline::installed());
+        #[cfg(not(test))]
+        let timeline = open_timeline::installed();
+        if let Some(timeline) = timeline
+            && let Ok(directory) =
+                EndpointRecord::directory(&data_dir, &record.authority.project_scope)
+        {
+            let _ =
+                open_timeline::write(timeline, &directory, &record.authority.service_generation);
+        }
         retired.and(closed).and(released)
     }
 }
@@ -2611,6 +2672,9 @@ pub fn is_peer_closed(error: &anyhow::Error) -> bool {
             )
         })
 }
+
+#[cfg(test)]
+mod open_timeline_tests;
 
 #[cfg(test)]
 mod tests {
