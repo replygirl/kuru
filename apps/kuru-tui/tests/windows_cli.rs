@@ -1,5 +1,8 @@
 #![cfg(windows)]
 
+#[path = "../../../packages/kuru-delivery/tests/support/stock_powershell.rs"]
+mod stock_powershell;
+
 use base64::Engine;
 use kuru_delivery::command::BlockingCommand as Command;
 use kuru_platform::fs::regular_file_info;
@@ -722,15 +725,19 @@ async fn pe_inspection_uses_native_paths_and_real_msvc_imports() {
     )
     .unwrap();
     let launcher = root.path().join("inspect-pe.ps1");
+    // The support script's first command (`Resolve-Path`) is a Management
+    // cmdlet; import before it so a cold profile cannot park in discovery.
     fs::write(
         &launcher,
-        r#"$ErrorActionPreference = 'Stop'
+        stock_powershell::with_module_prelude(
+            r#"$ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'expected stock PowerShell 5.1' }
 # Native Rust fixture output and exact Unicode result assertions use UTF-8.
 # Keep this ASCII script independent of Windows PowerShell's source encoding.
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 & $env:KURU_PE_SCRIPT -Binary $env:KURU_PE_INPUT
 "#,
+        ),
     )
     .unwrap();
     let powershell = kuru_platform::windows::process::system_directory()
@@ -1094,9 +1101,14 @@ fn source_entrypoint_fixture(root: &Path) -> Command {
     let entrypoint = scripts.join("install.ps1");
     fs::write(&entrypoint, include_bytes!("../../../scripts/install.ps1")).unwrap();
     let probe = root.join("source-entrypoint-probe.ps1");
+    // The probe's own `ConvertTo-Json` and `Write-Output` are Utility
+    // cmdlets; import before any statement so a cold profile cannot park in
+    // discovery. The entrypoint's own imports are proven by the
+    // autoload-refusal probe below, which deliberately has no prelude.
     fs::write(
         &probe,
-        traced_probe(
+        // Prelude first, then the lookup hooks, then the probe body.
+        stock_powershell::with_module_prelude(&traced_probe(
             r#"$ErrorActionPreference = 'Stop'
 # trace: probe-entered
 function Snapshot {
@@ -1132,7 +1144,7 @@ if ($null -ne $failure) {
 }
 # trace: probe-completed
 "#,
-        ),
+        )),
     )
     .unwrap();
     let mut child = command(root, &stock_powershell());

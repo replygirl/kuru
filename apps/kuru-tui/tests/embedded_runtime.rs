@@ -2,6 +2,9 @@
 //! and removes PATH tools; it does not install an OS egress firewall. Runtime
 //! download removal is also checked in the owning memory package/source review.
 
+#[cfg(windows)]
+#[path = "../../../packages/kuru-delivery/tests/support/stock_powershell.rs"]
+mod stock_powershell;
 #[path = "support/update_profiles.rs"]
 mod update_profiles;
 
@@ -1316,7 +1319,10 @@ async fn verify_installed_powershell_activation(root: &Path, installed: &Path) -
         )
         .env("KURU_INSTALLED", installed)
         .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-        .arg(
+        // `Out-String` and `Invoke-Expression` are Utility cmdlets; this cold
+        // isolated profile imports them before its first statement instead of
+        // parking in module discovery inside the step's bound.
+        .arg(stock_powershell::with_module_prelude(
             "$ErrorActionPreference = 'Stop'; \
              $script = & $env:KURU_INSTALLED completions powershell | Out-String; \
              if ($LASTEXITCODE -ne 0) { throw 'installed completion generator failed' }; \
@@ -1325,7 +1331,7 @@ async fn verify_installed_powershell_activation(root: &Path, installed: &Path) -
              if (@($found | Where-Object { $_.CompletionText -eq 'memory' }).Count -ne 1) \
              { throw 'installed PowerShell completion was not registered' }; \
              [Console]::Out.WriteLine('installed PowerShell completion registered')",
-        );
+        ));
     if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
         command.env("LLVM_PROFILE_FILE", profile);
     }
