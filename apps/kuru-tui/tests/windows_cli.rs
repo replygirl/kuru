@@ -1050,3 +1050,79 @@ fn source_install_entrypoint_rejects_release_options_before_mise_or_environment_
         "Source installation does not accept release-selection or recovery options."
     );
 }
+
+/// Copies the unmodified public entrypoint into an isolated checkout layout
+/// whose `tools/mise.exe` is the CLI fixture, returning the entrypoint path.
+fn source_entrypoint_checkout(root: &Path) -> std::path::PathBuf {
+    let tools = root.join("tools");
+    let scripts = root.join("checkout & spaced 日本語").join("scripts");
+    fs::create_dir(&tools).unwrap();
+    fs::create_dir_all(&scripts).unwrap();
+    fs::copy(
+        env!("CARGO_BIN_EXE_kuru-cli-windows-fixture"),
+        tools.join("mise.exe"),
+    )
+    .unwrap();
+    let entrypoint = scripts.join("install.ps1");
+    fs::write(&entrypoint, include_bytes!("../../../scripts/install.ps1")).unwrap();
+    entrypoint
+}
+
+#[test]
+fn source_install_entrypoint_supplies_its_stock_commands_without_module_auto_discovery() {
+    // The fixture's fresh LOCALAPPDATA gives stock PowerShell a cold
+    // module-analysis cache, as on a new profile. With autoloading disabled,
+    // any entrypoint command reached through auto-discovery is refused
+    // (command-not-found) instead of scanning the module path, so this fails
+    // deterministically, without a deadline, unless the entrypoint's exact
+    // PSHOME imports supply its stock commands.
+    let root = tempfile::tempdir().unwrap();
+    let entrypoint = source_entrypoint_checkout(root.path());
+    let probe = root.path().join("source-entrypoint-autoload-probe.ps1");
+    fs::write(
+        &probe,
+        r#"$ErrorActionPreference = 'Stop'
+$PSModuleAutoLoadingPreference = 'None'
+& $env:KURU_ENTRYPOINT_SCRIPT -Source -InstallDir $env:KURU_ENTRYPOINT_INSTALL
+foreach ($name in @('Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility')) {
+    $expected = [IO.Path]::Combine($PSHOME, 'Modules', $name, "$name.psd1")
+    $loaded = @(Microsoft.PowerShell.Core\Get-Module -Name $name)
+    if ($loaded.Count -ne 1 -or -not [String]::Equals($loaded[0].Path, $expected, [StringComparison]::OrdinalIgnoreCase)) { throw "source entrypoint did not load the exact PSHOME $name manifest" }
+}
+"#,
+    )
+    .unwrap();
+    let powershell = kuru_platform::windows::process::system_directory()
+        .unwrap()
+        .join("WindowsPowerShell/v1.0/powershell.exe");
+    let mut child = command(root.path(), &powershell);
+    child
+        .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+        .env("KURU_ENTRYPOINT_SCRIPT", &entrypoint)
+        .env("KURU_ENTRYPOINT_INSTALL", ".\\installed & 日本語")
+        .env(
+            "KURU_CLI_FIXTURE_SETUP_LOG",
+            root.path().join("setup.jsonl"),
+        )
+        .env("KURU_CLI_FIXTURE_SETUP_EXIT", "0")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&probe);
+    let output = launch(
+        &mut child,
+        "step: source-install entrypoint with module autoloading disabled",
+    );
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{diagnostic}");
+    let calls = fs::read_to_string(root.path().join("setup.jsonl")).expect(&diagnostic);
+    assert_eq!(calls.lines().count(), 1, "{diagnostic}");
+}
