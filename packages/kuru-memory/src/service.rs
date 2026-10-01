@@ -7480,6 +7480,8 @@ mod tests {
             drop(attach_raw(&data, &scope, None).await?);
             pause.entered.notified().await;
 
+            // Only Unix polls it before the listener drop.
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut requested = Box::pin(request_idle_retirement(&options));
             // On Unix one poll queues the connect on the listener that no
             // longer accepts and parks on its write readiness.
@@ -7579,6 +7581,8 @@ mod tests {
             drop(attach_raw(&data, &scope, None).await?);
             pause.entered.notified().await;
 
+            // Only Unix polls it before the listener drop.
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut attaching = Box::pin(try_attach_observed(&data, &scope, &project, None));
             #[cfg(unix)]
             ensure!(
