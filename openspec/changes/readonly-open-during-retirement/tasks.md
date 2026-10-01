@@ -17,7 +17,7 @@
 
 ## 3b. Connect-reset mapping
 
-- [x] 3.2 Map a peer-closed connect error in `request_idle_retirement` (to `None`) and `try_attach_observed` (to `AttachMiss::PeerClosed`); count peer-closed apart from unanswered in `MaintenanceTrace` and name the counts in the owner-still-active error; leave the close order, deadlines and `is_transport_unavailable` unchanged, and verify tests 1.2
+- [x] 3.2 Map a peer-closed connect error in `request_idle_retirement` (to `RetirementReply::PeerClosed`) and `try_attach_observed` (to `AttachMiss::PeerClosed`); count peer-closed apart from unanswered in `MaintenanceTrace` and name the trace in both maintenance deadline errors (owner still active, owner-response deadline); leave the close order, deadlines and `is_transport_unavailable` unchanged, and verify tests 1.2
 
 ## 4. Gates
 
