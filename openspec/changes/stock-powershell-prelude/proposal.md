@@ -29,8 +29,16 @@ activation step did on PR #158 (run 36888874521, job 110459524521).
 - `packages/kuru-delivery/tests/bootstrap_windows.rs`: the architecture probe
   that calls `Write-Output` before the bootstrap starts with the prelude.
 - Launches that deliberately exercise module discovery or module-path
-  reconstruction, timeouts, product launches and installer-first scripts stay
-  unchanged.
+  reconstruction, timeouts, product launches and scripts that run the current
+  installer before any non-Core command stay unchanged.
+- Not covered: `bootstrap_windows.rs`
+  `retained_v041_v042_powershell_reader_accepts_the_new_three_member_core`
+  launches the retained, SHA-pinned v0.4.2 reader with `-File` as shipped; its
+  first non-Core command (`Write-Verbose`) precedes any import, and it stalled
+  in this family on PR #161 (run 36890439278, job 110464840194). A prelude
+  would require wrapping it in `-EncodedCommand` with `& $reader`, changing the
+  launch form and exit-code path of a compatibility acceptance test in a way
+  only Windows CI can verify; that is left as a separate decision.
 
 No deadline, retry or sleep changes. Shipped code is unchanged.
 
