@@ -2,18 +2,18 @@
 
 ## 1. Row validator and trailer
 
-- [ ] 1.1 Factor `validate_owned_row(key: &[u8], value: &str)` out of the scan loop (keep the `session-index/` before `session/` order), call it from the scan and from `put_state_tx` before the `INSERT`, and verify with the existing WP0 refusal tests unchanged plus the same-function test (T14)
-- [ ] 1.2 Add `VALIDATOR`, the trailer encoder and the strict parser, the golden corpus beside the constant, and the module-doc invariants (row-locality, same function, no other writer), and verify with the parser and corpus tests (T17, T18)
+- [x] 1.1 Factor `validate_owned_row(key: &[u8], value: &str)` out of the scan loop (keep the `session-index/` before `session/` order), call it from the scan and from `put_state_tx` before the `INSERT`, and verify with the existing WP0 refusal tests unchanged plus the same-function test (T14)
+- [x] 1.2 Add `VALIDATOR`, the trailer encoder and the strict parser, the golden corpus beside the constant, and the module-doc invariants (row-locality, same function, no other writer), and verify with the parser and corpus tests (T17, T18)
 
 ## 2. Writes
 
-- [ ] 2.1 Add `Shared.usage_validated` (both constructions), read `DOLT_HASHOF_TABLE('state')` before any read in `apply_change`, refuse with the typed error and clear the hash on inequality, append the trailer from the hash read after the last put, and set the hash only after `COMMIT`; verify with T12 and the adapted `uncertain_committed_receipt_reconciles_without_replaying_usage`
-- [ ] 2.2 Add `Receipt::UsageOperation` and `Receipt::UsageValidation` with their `resolve_uncertain` arms and the post-settle re-derivation from HEAD's trailer, and verify with T13 (committed and not-committed, for a write and for the record commit)
+- [x] 2.1 Add `Shared.usage_validated` (both constructions), read `DOLT_HASHOF_TABLE('state')` before any read in `apply_change`, refuse with the typed error and clear the hash on inequality, append the trailer from the hash read after the last put, and set the hash only after `COMMIT`; verify with T12 and the adapted `uncertain_committed_receipt_reconciles_without_replaying_usage`
+- [x] 2.2 Add `Receipt::UsageOperation` and `Receipt::UsageValidation` with their `resolve_uncertain` arms and the post-settle re-derivation from HEAD's trailer, and verify with T13 (committed and not-committed, for a write and for the record commit)
 
 ## 3. Open
 
-- [ ] 3.1 Implement `bound_validation` and the new `establish` order (bound check or full scan, `upgrade_usage`, `validate_usage`, D hash re-read, flat checks, record commit when an owned row exists and HEAD lacks the record, set the hash, publish), keeping each timeline stamp exactly once and `usage_rows(0)` on Bound; verify with T9, T10, T11, T15, T16, T20 and T19 unchanged
-- [ ] 3.2 Confirm the tests that pin an empty ledger writes nothing (`creation_template/open_tests.rs`, `template_stage_tests.rs`, `engine_contract_tests.rs`) and WP0's `plant` tests stay green unchanged, and verify by running them
+- [x] 3.1 Implement `bound_validation` and the new `establish` order (bound check or full scan, `upgrade_usage`, `validate_usage`, D hash re-read, flat checks, record commit when an owned row exists and HEAD lacks the record, set the hash, publish), keeping each timeline stamp exactly once and `usage_rows(0)` on Bound; verify with T9, T10, T11, T15, T16, T20 and T19 unchanged
+- [x] 3.2 Confirm the tests that pin an empty ledger writes nothing (`creation_template/open_tests.rs`, `template_stage_tests.rs`, `engine_contract_tests.rs`) and WP0's `plant` tests stay green unchanged, and verify by running them
 
 ## 4. CI
 
