@@ -142,6 +142,21 @@ description = "Run the previous published release's own updater against this tre
 # download or a Kuru child. Needs outbound HTTPS to api.github.com and github.com.
 run = "cargo test -p kuru-delivery --features tooling --locked --test previous_release_update previous_published_release_updates_to_this_tree -- --ignored --exact --nocapture --test-threads=1"
 
+[tasks."measure:open-time"]
+description = "Report-only open-time measurement of a release kuru executable, from outside the binary"
+# Inputs: KURU_OPEN_TIME_BINARY (required) is the release-profile kuru to
+# measure and KURU_OPEN_TIME_OUTPUT (required) receives records.jsonl and
+# summary.md. KURU_OPEN_TIME_SCRATCH (parent of the private scratch root),
+# KURU_OPEN_TIME_ITERATIONS (default 10), KURU_OPEN_TIME_LABEL,
+# KURU_OPEN_TIME_INTERVAL_MS (sampling period, default 20),
+# KURU_OPEN_TIME_FILES (on, or off for the processes-only control) and
+# KURU_OPEN_TIME_RETIRE_WAIT (on, or off for the ramp series) are optional;
+# GITHUB_STEP_SUMMARY, when set, also receives the summary. Offline demo
+# conversations only: no network, login or credential store. Measured times are
+# never compared with a budget; only an infrastructure failure exits non-zero.
+dir = "{{config_root}}/../.."
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- open-time"
+
 [tasks."verify:published-windows"]
 description = "Verify the exact published Windows release through ordinary mise"
 # Inputs: RELEASE_VERSION, RELEASE_SHA, RELEASE_RUN_URL and
