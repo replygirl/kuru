@@ -10125,10 +10125,11 @@ mod tests {
     #[tokio::test]
     async fn observed_open_of_a_new_project_reports_creation_once() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().to_owned(),
             format!("project/{}", "1".repeat(64)),
-        )?;
+        )
+        .await?;
         let (store, stages) = open_collecting(options).await;
         store?.close().await?;
         assert_eq!(count(&stages, MemoryOpenStage::CreatingDatabase), 1);
@@ -10155,10 +10156,11 @@ mod tests {
     async fn observed_reopen_of_a_current_store_reports_neither_creation_nor_upgrade() -> Result<()>
     {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().to_owned(),
             format!("project/{}", "2".repeat(64)),
-        )?;
+        )
+        .await?;
         MemoryStore::open(options.clone()).await?.close().await?;
         let (store, stages) = open_collecting(options).await;
         store?.close().await?;
@@ -10198,10 +10200,11 @@ mod tests {
     #[tokio::test]
     async fn observed_open_of_a_released_store_reports_its_upgrade_once() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().to_owned(),
             format!("project/{}", "4".repeat(64)),
-        )?;
+        )
+        .await?;
         released_v1(&options).await?;
         let (store, stages) = open_collecting(options).await;
         store?.close().await?;
@@ -10259,10 +10262,11 @@ mod tests {
     #[tokio::test]
     async fn observed_open_reports_the_ownership_wait_only_while_the_lock_is_held() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().to_owned(),
             format!("project/{}", "6".repeat(64)),
-        )?;
+        )
+        .await?;
         let held = hold_startup_lock(&options)?;
         let (mut progress, opening) = MemoryStore::open_observed(options);
         let mut opening = Box::pin(opening);
