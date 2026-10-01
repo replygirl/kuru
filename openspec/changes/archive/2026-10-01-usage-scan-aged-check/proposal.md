@@ -27,9 +27,11 @@ grows faster than linear or passes an absolute ceiling.
   the evaluation of the provisional bounds. `src/main.rs` adds the
   `usage-scan-fixture` and `measure-usage-scan` subcommands. `test_support.rs`
   declares the module.
-- Visibility only, no behaviour: `store::migrations::{CURRENT_VERSION,
-  USAGE_CURRENT_VERSION}` and `EndpointRecord::directory` become `pub(crate)`,
-  and `aged_store::REPORT_FORMAT_VERSION` becomes `pub`, so the key and the
+- Visibility only, no behaviour: `store::SCHEMA_VERSIONS` (a test-support,
+  Unix-only `pub(crate)` pair re-exporting `migrations::CURRENT_VERSION` and
+  `USAGE_CURRENT_VERSION`, which stay `pub(super)`) is added,
+  `EndpointRecord::directory` becomes `pub(crate)`, and
+  `aged_store::REPORT_FORMAT_VERSION` becomes `pub`, so the key and the
   driver read the real values instead of copies.
 - `packages/kuru-memory/mise.toml`: `measure:age-store` gains
   `--profile <profile>` (default `dev`). The new tasks are
