@@ -83,6 +83,42 @@ guards that make the new start counts observable and regression-tested.
   eligibility cases above) rather than attempting a second template copy or
   build inside the same open.
 
+- **Failure mapping in the creation worker.** `creation_template::create_in`
+  already carries the discriminant (`CreationFailure::{TemplateVerdict, Engine,
+  Io}`); the worker maps it without a second classification:
+  `Unavailable` (busy or lock error), `TemplateVerdict` and `Io` go cold in a
+  new stage, after preserving any copy remnant (Class R) and removing an empty
+  stage; `Engine` (only the template build's engine, SQL or capture can
+  produce it) returns its error. A shape verdict on the *build* engine is
+  classified `TemplateVerdict` with nothing published, so it also goes cold:
+  the cold path never runs the shared shape check, so the user's open
+  succeeds, and the next new project tries the build again. Rejected:
+  returning that error, which would turn a build-side check bug into a
+  new-project failure on every machine.
+
+- **The copy runs on a blocking thread that holds the key lock.** `create_in`
+  hands each copy, with the key lock, to `spawn_blocking` through a second
+  handle on the stage bound to the stage's identity, and gets the lock back
+  with the result; the creation worker's task owns the startup lock. Test
+  hooks are task-local, so the worker and the copy re-enter the caller's hooks
+  explicitly.
+
+- **A failure of the copied stage's own engine start leaves the stage where it
+  is.** Adoption runs in the start's bootstrap, so the startup lock was the
+  failing server's reap guard and is released after the reap; the worker does
+  not move the stage without it. The next open's recovery preserves it as
+  Class U without an engine start, as the adoption requirement already says. A
+  failure after the start (validation, shape, `ready.json`) is preserved by
+  the staging job itself under the returned lock. A verdict in either case
+  quarantines the judged template through `quarantine_after_adoption`, which
+  takes the key's exclusive lock without waiting and needs no startup lock.
+
+- **Fixture budgets keep four starts per fresh open.** `fresh_open_budget_of`
+  budgets each path (`FreshOpen::{Template, FirstProject, Cold}`), but the
+  default fresh-open budget and `fixture_deadline` keep the cold build's four
+  starts: an open can still fall back to it until restart removal makes the
+  cold path two starts. No deadline changes.
+
 ## Risks / Trade-offs
 
 - **[Risk] The selector regresses an existing project's open path** by

@@ -1581,13 +1581,6 @@ pub(crate) fn stage_template_key(directory: &Path) -> Result<Option<String>> {
 /// the store template `template`: a new instance, new secrets, the project's
 /// own scope and `initialized: false`, so the stage's first engine start
 /// adopts the copy. It must be the last file written into the stage.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no open creates a template stage until the template cache lands"
-    )
-)]
 pub(crate) fn write_template_stage_identity(
     directory: &Path,
     project_scope: &str,
@@ -1614,13 +1607,6 @@ pub(crate) fn write_template_stage_identity(
 /// placeholder instance and scope, new secrets and the template key, so its
 /// first engine start writes the placeholder identity row instead of a
 /// project's. Opened with [`TEMPLATE_SCOPE`] as its project scope.
-#[cfg_attr(
-    not(any(test, feature = "test-support")),
-    expect(
-        dead_code,
-        reason = "only test-fixture warm-up builds a store template until creation uses it"
-    )
-)]
 pub(crate) fn write_template_build_identity(directory: &Path, template: &str) -> Result<()> {
     let identity = Identity {
         version: 1,
@@ -1643,13 +1629,6 @@ pub(crate) fn write_template_build_identity(directory: &Path, template: &str) ->
 /// that refuses to publish a captured `data/` holding either. Only a build
 /// identity (the template instance and scope, uninitialized or initialized
 /// by its own build) is read; any other record is refused.
-#[cfg_attr(
-    not(any(test, feature = "test-support")),
-    expect(
-        dead_code,
-        reason = "only test-fixture warm-up builds a store template until creation uses it"
-    )
-)]
 pub(crate) fn template_build_secrets(directory: &Path) -> Result<[String; 2]> {
     let identity = read_record::<Identity>(&directory.join("identity.json"))?
         .context("memory template build identity is missing")?;

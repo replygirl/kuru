@@ -112,6 +112,13 @@ const SWEEP_QUIESCENCE: Duration = Duration::from_millis(10);
 const PUBLISH_RETRY_LIMIT: Duration = Duration::from_secs(2);
 const PUBLISH_RETRY_SPACING: Duration = Duration::from_millis(20);
 /// How often a waiting warm-up retries a busy key lock.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    expect(
+        dead_code,
+        reason = "only test-fixture warm-up and prefetch wait for or ensure a template; an open uses create_in"
+    )
+)]
 const LOCK_POLL: Duration = Duration::from_millis(25);
 /// The shortest host name the byte scan looks for: shorter names occur by
 /// chance in compressed chunks and would refuse sound builds.
@@ -950,6 +957,13 @@ pub(crate) struct Swept {
 }
 
 /// An abandoned entry a sweep left for a later holder, and why.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "only the template cache's own tests read a build's report"
+    )
+)]
 #[derive(Debug)]
 pub(crate) struct SweepLeft {
     pub(crate) name: String,
@@ -957,6 +971,13 @@ pub(crate) struct SweepLeft {
 }
 
 /// What one build did.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "only the template cache's own tests read a build's report"
+    )
+)]
 #[derive(Debug)]
 pub(crate) struct BuildReport {
     pub(crate) swept: Swept,
@@ -1424,6 +1445,13 @@ fn remove_rejected(root: &Directory, key: &str) {
 // --- Entry points -------------------------------------------------------------------------
 
 /// How long a key-lock holder may be waited for.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    expect(
+        dead_code,
+        reason = "only test-fixture warm-up and prefetch wait for or ensure a template; an open uses create_in"
+    )
+)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Wait {
     /// Product openers: a busy lock means no template now.
@@ -1442,6 +1470,13 @@ pub(crate) enum Unavailable {
 }
 
 /// What [`ensure_in`] found or did.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    expect(
+        dead_code,
+        reason = "only test-fixture warm-up and prefetch wait for or ensure a template; an open uses create_in"
+    )
+)]
 #[derive(Debug)]
 pub(crate) enum Ensured {
     /// A structurally valid template was already published.
@@ -1474,6 +1509,13 @@ fn lock_unavailable<T>(
 }
 
 /// Whether a busy key lock ends the call ([`Wait::Never`]) or is polled.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    expect(
+        dead_code,
+        reason = "only test-fixture warm-up and prefetch wait for or ensure a template; an open uses create_in"
+    )
+)]
 async fn busy(wait: Wait, root: &Directory, key: &str) -> Result<bool, CreationFailure> {
     match wait {
         Wait::Never => Ok(true),
@@ -1501,6 +1543,13 @@ async fn busy(wait: Wait, root: &Directory, key: &str) -> Result<bool, CreationF
 /// rebuild on top of a damaged template; with [`Wait::Until`] (warm-up and
 /// prefetch) the quarantine is followed by a rebuild. A product opener uses
 /// [`create_in`], which never rebuilds after a verdict either.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    expect(
+        dead_code,
+        reason = "only test-fixture warm-up and prefetch wait for or ensure a template; an open uses create_in"
+    )
+)]
 pub(crate) async fn ensure_in(
     root: &Path,
     engine: &Engine,
@@ -1579,10 +1628,67 @@ pub(crate) async fn ensure_in(
 /// How [`create_in`] ended.
 #[derive(Debug)]
 pub(crate) enum Created {
-    /// The stage holds a verified copy of this key's template.
-    Copied { built: bool, published: bool },
+    /// The stage holds a verified copy of this key's template. `judged` is
+    /// the identity of the published template it was copied from, which a
+    /// later verdict on the copy's own engine quarantines
+    /// ([`quarantine_after_adoption`]); `None` when the copy came from a
+    /// build's verified but unpublished stage.
+    Copied {
+        built: bool,
+        published: bool,
+        judged: Option<FileIdentity>,
+    },
     /// No template now; the caller creates the store cold.
     Unavailable(Unavailable),
+}
+
+/// [`copy_into`] on a blocking thread, which also holds the key lock `lock`
+/// for as long as the copy writes: a cancelled caller cannot release the
+/// lock under a copy in flight. The lock comes back with the outcome; a copy
+/// that panicked returns none, and its lock was released as the copy
+/// unwound. The thread writes through its own handle on `stage`, opened
+/// again and bound to `stage`'s identity.
+async fn copy_blocking(
+    judged: Judged,
+    stage: &Directory,
+    lock: File,
+) -> (Option<File>, Result<(), CreationFailure>) {
+    let destination = match files::directory(stage.path()) {
+        Ok(destination) if destination.identity() == stage.identity() => destination,
+        Ok(_) => {
+            return (
+                Some(lock),
+                Err(CreationFailure::Io(anyhow!(
+                    "the store stage {} was replaced before its template copy",
+                    stage.path().display()
+                ))),
+            );
+        }
+        Err(error) => return (Some(lock), Err(CreationFailure::Io(error))),
+    };
+    #[cfg(test)]
+    let scoped = hooks::captured();
+    let copied = tokio::task::spawn_blocking(move || {
+        let copy = || copy_into(&judged, &destination);
+        #[cfg(test)]
+        let outcome = match scoped {
+            Some(scoped) => hooks::HOOKS.sync_scope(scoped, copy),
+            None => copy(),
+        };
+        #[cfg(not(test))]
+        let outcome = copy();
+        (lock, outcome)
+    })
+    .await;
+    match copied {
+        Ok((lock, outcome)) => (Some(lock), outcome),
+        Err(error) => (
+            None,
+            Err(CreationFailure::Io(anyhow!(
+                "the store template copy stopped: {error}"
+            ))),
+        ),
+    }
 }
 
 /// Copy this build's template into `stage/data`, building it first when
@@ -1590,7 +1696,8 @@ pub(crate) enum Created {
 /// a lock. A verdict against a published template quarantines that template
 /// (identity-bound, best-effort) and is returned; every other failure is
 /// returned and leaves every template untouched. On any failure the partial
-/// copy stays in `stage` for the caller to preserve.
+/// copy stays in `stage` for the caller to preserve. Each copy runs on a
+/// blocking thread that holds the key lock until it returns.
 pub(crate) async fn create_in(
     root: &Path,
     engine: &Engine,
@@ -1615,15 +1722,17 @@ pub(crate) async fn create_in(
             match judged {
                 None => drop(shared),
                 Some(Ok(judged)) => {
-                    let copied = copy_into(&judged, stage);
+                    let identity = judged.identity;
+                    let (shared, copied) = copy_blocking(judged, stage, shared).await;
                     drop(shared);
                     return match copied {
                         Ok(()) => Ok(Created::Copied {
                             built: false,
                             published: true,
+                            judged: Some(identity),
                         }),
                         Err(failure) => {
-                            condemn(root, key, Some(judged.identity), &failure, stage).await;
+                            condemn(root, key, Some(identity), &failure, stage).await;
                             Err(failure)
                         }
                     };
@@ -1643,18 +1752,24 @@ pub(crate) async fn create_in(
     };
     match inspect(root, key)? {
         Inspection::Valid(judged) => {
-            let copied = copy_into(&judged, stage);
+            let identity = judged.identity;
+            let (lock, copied) = copy_blocking(judged, stage, lock).await;
             if let Err(failure) = &copied
                 && failure.is_verdict()
             {
-                let moved = quarantine_held(root, key, judged.identity);
-                account(root.path(), stage.path(), &moved);
-                sweep_held(root, key).await;
+                // A copy that stopped without its lock leaves the quarantine
+                // to the next copier, which judges the template again.
+                if lock.is_some() {
+                    let moved = quarantine_held(root, key, identity);
+                    account(root.path(), stage.path(), &moved);
+                    sweep_held(root, key).await;
+                }
             }
             drop(lock);
             copied.map(|()| Created::Copied {
                 built: false,
                 published: true,
+                judged: Some(identity),
             })
         }
         Inspection::Condemned { identity, failure } => {
@@ -1677,11 +1792,13 @@ pub(crate) async fn create_in(
                 }
                 // Copied from the published template, or from the verified
                 // stage when publication failed; the chain is paid once.
-                let copied = copy_into(&template, stage);
+                let judged = report.published.then_some(template.identity);
+                let (lock, copied) = copy_blocking(template, stage, lock).await;
                 drop(lock);
                 copied.map(|()| Created::Copied {
                     built: true,
                     published: report.published,
+                    judged,
                 })
             }
             Err((lock, failure)) => {
@@ -1711,6 +1828,25 @@ async fn condemn(
     account(root.path(), stage.path(), &moved);
 }
 
+/// After a verdict on a copy's own engine (its adoption or the template
+/// shape): quarantine the published template the copy came from, bound to
+/// the identity it had when it was judged, holding no key lock until then.
+/// Best-effort, like every quarantine: it never fails the caller, whose own
+/// error stands.
+pub(crate) async fn quarantine_after_adoption(
+    root: &Path,
+    judged: FileIdentity,
+    stage: &Path,
+) -> Quarantine {
+    let directory = match open_root(root) {
+        Ok(directory) => directory,
+        Err(error) => return skipped(format!("{error:#}")),
+    };
+    let moved = quarantine(&directory, compiled_key(), judged).await;
+    account(directory.path(), stage, &moved);
+    moved
+}
+
 /// Test support: record a quarantine under the shared test root against the
 /// fixture whose creation caused it.
 fn account(root: &Path, stage: &Path, moved: &Quarantine) {
@@ -1735,3 +1871,6 @@ pub(crate) mod hooks;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod open_tests;

@@ -44,13 +44,17 @@ pub(crate) struct Pause {
     pub(crate) resume: tokio::sync::Notify,
 }
 
-/// An ordered observation of the capture.
+/// An ordered observation of the capture, or of a project's creation from
+/// the template.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Event {
     /// A file or directory was synced.
     Synced(PathBuf),
     /// The capture's manifest was written and synced.
     Manifest,
+    /// A template stage's identity record is about to be written into this
+    /// stage, after its copy.
+    Identity(PathBuf),
 }
 
 #[derive(Clone, Default)]
@@ -62,6 +66,10 @@ pub(crate) struct Hooks {
     pub(crate) before_quarantine: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Statements run on the build engine's `main` before the shape check.
     pub(crate) before_shape: Vec<String>,
+    /// Statements run on the build engine's `main` after the shape check
+    /// passed: a published template whose bytes a copy's own shape check
+    /// then refuses.
+    pub(crate) after_shape: Vec<String>,
     pub(crate) pause: Option<Arc<Pause>>,
     pub(crate) events: Option<Arc<StdMutex<Vec<Event>>>>,
     /// After the build engine is reaped and before the capture: write the
@@ -80,6 +88,22 @@ tokio::task_local! {
 
 fn current() -> Option<Hooks> {
     HOOKS.try_with(Clone::clone).ok()
+}
+
+/// The hooks scoped around the calling task, for work it hands to another
+/// task or a blocking thread, which re-enters them: task-local values do not
+/// cross `tokio::spawn` or `spawn_blocking`.
+pub(crate) fn captured() -> Option<Hooks> {
+    current()
+}
+
+pub(in crate::store) fn identity_written(stage: &Path) {
+    if let Some(events) = current().and_then(|hooks| hooks.events) {
+        events
+            .lock()
+            .expect("hook events")
+            .push(Event::Identity(stage.to_owned()));
+    }
 }
 
 pub(super) fn lock_fault(step: LockStep) -> Result<()> {
@@ -144,13 +168,8 @@ pub(super) fn manifest_written() {
     }
 }
 
-/// On the live build engine, before the shape check: run the scoped
-/// statements, then wait at the scoped pause.
-pub(in crate::store) async fn before_shape(main: &MySqlPool) -> Result<()> {
-    let Some(hooks) = current() else {
-        return Ok(());
-    };
-    for statement in &hooks.before_shape {
+async fn execute(main: &MySqlPool, statements: &[String]) -> Result<()> {
+    for statement in statements {
         tokio::time::timeout(
             QUERY_TIMEOUT,
             sqlx::query(sqlx::AssertSqlSafe(statement.clone())).execute(main),
@@ -158,9 +177,28 @@ pub(in crate::store) async fn before_shape(main: &MySqlPool) -> Result<()> {
         .await
         .context("injected build statement deadline exceeded")??;
     }
+    Ok(())
+}
+
+/// On the live build engine, before the shape check: run the scoped
+/// statements, then wait at the scoped pause.
+pub(in crate::store) async fn before_shape(main: &MySqlPool) -> Result<()> {
+    let Some(hooks) = current() else {
+        return Ok(());
+    };
+    execute(main, &hooks.before_shape).await?;
     if let Some(pause) = hooks.pause {
         pause.reached.notify_one();
         pause.resume.notified().await;
     }
     Ok(())
+}
+
+/// On the live build engine, after the shape check passed: run the scoped
+/// statements.
+pub(in crate::store) async fn after_shape(main: &MySqlPool) -> Result<()> {
+    match current() {
+        Some(hooks) => execute(main, &hooks.after_shape).await,
+        None => Ok(()),
+    }
 }

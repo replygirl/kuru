@@ -2373,13 +2373,6 @@ async fn publish(
 #[cfg(test)]
 mod main_pool_classification_tests;
 
-#[cfg_attr(
-    not(any(test, feature = "test-support")),
-    expect(
-        dead_code,
-        reason = "only test-fixture warm-up builds a store template until creation uses it"
-    )
-)]
 pub(super) mod template_shape;
 
 #[cfg(test)]
@@ -3588,11 +3581,15 @@ mod tests {
     #[tokio::test]
     async fn retained_v2_attempts_and_candidate_survive_test_v8_progression() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::warmed_open_options(
+        let mut options = crate::test_support::warmed_open_options(
             root.path().join("private"),
             format!("project/{}", "3".repeat(64)),
         )
         .await?;
+        // The test pools a retained attempt branch, which carries the store's
+        // own identity only in a cold store; a template copy's carry the
+        // placeholder.
+        options.creation = super::super::Creation::Cold;
         let store = super::super::MemoryStore::open(options.clone()).await?;
         store
             .append("conversation", "user", "written after the v2 upgrade")

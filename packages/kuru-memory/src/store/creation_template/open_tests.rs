@@ -1,0 +1,948 @@
+//! Ordinary opens that create their store from the store template (cospec
+//! change `memory-template-creation`): the path selector, the creation
+//! worker's engine starts, its cold fallbacks, the verdicts its stage engine
+//! reaches, and the fixture class guard on the shared template.
+//!
+//! Engine starts are counted per directory through the engine ledger
+//! (`Ledger::starts_under`): a stage and the active store it becomes share a
+//! key, and a build store under a private template root is counted there.
+//! Tests that need an empty, busy or damaged template pass a private root
+//! (`OpenOptions::template_root`), so the shared, warmed template other tests
+//! copy is never disturbed.
+use super::hooks::{Event, HOOKS, Hooks, LockStep, Pause, ReadFault};
+use super::tests::{
+    CHILD_OUTCOME, DEPTH, clone_shared, engine, ensure, entries_of, failure, hold, key,
+    largest_file, published, read_manifest, rejected, release, spawn_child, wait_child,
+    write_manifest,
+};
+use super::*;
+use crate::server::{TemplateVerdict, read_identity_view};
+use crate::test_support::{FreshOpen, TempDir, engine_ledger};
+
+fn fixture() -> Result<TempDir> {
+    Ok(TempDir::new("kuru-template-open-", None)?.with_depth_budget(DEPTH))
+}
+
+fn scope(digit: char) -> String {
+    format!("project/{}", digit.to_string().repeat(64))
+}
+
+/// Warmed fixture options for `scope` in `data`, creating from the private
+/// template root `root` when given and from the shared one otherwise.
+async fn options(data: PathBuf, scope: &str, root: Option<&Path>) -> Result<OpenOptions> {
+    let mut options = crate::test_support::warmed_open_options(data, scope.to_owned()).await?;
+    options.template_root = root.map(Path::to_owned);
+    Ok(options)
+}
+
+async fn open(options: OpenOptions) -> Result<MemoryStore> {
+    crate::test_support::spawn_gated_open(options).await
+}
+
+/// Engine starts this process made on store directories first started
+/// beneath `root`.
+fn starts_under(root: &Path) -> Result<u64> {
+    let canonical = fs::canonicalize(root)?;
+    Ok(engine_ledger::with(|ledger| {
+        ledger.starts_under(&canonical)
+    }))
+}
+
+fn active(options: &OpenOptions) -> Result<PathBuf> {
+    project_directory(&options.data_dir, &options.project_scope)
+}
+
+/// The template key the active store's identity record names.
+fn template_of(options: &OpenOptions) -> Result<Option<String>> {
+    Ok(read_identity_view(&active(options)?)?.template)
+}
+
+/// The entries the open preserved under its project's `interrupted/`.
+fn interrupted(options: &OpenOptions) -> Result<Vec<PathBuf>> {
+    let directory = active(options)?
+        .parent()
+        .context("store has no parent")?
+        .join("interrupted");
+    let mut entries = match fs::read_dir(&directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        entries => entries?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?,
+    };
+    entries.sort();
+    Ok(entries)
+}
+
+async fn count(store: &MemoryStore, query: &'static str) -> Result<u64> {
+    let count: i64 = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar(query).fetch_one(store.pool.as_ref()),
+    )
+    .await
+    .with_context(|| format!("{query}: deadline exceeded"))??;
+    Ok(u64::try_from(count)?)
+}
+
+/// The history lengths of `main` and the usage branch.
+async fn histories(store: &MemoryStore) -> Result<(u64, u64)> {
+    Ok((
+        count(store, "SELECT COUNT(*) FROM dolt_log").await?,
+        count(store, "SELECT COUNT(*) FROM `kuru/kuru_usage_v1`.dolt_log").await?,
+    ))
+}
+
+/// The commits of a template-born store's histories before its adoption
+/// commits: each carries the placeholder identity.
+async fn pre_adoption_commits(store: &MemoryStore) -> Result<BTreeSet<String>> {
+    let mut commits = BTreeSet::new();
+    for log in ["dolt_log", "`kuru/kuru_usage_v1`.dolt_log"] {
+        let found: Vec<String> = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT commit_hash FROM {log} WHERE commit_order < \
+                 (SELECT MIN(commit_order) FROM {log} WHERE message = ?) LIMIT 1000"
+            )))
+            .bind(crate::server::ADOPTION_MESSAGE)
+            .fetch_all(store.pool.as_ref()),
+        )
+        .await
+        .context("pre-adoption history deadline exceeded")??;
+        ensure!(!found.is_empty(), "{log} holds no pre-adoption commit");
+        commits.extend(found);
+    }
+    Ok(commits)
+}
+
+/// The pools this store's server opened on a template-era revision: a
+/// retained migration branch or a pre-adoption commit. Their identity row is
+/// the placeholder, which no pool may serve.
+fn template_era_pools(store: &MemoryStore, pre_adoption: &BTreeSet<String>) -> Vec<String> {
+    store
+        .shared
+        .server
+        .pool_requests()
+        .into_iter()
+        .filter(|name| {
+            name.starts_with("kuru_migration_")
+                || name.starts_with("kuru_usage_migration_")
+                || pre_adoption.contains(name)
+        })
+        .collect()
+}
+
+/// A store this open created from the template: its identity names the
+/// compiled key, and its histories are the template's plus one adoption
+/// commit per ref, so no migration ran for it.
+async fn assert_template_born(options: &OpenOptions, store: &MemoryStore) -> Result<()> {
+    let identity = read_identity_view(&active(options)?)?;
+    ensure!(
+        identity.initialized && identity.template.as_deref() == Some(key()),
+        "the store was not created from the template: {identity:?}"
+    );
+    let adopted = migrations::template_shape::compiled_commits(true)?;
+    let found = histories(store).await?;
+    ensure!(
+        found == adopted,
+        "the store's histories {found:?} are not the template's plus one adoption commit per ref \
+         {adopted:?}"
+    );
+    Ok(())
+}
+
+/// A store the cold staged build created: no template key, and the chain's
+/// own histories.
+async fn assert_cold(options: &OpenOptions, store: &MemoryStore) -> Result<()> {
+    ensure!(
+        template_of(options)?.is_none(),
+        "the store was created from a template"
+    );
+    let cold = migrations::template_shape::compiled_commits(false)?;
+    let found = histories(store).await?;
+    ensure!(
+        found == cold,
+        "the cold store's histories {found:?} are not {cold:?}"
+    );
+    Ok(())
+}
+
+/// T1: a new project on a machine with a warm engine and template opens with
+/// two engine starts (the stage's adoption start and the active start), runs
+/// no migration, reports `Ready` once, and builds or quarantines nothing in
+/// the shared template, which the fixture guard checks at release.
+#[tokio::test]
+async fn warm_template_new_project_uses_two_engine_starts_and_no_migration() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        let shared = crate::test_support::shared_template_root()?;
+        let options = options(fixture.path().join("project"), &scope('1'), None).await?;
+        let template = published(&shared).context("the warmed template is not published")?;
+        let (mut progress, opening) = MemoryStore::open_observed(options.clone());
+        let store = {
+            let _gate = crate::spawn_gate::spawning().await;
+            opening.await?
+        };
+        let mut ready = 0;
+        while let Some(stage) = progress.recv().await {
+            ready += usize::from(stage == crate::MemoryOpenStage::Ready);
+        }
+        let checked = async {
+            ensure!(ready == 1, "Ready was reported {ready} times");
+            let starts = starts_under(fixture.path())?;
+            ensure!(
+                starts == u64::from(FreshOpen::Template.starts()),
+                "a new project with a warm template made {starts} engine starts"
+            );
+            assert_template_born(&options, &store).await?;
+            let pooled = template_era_pools(&store, &pre_adoption_commits(&store).await?);
+            ensure!(pooled.is_empty(), "the open pooled {pooled:?}");
+            ensure!(
+                published(&shared) == Some(template),
+                "the shared template changed"
+            );
+            ensure!(
+                interrupted(&options)?.is_empty(),
+                "the open preserved a stage"
+            );
+            Ok(())
+        }
+        .await;
+        store.close().await?;
+        checked
+    }
+    .await;
+    fixture.release(outcome)
+}
+
+/// T2: the first project for a template key builds the template on one
+/// engine, publishes it and copies itself from it: three engine starts, the
+/// chain once, and nothing transient left in the template root.
+#[tokio::test]
+async fn first_project_builds_template_once_and_copies_with_three_starts() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        let root = fixture.path().join("templates");
+        let options = options(fixture.path().join("first"), &scope('2'), Some(&root)).await?;
+        let store = open(options.clone()).await?;
+        let checked = async {
+            let starts = starts_under(fixture.path())?;
+            ensure!(
+                starts == u64::from(FreshOpen::FirstProject.starts()),
+                "the first project made {starts} engine starts"
+            );
+            ensure!(
+                starts_under(&root)? == 1,
+                "the template was not built on exactly one engine"
+            );
+            assert_template_born(&options, &store).await?;
+            let mut names = entries_of(&root)?;
+            names.sort();
+            ensure!(
+                names == [key().to_owned(), format!("{}.lock", key())],
+                "the template root holds more than the published template: {names:?}"
+            );
+            Ok(())
+        }
+        .await;
+        store.close().await?;
+        checked
+    }
+    .await;
+    fixture.release(outcome)
+}
+
+/// T3: once the first project published the template, a second project
+/// copies it with two engine starts, builds nothing and leaves the template
+/// and its root as they were.
+#[tokio::test]
+async fn second_project_reuses_template_without_build() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        let root = fixture.path().join("templates");
+        let first = options(fixture.path().join("first"), &scope('3'), Some(&root)).await?;
+        open(first).await?.close().await?;
+        let template = published(&root).context("the first project published nothing")?;
+        let names = entries_of(&root)?;
+        let second = options(fixture.path().join("second"), &scope('4'), Some(&root)).await?;
+        let store = open(second.clone()).await?;
+        let checked = async {
+            let starts = starts_under(&second.data_dir)?;
+            ensure!(
+                starts == u64::from(FreshOpen::Template.starts()),
+                "the second project made {starts} engine starts"
+            );
+            ensure!(
+                starts_under(&root)? == 1,
+                "the second project started a template build"
+            );
+            assert_template_born(&second, &store).await?;
+            ensure!(
+                published(&root) == Some(template) && entries_of(&root)? == names,
+                "the second project changed the template root"
+            );
+            Ok(())
+        }
+        .await;
+        store.close().await?;
+        checked
+    }
+    .await;
+    fixture.release(outcome)
+}
+
+/// T5, design 3.9: while the first new project is inside its template build,
+/// a second new project under the same key does not wait for it. It completes
+/// on the cold path with the cold start count, reads no unpublished name and
+/// leaves the template root as it found it; the first then publishes and
+/// completes with three starts.
+#[tokio::test]
+async fn concurrent_new_projects_never_wait_for_a_template_build() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        let root = fixture.path().join("templates");
+        // Both options are warmed before the one spawn gate both opens run
+        // under: the first holds it through its pause, and a nested gate
+        // behind a queued writer would wait for the first to resume.
+        let first = options(fixture.path().join("first"), &scope('5'), Some(&root)).await?;
+        let second = options(fixture.path().join("second"), &scope('6'), Some(&root)).await?;
+        let pause = Arc::new(Pause::default());
+        let hooks = Hooks {
+            pause: Some(pause.clone()),
+            ..Hooks::default()
+        };
+        let _gate = crate::spawn_gate::spawning().await;
+        let building = tokio::spawn(HOOKS.scope(hooks, MemoryStore::open(first.clone())));
+        let bound = crate::test_support::fresh_open_budget_of(FreshOpen::FirstProject);
+        if tokio::time::timeout(bound, pause.reached.notified())
+            .await
+            .is_err()
+        {
+            building.abort();
+            let _ = building.await;
+            bail!("the first project did not reach its template build's pause in {bound:?}");
+        }
+        let during = entries_of(&root)?;
+        let concurrent = async {
+            ensure!(
+                during
+                    .iter()
+                    .any(|name| name.starts_with(&format!(".build-{}-", key())))
+                    && published(&root).is_none(),
+                "the first project is not inside its build: {during:?}"
+            );
+            let store = MemoryStore::open(second.clone()).await?;
+            let checked = async {
+                let starts = starts_under(&second.data_dir)?;
+                ensure!(
+                    starts == u64::from(FreshOpen::Cold.starts()),
+                    "the concurrent project made {starts} engine starts"
+                );
+                assert_cold(&second, &store).await?;
+                ensure!(
+                    entries_of(&root)? == during && interrupted(&second)?.is_empty(),
+                    "the concurrent project touched the template root or a stage"
+                );
+                Ok(())
+            }
+            .await;
+            store.close().await?;
+            checked
+        }
+        .await;
+        // Resume the first project whatever the second found.
+        pause.resume.notify_one();
+        let built = tokio::time::timeout(bound, building)
+            .await
+            .context("the first project did not finish after its pause")??;
+        let store = built?;
+        let checked = async {
+            concurrent?;
+            let starts = starts_under(fixture.path())? - starts_under(&second.data_dir)?;
+            ensure!(
+                starts == u64::from(FreshOpen::FirstProject.starts()),
+                "the building project made {starts} engine starts"
+            );
+            assert_template_born(&first, &store).await?;
+            ensure!(published(&root).is_some(), "the build published nothing");
+            Ok(())
+        }
+        .await;
+        store.close().await?;
+        checked
+    }
+    .await;
+    fixture.release(outcome)
+}
+
+/// T11: every file and directory a project's copy writes is synced before
+/// the stage's identity record, which makes the copy adoptable, is written.
+#[tokio::test]
+async fn copied_files_and_directories_are_synced_before_identity() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        let options = options(fixture.path().join("project"), &scope('7'), None).await?;
+        let shared = crate::test_support::shared_template_root()?;
+        let manifest = read_manifest(&shared.join(key()))?;
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let hooks = Hooks {
+            events: Some(events.clone()),
+            ..Hooks::default()
+        };
+        let store = HOOKS.scope(hooks, open(options.clone())).await?;
+        store.close().await?;
+        let events = events.lock().expect("hook events").clone();
+        let [identity] = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                Event::Identity(stage) => Some((index, stage.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|found: Vec<_>| anyhow::anyhow!("identity writes: {found:?}"))?;
+        let (at, stage) = identity;
+        // The copy writes through a handle opened on the canonical path; the
+        // stage itself has since moved onto the active path.
+        let stage = fs::canonicalize(stage.parent().context("stage has no parent")?)?
+            .join(stage.file_name().context("stage has no name")?);
+        let synced = |range: &[Event]| -> BTreeSet<PathBuf> {
+            range
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Synced(path) if path.starts_with(&stage) => Some(path.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut expected: BTreeSet<PathBuf> = manifest
+            .entries
+            .iter()
+            .map(|entry| {
+                let (Entry::Directory { path } | Entry::File { path, .. }) = entry;
+                path.iter()
+                    .fold(stage.join(DATA), |parent, name| parent.join(name))
+            })
+            .collect();
+        expected.insert(stage.join(DATA));
+        expected.insert(stage.clone());
+        let before = synced(&events[..at]);
+        ensure!(
+            before == expected,
+            "synced before the identity record: {before:?}; expected {expected:?}"
+        );
+        ensure!(
+            synced(&events[at..]).is_empty(),
+            "the copy synced after the identity record"
+        );
+        Ok(())
+    }
+    .await;
+    fixture.release(outcome)
+}
+
+/// T9: an ordinary template-born store, opened fresh, written, used through
+/// a promoted candidate, the usage ledger and an export, then reopened
+/// writable and read-only, never pools a template-era revision: those carry
+/// the placeholder identity.
+#[tokio::test]
+async fn ordinary_open_never_pools_a_pre_adoption_revision() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        let mut options = options(fixture.path().join("project"), &scope('8'), None).await?;
+        let store = open(options.clone()).await?;
+        let used = async {
+            let pre_adoption = pre_adoption_commits(&store).await?;
+            store.append("t9/main", "user", "on main").await?;
+            let candidate = store.begin_candidate("t9").await?;
+            candidate
+                .view()
+                .append("t9/candidate", "assistant", "on a candidate")
+                .await?;
+            candidate.promote().await?;
+            store.usage_ledger()?.mark_new_session("t9-session").await?;
+            let export = store.begin_active_export().await?;
+            export.page(None).await?;
+            let pooled = template_era_pools(&store, &pre_adoption);
+            ensure!(pooled.is_empty(), "the fresh open pooled {pooled:?}");
+            Ok(pre_adoption)
+        }
+        .await;
+        store.close().await?;
+        let pre_adoption = used?;
+        for read_only in [false, true] {
+            options.read_only = read_only;
+            let store = open(options.clone()).await?;
+            let pooled = template_era_pools(&store, &pre_adoption);
+            store.close().await?;
+            ensure!(
+                pooled.is_empty(),
+                "a reopen (read-only: {read_only}) pooled {pooled:?}"
+            );
+        }
+        Ok(())
+    }
+    .await;
+    fixture.release(outcome)
+}
+
+/// T15: a legacy import and a configured engine binary keep the cold staged
+/// build, with its four starts, and never open the template root.
+#[tokio::test]
+async fn legacy_import_and_configured_binary_take_cold_path() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        let root = fixture.path().join("templates");
+
+        let mut configured =
+            options(fixture.path().join("configured"), &scope('9'), Some(&root)).await?;
+        configured.config.dolt_binary = Some(crate::test_support::warm_runtime_cache().await?);
+        let store = open(configured.clone()).await?;
+        let checked = assert_cold(&configured, &store).await;
+        store.close().await?;
+        checked?;
+        let starts = starts_under(&configured.data_dir)?;
+        ensure!(
+            starts == u64::from(FreshOpen::Cold.starts()),
+            "a configured engine binary's open made {starts} engine starts"
+        );
+
+        let legacy_dir = fixture.path().join("legacy");
+        files::private_dir(&legacy_dir)?;
+        let legacy_scope = scope('a');
+        let source = rusqlite::Connection::open(legacy_dir.join("memory.sqlite3"))?;
+        source.execute_batch(
+            "PRAGMA application_id=1263882837;
+             PRAGMA user_version=1;
+             CREATE TABLE messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL);
+             CREATE TABLE state (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
+        )?;
+        source.execute(
+            "INSERT INTO messages (namespace, role, content) VALUES (?1, 'user', 'legacy')",
+            [format!("{legacy_scope}/transcript")],
+        )?;
+        drop(source);
+        let legacy = options(legacy_dir, &legacy_scope, Some(&root)).await?;
+        let store = open(legacy.clone()).await?;
+        let checked = async {
+            ensure!(
+                template_of(&legacy)?.is_none(),
+                "an imported store was created from a template"
+            );
+            ensure!(
+                read_activation(&active(&legacy)?, &legacy_scope)?
+                    .migration
+                    .is_some(),
+                "the legacy store was not imported"
+            );
+            Ok(())
+        }
+        .await;
+        store.close().await?;
+        checked?;
+        let starts = starts_under(&legacy.data_dir)?;
+        ensure!(
+            starts == u64::from(FreshOpen::Cold.starts()),
+            "a legacy import's open made {starts} engine starts"
+        );
+        ensure!(
+            !root.exists(),
+            "a cold-only open created the template root"
+        );
+        Ok(())
+    }
+    .await;
+    fixture.release(outcome)
+}
+
+/// T22 and the busy cases through an ordinary open: an injected error
+/// opening, locking or verifying the key lock, a key lock another holder
+/// excludes, and a manifest read error each complete the open on the cold
+/// path, with no error and no change to the published template.
+#[tokio::test]
+async fn template_lock_errors_and_busy_locks_send_the_opener_cold() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        let root = fixture.path().join("templates");
+        let template = clone_shared(&root).await?;
+        let faults = [
+            (
+                "lock open",
+                Hooks {
+                    lock: Some(LockStep::Open),
+                    ..Hooks::default()
+                },
+            ),
+            (
+                "try-lock",
+                Hooks {
+                    lock: Some(LockStep::TryLock),
+                    ..Hooks::default()
+                },
+            ),
+            (
+                "lock verification",
+                Hooks {
+                    lock: Some(LockStep::Verify),
+                    ..Hooks::default()
+                },
+            ),
+            (
+                "manifest read",
+                Hooks {
+                    manifest_read_error: true,
+                    ..Hooks::default()
+                },
+            ),
+            ("busy", Hooks::default()),
+        ];
+        for (index, (label, hooks)) in faults.into_iter().enumerate() {
+            let digit = char::from_digit(u32::try_from(index)? + 1, 16).context("digit")?;
+            let options = options(
+                fixture.path().join(format!("cold-{index}")),
+                &scope(digit),
+                Some(&root),
+            )
+            .await?;
+            let held = match label {
+                "busy" => Some(hold(&root, Mode::Exclusive).await?),
+                _ => None,
+            };
+            let opened = HOOKS.scope(hooks, open(options.clone())).await;
+            if let Some(held) = held {
+                release(held).await;
+            }
+            let store = opened.with_context(|| format!("{label}: the open failed"))?;
+            let checked = assert_cold(&options, &store).await;
+            store.close().await?;
+            checked.with_context(|| label.to_owned())?;
+            let starts = starts_under(&options.data_dir)?;
+            ensure!(
+                starts == u64::from(FreshOpen::Cold.starts()),
+                "{label}: the open made {starts} engine starts"
+            );
+            ensure!(
+                published(&root) == Some(template) && rejected(&root)?.is_empty(),
+                "{label}: the published template changed"
+            );
+            ensure!(
+                interrupted(&options)?.is_empty(),
+                "{label}: the open preserved a stage"
+            );
+        }
+        Ok(())
+    }
+    .await;
+    fixture.release(outcome)
+}
+
+/// T7 and T8 through an ordinary open. A structural verdict quarantines the
+/// judged template before any copy; a digest mismatch mid-copy preserves the
+/// copy remnant under `interrupted/` without an engine start and quarantines;
+/// an injected read error mid-copy preserves the remnant and quarantines
+/// nothing. Each open completes on the cold path.
+#[tokio::test]
+async fn damaged_templates_send_the_opener_cold_and_preserve_copy_remnants() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        let cases = ["structure", "digest", "read error"];
+        for (index, label) in cases.into_iter().enumerate() {
+            let root = fixture.path().join(format!("templates-{index}"));
+            let template = clone_shared(&root).await?;
+            let mut hooks = Hooks::default();
+            match label {
+                "structure" => {
+                    let mut manifest = read_manifest(&root.join(key()))?;
+                    manifest.format += 1;
+                    write_manifest(&root.join(key()), &manifest)?;
+                }
+                "digest" => {
+                    let file = largest_file(&root.join(key()))?;
+                    let mut bytes = fs::read(&file)?;
+                    let last = bytes.last_mut().context("empty template file")?;
+                    *last ^= 1;
+                    files::write(&file, &bytes)?;
+                }
+                _ => {
+                    let file = largest_file(&root.join(key()))?;
+                    let name = file
+                        .file_name()
+                        .context("template file has no name")?
+                        .to_string_lossy()
+                        .into_owned();
+                    hooks.read = Some(ReadFault::new(&name));
+                }
+            }
+            let digit = char::from_digit(u32::try_from(index)? + 1, 16).context("digit")?;
+            let options = options(
+                fixture.path().join(format!("project-{index}")),
+                &scope(digit),
+                Some(&root),
+            )
+            .await?;
+            let store = HOOKS
+                .scope(hooks, open(options.clone()))
+                .await
+                .with_context(|| format!("{label}: the open failed"))?;
+            let checked = assert_cold(&options, &store).await;
+            store.close().await?;
+            checked.with_context(|| label.to_owned())?;
+            let quarantined = rejected(&root)?;
+            let remnants = interrupted(&options)?;
+            match label {
+                "read error" => ensure!(
+                    published(&root) == Some(template) && quarantined.is_empty(),
+                    "{label}: the template was quarantined"
+                ),
+                _ => ensure!(
+                    published(&root).is_none() && quarantined.len() == 1,
+                    "{label}: the template was not quarantined: {quarantined:?}"
+                ),
+            }
+            match label {
+                "structure" => ensure!(
+                    remnants.is_empty(),
+                    "{label}: a stage was copied before the structural check"
+                ),
+                _ => {
+                    let [remnant] = remnants.as_slice() else {
+                        bail!("{label}: not exactly one preserved remnant: {remnants:?}");
+                    };
+                    // Its lease came from the preservation's quiescence wait,
+                    // not from a reap this process recorded.
+                    let lifecycles =
+                        cfg!(windows).then(|| options.data_dir.join("memory/lifecycles"));
+                    crate::test_support::await_store_quiescence(remnant, lifecycles.as_deref())
+                        .await?;
+                    let key = engine_ledger::key(remnant).context("no ledger key")?;
+                    ensure!(
+                        remnant.join(DATA).is_dir()
+                            && !remnant.join("identity.json").exists()
+                            && engine_ledger::with(|ledger| ledger.starts(&key)) == 0,
+                        "{label}: the remnant {} is not an unstarted copy",
+                        remnant.display()
+                    );
+                }
+            }
+            let starts = starts_under(&options.data_dir)?;
+            ensure!(
+                starts == u64::from(FreshOpen::Cold.starts()),
+                "{label}: the open made {starts} engine starts"
+            );
+        }
+        Ok(())
+    }
+    .await;
+    fixture.release(outcome)
+}
+
+/// Adoption and the template shape run on the copy's own engine: a verdict
+/// there fails the open with the typed verdict and no retry, preserves the
+/// unready stage and quarantines the template it was copied from. The next
+/// new project builds a template again.
+#[tokio::test]
+async fn shape_verdict_on_the_copy_fails_the_open_and_quarantines_the_template() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        let root = fixture.path().join("templates");
+        let engine = engine().await?;
+        // A template whose bytes pass the build's own shape check and every
+        // structural and byte check, but hold a branch outside the compiled
+        // set: a copy's shape check refuses it.
+        let hooks = Hooks {
+            after_shape: vec!["CALL DOLT_BRANCH('extra_branch')".to_owned()],
+            ..Hooks::default()
+        };
+        let built = HOOKS
+            .scope(hooks, ensure(&root, &engine))
+            .await
+            .map_err(failure)?;
+        ensure!(matches!(built, Ensured::Built(_)), "{built:?}");
+        let flawed = published(&root).context("the flawed template was not published")?;
+        let options = options(fixture.path().join("project"), &scope('b'), Some(&root)).await?;
+        let error = open(options.clone())
+            .await
+            .err()
+            .context("a copy of a flawed template was activated")?;
+        let message = format!("{error:#}");
+        ensure!(
+            TemplateVerdict::find(&error).is_some() && message.contains("unexpected branch"),
+            "the open did not fail with the shape verdict: {message}"
+        );
+        ensure!(!active(&options)?.exists(), "an active directory appeared");
+        let preserved = interrupted(&options)?;
+        let [stage] = preserved.as_slice() else {
+            bail!("not exactly one preserved stage: {preserved:?}");
+        };
+        ensure!(
+            !stage.join("ready.json").exists()
+                && read_identity_view(stage)?.template.as_deref() == Some(key()),
+            "the preserved stage is not the unready copy"
+        );
+        let quarantined = rejected(&root)?;
+        let [moved] = quarantined.as_slice() else {
+            bail!("not exactly one quarantined template: {quarantined:?}");
+        };
+        ensure!(
+            published(&root).is_none() && files::directory(&root.join(moved))?.identity() == flawed,
+            "the judged template was not the one quarantined"
+        );
+        ensure!(
+            starts_under(&options.data_dir)? == 1,
+            "the failed open retried or reached its active start"
+        );
+        // The next new project pays one build, then copies the new template.
+        let next = options_for(&fixture, &root, 'c').await?;
+        let store = open(next.clone()).await?;
+        let checked = assert_template_born(&next, &store).await;
+        store.close().await?;
+        checked?;
+        let starts = starts_under(&next.data_dir)?;
+        ensure!(
+            starts == u64::from(FreshOpen::Template.starts()) && published(&root).is_some(),
+            "the next project made {starts} starts in its own directory"
+        );
+        Ok(())
+    }
+    .await;
+    fixture.release(outcome)
+}
+
+async fn options_for(fixture: &TempDir, root: &Path, digit: char) -> Result<OpenOptions> {
+    options(
+        fixture.path().join(format!("project-{digit}")),
+        &scope(digit),
+        Some(root),
+    )
+    .await
+}
+
+/// T20 through an ordinary open: a failure on the copy's own engine that is
+/// not a verdict (here the stage's ready-marker observer closing before
+/// release) fails the open, preserves the unready stage and leaves the
+/// published template exactly as it was; the next new project copies it
+/// with two starts.
+#[tokio::test]
+async fn engine_failure_on_the_copy_preserves_the_stage_and_keeps_the_template() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        let root = fixture.path().join("templates");
+        let template = clone_shared(&root).await?;
+        let options = options_for(&fixture, &root, 'd').await?;
+        let (observation, release_marker, opening) =
+            marker_fixture::prepare(options.clone(), false);
+        let opening = tokio::spawn(async move {
+            let _gate = crate::spawn_gate::spawning().await;
+            opening.await
+        });
+        let bound = crate::test_support::fresh_open_budget_of(FreshOpen::Template);
+        let observed = tokio::time::timeout(bound, observation)
+            .await
+            .context("the copy did not reach its ready marker")?
+            .context("the copy ended before its ready marker")?;
+        ensure!(!observed.after_marker);
+        drop(release_marker);
+        let error = tokio::time::timeout(bound, opening)
+            .await
+            .context("the failed open did not return")??
+            .err()
+            .context("the open succeeded without its ready marker")?;
+        ensure!(
+            TemplateVerdict::find(&error).is_none(),
+            "an engine-side failure was a verdict: {error:#}"
+        );
+        let preserved = interrupted(&options)?;
+        ensure!(
+            preserved.len() == 1 && !preserved[0].join("ready.json").exists(),
+            "the unready stage was not preserved: {preserved:?}"
+        );
+        ensure!(
+            published(&root) == Some(template) && rejected(&root)?.is_empty(),
+            "an engine-side failure changed the template"
+        );
+        let next = options_for(&fixture, &root, 'e').await?;
+        let store = open(next.clone()).await?;
+        let checked = assert_template_born(&next, &store).await;
+        store.close().await?;
+        checked?;
+        let starts = starts_under(&next.data_dir)?;
+        ensure!(
+            starts == u64::from(FreshOpen::Template.starts()),
+            "the next project made {starts} engine starts"
+        );
+        Ok(())
+    }
+    .await;
+    fixture.release(outcome)
+}
+
+const GUARD_CHILD_TEST: &str =
+    "store::creation_template::open_tests::child_process_fixture_open_builds_the_shared_template";
+
+/// Runs only as a child of
+/// `fixture_open_that_builds_the_shared_template_fails_teardown`, whose
+/// environment names a private, empty cache as this process's shared test
+/// cache. Its fixture options claim a warm-up that never built the template,
+/// so the open builds the shared template itself (three starts), and the
+/// fixture root's release fails, naming the build.
+#[tokio::test]
+async fn child_process_fixture_open_builds_the_shared_template() -> Result<()> {
+    let Some(outcome) = std::env::var_os(CHILD_OUTCOME) else {
+        return Ok(());
+    };
+    let cache = crate::store::test_cache();
+    {
+        let _gate = crate::spawn_gate::spawning().await;
+        let config = OpenOptions::new(PathBuf::new(), String::new()).config;
+        crate::provision::provision(&config, &cache).await?;
+    }
+    let root = crate::test_support::tempdir()?;
+    let mut options = crate::test_support::open_options(root.path().join("project"), scope('f'))?;
+    // As if warmed: the guard before the open passes, the template is absent.
+    options.fixture = Some(Fixture::Warmed);
+    let store = open(options.clone()).await?;
+    let project = starts_under(&options.data_dir)?;
+    let built = starts_under(&crate::test_support::shared_template_root()?)?;
+    store.close().await?;
+    let verdict = match root.release(Ok(())) {
+        Ok(()) => "passed".to_owned(),
+        Err(error) => format!(
+            "failed={}",
+            format!("{error:#}").contains("built the shared store template")
+        ),
+    };
+    files::write(
+        Path::new(&outcome),
+        format!("project={project} build={built} guard={verdict}").as_bytes(),
+    )
+}
+
+/// T18, the real trigger: a fixture whose open builds the shared store
+/// template, because its options claim a warm-up that never ran, fails at
+/// teardown naming the build. A child process with a private cache makes the
+/// shared template absent without disturbing this process's.
+#[tokio::test]
+async fn fixture_open_that_builds_the_shared_template_fails_teardown() -> Result<()> {
+    let fixture = fixture()?.allowing_template_build();
+    let cache = fixture.path().join("cache");
+    files::private_dir(&cache)?;
+    let outcome = fixture.path().join("outcome");
+    let log = fixture.path().join("child.log");
+    let child = spawn_child(GUARD_CHILD_TEST, &cache, &outcome, &log).await?;
+    let status = wait_child(child).await?;
+    let diagnostics = format!(
+        "stdout: {}\nstderr: {}",
+        fs::read_to_string(&log).unwrap_or_default(),
+        fs::read_to_string(log.with_extension("stderr")).unwrap_or_default()
+    );
+    let checked = async {
+        ensure!(status.success(), "child failed ({status}): {diagnostics}");
+        let reported = String::from_utf8(files::read_bytes(&outcome, 256)?)?;
+        ensure!(
+            reported == "project=2 build=1 guard=failed=true",
+            "{reported}; {diagnostics}"
+        );
+        Ok(())
+    }
+    .await;
+    fixture.release(checked)
+}

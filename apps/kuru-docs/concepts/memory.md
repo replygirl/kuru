@@ -208,20 +208,33 @@ unchanged; correct that exact path before retrying.
 
 An interrupted import can resume after validation. Partial imports are stopped and preserved under `memory/interrupted/`; a failed import never becomes the active store. Keep the original and snapshots until you have checked every project you want to retain.
 
-Kuru is being prepared to create new project stores by copying a pre-built,
-schema-only template instead of running every schema upgrade. No release
-creates stores this way yet, so nothing changes for you today. The template
-will live beside the engine in its cache, under
-`<engine version>/templates/`, built once per machine, engine and schema. It
-holds only schema, migration receipts and a fixed placeholder identity, never
-project data or credentials, so every project sharing the cache can use it
-and `kuru memory purge` leaves it in place. When it does,
-each copy takes its own identity and credentials on first start, shares only
-schema history with other copies, and is set aside under `memory/interrupted/`
-without being started if a crash interrupts it. See
-[memory storage](https://github.com/replygirl/kuru/blob/main/docs/memory.md#template-born-stores)
-for the details. If Kuru ever warns that it cannot read a template, delete that
-template's directory under `templates/` while Kuru is not running; it is
+New project stores are created by copying a pre-built, schema-only template
+instead of running every schema upgrade. The template lives beside the engine
+in its cache, under `<engine version>/templates/`, and is built once per
+machine, engine and schema. It holds only schema, migration receipts and a
+fixed placeholder identity, never project data or credentials, so every
+project sharing the cache can use it and `kuru memory purge` leaves it in
+place. Each copy takes its own identity and credentials on its first start and
+shares only schema history with other copies.
+
+What the first launch pays: the first new project on a machine, and the first
+after an update that changes the schema or the engine, builds the template
+before copying from it, which takes about as long as building a store directly
+did. Every later new project opens faster, with two database starts instead of
+four. A project that imports older SQLite data, or a configured development
+engine (`memory.dolt_binary`), is still built directly.
+
+If the template is busy (another Kuru process is building it) or cannot be
+used, the new project is simply built directly, with a warning in the memory
+service log; you do not need to do anything. If a copy turns out to be damaged
+once its own database has started, that open fails with a template error,
+nothing appears at the project's path, the copy is set aside under
+`memory/interrupted/`, and the damaged template is moved aside: opening again
+builds a fresh template. A copy interrupted by a crash is set aside the same
+way, without being started. See
+[memory storage](https://github.com/replygirl/kuru/blob/main/docs/memory.md#new-projects-and-the-store-template)
+for the details. If Kuru keeps warning that it cannot read a template, delete
+that template's directory under `templates/` while Kuru is not running; it is
 built again once.
 
 Kuru also applies compatible database schema upgrades automatically when a

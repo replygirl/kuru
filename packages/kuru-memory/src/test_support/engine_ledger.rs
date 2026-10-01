@@ -147,13 +147,6 @@ impl Record {
 /// Something an open did to the shared store template that test support
 /// charges to the fixture it opened for: a fixture's open never builds the
 /// shared template (warm-up does) and quarantines it only on a real verdict.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no open creates a store from the template cache until creation uses it"
-    )
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TemplateEvent {
     /// The open built the store template under the shared test root.
@@ -247,13 +240,6 @@ pub(crate) fn record(directory: &Path) {
 
 /// Charge `event` on the shared store template to the fixture whose stage
 /// `stage` (beneath its root) was being created.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no open creates a store from the template cache until creation uses it"
-    )
-)]
 pub(crate) fn template_event(stage: &Path, event: TemplateEvent) {
     let stage = fs::canonicalize(stage).unwrap_or_else(|_| stage.to_path_buf());
     let label = super::lifecycle_trace::label();
@@ -362,6 +348,28 @@ impl Ledger {
     #[cfg(test)]
     pub(crate) fn starts(&self, key: &Key) -> u64 {
         self.starts.get(key).map_or(0, |(_, starts)| *starts)
+    }
+
+    /// Every store directory this process started a supervisor for, by the
+    /// canonical directory of its first start, with its start count.
+    #[cfg(test)]
+    pub(crate) fn start_counts(&self) -> Vec<(PathBuf, u64)> {
+        let mut counts = self.starts.values().cloned().collect::<Vec<_>>();
+        counts.sort();
+        counts
+    }
+
+    /// How many supervisors this process has started for every store
+    /// directory first started beneath `root` (canonical): a store's stage
+    /// and its active directory, which the key follows through the rename,
+    /// and any template build store there, including one since removed.
+    #[cfg(test)]
+    pub(crate) fn starts_under(&self, root: &Path) -> u64 {
+        self.starts
+            .values()
+            .filter(|(directory, _)| directory.starts_with(root))
+            .map(|(_, starts)| starts)
+            .sum()
     }
 
     /// Live owners whose store lies beneath `root` (canonical), for a failure

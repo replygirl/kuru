@@ -682,8 +682,12 @@ for compatibility; bundled engine provisioning never uses HTTP, and this setting
 does not disable provider network calls. `cache_dir` and `dolt_binary` must be
 absolute native paths; Kuru does not resolve either relative to a configuration
 file. `dolt_binary` is an optional development override that must report the
-supported exact version. Corrupt existing caches fail without automatic repair.
-If activating a verified engine fails, the error reports the retained private
+supported exact version. The engine cache also holds the store template new
+projects are created from (see
+[memory storage](memory.md#new-projects-and-the-store-template)); data
+directories that share a `cache_dir` share it. With `dolt_binary` set, new
+projects are built without the template. Corrupt existing caches fail without
+automatic repair. If activating a verified engine fails, the error reports the retained private
 staging directory for inspection; Kuru does not automatically retry that move.
 The startup timeout is 1–300 seconds. If a newly started memory service is not
 ready in time, the error `memory service readiness deadline exceeded` also

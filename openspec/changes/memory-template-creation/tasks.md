@@ -2,110 +2,98 @@
 
 ## 1. Path selector
 
-- [ ] 1.1 Add the creation-path selector in `open_inner` after
-      `recover_staging`, choosing cold for a legacy import, a configured
-      engine binary, or `Creation::Cold`, and the template path otherwise;
-      verify with `template_key_is_not_consulted_for_legacy_or_cold_overrides`
-      asserting zero `templates/` filesystem accesses for those three cases.
-- [ ] 1.2 Add the shared-lock probe for an already-published template
-      (structural check only, no stage yet) and route a structural verdict,
-      lock-busy or lock-error result to the cold path with a warning logged,
-      never an open error; verify with
-      `busy_or_damaged_template_sends_opener_cold_not_error`.
-- [ ] 1.3 Add the exclusive-lock probe for "no template published yet" and
-      route a lock-busy or lock-error result there to the cold path too;
-      verify with the same test extended to the exclusive-lock case.
+- [ ] 1.1 Add the creation-path selector (`creation_worker::select`) in
+      `open_inner` after `recover_staging`, choosing cold for a legacy import,
+      a configured engine binary, or `Creation::Cold`, and the template path
+      otherwise; verify with `legacy_import_and_configured_binary_take_cold_path`
+      (four starts each, the private template root never created) and the
+      `Creation::Cold` fixtures (`template_born_store_matches_cold_store`, the
+      cold-path cancellation and pool-budget tests).
+- [ ] 1.2 Route a busy key lock, a lock-file open, lock or verification error
+      and a manifest read error to the cold path with a warning, never an
+      open error, and never touching the template; verify with
+      `template_lock_errors_and_busy_locks_send_the_opener_cold`.
+- [ ] 1.3 Route a structural verdict (quarantine first) and a verdict or I/O
+      error mid-copy (copy remnant preserved without an engine start; only a
+      verdict quarantines) to the cold path in a new stage; verify with
+      `damaged_templates_send_the_opener_cold_and_preserve_copy_remnants`.
 
 ## 2. Creation worker and locks
 
-- [ ] 2.1 Add the creation worker (`tokio::spawn`, the `run_migration_worker`
-      ownership shape) that receives the project's startup lock and the
-      template key lock (shared for a copy, exclusive for a build) and
-      returns both only after its engine, if any, is reaped; verify with
-      `cancelled_open_during_template_copy_keeps_startup_lock_until_reap` and
-      an equivalent build-path test.
-- [ ] 2.2 Wire `creation_template::copy_into` and the existing adoption
-      bootstrap/`adopt_and_mark` into the worker's copy path for an already
-      published template; verify with
+- [ ] 2.1 Add the creation worker (`creation_worker::run`, `tokio::spawn`, the
+      `run_migration_worker` ownership shape) that owns the startup lock and
+      returns it only after its engines are reaped, and run each copy on a
+      blocking thread that holds the key lock; verify with
+      `cancelled_open_during_template_copy_keeps_startup_lock_until_reap`
+      (and, for the build's key lock, the existing
+      `cancelled_build_releases_key_lock_only_after_reap`).
+- [ ] 2.2 Wire `creation_template::create_in`, the stage identity record
+      (written last) and `StageWorker::adopt_and_mark` into the worker's copy
+      path; verify with
       `warm_template_new_project_uses_two_engine_starts_and_no_migration`
-      (ledger: 2 starts, no new migration branch, one `Ready`).
+      (ledger: 2 starts, histories of the template plus one adoption commit
+      per ref, `Ready` once, no template-era pool) and
+      `copied_files_and_directories_are_synced_before_identity`.
 
 ## 3. First project on a fresh machine
 
-- [ ] 3.1 Wire the exclusive-lock build-then-copy path using
-      `creation_template::create_in` and the stage worker's `TemplateBuild`
-      job: publish the template, then copy this project's stage from the
-      published template, or from the verified build stage if publication
-      fails; verify with
-      `first_project_builds_template_once_and_copies_with_three_starts`
-      (ledger: 3 starts, chain runs once).
-- [ ] 3.2 Ensure a second, concurrently opened, different project never waits
-      on the first project's build or startup lock and instead takes the
-      cold path immediately; verify with
-      `concurrent_new_projects_never_wait_for_a_template_build` (P1 paused
-      inside its build; P2 completes on the cold path and never observes
-      `.build-*` or `.stage-*`).
+- [ ] 3.1 Build-then-copy through `create_in` under the exclusive key lock;
+      verify with `first_project_builds_template_once_and_copies_with_three_starts`
+      and `second_project_reuses_template_without_build`.
+- [ ] 3.2 A concurrent different project never waits on the build; verify
+      with `concurrent_new_projects_never_wait_for_a_template_build` (first
+      project paused inside its build engine; the second completes cold with
+      four starts and leaves the template root unchanged; the first then
+      completes with three).
 
-## 4. Cold fallbacks
+## 4. Verdicts and engine failures on the copy
 
-- [ ] 4.1 Confirm every cold-fallback condition already specified by the
-      template-cache requirement (busy/unreadable key lock, lock
-      verification failure, structural verdict, I/O error mid-copy) reaches
-      the cold path from the new selector without a caller-visible
-      template-specific error; verify with
-      `template_lock_errors_send_the_opener_cold` and
-      `template_failing_structure_is_quarantined_and_open_goes_cold`.
-- [ ] 4.2 Confirm an adoption or shape verdict, or an engine-side failure, on
-      the copy's own stage engine returns the existing typed error (no
-      in-open retry, no fallback to cold) and leaves the template quarantined
-      or untouched per the already-specified rules; verify with
-      `adoption_verdicts_are_typed_and_engine_failures_are_not` exercised
-      from an ordinary new-project open, not only from template-internal
-      tests.
+- [ ] 4.1 A verdict on the copy's own engine fails the open with the typed
+      verdict, no retry, preserves the stage and quarantines the judged
+      template (`creation_template::quarantine_after_adoption`); verify with
+      `shape_verdict_on_the_copy_fails_the_open_and_quarantines_the_template`.
+- [ ] 4.2 A non-verdict failure on the copy's engine fails the open and leaves
+      the template untouched; verify with
+      `engine_failure_on_the_copy_preserves_the_stage_and_keeps_the_template`.
 
 ## 5. Test support: budgets and class guards
 
-- [ ] 5.1 Extend `test_support::engine_ledger`-based fresh-open budget
-      helpers with the warm-template (2 starts) and build-then-copy (3
-      starts) cases, alongside the unchanged cold-path case; verify by
-      running the extended `fresh_open_budget` / `fixture_deadline` unit
-      tests.
-- [ ] 5.2 Extend the fixture teardown class guard so a fixture whose open
-      took the build-then-copy path, or quarantined a template, still fails
-      unless opted in, covering the new call sites added by this change;
-      verify with a test asserting the guard fires for an unopted-in fixture
-      that builds inside its own open.
-- [ ] 5.3 Add `warm_template_new_project_uses_two_engine_starts_and_no_migration`,
-      `first_project_builds_template_once_and_copies_with_three_starts`,
-      `second_project_reuses_template_without_build`,
-      `concurrent_new_projects_never_wait_for_a_template_build`, and the
-      synced-copy ordering test `copied_files_and_directories_are_synced_before_identity`
-      as deterministic, real-engine tests; verify by running them locally
-      under `mise run //packages/kuru-memory:test`.
+- [ ] 5.1 Add `FreshOpen::{Template, FirstProject, Cold}` and
+      `fresh_open_budget_of`, keeping the cold case as the default fresh-open
+      budget and in `fixture_deadline`; verify with
+      `fresh_open_budgets_follow_each_creation_path` and
+      `single_stall_defaults_match_the_reviewed_bounds`.
+- [ ] 5.2 Make the fixture class guard live: verify the real trigger with
+      `fixture_open_that_builds_the_shared_template_fails_teardown` (child
+      process with a private cache; the open builds the shared template in
+      three starts and teardown fails naming the build).
+- [ ] 5.3 Add `ordinary_open_never_pools_a_pre_adoption_revision` (T9) and
+      `test_template_build_copies_the_store_template_with_two_starts` (T24);
+      keep cold-path fixtures that pause or delay a cold staging job on
+      `Creation::Cold`; adjust
+      `copy_remnant_without_identity_is_preserved_without_engine_start` to the
+      template-born store the open now creates.
+- [ ] 5.4 Remove the `dead_code` expectations that held while no open used the
+      template, keeping targeted ones for warm-up-only items.
 
 ## 6. Documentation
 
-- [ ] 6.1 Update `docs/memory.md` with a "New projects" paragraph: template
-      origin, what is shared, no secrets in the template, and that the first
-      project per machine and key pays the schema-migration chain once;
-      verify by `mise run docs:check` (if applicable) or manual review
-      against the merged behavior.
-- [ ] 6.2 Update `apps/kuru-docs/concepts/memory.md` with the same new-project
-      behavior and what a user sees if a template is damaged (silently falls
-      back to the cold path); verify with `mise run //apps/kuru-docs:build`.
-- [ ] 6.3 Update `docs/development.md`'s fixture-expectations section to
-      state the 2-start budget for a fresh warm-template fixture open and the
-      3-start budget for the first fixture open on an unwarmed template
-      cache; verify by manual review against the updated budget constants
-      from task 5.1.
+- [ ] 6.1 Update `docs/memory.md`: new projects come from the template, start
+      counts per case, when a project is built directly, and what a user sees
+      when a template is damaged.
+- [ ] 6.2 Update `apps/kuru-docs/concepts/memory.md` (what the first launch
+      pays, what a damaged template does) and the `cache_dir` notes in
+      `docs/configuration.md` and `apps/kuru-docs/reference/configuration.md`.
+- [ ] 6.3 Update `docs/development.md` fixture expectations: two starts for a
+      fresh fixture open, `FreshOpen`, `Creation::Cold` for paused cold jobs,
+      private template roots.
+- [ ] 6.4 Spec delta: the creation path requirement, and the byte-scan
+      correction in "Per-machine store template cache".
 
 ## 7. Verification
 
-- [ ] 7.1 Run the full `packages/kuru-memory` test suite locally
-      (`mise run //packages/kuru-memory:test`) and confirm no existing-project
-      or cold-path test's start count regressed.
-- [ ] 7.2 Run `mise run //packages/kuru-memory:lint` and
-      `mise run //packages/kuru-memory:typecheck` and confirm both pass clean
-      on the new selector and worker wiring.
-- [ ] 7.3 Record which of the above were actually run versus deferred to CI,
-      naming the reason for any deferral, before this change is archived.
+- [ ] 7.1 Run the full `packages/kuru-memory`, `packages/kuru-runtime` and
+      `apps/kuru-tui` test tasks locally.
+- [ ] 7.2 Run `format:check`, kuru-memory `lint`, `lint:windows` and
+      `typecheck`, and `docs:check`.
+- [ ] 7.3 Record which checks ran and which are deferred to CI, with reasons.

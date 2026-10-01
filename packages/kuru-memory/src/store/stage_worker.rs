@@ -34,21 +34,7 @@ enum Start {
     Init,
     Migrate,
     Validate,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no open creates a template stage until the template cache lands"
-        )
-    )]
     Adopt,
-    #[cfg_attr(
-        not(any(test, feature = "test-support")),
-        expect(
-            dead_code,
-            reason = "only test-fixture warm-up builds a store template until creation uses it"
-        )
-    )]
     TemplateBuild,
 }
 
@@ -218,13 +204,6 @@ where
     /// template shape with the adopted identity, and publishes `ready.json`;
     /// a failure there preserves the unready stage like any validation
     /// failure. The initial revision is the adoption head of `main`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no open creates a template stage until the template cache lands"
-        )
-    )]
     pub(super) async fn adopt_and_mark(
         &self,
         startup: File,
@@ -248,13 +227,6 @@ where
     /// `main` and the template shape with the placeholder row run. Returns the
     /// engine's `@@hostname` for the capture's byte scan. A failure leaves the
     /// build store where it is, for the next exclusive holder's sweep.
-    #[cfg_attr(
-        not(any(test, feature = "test-support")),
-        expect(
-            dead_code,
-            reason = "only test-fixture warm-up builds a store template until creation uses it"
-        )
-    )]
     pub(super) async fn build_template(
         &self,
         guard: File,
@@ -277,6 +249,8 @@ where
             super::creation_template::hooks::before_shape(&pool).await?;
             migrations::template_shape::check(&pool, migrations::template_shape::Row::Placeholder)
                 .await?;
+            #[cfg(test)]
+            super::creation_template::hooks::after_shape(&pool).await?;
             let hostname: String = tokio::time::timeout(
                 QUERY_TIMEOUT,
                 sqlx::query_scalar("SELECT @@hostname").fetch_one(pool.as_ref()),
@@ -497,6 +471,73 @@ mod tests {
         Ok(())
     }
 
+    /// Cancel an opener at the boundary before its stage's `ready.json` and
+    /// show that a second opener acquires the startup lock only after the
+    /// engine ledger shows the stage engine reaped, and that the next open
+    /// preserves the unready stage. On the cold path the opener owns the
+    /// validation start, so cancellation drops it and the owner's reaper
+    /// keeps the lock until the supervisor has exited; on the template path
+    /// the creation worker owns the stage's one start and keeps the lock
+    /// until it has closed and reaped that engine.
+    async fn cancel_at_the_ready_marker(digit: char, creation: Creation) -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let canonical = fs::canonicalize(root.path())?;
+        let mut options = crate::test_support::warmed_open_options(
+            root.path().to_owned(),
+            format!("project/{}", digit.to_string().repeat(64)),
+        )
+        .await?;
+        options.creation = creation;
+        let deadline = observation_deadline(&options);
+        let (observation, release, opening) = marker_fixture::prepare(options.clone(), false);
+        let opening = tokio::spawn(async move {
+            let _gate = crate::spawn_gate::spawning().await;
+            opening.await
+        });
+        let observed = match tokio::time::timeout(deadline, observation).await {
+            Ok(Ok(observed)) => observed,
+            Ok(Err(_)) => {
+                let ended = match opening.await {
+                    Ok(Ok(store)) => {
+                        store.close().await?;
+                        "opened".to_owned()
+                    }
+                    Ok(Err(error)) => format!("{error:#}"),
+                    Err(error) => error.to_string(),
+                };
+                bail!("the stage opener ended before the ready-marker boundary: {ended}");
+            }
+            Err(_) => {
+                opening.abort();
+                let _ = opening.await;
+                bail!("the stage opener did not reach the ready-marker boundary in {deadline:?}");
+            }
+        };
+        ensure!(
+            !observed.after_marker && !observed.stage.join("ready.json").exists(),
+            "the ready-marker pause was not before the marker"
+        );
+        opening.abort();
+        ensure!(
+            opening.await.is_err_and(|error| error.is_cancelled()),
+            "the stage opener finished instead of being cancelled at the ready marker"
+        );
+        // Closing the observer only now keeps the cancellation, not an
+        // observer error, as the reason the opener stopped.
+        drop(release);
+        let acquired = second_opener_acquires(&options, &canonical, deadline).await;
+        let reaped = await_reaped(&canonical, deadline).await;
+        let live = acquired?;
+        reaped?;
+        ensure!(
+            live.is_empty(),
+            "a second opener acquired the startup lock before the cancelled stage engine was \
+             reaped: {live:?}"
+        );
+        next_open_preserves_the_cancelled_stage(&options).await?;
+        Ok(())
+    }
+
     /// Cancel an opener inside two stage jobs and show that a second opener
     /// acquires the startup lock only after the engine ledger shows the reap.
     ///
@@ -523,6 +564,8 @@ mod tests {
             let deadline = observation_deadline(&options);
             let (hooks, control) =
                 migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::AfterDdl);
+            // The pause is in the cold staged build's migration job.
+            options.creation = Creation::Cold;
             options.migration_hooks = Some(Arc::new(hooks));
             let opening = tokio::spawn(crate::test_support::spawn_gated_open(options.clone()));
             tokio::time::timeout(deadline, control.reached())
@@ -565,64 +608,15 @@ mod tests {
         }
 
         // Validate-and-mark: cancel at the boundary before `ready.json`.
-        {
-            let root = crate::test_support::tempdir()?;
-            let canonical = fs::canonicalize(root.path())?;
-            let options = crate::test_support::warmed_open_options(
-                root.path().to_owned(),
-                format!("project/{}", "7".repeat(64)),
-            )
-            .await?;
-            let deadline = observation_deadline(&options);
-            let (observation, release, opening) = marker_fixture::prepare(options.clone(), false);
-            let opening = tokio::spawn(async move {
-                let _gate = crate::spawn_gate::spawning().await;
-                opening.await
-            });
-            let observed = match tokio::time::timeout(deadline, observation).await {
-                Ok(Ok(observed)) => observed,
-                Ok(Err(_)) => {
-                    let ended = match opening.await {
-                        Ok(Ok(store)) => {
-                            store.close().await?;
-                            "opened".to_owned()
-                        }
-                        Ok(Err(error)) => format!("{error:#}"),
-                        Err(error) => error.to_string(),
-                    };
-                    bail!("the stage opener ended before the ready-marker boundary: {ended}");
-                }
-                Err(_) => {
-                    opening.abort();
-                    let _ = opening.await;
-                    bail!(
-                        "the stage opener did not reach the ready-marker boundary in {deadline:?}"
-                    );
-                }
-            };
-            ensure!(
-                !observed.after_marker && !observed.stage.join("ready.json").exists(),
-                "the ready-marker pause was not before the marker"
-            );
-            opening.abort();
-            ensure!(
-                opening.await.is_err_and(|error| error.is_cancelled()),
-                "the stage opener finished instead of being cancelled at the ready marker"
-            );
-            // Closing the observer only now keeps the cancellation, not an
-            // observer error, as the reason the opener stopped.
-            drop(release);
-            let acquired = second_opener_acquires(&options, &canonical, deadline).await;
-            let reaped = await_reaped(&canonical, deadline).await;
-            let live = acquired?;
-            reaped?;
-            ensure!(
-                live.is_empty(),
-                "a second opener acquired the startup lock before the cancelled stage engine was \
-                 reaped: {live:?}"
-            );
-            next_open_preserves_the_cancelled_stage(&options).await?;
-        }
-        Ok(())
+        cancel_at_the_ready_marker('7', Creation::Cold).await
+    }
+
+    /// The template path's creation worker owns the startup lock, the copy
+    /// and the stage's one engine start: an opener cancelled at the boundary
+    /// before the stage's `ready.json` leaves the lock with the worker until
+    /// that engine was reaped, and the next open preserves the stage.
+    #[tokio::test]
+    async fn cancelled_open_during_template_copy_keeps_startup_lock_until_reap() -> Result<()> {
+        cancel_at_the_ready_marker('8', Creation::Default).await
     }
 }
