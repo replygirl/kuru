@@ -692,9 +692,13 @@ path, scope, SQL, identity, credential or content. An existing-project open
 records, in order: `owner-main`, `owner-lock`, `cache-verify-start`,
 `cache-verify-end`, `supervisor-ready`, `probe-verified`, `main-pool`,
 `version-read`, `validate-active`, `candidate-recovery`, `usage-pool`,
-`usage-scan-1`, `usage-upgrade`, `usage-validate`, `usage-scan-2`,
-`store-ready`, `listener-bound` and `endpoint-published`; creation and upgrade
-opens repeat some of them. Each gated owner run leaves one file of a few
+`usage-bound`, `usage-scan-1`, `usage-upgrade`, `usage-validate`,
+`usage-scan-2`, `usage-record`, `store-ready`, `listener-bound` and
+`endpoint-published`; creation and upgrade opens repeat some of them.
+`usage-bound` follows the read of the usage head's validation record (see
+[the usage ledger validation record](memory.md#usage-ledger-validation-record)),
+and `usage-scan-1` then closes the owned-row walk, which a recorded reopen
+skips: its `counts.usage_rows` is 0. Each gated owner run leaves one file of a few
 kilobytes. Nothing in Kuru reads, lists or removes these files, so delete them
 by hand, or measure in a scratch data directory.
 
@@ -791,35 +795,78 @@ with `--profile release` so one release build serves the whole check.
 ### Usage scan scaling check
 
 The required CI job `usage-scan-scaling` ("Usage scan scaling (ubuntu-latest,
-provisional bounds)" in `ci.yml`, listed in `ci-gate`) fails when the
-usage-ledger startup scan grows faster than linearly with ledger size. It
-runs on Ubuntu only, because the owner open timeline is inert on Windows.
+calibrated bounds)" in `ci.yml`, listed in `ci-gate`) fails when the
+usage-ledger startup scan grows faster than linearly with ledger size, or when
+a reopen of an already validated ledger decodes any usage row. It runs on
+Ubuntu only, because the owner open timeline is inert on Windows.
 
 - **Fixture.** Two aged stores at 1,000 and 5,000 conversations (seed 1, one
   turn). Each holds exactly 4,000 and 20,000 owned usage rows: one session
-  marker and three rows per invocation.
+  marker and three rows per invocation. The binary that ages them writes the
+  validation record with every write, so an unforced open of a fixture is
+  already a recorded reopen.
+- **Forcing.** The measuring driver adds one empty commit without a record to
+  the usage branch before each full open, through a direct open of the store
+  under the owner lock. That is the head a release that does not write records
+  leaves (see
+  [the validation record](memory.md#usage-ledger-validation-record)): the next
+  open decodes every owned row and records, and the open after it is recorded.
 - **Measurement.** The job builds the release kuru-memory test-support
-  tooling. For each size it starts one warm-up and then five cold owner
-  processes with `KURU_OPEN_TIMELINE=1`. Each opens the store writable,
-  publishes its endpoint, retires and writes its timeline.
-- **T(N).** The first usage scan, from `usage-pool` to `usage-scan-1`. That
-  interval also holds the scan's flat working-set and schema checks. The row
-  count is the timeline's `counts.usage_rows`.
+  tooling. For each size it runs one warm-up cycle and then five measured
+  cycles. A cycle forces, then starts a cold owner process with
+  `KURU_OPEN_TIMELINE=1` for the full open and another for the recorded
+  reopen (the warm-up cycle stops after its full open). Each opens the store
+  writable, publishes its endpoint, retires and writes its timeline.
+- **T(N).** The first usage scan of the full opens, from `usage-pool` to
+  `usage-scan-1`. That interval also holds the scan's flat working-set and
+  schema checks. The row count is the timeline's `counts.usage_rows`. The
+  recorded reopens' own `usage-pool` to `usage-scan-1` interval is printed and
+  not bounded: no Ubuntu measurement of it exists yet, and the 0-row check is
+  the deterministic guarantee.
 - **Checks.** It fails if any of these fails:
-  - **rows:** every open, warm-up included, decoded exactly its size's rows;
-  - **ratio:** `T(20000) / max(T(4000), 100 ms)` is at most 8. Linear growth
-    predicts about 5 and quadratic growth about 25. The 100 ms floor keeps a
-    fast small size from turning noise into a ratio failure;
-  - **ceiling:** `T(20000)` is at most 3 s.
+  - **rows:** every full open, warm-up included, decoded exactly its size's
+    rows (a failure means the forcing step did not leave the head unrecorded);
+  - **ratio:** `T(20000) / max(T(4000), 100 ms)` is at most K = 6. Linear
+    growth predicts at most 5 and quadratic growth about 17 (25 with no flat
+    part). The 100 ms floor keeps a fast small size from turning noise into a
+    ratio failure;
+  - **ceiling:** `T(20000)` is at most 1 s;
+  - **bound-rows:** every recorded reopen decoded 0 usage rows (a failure means
+    the record did not bind the reopen).
 
-**The bounds are provisional.** The validation-record change replaces them
-with calibrated bounds and their derivation. It also adds the assertion that
-a recorded reopen decodes 0 usage rows; that is left out until then, because
-every writable open scans the whole ledger.
+**Bounds and their derivation.** The numbers below are measured scan-1 medians
+of the first four Ubuntu runs of this job, whose bounds were provisional and
+whose every open scanned (after the primary-key paging of the scans), as
+`T(4000) / T(20000)` in ms: 45.8 / 169.9, 64.3 / 235.8, 51.9 / 177.3 and
+56.7 / 212.4. The rest is arithmetic on them.
 
-**Output.** Every run prints the per-size scan medians and samples, the
-second scan, the usage block, the whole open, the ratio and the bounds, and
-appends them to the job summary. A failed assertion also writes every
+- **Linear rate.** Two points per run give 7.8, 10.7, 7.8 and 9.7 µs per row
+  over a flat part of 14.8, 21.4, 20.6 and 17.8 ms. The worst run is
+  10.7 µs per row over 21.4 ms; its prediction at 20,000 rows is
+  21.4 + 20,000 × 0.0107 = 236 ms, which is the worst measured T(20000).
+- **K = 6.** The unfloored ratio of the four runs is 3.7, 3.7, 3.4 and 3.7
+  (at most 3.75), below the ideal 5 because of the flat part. K = 6 is 1.6
+  times the worst 3.75. A quadratic scan scales the variable part by 25, so
+  the worst run predicts 21.4 + 25 × (64.3 − 21.4) = 1,094 ms, a ratio of 17,
+  nearly three times K.
+- **Floor.** Every Ubuntu T(4000) is below the 100 ms floor, so the ratio check
+  is in practice `T(20000) <= 6 × 100 ms = 600 ms`, 2.5 times the worst 236 ms.
+  It is the binding check there.
+- **Ceiling = 1 s.** 4.2 times the worst 236 ms, below the quadratic
+  prediction of 1,094 ms and 30 times under the 30 s open deadline. It binds
+  only when T(4000) exceeds about 167 ms (1,000 / 6), on a runner about 2.6
+  times slower than the slowest measured (64.3 ms).
+- **To recalibrate**, rerun the job on Ubuntu, take the worst of the printed
+  `T(4000) / T(20000)` pairs, repeat the arithmetic and change `CALIBRATED` and
+  `DERIVATION` in `test_support/usage_scan.rs` together: the report prints both.
+  An engine upgrade can change a table's content hash, which reads as a missing
+  record and costs one full open; the forcing step makes the check independent
+  of it.
+
+**Output.** Every run prints the per-size scan medians and samples of the full
+opens and of the recorded reopens, the second scan, the usage block, the whole
+open, the ratio, the bounds and their derivation, and appends them to the job
+summary. A failed assertion also writes every
 timeline to standard error. The records (`records.jsonl`, `verdict.json`),
 timelines, owner logs and ageing logs are uploaded as
 `ci-usage-scan-attempt-<n>` on any outcome.
