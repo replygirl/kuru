@@ -60,7 +60,9 @@ The same shape appears in `session_index_page` (`/cost`) and in
 |---|---|---|---|
 | One owned-state page, median of 10 (4,550 / 20,500 / 80,075 rows) | 13.09 / 64.35 / 270.39 ms | 0.40 / 0.42 / 0.49 ms | Unit 7 research §3.4: APFS clones of the unit 6b aged stores, Dolt 2.3.5 `sql-server`, SQL-level `PREPARE … EXECUTE` |
 | One full owned-state walk, SQL only (same stores) | 0.537 / 10.501 / 157.505 s | 0.020 / 0.083 / 0.273 s | Same |
-| One full `validate_branch`-equivalent walk through sqlx's binary protocol, SQL plus decode (aged 1k / 5k / 20k) | recorded in verification 1.3 | recorded in verification 1.3 | This change: production page and decode code against fresh APFS clones of the aged stores |
+| One full owned-state walk through sqlx's binary protocol, bound as production binds it, median of 5 after (aged 1k / 5k / 20k: 4,550 / 20,500 / 80,075 rows) | 0.528 / 10.324 / 153.749 s (one walk) | 0.027 / 0.109 / 0.422 s | This change: an uncommitted harness in the crate's test module calling the old query and the production `owned_state_page` against fresh APFS clones of the unit 6b aged stores, pinned Dolt 2.3.5 `sql-server`, macOS arm64, debug test build, load average 4-19 |
+| One page through sqlx, median over the walk | 13.73 / 62.82 / 241.83 ms | 0.71 / 0.67 / 0.66 ms | Same |
+| Whole `validate_branch` (status, historical schema, walk, decode and key checks), median of 5, after | not measured | 0.087 / 0.361 / 1.379 s | Same; debug build (workspace code at opt-level 0), so the decode share is an upper bound for release |
 
 ## Impact
 
