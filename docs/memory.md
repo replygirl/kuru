@@ -106,12 +106,47 @@ Independent opens perform those checks concurrently; the exclusive installation
 lock is reserved for missing-cache extraction and atomic publication. Corrupt
 existing caches fail before execution and remain preserved for inspection.
 
-Before an application command opens memory, Kuru may print bounded progress on
-standard error for the current work: waiting for private ownership, checking or
-extracting the verified runtime, preparing and opening the database, then ready.
-These messages do not estimate time or prove a stage succeeded; the command's
-ordinary result remains authoritative. JSON and other command output stay on
-standard output, and library callers do not receive progress messages.
+While an application command opens memory, Kuru shows one plain sentence about
+what it is doing at that moment, and nothing else: no title, no label, no
+elapsed time and no line when memory is ready. These five sentences are the
+whole set; each ends with an ellipsis.
+
+- `Opening this project's memory…` is true for the whole open and is shown
+  first.
+- `Getting Kuru's memory ready on this computer…` while Kuru unpacks or checks
+  its bundled database engine for the first time on this computer, or waits for
+  another copy of Kuru that is doing so.
+- `Creating this project's memory…` while the project has no memory yet and this
+  open creates it, including finishing an import or an interrupted setup.
+- `Upgrading this project's memory…` while an existing project's memory is
+  upgraded to this version of Kuru.
+- `Waiting for another copy of Kuru to finish with this project's memory…` while
+  another Kuru process holds the project's memory, often the previous command's
+  service while it shuts down.
+
+The sentence follows the work being done, not a count of internal steps: stages
+that begin nothing a person would recognise keep the current sentence, and so
+does any stage added later. A wait shorter than one 100 ms tick may never be
+shown. On a terminal the sentence is rewritten in place on one line, shortened
+with its ellipsis kept when the terminal is narrow, and erased when memory is
+ready, so nothing remains. When standard error is not a terminal, each new
+sentence is written once, whole, on its own line. An interactive session whose
+standard error is redirected but whose standard output is a terminal still shows
+the sentence on that terminal before the interface takes the screen; it is
+erased before the interface opens. That is the only case in which it goes
+through standard output; command output, including JSON, never receives it, and
+library callers receive nothing.
+The sentence does not estimate time and does not prove a stage succeeded; the
+command's ordinary result remains authoritative. The sentence cannot fail or
+delay the open: the owner publishes what it is doing in a small activity record
+that grants no authority, is never read to elect, attach, recover or retire, and
+is removed when the owner closes. If the record cannot be written the command
+shows only the opening sentence. When an inspection command's own open installs
+the engine and cannot remove leftover setup files, it prints one notice on a
+line of its own after the sentence is erased and memory is ready, "Kuru could
+not remove some leftover setup files; it will try again on a later start." when
+the stage is receipted, otherwise the not-retried notice quoted below. A service
+started on behalf of a command has no terminal and reports none.
 
 Writable runtime commands attach to the private project memory service while
 retaining the existing one-conversation driver lease. This phase does not admit
@@ -129,9 +164,9 @@ the command never attaches, for example because it died first, the service keeps
 serving other clients and exits at its first empty moment once
 `memory.startup_timeout_secs` has passed since it published its endpoint, with a
 warning in its log. A command that starts while the previous service is still
-shutting down waits for that shutdown and then starts or attaches to a
-successor, within the same timeout; meeting a retiring service is not an error
-in itself. If the shutdown outlasts the timeout, the error says the previous
+shutting down waits for that shutdown, shows the waiting sentence while it does,
+and then starts or attaches to a successor, within the same timeout; meeting a
+retiring service is not an error in itself. If the shutdown outlasts the timeout, the error says the previous
 service was still shutting down.
 
 A writable session keeps at least one attachment across a cancelled or failed
@@ -389,8 +424,12 @@ crashed worker may not. Kuru records a retained stage before it releases the
 installation lock, so another installer never finds an unrecorded one. A failed activation instead keeps its stage
 deliberately as evidence and names it in the error. No stage whose removal is
 still uncertain is deleted. If even the receipt cannot be written, diagnostics
-say so, as does the startup notice when the engine was published: that stage is
-never collected automatically and has to be removed by hand.
+say so, as does a notice on standard error when an inspection command's own open
+published the engine: "Kuru could not remove some leftover setup files from the
+tools folder of its data directory, and will not retry. Remove them by hand when
+no copy of Kuru is running." (with `memory.cache_dir` set it names that folder
+instead). That stage is never collected automatically and has to be removed by
+hand.
 
 ## Backup and recovery
 

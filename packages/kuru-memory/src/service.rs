@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::progress::{MemoryOpenStage, ProgressReporter};
+
+pub(crate) mod activity;
 pub(crate) mod rpc;
 pub use rpc::{ServiceCall, ServiceReply, ServiceRequest, ServiceResponse, ServiceValue};
 
@@ -64,27 +67,6 @@ fn fixture_startup_stages_enabled() -> bool {
 }
 
 #[cfg(feature = "test-support")]
-async fn open_owner_store_with_fixture_stages(
-    options: crate::store::OpenOptions,
-) -> Result<crate::store::MemoryStore> {
-    if !fixture_startup_stages_enabled() {
-        return crate::store::MemoryStore::open(options).await;
-    }
-    let (mut progress, opening) = crate::store::MemoryStore::open_observed(options);
-    tokio::pin!(opening);
-    let mut progress_open = true;
-    loop {
-        tokio::select! {
-            result = &mut opening => return result,
-            stage = progress.recv(), if progress_open => match stage {
-                Some(stage) => eprintln!("memory startup stage: {stage:?}"),
-                None => progress_open = false,
-            },
-        }
-    }
-}
-
-#[cfg(feature = "test-support")]
 fn fixture_startup_observations(
     options: &crate::store::OpenOptions,
     diagnostic: &mut File,
@@ -111,6 +93,9 @@ fn fixture_startup_observations(
                             | "PreparingDatabase"
                             | "OpeningDatabase"
                             | "Ready"
+                            | "CreatingDatabase"
+                            | "UpgradingDatabase"
+                            | "StartingMemoryService"
                     )
                 })
                 .map(str::to_owned)
@@ -487,6 +472,8 @@ impl ServiceAttachment {
 /// differenced, so the rounded phases sum to the whole elapsed wait. The owner
 /// reports no stage timing to the client; this covers only what the client
 /// observes itself. It is built only after the child was just seen running.
+/// The owner may report open stages through the activity record; see
+/// `service/activity.rs`.
 struct ReadinessSplit {
     started: tokio::time::Instant,
     elected: tokio::time::Instant,
@@ -522,11 +509,13 @@ impl std::fmt::Display for ReadinessSplit {
 
 /// Attach to a valid owner, or elect and start one while retaining a distinct
 /// short start lock. Endpoint readiness is the authenticated private handshake;
-/// the child holds the owner lock before publishing it.
-pub async fn attach_or_start(
+/// the child holds the owner lock before publishing it. `progress` receives
+/// only the stages this client observes or forwards from its own owner.
+pub(crate) async fn attach_or_start_observed(
     options: &crate::store::OpenOptions,
     project: &Path,
     executable: &Path,
+    progress: &mut ProgressReporter,
 ) -> Result<ServiceAttachment> {
     ensure_project_scope(project, &options.project_scope)?;
     options.config.validate()?;
@@ -562,7 +551,8 @@ pub async fn attach_or_start(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let attached = attach_or_spawn_elected(options, project, executable, started, deadline).await;
+    let attached =
+        attach_or_spawn_elected(options, project, executable, started, deadline, progress).await;
     // Released explicitly on every path: a sibling's child between fork and
     // exec may hold a duplicate of this lock's description.
     let released = start.release();
@@ -579,6 +569,7 @@ async fn attach_or_spawn_elected(
     executable: &Path,
     started: tokio::time::Instant,
     deadline: tokio::time::Instant,
+    progress: &mut ProgressReporter,
 ) -> Result<ServiceAttachment> {
     let elected = tokio::time::Instant::now();
     if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project)
@@ -598,6 +589,8 @@ async fn attach_or_spawn_elected(
             owner_probe.release()?;
             break;
         }
+        // Reached only while another process holds owner authority.
+        progress.report(MemoryOpenStage::WaitingForProjectOwnership);
         ensure!(
             tokio::time::Instant::now() < deadline,
             "the previous memory service was still shutting down or did not publish a valid endpoint within memory.startup_timeout_secs"
@@ -611,6 +604,8 @@ async fn attach_or_spawn_elected(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let probed = tokio::time::Instant::now();
+    // Ends any wait shown above: a stage is never reported twice.
+    progress.report(MemoryOpenStage::StartingMemoryService);
     #[cfg(feature = "test-support")]
     let mut startup_diagnostic = fixture_startup_stages_enabled()
         .then(|| tempfile::tempfile_in(&options.data_dir))
@@ -632,6 +627,11 @@ async fn attach_or_spawn_elected(
     // here; a token reused from the session's options cannot reach another
     // owner.
     let starter_token = options.starter_token.unwrap_or_else(uuid::Uuid::new_v4);
+    // Only an observed open reads activity, and only its own owner's record.
+    let activity_tag = progress
+        .is_observed()
+        .then(|| activity::activity_tag(&starter_token));
+    let mut forwarded = 0;
     let mut child = ServiceProcess::new(
         spawn_service(
             options,
@@ -692,6 +692,17 @@ async fn attach_or_spawn_elected(
             }
             bail!("memory service readiness deadline exceeded; {split}");
         }
+        // After the deadline check and never after an attach, so the read can
+        // neither move the deadline nor count as a poll.
+        if let Some(tag) = &activity_tag {
+            activity::forward_new(
+                &options.data_dir,
+                &options.project_scope,
+                tag,
+                &mut forwarded,
+                progress,
+            );
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -702,9 +713,10 @@ async fn attach_or_spawn_elected(
 /// The owner lock is probed only while this inspection holds the start lock:
 /// no starter can then be between its election and its owner's single
 /// owner-lock acquisition, which the probe could otherwise make fail.
-pub(crate) async fn attach_existing(
+pub(crate) async fn attach_existing_observed(
     options: &crate::store::OpenOptions,
     project: &Path,
+    progress: &mut ProgressReporter,
 ) -> Result<Option<ServiceAttachment>> {
     ensure_project_scope(project, &options.project_scope)?;
     options.config.validate()?;
@@ -735,6 +747,9 @@ pub(crate) async fn attach_existing(
             if owner_free? {
                 return Ok(None);
             }
+            // Another process holds owner authority. A busy start lock is an
+            // election in progress instead, and is not reported as a wait.
+            progress.report(MemoryOpenStage::WaitingForProjectOwnership);
         }
         ensure!(
             tokio::time::Instant::now() < deadline,
@@ -885,6 +900,31 @@ fn ensure_project_scope(project: &Path, scope: &str) -> Result<()> {
     Ok(())
 }
 
+/// [`attach_or_start_observed`] with nobody observing.
+pub async fn attach_or_start(
+    options: &crate::store::OpenOptions,
+    project: &Path,
+    executable: &Path,
+) -> Result<ServiceAttachment> {
+    attach_or_start_observed(
+        options,
+        project,
+        executable,
+        &mut ProgressReporter::silent(),
+    )
+    .await
+}
+
+/// [`attach_existing_observed`] with nobody observing; only tests inspect
+/// without a reader.
+#[cfg(test)]
+pub(crate) async fn attach_existing(
+    options: &crate::store::OpenOptions,
+    project: &Path,
+) -> Result<Option<ServiceAttachment>> {
+    attach_existing_observed(options, project, &mut ProgressReporter::silent()).await
+}
+
 /// The owner's arguments. A starter token, when given, is the optional
 /// tenth argument; the owner then retires on its own only after an
 /// attachment presents it.
@@ -934,6 +974,10 @@ async fn spawn_service(
     for (name, value) in crate::test_support::lifecycle_trace::forwarded() {
         command.env(name, value);
     }
+    #[cfg(test)]
+    for (name, value) in activity::owner_test_environment() {
+        command.env(name, value);
+    }
     command.spawn().context("start project memory service")
 }
 
@@ -971,11 +1015,17 @@ async fn spawn_service(
             .environment
             .push((STARTUP_STAGE_DIAGNOSTIC_ENV.into(), OsString::from("1")));
     }
+    #[cfg(any(test, feature = "test-support"))]
+    command.environment.extend(activity::forwarded_test_hooks());
     // Test-support measurement only: forward the inert-by-default trace.
     #[cfg(any(test, feature = "test-support"))]
     command
         .environment
         .extend(crate::test_support::lifecycle_trace::forwarded());
+    #[cfg(test)]
+    command
+        .environment
+        .extend(activity::owner_test_environment());
     command
         .spawn()
         .await
@@ -1252,6 +1302,9 @@ pub struct ServiceOwner {
     data_dir: PathBuf,
     receipt_progress: std::sync::Arc<rpc::ReceiptProgress>,
     starter_token: Option<uuid::Uuid>,
+    /// The finished publisher of this owner's open-activity record, retired
+    /// inside `close` while owner authority is still held.
+    activity: Option<activity::Publisher>,
     startup_timeout: Duration,
     /// Taken after the endpoint record was published.
     published: tokio::time::Instant,
@@ -1259,6 +1312,25 @@ pub struct ServiceOwner {
 
 impl ServiceOwner {
     pub async fn open(options: crate::store::OpenOptions, project_path: &Path) -> Result<Self> {
+        Self::open_hooked(options, project_path, activity::OwnerHooks::from_env()).await
+    }
+
+    /// [`Self::open`] with a test's own activity hooks instead of the
+    /// process environment.
+    #[cfg(test)]
+    pub(crate) async fn open_with_activity(
+        options: crate::store::OpenOptions,
+        project_path: &Path,
+        hooks: activity::OwnerHooks,
+    ) -> Result<Self> {
+        Self::open_hooked(options, project_path, hooks).await
+    }
+
+    async fn open_hooked(
+        options: crate::store::OpenOptions,
+        project_path: &Path,
+        hooks: activity::OwnerHooks,
+    ) -> Result<Self> {
         ensure!(
             !options.read_only,
             "memory service owner must open writable storage"
@@ -1271,10 +1343,9 @@ impl ServiceOwner {
         )?
         .context("project already has a memory service owner; wait for its validated endpoint")?;
         lock.verify()?;
-        #[cfg(feature = "test-support")]
-        let store = open_owner_store_with_fixture_stages(options.clone()).await?;
-        #[cfg(not(feature = "test-support"))]
-        let store = crate::store::MemoryStore::open(options.clone()).await?;
+        // On failure the store open retires its own record before returning,
+        // while this owner lock is still held.
+        let (store, activity) = activity::open_owner_store(options.clone(), hooks).await?;
         let prepared = async {
             let (listener, address) =
                 ServiceListener::bind(&options.data_dir, &options.project_scope)?;
@@ -1290,6 +1361,9 @@ impl ServiceOwner {
             Err(error) => {
                 // A failed listener or publication must still reap Dolt while
                 // this process retains its service-owner authority.
+                if let Some(publisher) = activity {
+                    activity::retire(publisher, &options.data_dir, &options.project_scope).await;
+                }
                 if let Err(cleanup) = store.close().await {
                     return Err(error.context(format!(
                         "reap Dolt after memory service startup failed: {cleanup:#}"
@@ -1306,6 +1380,7 @@ impl ServiceOwner {
             data_dir: options.data_dir,
             receipt_progress: std::sync::Arc::new(rpc::ReceiptProgress::default()),
             starter_token: options.starter_token,
+            activity,
             startup_timeout: Duration::from_secs(options.config.startup_timeout_secs),
             published: tokio::time::Instant::now(),
         })
@@ -1533,6 +1608,7 @@ impl ServiceOwner {
             listener,
             record,
             data_dir,
+            activity,
             ..
         } = self;
         #[cfg(test)]
@@ -1543,6 +1619,11 @@ impl ServiceOwner {
         let retired = record.retire(&data_dir, &lock);
         #[cfg(test)]
         ClosePause::reached(pause, ClosePoint::AfterEndpointRetire).await;
+        // Still under owner authority, so no successor's record can share the
+        // name yet. Best effort: a failure here never fails the close.
+        if let Some(publisher) = activity {
+            activity::retire(publisher, &data_dir, &record.authority.project_scope).await;
+        }
         // A failed retirement still closes the store and reaps Dolt; the
         // owner lock is released only after that close has returned.
         let closed = store.close().await;
@@ -6677,7 +6758,9 @@ mod tests {
 
     /// A canonical project under `root`, its scope, private data directory
     /// and offline fixture options.
-    fn owner_fixture(root: &Path) -> Result<(PathBuf, String, PathBuf, crate::store::OpenOptions)> {
+    pub(super) fn owner_fixture(
+        root: &Path,
+    ) -> Result<(PathBuf, String, PathBuf, crate::store::OpenOptions)> {
         let project = root.join("project");
         std::fs::create_dir(&project)?;
         let project = project.canonicalize()?;
@@ -6699,7 +6782,7 @@ mod tests {
 
     /// An authenticated bare attachment to the published owner, presenting
     /// `starter_token` when given.
-    async fn attach_raw(
+    pub(super) async fn attach_raw(
         data: &Path,
         scope: &str,
         starter_token: Option<uuid::Uuid>,
@@ -6720,7 +6803,7 @@ mod tests {
     }
 
     /// Probe the owner lock, releasing it at once when free.
-    fn owner_lock_free(options: &crate::store::OpenOptions) -> Result<bool> {
+    pub(super) fn owner_lock_free(options: &crate::store::OpenOptions) -> Result<bool> {
         match ServiceLock::try_acquire(
             &options.data_dir,
             &options.project_scope,

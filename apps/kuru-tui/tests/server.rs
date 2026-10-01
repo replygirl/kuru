@@ -20,18 +20,10 @@ struct Server(Child);
 
 const MAX_STARTUP_LINES: usize = 16;
 
+/// A fixed open sentence or the first-run notice; never a labelled line.
 fn expected_startup_line(line: &str) -> bool {
-    matches!(
-        line.trim_end(),
-        "Memory: waiting for project ownership…"
-            | "Memory: waiting for verified runtime cache…"
-            | "Memory: verifying cached runtime…"
-            | "Memory: extracting embedded runtime…"
-            | "Memory: checking runtime version…"
-            | "Memory: preparing database…"
-            | "Memory: opening database…"
-            | "Memory: ready."
-    ) || line.starts_with("Memory is ready at ")
+    kuru::memory_activity::SENTENCES.contains(&line.trim_end())
+        || line.starts_with("Memory is ready at ")
 }
 
 impl Drop for Server {

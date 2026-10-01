@@ -449,6 +449,12 @@ pub use crate::service::FixtureLoggedOwner;
 #[cfg(feature = "test-support")]
 pub use crate::service::OWNER_DIAGNOSTIC_ENV;
 
+/// Owner open-activity hooks, read by the owner process itself, so a test
+/// sets them on the command-line child whose owner it observes (Windows
+/// owners receive them by explicit forwarding). Inert when unset.
+#[cfg(feature = "test-support")]
+pub use crate::service::activity::{OPEN_HOLD_DIR_ENV, WRITE_FAILURE_ENV};
+
 /// Start the actual service executable with one caller-owned private stderr
 /// file, and wait for its authenticated endpoint. The returned fixture holds
 /// the attachment of the fixture that started it, which is the owner's
@@ -549,6 +555,32 @@ pub async fn await_owner_release(options: &OpenOptions) -> Result<()> {
         crate::service::ServiceLockKind::Owner,
     )
     .await
+}
+
+/// A project's owner authority held by the test, as a running owner holds it,
+/// so a command-line child that elects an owner finds it busy.
+#[cfg(any(test, feature = "test-support"))]
+pub struct HeldOwnerLock(crate::service::ServiceLock);
+
+#[cfg(any(test, feature = "test-support"))]
+impl HeldOwnerLock {
+    /// Release the authority, letting a waiting child proceed.
+    pub fn release(self) -> Result<()> {
+        self.0.release()
+    }
+}
+
+/// Take `options`' project owner lock. Fails when another process holds it,
+/// so call it only after the previous owner's exit has been awaited.
+#[cfg(any(test, feature = "test-support"))]
+pub fn hold_owner_lock(options: &OpenOptions) -> Result<HeldOwnerLock> {
+    crate::service::ServiceLock::try_acquire(
+        &options.data_dir,
+        &options.project_scope,
+        crate::service::ServiceLockKind::Owner,
+    )?
+    .map(HeldOwnerLock)
+    .context("the project's owner lock is already held")
 }
 
 /// Wait until a managed fixture's store has no live Dolt, and record that on

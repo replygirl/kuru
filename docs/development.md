@@ -594,6 +594,53 @@ starter attaches. An owner started without one (a client from before the token,
 after an update replaced the executable) treats any authenticated attachment as
 reaching it.
 
+While it opens, the owner publishes the open stages it has begun as a small
+private record beside its endpoint (`activity.json`, in `service/activity.rs`).
+The record carries a SHA-256 value derived from the starter token, never the
+token, and the starting client forwards only a record carrying the value for
+the token it passed, between its readiness polls. The record grants no
+authority: election, attachment, recovery and retirement never read it, and a
+failed write never fails or delays the open. The owner retires it (rename,
+then remove) inside its close, after the endpoint is retired and before the
+store closes, and on both error returns of its open. Two hooks, read only by
+the owner process under `test`/`test-support` (Windows owners receive them by
+explicit forwarding), let tests follow events instead of sleeping:
+`KURU_TEST_MEMORY_ACTIVITY_WRITE_FAILURE=1` makes every record write fail, and
+`KURU_TEST_MEMORY_OPEN_HOLD_DIR=<dir>` holds the owner's open at stage `X`
+while `<dir>/X.hold` exists, once a record holding `X` has been written, until
+that file is removed. Tests set them on the command-line child, never on the
+runner's own environment (`test_support::{WRITE_FAILURE_ENV,
+OPEN_HOLD_DIR_ENV}`), and remove a hold once the sentence for that stage is
+visible. `test_support::hold_owner_lock` takes a project's owner lock, so a
+child that elects an owner finds it busy and shows the waiting sentence until
+`HeldOwnerLock::release`.
+
+With `KURU_OPEN_MARKERS=1` (exactly `1`; unset or any other value changes
+nothing) the command line writes open-time marker lines to standard error for
+the open-time harness. This is a release-binary feature, not test support, and
+it is documented here only. Each marker is one ASCII line, written and flushed
+at once, whether or not standard error is a terminal:
+
+```text
+kuru-open-marker v1 <event> <monotonic_ns>
+```
+
+`<event>` is `open-start` (before the client's first attach attempt),
+`waiting-ownership` (once, and only when the open waited for another copy of
+Kuru) or `ready` (where memory becomes ready, including an attach to a running
+owner; never written when the open fails). `<monotonic_ns>` is an unsigned
+decimal count of nanoseconds from one monotonic clock anchor per process, taken
+as the open begins, so `open-start` is near zero and the three events share one
+clock. Markers never reach standard output. When the sentence is on the same
+terminal, its line is erased before a marker is written and drawn again below
+it, so a marker never shares a row with a sentence. A marker that cannot be
+written is dropped without affecting the open or the sentences. The first
+standard-error line of any kind is `open-start` with markers on, and the
+opening sentence without them. Each command's owner retires as soon as it is
+unused, so a measurement that repeats commands must await the previous owner's
+exit (as `await_owner_exit` does in the command-line tests); otherwise the next
+open waits for it and shows the waiting sentence.
+
 A lost-reply test that pauses a request with the fixture reply pause
 (`ReplyPause`, or `test_support::ReplyBarrier` outside kuru-memory), cancels it
 and then expects one `reconcile` or recovery call to return a definite answer

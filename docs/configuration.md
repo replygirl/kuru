@@ -59,10 +59,13 @@ The managed document shape is published at
 `configuration.v1.schema.json#/$defs/managed`. Native parsing and semantic
 validation remain authoritative.
 
-When a command opens memory, fixed progress messages appear on standard error
-while Kuru acquires private ownership, verifies or extracts the bundled runtime,
-and opens the database. They describe work in progress, not an estimate or a
-successful open; JSON and other command results remain on standard output.
+While a command opens memory, Kuru shows one plain sentence on standard error
+about what it is doing. On a terminal it is rewritten in place and erased when
+memory is ready; otherwise each new sentence remains as its own line. An
+interactive session whose standard error is redirected shows the sentence on its
+terminal standard output instead, erased before the interface opens. JSON and
+other command results remain on standard output and never receive it. See
+[project memory](memory.md) for the sentences and when each appears.
 Every ancestor directory through the project root can provide `AGENTS.md` and
 `CLAUDE.md` instructions. Kuru reads outermost directories first, then the
 project root; within one directory it reads `AGENTS.md` before `CLAUDE.md`.

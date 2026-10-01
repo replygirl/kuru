@@ -5,6 +5,7 @@ pub mod cli;
 mod commands;
 mod diagnostics;
 mod instruction_gate;
+pub mod memory_activity;
 mod memory_export;
 mod memory_notice;
 mod permission_store;

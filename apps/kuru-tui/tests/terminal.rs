@@ -2373,13 +2373,80 @@ fn real_pty_reports_actual_optional_context_omission_without_erasing_history() -
     terminal.assert_restored()
 }
 
+/// The offset of the last `needle` in `haystack`.
+fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    rfind_bytes(haystack, needle).is_some()
+}
+
+/// The terminal bytes written before the interface takes the screen.
+fn primary_screen_bytes(output: &[u8]) -> Result<&[u8]> {
+    let alternate = output
+        .windows(b"\x1b[?1049h".len())
+        .position(|bytes| bytes == b"\x1b[?1049h")
+        .context("terminal did not enter its alternate screen")?;
+    Ok(&output[..alternate])
+}
+
+/// After the last sentence the line is padded, then erased with `\r`, spaces
+/// and `\r`; no sentence bytes follow that erase. Other bytes, such as the
+/// first-run notice, may follow it.
+fn assert_sentence_erased(startup: &[u8]) -> Result<()> {
+    let end = kuru::memory_activity::SENTENCES
+        .iter()
+        .filter_map(|sentence| {
+            rfind_bytes(startup, sentence.as_bytes()).map(|at| at + sentence.len())
+        })
+        .max()
+        .context("memory startup wrote no sentence")?;
+    let after = &startup[end..];
+    let after = &after[after.iter().take_while(|byte| **byte == b' ').count()..];
+    let blanks = after
+        .strip_prefix(b"\r")
+        .map(|rest| rest.iter().take_while(|byte| **byte == b' ').count());
+    ensure!(
+        blanks.is_some_and(|blanks| blanks > 0 && after[1 + blanks..].starts_with(b"\r")),
+        "the last sentence was not erased: {:?}",
+        String::from_utf8_lossy(&after[..after.len().min(80)])
+    );
+    Ok(())
+}
+
+/// Each run of the interface: the first creates the project and holds its
+/// owner at creation until the creating sentence is on the terminal; a later
+/// one reopens it after the previous owner exited.
 fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> Result<()> {
+    use kuru::memory_activity::{CREATING, OPENING, SENTENCES};
+    let holds = sandbox.root.path().join("holds");
+    let hold = holds.join("CreatingDatabase.hold");
     let mut command = sandbox.command("demo");
     command.args(["--mode", "freudian"]);
     if reduced {
         command.env("KURU_REDUCED_MOTION", "1");
     }
+    if expect_notice {
+        std::fs::create_dir(&holds)?;
+        std::fs::write(&hold, b"")?;
+        command.env(kuru_memory::test_support::OPEN_HOLD_DIR_ENV, &holds);
+    } else {
+        // A reopen that landed while the previous owner still closed would
+        // show the waiting sentence instead of only the opening one.
+        memory::await_owner_exit(&memory_options(sandbox)?)?;
+    }
     let mut terminal = Terminal::spawn(command, 35, 120)?;
+    if expect_notice {
+        terminal.wait(
+            "the creating sentence on the terminal",
+            sandbox.startup_timeout,
+            |terminal| Ok(contains_bytes(&terminal.output, CREATING.as_bytes())),
+        )?;
+        std::fs::remove_file(&hold)?;
+    }
     let expected = if expect_notice {
         vec!["KURU", "enter send", "Memory is ready at"]
     } else {
@@ -2395,46 +2462,29 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
         sandbox.startup_timeout,
     )?;
     terminal.wait_composer_frame(&expected, READY_TIMEOUT)?;
-    let alternate = terminal
-        .output
-        .windows(b"\x1b[?1049h".len())
-        .position(|bytes| bytes == b"\x1b[?1049h")
-        .context("terminal did not enter its alternate screen")?;
-    let startup = &terminal.output[..alternate];
-    let waiting = b"Memory: waiting for project ownership";
-    let ready = b"Memory: ready.";
-    let waiting_at = startup
-        .windows(waiting.len())
-        .position(|bytes| bytes == waiting)
-        .context("memory startup did not report project-ownership wait before the first completed TUI frame")?;
-    let ready_at = startup
-        .windows(ready.len())
-        .position(|bytes| bytes == ready)
-        .context("memory startup did not report ready before the first completed TUI frame")?;
-    assert!(
-        waiting_at < ready_at,
-        "memory startup reported ready before ownership wait"
+    let startup = primary_screen_bytes(&terminal.output)?;
+    ensure!(
+        contains_bytes(startup, OPENING.as_bytes()),
+        "memory startup did not show its opening sentence before the first completed TUI frame"
     );
-    let mut previous = waiting_at;
-    for stage in [
-        b"Memory: waiting for verified runtime cache".as_slice(),
-        b"Memory: extracting embedded runtime",
-        b"Memory: verifying cached runtime".as_slice(),
-        b"Memory: checking runtime version",
-        b"Memory: preparing database",
-        b"Memory: opening database",
-    ] {
-        if let Some(position) = startup
-            .windows(stage.len())
-            .position(|bytes| bytes == stage)
-        {
-            assert!(
-                position > previous && position < ready_at,
-                "memory startup reordered {stage:?} before the first completed TUI frame"
+    ensure!(
+        !contains_bytes(startup, b"Memory:"),
+        "memory startup still wrote a labelled line"
+    );
+    ensure!(
+        contains_bytes(startup, CREATING.as_bytes()) == expect_notice,
+        "the creating sentence belongs to the first run only"
+    );
+    if !expect_notice {
+        // A reopen after the previous owner exited shows nothing else.
+        for sentence in SENTENCES.iter().filter(|sentence| **sentence != OPENING) {
+            ensure!(
+                !contains_bytes(startup, sentence.as_bytes()),
+                "a reopen showed {sentence:?}"
             );
-            previous = position;
         }
     }
+    assert_sentence_erased(startup)?;
     assert!(
         terminal
             .output
@@ -2493,6 +2543,136 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
     terminal.wait_exit(EXIT_TIMEOUT)?;
     drop(resume);
     assert!(terminal.output.windows(4).any(|bytes| bytes == b"demo"));
+    terminal.assert_restored()
+}
+
+/// T18: an interactive session whose standard error is redirected shows its
+/// sentence on the terminal, before the interface, and writes none to the file.
+#[test]
+fn real_pty_redirected_standard_error_still_shows_the_sentence_on_the_terminal() -> Result<()> {
+    use kuru::memory_activity::{OPENING, SENTENCES};
+    let sandbox = Sandbox::new()?;
+    let stderr = sandbox.root.path().join("redirected-stderr");
+    let inner = sandbox.command("demo");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "stderr=$1; shift; exec \"$@\" 2>\"$stderr\"", "sh"])
+        .arg(&stderr)
+        .arg(inner.get_program())
+        .args(inner.get_args());
+    for (name, value) in inner.get_envs() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    let mut terminal = Terminal::spawn(command, 35, 120)?;
+    terminal.wait_composer_frame(&["KURU", "enter send"], sandbox.startup_timeout)?;
+    let startup = primary_screen_bytes(&terminal.output)?;
+    ensure!(
+        contains_bytes(startup, OPENING.as_bytes()),
+        "the sentence did not reach the terminal"
+    );
+    assert_sentence_erased(startup)?;
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()?;
+    let redirected = std::fs::read(&stderr)?;
+    for sentence in SENTENCES {
+        ensure!(
+            !contains_bytes(&redirected, sentence.as_bytes()),
+            "{sentence:?} was written to the redirected file: {:?}",
+            String::from_utf8_lossy(&redirected)
+        );
+    }
+    Ok(())
+}
+
+/// With markers on, each is a whole line of its own on the same terminal as
+/// the sentence, never inside it: the waiting marker arrives while the opening
+/// sentence is on screen, and the screen holds no sentence once memory is
+/// ready.
+#[test]
+fn real_pty_marker_lines_never_share_a_row_with_the_sentence() -> Result<()> {
+    use kuru::memory_activity::{MARKER_PREFIX, MARKERS_ENV, OPENING, SENTENCES, WAITING};
+    let sandbox = Sandbox::new()?;
+    // An existing project, so every stage after the wait is the opening one.
+    let seed = sandbox
+        .command("demo")
+        .args(["run", "create the project first", "--json"])
+        .output()?;
+    ensure!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    let options = memory_options(&sandbox)?;
+    memory::await_owner_exit(&options)?;
+    let held = kuru_memory::test_support::hold_owner_lock(&options)?;
+
+    let mut command = sandbox.command("demo");
+    command.env(MARKERS_ENV, "1");
+    let mut terminal = Terminal::spawn(command, 35, 120)?;
+    terminal.wait(
+        "the waiting sentence on the terminal",
+        sandbox.startup_timeout,
+        |terminal| Ok(contains_bytes(&terminal.output, WAITING.as_bytes())),
+    )?;
+    held.release()?;
+    terminal.wait_composer_frame(&["KURU", "enter send"], sandbox.startup_timeout)?;
+    let startup = primary_screen_bytes(&terminal.output)?;
+    // A marker comes before the sentence it introduces.
+    for (event, sentence) in [("open-start", OPENING), ("waiting-ownership", WAITING)] {
+        let marker = format!("{MARKER_PREFIX}{event} ");
+        let marker_at = rfind_bytes(startup, marker.as_bytes())
+            .with_context(|| format!("no {event} marker was written"))?;
+        let sentence_at = startup
+            .windows(sentence.len())
+            .position(|bytes| bytes == sentence.as_bytes())
+            .with_context(|| format!("{sentence:?} was never written"))?;
+        ensure!(
+            marker_at < sentence_at,
+            "{event} did not precede {sentence:?}"
+        );
+    }
+    let mut screen = vt100::Parser::new(35, 120, 0);
+    screen.process(startup);
+    let rows: Vec<String> = screen
+        .screen()
+        .rows(0, 120)
+        .map(|row| row.trim_end().to_owned())
+        .collect();
+    let mut previous = 0_u128;
+    let mut events = Vec::new();
+    for row in rows.iter().filter(|row| row.contains("kuru-open-marker")) {
+        let rest = row
+            .strip_prefix(MARKER_PREFIX)
+            .with_context(|| format!("a marker row holds more than the marker: {row:?}"))?;
+        let (event, nanoseconds) = rest
+            .split_once(' ')
+            .with_context(|| format!("malformed marker row {row:?}"))?;
+        let nanoseconds: u128 = nanoseconds
+            .parse()
+            .with_context(|| format!("marker clock is not decimal in {row:?}"))?;
+        ensure!(
+            nanoseconds >= previous,
+            "marker clock went backwards: {rows:?}"
+        );
+        previous = nanoseconds;
+        events.push(event);
+    }
+    ensure!(
+        events == ["open-start", "waiting-ownership", "ready"],
+        "{rows:?}"
+    );
+    for row in &rows {
+        ensure!(
+            !SENTENCES.iter().any(|sentence| row.contains(sentence)),
+            "a sentence is still on the screen after ready: {rows:?}"
+        );
+    }
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
     terminal.assert_restored()
 }
 

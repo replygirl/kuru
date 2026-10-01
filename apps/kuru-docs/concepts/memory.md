@@ -63,10 +63,18 @@ No separate engine installation or runtime download is needed. `memory.cache_dir
 selects another extraction directory. Corrupt existing caches fail before
 execution and remain preserved.
 
-Before memory opens, Kuru shows a small fixed progress sequence on standard
-error for current local work such as acquiring ownership, checking or extracting
-the runtime, and opening the database. It is not a timer or proof that a stage
-succeeded. Command output, including JSON, remains on standard output.
+While memory opens, Kuru shows one plain sentence about what it is doing, such as
+"Opening this project's memory…", "Getting Kuru's memory ready on this computer…"
+on first use, "Creating this project's memory…" for a new project, "Upgrading
+this project's memory…" after an update, or "Waiting for another copy of Kuru to
+finish with this project's memory…" while another copy of Kuru still holds it.
+On a terminal the sentence is rewritten in place and erased when memory is
+ready; when standard error is not a terminal, each new sentence is written once
+on its own line. An interactive session whose standard error is redirected but
+whose standard output is a terminal shows the sentence on that terminal instead,
+rewritten in place and erased before the interface opens. It is not a timer or
+proof that a step succeeded. Command output, including JSON, remains on standard
+output and never receives the sentence.
 
 The first conversation/runtime command (`kuru run`, `kuru dream`, `kuru
 undo-dream`, the TUI, or `kuru serve`) that opens a writable project store also
@@ -175,9 +183,10 @@ stage before it releases the installation lock, so another installer never finds
 an unrecorded one. A failed activation instead
 keeps its stage deliberately as evidence and names it in the error. No stage
 whose removal is still uncertain is deleted. If even the receipt cannot be
-written, diagnostics say so, as does the startup notice when the engine was
-published: that stage is never collected automatically and has to be removed by
-hand.
+written, diagnostics say so, as does a notice on standard error when an
+inspection command's own open published the engine: Kuru could not remove some
+leftover setup files and will not retry, and they have to be removed by hand when
+no copy of Kuru is running. That stage is never collected automatically.
 
 An operating-system writer lock prevents two Kuru processes from overwriting the same project's topology. Read-only session listing remains available.
 
