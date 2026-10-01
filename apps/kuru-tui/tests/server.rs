@@ -20,6 +20,7 @@ struct Server(Child);
 
 const MAX_STARTUP_LINES: usize = 16;
 
+/// A fixed open sentence or the first-run notice; never a labelled line.
 fn expected_startup_line(line: &str) -> bool {
     kuru::memory_activity::SENTENCES.contains(&line.trim_end())
         || line.starts_with("Memory is ready at ")

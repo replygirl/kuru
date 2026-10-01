@@ -948,21 +948,150 @@ fn service_cleanup_release_attaches_its_failure_to_the_fixture_outcome() {
         .unwrap();
 }
 
-/// Interim (unit 2 WP-C): the plain open sentences, until WP-D's T14-T17
-/// assertions replace this helper.
+/// The lines a command wrote on standard error before the first-run notice,
+/// which is the one non-sentence line a successful open can leave.
+fn startup_lines(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .take_while(|line| !line.starts_with("Memory is ready at "))
+        .collect()
+}
+
+/// Whatever ordering a command's open happened to take: the opening sentence
+/// first, only fixed sentences, none repeated back to back, no label.
 fn assert_memory_progress(stderr: &str) {
     use kuru::memory_activity::{OPENING, SENTENCES};
     let lines: Vec<_> = stderr.lines().collect();
     assert_eq!(lines.first(), Some(&OPENING), "{stderr}");
     assert!(!stderr.contains("Memory:"), "{stderr}");
-    let sentences: Vec<_> = lines
-        .iter()
-        .filter(|line| SENTENCES.contains(line))
-        .collect();
+    let startup = startup_lines(stderr);
     assert!(
-        sentences.windows(2).all(|pair| pair[0] != pair[1]),
+        startup.iter().all(|line| SENTENCES.contains(line)),
         "{stderr}"
     );
+    assert!(
+        startup.windows(2).all(|pair| pair[0] != pair[1]),
+        "{stderr}"
+    );
+}
+
+/// A command-line child whose standard error is read line by line while it
+/// runs, so a test can hold the owner it started until the sentence for the
+/// stage it holds has been shown. Standard output is drained concurrently:
+/// a full pipe would block the command and its open.
+#[cfg(unix)]
+struct Streaming {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+    seen: Vec<String>,
+    stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
+}
+
+#[cfg(unix)]
+impl Streaming {
+    /// The longest a stage may take to show: the owner's own startup bound
+    /// plus the engine's installation.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+    fn spawn(command: &mut Command) -> Self {
+        use std::{io::BufRead, process::Stdio};
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let stdout = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        });
+        let (sender, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr).split(b'\n') {
+                let Ok(line) = line else { break };
+                if sender
+                    .send(String::from_utf8_lossy(&line).into_owned())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            lines,
+            seen: Vec::new(),
+            stdout: Some(stdout),
+        }
+    }
+
+    /// Read standard error until `line` has been written, and no further.
+    fn until(&mut self, line: &str) {
+        let deadline = std::time::Instant::now() + Self::WAIT;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.lines.recv_timeout(remaining) {
+                Ok(found) => {
+                    let done = found == line;
+                    self.seen.push(found);
+                    if done {
+                        return;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!(
+                        "the command's standard error ended before it wrote {line:?}; it wrote {:?}",
+                        self.seen
+                    );
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = self.child.kill();
+                    panic!(
+                        "the command wrote no {line:?} within {:?}; it wrote {:?}",
+                        Self::WAIT,
+                        self.seen
+                    );
+                }
+            }
+        }
+    }
+
+    /// Wait for the command to end, and return its status, its standard
+    /// output and every line it wrote on standard error.
+    fn finish(mut self) -> (std::process::ExitStatus, Vec<u8>, Vec<String>) {
+        let deadline = std::time::Instant::now() + Self::WAIT;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.lines.recv_timeout(remaining) {
+                Ok(found) => self.seen.push(found),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = self.child.kill();
+                    panic!(
+                        "the command did not end within {:?}; it wrote {:?}",
+                        Self::WAIT,
+                        self.seen
+                    );
+                }
+            }
+        }
+        let status = self.child.wait().unwrap();
+        let stdout = self.stdout.take().unwrap().join().unwrap();
+        (status, stdout, std::mem::take(&mut self.seen))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Streaming {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 #[tokio::test]
@@ -3206,8 +3335,12 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
     );
 
     // The first command's service retires when that command's last client
-    // detaches, so this command starts its own; if it lands while the first is
-    // still closing it also waits for that close, and the figure includes it.
+    // detaches, so the reopen starts its own. A reopen that landed while the
+    // first was still closing would wait for it and show the waiting
+    // sentence, so the first owner's exit is awaited here.
+    let scope = kuru_runtime::project_scope(&env.project).unwrap();
+    let close =
+        memory::await_owner_exit(&kuru_memory::OpenOptions::new(env.data.clone(), scope)).unwrap();
     let reopen_started = std::time::Instant::now();
     let reopen = env.run(&["run", "reopen memory", "--json"]);
     let reopen_elapsed = reopen_started.elapsed();
@@ -3218,10 +3351,235 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
     );
     let reopen_json: Value = serde_json::from_slice(&reopen.stdout).unwrap();
     assert!(reopen_json["text"].as_str().unwrap().contains("demo"));
-    assert_memory_progress(&String::from_utf8_lossy(&reopen.stderr));
-    eprintln!(
-        "observed isolated CLI startup wall time: cold={cold_elapsed:?}; reopen={reopen_elapsed:?}; no optimization claim"
+    // T15: every stage of a reopen maps to the opening sentence or keeps it.
+    let reopen_stderr = String::from_utf8_lossy(&reopen.stderr);
+    assert_eq!(
+        reopen_stderr.lines().collect::<Vec<_>>(),
+        [kuru::memory_activity::OPENING],
+        "{reopen_stderr}"
     );
+    eprintln!(
+        "observed isolated CLI startup wall time: cold={cold_elapsed:?}; close={close:?}; reopen={reopen_elapsed:?}; no optimization claim"
+    );
+}
+
+/// A sandbox whose engine cache is a new empty private folder, so the first
+/// open of its project unpacks the engine and then creates the project.
+fn cold_sandbox() -> Sandbox {
+    let env = Sandbox::new();
+    let memory = kuru_core::MemoryConfig {
+        cache_dir: Some(env.root.path().join("fresh verified runtime cache")),
+        offline: true,
+        ..Default::default()
+    };
+    std::fs::write(
+        env.root.path().join("config/kuru/config.toml"),
+        toml::to_string(&std::collections::BTreeMap::from([("memory", memory)])).unwrap(),
+    )
+    .unwrap();
+    env
+}
+
+/// T14: a new project with an empty engine cache. The owner is held at each
+/// stage whose sentence is checked until that sentence has been written, so
+/// the order does not depend on timing.
+#[cfg(unix)]
+#[test]
+fn cli_new_project_shows_engine_preparation_then_creation_and_keeps_json_on_stdout() {
+    use kuru::memory_activity::{CREATING, GETTING_READY, OPENING, SENTENCES};
+    use kuru_memory::test_support::OPEN_HOLD_DIR_ENV;
+
+    let env = cold_sandbox();
+    let holds = env.root.path().join("holds");
+    std::fs::create_dir(&holds).unwrap();
+    let extracting = holds.join("ExtractingEmbeddedRuntime.hold");
+    let creating = holds.join("CreatingDatabase.hold");
+    std::fs::write(&extracting, b"").unwrap();
+    std::fs::write(&creating, b"").unwrap();
+
+    let mut run = Streaming::spawn(env.command().env(OPEN_HOLD_DIR_ENV, &holds).args([
+        "run",
+        "new project",
+        "--json",
+    ]));
+    run.until(GETTING_READY);
+    std::fs::remove_file(&extracting).unwrap();
+    run.until(CREATING);
+    std::fs::remove_file(&creating).unwrap();
+    let (status, stdout, lines) = run.finish();
+    let stderr = lines.join("\n");
+
+    assert!(status.success(), "{stderr}");
+    let json: Value = serde_json::from_slice(&stdout).unwrap();
+    assert!(json["text"].as_str().unwrap().contains("demo"));
+    assert!(!stderr.contains("Memory:"), "{stderr}");
+    let startup: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .take_while(|line| !line.starts_with("Memory is ready at "))
+        .collect();
+    assert_eq!(startup.first(), Some(&OPENING), "{stderr}");
+    assert!(
+        startup.iter().all(|line| SENTENCES.contains(line)),
+        "{stderr}"
+    );
+    assert!(
+        startup.windows(2).all(|pair| pair[0] != pair[1]),
+        "{stderr}"
+    );
+    let count = |sentence: &str| startup.iter().filter(|line| **line == sentence).count();
+    let position = |sentence: &str| startup.iter().position(|line| *line == sentence);
+    // How many opening lines fall between them is not fixed: stages that
+    // arrive in one read are drawn once.
+    assert_eq!(count(GETTING_READY), 1, "{stderr}");
+    assert_eq!(count(CREATING), 1, "{stderr}");
+    assert!(position(GETTING_READY) < position(CREATING), "{stderr}");
+    assert_eq!(startup.last(), Some(&CREATING), "{stderr}");
+    assert!(stderr.contains("Memory is ready at"), "{stderr}");
+}
+
+/// T16: another copy of Kuru holds the project's memory. The command shows the
+/// waiting sentence, then the opening sentence once that copy lets go.
+#[cfg(unix)]
+#[test]
+fn cli_waits_for_another_copy_of_kuru_with_the_waiting_sentence() {
+    use kuru::memory_activity::{OPENING, WAITING};
+
+    let env = Sandbox::new();
+    env.success(&["run", "create the project first", "--json"]);
+    let scope = kuru_runtime::project_scope(&env.project).unwrap();
+    let options = kuru_memory::OpenOptions::new(env.data.clone(), scope);
+    memory::await_owner_exit(&options).unwrap();
+    let held = kuru_memory::test_support::hold_owner_lock(&options).unwrap();
+
+    let mut run = Streaming::spawn(env.command().args(["run", "after the wait", "--json"]));
+    run.until(WAITING);
+    held.release().unwrap();
+    let (status, stdout, lines) = run.finish();
+
+    let stderr = lines.join("\n");
+    assert!(status.success(), "{stderr}");
+    let json: Value = serde_json::from_slice(&stdout).unwrap();
+    assert!(json["text"].as_str().unwrap().contains("demo"));
+    // Every stage after the wait on an existing project is the opening one.
+    assert_eq!(lines, [OPENING, WAITING, OPENING], "{stderr}");
+}
+
+/// A record the owner cannot write is never the open's failure and never a
+/// sentence: the command knows only what it observed itself.
+#[test]
+fn cli_open_is_unchanged_when_the_owner_cannot_publish_its_activity() {
+    use kuru::memory_activity::OPENING;
+    use kuru_memory::test_support::WRITE_FAILURE_ENV;
+
+    let env = cold_sandbox();
+    let output = env
+        .command()
+        .env(WRITE_FAILURE_ENV, "1")
+        .args(["run", "unpublished activity", "--json"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["text"].as_str().unwrap().contains("demo"));
+    // Without the record the unpacking and creation sentences are unknown.
+    assert_eq!(startup_lines(&stderr), [OPENING], "{stderr}");
+}
+
+/// One marker line as `(event, nanoseconds)`, or `None` for any other line.
+fn marker(line: &str) -> Option<(&str, u128)> {
+    let rest = line.strip_prefix(kuru::memory_activity::MARKER_PREFIX)?;
+    let (event, nanoseconds) = rest.split_once(' ')?;
+    let digits = nanoseconds.bytes().all(|byte| byte.is_ascii_digit());
+    assert!(
+        digits && !nanoseconds.is_empty() && line.is_ascii(),
+        "not a marker line: {line:?}"
+    );
+    Some((event, nanoseconds.parse().ok()?))
+}
+
+/// The open-time markers are written to standard error, one ASCII line each,
+/// only when `KURU_OPEN_MARKERS` is exactly `1`; standard output stays the
+/// parseable result either way.
+#[test]
+fn cli_open_markers_are_written_to_standard_error_only_when_asked() {
+    use kuru::memory_activity::{MARKER_PREFIX, MARKERS_ENV, OPENING, SENTENCES};
+
+    let env = cold_sandbox();
+    let marked = env
+        .command()
+        .env(MARKERS_ENV, "1")
+        .args(["run", "marked memory", "--json"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&marked.stderr);
+    assert!(marked.status.success(), "{stderr}");
+    let json: Value = serde_json::from_slice(&marked.stdout).unwrap();
+    assert!(json["text"].as_str().unwrap().contains("demo"));
+    assert!(
+        !String::from_utf8_lossy(&marked.stdout).contains(MARKER_PREFIX),
+        "a marker reached standard output"
+    );
+    let lines: Vec<&str> = stderr.lines().collect();
+    // The first line of any kind is the start of the open, then the opening
+    // sentence; ready follows every sentence; no wait happened.
+    let markers: Vec<_> = lines
+        .iter()
+        .filter_map(|line| marker(line).map(|found| (found, *line)))
+        .collect();
+    let events: Vec<_> = markers.iter().map(|((event, _), _)| *event).collect();
+    assert_eq!(events, ["open-start", "ready"], "{stderr}");
+    assert!(markers[0].0.1 <= markers[1].0.1, "{stderr}");
+    assert!(
+        lines[0].starts_with(&format!("{MARKER_PREFIX}open-start ")),
+        "{stderr}"
+    );
+    assert_eq!(lines[1], OPENING, "{stderr}");
+    let ready = lines
+        .iter()
+        .position(|line| line.starts_with(&format!("{MARKER_PREFIX}ready ")))
+        .unwrap();
+    let last_sentence = lines
+        .iter()
+        .rposition(|line| SENTENCES.contains(line))
+        .unwrap();
+    assert!(last_sentence < ready, "{stderr}");
+    memory::await_owner_exit(&kuru_memory::OpenOptions::new(
+        env.data.clone(),
+        kuru_runtime::project_scope(&env.project).unwrap(),
+    ))
+    .unwrap();
+
+    // Unset, or anything but exactly `1`: no marker byte anywhere.
+    for value in [None, Some("0"), Some("true"), Some("")] {
+        let mut command = env.command();
+        match value {
+            Some(value) => command.env(MARKERS_ENV, value),
+            None => command.env_remove(MARKERS_ENV),
+        };
+        let output = command
+            .args(["run", "unmarked memory", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for bytes in [&output.stdout, &output.stderr] {
+            assert!(
+                !String::from_utf8_lossy(bytes).contains("kuru-open-marker"),
+                "{value:?} wrote a marker: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        memory::await_owner_exit(&kuru_memory::OpenOptions::new(
+            env.data.clone(),
+            kuru_runtime::project_scope(&env.project).unwrap(),
+        ))
+        .unwrap();
+    }
 }
 
 #[test]

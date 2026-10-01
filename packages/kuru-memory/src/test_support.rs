@@ -557,6 +557,32 @@ pub async fn await_owner_release(options: &OpenOptions) -> Result<()> {
     .await
 }
 
+/// A project's owner authority held by the test, as a running owner holds it,
+/// so a command-line child that elects an owner finds it busy.
+#[cfg(any(test, feature = "test-support"))]
+pub struct HeldOwnerLock(crate::service::ServiceLock);
+
+#[cfg(any(test, feature = "test-support"))]
+impl HeldOwnerLock {
+    /// Release the authority, letting a waiting child proceed.
+    pub fn release(self) -> Result<()> {
+        self.0.release()
+    }
+}
+
+/// Take `options`' project owner lock. Fails when another process holds it,
+/// so call it only after the previous owner's exit has been awaited.
+#[cfg(any(test, feature = "test-support"))]
+pub fn hold_owner_lock(options: &OpenOptions) -> Result<HeldOwnerLock> {
+    crate::service::ServiceLock::try_acquire(
+        &options.data_dir,
+        &options.project_scope,
+        crate::service::ServiceLockKind::Owner,
+    )?
+    .map(HeldOwnerLock)
+    .context("the project's owner lock is already held")
+}
+
 /// Wait until a managed fixture's store has no live Dolt, and record that on
 /// its fixture root, before the root is released.
 ///

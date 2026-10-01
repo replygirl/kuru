@@ -398,8 +398,7 @@ fn expected_receipt() -> String {
 
 fn assert_expected_startup_notice(stderr: &[u8]) -> Result<()> {
     let stderr = std::str::from_utf8(stderr).context("startup stderr is not UTF-8")?;
-    // Interim (unit 2 WP-C): the plain open sentences, until WP-D's
-    // assertions replace these.
+    // Only fixed open sentences, none twice in a row, and then the notice.
     let lines: Vec<_> = stderr.lines().collect();
     ensure!(
         lines.first() == Some(&kuru::memory_activity::OPENING),
