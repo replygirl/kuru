@@ -126,6 +126,15 @@ pub fn tempdir() -> Result<TempDir> {
     TempDir::new("kuru-fixture-", None)
 }
 
+/// The directory levels a store template occupies beneath the engine cache
+/// that holds it, down to its deepest captured directory:
+/// `<engine version>/templates/<key>/data/kuru/.dolt/stats/.dolt/noms/oldgen`.
+/// The first new project in an empty engine cache builds the template there,
+/// so a fixture root that holds its own cache raises its depth budget
+/// ([`TempDir::with_depth_budget`]) to the cache directory's own depth plus
+/// this.
+pub const TEMPLATE_DEPTH: usize = 10;
+
 /// Warm the shared test cache once per test process, before any fixture's
 /// own deadline: provision the bundled Dolt runtime, then make sure this
 /// build's store template is published beside it. Returns the engine.
@@ -206,7 +215,7 @@ async fn warm_engine() -> Result<PathBuf> {
 /// bookkeeping, so its own deadline errors are observed before the warm-up's.
 pub const WARM_UP_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The store template step's bound: one fresh-open budget (whose four
+/// The store template step's bound: one cold fresh-open budget (whose four
 /// engine starts cover one build start, the chain and the capture with
 /// room, and a peer process's build) plus [`WARM_UP_MARGIN`].
 pub(crate) fn template_warm_up_bound() -> Duration {
@@ -351,20 +360,66 @@ pub(crate) fn server_start_budget() -> std::time::Duration {
     default_startup().saturating_add(crate::server::SUPERVISOR_TRANSPORT_ALLOWANCE)
 }
 
-/// A fresh store open (`MemoryStore::open_inner` with no active directory):
-/// the startup lock wait, four server starts (initialization, migration,
-/// validation, active) each with one `QUERY_TIMEOUT` session, three owned
-/// server closes, and the staged directory's quiescence wait.
-pub(crate) fn fresh_open_budget() -> std::time::Duration {
+/// How a fresh store open (`MemoryStore::open_inner` with no active
+/// directory) creates its store, by its engine starts and the owned closes
+/// before it is ready.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "fixture budgets take the cold case; only the creation-path tests name the others"
+    )
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FreshOpen {
+    /// A copy of a published store template: the stage's one start
+    /// (adoption, validation, ready marker) and the active start.
+    Template,
+    /// The first open for a template key: the template build's start, then
+    /// the copy's stage start and the active start.
+    FirstProject,
+    /// The cold staged build (a legacy import, a configured engine binary,
+    /// `Creation::Cold`, or any fallback from the template): initialization,
+    /// migration, validation and the active start.
+    Cold,
+}
+
+impl FreshOpen {
+    /// Engine starts, as the engine ledger counts them.
+    pub(crate) const fn starts(self) -> u32 {
+        match self {
+            Self::Template => 2,
+            Self::FirstProject => 3,
+            Self::Cold => 4,
+        }
+    }
+
+    /// Owned server closes before the store is ready.
+    pub(crate) const fn closes(self) -> u32 {
+        self.starts() - 1
+    }
+}
+
+/// A fresh store open of `kind`: the startup lock wait, each server start
+/// with one `QUERY_TIMEOUT` session, each owned server close, and the staged
+/// directory's quiescence wait.
+pub(crate) fn fresh_open_budget_of(kind: FreshOpen) -> std::time::Duration {
     let startup = default_startup();
     startup
         .saturating_add(
             server_start_budget()
                 .saturating_add(crate::store::QUERY_TIMEOUT)
-                .saturating_mul(4),
+                .saturating_mul(kind.starts()),
         )
-        .saturating_add(crate::server::close_budget().saturating_mul(3))
+        .saturating_add(crate::server::close_budget().saturating_mul(kind.closes()))
         .saturating_add(startup)
+}
+
+/// The budget of any fresh store open, whatever path it takes: the cold
+/// staged build's, the longest. An open that meets a busy or unusable store
+/// template falls back to it.
+pub(crate) fn fresh_open_budget() -> std::time::Duration {
+    fresh_open_budget_of(FreshOpen::Cold)
 }
 
 /// Outer hang backstop for a fixture with `fresh` real lifecycles that create
@@ -374,8 +429,11 @@ pub(crate) fn fresh_open_budget() -> std::time::Duration {
 /// A lifecycle is a `ServiceOwner::open`, a spawned service owner, or a local
 /// `MemoryStore::open` that starts Dolt; managed attaches and checked rebinds
 /// start none. Every Dolt server start the fixture really performs gets the
-/// full `server_start_budget()`: four for a fresh open (initialization,
-/// migration, validation, active) and one for a reopen. On top of those, the
+/// full `server_start_budget()`: for a fresh open, the starts of the longest
+/// path it can take, the cold staged build's four (initialization, migration,
+/// validation, active), which a copy of the store template (two) or a cold
+/// fallback from a busy or unusable template never exceeds; one for a reopen.
+/// On top of those, the
 /// fixture gets one single-stall term, the largest bound any other single
 /// product step can reach (an owned server close, a `QUERY_TIMEOUT` statement,
 /// or a startup-budgeted lock, quiescence or maintenance-permit wait), and one
@@ -389,7 +447,9 @@ pub(crate) fn fresh_open_budget() -> std::time::Duration {
 /// runtime install is charged here, and keep the `OpenOptions::new` budgets.
 #[cfg(test)]
 pub(crate) fn fixture_deadline(fresh: u32, reopened: u32) -> std::time::Duration {
-    let starts = fresh.saturating_mul(4).saturating_add(reopened);
+    let starts = fresh
+        .saturating_mul(FreshOpen::Cold.starts())
+        .saturating_add(reopened);
     let single_stall = crate::server::close_budget()
         .max(crate::store::QUERY_TIMEOUT)
         .max(default_startup());
@@ -401,8 +461,36 @@ pub(crate) fn fixture_deadline(fresh: u32, reopened: u32) -> std::time::Duration
 
 #[cfg(test)]
 mod fixture_deadline_tests {
-    use super::fixture_deadline;
+    use super::{FreshOpen, fixture_deadline, fresh_open_budget, fresh_open_budget_of};
     use std::time::Duration;
+
+    /// Each creation path's budget counts its own starts and closes, and the
+    /// default fresh-open budget is the cold staged build's, the longest, so
+    /// it covers an open that falls back from the template.
+    #[test]
+    fn fresh_open_budgets_follow_each_creation_path() {
+        assert_eq!(
+            [
+                FreshOpen::Template,
+                FreshOpen::FirstProject,
+                FreshOpen::Cold
+            ]
+            .map(|kind| (kind.starts(), kind.closes())),
+            [(2, 1), (3, 2), (4, 3)]
+        );
+        let start = super::server_start_budget()
+            .saturating_add(crate::store::QUERY_TIMEOUT)
+            .saturating_add(crate::server::close_budget());
+        assert_eq!(
+            fresh_open_budget_of(FreshOpen::FirstProject),
+            fresh_open_budget_of(FreshOpen::Template) + start
+        );
+        assert_eq!(
+            fresh_open_budget_of(FreshOpen::Cold),
+            fresh_open_budget_of(FreshOpen::FirstProject) + start
+        );
+        assert_eq!(fresh_open_budget(), fresh_open_budget_of(FreshOpen::Cold));
+    }
 
     #[test]
     fn single_stall_defaults_match_the_reviewed_bounds() {

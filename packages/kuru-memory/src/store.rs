@@ -128,8 +128,8 @@ pub struct OpenOptions {
     candidate_cleanup_failure: Option<Arc<AtomicBool>>,
     #[cfg(test)]
     migrated_stage_pool_delay: Option<(Duration, Arc<AtomicBool>)>,
-    /// Test-support creation path; no open reads it before creation from a
-    /// template exists.
+    /// Test-support creation path: `Cold` keeps a fixture on the cold staged
+    /// build; see [`Creation`].
     #[cfg(any(test, feature = "test-support"))]
     creation: Creation,
     /// Test-support fixture token: whether these options went through the
@@ -167,9 +167,12 @@ pub(crate) const UNWARMED_FIXTURE: &str = "fixture opened a fresh store without 
 
 /// How a test-support open creates a store that does not exist yet.
 ///
-/// Crate-private, so no product caller can choose a creation path. Both
-/// variants take today's cold staged build; `Cold` names the fixtures that
-/// must keep that path once another one exists.
+/// Crate-private, so no product caller can choose a creation path. `Default`
+/// takes the ordinary path selector ([`creation_worker::select`]): a copy of
+/// the per-machine store template unless a legacy import or a configured
+/// engine binary keeps the open cold. `Cold` names the fixtures that test the
+/// cold staged build itself (lifecycle, migration, import, identity and
+/// secret tests) and must keep it.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Creation {
@@ -1617,14 +1620,8 @@ struct StoppedStage {
     _lease: LifecycleLease,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no open creates a store from the template cache until creation uses it"
-    )
-)]
 pub(crate) mod creation_template;
+mod creation_worker;
 mod export;
 pub(crate) mod marker_fixture;
 mod migrations;
@@ -1908,41 +1905,78 @@ impl MemoryStore {
                 progress,
             )
             .await?;
-            let mut staging = if let Some(staging) = recovered {
-                staging
-            } else {
-                let staging = parent.join(format!(
+            let new_stage = || {
+                parent.join(format!(
                     "{}.staging-{}",
                     name.to_string_lossy(),
                     Uuid::new_v4()
-                ));
-                let worker = stage_worker::StageWorker {
-                    make_options: &make_options,
-                    stage: &staging,
-                    parent,
-                    lifecycle_root: lifecycle_root.as_deref(),
-                    timeout,
-                    project_scope: &options.project_scope,
-                    legacy: legacy.as_ref(),
-                    #[cfg(test)]
-                    migration_hooks: options.migration_hooks.clone(),
-                    #[cfg(test)]
-                    migrated_stage_pool_delay: options.migrated_stage_pool_delay.clone(),
+                ))
+            };
+            let mut staging = if let Some(staging) = recovered {
+                staging
+            } else if let Some(root) = creation_worker::select(&options, legacy.is_some()) {
+                // A copy of the store template: 2 engine starts, or 3 when
+                // this open builds the template first.
+                let staging = new_stage();
+                // Stands in for the report each stage-worker engine start makes
+                // on the cold path: the creation worker's starts report
+                // silently, from its own task. Reported before any engine has
+                // started. Keep it: the terminal keeps the creating sentence
+                // on it (rule R7), and clients that show stages see the open
+                // leave preparation.
+                progress.report(MemoryOpenStage::OpeningDatabase);
+                let job = creation_worker::TemplateCreation {
+                    root,
+                    engine: creation_template::Engine {
+                        binary: binary.clone(),
+                        supervisor: supervisor.clone(),
+                        timeout,
+                    },
+                    base: make_options(staging.clone(), false),
+                    stage: staging.clone(),
+                    parent: parent.to_owned(),
+                    project_scope: options.project_scope.clone(),
+                    marker_pause: marker_pause.take(),
                 };
-                // Each job's engine holds the startup lock as its reap guard
-                // and returns it only after that engine has been reaped.
-                let returned_lock = worker
-                    .init(lock.take().expect("startup lock"), progress)
-                    .await?;
-                let returned_lock = worker.migrate(returned_lock, progress).await?;
-                lock = Some(
-                    worker
-                        .validate_and_mark(returned_lock, &mut marker_pause, progress)
-                        .await?,
-                );
-                let lease =
-                    Server::quiescence_at(&staging, lifecycle_root.as_deref(), timeout).await?;
-                StoppedStage { _lease: lease }
+                let (returned_lock, created) =
+                    creation_worker::run(job, lock.take().expect("startup lock")).await?;
+                lock = Some(returned_lock);
+                match created {
+                    creation_worker::Outcome::Ready => {
+                        let lease =
+                            Server::quiescence_at(&staging, lifecycle_root.as_deref(), timeout)
+                                .await?;
+                        StoppedStage { _lease: lease }
+                    }
+                    creation_worker::Outcome::Cold(pause) => {
+                        marker_pause = pause;
+                        Box::pin(Self::create_cold(
+                            &make_options,
+                            &new_stage(),
+                            parent,
+                            lifecycle_root.as_deref(),
+                            &options,
+                            legacy.as_ref(),
+                            &mut lock,
+                            &mut marker_pause,
+                            progress,
+                        ))
+                        .await?
+                    }
+                }
+            } else {
+                Box::pin(Self::create_cold(
+                    &make_options,
+                    &new_stage(),
+                    parent,
+                    lifecycle_root.as_deref(),
+                    &options,
+                    legacy.as_ref(),
+                    &mut lock,
+                    &mut marker_pause,
+                    progress,
+                ))
+                .await?
             };
             // A live Dolt data directory must never be renamed.
             staging
@@ -2061,16 +2095,65 @@ impl MemoryStore {
         Ok(store)
     }
 
+    /// The cold staged build of a new store in `staging`: initialization and
+    /// the optional legacy import, every migration, then validation and the
+    /// ready marker, each on its own engine start under the startup lock.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the cold staging jobs share the open's own inputs"
+    )]
+    async fn create_cold(
+        make_options: &(impl Fn(PathBuf, bool) -> ServerOptions + Sync),
+        staging: &Path,
+        parent: &Path,
+        lifecycle_root: Option<&Path>,
+        options: &OpenOptions,
+        legacy: Option<&LegacyImport>,
+        lock: &mut Option<File>,
+        marker_pause: &mut Option<marker_fixture::ReadyMarkerPause>,
+        progress: &mut ProgressReporter,
+    ) -> Result<StoppedStage> {
+        let timeout = Duration::from_secs(options.config.startup_timeout_secs);
+        let worker = stage_worker::StageWorker {
+            make_options,
+            stage: staging,
+            parent,
+            lifecycle_root,
+            timeout,
+            project_scope: &options.project_scope,
+            legacy,
+            #[cfg(test)]
+            migration_hooks: options.migration_hooks.clone(),
+            #[cfg(test)]
+            migrated_stage_pool_delay: options.migrated_stage_pool_delay.clone(),
+        };
+        // Each job's engine holds the startup lock as its reap guard and
+        // returns it only after that engine has been reaped.
+        let returned_lock = worker
+            .init(lock.take().expect("startup lock"), progress)
+            .await?;
+        let returned_lock = worker.migrate(returned_lock, progress).await?;
+        *lock = Some(
+            worker
+                .validate_and_mark(returned_lock, marker_pause, progress)
+                .await?,
+        );
+        let lease = Server::quiescence_at(staging, lifecycle_root, timeout).await?;
+        Ok(StoppedStage { _lease: lease })
+    }
+
     /// Real isolated Dolt fixture copied from the pre-migrated test template.
     ///
     /// The store owns its own private directory, writable open, supervisor
     /// and Dolt process, exactly as [`Self::temporary_cold`] does. Only the
     /// schema work is skipped: the directory starts as a private copy of one
-    /// cleanly closed cold open (see [`crate::test_support`]), so every copy
-    /// shares that template's instance identity, credentials, initial revision
-    /// and migration receipts. Tests of server or process lifecycle,
-    /// migration, import or legacy data, and tests that compare identity or
-    /// secrets use [`Self::temporary_cold`]. Missing runtime/helper is an
+    /// cleanly closed new store (see [`crate::test_support`]), itself created
+    /// from the store template, so its retained migration branches carry the
+    /// template's placeholder identity, and every copy shares that store's
+    /// instance identity, credentials, initial revision and migration
+    /// receipts. Tests of server or process lifecycle, migration, import or
+    /// legacy data, tests that compare identity or secrets, and tests that
+    /// pool a retained migration branch use [`Self::temporary_cold`]. Missing runtime/helper is an
     /// error, never a skip.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn temporary() -> Result<Self> {

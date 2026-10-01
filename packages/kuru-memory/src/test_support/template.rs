@@ -942,6 +942,60 @@ mod tests {
         Ok(child.wait(CHILD_DEADLINE).await?)
     }
 
+    /// T24: with the store template warmed, this test template's build
+    /// opens its source store through the ordinary creation path, which
+    /// copies the published store template: two engine starts and no
+    /// template build inside the open.
+    #[tokio::test]
+    async fn test_template_build_copies_the_store_template_with_two_starts() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        let shared = crate::test_support::shared_template_root()?
+            .join(crate::store::creation_template::compiled_key());
+        let published = || files::directory(&shared).map(|template| template.identity());
+        let container = crate::test_support::tempdir()?.with_depth_budget(TEMPLATE_FIXTURE_DEPTH);
+        let outcome = async {
+            let template = published()?;
+            // A source store of a finished build: `build` removes its
+            // `kuru-memory-template-*` directory only after the source open
+            // and close completed, so a build still running beside this one
+            // (whose count is not final yet) keeps its directory.
+            let finished_source = |path: &Path| {
+                path.ancestors().any(|ancestor| {
+                    ancestor.file_name().is_some_and(|name| {
+                        name.to_string_lossy().starts_with("kuru-memory-template-")
+                    }) && fs::symlink_metadata(ancestor).is_err()
+                })
+            };
+            let before = crate::test_support::engine_ledger::with(|ledger| ledger.start_counts());
+            let root = container.path().join("templates");
+            let data = container.path().join("copy").join("private");
+            ensure!(
+                instantiate_in(&root, &data, &scope()).await? == Outcome::Created,
+                "the test template was not built"
+            );
+            // Builds of other test templates running beside this one take
+            // the same path, so every new source store whose build finished,
+            // this test's own included, must show two starts.
+            let built = crate::test_support::engine_ledger::with(|ledger| ledger.start_counts())
+                .into_iter()
+                .filter(|(directory, _)| {
+                    finished_source(directory) && !before.iter().any(|(seen, _)| seen == directory)
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                !built.is_empty() && built.iter().all(|(_, starts)| *starts == 2),
+                "test template source stores did not open with two engine starts: {built:?}"
+            );
+            ensure!(
+                published()? == template,
+                "the test template's build changed the shared store template"
+            );
+            open_copy(&data).await
+        }
+        .await;
+        container.release(outcome)
+    }
+
     #[tokio::test]
     async fn concurrent_processes_create_one_template() -> Result<()> {
         // Keeps a template and unopened copies, which no lease recognises,

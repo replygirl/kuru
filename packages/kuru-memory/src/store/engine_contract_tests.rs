@@ -234,8 +234,9 @@ struct Stopped {
 
 async fn cold_open(data_dir: &Path, scope: &str) -> Result<(OpenOptions, MemoryStore)> {
     crate::test_support::warm_runtime_cache().await?;
-    let options =
+    let mut options =
         crate::test_support::warmed_open_options(data_dir.to_owned(), scope.to_owned()).await?;
+    options.creation = Creation::Cold;
     let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     Ok((options, store))
 }
@@ -892,7 +893,9 @@ async fn engine_sessions(pool: &MySqlPool) -> Result<Vec<Option<String>>> {
 /// would need a root connection.
 #[tokio::test]
 async fn as_of_reads_through_main_pool_open_no_revision_connection() -> Result<()> {
-    let store = MemoryStore::temporary().await?;
+    // The comparison pools each retained branch, which only a cold store's
+    // branches allow: a template copy's branches carry the placeholder identity.
+    let store = MemoryStore::temporary_cold().await?;
     let (reader_server, reader_pool) = match reader(&store).await {
         Ok(opened) => opened,
         Err(error) => {

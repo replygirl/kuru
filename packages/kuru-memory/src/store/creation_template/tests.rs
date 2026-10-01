@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 /// Template roots hold Dolt repositories the fixture guard reads in full:
 /// `<root>/<key>/data/kuru/.dolt/stats/.dolt/noms`, and a child process's
 /// engine cache one level deeper.
-const DEPTH: usize = 16;
+pub(super) const DEPTH: usize = 16;
 /// A bound for one operation that must not wait.
 const PROMPT: Duration = Duration::from_secs(10);
 
@@ -19,7 +19,7 @@ fn fixture() -> Result<TempDir> {
         .allowing_template_build())
 }
 
-fn startup() -> Duration {
+pub(super) fn startup() -> Duration {
     Duration::from_secs(
         OpenOptions::new(PathBuf::new(), String::new())
             .config
@@ -28,7 +28,7 @@ fn startup() -> Duration {
 }
 
 /// The warmed engine and the test supervisor.
-async fn engine() -> Result<Engine> {
+pub(super) async fn engine() -> Result<Engine> {
     Ok(Engine {
         binary: crate::test_support::warm_runtime_cache().await?,
         supervisor: test_supervisor()?,
@@ -45,23 +45,19 @@ fn no_engine() -> Engine {
     }
 }
 
-fn failure(failure: CreationFailure) -> anyhow::Error {
+pub(super) fn failure(failure: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
     anyhow::Error::from(failure)
 }
 
 /// `ensure_in` without waiting, under the spawn gate (a build starts a
 /// supervisor and Dolt).
-async fn ensure(root: &Path, engine: &Engine) -> Result<Ensured, CreationFailure> {
+pub(super) async fn ensure(root: &Path, engine: &Engine) -> Result<Ensured, CreationFailure> {
     let _gate = crate::spawn_gate::spawning().await;
     ensure_in(root, engine, Wait::Never).await
 }
 
 /// `create_in` into `stage`, under the spawn gate.
-async fn create(
-    root: &Path,
-    engine: &Engine,
-    stage: &Directory,
-) -> Result<Created, CreationFailure> {
+async fn create(root: &Path, engine: &Engine, stage: &Directory) -> Result<Created, CreateError> {
     let _gate = crate::spawn_gate::spawning().await;
     create_in(root, engine, stage).await
 }
@@ -73,7 +69,7 @@ fn stage(fixture: &TempDir, name: &str) -> Result<Directory> {
 
 /// The sorted top-level names of a template root, without the Windows
 /// lifecycle leases.
-fn entries_of(root: &Path) -> Result<Vec<String>> {
+pub(super) fn entries_of(root: &Path) -> Result<Vec<String>> {
     let mut names = fs::read_dir(root)?
         .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
         .collect::<Result<Vec<_>>>()?;
@@ -82,27 +78,27 @@ fn entries_of(root: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-fn key() -> &'static str {
+pub(super) fn key() -> &'static str {
     compiled_key()
 }
 
 /// The key lock of `root`, taken in `mode` without waiting, under the lock
 /// gate.
-async fn hold(root: &Path, mode: Mode) -> Result<File> {
+pub(super) async fn hold(root: &Path, mode: Mode) -> Result<File> {
     let root = open_root(root)?;
     let _gate = crate::spawn_gate::locking_async().await;
     try_key_lock(&root, key(), mode)?.context("the key lock was busy")
 }
 
 /// Release a held key lock under the lock gate.
-async fn release(lock: File) {
+pub(super) async fn release(lock: File) {
     let _gate = crate::spawn_gate::locking_async().await;
     drop(lock);
 }
 
 /// Publish under `root` a copy of the shared, warmed template, read under
 /// its shared key lock, and return the copy's directory identity.
-async fn clone_shared(root: &Path) -> Result<FileIdentity> {
+pub(super) async fn clone_shared(root: &Path) -> Result<FileIdentity> {
     crate::test_support::warm_runtime_cache().await?;
     let shared = open_root(&crate::test_support::shared_template_root()?)?;
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -153,14 +149,14 @@ fn plant_abandoned(root: &Path, key: &str) -> Result<[String; 2]> {
 }
 
 /// The template directory's identity, if it is published.
-fn published(root: &Path) -> Option<FileIdentity> {
+pub(super) fn published(root: &Path) -> Option<FileIdentity> {
     files::directory(&root.join(key()))
         .ok()
         .map(|template| template.identity())
 }
 
 /// This key's quarantined directories under `root`.
-fn rejected(root: &Path) -> Result<Vec<String>> {
+pub(super) fn rejected(root: &Path) -> Result<Vec<String>> {
     let prefix = format!(".rejected-{}-", key());
     Ok(entries_of(root)?
         .into_iter()
@@ -169,7 +165,7 @@ fn rejected(root: &Path) -> Result<Vec<String>> {
 }
 
 /// The manifest of the template directory `template`.
-fn read_manifest(template: &Path) -> Result<Manifest> {
+pub(super) fn read_manifest(template: &Path) -> Result<Manifest> {
     Ok(serde_json::from_slice(&files::read_bytes(
         &template.join(MANIFEST),
         MANIFEST_LIMIT,
@@ -177,12 +173,12 @@ fn read_manifest(template: &Path) -> Result<Manifest> {
 }
 
 /// Rewrite the manifest of the template directory `template`.
-fn write_manifest(template: &Path, manifest: &Manifest) -> Result<()> {
+pub(super) fn write_manifest(template: &Path, manifest: &Manifest) -> Result<()> {
     files::write(&template.join(MANIFEST), &serde_json::to_vec(manifest)?)
 }
 
 /// The largest data file of a template, by its manifest.
-fn largest_file(template: &Path) -> Result<PathBuf> {
+pub(super) fn largest_file(template: &Path) -> Result<PathBuf> {
     let manifest = read_manifest(template)?;
     let (path, _) = manifest
         .entries
@@ -457,7 +453,7 @@ async fn template_builds_once_with_data_only_and_is_reused_without_build() -> Re
                 let text = path.to_string_lossy().replace('\\', "/");
                 text.split("/data/").nth(1).map(str::to_owned)
             }
-            Event::Manifest => None,
+            Event::Manifest | Event::Identity(_) => None,
         })
         .collect();
     for entry in &manifest.entries {
@@ -781,7 +777,8 @@ async fn second_creator_goes_cold_at_once_while_a_build_is_in_progress() -> Resu
             copied,
             Created::Copied {
                 built: false,
-                published: true
+                published: true,
+                judged: Some(_),
             }
         ),
         "{copied:?}"
@@ -988,7 +985,8 @@ async fn publication_failure_copies_from_verified_stage() -> Result<()> {
             created,
             Created::Copied {
                 built: true,
-                published: false
+                published: false,
+                judged: None,
             }
         ),
         "{created:?}"
@@ -1038,7 +1036,10 @@ async fn template_failing_structure_is_quarantined() -> Result<()> {
         .scope(hooks, create_in(&root, &no_engine(), &destination))
         .await
         .expect_err("a manifest read error was accepted");
-    ensure!(matches!(error, CreationFailure::Io(_)), "{error}");
+    ensure!(
+        matches!(error, CreateError::Use(CreationFailure::Io(_))),
+        "{error}"
+    );
     assert_eq!(published(&root), Some(identity));
     ensure!(rejected(&root)?.is_empty());
     // Verdicts: each quarantines the template it judged, and no copy starts.
@@ -1119,7 +1120,10 @@ async fn template_byte_corruption_mid_copy_preserves_remnant_and_quarantines() -
         .await
         .expect_err("an injected read error was accepted");
     ensure!(fault.fired(), "the read fault never fired");
-    ensure!(matches!(error, CreationFailure::Io(_)), "{error}");
+    ensure!(
+        matches!(error, CreateError::Use(CreationFailure::Io(_))),
+        "{error}"
+    );
     assert_eq!(published(&root), Some(identity));
     ensure!(rejected(&root)?.is_empty());
     ensure!(
@@ -1257,6 +1261,29 @@ fn only_a_template_verdict_is_a_verdict() {
         );
     }
     assert!(!CreationFailure::io(std::io::Error::other("EIO")).is_verdict());
+}
+
+/// A failed copy after a successful build names the copy, not the build, and
+/// keeps its classification: a verdict stays a verdict.
+#[test]
+fn a_failed_copy_after_the_build_is_not_reported_as_a_failed_build() {
+    let copy = CreateError::BuiltCopy(CreationFailure::io(std::io::Error::other("EIO")));
+    let text = copy.to_string();
+    assert!(
+        text.contains("the copy from the store template this open built failed")
+            && !text.contains("build failed"),
+        "{text}"
+    );
+    assert!(!copy.is_verdict());
+    let verdict = CreateError::BuiltCopy(CreationFailure::classify(anyhow::Error::from(
+        TemplateVerdict::new("placeholder differs"),
+    )));
+    assert!(verdict.is_verdict(), "{verdict}");
+    let build = CreateError::Build(CreationFailure::io(std::io::Error::other("EIO")));
+    assert!(
+        build.to_string().contains("template build failed"),
+        "{build}"
+    );
 }
 
 /// No call removes another key's template, quarantined directory, build or
@@ -1676,7 +1703,7 @@ fn fixture_open_that_builds_a_template_fails_the_guard() -> Result<()> {
     private.release(Ok(()))
 }
 
-const CHILD_OUTCOME: &str = "KURU_TEST_TEMPLATE_CACHE_CHILD_OUTCOME";
+pub(super) const CHILD_OUTCOME: &str = "KURU_TEST_TEMPLATE_CACHE_CHILD_OUTCOME";
 const CHILD_TEST: &str = "store::creation_template::tests::child_process_warms_its_template_cache";
 const UNWARMED_CHILD_TEST: &str =
     "store::creation_template::tests::child_process_refuses_an_unwarmed_fixture_in_a_cold_cache";
@@ -1775,7 +1802,7 @@ async fn child_process_warms_its_template_cache() -> Result<()> {
 }
 
 #[cfg(unix)]
-async fn spawn_child(
+pub(super) async fn spawn_child(
     test: &str,
     cache: &Path,
     outcome: &Path,
@@ -1806,7 +1833,9 @@ async fn spawn_child(
 }
 
 #[cfg(unix)]
-async fn wait_child(mut child: tokio::process::Child) -> Result<std::process::ExitStatus> {
+pub(super) async fn wait_child(
+    mut child: tokio::process::Child,
+) -> Result<std::process::ExitStatus> {
     tokio::time::timeout(CHILD_DEADLINE, child.wait())
         .await
         .context("template cache child process exceeded its deadline")?
@@ -1814,7 +1843,7 @@ async fn wait_child(mut child: tokio::process::Child) -> Result<std::process::Ex
 }
 
 #[cfg(windows)]
-async fn spawn_child(
+pub(super) async fn spawn_child(
     test: &str,
     cache: &Path,
     outcome: &Path,
@@ -1864,7 +1893,7 @@ async fn spawn_child(
 }
 
 #[cfg(windows)]
-async fn wait_child(
+pub(super) async fn wait_child(
     mut child: kuru_platform::windows::process::NativeChild,
 ) -> Result<std::process::ExitStatus> {
     Ok(child.wait(CHILD_DEADLINE).await?)

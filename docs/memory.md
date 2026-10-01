@@ -306,10 +306,68 @@ has since advanced; it is never silently rewritten by an upgrade.
 
 ## New projects and the store template
 
-Kuru can now build, verify and quarantine a per-machine store template, but no
-open builds or uses one yet: new projects are still built by running every
-schema step, and nothing user-visible changes in this release. The next change
-creates new projects from it.
+New projects are created from a per-machine store template: a copy of a store
+that has already run every schema step. With the template for this release
+already on the machine, a new project opens with two database starts: one that
+adopts the copy, validates it and marks it ready in its staging directory, and
+the ordinary start at the project's own path. No schema step runs for it.
+
+The first new project on a machine, and the first after an update that changes
+the template's key (a new schema step, engine version or store-creation
+statement), builds the template first: every schema step runs once, on one
+database start, and the project is then copied from the result, in three
+starts. That first open does about as much work as building the store directly;
+every later new project skips the schema steps. The template is shared by every
+data directory that uses the same engine cache.
+
+While a new project is created, whether it is copied from the template, the
+template is built first, or the project is built directly, Kuru shows
+`Creating this project's memory…` (after `Getting Kuru's memory ready on this
+computer…` while a first launch unpacks the engine). Building the template is
+part of creating the project, so the sentence stays the same throughout and
+no other sentence is shown for it.
+
+A new project is built directly instead, running every schema step in its own
+staging directory (four database starts), when:
+
+- it imports legacy SQLite data (the import runs before the schema steps);
+- `memory.dolt_binary` names a development engine, because the template's key
+  binds the bundled engine;
+- another process is building the template or moving a damaged one aside at
+  that moment: a new project never waits for another one's build;
+- the template's directory or lock file cannot be opened, locked or verified,
+  which is logged as a warning in the memory service log; or
+- a template this open did not build fails a check while it is copied. A
+  partial copy is preserved under `memory/interrupted/` without starting a
+  database. A template whose own bytes failed the check is moved aside, and the
+  next new project builds a fresh one; an I/O error leaves it in place.
+
+None of these is an error: the project opens as before, only more slowly.
+
+The one damaged-template case you can see is a copy that the project's own
+database refuses after copying it: adoption finds an identity other than the
+template's placeholder, or the shape check finds anything but the expected
+branches, commits, schema and placeholder identity. That open fails with a
+template verdict naming what differed, nothing appears at the project's path,
+and the template is moved aside. Any other failure of that database start (a
+crash, a deadline, a lost reply, or a copy made for a different Kuru build)
+fails the open the same way but leaves the template in place. Either way the
+unready copy is preserved under `memory/interrupted/`: at once when the
+failure came after its database was serving (the shape check, validation or
+marking it ready), and otherwise by the next open of the project, before it
+starts anything and without starting the copy's database. That next open then
+creates the project again: from the template when it is still in place, or by
+building a new one when it was moved aside.
+
+A failure of the template build that a first launch runs (its database, its
+own checks, or saving its result), or of copying the project from the template
+it just built, also fails that open, with that error; opening again tries
+again. A partial copy is preserved under `memory/interrupted/` without starting
+a database. Only a copy that finds the new template's own bytes differ from its
+manifest moves that template aside, and the next new project builds it again;
+any other such failure moves no template aside.
+Kuru never retries inside the same open, so the schema steps never run twice
+in one open.
 
 The template lives beside the engine it was built with, in the engine cache
 (`tools/dolt` in the data directory, or `memory.cache_dir`):
@@ -359,20 +417,14 @@ private to your user.
 
 A template directory Kuru cannot read, for example one whose permissions are
 no longer private to your user, is an I/O failure rather than a verdict
-against its bytes, so it is never moved aside. Once new projects are created
-from the template, each one would then be built without it, with a warning,
-until the directory is fixed. To recover, delete `<cache>/<engine version>/templates/<key>/` while
+against its bytes, so it is never moved aside. Each new project is then
+built without it, with a warning, until the directory is fixed. To recover, delete `<cache>/<engine version>/templates/<key>/` while
 no Kuru process is running; the next new project builds it again. On Windows
 the same `templates/` directory also holds a small `lifecycles/` lease file per
 build; like the key lock files, these are permanent and go only with the cache
 directory.
 
 ## Template-born stores
-
-Kuru can now adopt and recover a new project store copied from a
-pre-migrated store template, but no open creates a store that way yet: new
-projects are still built by running every schema step, and nothing
-user-visible changes in this release.
 
 A copied store records the template it came from in its private identity
 record (`identity.json`, field `template`). A store created directly or by
@@ -391,11 +443,13 @@ that it holds nothing but the expected branches, commits, schema and identity.
 A copy whose bytes differ from what this build expects is refused with a
 distinct template verdict; an engine, SQL, I/O or deadline failure, or a copy
 made for a different Kuru build, is an ordinary error. Either way the unready
-copy is left in its staging directory, never at the project's active path, and
-is never activated. If a crash interrupts a copy before or during adoption,
-the next open moves it under `memory/interrupted/` without starting its
-database and builds the store afresh; a copy already marked ready is activated
-like any completed stage. A copy is compared with the Kuru build only before
+copy is never placed at the project's active path and is never activated: a
+failure after its database was serving preserves it under `memory/interrupted/`
+at once, and one before leaves it in its staging directory for the next open.
+If a crash or such a failure interrupts a copy before or during adoption, the
+next open moves it under `memory/interrupted/` without starting its database
+and creates the store afresh; a copy already marked ready is activated like
+any completed stage. A copy is compared with the Kuru build only before
 adoption, so an adopted store keeps opening under later releases. A release
 without this support fails closed on a template-born store's identity record
 rather than misreading it.

@@ -60,7 +60,12 @@ impl Sandbox {
     fn new(config: &str) -> Self {
         #[cfg(windows)]
         ensure_powershell_warm();
-        let root = kuru_memory::test_support::tempdir().unwrap();
+        // No `memory.cache_dir` is configured, so the engine cache is the
+        // data directory's `tools/dolt`, three levels down, and the first new
+        // project builds the store template in it.
+        let root = kuru_memory::test_support::tempdir()
+            .unwrap()
+            .with_depth_budget(3 + kuru_memory::test_support::TEMPLATE_DEPTH);
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project).unwrap();

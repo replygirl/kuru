@@ -55,10 +55,24 @@ impl Sandbox {
         Self::with_cache(&kuru_memory::test_support::warmed_cache_dir().await.unwrap())
     }
 
+    /// A sandbox with its own empty engine and store template cache, as on a
+    /// machine where Kuru has never run.
+    fn fresh_cache() -> Self {
+        // The cache, one level down, receives the store template.
+        let root = kuru_memory::test_support::tempdir()
+            .unwrap()
+            .with_depth_budget(1 + kuru_memory::test_support::TEMPLATE_DEPTH);
+        let cache = root.path().join("fresh verified runtime cache");
+        Self::in_root(root, &cache)
+    }
+
     fn with_cache(cache: &Path) -> Self {
+        Self::in_root(kuru_memory::test_support::tempdir().unwrap(), cache)
+    }
+
+    fn in_root(root: kuru_memory::test_support::TempDir, cache: &Path) -> Self {
         #[cfg(windows)]
         ensure_powershell_warm();
-        let root = kuru_memory::test_support::tempdir().unwrap();
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project).unwrap();
@@ -3298,18 +3312,7 @@ fn cli_explains_owner_owned_unsafe_data_directory_without_legacy_sqlite() {
 
 #[test]
 fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
-    let env = Sandbox::new();
-    let cache = env.root.path().join("fresh verified runtime cache");
-    let memory = kuru_core::MemoryConfig {
-        cache_dir: Some(cache),
-        offline: true,
-        ..Default::default()
-    };
-    std::fs::write(
-        env.root.path().join("config/kuru/config.toml"),
-        toml::to_string(&std::collections::BTreeMap::from([("memory", memory)])).unwrap(),
-    )
-    .unwrap();
+    let env = Sandbox::fresh_cache();
 
     let cold_started = std::time::Instant::now();
     let cold = env
@@ -3363,33 +3366,18 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
     );
 }
 
-/// A sandbox whose engine cache is a new empty private folder, so the first
-/// open of its project unpacks the engine and then creates the project.
-fn cold_sandbox() -> Sandbox {
-    let env = Sandbox::new();
-    let memory = kuru_core::MemoryConfig {
-        cache_dir: Some(env.root.path().join("fresh verified runtime cache")),
-        offline: true,
-        ..Default::default()
-    };
-    std::fs::write(
-        env.root.path().join("config/kuru/config.toml"),
-        toml::to_string(&std::collections::BTreeMap::from([("memory", memory)])).unwrap(),
-    )
-    .unwrap();
-    env
-}
-
-/// T14: a new project with an empty engine cache. The owner is held at each
-/// stage whose sentence is checked until that sentence has been written, so
-/// the order does not depend on timing.
+/// T14: a new project with an empty engine cache, which also builds the store
+/// template before copying the project from it; the creating sentence is the
+/// last one shown through that build. The owner is held at each stage whose
+/// sentence is checked until that sentence has been written, so the order
+/// does not depend on timing.
 #[cfg(unix)]
 #[test]
 fn cli_new_project_shows_engine_preparation_then_creation_and_keeps_json_on_stdout() {
     use kuru::memory_activity::{CREATING, GETTING_READY, OPENING, SENTENCES};
     use kuru_memory::test_support::OPEN_HOLD_DIR_ENV;
 
-    let env = cold_sandbox();
+    let env = Sandbox::fresh_cache();
     let holds = env.root.path().join("holds");
     std::fs::create_dir(&holds).unwrap();
     let extracting = holds.join("ExtractingEmbeddedRuntime.hold");
@@ -3472,7 +3460,7 @@ fn cli_open_is_unchanged_when_the_owner_cannot_publish_its_activity() {
     use kuru::memory_activity::OPENING;
     use kuru_memory::test_support::WRITE_FAILURE_ENV;
 
-    let env = cold_sandbox();
+    let env = Sandbox::fresh_cache();
     let output = env
         .command()
         .env(WRITE_FAILURE_ENV, "1")

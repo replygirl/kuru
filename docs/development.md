@@ -369,13 +369,16 @@ before they run, so concurrent Cargo builds cannot replace their executable.
 Coverage explicitly clears that snapshot opt-in and does not compile an unused
 ordinary supervisor first.
 
-`MemoryStore::temporary()` copies a pre-migrated template of one cleanly closed
-cold open, then performs the ordinary existing-store open, so each test still
-owns its directory, supervisor and Dolt process. Templates live under
-`target/<profile>/kuru-test-templates`, one per fingerprint of the supervisor,
-schema, engine and schema sources, created and validated under a file lock.
-Copies share the template's instance identity, credentials and migration
-receipts; tests of lifecycle, migration, import or identity use
+`MemoryStore::temporary()` copies a pre-migrated test template of one cleanly
+closed new store, then performs the ordinary existing-store open, so each test
+still owns its directory, supervisor and Dolt process. The test template's
+source store is itself created from the production store template below, so
+its retained migration branches carry that template's placeholder identity.
+Templates live under `target/<profile>/kuru-test-templates`, one per
+fingerprint of the supervisor, schema, engine and schema sources, created and
+validated under a file lock. Copies share the template's instance identity,
+credentials and migration receipts; tests of lifecycle, migration, import or
+identity, and tests that pool a retained migration branch, use
 `MemoryStore::temporary_cold()`. Old fingerprints are not pruned; `cargo clean`
 removes them.
 
@@ -389,10 +392,30 @@ only, keyed by the schema, the engine and the creation statements, not by the
 supervisor executable, so an instrumented and an ordinary supervisor build
 interchangeable templates. It differs from the test template above, which is
 a whole closed store keyed by supervisor bytes, sources and scope; the test
-template's own cold open runs after the production template is warm. No open
-creates a store from the production template yet: this change lands the
-cache, its build and its verification, and the next one routes creation
-through it.
+template's own source open runs after the production template is warm, so it
+copies the production template.
+
+Every fresh fixture open (a writable open of a store that does not exist yet)
+now creates its store from the warmed production template: two engine starts,
+the copy's adoption start and the active start, in the engine ledger. The
+first open for a template key that finds no published template builds it
+first, three starts; with warm-up in place a fixture never does, and the guard
+below fails one that did. `Creation::Cold` fixtures, a legacy import and a
+configured `dolt_binary` keep the cold staged build's four starts, as does
+any open that falls back from a busy or unusable template. Fixture deadlines
+(`test_support::fixture_deadline`) keep budgeting four starts per fresh open,
+the longest path; `test_support::fresh_open_budget_of` budgets each path
+(`FreshOpen::Template`, `FirstProject`, `Cold`) for tests that assert one.
+Tests that pause or delay a cold staging job (migration hooks, the migrated
+stage pool delay) set `Creation::Cold`, since a template copy runs no
+migration. Tests of an empty, busy or damaged template set
+`OpenOptions::template_root` to a private root, so the shared template other
+fixtures copy is never disturbed. A spawned-binary fixture that gives Kuru
+its own empty `memory.cache_dir` (a first launch on a fresh machine) has its
+first new project build the store template in that cache; the template's
+captured database repository belongs to no store, so the fixture root's
+depth budget (`TempDir::with_depth_budget`) is the cache directory's own depth
+plus `test_support::TEMPLATE_DEPTH`.
 
 `test_support::warm_runtime_cache()` warms both halves of the shared cache
 once per test process, before any fixture deadline: it provisions the engine,

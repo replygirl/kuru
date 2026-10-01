@@ -332,7 +332,7 @@ startup_timeout_secs = 30
 # dolt_binary = "/absolute/path/to/dolt"
 ```
 
-Kuru includes its pinned full-Dolt engine and licenses. First memory use extracts them locally into `tools/dolt` inside the data directory, or the configured `cache_dir`; an empty cache works offline. Existing caches are verified, and corrupt entries fail without automatic repair.
+Kuru includes its pinned full-Dolt engine and licenses. First memory use extracts them locally into `tools/dolt` inside the data directory, or the configured `cache_dir`; an empty cache works offline. Existing caches are verified, and corrupt entries fail without automatic repair. The engine cache also holds the store template new projects are created from; data directories that share a `cache_dir` share it, and with `dolt_binary` set new projects are built without it (see [memory](../concepts/memory)).
 
 `offline` remains accepted for compatibility; bundled engine provisioning never uses HTTP. `cache_dir` and `dolt_binary` must be absolute native paths and are not resolved relative to a configuration file. `dolt_binary` is an optional development override and must report the supported exact version. The startup timeout is 1–300 seconds. If a newly started memory service is not ready in time, the error `memory service readiness deadline exceeded` also reports how that wait was split: election, owner probe, spawn and readiness polling in milliseconds, the number of readiness polls, and what the last poll found. Provider network access is independent of these memory settings.
 

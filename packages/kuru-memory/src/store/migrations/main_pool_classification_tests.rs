@@ -528,9 +528,12 @@ fn is_revision_pool(name: &str) -> bool {
 async fn adopted_store_classifies_retained_branches_from_main() -> Result<()> {
     let root = crate::test_support::tempdir()?;
     let scope = format!("project/{}", "e".repeat(64));
-    let options =
+    let mut options =
         crate::test_support::warmed_open_options(root.path().join("private"), scope.clone())
             .await?;
+    // The branch-pool oracle needs retained branches that carry main's own
+    // identity: a cold store, not a template copy.
+    options.creation = crate::store::Creation::Cold;
     let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     let (source_oracle, source_main_pool) =
         verdicts(REGISTRY, &store.shared.server, &store.pool, RESERVED_PREFIX).await;
@@ -614,6 +617,8 @@ async fn historical_classification_opens_no_branch_or_commit_pools() -> Result<(
         format!("project/{}", "d".repeat(64)),
     )
     .await?;
+    // The branch-pool oracle below needs a cold store's retained branches.
+    options.creation = crate::store::Creation::Cold;
     crate::test_support::spawn_gated_open(options.clone())
         .await?
         .close()

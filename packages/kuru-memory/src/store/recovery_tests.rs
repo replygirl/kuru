@@ -481,6 +481,8 @@ fn bounded_fixture_text(path: &std::path::Path) -> String {
 #[cfg(any(unix, windows))]
 async fn paused_process_loss_child(root: &std::path::Path, scope: String) -> Result<()> {
     let mut options = crate::test_support::warmed_open_options(root.to_owned(), scope).await?;
+    // The pause is in the cold staged build's migration.
+    options.creation = Creation::Cold;
     let observation_deadline = migration_observation_deadline(&options);
     let (hooks, control) =
         migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::AfterDdl);

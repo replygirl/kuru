@@ -24,6 +24,8 @@ async fn migrated_stage_pool_uses_remaining_startup_budget_and_post_open_pools_s
     )
     .await?;
     let entered = Arc::new(AtomicBool::new(false));
+    // The delayed pool is the cold staged build's validation start.
+    options.creation = Creation::Cold;
     options.migrated_stage_pool_delay = Some((beyond_ordinary, entered.clone()));
     let store = crate::test_support::spawn_gated_open(options).await?;
     assert!(
@@ -70,6 +72,8 @@ async fn migrated_stage_pool_uses_remaining_startup_budget_and_post_open_pools_s
     .await?;
     let startup_budget = crate::test_support::server_start_budget();
     let entered = Arc::new(AtomicBool::new(false));
+    // The delayed pool is the cold staged build's validation start.
+    options.creation = Creation::Cold;
     options.migrated_stage_pool_delay = Some((startup_budget, entered.clone()));
     let error = crate::test_support::spawn_gated_open(options)
         .await

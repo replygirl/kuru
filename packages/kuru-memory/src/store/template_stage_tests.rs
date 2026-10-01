@@ -2,8 +2,8 @@
 //! bootstrap, its typed verdict, the template shape, and recovery classes R
 //! and U (cospec change `memory-template-stage-adoption`).
 //!
-//! No open creates a template stage yet, so these tests make one by hand, as
-//! the template cache and its copy worker will. [`build_template`] builds a
+//! These tests make template stages by hand, as the creation worker does,
+//! so each case controls the template's bytes and the stage's state. [`build_template`] builds a
 //! template store on one engine under the build identity: initialization,
 //! every migration, the usage branch's chain, validation and the template
 //! shape with the placeholder row. A stage copies that store's stopped
@@ -902,11 +902,12 @@ async fn copy_remnant_without_identity_is_preserved_without_engine_start() -> Re
                     "recovery wrote an identity into a copy remnant"
                 );
             }
+            // The open then created its store afresh, from the shared
+            // template: a new copy, not either remnant.
+            let created = read_identity_view(&project_directory(&data_dir, &scope)?)?;
             ensure!(
-                read_identity_view(&project_directory(&data_dir, &scope)?)?
-                    .template
-                    .is_none(),
-                "the store created after recovery is not a cold store"
+                created.initialized && created.template.as_deref() == Some(compiled_template_key()),
+                "the store created after recovery is not a new template copy: {created:?}"
             );
             Ok(())
         };
