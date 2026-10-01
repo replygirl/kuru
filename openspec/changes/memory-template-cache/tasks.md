@@ -459,6 +459,7 @@ nothing is silently skipped.
       `mise run cospec -- validate memory-template-cache --strict`,
       recording its pass with 0 errors/0 warnings as evidence (or naming and
       resolving whatever it reports).
+      Evidence [measured]: `mise run cospec -- validate memory-template-cache --strict` and `mise run cospec:validate` (all changes and specs): 0 errors, 0 warnings; `mise run cospec:managed:check`: no drift. The spec delta was tightened ("a symbolic link, an extra hard link"; "MUST NOT wait ... MUST NOT remove").
 - [x] 14.2 Run the package-scoped checks this change touches:
       `mise run //packages/kuru-memory:test`,
       `mise run //packages/kuru-memory:lint`,
@@ -468,3 +469,4 @@ nothing is silently skipped.
       any skipped or deferred check (for example a full coverage run, which
       CI gates separately), name why it was not run here rather than
       claiming a pass that was not observed.
+      Evidence [measured, macOS arm64, loaded shared host]: `mise run //packages/kuru-memory:test` on the implementation before its last test-only clippy/format fixes: lib 453 passed, 0 failed, 4 ignored (681 s), integration targets 28 passed; after those fixes, on commit 2bbd9d7f, the 40 lib tests matching `creation_template`, `template_stage_tests`, `spawn_gate` and `test_support::tests` passed again. `mise run //packages/kuru-runtime:test` (2bbd9d7f): 220 passed, 0 failed. `mise run //apps/kuru-tui:test` (2bbd9d7f): every target passed (lib 114, cli 38, terminal 40, trust 22, embedded_runtime 5, unix_shell_turn 5, lease 4, preferences 3 and the rest), 0 failed. `lint` for kuru-memory, kuru-runtime and kuru-tui, and `lint:windows` for all three: passed (after fixing three clippy findings in the new tests). `cargo check --workspace --all-targets --all-features --locked` and the no-feature `cargo check -p kuru-memory` (only the two pre-existing `fixture_commit_malformed_state` warnings): passed. `mise run format:check`, `mise run docs:check`, `mise run lint:tooling`: passed. Not run here: a coverage run and its 90% gate, and native Linux/Windows runs (CI gates them). Observation: the template warm-up holds the shared spawn-gate guard while it polls a peer process's build, up to its bound, which keeps in-process `locking()` writers waiting that long; the engine cell has the same shape.

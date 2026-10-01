@@ -41,12 +41,12 @@ coverage evidence comes only from CI on the pull request; none is claimed here.
 
 ## 7. Every fixture call site across kuru-memory, kuru-runtime and kuru-tui is warmed
 
-- [ ] 7.1 @regression (agent) full test suite of all three packages, with the deterministic guard active, after switching every test_support::open_options call site to the warmed form -> no guard failure across any package's suite
+- [x] 7.1 @regression (agent) full test suite of all three packages, with the deterministic guard active, after switching every test_support::open_options call site to the warmed form -> no guard failure across any package's suite Observed: kuru-memory 453 lib tests, kuru-runtime 220 and every kuru-tui target passed with the guard active (see tasks 14.2); no guard failure.
 - [x] 7.2 @manual (agent) spawn-gate audit of every spawning() site in service.rs, facade.rs and operational_gc_tests.rs that encloses an open -> none runs an unwarmed first warm-up under a held gate; counts recorded against the roadmap design's prior count, drift named Observed: audit recorded in tasks 11.1; the scan test `no_spawn_guard_encloses_a_test_cache_warm_up` passes and failed on a deliberate violation.
 
 ## 8. No product behavior changes (nothing selects the template path yet)
 
-- [ ] 8.1 @regression (agent) existing fresh_open_budget/fixture_deadline tests and every existing product-path test (facade, service, store) pass unchanged -> no start-count or deadline assertion in the existing suite changes value
+- [x] 8.1 @regression (agent) existing fresh_open_budget/fixture_deadline tests and every existing product-path test (facade, service, store) pass unchanged -> no start-count or deadline assertion in the existing suite changes value Observed: the existing budget, deadline and product-path tests passed unchanged in the kuru-memory, kuru-runtime and kuru-tui runs; no start-count or deadline value changed.
 
 ## 9. Documentation states what lands here and what does not
 
