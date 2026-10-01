@@ -35,7 +35,7 @@ pub use store::{
     SessionHistoryWindowAfter, SessionLifecycleOutcome, SessionLifecycleRefusal,
     SessionLifecycleRejected, SessionLifecycleState, SessionModeCheckpoint, SessionSourceSnapshot,
     SessionTurnCheckpoint, SessionTurnRefusal, SessionTurnRejected, StorageRecord, StoredNote,
-    UsageProof, context_summary_id, public_turn_continuation_node_id,
+    UsageLedgerStateChanged, UsageProof, context_summary_id, public_turn_continuation_node_id,
     public_turn_legacy_continuation_node_id, public_turn_node_id,
 };
 

@@ -1647,6 +1647,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
             dream: Arc::new(Mutex::new(())),
             uncertain: StdMutex::new(None),
             usage_pool: StdMutex::new(None),
+            usage_validated: StdMutex::new(None),
             candidate_recovery_pause: None,
             candidate_cleanup_failure: None,
             apply_pause: StdMutex::new(None),

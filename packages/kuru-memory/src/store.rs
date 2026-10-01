@@ -272,6 +272,10 @@ struct Shared {
     dream: Arc<Mutex<()>>,
     uncertain: StdMutex<Option<Pending>>,
     usage_pool: StdMutex<Option<Arc<MemoryPool>>>,
+    /// The usage branch's `state` table hash that this open validated, or
+    /// that this open's own ledger writes produced from it. `None` refuses
+    /// every ledger write until a reopen revalidates.
+    usage_validated: StdMutex<Option<String>>,
     #[cfg(test)]
     candidate_recovery_pause: Option<Arc<CandidateRecoveryPause>>,
     #[cfg(test)]
@@ -341,6 +345,13 @@ struct Pending {
 #[derive(Clone, Debug)]
 enum Receipt {
     Operation(String),
+    /// A usage ledger write's `operations` receipt on the usage branch.
+    UsageOperation(String),
+    /// The open's empty usage validation record commit.
+    UsageValidation {
+        base_head: String,
+        state_hash: String,
+    },
     CandidateCreation {
         branch: String,
         base: String,
@@ -395,6 +406,22 @@ impl std::fmt::Display for LogicalReceiptConflict {
 }
 
 impl std::error::Error for LogicalReceiptConflict {}
+
+/// A usage ledger write found the branch's `state` content different from
+/// the content this open validated. It committed nothing, and every later
+/// ledger write on this open refuses the same way until a reopen revalidates.
+#[derive(Debug)]
+pub struct UsageLedgerStateChanged;
+
+impl std::fmt::Display for UsageLedgerStateChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "usage ledger state changed outside its writer since validation; reopen to revalidate",
+        )
+    }
+}
+
+impl std::error::Error for UsageLedgerStateChanged {}
 /// One durable message row with its stable store sequence.
 ///
 /// Callers that present selected active notes use the sequence only with an
@@ -2087,6 +2114,7 @@ impl MemoryStore {
             dream: Arc::new(Mutex::new(())),
             uncertain: StdMutex::new(None),
             usage_pool: StdMutex::new(None),
+            usage_validated: StdMutex::new(None),
             #[cfg(test)]
             candidate_recovery_pause: options.candidate_recovery_pause,
             #[cfg(test)]
@@ -3785,9 +3813,20 @@ impl MemoryStore {
             await_session_end(&pending.pool, pending.connection, QUERY_TIMEOUT)
                 .await
                 .context("memory outcome is uncertain; original SQL session has not finished")?;
+            let usage = matches!(
+                pending.receipt,
+                Receipt::UsageOperation(_) | Receipt::UsageValidation { .. }
+            );
             let committed = match pending.receipt {
-                Receipt::Operation(operation) => {
+                Receipt::Operation(operation) | Receipt::UsageOperation(operation) => {
                     operation_exists(&pending.pool, &operation).await?
+                }
+                Receipt::UsageValidation {
+                    base_head,
+                    state_hash,
+                } => {
+                    usage_ledger::validation_committed(&pending.pool, &base_head, &state_hash)
+                        .await?
                 }
                 Receipt::CandidateCreation { branch, base } => {
                     let names = CandidateNames::from_open(&branch)?;
@@ -3858,6 +3897,12 @@ impl MemoryStore {
                     true
                 }
             };
+            if usage {
+                // Whichever caller settled it, a usage outcome re-derives the
+                // validated content, so a committed write with a lost reply
+                // never leaves the ledger refusing writes.
+                usage_ledger::rederive_validated(&self.shared, &pending.pool).await?;
+            }
             *self.shared.uncertain.lock().expect("uncertain lock") = None;
             return Ok(Some(committed));
         }
@@ -11506,6 +11551,7 @@ mod tests {
                 dream: Arc::new(Mutex::new(())),
                 uncertain: StdMutex::new(None),
                 usage_pool: StdMutex::new(None),
+                usage_validated: StdMutex::new(None),
                 candidate_recovery_pause: None,
                 candidate_cleanup_failure: None,
                 apply_pause: StdMutex::new(None),

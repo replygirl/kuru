@@ -3,6 +3,35 @@
 //! The permanent branch is deliberately reachable only through `UsageLedger`.
 //! It shares the project's writer serialization and receipt reconciliation, but
 //! never gives a caller a mutable `MemoryStore` view of that branch.
+//!
+//! # Content-bound validation
+//!
+//! A writable open publishes the ledger only when every owned row (every
+//! `state` row under `kuru.usage.v1/`) of the exact content being activated
+//! passes [`validate_owned_row`]. That is proved either by a full scan or by a
+//! validation record on the branch head: the commit-message trailer
+//! `Kuru-Usage-State: <validator id> <state hash>`, where the hash is
+//! `DOLT_HASHOF_TABLE('state')` (content-addressed and history-independent).
+//! A record is accepted only when it is on HEAD, names exactly [`VALIDATOR`]
+//! and equals the live table hash; anything else is Missing, which means scan
+//! and re-record, never refuse.
+//!
+//! Each ledger write starts from validated content (the open's scan or record,
+//! held in memory), validates each row it writes with the same function before
+//! its `INSERT`, deletes nothing, and records the hash of the content it
+//! produced in the same `DOLT_COMMIT`. By induction every recorded content is
+//! valid. The argument rests on three invariants, each tested:
+//!
+//! 1. **Row-locality.** [`validate_owned_row`]'s verdict depends only on one
+//!    key and its value. Adding a cross-row check, or any other input, to the
+//!    scan requires bumping the `v1` stem of [`VALIDATOR`] and redoing this
+//!    argument.
+//! 2. **Same function.** Writes call [`validate_owned_row`] from
+//!    `put_state_tx`, the only statement that writes owned rows; there is no
+//!    lookalike and no `DELETE`.
+//! 3. **No other writer of owned rows.** Migration publications (which do not
+//!    touch `state`), template adoption (`kuru_instance` only) and foreign or
+//!    manual commits carry no valid record, so they fall to the full scan.
 
 use super::*;
 use crate::open_timeline::{self, Event};
@@ -31,6 +60,17 @@ const RANGE_NEXT_PAGE: &str =
     "SELECT `key`, value FROM state WHERE `key` > ? AND `key` < ? ORDER BY `key` LIMIT ?";
 const RANGE_ANY_FOR_UPDATE: &str =
     "SELECT 1 FROM state WHERE `key` >= ? AND `key` < ? LIMIT 1 FOR UPDATE";
+
+/// The identity of [`validate_owned_row`] and the decoders it calls, bound to
+/// the release: every release boundary, in either direction, costs one full
+/// scan. Bump the `v1` stem together with the golden corpus whenever a verdict
+/// changes within one version string.
+pub(crate) const VALIDATOR: &str = concat!("kuru.usage.state.v1+", env!("CARGO_PKG_VERSION"));
+const RECORD_TRAILER: &str = "Kuru-Usage-State:";
+const RECORD_SUBJECT: &str = "usage ledger validation v1";
+const RECORD_MESSAGE_MAX: usize = 512;
+const RECORD_VALIDATOR_MAX: usize = 128;
+const STATE_HASH_LEN: usize = 32;
 
 #[derive(Clone, Debug)]
 pub struct UsageLedger {
@@ -329,6 +369,15 @@ impl UsageLedger {
         self.store.writable()?;
         let guard = self.store.shared.write.clone().lock_owned().await;
         self.store.resolve_uncertain().await?;
+        // Read only after reconciliation, which may have re-derived it.
+        let validated = self
+            .store
+            .shared
+            .usage_validated
+            .lock()
+            .expect("usage validated lock")
+            .clone()
+            .ok_or(UsageLedgerStateChanged)?;
         let store = self.store.clone();
         tokio::spawn(async move {
             let _guard = guard;
@@ -337,22 +386,52 @@ impl UsageLedger {
             *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: store.pool.clone(),
                 connection: id,
-                receipt: Receipt::Operation(operation.clone()),
+                receipt: Receipt::UsageOperation(operation.clone()),
             });
             // One budget bounds the write and its session's return.
             let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
             let result = tokio::time::timeout_at(
                 deadline,
-                apply_change(&mut connection, &operation, change),
+                apply_change(&mut connection, &operation, &validated, change),
             )
             .await;
             match result {
-                // Committed, or an unchanged settlement rolled back: either
-                // way the session is clean and the outcome receipted.
-                Ok(Ok(_)) => {
+                // Nothing changed and the transaction rolled back: the
+                // session is clean and the outcome receipted.
+                Ok(Ok(None)) => {
                     *store.shared.uncertain.lock().expect("uncertain lock") = None;
                     connection.settle_receipted(deadline).await;
                     Ok(())
+                }
+                // Committed: the session is clean and the outcome receipted.
+                Ok(Ok(Some(produced))) => {
+                    *store.shared.uncertain.lock().expect("uncertain lock") = None;
+                    // Published only after COMMIT returned.
+                    *store
+                        .shared
+                        .usage_validated
+                        .lock()
+                        .expect("usage validated lock") = Some(produced);
+                    connection.settle_receipted(deadline).await;
+                    Ok(())
+                }
+                Ok(Err(error)) if error.is::<UsageLedgerStateChanged>() => {
+                    // The precondition rolled back before any read or write;
+                    // settle the receipt, then fail closed after its
+                    // re-derivation so later writes refuse until a reopen.
+                    // Not a receipted success: end the session first.
+                    drop(connection);
+                    let settled = store.resolve_uncertain().await;
+                    *store
+                        .shared
+                        .usage_validated
+                        .lock()
+                        .expect("usage validated lock") = None;
+                    ensure!(
+                        settled? == Some(false),
+                        "a refused usage ledger write produced a receipt"
+                    );
+                    Err(error)
                 }
                 other => {
                     // Not a receipted success: end the session first.
@@ -410,6 +489,12 @@ pub(super) async fn establish(store: &MemoryStore) -> Result<()> {
     open_timeline::stamp(Event::UsageValidate);
     validate_branch(pool.as_ref()).await?;
     open_timeline::stamp(Event::UsageScan2);
+    let validated = state_hash(pool.as_ref()).await?;
+    *store
+        .shared
+        .usage_validated
+        .lock()
+        .expect("usage validated lock") = Some(validated);
     *store.shared.usage_pool.lock().expect("usage pool lock") = Some(pool);
     Ok(())
 }
@@ -456,6 +541,176 @@ async fn validate_branch(pool: &MemoryPool) -> Result<u64> {
     Ok(decoded)
 }
 
+/// The validation record line for `state_hash` under this binary's validator.
+fn record_trailer(state_hash: &str) -> String {
+    format!("{RECORD_TRAILER} {VALIDATOR} {state_hash}")
+}
+
+/// A ledger write's commit message: its unchanged subject, then the record of
+/// the content it produced.
+fn write_message(operation: &str, state_hash: &str) -> String {
+    format!(
+        "usage ledger v1 [{operation}]\n\n{}",
+        record_trailer(state_hash)
+    )
+}
+
+/// The open's empty record commit's message.
+fn record_message(state_hash: &str) -> String {
+    format!("{RECORD_SUBJECT}\n\n{}", record_trailer(state_hash))
+}
+
+/// A validation record parsed from one commit message.
+#[derive(Debug, PartialEq, Eq)]
+struct UsageRecord<'a> {
+    validator: &'a str,
+    state_hash: &'a str,
+}
+
+/// Parse a commit message's validation record strictly. `None` for every
+/// malformed form: an oversize message, no or more than one record line, a
+/// record that is not the final line, a validator that is not short printable
+/// ASCII, or a hash that is not exactly 32 characters of Dolt's `[0-9a-v]`.
+fn parse_record(message: &str) -> Option<UsageRecord<'_>> {
+    if message.len() > RECORD_MESSAGE_MAX {
+        return None;
+    }
+    let body = message.strip_suffix('\n').unwrap_or(message);
+    let mut lines = body
+        .split('\n')
+        .filter(|line| line.contains(RECORD_TRAILER));
+    let line = lines.next()?;
+    if lines.next().is_some() || !body.ends_with(line) {
+        return None;
+    }
+    let mut fields = line
+        .strip_prefix(RECORD_TRAILER)?
+        .strip_prefix(' ')?
+        .split(' ');
+    let (validator, state_hash) = (fields.next()?, fields.next()?);
+    if fields.next().is_some()
+        || validator.is_empty()
+        || validator.len() > RECORD_VALIDATOR_MAX
+        || !validator.bytes().all(|byte| byte.is_ascii_graphic())
+        || !state_hash_valid(state_hash)
+    {
+        return None;
+    }
+    Some(UsageRecord {
+        validator,
+        state_hash,
+    })
+}
+
+fn state_hash_valid(hash: &str) -> bool {
+    hash.len() == STATE_HASH_LEN
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'v').contains(&byte))
+}
+
+/// The content hash of the `state` table as `executor` sees it, including a
+/// transaction's own uncommitted writes.
+async fn state_hash<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::MySql>,
+) -> Result<String> {
+    let hash: String = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar("SELECT DOLT_HASHOF_TABLE('state')").fetch_one(executor),
+    )
+    .await
+    .context("usage ledger state hash deadline exceeded")??;
+    ensure!(
+        state_hash_valid(&hash),
+        "usage ledger state hash is not a Dolt hash"
+    );
+    Ok(hash)
+}
+
+/// The usage branch head as the validation record sees it.
+struct BoundCheck {
+    head: String,
+    state_hash: String,
+    /// True only when HEAD's message records exactly this binary's
+    /// validator and the live `state` hash (Bound); false is Missing.
+    bound: bool,
+}
+
+/// Read HEAD, HEAD's message and the live `state` hash. Never an error for a
+/// missing, foreign or malformed record: those read as Missing.
+async fn bound_check(pool: &MemoryPool) -> Result<BoundCheck> {
+    let head = revision(pool).await?;
+    // HEAD-first order is observed, not documented; the equality check
+    // below is what makes the first row HEAD's message. The message is
+    // truncated past the record limit so a foreign message cannot grow the
+    // read, and parse_record then refuses it as oversize.
+    let (logged, message): (String, String) = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_as("SELECT commit_hash, LEFT(message, ?) FROM dolt_log LIMIT 1")
+            .bind(i64::try_from(RECORD_MESSAGE_MAX + 1).unwrap_or(i64::MAX))
+            .fetch_one(pool),
+    )
+    .await
+    .context("usage ledger head message deadline exceeded")??;
+    let live = state_hash(pool).await?;
+    let bound = logged == head
+        && parse_record(&message)
+            .is_some_and(|record| record.validator == VALIDATOR && record.state_hash == live);
+    Ok(BoundCheck {
+        head,
+        state_hash: live,
+        bound,
+    })
+}
+
+/// Reconcile the open's record commit: not committed while HEAD is still its
+/// base; committed when HEAD records exactly this content and its only
+/// parent is the base; anything else is ambiguous.
+pub(super) async fn validation_committed(
+    pool: &MemoryPool,
+    base_head: &str,
+    state_hash: &str,
+) -> Result<bool> {
+    let check = bound_check(pool).await?;
+    if check.head == base_head {
+        return Ok(false);
+    }
+    let parents: Vec<String> = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? ORDER BY parent_index LIMIT 2",
+        )
+        .bind(&check.head)
+        .fetch_all(pool),
+    )
+    .await
+    .context("usage validation record parent deadline exceeded")??;
+    ensure!(
+        check.bound && check.state_hash == state_hash && parents == [base_head],
+        "cannot reconcile the usage validation record: the usage branch head diverged from both its base and the record"
+    );
+    Ok(true)
+}
+
+/// After reconciliation settled a usage write or record commit, re-derive
+/// the validated content: a clean branch whose head records the live content
+/// (Bound), or whose live content is still exactly the content already
+/// validated, keeps the ledger writable; anything else refuses writes until a
+/// reopen.
+pub(super) async fn rederive_validated(shared: &Shared, pool: &MemoryPool) -> Result<()> {
+    let dirty: i64 = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status").fetch_one(pool),
+    )
+    .await
+    .context("usage ledger working-set validation deadline exceeded")??;
+    let check = bound_check(pool).await?;
+    let mut validated = shared.usage_validated.lock().expect("usage validated lock");
+    let unchanged = validated.as_deref() == Some(check.state_hash.as_str());
+    *validated = (dirty == 0 && (check.bound || unchanged)).then_some(check.state_hash);
+    Ok(())
+}
+
 /// The one owned-row validator: the open scan calls it for every row under
 /// `kuru.usage.v1/`, and every ledger write calls it for each row it is about
 /// to `INSERT`. It is row-local by contract (see the module documentation):
@@ -493,12 +748,23 @@ fn validate_owned_row(key: &[u8], value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Apply one ledger change in one short transaction. Returns the `state`
+/// hash the committed write produced, or `None` when nothing changed.
+/// `validated` is the content this open validated: the write refuses with
+/// [`UsageLedgerStateChanged`] before any other read or write when the
+/// branch's `state` no longer has that hash.
 async fn apply_change(
     connection: &mut MySqlConnection,
     operation: &str,
+    validated: &str,
     change: Change,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     let mut transaction = connection.begin().await?;
+    let current = state_hash(&mut *transaction).await?;
+    if current != validated {
+        transaction.rollback().await?;
+        return Err(UsageLedgerStateChanged.into());
+    }
     let changed = match change {
         Change::MarkNewSession(session_id) => {
             let marker = read_marker_tx(&mut transaction, &session_id).await?;
@@ -637,7 +903,7 @@ async fn apply_change(
     };
     if !changed {
         transaction.rollback().await?;
-        return Ok(false);
+        return Ok(None);
     }
     let version: i32 = sqlx::query_scalar("SELECT version FROM kuru_schema WHERE id = 1")
         .fetch_one(&mut *transaction)
@@ -651,13 +917,16 @@ async fn apply_change(
         .bind("usage ledger v1")
         .execute(&mut *transaction)
         .await?;
+    // The content this write produced, including its own uncommitted puts;
+    // `state` is independent of the `operations` receipt.
+    let produced = state_hash(&mut *transaction).await?;
     sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
-        .bind(format!("usage ledger v1 [{operation}]"))
+        .bind(write_message(operation, &produced))
         .bind(AUTHOR)
         .fetch_all(&mut *transaction)
         .await?;
     transaction.commit().await?;
-    Ok(true)
+    Ok(Some(produced))
 }
 
 fn initial_record(start: InvocationStart) -> InvocationUsage {
@@ -1550,22 +1819,16 @@ mod tests {
         store.close().await
     }
 
-    #[tokio::test]
-    async fn uncertain_committed_receipt_reconciles_without_replaying_usage() -> Result<()> {
-        let store = MemoryStore::temporary().await?;
-        let ledger = store.usage_ledger()?;
-        let start = start("resumed", "invocation-1");
-        let operation = Uuid::new_v4().to_string();
-        let (mut connection, id) = owned_connection(&ledger.store.pool).await?;
-        assert!(
-            apply_change(
-                &mut connection,
-                &operation,
-                Change::Admit(Box::new(start.clone())),
-            )
-            .await?
-        );
-        drop(connection);
+    fn validated(store: &MemoryStore) -> Option<String> {
+        store
+            .shared
+            .usage_validated
+            .lock()
+            .expect("usage validated lock")
+            .clone()
+    }
+
+    fn set_pending(ledger: &UsageLedger, connection: u64, receipt: Receipt) {
         *ledger
             .store
             .shared
@@ -1573,14 +1836,147 @@ mod tests {
             .lock()
             .expect("uncertain lock") = Some(Pending {
             pool: ledger.store.pool.clone(),
-            connection: id,
-            receipt: Receipt::Operation(operation),
+            connection,
+            receipt,
         });
+    }
+
+    // T13 for a ledger write, committed case: the reply is lost after the
+    // commit; reconciliation proves the receipt, re-derives the validated
+    // content from HEAD's record and the next write succeeds.
+    #[tokio::test]
+    async fn uncertain_committed_receipt_reconciles_without_replaying_usage() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let ledger = store.usage_ledger()?;
+        let start = start("resumed", "invocation-1");
+        let operation = Uuid::new_v4().to_string();
+        let before = validated(&store).context("open validated nothing")?;
+        let (mut connection, id) = owned_connection(&ledger.store.pool).await?;
+        let produced = apply_change(
+            &mut connection,
+            &operation,
+            &before,
+            Change::Admit(Box::new(start.clone())),
+        )
+        .await?
+        .context("the admission changed nothing")?;
+        drop(connection);
+        ensure!(produced != before);
+        ensure!(
+            validated(&store).as_ref() == Some(&before),
+            "the in-memory hash moved without the writer's answer"
+        );
+        set_pending(&ledger, id, Receipt::UsageOperation(operation));
         assert_eq!(ledger.store.reconcile().await?, Some(true));
+        assert_eq!(validated(&store), Some(produced));
         ledger.admit(start).await?;
         assert_eq!(ledger.session("resumed").await?.invocation_count, 1);
+        ledger.admit(self::start("resumed", "invocation-2")).await?;
+        assert_eq!(ledger.session("resumed").await?.invocation_count, 2);
         drop(ledger);
         store.close().await
+    }
+
+    // T13 for a ledger write, not-committed case: the transaction never
+    // commits; reconciliation proves no receipt, keeps the validated content
+    // (the live hash is unchanged) and the retry succeeds.
+    #[tokio::test]
+    async fn uncertain_uncommitted_receipt_keeps_the_ledger_writable() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let ledger = store.usage_ledger()?;
+        let before = validated(&store).context("open validated nothing")?;
+        let operation = Uuid::new_v4().to_string();
+        let (mut connection, id) = owned_connection(&ledger.store.pool).await?;
+        {
+            let mut transaction = connection.begin().await?;
+            put_state_tx(
+                &mut transaction,
+                &session_key("lost"),
+                &SessionMarker {
+                    format: FORMAT,
+                    session_id: "lost".into(),
+                    historical_complete: true,
+                },
+            )
+            .await?;
+            // Dropped without COMMIT, as a write whose connection died.
+        }
+        drop(connection);
+        set_pending(&ledger, id, Receipt::UsageOperation(operation));
+        assert_eq!(ledger.store.reconcile().await?, Some(false));
+        assert_eq!(validated(&store), Some(before));
+        ledger.mark_new_session("lost").await?;
+        ensure!(ledger.session("lost").await?.historical_complete);
+        drop(ledger);
+        store.close().await
+    }
+
+    // T6 (design T12): a foreign commit changes `state` between the open and
+    // a write. The write refuses with the typed error, commits nothing and
+    // inserts no receipt; later writes refuse too; a reopen scans and the
+    // ledger writes again.
+    #[tokio::test]
+    async fn writes_refuse_after_state_changed_outside_the_writer() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let store = reopen(&root).await?;
+        let ledger = store.usage_ledger()?;
+        ledger.mark_new_session("before").await?;
+        let pool = ledger.store.pool.clone();
+        // A non-owned key: any change to `state` breaks the precondition.
+        sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+            .bind(b"outside/the/ledger".as_slice())
+            .bind("foreign")
+            .execute(pool.as_ref())
+            .await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'foreign state change', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(pool.as_ref())
+            .await?;
+        let head = revision(pool.as_ref()).await?;
+        let receipts = |pool: Arc<MemoryPool>| async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM operations")
+                .fetch_one(pool.as_ref())
+                .await
+        };
+        let receipts_before = receipts(pool.clone()).await?;
+        for attempt in ["first", "later"] {
+            let error = ledger.mark_new_session(attempt).await.unwrap_err();
+            ensure!(
+                error.is::<UsageLedgerStateChanged>(),
+                "{attempt}: unexpected refusal {error:#}"
+            );
+            ensure!(
+                format!("{error:#}").contains(
+                    "usage ledger state changed outside its writer since validation; reopen to revalidate"
+                ),
+                "{error:#}"
+            );
+            ensure!(validated(&store).is_none());
+            ensure!(
+                revision(pool.as_ref()).await? == head,
+                "{attempt} committed"
+            );
+            ensure!(receipts(pool.clone()).await? == receipts_before);
+            ensure!(
+                ledger
+                    .store
+                    .shared
+                    .uncertain
+                    .lock()
+                    .expect("uncertain lock")
+                    .is_none()
+            );
+        }
+        drop(pool);
+        drop(ledger);
+        store.close().await?;
+
+        let reopened = reopen(&root).await?;
+        let ledger = reopened.usage_ledger()?;
+        ledger.mark_new_session("after").await?;
+        ensure!(ledger.session("after").await?.historical_complete);
+        drop(ledger);
+        reopened.close().await
     }
 
     #[tokio::test]
@@ -2613,6 +3009,15 @@ mod tests {
             .bind(AUTHOR)
             .fetch_all(pool.as_ref())
             .await?;
+        // These rows exist only to put the probe's range edges next to real
+        // keys; a reopen's scan would refuse them, and the write precondition
+        // refuses any foreign change. Adopt the planted content as validated
+        // so the probe itself is what this test exercises.
+        *store
+            .shared
+            .usage_validated
+            .lock()
+            .expect("usage validated lock") = Some(state_hash(pool.as_ref()).await?);
         drop(pool);
         let refused = format!(
             "{:#}",
@@ -2809,7 +3214,7 @@ mod tests {
     }
 
     /// Every owned row of `pool`'s state, in key order.
-    async fn owned_rows(pool: &MySqlPool) -> Result<Vec<(Vec<u8>, String)>> {
+    async fn owned_rows(pool: &MemoryPool) -> Result<Vec<(Vec<u8>, String)>> {
         let owned = KeyRange::prefix(OWNED_PREFIX)?;
         let mut rows = Vec::new();
         let mut after: Option<Vec<u8>> = None;
@@ -2888,5 +3293,237 @@ mod tests {
         drop(pool);
         drop(ledger);
         store.close().await
+    }
+
+    const GOLDEN_SESSION_KEY: &str =
+        "kuru.usage.v1/session/1e591f4cbe50d9d30081aea051bd034c41979b37bf2ac3f58a2dc611807ab76a";
+    const GOLDEN_MARKER: &str =
+        r#"{"format":1,"session_id":"golden-session","historical_complete":true}"#;
+    const GOLDEN_RECORD_KEY: &str =
+        "kuru.usage.v1/record/279d6880e15f0baec51570ca907d2b220e0fae60d18eab62a9d8f2c402309c6b";
+    const GOLDEN_RECORD: &str = r#"{"start":{"session_id":"golden-session","invocation_id":"golden-invocation","operation_id":"turn-1","phase":"speak","actor_id":"speaker","route":"responses","model":"model","price_at_invocation":null},"usage":{"input_tokens":null,"output_tokens":null,"cached_input_tokens":null,"reasoning_output_tokens":null},"last_usage_sequence":1,"terminal_usage":null,"outcome":null,"incomplete":true}"#;
+    const GOLDEN_OBSERVATION_KEY: &str = "kuru.usage.v1/observation/279d6880e15f0baec51570ca907d2b220e0fae60d18eab62a9d8f2c402309c6b/00000000000000000001";
+    const GOLDEN_OBSERVATION: &str = r#"{"invocation_id":"golden-invocation","observation":{"sequence":1,"terminal":true,"usage":{"input_tokens":3,"output_tokens":null,"cached_input_tokens":null,"reasoning_output_tokens":null}}}"#;
+    const GOLDEN_INDEX_KEY: &str = "kuru.usage.v1/session-index/1e591f4cbe50d9d30081aea051bd034c41979b37bf2ac3f58a2dc611807ab76a/279d6880e15f0baec51570ca907d2b220e0fae60d18eab62a9d8f2c402309c6b";
+    const GOLDEN_INDEX: &str = r#"{"format":1,"session_id":"golden-session","invocation_id":"golden-invocation","record_key":"kuru.usage.v1/record/279d6880e15f0baec51570ca907d2b220e0fae60d18eab62a9d8f2c402309c6b"}"#;
+
+    // T18, the tripwire beside `VALIDATOR`: fixed bytes, one accepted row per
+    // class and refused near-misses. A decoder or key change that flips any
+    // verdict here must update this corpus and bump the `v1` stem together,
+    // or a recorded ledger would skip the changed check until the next
+    // release.
+    #[test]
+    fn golden_corpus_pins_the_validator_verdicts() -> Result<()> {
+        assert_eq!(
+            VALIDATOR,
+            format!("kuru.usage.state.v1+{}", env!("CARGO_PKG_VERSION"))
+        );
+        for (key, value) in [
+            (GOLDEN_SESSION_KEY, GOLDEN_MARKER),
+            (GOLDEN_RECORD_KEY, GOLDEN_RECORD),
+            (GOLDEN_OBSERVATION_KEY, GOLDEN_OBSERVATION),
+            (GOLDEN_INDEX_KEY, GOLDEN_INDEX),
+        ] {
+            validate_owned_row(key.as_bytes(), value)
+                .with_context(|| format!("golden row {key} was refused"))?;
+        }
+        let long_id = "x".repeat(257);
+        let refused: [(&str, Vec<u8>, String, &str); 8] = [
+            (
+                "unknown field",
+                GOLDEN_SESSION_KEY.into(),
+                with_field(GOLDEN_MARKER, "unrecognized", Value::Bool(true))?,
+                "usage session marker is malformed",
+            ),
+            (
+                "wrong key",
+                GOLDEN_SESSION_KEY.replace("/1e59", "/1e58").into_bytes(),
+                GOLDEN_MARKER.into(),
+                "usage marker key is not canonical",
+            ),
+            (
+                "unknown class",
+                b"kuru.usage.v1/future/1e591f4cbe50".to_vec(),
+                GOLDEN_MARKER.into(),
+                "usage ledger owns an unrecognized state key",
+            ),
+            (
+                "non-UTF-8 key",
+                [GOLDEN_SESSION_KEY.as_bytes(), b"\xff"].concat(),
+                GOLDEN_MARKER.into(),
+                "usage ledger key is not UTF-8",
+            ),
+            (
+                "zero sequence",
+                GOLDEN_RECORD_KEY.into(),
+                with_field(GOLDEN_RECORD, "last_usage_sequence", Value::from(0))?,
+                "usage ledger sequence is invalid",
+            ),
+            (
+                "bad format",
+                GOLDEN_INDEX_KEY.into(),
+                with_field(GOLDEN_INDEX, "format", Value::from(2))?,
+                "usage session index format is unsupported",
+            ),
+            (
+                "over-long session id",
+                GOLDEN_SESSION_KEY.into(),
+                with_field(GOLDEN_MARKER, "session_id", Value::from(long_id.as_str()))?,
+                "usage session ID",
+            ),
+            (
+                "over-long invocation id",
+                GOLDEN_OBSERVATION_KEY.into(),
+                with_field(
+                    GOLDEN_OBSERVATION,
+                    "invocation_id",
+                    Value::from(long_id.as_str()),
+                )?,
+                "usage invocation ID",
+            ),
+        ];
+        for (case, key, value, expected) in refused {
+            let error = match validate_owned_row(&key, &value) {
+                Ok(()) => bail!("{case}: the validator accepted a near-miss"),
+                Err(error) => format!("{error:#}"),
+            };
+            ensure!(
+                error.contains(expected),
+                "{case}: expected {expected:?}, got {error}"
+            );
+        }
+        Ok(())
+    }
+
+    // T11, row-locality: the validator's only inputs are one key and its
+    // value (pinned by the fn-pointer type), and rows that are individually
+    // valid pass whatever else the table holds or lacks: an observation and
+    // an index whose record is absent are accepted. A cross-row check would
+    // fail this test and requires bumping the `v1` stem of `VALIDATOR`.
+    #[test]
+    fn the_row_validator_is_row_local() -> Result<()> {
+        let validator: fn(&[u8], &str) -> Result<()> = validate_owned_row;
+        let orphan_record = record_key("no-such-invocation");
+        let orphan_index = SessionIndex {
+            format: FORMAT,
+            session_id: "no-such-session".into(),
+            invocation_id: "no-such-invocation".into(),
+            record_key: orphan_record.clone(),
+        };
+        validator(
+            session_index_key("no-such-session", "no-such-invocation").as_bytes(),
+            &serde_json::to_string(&orphan_index)?,
+        )?;
+        let orphan_observation = StoredObservation {
+            invocation_id: "no-such-invocation".into(),
+            observation: UsageObservation {
+                sequence: 9,
+                terminal: false,
+                usage: Usage::default(),
+            },
+        };
+        validator(
+            observation_key("no-such-invocation", 9).as_bytes(),
+            &serde_json::to_string(&orphan_observation)?,
+        )?;
+        // The verdict is a function of the row alone: the same row gives the
+        // same verdict before and after unrelated rows are validated.
+        let before = validator(GOLDEN_RECORD_KEY.as_bytes(), GOLDEN_RECORD).is_ok();
+        validator(GOLDEN_SESSION_KEY.as_bytes(), GOLDEN_MARKER)?;
+        ensure!(before && validator(GOLDEN_RECORD_KEY.as_bytes(), GOLDEN_RECORD).is_ok());
+        Ok(())
+    }
+
+    const HASH: &str = "0123456789abcdefghijklmnopqrstuv";
+
+    // T8 (design T17): the record encoders round-trip, and every malformed
+    // form reads as no record.
+    #[test]
+    fn the_validation_record_parser_is_strict() {
+        let expected = Some(UsageRecord {
+            validator: VALIDATOR,
+            state_hash: HASH,
+        });
+        let write = write_message("op", HASH);
+        assert_eq!(
+            write,
+            format!("usage ledger v1 [op]\n\nKuru-Usage-State: {VALIDATOR} {HASH}")
+        );
+        assert_eq!(parse_record(&write), expected);
+        assert_eq!(parse_record(&format!("{write}\n")), expected);
+        let record = record_message(HASH);
+        assert!(record.starts_with("usage ledger validation v1\n\n"));
+        assert_eq!(parse_record(&record), expected);
+        let foreign = format!("subject\n\nKuru-Usage-State: kuru.usage.state.v0+0.0.0 {HASH}");
+        assert_eq!(
+            parse_record(&foreign),
+            Some(UsageRecord {
+                validator: "kuru.usage.state.v0+0.0.0",
+                state_hash: HASH,
+            })
+        );
+
+        let oversize = format!(
+            "{}\n\n{}",
+            "s".repeat(RECORD_MESSAGE_MAX),
+            record_trailer(HASH)
+        );
+        let at_limit = format!(
+            "{}\n\n{}",
+            "s".repeat(RECORD_MESSAGE_MAX - 2 - record_trailer(HASH).len()),
+            record_trailer(HASH)
+        );
+        assert_eq!(at_limit.len(), RECORD_MESSAGE_MAX);
+        assert_eq!(parse_record(&at_limit), expected);
+        let long_validator = format!("subject\n\nKuru-Usage-State: {} {HASH}", "v".repeat(129));
+        let max_validator = format!("subject\n\nKuru-Usage-State: {} {HASH}", "v".repeat(128));
+        assert!(parse_record(&max_validator).is_some());
+        for (case, message) in [
+            ("empty", String::new()),
+            ("no record", "usage ledger v1 [op]".to_owned()),
+            ("oversize", oversize),
+            ("two records", format!("{write}\n{}", record_trailer(HASH))),
+            (
+                "a record line before the subject's record",
+                format!("{}\n\n{write}", record_trailer(HASH)),
+            ),
+            ("trailing line", format!("{write}\nmore")),
+            ("trailing garbage", format!("{write} extra")),
+            ("indented", format!("subject\n\n {}", record_trailer(HASH))),
+            (
+                "no space",
+                format!("subject\n\nKuru-Usage-State:{VALIDATOR} {HASH}"),
+            ),
+            (
+                "double space",
+                format!("subject\n\nKuru-Usage-State: {VALIDATOR}  {HASH}"),
+            ),
+            (
+                "no hash",
+                format!("subject\n\nKuru-Usage-State: {VALIDATOR}"),
+            ),
+            ("short hash", record_message(&HASH[1..])),
+            ("long hash", record_message(&format!("{HASH}0"))),
+            (
+                "hash outside [0-9a-v]",
+                record_message(&HASH.replace('v', "w")),
+            ),
+            ("uppercase hash", record_message(&HASH.to_uppercase())),
+            ("long validator", long_validator),
+            (
+                "non-ASCII validator",
+                format!("subject\n\nKuru-Usage-State: kuru.usage.state.v1+0.9.0\u{e9} {HASH}"),
+            ),
+            (
+                "control in validator",
+                format!("subject\n\nKuru-Usage-State: kuru\tusage {HASH}"),
+            ),
+            (
+                "lowercase key",
+                format!("subject\n\nkuru-usage-state: {VALIDATOR} {HASH}"),
+            ),
+        ] {
+            assert_eq!(parse_record(&message), None, "{case}: {message:?}");
+        }
     }
 }
