@@ -8,6 +8,13 @@ param(
     [switch]$Recover
 )
 $ErrorActionPreference = 'Stop'
+# Load the stock modules this entrypoint and its forwarded bootstrap use from
+# their exact PSHOME manifests before the first command outside
+# Microsoft.PowerShell.Core. A bare first cmdlet would enter module
+# auto-discovery, which can stall indefinitely on a fresh profile's cold
+# analysis cache. Other modules keep ordinary autoloading.
+$null = Microsoft.PowerShell.Core\Import-Module -Name ([IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Management\Microsoft.PowerShell.Management.psd1')) -Verbose:$false -ErrorAction Stop
+$null = Microsoft.PowerShell.Core\Import-Module -Name ([IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1')) -Verbose:$false -ErrorAction Stop
 $kuruRepo = Split-Path -Parent $PSScriptRoot
 if ($Source) {
     if ($Version -or $Target -or $ReleaseBase -or $Recover) {

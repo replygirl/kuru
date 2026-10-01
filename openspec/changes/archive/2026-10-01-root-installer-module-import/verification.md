@@ -1,0 +1,16 @@
+# Verification
+
+## 1. Entrypoint never discovers its own stock commands [critical]
+
+- [x] 1.1 @regression (agent) run `powershell_diagnostics::source_entrypoint_imports_pshome_modules_before_any_discovered_command` against the unfixed and fixed `scripts/install.ps1` -> observed on macOS host 2026-10-01: unfixed script FAILED ("scripts/install.ps1 must import exact PSHOME Management"); fixed script with an injected `Split-Path` before the imports FAILED ("scripts/install.ps1 reaches split-path before its exact PSHOME module imports"); fixed script with an appended `Get-Acl` FAILED ("scripts/install.ps1 uses get-acl; import its exact stock PSHOME module before first use"); fixed script PASSED, and the generalized release-bootstrap contract still PASSED
+- [~] 1.2 @regression (agent) run native `windows_cli::source_install_entrypoint_supplies_its_stock_commands_without_module_auto_discovery` on stock Windows PowerShell 5.1 with a fresh isolated `LOCALAPPDATA` and autoloading disabled, in native Windows CI only (no local Windows host) (expected: fixed entrypoint reaches mise once with exactly one exact-PSHOME Management and Utility module loaded; the unfixed script fails at `Split-Path` with command-not-found) -> defer: no Windows host locally; native Windows CI on the PR is the proof. The test compiles under `mise run lint:windows` (clippy, x86_64-pc-windows-msvc, all targets, `-D warnings`, exit 0). Not observed running.
+
+## 2. Install-timeout family no longer recurs [critical]
+
+- [~] 2.1 @runtime (agent) observe repeated native windows-latest runs of the `windows_cli` source-entrypoint tests at the fixed head, in native Windows CI (expected: no install timeout; one green run does not prove an intermittent stall fixed) -> defer: requires repeated native CI runs after merge; attribution of the family to `Split-Path` discovery is an inference from the release-bootstrap signature, not a recorded trace
+
+- [~] 2.2 @e2e (agent) run the existing `windows_cli` source-entrypoint tests (`source_install_entrypoint_scopes_first_mise_and_restores_environment_on_success_or_failure`, `source_install_entrypoint_rejects_release_options_before_mise_or_environment_changes`) through the real entrypoint in native Windows CI (expected: both pass with the probe unchanged, its `ConvertTo-Json`/`Write-Output` resolving from the entrypoint's global imports) -> defer: native Windows CI only. Not observed.
+
+## 3. Repository gates
+
+- [x] 3.1 @integration (agent) run format check, lint, Windows-target lint, typecheck, delivery tests and shell lint, docs check and strict Cospec validation/apply -> observed on macOS host 2026-10-01: `mise run format:check` exit 0 (after `cargo fmt`); `mise run lint` exit 0; `mise run lint:windows` exit 0 (kuru-tui checked for x86_64-pc-windows-msvc with all targets); `mise run typecheck` exit 0; `mise run //packages/kuru-delivery:test` exit 0, no failures; `mise run //packages/kuru-delivery:lint:shell` exit 0 (shellcheck only; no PowerShell lint task exists); `mise run lint:tooling` exit 0 (repository metadata invariants passed); `mise run docs:check` exit 0 (public docs artifacts, links and anchors passed); Cospec strict validation 0 errors/0 warnings, apply exit 0 (gate clear). A pwsh 7 smoke of the native probe was not run: no pwsh version is configured on this host
