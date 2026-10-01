@@ -3587,8 +3587,8 @@ mod tests {
         )
         .await?;
         // The test pools a retained attempt branch, which carries the store's
-        // own identity only in a cold store; a template copy's carry the
-        // placeholder.
+        // own identity only in a cold store; a template copy's branches carry
+        // the placeholder.
         options.creation = super::super::Creation::Cold;
         let store = super::super::MemoryStore::open(options.clone()).await?;
         store

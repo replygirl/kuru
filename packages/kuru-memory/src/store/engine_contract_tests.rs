@@ -894,7 +894,7 @@ async fn engine_sessions(pool: &MySqlPool) -> Result<Vec<Option<String>>> {
 #[tokio::test]
 async fn as_of_reads_through_main_pool_open_no_revision_connection() -> Result<()> {
     // The comparison pools each retained branch, which only a cold store's
-    // branches allow: a template copy's carry the placeholder identity.
+    // branches allow: a template copy's branches carry the placeholder identity.
     let store = MemoryStore::temporary_cold().await?;
     let (reader_server, reader_pool) = match reader(&store).await {
         Ok(opened) => opened,
