@@ -147,7 +147,7 @@ async fn serve(
         // Keep that exact notification request local without disabling release
         // provenance, changing backend behavior, or accepting arbitrary traffic.
         content_type = "text/plain";
-        b"2026.9.4\n".to_vec()
+        b"2026.9.18\n".to_vec()
     } else if method == Method::GET
         && path == "/api/repos/replygirl/kuru/releases"
         && matches!(query, None | Some("per_page=100"))
@@ -767,7 +767,9 @@ async fn run_archive(
             installed
                 .success(&["--version"])
                 .await?
-                .contains("2026.9.4"),
+                .split_whitespace()
+                .next()
+                == Some("2026.9.18"),
             "unexpected mise version"
         );
         ensure!(

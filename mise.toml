@@ -1,4 +1,4 @@
-min_version = "2026.9.4"
+min_version = { hard = "2026.9.13", soft = "2026.9.18" }
 monorepo_root = true
 
 [settings]

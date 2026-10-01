@@ -24,6 +24,8 @@ const COMMAND_DEADLINE: Duration = Duration::from_secs(180);
 const OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const RECEIPT_LIMIT: usize = 64 * 1024;
 const RECEIPT_SCHEMA: u32 = 2;
+/// The exact mise release every workflow's `jdx/mise-action` `version:` installs.
+const WORKFLOW_MISE_VERSION: &str = "2026.9.18";
 /// PE optional headers follow a bounded DOS stub; a larger offset is malformed.
 const PE_HEADER_LIMIT: usize = 64 * 1024;
 const MISE_CONFIG: &str = r#"[settings]
@@ -865,8 +867,9 @@ pub async fn run(options: Options) -> Result<()> {
     let verified: Result<Receipt> = async {
         let mise_version = install.success("mise-version", &["--version"]).await?;
         ensure!(
-            mise_version.trim().starts_with("2026.9.4") && mise_version.trim().len() <= 256,
-            "workflow mise version differs from 2026.9.4"
+            mise_version.split_whitespace().next() == Some(WORKFLOW_MISE_VERSION)
+                && mise_version.trim().len() <= 256,
+            "workflow mise version differs from {WORKFLOW_MISE_VERSION}"
         );
         let isolated_config_count = install.verify_isolation().await?;
         let selector = format!("github:{REPOSITORY}@{version}");
@@ -1217,7 +1220,7 @@ mod tests {
             archive_sha256: "b".repeat(64),
             executable_sha256: "c".repeat(64),
             installed_sha256: "c".repeat(64),
-            mise_version: "2026.9.4".into(),
+            mise_version: WORKFLOW_MISE_VERSION.into(),
             isolated_config_count: 1,
             commands: vec![
                 CommandEvidence {

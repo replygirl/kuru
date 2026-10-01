@@ -22,7 +22,7 @@ use std::{collections::BTreeSet, fs, path::Path};
 use anyhow::{Context, Result};
 use serde_yaml_ng::Value;
 
-/// mise 2026.9.4 `settings.toml`: `exec_auto_install` (`mise x`, which
+/// mise 2026.9.18 `settings.toml`: `exec_auto_install` (`mise x`, which
 /// Windows shims run) and `task.run_auto_install` (`mise run`), both on by
 /// default.
 const EXEC_AUTO_INSTALL: &str = "MISE_EXEC_AUTO_INSTALL";
@@ -83,7 +83,7 @@ const PREFIXES: [Prefix; 8] = [
 const SHELLS: [&str; 4] = ["sh", "bash", "dash", "zsh"];
 /// mise options that take the next word as their value. Global options, which
 /// mise also accepts after the subcommand: `-C/--cd`, `-E/--env`, `-j/--jobs`
-/// (`docs/cli/index.md` at v2026.9.4). `install`: `-j/--jobs`,
+/// (`docs/cli/index.md` at v2026.9.18). `install`: `-j/--jobs`,
 /// `--minimum-release-age`, `--shared` (`docs/cli/install.md`). `upgrade`:
 /// `-j/--jobs`, `-x/--exclude`, `--minimum-release-age`
 /// (`docs/cli/upgrade.md`). `bootstrap`: `--from`, `--adopt`, `--from-dir`,
@@ -105,7 +105,7 @@ const MISE_VALUE_LONG: [&str; 11] = [
 ];
 /// mise subcommands that install every configured tool when given no tool:
 /// `install` (`i`), `upgrade` (`up`) and `bootstrap` (`bs`), whose phase 6
-/// installs the versioned tools (`docs/cli/*.md` at v2026.9.4).
+/// installs the versioned tools (`docs/cli/*.md` at v2026.9.18).
 const MISE_INSTALLS: [(&str, &str); 3] = [("install", "i"), ("upgrade", "up"), ("bootstrap", "bs")];
 
 pub(super) fn check(root: &Path, errors: &mut BTreeSet<String>) -> Result<()> {
