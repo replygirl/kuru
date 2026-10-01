@@ -21,7 +21,9 @@ and 2026.9.18, so the version bump alone does not remove it.
 - The delivery package's published-Windows workflow mise-version check and
   fixture, the release-workflow and mise-acceptance test expectations, the
   repository-validation fixtures and the mise CLI citations move to 2026.9.18.
-  These are version constants only; no behavior changes.
+  Both live version checks also become stricter: they compare the first token
+  of `mise --version` exactly instead of a prefix or substring, so a later
+  release such as 2026.9.180 no longer matches.
 - `//apps/kuru-docs:setup:tools` installs with `mise install --locked node npm`,
   matching the delivery package's locked cargo-audit install, so hook and docs
   runs no longer rewrite lockfiles.
