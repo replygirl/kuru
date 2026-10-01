@@ -1404,7 +1404,16 @@ impl MemoryStore {
     }
 
     /// Existing direct local opens remain usable by isolated fixtures and
-    /// explicit maintenance. The project store lock excludes a live owner.
+    /// explicit maintenance. A direct open consults no service authority: the
+    /// project store lock is held only while a store starts, so it does not
+    /// exclude a serving or retiring owner. A writable direct open waits for
+    /// the store's lifecycle lease and starts its own Dolt. A read-only one
+    /// borrows whatever Dolt the store's endpoint record still names, with no
+    /// lifetime guarantee: a retiring owner keeps that record until its close
+    /// reaps Dolt, then the borrowed view fails. Order a direct open after the
+    /// owner has exited, hold an attachment that keeps the owner alive, or
+    /// inspect through [`Self::open_managed_observed`], which decides from the
+    /// owner lock.
     pub async fn open(options: OpenOptions) -> Result<Self> {
         Ok(Self {
             backend: Backend::Local(store::MemoryStore::open(options).await?),

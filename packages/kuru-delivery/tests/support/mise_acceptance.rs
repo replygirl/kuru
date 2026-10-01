@@ -647,7 +647,14 @@ impl Installation {
         }
         let mut options = self.memory_options(binary, scope.to_owned());
         options.read_only = true;
-        let store = kuru_memory::MemoryStore::open(options).await?;
+        // The managed read-only path decides from the owner lock, so it never
+        // borrows the Dolt of an owner that is still retiring.
+        let (_, opening) = kuru_memory::MemoryStore::open_managed_observed(
+            options,
+            self.project.canonicalize()?,
+            binary.to_owned(),
+        );
+        let store = opening.await?;
         let transcript = store
             .history(&format!("{scope}/transcript/{session}"), 100)
             .await;

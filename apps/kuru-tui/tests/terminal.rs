@@ -145,10 +145,20 @@ impl Sandbox {
         Ok(toml::from_str(&String::from_utf8(output.stdout)?)?)
     }
 
+    /// Inspect saved preferences through the product's read-only path. While
+    /// a UI runs, it attaches to that UI's owner. After the UI exits, the
+    /// owner retires and its store's Dolt endpoint stays published until the
+    /// reap, so a direct open could borrow a Dolt that is stopping; the
+    /// managed open instead waits on the owner lock, then opens its own.
     async fn preferences(&self) -> Result<kuru_core::ProjectPreferences> {
         let mut options = memory_options(self)?;
         options.read_only = true;
-        let memory = MemoryStore::open(options).await?;
+        let (_, opening) = MemoryStore::open_managed_observed(
+            options,
+            self.project.canonicalize()?,
+            PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+        );
+        let memory = opening.await?;
         let preferences = kuru_runtime::Harness::load_preferences(&memory, &self.project).await?;
         memory.close().await?;
         Ok(preferences)
