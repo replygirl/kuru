@@ -336,8 +336,7 @@ Kuru includes its pinned full-Dolt engine and licenses. First memory use extract
 
 `offline` remains accepted for compatibility; bundled engine provisioning never uses HTTP. `cache_dir` and `dolt_binary` must be absolute native paths and are not resolved relative to a configuration file. `dolt_binary` is an optional development override and must report the supported exact version. The startup timeout is 1–300 seconds. If a newly started memory service is not ready in time, the error `memory service readiness deadline exceeded` also reports how that wait was split: election, owner probe, spawn and readiness polling in milliseconds, the number of readiness polls, and what the last poll found. Provider network access is independent of these memory settings.
 
-Commands that open memory print at most one fixed standard-error line for each
-actual startup stage: private ownership, runtime cache work, runtime checking,
-database preparation, database opening, and ready. These lines do not estimate
-duration or establish success; the final command result does. They never alter
-standard output, including JSON.
+While a command opens memory, it shows one plain sentence on standard error about
+what Kuru is doing, erased when memory is ready. It does not estimate duration or
+establish success, and it never alters standard output, including JSON. See
+[how memory works](/concepts/memory) for the sentences.
