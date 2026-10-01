@@ -68,6 +68,13 @@ env.KURU_TEST_SUPERVISOR_PREPARED = "1"
 depends = ["prefetch"]
 run = "cargo test -p kuru-memory --lib --all-features --locked lifecycle_measurement_tests -- --ignored --test-threads=2"
 
+[tasks."measure:cold-open"]
+description = "Run the ignored cold-path open-latency measurement on demand"
+env.RUST_TEST_THREADS = "1"
+env.KURU_TEST_SUPERVISOR_PREPARED = "1"
+depends = ["prefetch"]
+run = "cargo test -p kuru-memory --lib --all-features --locked stage_worker::tests::measure_cold_open_latency -- --ignored --test-threads=1"
+
 [tasks."bundle:test-fixtures"]
 description = "Prepare the actual upstream Windows ZIP for host-independent decoder tests"
 depends = [{ task = "bundle:prepare", args = ["--target", "x86_64-pc-windows-msvc"] }]

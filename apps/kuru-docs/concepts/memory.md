@@ -220,8 +220,8 @@ shares only schema history with other copies.
 What the first launch pays: the first new project on a machine, and the first
 after an update that changes the schema or the engine, builds the template
 before copying from it, which takes about as long as building a store directly
-did. Every later new project opens faster, with two database starts instead of
-four. A project that imports older SQLite data, or a configured development
+did. Every later new project opens faster, because it skips the schema
+upgrades. A project that imports older SQLite data, or a configured development
 engine (`memory.dolt_binary`), is still built directly. Whichever way a new
 project is created, including while the first launch builds the template,
 Kuru shows "Creating this project's memory…" until it is ready.

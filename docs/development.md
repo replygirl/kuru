@@ -405,14 +405,16 @@ the copy's adoption start and the active start, in the engine ledger. The
 first open for a template key that finds no published template builds it
 first, three starts; with warm-up in place a fixture never does, and the guard
 below fails one that did. `Creation::Cold` fixtures, a legacy import and a
-configured `dolt_binary` keep the cold staged build's four starts, as does
-any open that falls back from a busy or unusable template. Fixture deadlines
-(`test_support::fixture_deadline`) keep budgeting four starts per fresh open,
-the longest path; `test_support::fresh_open_budget_of` budgets each path
-(`FreshOpen::Template`, `FirstProject`, `Cold`) for tests that assert one.
-Tests that pause or delay a cold staging job (migration hooks, the migrated
-stage pool delay) set `Creation::Cold`, since a template copy runs no
-migration. Tests of an empty, busy or damaged template set
+configured `dolt_binary` take the cold staged build, also two starts: the
+stage's one start, which initializes, imports, migrates, validates and marks
+the stage ready, and the active start. So does any open that falls back from a
+busy or unusable template. Fixture deadlines (`test_support::fixture_deadline`)
+budget two starts per fresh open, the most a fixture open can take now that
+the guard forbids a build; `test_support::fresh_open_budget_of` budgets each
+path (`FreshOpen::Template`, `FirstProject`, `Cold`) for tests that assert
+one, and `fresh_open_budget` is the first project's, the longest. Tests that
+pause or delay the cold staging job (migration hooks, the stage pool delay)
+set `Creation::Cold`, since a template copy runs no migration. Tests of an empty, busy or damaged template set
 `OpenOptions::template_root` to a private root, so the shared template other
 fixtures copy is never disturbed. A spawned-binary fixture that gives Kuru
 its own empty `memory.cache_dir` (a first launch on a fresh machine) has its

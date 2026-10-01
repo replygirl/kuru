@@ -50,24 +50,23 @@ async fn options(root: &crate::test_support::TempDir, digit: char) -> Result<Ope
     .await
 }
 
-/// Staged open: an error on a staged server's main pool (the migrated stage's
+/// Staged open: an error on a staged server's main pool (the cold stage's
 /// open-sequence pool, past the whole startup budget).
 #[tokio::test]
 async fn staged_open_error_returns_only_after_its_server_is_reaped() -> Result<()> {
     let root = crate::test_support::tempdir()?;
     let mut options = options(&root, '4').await?;
     let entered = Arc::new(AtomicBool::new(false));
-    // The delayed pool is the cold staged build's validation start.
+    // The delayed pool is the cold staged build's one stage start.
     options.creation = Creation::Cold;
-    options.migrated_stage_pool_delay =
-        Some((crate::test_support::server_start_budget(), entered.clone()));
+    options.stage_pool_delay = Some((crate::test_support::server_start_budget(), entered.clone()));
     let error = crate::test_support::spawn_gated_open(options.clone())
         .await
         .expect_err("an expired staged main pool cannot open memory");
     assert!(entered.load(Ordering::SeqCst));
     assert!(
-        format!("{error:#}").contains("open migrated staged main pool"),
-        "the staged open failed before its migrated main pool"
+        format!("{error:#}").contains("open staged main pool"),
+        "the staged open failed before its main pool"
     );
     let directory = project_directory(&options.data_dir, &options.project_scope)?;
     let prefix = format!(

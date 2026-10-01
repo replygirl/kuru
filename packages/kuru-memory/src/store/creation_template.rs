@@ -1140,9 +1140,7 @@ async fn build(
         project_scope: TEMPLATE_SCOPE,
         legacy: None,
         #[cfg(test)]
-        migration_hooks: None,
-        #[cfg(test)]
-        migrated_stage_pool_delay: None,
+        hooks: stage_worker::StageHooks::default(),
     };
     let mut progress = ProgressReporter::silent();
     let (lock, hostname) = match worker.build_template(lock, &mut progress).await {

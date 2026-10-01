@@ -215,11 +215,11 @@ async fn warm_engine() -> Result<PathBuf> {
 /// bookkeeping, so its own deadline errors are observed before the warm-up's.
 pub const WARM_UP_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The store template step's bound: one cold fresh-open budget (whose four
-/// engine starts cover one build start, the chain and the capture with
+/// The store template step's bound: the budget of four engine starts and
+/// three closes (which cover one build start, the chain and the capture with
 /// room, and a peer process's build) plus [`WARM_UP_MARGIN`].
 pub(crate) fn template_warm_up_bound() -> Duration {
-    fresh_open_budget().saturating_add(WARM_UP_MARGIN)
+    starts_budget(4, 3).saturating_add(WARM_UP_MARGIN)
 }
 
 /// The store templates root of the shared test cache.
@@ -363,13 +363,7 @@ pub(crate) fn server_start_budget() -> std::time::Duration {
 /// How a fresh store open (`MemoryStore::open_inner` with no active
 /// directory) creates its store, by its engine starts and the owned closes
 /// before it is ready.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "fixture budgets take the cold case; only the creation-path tests name the others"
-    )
-)]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FreshOpen {
     /// A copy of a published store template: the stage's one start
@@ -379,18 +373,20 @@ pub(crate) enum FreshOpen {
     /// the copy's stage start and the active start.
     FirstProject,
     /// The cold staged build (a legacy import, a configured engine binary,
-    /// `Creation::Cold`, or any fallback from the template): initialization,
-    /// migration, validation and the active start.
+    /// `Creation::Cold`, or any fallback from the template): the stage's one
+    /// start (initialization, the import, migration, validation and the
+    /// ready marker) and the active start.
     Cold,
 }
 
+#[cfg(test)]
 impl FreshOpen {
     /// Engine starts, as the engine ledger counts them.
     pub(crate) const fn starts(self) -> u32 {
         match self {
             Self::Template => 2,
             Self::FirstProject => 3,
-            Self::Cold => 4,
+            Self::Cold => 2,
         }
     }
 
@@ -403,23 +399,32 @@ impl FreshOpen {
 /// A fresh store open of `kind`: the startup lock wait, each server start
 /// with one `QUERY_TIMEOUT` session, each owned server close, and the staged
 /// directory's quiescence wait.
+#[cfg(test)]
 pub(crate) fn fresh_open_budget_of(kind: FreshOpen) -> std::time::Duration {
+    starts_budget(kind.starts(), kind.closes())
+}
+
+/// The startup lock wait, `starts` server starts with one `QUERY_TIMEOUT`
+/// session each, `closes` owned server closes, and a quiescence wait.
+fn starts_budget(starts: u32, closes: u32) -> std::time::Duration {
     let startup = default_startup();
     startup
         .saturating_add(
             server_start_budget()
                 .saturating_add(crate::store::QUERY_TIMEOUT)
-                .saturating_mul(kind.starts()),
+                .saturating_mul(starts),
         )
-        .saturating_add(crate::server::close_budget().saturating_mul(kind.closes()))
+        .saturating_add(crate::server::close_budget().saturating_mul(closes))
         .saturating_add(startup)
 }
 
-/// The budget of any fresh store open, whatever path it takes: the cold
-/// staged build's, the longest. An open that meets a busy or unusable store
-/// template falls back to it.
+/// The budget of any fresh store open, whatever path it takes: the first
+/// project's, which builds the store template, the longest. A copy of the
+/// template and the cold staged build (including a fallback from a busy or
+/// unusable template) take fewer starts.
+#[cfg(test)]
 pub(crate) fn fresh_open_budget() -> std::time::Duration {
-    fresh_open_budget_of(FreshOpen::Cold)
+    fresh_open_budget_of(FreshOpen::FirstProject)
 }
 
 /// Outer hang backstop for a fixture with `fresh` real lifecycles that create
@@ -430,9 +435,11 @@ pub(crate) fn fresh_open_budget() -> std::time::Duration {
 /// `MemoryStore::open` that starts Dolt; managed attaches and checked rebinds
 /// start none. Every Dolt server start the fixture really performs gets the
 /// full `server_start_budget()`: for a fresh open, the starts of the longest
-/// path it can take, the cold staged build's four (initialization, migration,
-/// validation, active), which a copy of the store template (two) or a cold
-/// fallback from a busy or unusable template never exceeds; one for a reopen.
+/// path it can take: two, for a copy of the store template (adoption and
+/// active) and for the cold staged build or a cold fallback from a busy or
+/// unusable template (the stage's one start and active) alike; a fixture
+/// open never builds the template, which the fixture guard refuses. One for
+/// a reopen.
 /// On top of those, the
 /// fixture gets one single-stall term, the largest bound any other single
 /// product step can reach (an owned server close, a `QUERY_TIMEOUT` statement,
@@ -447,9 +454,8 @@ pub(crate) fn fresh_open_budget() -> std::time::Duration {
 /// runtime install is charged here, and keep the `OpenOptions::new` budgets.
 #[cfg(test)]
 pub(crate) fn fixture_deadline(fresh: u32, reopened: u32) -> std::time::Duration {
-    let starts = fresh
-        .saturating_mul(FreshOpen::Cold.starts())
-        .saturating_add(reopened);
+    let fresh_starts = FreshOpen::Template.starts().max(FreshOpen::Cold.starts());
+    let starts = fresh.saturating_mul(fresh_starts).saturating_add(reopened);
     let single_stall = crate::server::close_budget()
         .max(crate::store::QUERY_TIMEOUT)
         .max(default_startup());
@@ -465,8 +471,8 @@ mod fixture_deadline_tests {
     use std::time::Duration;
 
     /// Each creation path's budget counts its own starts and closes, and the
-    /// default fresh-open budget is the cold staged build's, the longest, so
-    /// it covers an open that falls back from the template.
+    /// default fresh-open budget is the first project's, the longest, so it
+    /// covers a template copy and a cold build or fallback alike.
     #[test]
     fn fresh_open_budgets_follow_each_creation_path() {
         assert_eq!(
@@ -476,7 +482,7 @@ mod fixture_deadline_tests {
                 FreshOpen::Cold
             ]
             .map(|kind| (kind.starts(), kind.closes())),
-            [(2, 1), (3, 2), (4, 3)]
+            [(2, 1), (3, 2), (2, 1)]
         );
         let start = super::server_start_budget()
             .saturating_add(crate::store::QUERY_TIMEOUT)
@@ -487,15 +493,18 @@ mod fixture_deadline_tests {
         );
         assert_eq!(
             fresh_open_budget_of(FreshOpen::Cold),
-            fresh_open_budget_of(FreshOpen::FirstProject) + start
+            fresh_open_budget_of(FreshOpen::Template)
         );
-        assert_eq!(fresh_open_budget(), fresh_open_budget_of(FreshOpen::Cold));
+        assert_eq!(
+            fresh_open_budget(),
+            fresh_open_budget_of(FreshOpen::FirstProject)
+        );
     }
 
     #[test]
     fn single_stall_defaults_match_the_reviewed_bounds() {
         for ((fresh, reopened), seconds) in
-            [((1, 0), 190), ((1, 1), 222), ((2, 1), 350), ((2, 4), 446)]
+            [((1, 0), 126), ((1, 1), 158), ((2, 1), 222), ((2, 4), 318)]
         {
             assert_eq!(
                 fixture_deadline(fresh, reopened),
