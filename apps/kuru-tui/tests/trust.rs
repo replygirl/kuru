@@ -1405,7 +1405,9 @@ async fn reached_undo_uses_only_approved_memory_authority_and_no_provider_route(
     let sandbox = Sandbox::new("");
     let scope = kuru_runtime::project_scope(&sandbox.project).unwrap();
     let options =
-        kuru_memory::test_support::open_options(sandbox.data.clone(), scope.clone()).unwrap();
+        kuru_memory::test_support::warmed_open_options(sandbox.data.clone(), scope.clone())
+            .await
+            .unwrap();
     let memory = MemoryStore::open(options.clone()).await.unwrap();
     let mut harness = Harness::new(
         Config {
@@ -1452,7 +1454,7 @@ async fn reached_undo_uses_only_approved_memory_authority_and_no_provider_route(
         api_key_env: "KURU_UNREADABLE_UNDO_KEY".into(),
         ..Config::default()
     };
-    config.memory.cache_dir = Some(kuru_memory::test_support::cache_dir());
+    config.memory.cache_dir = Some(kuru_memory::test_support::warmed_cache_dir().await.unwrap());
     config.memory.offline = true;
     sandbox.write_config(&toml::to_string(&config).unwrap());
 

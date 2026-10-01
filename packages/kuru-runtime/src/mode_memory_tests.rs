@@ -154,10 +154,11 @@ async fn open_memory(
     kuru_memory::test_support::TempDir,
 ) {
     let data = kuru_memory::test_support::tempdir().unwrap();
-    let options = kuru_memory::test_support::open_options(
+    let options = kuru_memory::test_support::warmed_open_options(
         data.path().into(),
         crate::project_scope(project).unwrap(),
     )
+    .await
     .unwrap();
     let memory = MemoryStore::open(options.clone()).await.unwrap();
     (memory, options, data)

@@ -18,10 +18,11 @@ async fn migrated_stage_pool_uses_remaining_startup_budget_and_post_open_pools_s
     let beyond_ordinary = crate::server::ORDINARY_POOL_WINDOW * 3 / 2;
 
     let root = crate::test_support::tempdir()?;
-    let mut options = crate::test_support::open_options(
+    let mut options = crate::test_support::warmed_open_options(
         root.path().join("within-budget"),
         format!("project/{}", "1".repeat(64)),
-    )?;
+    )
+    .await?;
     let entered = Arc::new(AtomicBool::new(false));
     options.migrated_stage_pool_delay = Some((beyond_ordinary, entered.clone()));
     let store = crate::test_support::spawn_gated_open(options).await?;
@@ -62,10 +63,11 @@ async fn migrated_stage_pool_uses_remaining_startup_budget_and_post_open_pools_s
     store.close().await?;
 
     // Past the whole startup budget, the same pool fails with its own bound.
-    let mut options = crate::test_support::open_options(
+    let mut options = crate::test_support::warmed_open_options(
         root.path().join("past-budget"),
         format!("project/{}", "2".repeat(64)),
-    )?;
+    )
+    .await?;
     let startup_budget = crate::test_support::server_start_budget();
     let entered = Arc::new(AtomicBool::new(false));
     options.migrated_stage_pool_delay = Some((startup_budget, entered.clone()));
@@ -88,10 +90,11 @@ async fn migrated_stage_pool_uses_remaining_startup_budget_and_post_open_pools_s
 #[tokio::test]
 async fn retained_open_pools_keep_the_ordinary_acquire_window() -> Result<()> {
     let root = crate::test_support::tempdir()?;
-    let options = crate::test_support::open_options(
+    let options = crate::test_support::warmed_open_options(
         root.path().join("retained"),
         format!("project/{}", "3".repeat(64)),
-    )?;
+    )
+    .await?;
     let store = crate::test_support::spawn_gated_open(options).await?;
     let usage = store
         .shared

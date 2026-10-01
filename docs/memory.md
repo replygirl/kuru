@@ -267,6 +267,69 @@ record, the database identity record, and the supervisor protocol. An old dream
 candidate stays on its recorded historical schema and remains stale if `main`
 has since advanced; it is never silently rewritten by an upgrade.
 
+## New projects and the store template
+
+Kuru can now build, verify and quarantine a per-machine store template, but no
+open builds or uses one yet: new projects are still built by running every
+schema step, and nothing user-visible changes in this release. The next change
+creates new projects from it.
+
+The template lives beside the engine it was built with, in the engine cache
+(`tools/dolt` in the data directory, or `memory.cache_dir`):
+`<cache>/<engine version>/templates/<key>/`. It is the `data/` directory of a
+store that Kuru built once, under a fixed placeholder identity, by running the
+real schema steps on one database start. It holds the schema, the migration
+receipts and that placeholder identity only: no project data, no identity
+record, no credentials, no database configuration or home directory. Every
+project that shares the cache can therefore share it, and purging a project
+(`kuru memory purge`) does not touch it.
+
+The key in its name covers exactly what decides a fresh store's bytes: the
+template format, the pinned engine version and this platform's engine digest,
+the schema versions and every schema step, and the statements and settings
+that create a store. A release that changes any of them uses a new key and
+builds a new template once; old templates stay, as old engine versions do.
+Nothing removes a template or its lock file during ordinary use.
+
+A template is built only by the holder of its key's exclusive lock, and is
+published only after its database validates, its shape matches exactly the
+schema, receipts and placeholder identity the schema steps produce, and a scan
+of its files finds none of the build directory's path, the build's database
+credentials or the host name. The shape check also reads every commit on
+`main` and on the usage branch: the engine's own first commit under its fixed
+system account, then Kuru's commits under Kuru's fixed author with the
+messages the schema steps write. That scan sees literal bytes only (the engine
+compresses its storage), so the shape check, which reads the database itself,
+is the guarantee and the scan an extra precaution; it is what rules out a
+recorded host or operating-system user name. The scan skips host names
+shorter than four characters, and does not look for the user name at all,
+because such short sequences occur by chance in compressed files and would
+refuse sound builds. A build whose scan finds anything is refused and its
+capture is removed at once. Copying a template checks
+every file's size and digest against its manifest and refuses links. A
+template is moved aside as `.rejected-<key>-<id>` only when a check of its own
+bytes fails; an engine, I/O, lock or deadline failure leaves it in place. No
+caller ever waits for another process's build: a busy template means building
+the store without one.
+
+A build's own working store (`.build-<key>-<id>/`, which holds the build's
+private identity record and its database credentials) is removed once its
+template is captured. If that removal fails, or a builder stops before it,
+the next holder of the key's exclusive lock removes it, without waiting for an
+engine that has not yet stopped: the next build, or the next quarantine of
+that key's template. Until then it stays in the cache directory, which is
+private to your user.
+
+A template directory Kuru cannot read, for example one whose permissions are
+no longer private to your user, is an I/O failure rather than a verdict
+against its bytes, so it is never moved aside. Once new projects are created
+from the template, each one would then be built without it, with a warning,
+until the directory is fixed. To recover, delete `<cache>/<engine version>/templates/<key>/` while
+no Kuru process is running; the next new project builds it again. On Windows
+the same `templates/` directory also holds a small `lifecycles/` lease file per
+build; like the key lock files, these are permanent and go only with the cache
+directory.
+
 ## Template-born stores
 
 Kuru can now adopt and recover a new project store copied from a

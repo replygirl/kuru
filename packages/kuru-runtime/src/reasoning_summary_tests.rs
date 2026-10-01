@@ -290,10 +290,11 @@ async fn settled_summary_persists_with_the_admitted_turn_and_stays_out_of_transc
 async fn settled_summary_survives_a_real_memory_reopen_without_entering_history() {
     let project = tempfile::tempdir().unwrap();
     let data = kuru_memory::test_support::tempdir().unwrap();
-    let options = kuru_memory::test_support::open_options(
+    let options = kuru_memory::test_support::warmed_open_options(
         data.path().into(),
         crate::project_scope(project.path()).unwrap(),
     )
+    .await
     .unwrap();
     let memory = MemoryStore::open(options.clone()).await.unwrap();
     let mut harness = Harness::new(

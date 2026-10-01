@@ -219,10 +219,11 @@ async fn live_transition_session_blocks_abandon_until_exact_teardown() -> Result
 #[tokio::test]
 async fn dirty_promoting_retry_publishes_the_committed_head_but_preserves_the_ref() -> Result<()> {
     let directory = crate::test_support::tempdir()?;
-    let options = crate::test_support::open_options(
+    let options = crate::test_support::warmed_open_options(
         directory.path().to_path_buf(),
         format!("project/{}", "9".repeat(64)),
-    )?;
+    )
+    .await?;
     let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     let candidate = store.begin_candidate("dirty retry").await?;
     candidate
@@ -671,10 +672,11 @@ async fn candidate_pool_retirement_observes_exact_server_sessions_before_rename(
 async fn startup_reclaims_only_resolved_status_and_never_finishes_a_pending_promotion() -> Result<()>
 {
     let directory = crate::test_support::tempdir()?;
-    let options = crate::test_support::open_options(
+    let options = crate::test_support::warmed_open_options(
         directory.path().to_path_buf(),
         format!("project/{}", "7".repeat(64)),
-    )?;
+    )
+    .await?;
     let store = crate::test_support::spawn_gated_open(options.clone()).await?;
 
     let unmerged = store.begin_candidate("unmerged").await?;
@@ -748,10 +750,11 @@ async fn startup_reclaims_only_resolved_status_and_never_finishes_a_pending_prom
 #[tokio::test]
 async fn startup_reconciles_equal_dual_refs_and_preserves_mismatched_refs() -> Result<()> {
     let directory = crate::test_support::tempdir()?;
-    let options = crate::test_support::open_options(
+    let options = crate::test_support::warmed_open_options(
         directory.path().to_path_buf(),
         format!("project/{}", "6".repeat(64)),
-    )?;
+    )
+    .await?;
     let store = crate::test_support::spawn_gated_open(options.clone()).await?;
 
     let equal = store.begin_candidate("equal dual refs").await?;
@@ -815,10 +818,11 @@ async fn startup_reconciles_equal_dual_refs_and_preserves_mismatched_refs() -> R
 async fn cancelled_startup_recovery_reaps_before_handoff_and_preserves_pending_intent() -> Result<()>
 {
     let directory = crate::test_support::tempdir()?;
-    let options = crate::test_support::open_options(
+    let options = crate::test_support::warmed_open_options(
         directory.path().to_path_buf(),
         format!("project/{}", "8".repeat(64)),
-    )?;
+    )
+    .await?;
     let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     let base = store.revision().await?;
     let candidate = store.begin_candidate("cancelled recovery").await?;
@@ -1328,7 +1332,8 @@ async fn slow_30s_managed_abandon_cleanup_bound_fences_client_and_keeps_status_r
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     );
-    let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+    let options =
+        crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
     let outcome = async {
         let names = deadline
             .serve(

@@ -29,6 +29,36 @@ const DEFINITION_LIMIT: usize = 64;
 const FIELD_LIMIT: usize = 1024;
 const MIGRATION_ID_LIMIT: usize = 128;
 const RECEIPT_PROTOCOL: &str = "kuru.memory.migration.receipt.v1";
+/// The statements and names every migration step runs besides its own
+/// definition: they shape each store's history, so the store template key
+/// covers them ([`TEMPLATE_KEY_STATEMENTS`]); call sites use these constants.
+const BRANCH_CREATE: &str = "CALL DOLT_BRANCH(?, ?)";
+const ATTEMPT_BEGIN: &str = "START TRANSACTION";
+const ATTEMPT_ADVANCE: &str = "UPDATE kuru_schema SET version = ? WHERE id = 1 AND version = ?";
+const ATTEMPT_RECEIPT: &str =
+    "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (?, ?, ?, ?)";
+const ATTEMPT_COMMIT: &str = "CALL DOLT_COMMIT('-Am', ?, '--author', ?)";
+/// The attempt commit message around its target version and operation.
+const ATTEMPT_MESSAGE: [&str; 3] = ["Upgrade Kuru memory schema ", " [", "]"];
+const ATTEMPT_END: &str = "COMMIT";
+const PUBLISH_MERGE: &str = "CALL DOLT_MERGE(?, '--ff-only')";
+/// Every migration-path statement and name the store template key covers.
+pub(super) const TEMPLATE_KEY_STATEMENTS: [&str; 14] = [
+    BRANCH_CREATE,
+    ATTEMPT_BEGIN,
+    ATTEMPT_ADVANCE,
+    ATTEMPT_RECEIPT,
+    ATTEMPT_COMMIT,
+    ATTEMPT_MESSAGE[0],
+    ATTEMPT_MESSAGE[1],
+    ATTEMPT_MESSAGE[2],
+    ATTEMPT_END,
+    PUBLISH_MERGE,
+    RESERVED_PREFIX,
+    USAGE_RESERVED_PREFIX,
+    RECEIPT_PROTOCOL,
+    super::usage_ledger::BRANCH,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MigrationBoundary {
@@ -567,6 +597,13 @@ impl Registry {
         }
         Ok(())
     }
+}
+
+/// The receipt digest of every definition of the main and the usage
+/// registries, in declared order: the migration chain as the store template
+/// key covers it.
+pub(super) fn template_key_definitions() -> [Vec<String>; 2] {
+    [REGISTRY, USAGE_REGISTRY].map(|registry| registry.definitions.iter().map(digest).collect())
 }
 
 fn digest(definition: &Definition) -> String {
@@ -1601,7 +1638,7 @@ async fn ensure_usage_branch_at_v4(main: &MySqlPool, base: &str) -> Result<()> {
         // usage ledger at the exact clean schema-4 head before main advances,
         // so later establishment never inherits or fabricates schema 5.
         bounded_query(
-            sqlx::query("CALL DOLT_BRANCH(?, ?)")
+            sqlx::query(BRANCH_CREATE)
                 .bind(super::usage_ledger::BRANCH)
                 .bind(base)
                 .fetch_all(main),
@@ -1988,7 +2025,7 @@ async fn discover_current_attempt_in(
     let created = async {
         hooks.reach(MigrationBoundary::BeforeBranch).await?;
         bounded_query(
-            sqlx::query("CALL DOLT_BRANCH(?, ?)")
+            sqlx::query(BRANCH_CREATE)
                 .bind(&branch)
                 .bind(base)
                 .fetch_all(&mut connection),
@@ -2045,12 +2082,12 @@ async fn build_attempt(
             bounded_query(sqlx::query(*statement).execute(&mut connection)).await?;
         }
         hooks.reach(MigrationBoundary::AfterDdl).await?;
-        bounded_query(sqlx::query("START TRANSACTION").execute(&mut connection)).await?;
+        bounded_query(sqlx::query(ATTEMPT_BEGIN).execute(&mut connection)).await?;
         if let Some(source_revision) = source_revision.as_deref() {
             migrate_legacy_session_catalog(&mut connection, source_revision).await?;
         }
         let advanced = bounded_query(
-            sqlx::query("UPDATE kuru_schema SET version = ? WHERE id = 1 AND version = ?")
+            sqlx::query(ATTEMPT_ADVANCE)
                 .bind(definition.to)
                 .bind(definition.from)
                 .execute(&mut connection),
@@ -2061,28 +2098,27 @@ async fn build_attempt(
             "Dolt migration schema version did not advance exactly once"
         );
         bounded_query(
-            sqlx::query(
-                "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (?, ?, ?, ?)",
-            )
-            .bind(definition.to)
-            .bind(definition.id)
-            .bind(digest(definition))
-            .bind(operation.hyphenated().to_string())
-            .execute(&mut connection),
+            sqlx::query(ATTEMPT_RECEIPT)
+                .bind(definition.to)
+                .bind(definition.id)
+                .bind(digest(definition))
+                .bind(operation.hyphenated().to_string())
+                .execute(&mut connection),
         )
         .await?;
         hooks.reach(MigrationBoundary::BeforeCommit).await?;
+        let [before, middle, after] = ATTEMPT_MESSAGE;
         bounded_query(
-            sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
+            sqlx::query(ATTEMPT_COMMIT)
                 .bind(format!(
-                    "Upgrade Kuru memory schema {} [{}]",
-                    definition.to, operation
+                    "{before}{}{middle}{operation}{after}",
+                    definition.to
                 ))
                 .bind(AUTHOR)
                 .fetch_all(&mut connection),
         )
         .await?;
-        bounded_query(sqlx::query("COMMIT").execute(&mut connection)).await?;
+        bounded_query(sqlx::query(ATTEMPT_END).execute(&mut connection)).await?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -2306,7 +2342,7 @@ async fn publish(
     let result = async {
         hooks.reach(MigrationBoundary::BeforePublish).await?;
         bounded_query(
-            sqlx::query("CALL DOLT_MERGE(?, '--ff-only')")
+            sqlx::query(PUBLISH_MERGE)
                 .bind(branch)
                 .fetch_all(&mut connection),
         )
@@ -2338,10 +2374,10 @@ async fn publish(
 mod main_pool_classification_tests;
 
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "test-support")),
     expect(
         dead_code,
-        reason = "no open creates or builds a template stage until the template cache lands"
+        reason = "only test-fixture warm-up builds a store template until creation uses it"
     )
 )]
 pub(super) mod template_shape;
@@ -2417,10 +2453,11 @@ mod tests {
     #[tokio::test]
     async fn older_registry_rejects_v4_store_without_mutating_it() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().join("private"),
             format!("project/{}", "4".repeat(64)),
-        )?;
+        )
+        .await?;
         super::super::tests::released_v1(&options).await?;
         let server = super::super::tests::released_server(&options).await?;
         let main = server.pool("main").await?;
@@ -2493,10 +2530,11 @@ mod tests {
     async fn released_v2_json_looking_text_and_historical_views_survive_current_upgrade()
     -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().join("private"),
             format!("project/{}", "c".repeat(64)),
-        )?;
+        )
+        .await?;
         released_v2(&options).await?;
         let server = super::super::tests::released_server(&options).await?;
         let main = server.pool("main").await?;
@@ -2599,10 +2637,11 @@ mod tests {
     async fn released_v4_rows_remain_unattributed_when_session_provenance_activates() -> Result<()>
     {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().join("private"),
             format!("project/{}", "9".repeat(64)),
-        )?;
+        )
+        .await?;
         released_v2(&options).await?;
         let server = super::super::tests::released_server(&options).await?;
         let main = server.pool("main").await?;
@@ -2929,10 +2968,11 @@ mod tests {
         .enumerate()
         {
             let root = crate::test_support::tempdir()?;
-            let options = crate::test_support::open_options(
+            let options = crate::test_support::warmed_open_options(
                 root.path().join("private"),
                 format!("project/{index:064x}"),
-            )?;
+            )
+            .await?;
             let store = crate::test_support::open_local_fixture(options.clone()).await?;
             match corruption {
                 Corruption::MissingReceipt => {
@@ -3134,10 +3174,11 @@ mod tests {
     #[tokio::test]
     async fn migration_attempt_rejection_preserves_exact_capacity() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().join("private"),
             format!("project/{}", "6".repeat(64)),
-        )?;
+        )
+        .await?;
         super::super::tests::released_v1(&options).await?;
         let server = super::super::tests::released_server(&options).await?;
         let main = server.pool("main").await?;
@@ -3316,10 +3357,11 @@ mod tests {
     #[tokio::test]
     async fn persisted_v1_future_receipt_authority_fails_before_new_attempt() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().join("private"),
             format!("project/{}", "b".repeat(64)),
-        )?;
+        )
+        .await?;
         super::super::tests::released_v1(&options).await?;
         let server = super::super::tests::released_server(&options).await?;
         let main = server.pool("main").await?;
@@ -3396,10 +3438,11 @@ mod tests {
         store.close().await?;
 
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().join("private"),
             format!("project/{}", "a".repeat(64)),
-        )?;
+        )
+        .await?;
         super::super::tests::released_v1(&options).await?;
         let server = super::super::tests::released_server(&options).await?;
         let main = server.pool("main").await?;
@@ -3516,10 +3559,11 @@ mod tests {
         store.close().await?;
 
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().join("private"),
             format!("project/{}", "f".repeat(64)),
-        )?;
+        )
+        .await?;
         super::super::tests::released_v1(&options).await?;
         let server = super::super::tests::released_server(&options).await?;
         let main = server.pool("main").await?;
@@ -3544,10 +3588,11 @@ mod tests {
     #[tokio::test]
     async fn retained_v2_attempts_and_candidate_survive_test_v8_progression() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().join("private"),
             format!("project/{}", "3".repeat(64)),
-        )?;
+        )
+        .await?;
         let store = super::super::MemoryStore::open(options.clone()).await?;
         store
             .append("conversation", "user", "written after the v2 upgrade")
@@ -3840,10 +3885,11 @@ mod tests {
     #[tokio::test]
     async fn current_upgrade_migrates_usage_without_rewriting_historical_candidate() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().join("private"),
             format!("project/{}", "a".repeat(64)),
-        )?;
+        )
+        .await?;
         released_v2(&options).await?;
         let server = super::super::tests::released_server(&options).await?;
         let main = server.pool("main").await?;
@@ -3993,7 +4039,8 @@ mod tests {
                 .collect::<String>()
         );
         let options =
-            crate::test_support::open_options(root.path().join("private"), scope.clone())?;
+            crate::test_support::warmed_open_options(root.path().join("private"), scope.clone())
+                .await?;
         released_v2(&options).await?;
         let server = super::super::tests::released_server(&options).await?;
         let main = server.pool("main").await?;

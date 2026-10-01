@@ -3162,7 +3162,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let mut turns = Vec::with_capacity(1025);
         let mut predecessor = None;
         for index in 0..1025 {
@@ -3324,7 +3325,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let outcome = deadline
             .serve(
                 async |served| {
@@ -3788,7 +3790,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let outcome = deadline
             .serve(
                 async |served| {
@@ -4030,7 +4033,8 @@ mod tests {
                 .collect::<String>()
         );
         let options =
-            crate::test_support::open_options(root.path().join("private"), scope.clone())?;
+            crate::test_support::warmed_open_options(root.path().join("private"), scope.clone())
+                .await?;
         let outcome = deadline
             .serve(
                 async |served| {
@@ -4225,7 +4229,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let namespace = format!("{}/transcript/managed-turn", options.project_scope);
         let candidate_namespace = format!("{}/transcript/candidate-turn", options.project_scope);
         let outcome = deadline
@@ -4661,7 +4666,8 @@ mod tests {
                 .collect::<String>()
         );
         let options =
-            crate::test_support::open_options(root.path().join("private"), scope.clone())?;
+            crate::test_support::warmed_open_options(root.path().join("private"), scope.clone())
+                .await?;
         let namespace = format!("{scope}/transcript/legacy-managed");
         let journal_key = format!("{scope}/session/legacy-managed/turn/{}", "b".repeat(64));
         let expected_journal = json!({
@@ -4866,7 +4872,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let outcome = deadline
             .serve(
                 async |served| {
@@ -4969,7 +4976,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let outcome = deadline
             .serve(
                 async |served| {
@@ -5108,7 +5116,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let outcome = deadline
             .serve(
                 async |served| {
@@ -5477,7 +5486,9 @@ mod tests {
                     .map(|byte| format!("{byte:02x}"))
                     .collect::<String>()
             );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+            let options =
+                crate::test_support::warmed_open_options(root.path().join("private"), scope)
+                    .await?;
             let outcome = deadline
                 .serve(
                     async |served| {
@@ -5705,7 +5716,9 @@ mod tests {
                     .map(|byte| format!("{byte:02x}"))
                     .collect::<String>()
             );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+            let options =
+                crate::test_support::warmed_open_options(root.path().join("private"), scope)
+                    .await?;
             let outcome = deadline
             .serve(
                 async |served| {
@@ -5945,7 +5958,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let outcome = deadline
             .serve(
                 async |served| {
@@ -6102,7 +6116,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let outcome = deadline
             .serve(
                 async |served| {
@@ -6232,7 +6247,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let outcome = deadline
             .serve(
                 async |served| {
@@ -6348,7 +6364,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let outcome = deadline
             .serve(
                 async |served| {
@@ -6427,7 +6444,9 @@ mod tests {
                     .map(|byte| format!("{byte:02x}"))
                     .collect::<String>()
             );
-            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+            let options =
+                crate::test_support::warmed_open_options(root.path().join("private"), scope)
+                    .await?;
             let outcome = deadline
             .serve(
                 async |served| {
@@ -6610,7 +6629,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let outcome = deadline
             .serve(
                 async |served| {
@@ -6936,7 +6956,7 @@ mod tests {
 
     use service::ServeEvent::{AttachmentAccepted, AttachmentJoined, EnteredEmpty};
 
-    fn retiring_fixture() -> Result<(tempfile::TempDir, PathBuf, OpenOptions)> {
+    async fn retiring_fixture() -> Result<(tempfile::TempDir, PathBuf, OpenOptions)> {
         let root = tempfile::tempdir()?;
         let project = root.path().join("project");
         std::fs::create_dir(&project)?;
@@ -6949,7 +6969,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         Ok((root, project, options))
     }
 
@@ -7072,7 +7093,7 @@ mod tests {
         // Real lifecycles: one fresh service owner.
         let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
-            let (_root, project, options) = retiring_fixture()?;
+            let (_root, project, options) = retiring_fixture().await?;
             let _gate = crate::spawn_gate::spawning().await;
             let owner = service::ServiceOwner::open(options.clone(), &project).await?;
             let (served, mut events) = serve_retiring(owner, None);
@@ -7141,7 +7162,7 @@ mod tests {
         // Real lifecycles: one fresh service owner.
         let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
-            let (_root, project, options) = retiring_fixture()?;
+            let (_root, project, options) = retiring_fixture().await?;
             let _gate = crate::spawn_gate::spawning().await;
             let owner = service::ServiceOwner::open(options.clone(), &project).await?;
             let dispatch = Arc::new(service::rpc::DispatchPause::default());
@@ -7228,7 +7249,7 @@ mod tests {
         // Real lifecycles: one fresh service owner.
         let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
-            let (_root, project, options) = retiring_fixture()?;
+            let (_root, project, options) = retiring_fixture().await?;
             let _gate = crate::spawn_gate::spawning().await;
             let owner = service::ServiceOwner::open(options.clone(), &project).await?;
             let (served, mut events) = serve_retiring(owner, None);
@@ -7295,7 +7316,7 @@ mod tests {
         // Real lifecycles: one fresh service owner.
         let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
-            let (_root, project, options) = retiring_fixture()?;
+            let (_root, project, options) = retiring_fixture().await?;
             let _gate = crate::spawn_gate::spawning().await;
             let owner = service::ServiceOwner::open(options.clone(), &project).await?;
             let dispatch = Arc::new(service::rpc::DispatchPause::default());
@@ -7387,7 +7408,7 @@ mod tests {
         // Real lifecycles: one fresh service owner.
         let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
-            let (_root, project, options) = retiring_fixture()?;
+            let (_root, project, options) = retiring_fixture().await?;
             let _gate = crate::spawn_gate::spawning().await;
             let owner = service::ServiceOwner::open(options.clone(), &project).await?;
             let dispatch = Arc::new(service::rpc::DispatchPause::default());
@@ -7463,7 +7484,7 @@ mod tests {
         // Real lifecycles: one fresh local open, then one service owner reopens it.
         let deadline = fixture_deadline(1, 1);
         tokio::time::timeout(deadline, async {
-            let (_root, project, options) = retiring_fixture()?;
+            let (_root, project, options) = retiring_fixture().await?;
             let _gate = crate::spawn_gate::spawning().await;
             let (branch, base, head) = retained_candidate_ref(&options).await?;
             let owner = service::ServiceOwner::open(options.clone(), &project).await?;
@@ -7526,7 +7547,7 @@ mod tests {
         // Real lifecycles: one fresh service owner.
         let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
-            let (_root, project, options) = retiring_fixture()?;
+            let (_root, project, options) = retiring_fixture().await?;
             let _gate = crate::spawn_gate::spawning().await;
             let owner = service::ServiceOwner::open(options.clone(), &project).await?;
             let dispatch = Arc::new(service::rpc::DispatchPause::default());
@@ -7653,7 +7674,7 @@ mod tests {
         let deadline = fixture_deadline(2, 2);
         tokio::time::timeout(deadline, async {
             for reopen in [true, false] {
-                let (_root, project, options) = retiring_fixture()?;
+                let (_root, project, options) = retiring_fixture().await?;
                 let gate = crate::spawn_gate::spawning().await;
                 let RetiredWithPendingWrite {
                     memory,
@@ -7714,7 +7735,7 @@ mod tests {
         // Real lifecycles: one fresh local open, then one owner and its reopened successor.
         let deadline = fixture_deadline(1, 2);
         tokio::time::timeout(deadline, async {
-            let (_root, project, options) = retiring_fixture()?;
+            let (_root, project, options) = retiring_fixture().await?;
             let gate = crate::spawn_gate::spawning().await;
             let (branch, base, head) = retained_candidate_ref(&options).await?;
             let RetiredWithPendingWrite {

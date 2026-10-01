@@ -480,12 +480,14 @@ async fn pe_inspection_uses_native_paths_and_real_msvc_imports() {
         offline: true,
         ..Default::default()
     };
-    let engine =
-        kuru_memory::provision::provision(&config, &kuru_memory::test_support::cache_dir())
-            .await
-            .unwrap()
-            .canonicalize()
-            .unwrap();
+    let engine = kuru_memory::provision::provision(
+        &config,
+        &kuru_memory::test_support::warmed_cache_dir().await.unwrap(),
+    )
+    .await
+    .unwrap()
+    .canonicalize()
+    .unwrap();
     let evidence = |path: &Path| {
         let mut file = File::open(path).unwrap();
         let info = regular_file_info(&file).unwrap();

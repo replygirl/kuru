@@ -223,10 +223,11 @@ async fn equal_activation_keeps_the_same_speaker_across_completed_turns() {
 async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() {
     let project = tempfile::tempdir().unwrap();
     let data = kuru_memory::test_support::tempdir().unwrap();
-    let options = kuru_memory::test_support::open_options(
+    let options = kuru_memory::test_support::warmed_open_options(
         data.path().to_owned(),
         crate::project_scope(project.path()).unwrap(),
     )
+    .await
     .unwrap();
     let higher = Arc::new(Mutex::new(None::<String>));
     let provider = Fake::new({
@@ -726,10 +727,11 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
         dream_on_exit: false,
         ..Config::default()
     };
-    let options = kuru_memory::test_support::open_options(
+    let options = kuru_memory::test_support::warmed_open_options(
         data.path().to_owned(),
         crate::project_scope(dir.path()).unwrap(),
     )
+    .await
     .unwrap();
     let memory = MemoryStore::open(options.clone()).await.unwrap();
     let mut harness = Harness::new(
@@ -2327,10 +2329,11 @@ async fn sessions_resume_mode_and_memory_and_projects_do_not_share_namespaces() 
         dream_every: 0,
         ..Config::default()
     };
-    let options = kuru_memory::test_support::open_options(
+    let options = kuru_memory::test_support::warmed_open_options(
         db.path().to_owned(),
         crate::project_scope(dir.path()).unwrap(),
     )
+    .await
     .unwrap();
     let memory = MemoryStore::open(options.clone()).await.unwrap();
     let mut harness = Harness::new(
@@ -2402,10 +2405,11 @@ async fn sessions_resume_mode_and_memory_and_projects_do_not_share_namespaces() 
         .is_err()
     );
     let other_memory = MemoryStore::open(
-        kuru_memory::test_support::open_options(
+        kuru_memory::test_support::warmed_open_options(
             db.path().to_owned(),
             crate::project_scope(other.path()).unwrap(),
         )
+        .await
         .unwrap(),
     )
     .await

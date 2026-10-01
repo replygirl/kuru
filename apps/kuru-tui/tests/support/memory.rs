@@ -176,10 +176,30 @@ pub fn await_owner_exit(options: &kuru_memory::OpenOptions) -> anyhow::Result<st
     reason = "each integration-test crate compiles this shared support module independently"
 )]
 pub fn configuration(root: &Path) -> anyhow::Result<PathBuf> {
+    configuration_with(root, &kuru_memory::test_support::cache_dir()?)
+}
+
+/// [`configuration`] from inside a Tokio runtime, which cannot warm the
+/// shared cache synchronously.
+#[allow(
+    dead_code,
+    reason = "each integration-test crate compiles this shared support module independently"
+)]
+pub async fn configuration_warmed(root: &Path) -> anyhow::Result<PathBuf> {
+    configuration_with(root, &kuru_memory::test_support::warmed_cache_dir().await?)
+}
+
+/// [`configuration`] with the shared cache a caller already warmed: from
+/// inside a Tokio runtime, `kuru_memory::test_support::warmed_cache_dir()`.
+#[allow(
+    dead_code,
+    reason = "each integration-test crate compiles this shared support module independently"
+)]
+pub fn configuration_with(root: &Path, cache: &Path) -> anyhow::Result<PathBuf> {
     let directory = root.join("config");
     std::fs::create_dir_all(directory.join("kuru"))?;
     let memory = kuru_core::MemoryConfig {
-        cache_dir: Some(kuru_memory::test_support::cache_dir()),
+        cache_dir: Some(cache.to_owned()),
         offline: true,
         ..Default::default()
     };

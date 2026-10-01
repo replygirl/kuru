@@ -132,7 +132,38 @@ pub struct OpenOptions {
     /// template exists.
     #[cfg(any(test, feature = "test-support"))]
     creation: Creation,
+    /// Test-support fixture token: whether these options went through the
+    /// template cache warm-up. `None` for every options value a product
+    /// caller builds; see [`Fixture`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fixture: Option<Fixture>,
+    /// Test-support private template root, in place of the one beside the
+    /// engine cache, so a test of an empty or damaged root never finds or
+    /// disturbs the shared, warmed one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) template_root: Option<PathBuf>,
 }
+
+/// Whether a test-support fixture's options went through the template cache
+/// warm-up ([`crate::test_support::warmed_open_options`],
+/// [`OpenOptions::warmed`]). A writable open of an absent store with
+/// [`Fixture::Unwarmed`] options in the shared test cache fails at once,
+/// before the startup lock wait and before provisioning, so
+/// every fixture that could build the store template inside its open is
+/// found on its first run, whatever the test order or cache state.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Fixture {
+    /// From `test_support::open_options`, not yet warmed.
+    Unwarmed,
+    /// The engine and the store template were warmed first.
+    Warmed,
+}
+
+/// The guard's message for an unwarmed fixture open.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) const UNWARMED_FIXTURE: &str = "fixture opened a fresh store without warming the template cache; use \
+     warmed_open_options before the fixture deadline and before any spawn gate";
 
 /// How a test-support open creates a store that does not exist yet.
 ///
@@ -168,7 +199,53 @@ impl OpenOptions {
             migrated_stage_pool_delay: None,
             #[cfg(any(test, feature = "test-support"))]
             creation: Creation::Default,
+            #[cfg(any(test, feature = "test-support"))]
+            fixture: None,
+            #[cfg(any(test, feature = "test-support"))]
+            template_root: None,
         }
+    }
+
+    /// Warm the shared test engine and store template caches, then mark
+    /// these fixture options warmed. Call it before the fixture's deadline
+    /// starts and before any spawn gate is held.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn warmed(mut self) -> Result<Self> {
+        crate::test_support::warm_runtime_cache().await?;
+        self.fixture = Some(Fixture::Warmed);
+        Ok(self)
+    }
+
+    /// A writable fresh open of fixture options that were never warmed, in
+    /// the shared test cache, would be the first to need the store template:
+    /// fail it before the startup lock wait, provisioning or any engine start.
+    #[cfg(any(test, feature = "test-support"))]
+    fn refuse_unwarmed_fixture(&self) -> Result<()> {
+        ensure!(
+            !(self.fixture == Some(Fixture::Unwarmed)
+                && !self.read_only
+                && self.template_root.is_none()
+                && self.config.cache_dir.as_deref() == Some(test_cache().as_path())),
+            UNWARMED_FIXTURE
+        );
+        Ok(())
+    }
+
+    /// The guard's first check, before the open creates a directory, waits
+    /// for the startup lock or provisions the engine: refuse only when the
+    /// store is plainly absent. An unreadable or purge-blocked store falls
+    /// through to the ordinary open, which reports its own error.
+    #[cfg(any(test, feature = "test-support"))]
+    fn refuse_unwarmed_fixture_early(&self) -> Result<()> {
+        if self.refuse_unwarmed_fixture().is_err()
+            && matches!(
+                MemoryStore::exists(&self.data_dir, &self.project_scope),
+                Ok(false)
+            )
+        {
+            self.refuse_unwarmed_fixture()?;
+        }
+        Ok(())
     }
 }
 
@@ -1540,6 +1617,14 @@ struct StoppedStage {
     _lease: LifecycleLease,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no open creates a store from the template cache until creation uses it"
+    )
+)]
+pub(crate) mod creation_template;
 mod export;
 pub(crate) mod marker_fixture;
 mod migrations;
@@ -1745,6 +1830,8 @@ impl MemoryStore {
     ) -> Result<Self> {
         options.config.validate()?;
         let directory = project_directory(&options.data_dir, &options.project_scope)?;
+        #[cfg(any(test, feature = "test-support"))]
+        options.refuse_unwarmed_fixture_early()?;
         #[cfg(not(windows))]
         private_dir(&options.data_dir)?;
         #[cfg(windows)]
@@ -1799,6 +1886,10 @@ impl MemoryStore {
                 !options.read_only,
                 "project memory has not been migrated or initialized; open Kuru normally first"
             );
+            // The early guard ran before the lock; this backstop covers a
+            // store that went absent while the open waited for it.
+            #[cfg(any(test, feature = "test-support"))]
+            options.refuse_unwarmed_fixture()?;
             let data = options.data_dir.clone();
             let scope = options.project_scope.clone();
             let legacy =
@@ -1981,6 +2072,9 @@ impl MemoryStore {
     /// error, never a skip.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn temporary() -> Result<Self> {
+        // Before the test template's lock and the fixture permit, so the
+        // store template is never built under either.
+        crate::test_support::warm_runtime_cache().await?;
         let directory = Arc::new(temporary_directory()?);
         // Boxed: template creation nests a complete cold open.
         Box::pin(crate::test_support::template::instantiate(
@@ -1999,6 +2093,7 @@ impl MemoryStore {
     /// an error, never a skip.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn temporary_cold() -> Result<Self> {
+        crate::test_support::warm_runtime_cache().await?;
         let permit = temporary_permit().await?;
         let directory = Arc::new(temporary_directory()?);
         Self::open_temporary(directory, Some(permit), Creation::Cold).await
@@ -2013,8 +2108,11 @@ impl MemoryStore {
         permit: Option<OwnedSemaphorePermit>,
         creation: Creation,
     ) -> Result<Self> {
-        let mut options =
-            crate::test_support::open_options(directory.path().join("private"), temporary_scope())?;
+        let mut options = crate::test_support::warmed_open_options(
+            directory.path().join("private"),
+            temporary_scope(),
+        )
+        .await?;
         options.creation = creation;
         let mut progress = ProgressReporter::silent();
         let fixture_options = options.clone();
@@ -7285,18 +7383,27 @@ async fn revision(pool: &MySqlPool) -> Result<String> {
     .await
     .context("revision deadline exceeded")??)
 }
+/// The statements that create schema 1 in a new stage. They shape every new
+/// store's bytes, so the store template key covers them.
+pub(crate) const INITIALIZE_STATEMENTS: [&str; 5] = [
+    "CREATE TABLE kuru_schema (id INT PRIMARY KEY, version INT NOT NULL)",
+    "INSERT INTO kuru_schema VALUES (1, 1)",
+    "CREATE TABLE messages (sequence BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, namespace VARBINARY(1024) NOT NULL, role VARBINARY(128) NOT NULL, content LONGTEXT CHARACTER SET utf8mb4 NOT NULL, INDEX messages_namespace_sequence (namespace, sequence))",
+    "CREATE TABLE state (`key` VARBINARY(1024) PRIMARY KEY, value LONGTEXT CHARACTER SET utf8mb4 NOT NULL)",
+    "CREATE TABLE operations (id VARCHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY, label VARCHAR(128) NOT NULL)",
+];
+/// The commit that records schema 1, with its message; [`AUTHOR`] is bound.
+pub(crate) const INITIALIZE_COMMIT: &str =
+    "CALL DOLT_COMMIT('-Am', 'Initialize Kuru memory schema 1', '--author', ?)";
+/// The message [`INITIALIZE_COMMIT`] records, which the template shape
+/// asserts.
+pub(crate) const INITIALIZE_MESSAGE: &str = "Initialize Kuru memory schema 1";
 async fn initialize(pool: &MySqlPool) -> Result<()> {
     // Initialization is only called in a new, unpublished staging directory.
-    for statement in [
-        "CREATE TABLE kuru_schema (id INT PRIMARY KEY, version INT NOT NULL)",
-        "INSERT INTO kuru_schema VALUES (1, 1)",
-        "CREATE TABLE messages (sequence BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, namespace VARBINARY(1024) NOT NULL, role VARBINARY(128) NOT NULL, content LONGTEXT CHARACTER SET utf8mb4 NOT NULL, INDEX messages_namespace_sequence (namespace, sequence))",
-        "CREATE TABLE state (`key` VARBINARY(1024) PRIMARY KEY, value LONGTEXT CHARACTER SET utf8mb4 NOT NULL)",
-        "CREATE TABLE operations (id VARCHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY, label VARCHAR(128) NOT NULL)",
-    ] {
+    for statement in INITIALIZE_STATEMENTS {
         sqlx::query(statement).execute(pool).await?;
     }
-    sqlx::query("CALL DOLT_COMMIT('-Am', 'Initialize Kuru memory schema 1', '--author', ?)")
+    sqlx::query(INITIALIZE_COMMIT)
         .bind(AUTHOR)
         .fetch_all(pool)
         .await?;
@@ -7949,7 +8056,8 @@ mod tests {
         let directory = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "a".repeat(64));
         let options =
-            crate::test_support::open_options(directory.path().to_owned(), scope.clone())?;
+            crate::test_support::warmed_open_options(directory.path().to_owned(), scope.clone())
+                .await?;
         let store = MemoryStore::open(options).await?;
         let session = "bounded-turn";
         let namespace = format!("{scope}/transcript/{session}");
@@ -9587,10 +9695,11 @@ mod tests {
     #[tokio::test]
     async fn compact_checkpoint_sidecars_are_atomic_on_stale_and_late_conflict() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().join("private"),
             format!("project/{}", "7".repeat(64)),
-        )?;
+        )
+        .await?;
         let store = MemoryStore::open(options.clone()).await?;
         let actor_namespace = "project/example/actor";
         let producer_actor = "actor-id";
@@ -9813,7 +9922,8 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
         let outcome = async {
             let (candidate_refs, successor, _gate) = deadline
                 .serve(
@@ -9934,10 +10044,11 @@ mod tests {
     #[tokio::test]
     async fn observed_open_reports_ready_only_after_a_usable_store() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().to_owned(),
             format!("project/{}", "d".repeat(64)),
-        )?;
+        )
+        .await?;
         let (mut progress, opening) = MemoryStore::open_observed(options);
         let store = opening.await?;
         assert!(!store.revision().await?.is_empty());
@@ -9967,10 +10078,11 @@ mod tests {
     #[tokio::test]
     async fn dropping_open_observer_does_not_cancel_the_store() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().to_owned(),
             format!("project/{}", "e".repeat(64)),
-        )?;
+        )
+        .await?;
         let fixture_options = options.clone();
         let (progress, opening) = MemoryStore::open_observed(options);
         drop(progress);
@@ -10003,10 +10115,11 @@ mod tests {
     #[tokio::test]
     async fn explicit_close_rejects_reads_and_writes_through_retained_clone() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
+        let options = crate::test_support::warmed_open_options(
             root.path().to_owned(),
             format!("project/{}", "c".repeat(64)),
-        )?;
+        )
+        .await?;
         let store = MemoryStore::open(options.clone()).await?;
         store.append("close", "user", "before shutdown").await?;
         let released = store.clone();
@@ -10228,7 +10341,8 @@ mod tests {
     async fn ready_released_v1_stage_activates_its_original_marker_then_upgrades() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "9".repeat(64));
-        let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope).await?;
         let (active, stage, _initial_marker, _base) = stopped_ready_v1_stage(&options).await?;
         // Model a released v1 stage whose first activation already contained
         // durable user state. The marker is written once with that exact v1
@@ -10384,7 +10498,8 @@ mod tests {
         ] {
             let root = crate::test_support::tempdir()?;
             let scope = format!("project/{}", "d".repeat(64));
-            let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+            let options =
+                crate::test_support::warmed_open_options(root.path().to_owned(), scope).await?;
             let (active, stage, marker, base) = stopped_ready_v1_stage(&options).await?;
             let server = released_server_at(&options, stage.clone()).await?;
             let pool = server.pool("main").await?;
@@ -10468,7 +10583,8 @@ mod tests {
     async fn stopped_v1_candidate_survives_upgrade_and_stays_stale() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "e".repeat(64));
-        let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope).await?;
         released_v1(&options).await?;
         let server = released_server(&options).await?;
         let main = server.pool("main").await?;
@@ -10598,7 +10714,8 @@ mod tests {
     async fn stopped_released_v1_upgrades_once_and_readonly_preserves_it() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "b".repeat(64));
-        let options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope.clone()).await?;
         released_v1(&options).await?;
         let directory = project_directory(root.path(), &scope)?;
         let marker = fs::read(directory.join("ready.json"))?;
@@ -10822,7 +10939,8 @@ mod tests {
     async fn readonly_inspection_preserves_dirty_data_and_rejects_dirty_authority() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "4".repeat(64));
-        let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope).await?;
         let store = MemoryStore::open(options.clone()).await?;
         sqlx::query("CREATE TABLE inspection_dirty_probe (id INT PRIMARY KEY)")
             .execute(store.pool.as_ref())
@@ -10860,7 +10978,8 @@ mod tests {
         ] {
             let root = crate::test_support::tempdir()?;
             let scope = format!("project/{index:064x}");
-            let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+            let options =
+                crate::test_support::warmed_open_options(root.path().to_owned(), scope).await?;
             let store = MemoryStore::open(options.clone()).await?;
             sqlx::query(change).execute(store.pool.as_ref()).await?;
             let before = inspection_snapshot(&store.pool).await?;
@@ -10876,7 +10995,8 @@ mod tests {
 
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "5".repeat(64));
-        let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope).await?;
         let store = MemoryStore::open(options.clone()).await?;
         raw_branch(&store, "kuru_migration_bad").await?;
         let before = inspection_snapshot(&store.pool).await?;
@@ -10895,7 +11015,8 @@ mod tests {
     async fn historical_v1_read_rejects_dirty_dropped_receipt_authority() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "6".repeat(64));
-        let options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope.clone()).await?;
         released_v1(&options).await?;
         let directory = project_directory(&options.data_dir, &scope)?;
         let server = released_server(&options).await?;
@@ -10983,7 +11104,8 @@ mod tests {
     async fn migration_inventory_uses_a_literal_lowercase_bounded_prefix() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "c".repeat(64));
-        let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope).await?;
         let store = MemoryStore::open(options.clone()).await?;
         for name in [
             "kuruXmigration_v0000000002_00000000000000000000000000000000",
@@ -11009,7 +11131,8 @@ mod tests {
     async fn migration_inventory_refuses_more_than_sixty_four_literal_attempts() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "d".repeat(64));
-        let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope).await?;
         let store = MemoryStore::open(options.clone()).await?;
         for number in 0..=64u128 {
             raw_branch(&store, &format!("kuru_migration_v0000000002_{number:032x}")).await?;
@@ -12167,10 +12290,11 @@ mod tests {
         let deadline = crate::test_support::fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
-            let mut options = crate::test_support::open_options(
+            let mut options = crate::test_support::warmed_open_options(
                 root.path().to_owned(),
                 format!("project/{}", "7".repeat(64)),
-            )?;
+            )
+            .await?;
             options.candidate_cleanup_failure = Some(Arc::new(AtomicBool::new(true)));
             let store = MemoryStore::open(options).await?;
             let candidate = store.begin_candidate("retry resolved cleanup").await?;
@@ -12365,10 +12489,11 @@ mod tests {
         let deadline = crate::test_support::fixture_deadline(1, 1);
         tokio::time::timeout(deadline, async {
             let root = crate::test_support::tempdir()?;
-            let options = crate::test_support::open_options(
+            let options = crate::test_support::warmed_open_options(
                 root.path().to_owned(),
                 format!("project/{}", "7".repeat(64)),
-            )?;
+            )
+            .await?;
             let store = MemoryStore::open(options.clone()).await?;
             let id = Uuid::new_v4();
             ensure!(matches!(
@@ -12522,7 +12647,9 @@ mod tests {
         let directory = crate::test_support::tempdir().unwrap();
         let scope = format!("project/{}", "a".repeat(64));
         let options =
-            crate::test_support::open_options(directory.path().to_owned(), scope.clone()).unwrap();
+            crate::test_support::warmed_open_options(directory.path().to_owned(), scope.clone())
+                .await
+                .unwrap();
         let store = MemoryStore::open(options.clone()).await.unwrap();
         store.append("retained", "user", "hello").await.unwrap();
         store.put("choice", &json!("jungian")).await.unwrap();
@@ -12602,7 +12729,9 @@ mod tests {
         let data = crate::test_support::tempdir().unwrap();
         let scope = format!("project/{}", "7".repeat(64));
         let options =
-            crate::test_support::open_options(data.path().to_owned(), scope.clone()).unwrap();
+            crate::test_support::warmed_open_options(data.path().to_owned(), scope.clone())
+                .await
+                .unwrap();
         let store = MemoryStore::open(options.clone()).await.unwrap();
         let initial = store.revision().await.unwrap();
         let active = project_directory(data.path(), &scope).unwrap();
@@ -12665,7 +12794,9 @@ mod tests {
         let data = crate::test_support::tempdir().unwrap();
         let scope = format!("project/{}", "f".repeat(64));
         let options =
-            crate::test_support::open_options(data.path().to_owned(), scope.clone()).unwrap();
+            crate::test_support::warmed_open_options(data.path().to_owned(), scope.clone())
+                .await
+                .unwrap();
         let store = MemoryStore::open(options.clone()).await.unwrap();
         let initial = store.revision().await.unwrap();
         let active = project_directory(data.path(), &scope).unwrap();
@@ -12718,7 +12849,9 @@ mod tests {
         let data = crate::test_support::tempdir().unwrap();
         let scope = format!("project/{}", "8".repeat(64));
         let mut options =
-            crate::test_support::open_options(data.path().to_owned(), scope.clone()).unwrap();
+            crate::test_support::warmed_open_options(data.path().to_owned(), scope.clone())
+                .await
+                .unwrap();
         let store = MemoryStore::open(options.clone()).await.unwrap();
         let initial = store.revision().await.unwrap();
         store.close().await.unwrap();
@@ -12802,7 +12935,9 @@ mod tests {
         let restored = crate::test_support::tempdir().unwrap();
         let scope = format!("project/{}", "9".repeat(64));
         let options =
-            crate::test_support::open_options(source.path().to_owned(), scope.clone()).unwrap();
+            crate::test_support::warmed_open_options(source.path().to_owned(), scope.clone())
+                .await
+                .unwrap();
         let store = MemoryStore::open(options).await.unwrap();
         store
             .append("session", "user", "retained transcript")
@@ -12904,7 +13039,9 @@ mod tests {
             &source.path().join("memory"),
             &restored.path().join("memory"),
         );
-        let options = crate::test_support::open_options(restored.path().to_owned(), scope).unwrap();
+        let options = crate::test_support::warmed_open_options(restored.path().to_owned(), scope)
+            .await
+            .unwrap();
         let store = MemoryStore::open(options).await.unwrap();
         assert_eq!(store.revision().await.unwrap(), revision);
         assert_eq!(export_records(&store).await.unwrap(), before);

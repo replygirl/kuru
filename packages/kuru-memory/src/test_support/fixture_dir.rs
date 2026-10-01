@@ -84,6 +84,7 @@ pub struct TempDir {
     inner: Option<PrivateTemp>,
     label: String,
     depth: usize,
+    allow_template: bool,
 }
 
 impl TempDir {
@@ -92,7 +93,18 @@ impl TempDir {
             inner: Some(PrivateTemp::new(prefix, parent)?),
             label: super::lifecycle_trace::label(),
             depth: MAX_DEPTH,
+            allow_template: false,
         })
+    }
+
+    /// Let opens beneath this root build or quarantine the shared store
+    /// template without failing teardown: for the template cache's own
+    /// tests. Every other fixture warms first ([`super::warmed_open_options`]),
+    /// so its open never builds the template, and teardown fails a fixture
+    /// whose open did either.
+    pub fn allowing_template_build(mut self) -> Self {
+        self.allow_template = true;
+        self
     }
 
     /// Scan this root to `depth` directory levels instead of the default 8,
@@ -140,7 +152,7 @@ impl TempDir {
         let Some(inner) = self.inner.take() else {
             return outcome;
         };
-        let Some(verdict) = check(inner, &self.label, self.depth) else {
+        let Some(verdict) = check(inner, &self.label, self.depth, self.allow_template) else {
             return outcome;
         };
         match outcome {
@@ -153,17 +165,36 @@ impl TempDir {
 }
 
 /// Scan and forget the records beneath `inner`'s root, then remove it, or
-/// keep it and describe why.
-fn check(inner: PrivateTemp, label: &str, depth: usize) -> Option<String> {
+/// keep it and describe why. A store template event charged beneath the
+/// root fails the fixture too, unless `allow_template`, though the root is
+/// still removed when every store is quiescent.
+fn check(inner: PrivateTemp, label: &str, depth: usize, allow_template: bool) -> Option<String> {
     // The records beneath the root go with it, kept or removed, so no
     // later directory that recycles a native identity inherits one.
-    let violations = engine_ledger::with(|ledger| {
+    let (violations, template) = engine_ledger::with(|ledger| {
+        let canonical = canonical(inner.path());
         let violations = scan(ledger, inner.path(), depth);
-        ledger.forget_under(&canonical(inner.path()));
-        violations
+        let template = if allow_template {
+            Vec::new()
+        } else {
+            ledger.template_events_under(&canonical)
+        };
+        ledger.forget_under(&canonical);
+        (violations, template)
     });
     if violations.is_empty() {
-        return None;
+        if template.is_empty() {
+            return None;
+        }
+        let path = inner.path().to_path_buf();
+        drop(inner);
+        return Some(format!(
+            "fixture root {} (created by test {label}) opened a store whose creation touched \
+             the shared store template; warm the fixture with test_support::warmed_open_options \
+             first, or opt in with TempDir::allowing_template_build(): {}",
+            path.display(),
+            template.join("; ")
+        ));
     }
     // Never delete the tree under a possibly live engine.
     let kept = inner.keep();
@@ -194,7 +225,7 @@ impl Drop for TempDir {
         };
         // The root is kept on a violation even while this test is already
         // failing; only a thread that is not unwinding reports.
-        if let Some(verdict) = check(inner, &self.label, self.depth)
+        if let Some(verdict) = check(inner, &self.label, self.depth, self.allow_template)
             && !std::thread::panicking()
         {
             panic!("{verdict}");

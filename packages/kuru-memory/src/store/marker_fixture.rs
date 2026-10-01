@@ -107,7 +107,9 @@ mod tests {
         for after_marker in [false, true] {
             let root = crate::test_support::tempdir()?;
             let scope = format!("project/{}", "5".repeat(64));
-            let options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+            let options =
+                crate::test_support::warmed_open_options(root.path().to_owned(), scope.clone())
+                    .await?;
             let (observation, release, opening) = prepare(options.clone(), after_marker);
             tokio::pin!(opening);
             let observed = tokio::select! {
@@ -180,7 +182,8 @@ mod tests {
     async fn released_marker_observation_activates_the_same_committed_store_once() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "4".repeat(64));
-        let options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope.clone()).await?;
         let (observation, release, opening) = prepare(options.clone(), true);
         tokio::pin!(opening);
         let observed = tokio::select! {

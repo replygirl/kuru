@@ -20,12 +20,17 @@ struct Sandbox {
 }
 
 impl Sandbox {
-    fn new() -> Self {
+    /// A sandbox for a test inside a Tokio runtime, which every caller is.
+    async fn warmed() -> Self {
+        Self::with_cache(&kuru_memory::test_support::warmed_cache_dir().await.unwrap())
+    }
+
+    fn with_cache(cache: &std::path::Path) -> Self {
         let root = kuru_memory::test_support::tempdir().unwrap();
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project).unwrap();
-        memory::configuration(root.path()).unwrap();
+        memory::configuration_with(root.path(), cache).unwrap();
         Self {
             root: memory::ServiceCleanup::new(root, &data),
             project,
@@ -70,10 +75,11 @@ impl Sandbox {
     /// inspect through the product's read-only path, which decides from the
     /// owner lock and opens this inspection's own generation.
     async fn preferences(&self) -> ProjectPreferences {
-        let mut options = kuru_memory::test_support::open_options(
+        let mut options = kuru_memory::test_support::warmed_open_options(
             self.data.clone(),
             kuru_runtime::project_scope(&self.project).unwrap(),
         )
+        .await
         .unwrap();
         options.read_only = true;
         let exited = options.clone();
@@ -95,10 +101,11 @@ impl Sandbox {
     }
 
     async fn remember(&self) -> String {
-        let options = kuru_memory::test_support::open_options(
+        let options = kuru_memory::test_support::warmed_open_options(
             self.data.clone(),
             kuru_runtime::project_scope(&self.project).unwrap(),
         )
+        .await
         .unwrap();
         let memory = MemoryStore::open(options).await.unwrap();
         let mut harness = Harness::new(
@@ -134,7 +141,7 @@ fn success(output: Output) -> String {
 
 #[tokio::test]
 async fn invocation_overrides_resume_and_other_projects_do_not_replace_saved_selections() {
-    let sandbox = Sandbox::new();
+    let sandbox = Sandbox::warmed().await;
     let saved_session = sandbox.remember().await;
     std::fs::create_dir(sandbox.project.join(".kuru")).unwrap();
     let shared = sandbox.project.join(".kuru/config.toml");
@@ -254,7 +261,7 @@ async fn invocation_overrides_resume_and_other_projects_do_not_replace_saved_sel
 
 #[tokio::test]
 async fn configuration_inspection_ignores_tool_root_storage_but_activation_rejects_it() {
-    let sandbox = Sandbox::new();
+    let sandbox = Sandbox::warmed().await;
     assert_eq!(sandbox.config(&[]).mode, Mode::Ifs);
     assert!(!sandbox.data.exists());
     let nested = sandbox.project.join("state");
@@ -290,7 +297,7 @@ async fn configuration_inspection_ignores_tool_root_storage_but_activation_rejec
 
 #[tokio::test]
 async fn an_explicit_framework_override_is_validated_against_its_own_part_budget() {
-    let sandbox = Sandbox::new();
+    let sandbox = Sandbox::warmed().await;
     sandbox.remember().await;
     let local = sandbox.root.path().join("small-pool.toml");
     std::fs::write(&local, "max_parts=3\n").unwrap();

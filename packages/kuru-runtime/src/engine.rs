@@ -6321,10 +6321,11 @@ mod publication_tests {
     async fn stopped_started_turn_resumes_once_but_possible_turn_never_dispatches() {
         let project = tempfile::tempdir().unwrap();
         let data = kuru_memory::test_support::tempdir().unwrap();
-        let options = kuru_memory::test_support::open_options(
+        let options = kuru_memory::test_support::warmed_open_options(
             data.path().into(),
             project_scope(project.path()).unwrap(),
         )
+        .await
         .unwrap();
         let memory = MemoryStore::open(options.clone()).await.unwrap();
         let provider = Arc::new(CountingProvider::default());

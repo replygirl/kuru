@@ -1669,10 +1669,10 @@ async fn cancellation_after_compact_settlement_drains_the_atomic_checkpoint() {
         let project = tempfile::tempdir().unwrap();
         let project_path = project.path().canonicalize().unwrap();
         let data = kuru_memory::test_support::tempdir().unwrap();
-        let options = kuru_memory::test_support::open_options(
+        let options = kuru_memory::test_support::warmed_open_options(
             data.path().to_owned(),
             crate::project_scope(&project_path).unwrap(),
-        )
+        ).await
         .unwrap();
         let executable = options.supervisor.clone().unwrap();
         let open = || {
@@ -1826,10 +1826,11 @@ async fn unrelated_peer_write_during_compact_inference_preserves_source_and_usag
         let project = tempfile::tempdir().unwrap();
         let project_path = project.path().canonicalize().unwrap();
         let data = kuru_memory::test_support::tempdir().unwrap();
-        let options = kuru_memory::test_support::open_options(
+        let options = kuru_memory::test_support::warmed_open_options(
             data.path().to_owned(),
             crate::project_scope(&project_path).unwrap(),
         )
+        .await
         .unwrap();
         let memory = MemoryStore::open_managed_observed(
             options.clone(),
@@ -2086,10 +2087,10 @@ async fn accepted_compact_checkpoint_lost_reply_reconciles_on_a_successor_withou
         let project = tempfile::tempdir().unwrap();
         let project_path = project.path().canonicalize().unwrap();
         let data = kuru_memory::test_support::tempdir().unwrap();
-        let options = kuru_memory::test_support::open_options(
+        let options = kuru_memory::test_support::warmed_open_options(
             data.path().to_owned(),
             crate::project_scope(&project_path).unwrap(),
-        )
+        ).await
         .unwrap();
         let executable = options.supervisor.clone().unwrap();
         let open = || {
@@ -2243,10 +2244,10 @@ async fn manual_compact_reports_its_immutable_checkpoint_after_a_concurrent_adva
         let project = tempfile::tempdir().unwrap();
         let project_path = project.path().canonicalize().unwrap();
         let data = kuru_memory::test_support::tempdir().unwrap();
-        let options = kuru_memory::test_support::open_options(
+        let options = kuru_memory::test_support::warmed_open_options(
             data.path().to_owned(),
             crate::project_scope(&project_path).unwrap(),
-        )
+        ).await
         .unwrap();
         let executable = options.supervisor.clone().unwrap();
         let open = || {
@@ -2414,10 +2415,10 @@ async fn ordinary_context_refuses_a_shared_summary_changed_after_its_window_read
         let project = tempfile::tempdir().unwrap();
         let project_path = project.path().canonicalize().unwrap();
         let data = kuru_memory::test_support::tempdir().unwrap();
-        let options = kuru_memory::test_support::open_options(
+        let options = kuru_memory::test_support::warmed_open_options(
             data.path().to_owned(),
             crate::project_scope(&project_path).unwrap(),
-        )
+        ).await
         .unwrap();
         let executable = options.supervisor.clone().unwrap();
         let open = || {
@@ -2568,10 +2569,10 @@ async fn ordinary_context_refuses_a_cursor_advanced_after_its_prior_summary_read
         let project = tempfile::tempdir().unwrap();
         let project_path = project.path().canonicalize().unwrap();
         let data = kuru_memory::test_support::tempdir().unwrap();
-        let options = kuru_memory::test_support::open_options(
+        let options = kuru_memory::test_support::warmed_open_options(
             data.path().to_owned(),
             crate::project_scope(&project_path).unwrap(),
-        )
+        ).await
         .unwrap();
         let executable = options.supervisor.clone().unwrap();
         let open = || {
@@ -3561,7 +3562,9 @@ async fn abandoned_dream_keeps_usage_after_reopen_without_advancing_main() {
     let directory = kuru_memory::test_support::tempdir().unwrap();
     let scope = crate::project_scope(directory.path()).unwrap();
     let options =
-        kuru_memory::test_support::open_options(directory.path().join("memory"), scope).unwrap();
+        kuru_memory::test_support::warmed_open_options(directory.path().join("memory"), scope)
+            .await
+            .unwrap();
     let memory = MemoryStore::open(options.clone()).await.unwrap();
     let observed = Arc::new(Notify::new());
     let timings = crate::step_timings::StepTimings::recording();

@@ -145,6 +145,7 @@ fn native_roaming_and_local_defaults_and_explicit_precedence_survive_real_reopen
         "mode = 'freudian'\n[memory]\noffline = true\ncache_dir = {}\n",
         toml::Value::String(
             kuru_memory::test_support::cache_dir()
+                .unwrap()
                 .to_str()
                 .unwrap()
                 .into()

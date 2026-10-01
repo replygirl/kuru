@@ -17,9 +17,16 @@ fn config() -> Config {
     }
 }
 
-fn memory_options(data: &std::path::Path, project: &std::path::Path) -> kuru_memory::OpenOptions {
-    kuru_memory::test_support::open_options(data.to_owned(), crate::project_scope(project).unwrap())
-        .unwrap()
+async fn memory_options(
+    data: &std::path::Path,
+    project: &std::path::Path,
+) -> kuru_memory::OpenOptions {
+    kuru_memory::test_support::warmed_open_options(
+        data.to_owned(),
+        crate::project_scope(project).unwrap(),
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -27,7 +34,7 @@ async fn preferences_survive_reopening_without_resuming_chats_or_crossing_projec
     let project = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
     let state = kuru_memory::test_support::tempdir().unwrap();
-    let options = memory_options(state.path(), project.path());
+    let options = memory_options(state.path(), project.path()).await;
     let memory = MemoryStore::open(options.clone()).await.unwrap();
     let mut harness = Harness::new(
         config(),

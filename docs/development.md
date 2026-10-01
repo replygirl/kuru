@@ -379,6 +379,68 @@ receipts; tests of lifecycle, migration, import or identity use
 `MemoryStore::temporary_cold()`. Old fingerprints are not pruned; `cargo clean`
 removes them.
 
+### Shared store template and fixture warm-up
+
+The production store template cache (see [memory](memory.md#new-projects-and-the-store-template))
+lives beside the engine in the shared test cache: `KURU_DOLT_CACHE`, or
+`kuru-dolt-test-cache` under the system temporary directory, at
+`<cache>/<engine version>/templates/<key>/`. It holds a captured `data/` tree
+only, keyed by the schema, the engine and the creation statements, not by the
+supervisor executable, so an instrumented and an ordinary supervisor build
+interchangeable templates. It differs from the test template above, which is
+a whole closed store keyed by supervisor bytes, sources and scope; the test
+template's own cold open runs after the production template is warm. No open
+creates a store from the production template yet: this change lands the
+cache, its build and its verification, and the next one routes creation
+through it.
+
+`test_support::warm_runtime_cache()` warms both halves of the shared cache
+once per test process, before any fixture deadline: it provisions the engine,
+then checks the published template's structure under its shared key lock, or
+takes the exclusive key lock and builds and publishes it, waiting by polling
+for another process's build within one fresh-open budget. Only a successful
+template warm-up is cached, so a failure fails the fixture that met it, by
+name, and the next fixture tries again. A lock-file error is fatal in
+warm-up, never treated as "no template". The `prefetch` task builds the
+template after provisioning, with its prepared supervisor snapshot, so the
+ordinary `test` tasks start warm; coverage does not run `prefetch`, and its
+instrumented fixtures warm the template in the instrumented test process
+with the instrumented supervisor.
+
+Fixtures obtain their options through `test_support::warmed_open_options()`
+or `OpenOptions::warmed()`, both async, and build them before any spawn gate:
+the warm-up holds a shared `spawn_gate` guard, and the gate is fair, so a
+first warm-up under a caller's own guard could deadlock behind a queued
+writer (the lib test `no_spawn_guard_encloses_a_test_cache_warm_up` scans
+the sources for one). `test_support::open_options()` alone returns options
+marked unwarmed; a writable open of a store that does not exist yet fails at
+once with those options in the shared cache, before any engine starts, so
+every fixture that could build the template inside its open is found on its
+first run. Reopens, read-only opens and options naming another cache are not
+refused. `MemoryStore::temporary()` and `temporary_cold()` warm first, before
+the test template's lock and the fixture permit. `Creation::Cold` fixtures
+are warmed too: they need the engine.
+
+Spawned processes cannot carry that mark, so `test_support::cache_dir()`
+warms before it returns the shared cache, on a private thread with its own
+runtime (`test_support::warm_blocking()`), and refuses to run inside a Tokio
+runtime; a caller inside one awaits `test_support::warmed_cache_dir()`
+instead. `test_support::spawn_logged_owner` warms with the async form. In the
+application tests each sandbox has a synchronous constructor for plain `fn`
+tests and an async `warmed` one for tests inside a runtime.
+
+Test support charges a fixture whose open built or quarantined the shared
+template, and the fixture root's teardown fails it, unless the root opted in
+with `TempDir::allowing_template_build()`: the template cache's own tests do,
+and use private template roots. Warm-up never fails for finding a
+quarantined `.rejected-*` directory.
+
+Nothing prunes the shared test cache. It keeps every engine version and
+every template key built on the machine, across worktrees; key lock files are
+permanent, as are the Windows build-store leases under `templates/lifecycles/`
+(one small file per build). Reclaim it by deleting the whole cache directory
+while no test runs anywhere on the machine.
+
 Ordinary application opens start or attach to the internal per-project memory
 service from the same Kuru executable. The service owns the prepared Dolt child
 and shuts down as soon as its last client and accepted work have drained; it is
@@ -1322,7 +1384,8 @@ the supervisor fixture and integration checks. The `test-support` feature is
 enabled by package test tasks and their dev-dependency edges, so ordinary Cargo
 builds do not include it.
 Runtime/TUI test tasks depend on those fixtures. `mise run //packages/kuru-memory:prefetch` extracts and verifies
-the embedded engine into the shared test cache. Its build dependency prepares
+the embedded engine into the shared test cache, then builds or verifies this
+build's store template beside it. Its build dependency prepares
 the archive as described above, downloading it only when needed and permitted.
 Cold-cache tests
 also exercise first offline extraction, so a populated cache is not a runtime

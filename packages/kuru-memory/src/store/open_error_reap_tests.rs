@@ -42,11 +42,12 @@ async fn assert_reaped(options: &OpenOptions, directory: &Path) -> Result<()> {
     }
 }
 
-fn options(root: &crate::test_support::TempDir, digit: char) -> Result<OpenOptions> {
-    crate::test_support::open_options(
+async fn options(root: &crate::test_support::TempDir, digit: char) -> Result<OpenOptions> {
+    crate::test_support::warmed_open_options(
         root.path().to_owned(),
         format!("project/{}", digit.to_string().repeat(64)),
     )
+    .await
 }
 
 /// Staged open: an error on a staged server's main pool (the migrated stage's
@@ -54,7 +55,7 @@ fn options(root: &crate::test_support::TempDir, digit: char) -> Result<OpenOptio
 #[tokio::test]
 async fn staged_open_error_returns_only_after_its_server_is_reaped() -> Result<()> {
     let root = crate::test_support::tempdir()?;
-    let mut options = options(&root, '4')?;
+    let mut options = options(&root, '4').await?;
     let entered = Arc::new(AtomicBool::new(false));
     options.migrated_stage_pool_delay =
         Some((crate::test_support::server_start_budget(), entered.clone()));
@@ -89,7 +90,7 @@ async fn staged_open_error_returns_only_after_its_server_is_reaped() -> Result<(
 #[tokio::test]
 async fn active_open_validation_error_returns_only_after_its_server_is_reaped() -> Result<()> {
     let root = crate::test_support::tempdir()?;
-    let options = options(&root, '5')?;
+    let options = options(&root, '5').await?;
     let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     sqlx::query("UPDATE kuru_schema SET version = 99")
         .execute(store.pool.as_ref())
@@ -109,7 +110,7 @@ async fn active_open_validation_error_returns_only_after_its_server_is_reaped() 
 #[tokio::test]
 async fn established_store_open_error_returns_only_after_its_server_is_reaped() -> Result<()> {
     let root = crate::test_support::tempdir()?;
-    let options = options(&root, '6')?;
+    let options = options(&root, '6').await?;
     let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     let usage_pool = store
         .shared
@@ -142,7 +143,7 @@ async fn established_store_open_error_returns_only_after_its_server_is_reaped() 
 async fn active_open_final_validation_error_returns_only_after_its_server_is_reaped() -> Result<()>
 {
     let root = crate::test_support::tempdir()?;
-    let options = options(&root, '7')?;
+    let options = options(&root, '7').await?;
     let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     sqlx::query("CREATE TABLE uncommitted_fixture (id INT PRIMARY KEY)")
         .execute(store.pool.as_ref())

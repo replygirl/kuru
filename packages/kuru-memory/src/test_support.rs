@@ -126,17 +126,59 @@ pub fn tempdir() -> Result<TempDir> {
     TempDir::new("kuru-fixture-", None)
 }
 
-/// Provision the bundled Dolt runtime into the shared test cache once per test
-/// process and return its executable.
+/// Warm the shared test cache once per test process, before any fixture's
+/// own deadline: provision the bundled Dolt runtime, then make sure this
+/// build's store template is published beside it. Returns the engine.
 ///
-/// Fixtures call this before starting their own outer deadline, so a cold
-/// install is paid here once instead of inside whichever fixtures happen to
-/// start first. The wait is bounded by the provisioner's cache-lock peer budget
+/// The engine step is bounded by the provisioner's cache-lock peer budget
 /// plus its version-probe budget and [`WARM_UP_MARGIN`], so the product's own
 /// lock error wins that race and an installing caller's extraction and probe
-/// are covered; the result, including a failure, is shared by every later
+/// are covered; its result, including a failure, is shared by every later
 /// caller in the process.
+///
+/// The template step checks a published template's structure under its
+/// shared key lock, or takes the exclusive key lock and builds it, waiting
+/// for a peer process's build by polling, all within one fresh-open budget
+/// plus [`WARM_UP_MARGIN`] ([`template_warm_up_bound`]). Only its success is
+/// cached: a failure fails the fixture whose warm-up met it, named, and the
+/// next fixture's warm-up tries again. A lock-file error is fatal here, never
+/// "no template". Both steps hold the spawn gate, so neither may start while
+/// the caller holds one.
 pub async fn warm_runtime_cache() -> Result<PathBuf> {
+    let engine = warm_engine().await?;
+    // Boxed: a template build nests a complete engine start and the chain.
+    Box::pin(warm_template_in(
+        &WARMED_TEMPLATE,
+        &shared_template_root()?,
+        &template_engine(engine.clone())?,
+        template_warm_up_bound(),
+    ))
+    .await?;
+    Ok(engine)
+}
+
+/// The template half of [`warm_runtime_cache`] in this process: how its one
+/// successful warm-up found the shared template.
+static WARMED_TEMPLATE: tokio::sync::OnceCell<TemplateWarmUp> = tokio::sync::OnceCell::const_new();
+
+/// How a successful template warm-up found the template.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TemplateWarmUp {
+    /// A structurally valid template was already published.
+    Published,
+    /// This warm-up built and published it.
+    Built,
+}
+
+/// How this process's template warm-up found the shared template, once it
+/// succeeded.
+#[cfg(test)]
+pub(crate) fn warmed_template() -> Option<TemplateWarmUp> {
+    WARMED_TEMPLATE.get().copied()
+}
+
+/// The engine half of [`warm_runtime_cache`].
+async fn warm_engine() -> Result<PathBuf> {
     static WARMED: tokio::sync::OnceCell<std::result::Result<PathBuf, String>> =
         tokio::sync::OnceCell::const_new();
     WARMED
@@ -164,12 +206,140 @@ pub async fn warm_runtime_cache() -> Result<PathBuf> {
 /// bookkeeping, so its own deadline errors are observed before the warm-up's.
 pub const WARM_UP_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The store template step's bound: one fresh-open budget (whose four
+/// engine starts cover one build start, the chain and the capture with
+/// room, and a peer process's build) plus [`WARM_UP_MARGIN`].
+pub(crate) fn template_warm_up_bound() -> Duration {
+    fresh_open_budget().saturating_add(WARM_UP_MARGIN)
+}
+
+/// The store templates root of the shared test cache.
+pub(crate) fn shared_template_root() -> Result<PathBuf> {
+    let cache = crate::store::test_cache();
+    let cache = fs::canonicalize(&cache)
+        .with_context(|| format!("resolve the shared test cache {}", cache.display()))?;
+    Ok(crate::store::creation_template::root_in(&cache))
+}
+
+/// Whether `root` is the shared test cache's templates root, which every
+/// fixture shares and no fixture's open may build in or quarantine from
+/// unless it opted in.
+pub(crate) fn is_shared_template_root(root: &Path) -> bool {
+    match (shared_template_root(), fs::canonicalize(root)) {
+        (Ok(shared), Ok(root)) => shared == root,
+        _ => false,
+    }
+}
+
+/// The engine fixtures build store templates with: the warmed engine, the
+/// test supervisor (instrumented under coverage, the prepared snapshot
+/// otherwise; the template key excludes it) and the default startup budget.
+fn template_engine(binary: PathBuf) -> Result<crate::store::creation_template::Engine> {
+    Ok(crate::store::creation_template::Engine {
+        binary,
+        supervisor: crate::store::test_supervisor()?,
+        timeout: default_startup(),
+    })
+}
+
+/// The template step of [`warm_runtime_cache`], on `cell`: cache only
+/// success, bound the whole step, hold the spawn gate.
+pub(crate) async fn warm_template_in(
+    cell: &tokio::sync::OnceCell<TemplateWarmUp>,
+    root: &Path,
+    engine: &crate::store::creation_template::Engine,
+    bound: Duration,
+) -> Result<TemplateWarmUp> {
+    cell.get_or_try_init(|| async {
+        // Builds start a supervisor and Dolt; see `crate::spawn_gate`.
+        #[cfg(test)]
+        let _gate = crate::spawn_gate::spawning().await;
+        let deadline = std::time::Instant::now() + bound;
+        let ensured = tokio::time::timeout(
+            bound,
+            crate::store::creation_template::ensure_in(
+                root,
+                engine,
+                crate::store::creation_template::Wait::Until(deadline),
+            ),
+        )
+        .await;
+        match ensured {
+            Ok(Ok(crate::store::creation_template::Ensured::Built(report))) => {
+                if report.published {
+                    Ok(TemplateWarmUp::Built)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "warm the test store template cache {}: the template was built but could \
+                         not be published; its verified stage is left for the next build",
+                        root.display()
+                    ))
+                }
+            }
+            Ok(Ok(crate::store::creation_template::Ensured::Published)) => {
+                Ok(TemplateWarmUp::Published)
+            }
+            Ok(Ok(crate::store::creation_template::Ensured::Unavailable(unavailable))) => {
+                Err(anyhow::anyhow!(
+                    "warm the test store template cache {}: unavailable ({unavailable:?})",
+                    root.display()
+                ))
+            }
+            Ok(Err(failure)) => Err(anyhow::anyhow!(
+                "warm the test store template cache {}: {failure}",
+                root.display()
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "warm the test store template cache {} exceeded {bound:?}",
+                root.display()
+            )),
+        }
+    })
+    .await
+    .copied()
+}
+
+/// Build or verify this build's store template in an engine cache, waiting
+/// for a peer's build within [`template_warm_up_bound`]: the `prefetch`
+/// task's step after provisioning, with its prepared supervisor snapshot.
+pub async fn warm_template_cache(cache: &Path, engine: &Path, supervisor: &Path) -> Result<()> {
+    let cache = fs::canonicalize(cache)?;
+    let bound = template_warm_up_bound();
+    let deadline = std::time::Instant::now() + bound;
+    let engine = crate::store::creation_template::Engine {
+        binary: engine.to_owned(),
+        supervisor: supervisor.to_owned(),
+        timeout: default_startup(),
+    };
+    let root = crate::store::creation_template::root_in(&cache);
+    tokio::time::timeout(
+        bound,
+        Box::pin(crate::store::creation_template::ensure_in(
+            &root,
+            &engine,
+            crate::store::creation_template::Wait::Until(deadline),
+        )),
+    )
+    .await
+    .with_context(|| format!("prefetch the store template exceeded {bound:?}"))?
+    .map_err(|failure| anyhow::anyhow!("prefetch the store template {}: {failure}", root.display()))
+    .and_then(|ensured| match ensured {
+        crate::store::creation_template::Ensured::Built(report) if !report.published => {
+            Err(anyhow::anyhow!(
+                "prefetch the store template {}: built but not published",
+                root.display()
+            ))
+        }
+        _ => Ok(()),
+    })
+}
+
 /// Allowance for creating a fixture child process and its runtime before the
 /// product's own startup clock begins inside it.
 #[cfg(test)]
 pub(crate) const CHILD_START_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn default_startup() -> std::time::Duration {
     let config = OpenOptions::new(PathBuf::new(), String::new()).config;
     std::time::Duration::from_secs(config.startup_timeout_secs)
@@ -177,7 +347,6 @@ fn default_startup() -> std::time::Duration {
 
 /// One owned Dolt server start: the configured startup timeout plus the
 /// supervisor-transport allowance `Server::open` adds to it.
-#[cfg(test)]
 pub(crate) fn server_start_budget() -> std::time::Duration {
     default_startup().saturating_add(crate::server::SUPERVISOR_TRANSPORT_ALLOWANCE)
 }
@@ -186,7 +355,6 @@ pub(crate) fn server_start_budget() -> std::time::Duration {
 /// the startup lock wait, four server starts (initialization, migration,
 /// validation, active) each with one `QUERY_TIMEOUT` session, three owned
 /// server closes, and the staged directory's quiescence wait.
-#[cfg(test)]
 pub(crate) fn fresh_open_budget() -> std::time::Duration {
     let startup = default_startup();
     startup
@@ -249,12 +417,24 @@ mod fixture_deadline_tests {
     }
 }
 
+/// Fixture options in the shared test cache, not yet warmed: a writable open
+/// that would create the store fails at once until they are passed through
+/// [`OpenOptions::warmed`]. Use [`warmed_open_options`] for a fixture that
+/// creates its store; these suit reopens and path computations.
 pub fn open_options(data_dir: PathBuf, project_scope: String) -> Result<OpenOptions> {
     let mut options = OpenOptions::new(data_dir, project_scope);
     options.config.cache_dir = Some(crate::store::test_cache());
     options.config.offline = true;
     options.supervisor = Some(crate::store::test_supervisor()?);
+    options.fixture = Some(crate::store::Fixture::Unwarmed);
     Ok(options)
+}
+
+/// [`open_options`] after [`warm_runtime_cache`]: the shared engine and
+/// store template are ready, so the fixture's open never builds either.
+/// Call it before the fixture's deadline and before any spawn gate.
+pub async fn warmed_open_options(data_dir: PathBuf, project_scope: String) -> Result<OpenOptions> {
+    open_options(data_dir, project_scope)?.warmed().await
 }
 
 #[cfg(feature = "test-support")]
@@ -284,6 +464,8 @@ pub async fn spawn_logged_owner(
     executable: &Path,
     diagnostic: File,
 ) -> Result<FixtureLoggedOwner> {
+    // The spawned owner cannot carry a fixture token: warm here instead.
+    warm_runtime_cache().await?;
     crate::service::spawn_logged_owner_fixture(options, project, executable, diagnostic).await
 }
 
@@ -825,8 +1007,46 @@ pub async fn commit_malformed_state(store: &crate::MemoryStore, key: &str) -> Re
     store.fixture_commit_malformed_state(key).await
 }
 
-pub fn cache_dir() -> PathBuf {
-    crate::store::test_cache()
+/// The shared test cache, for a spawned process to use, after warming its
+/// engine and store template synchronously ([`warm_blocking`]). A caller
+/// inside a Tokio runtime uses [`warmed_cache_dir`] instead.
+pub fn cache_dir() -> Result<PathBuf> {
+    warm_blocking()?;
+    Ok(crate::store::test_cache())
+}
+
+/// [`cache_dir`] for a caller inside a Tokio runtime.
+pub async fn warmed_cache_dir() -> Result<PathBuf> {
+    warm_runtime_cache().await?;
+    Ok(crate::store::test_cache())
+}
+
+/// Threads [`warm_blocking`] started, for its own test.
+#[cfg(test)]
+pub(crate) static WARM_THREADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Run [`warm_runtime_cache`] to completion from synchronous code, on a
+/// private thread with its own current-thread runtime. Refuses to run inside
+/// a Tokio runtime, where blocking could starve another task's in-flight
+/// warm-up: such a caller awaits [`warmed_cache_dir`].
+pub fn warm_blocking() -> Result<()> {
+    ensure!(
+        tokio::runtime::Handle::try_current().is_err(),
+        "test_support::warm_blocking cannot run inside a Tokio runtime; await \
+         test_support::warmed_cache_dir() instead"
+    );
+    #[cfg(test)]
+    WARM_THREADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::thread::spawn(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(warm_runtime_cache())
+            .map(|_| ())
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("the test cache warm-up thread panicked"))?
 }
 
 fn profile(executable: &Path) -> Result<&Path> {

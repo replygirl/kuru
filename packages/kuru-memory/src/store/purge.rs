@@ -557,7 +557,8 @@ mod tests {
         )?;
         let legacy_bytes = fs::read(&legacy_path)?;
 
-        let options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope.clone()).await?;
         let store = MemoryStore::open(options.clone()).await?;
         assert!(store.get(&key).await?.is_some());
         let ledger = store.usage_ledger()?;
@@ -580,7 +581,9 @@ mod tests {
         let project = project_directory(root.path(), &scope)?;
         assert!(project.join("ready.json").is_file());
 
-        let other = crate::test_support::open_options(root.path().to_owned(), other_scope.clone())?;
+        let other =
+            crate::test_support::warmed_open_options(root.path().to_owned(), other_scope.clone())
+                .await?;
         MemoryStore::open(other.clone()).await?.close().await?;
         let purged = Directory::ensure_private(&root.path().join("memory/purged"))?;
         purged
@@ -621,7 +624,8 @@ mod tests {
     -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "9".repeat(64));
-        let options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope.clone()).await?;
         MemoryStore::open(options.clone()).await?.close().await?;
 
         let project = project_directory(root.path(), &scope)?;
@@ -665,7 +669,8 @@ mod tests {
     async fn unverified_same_project_staging_refuses_before_publishing_or_removing() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "7".repeat(64));
-        let options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope.clone()).await?;
         MemoryStore::open(options.clone()).await?.close().await?;
         let project = project_directory(root.path(), &scope)?;
         let memory = project.parent().unwrap();
@@ -692,7 +697,8 @@ mod tests {
     async fn live_owner_refusal_leaves_no_purge_control_or_tree_change() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "f".repeat(64));
-        let mut options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+        let mut options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope.clone()).await?;
         let store = MemoryStore::open(options.clone()).await?;
         let project = project_directory(root.path(), &scope)?;
         let revision = store.revision().await?;
@@ -727,7 +733,8 @@ mod tests {
     -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "b".repeat(64));
-        let options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope.clone()).await?;
         MemoryStore::open(options.clone()).await?.close().await?;
         let project = project_directory(root.path(), &scope)?;
         let memory = project.parent().unwrap();
@@ -762,7 +769,8 @@ mod tests {
         // was already moved into its exact quarantine name and its activation
         // marker is gone. A retry must still remove that recorded physical
         // tree; it must not require a marker or rediscover a new active path.
-        let options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope.clone()).await?;
         MemoryStore::open(options.clone()).await?.close().await?;
         let operation = Uuid::new_v4();
         let quarantined =
@@ -800,7 +808,8 @@ mod tests {
     async fn pending_purge_refuses_a_replacement_root_without_deleting_it() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "a".repeat(64));
-        let options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+        let options =
+            crate::test_support::warmed_open_options(root.path().to_owned(), scope.clone()).await?;
         MemoryStore::open(options.clone()).await?.close().await?;
         let project = project_directory(root.path(), &scope)?;
         let memory = project.parent().unwrap();

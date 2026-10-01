@@ -201,12 +201,19 @@ An interrupted import can resume after validation. Partial imports are stopped a
 
 Kuru is being prepared to create new project stores by copying a pre-built,
 schema-only template instead of running every schema upgrade. No release
-creates stores this way yet, so nothing changes for you today. When it does,
+creates stores this way yet, so nothing changes for you today. The template
+will live beside the engine in its cache, under
+`<engine version>/templates/`, built once per machine, engine and schema. It
+holds only schema, migration receipts and a fixed placeholder identity, never
+project data or credentials, so every project sharing the cache can use it
+and `kuru memory purge` leaves it in place. When it does,
 each copy takes its own identity and credentials on first start, shares only
 schema history with other copies, and is set aside under `memory/interrupted/`
 without being started if a crash interrupts it. See
 [memory storage](https://github.com/replygirl/kuru/blob/main/docs/memory.md#template-born-stores)
-for the details.
+for the details. If Kuru ever warns that it cannot read a template, delete that
+template's directory under `templates/` while Kuru is not running; it is
+built again once.
 
 Kuru also applies compatible database schema upgrades automatically when a
 writable project opens. Each upgrade is prepared on an internal isolated branch

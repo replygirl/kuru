@@ -189,6 +189,148 @@ mod tests {
         writer.await.unwrap();
     }
 
+    /// The test cache warm-up (`test_support::warm_runtime_cache` and every
+    /// form that calls it) holds a shared guard while it provisions and
+    /// builds. The gate is fair, so a first warm-up started under a caller's
+    /// own guard, with a writer queued, would wait behind that writer while
+    /// the writer waits for the caller. Fixtures therefore warm before they
+    /// take a guard; this scan of the crate's sources finds a warm-up call
+    /// written while a guard bound in the same scope is still held.
+    #[test]
+    fn no_spawn_guard_encloses_a_test_cache_warm_up() {
+        // Direct warm-ups, then the helpers that warm first.
+        const WARM: [&str; 10] = [
+            "warm_runtime_cache(",
+            ".warmed()",
+            "warmed_open_options(",
+            "warmed_cache_dir(",
+            "warm_blocking(",
+            "temporary()",
+            "temporary_cold()",
+            "open_temporary(",
+            "spawn_logged_owner(",
+            "cache_dir()",
+        ];
+        let mut files = Vec::new();
+        let mut pending = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        let mut violations = Vec::new();
+        let mut guards_seen = 0;
+        for file in &files {
+            let source = code_only(&std::fs::read_to_string(file).unwrap());
+            // (binding, brace depth, line) of each guard still held.
+            let mut held: Vec<(String, usize, usize)> = Vec::new();
+            let mut depth = 0usize;
+            let mut line = 1;
+            let bytes = source.as_bytes();
+            for (index, byte) in bytes.iter().enumerate() {
+                let rest = &source[index..];
+                match byte {
+                    b'\n' => line += 1,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth = depth.saturating_sub(1);
+                        held.retain(|(_, at, _)| *at <= depth);
+                    }
+                    _ => {}
+                }
+                if rest.starts_with("spawn_gate::spawning") {
+                    guards_seen += 1;
+                    let start = source[..index].rfind('\n').map_or(0, |at| at + 1);
+                    let prefix = source[start..index].trim_start();
+                    if let Some(binding) = prefix.strip_prefix("let ").and_then(|after| {
+                        after
+                            .split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .next()
+                    }) {
+                        held.push((binding.to_owned(), depth, line));
+                    }
+                } else if let Some(after) = rest.strip_prefix("drop(") {
+                    let binding: String = after
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    held.retain(|(name, _, _)| *name != binding);
+                } else if let Some(warm) = WARM.iter().find(|warm| rest.starts_with(*warm)) {
+                    let start = source[..index].rfind('\n').map_or(0, |at| at + 1);
+                    let defining = source[start..index].contains("fn ");
+                    if !defining && let Some((name, _, at)) = held.last() {
+                        violations.push(format!(
+                            "{}:{line}: {warm} while the spawn guard `{name}` from line {at} is held",
+                            file.display()
+                        ));
+                    }
+                }
+            }
+        }
+        println!(
+            "{guards_seen} spawn guards scanned, {} violations",
+            violations.len()
+        );
+        assert!(
+            guards_seen > 50,
+            "the scan found only {guards_seen} spawn guards"
+        );
+        assert!(
+            violations.is_empty(),
+            "warm the test cache before taking a spawn guard:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// `source` with comments, string and character literals blanked, so
+    /// braces and calls are only read from code. Line breaks are kept.
+    fn code_only(source: &str) -> String {
+        let bytes = source.as_bytes();
+        let mut out = String::with_capacity(source.len());
+        let mut index = 0;
+        let blank = |text: &str, out: &mut String| {
+            out.extend(text.chars().map(|c| if c == '\n' { '\n' } else { ' ' }));
+        };
+        while index < bytes.len() {
+            let rest = &source[index..];
+            let end = if rest.starts_with("//") {
+                rest.find('\n').unwrap_or(rest.len())
+            } else if rest.starts_with("/*") {
+                rest.find("*/").map_or(rest.len(), |at| at + 2)
+            } else if rest.starts_with("r#\"") || rest.starts_with("r\"") {
+                let hashes = rest[1..].chars().take_while(|c| *c == '#').count();
+                let close = format!("\"{}", "#".repeat(hashes));
+                rest[2 + hashes..]
+                    .find(&close)
+                    .map_or(rest.len(), |at| 2 + hashes + at + close.len())
+            } else if rest.starts_with('"') {
+                let mut at = 1;
+                while at < rest.len() && rest.as_bytes()[at] != b'"' {
+                    at += if rest.as_bytes()[at] == b'\\' { 2 } else { 1 };
+                }
+                (at + 1).min(rest.len())
+            } else if rest.starts_with('\'')
+                && (rest.get(2..3) == Some("'") || rest.starts_with("'\\"))
+            {
+                rest[1..].find('\'').map_or(1, |at| at + 2).min(4)
+            } else {
+                let next = rest.chars().next().map_or(1, char::len_utf8);
+                out.push_str(&rest[..next]);
+                index += next;
+                continue;
+            };
+            blank(&rest[..end], &mut out);
+            index += end;
+        }
+        out
+    }
+
     #[test]
     fn a_panicking_holder_releases_the_gate() {
         static GATE: Gate = Gate::new();
