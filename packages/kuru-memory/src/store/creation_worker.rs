@@ -177,12 +177,14 @@ impl TemplateCreation {
                 let error = failure
                     .into_error()
                     .context("build the memory store template");
-                return match self.set_aside(stage).await {
-                    Ok(()) => Err(error),
-                    Err(preserve) => Err(error.context(format!(
-                        "memory template stage preservation also failed: {preserve:#}"
-                    ))),
-                };
+                return Err(self.fail_after_build(stage, error).await);
+            }
+            // The build succeeded: the error names the copy that failed.
+            Err(CreateError::BuiltCopy(failure)) => {
+                let error = failure
+                    .into_error()
+                    .context("copy the new project from the memory store template this open built");
+                return Err(self.fail_after_build(stage, error).await);
             }
             Err(CreateError::Use(failure)) => {
                 tracing::warn!(
@@ -250,6 +252,17 @@ impl TemplateCreation {
                 }
                 Err(error)
             }
+        }
+    }
+
+    /// Set aside the stage of an open its own template build, or the copy
+    /// after it, failed, and return the error that fails the open.
+    async fn fail_after_build(&self, stage: Directory, error: anyhow::Error) -> anyhow::Error {
+        match self.set_aside(stage).await {
+            Ok(()) => error,
+            Err(preserve) => error.context(format!(
+                "memory template stage preservation also failed: {preserve:#}"
+            )),
         }
     }
 

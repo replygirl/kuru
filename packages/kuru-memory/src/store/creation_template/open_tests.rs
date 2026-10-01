@@ -988,9 +988,18 @@ async fn failed_copy_after_the_build_fails_the_open_without_a_cold_retry() -> Re
             let message = format!("{error:#}");
             ensure!(
                 fault.fired()
-                    && message.contains("copy the new project from the store template")
+                    && message.contains(
+                        "copy the new project from the memory store template this open built"
+                    )
                     && TemplateVerdict::find(&error).is_some() == verdict,
                 "{label}: the open did not fail with its copy's failure: {message}"
+            );
+            // The build succeeded and published: the error names the copy,
+            // never a failed build.
+            ensure!(
+                !message.contains("build the memory store template")
+                    && !message.contains("template build failed"),
+                "{label}: a failed copy was reported as a failed build: {message}"
             );
             let starts = starts_under(&options.data_dir)?;
             ensure!(

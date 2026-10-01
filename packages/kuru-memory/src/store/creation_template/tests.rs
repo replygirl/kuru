@@ -1263,6 +1263,29 @@ fn only_a_template_verdict_is_a_verdict() {
     assert!(!CreationFailure::io(std::io::Error::other("EIO")).is_verdict());
 }
 
+/// A failed copy after a successful build names the copy, not the build, and
+/// keeps its classification: a verdict stays a verdict.
+#[test]
+fn a_failed_copy_after_the_build_is_not_reported_as_a_failed_build() {
+    let copy = CreateError::BuiltCopy(CreationFailure::io(std::io::Error::other("EIO")));
+    let text = copy.to_string();
+    assert!(
+        text.contains("the copy from the store template this open built failed")
+            && !text.contains("build failed"),
+        "{text}"
+    );
+    assert!(!copy.is_verdict());
+    let verdict = CreateError::BuiltCopy(CreationFailure::classify(anyhow::Error::from(
+        TemplateVerdict::new("placeholder differs"),
+    )));
+    assert!(verdict.is_verdict(), "{verdict}");
+    let build = CreateError::Build(CreationFailure::io(std::io::Error::other("EIO")));
+    assert!(
+        build.to_string().contains("template build failed"),
+        "{build}"
+    );
+}
+
 /// No call removes another key's template, quarantined directory, build or
 /// capture stage, or any lock file: a build and a copy of this key leave
 /// every other entry byte-identical.

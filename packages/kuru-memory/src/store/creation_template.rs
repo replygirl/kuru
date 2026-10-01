@@ -1657,22 +1657,26 @@ pub(crate) enum CreateError {
     /// or the copy from it. A verdict among them already quarantined the
     /// judged template. The caller creates the store cold.
     Use(CreationFailure),
-    /// This call's template build failed, or the copy from it: the build's
-    /// engine, its own assertions (a shape verdict there is against the
-    /// build's unpublished bytes), its capture, its publication, or this
-    /// project's copy from the template or verified stage it produced. A
-    /// verdict on that copy already quarantined the template this call
-    /// published. The chain may already have run, so the caller fails the
-    /// open with this error and runs no other creation in it, as it would
-    /// not rebuild after a verdict.
+    /// This call's template build failed: its engine, its own assertions (a
+    /// shape verdict there is against the build's unpublished bytes), its
+    /// capture, or its publication with no verified stage to copy from. The
+    /// chain may already have run, so the caller fails the open with this
+    /// error and runs no other creation in it, as it would not rebuild after
+    /// a verdict.
     Build(CreationFailure),
+    /// This call's template build succeeded, and this project's copy from the
+    /// template or verified stage it produced failed. A verdict on that copy
+    /// already quarantined the template this call published. The chain ran
+    /// in this call, so the caller fails the open as it would for
+    /// [`Self::Build`], but reports the copy, not the build, as what failed.
+    BuiltCopy(CreationFailure),
 }
 
 #[cfg(test)]
 impl CreateError {
     pub(crate) fn failure(&self) -> &CreationFailure {
         match self {
-            Self::Use(failure) | Self::Build(failure) => failure,
+            Self::Use(failure) | Self::Build(failure) | Self::BuiltCopy(failure) => failure,
         }
     }
 
@@ -1694,6 +1698,10 @@ impl fmt::Display for CreateError {
             Self::Build(failure) => {
                 write!(formatter, "the store template build failed: {failure}")
             }
+            Self::BuiltCopy(failure) => write!(
+                formatter,
+                "the copy from the store template this open built failed: {failure}"
+            ),
         }
     }
 }
@@ -1753,9 +1761,10 @@ async fn copy_blocking(
 /// none is published and the exclusive key lock is free. It never waits for
 /// a lock. A verdict against a published template quarantines that template
 /// (identity-bound, best-effort) and is returned; every other failure is
-/// returned and leaves every template untouched. A failure of the build, or
-/// of the copy from the template it built, is returned as
-/// [`CreateError::Build`], every other one as [`CreateError::Use`]. On any
+/// returned and leaves every template untouched. A failure of the build is
+/// returned as [`CreateError::Build`], a failure of the copy from the
+/// template or verified stage it built as [`CreateError::BuiltCopy`], every
+/// other one as [`CreateError::Use`]. On any
 /// failure the partial copy stays in `stage`
 /// for the caller to preserve. Each copy runs on a blocking thread that
 /// holds the key lock until it returns.
@@ -1885,9 +1894,7 @@ pub(crate) async fn create_in(
                             sweep_held(root, key).await;
                         }
                         drop(lock);
-                        Err(CreateError::Build(failure.context(
-                            "copy the new project from the store template this open built".into(),
-                        )))
+                        Err(CreateError::BuiltCopy(failure))
                     }
                 }
             }
