@@ -26,7 +26,7 @@ Usage SHALL live on a per-project permanent operational Dolt branch outside live
 - **THEN** the live revision is unchanged, the candidate can still promote when otherwise valid, and usage appears once whether that candidate promotes or is abandoned.
 
 #### Scenario: Invalid operational branch
-- **WHEN** the ledger's owned schema or receipt contract cannot be validated or migrated at writable open
+- **WHEN** the ledger's owned schema, receipt contract or any ledger-owned row (malformed, non-canonically keyed or of an unrecognized class) cannot be validated or migrated at writable open
 - **THEN** no unaccounted new provider work begins, while historical inspection reports its uncertainty rather than substituting live-branch totals.
 
 ### Requirement: Honest session totals and frozen estimates
