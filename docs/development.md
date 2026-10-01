@@ -766,7 +766,8 @@ receives their CSV rows, and
 
 To measure how an open changes as a store ages, `mise run
 //packages/kuru-memory:measure:age-store --data-dir <dir> --conversations <n>
-[--turns <n>] [--seed <n>]` (defaults: one turn, seed 1) grows the one
+[--turns <n>] [--seed <n>] [--profile <profile>]` (defaults: one turn, seed 1,
+the `dev` profile) grows the one
 existing project store under an absolute data directory. Create that store
 first with one ordinary `kuru` run against the same data directory; the task
 refuses a directory with no store or with several. It waits for any previous
@@ -784,7 +785,95 @@ commit hashes differ, because commits carry timestamps. Progress goes to
 standard error every 500 conversations, and one `kuru.aged-store` JSON line
 with the counts and `elapsed_ms` goes to standard output. It is a
 measurement aid built only with the package's test support, never part of
-`test`, coverage or CI.
+`test` or coverage. CI runs it only to build the usage-scan fixture below,
+with `--profile release` so one release build serves the whole check.
+
+### Usage scan scaling check
+
+The required CI job `usage-scan-scaling` ("Usage scan scaling (ubuntu-latest,
+provisional bounds)" in `ci.yml`, listed in `ci-gate`) fails when the
+usage-ledger startup scan grows faster than linearly with ledger size. It
+runs on Ubuntu only, because the owner open timeline is inert on Windows.
+
+- **Fixture.** Two aged stores at 1,000 and 5,000 conversations (seed 1, one
+  turn). Each holds exactly 4,000 and 20,000 owned usage rows: one session
+  marker and three rows per invocation.
+- **Measurement.** The job builds the release kuru-memory test-support
+  tooling. For each size it starts one warm-up and then five cold owner
+  processes with `KURU_OPEN_TIMELINE=1`. Each opens the store writable,
+  publishes its endpoint, retires and writes its timeline.
+- **T(N).** The first usage scan, from `usage-pool` to `usage-scan-1`. That
+  interval also holds the scan's flat working-set and schema checks. The row
+  count is the timeline's `counts.usage_rows`.
+- **Checks.** It fails if any of these fails:
+  - **rows:** every open, warm-up included, decoded exactly its size's rows;
+  - **ratio:** `T(20000) / max(T(4000), 100 ms)` is at most 8. Linear growth
+    predicts about 5 and quadratic growth about 25. The 100 ms floor keeps a
+    fast small size from turning noise into a ratio failure;
+  - **ceiling:** `T(20000)` is at most 3 s.
+
+**The bounds are provisional.** The validation-record change replaces them
+with calibrated bounds and their derivation. It also adds the assertion that
+a recorded reopen decodes 0 usage rows; that is left out until then, because
+every writable open scans the whole ledger.
+
+**Output.** Every run prints the per-size scan medians and samples, the
+second scan, the usage block, the whole open, the ratio and the bounds, and
+appends them to the job summary. A failed assertion also writes every
+timeline to standard error. The records (`records.jsonl`, `verdict.json`),
+timelines, owner logs and ageing logs are uploaded as
+`ci-usage-scan-attempt-<n>` on any outcome.
+
+**The fixture cache.**
+- **Key.** `usage-scan-fixture-v1-<sha256>`, printed by `usage-scan-fixture
+  key` from compiled constants, so the workflow repeats none of them. It
+  covers the fixture format version, seed, turns and sizes, the aged-store
+  report format version, `CURRENT_VERSION` and `USAGE_CURRENT_VERSION`, the
+  bundled Dolt version, its archive and executable digests and target, and
+  the fixture root's canonical path. The path is needed because an owner
+  binds a store's scope to its project's canonical path; the job pins the
+  root at `$RUNNER_TEMP/kuru-usage-scan`.
+- **Contents.** Only `fixture.json` and each `data-<n>/memory` are cached.
+  The first, warm-up open extracts the engine again. The `key` step creates
+  each `data-<n>` owner-private before the restore, because the memory open
+  refuses a data directory with any other mode, and an archive that carries
+  only `data-<n>/memory` would otherwise leave its parent at the runner's
+  default mode.
+- **Restore.** Pull requests restore by the exact key only, with no
+  `restore-keys`, because an older-schema fixture would measure a migration
+  open instead.
+- **Save.** Only `main` saves, before any measuring open, so the cache holds
+  no timeline.
+- **Miss.** A miss ages both stores in-job, one after the other, and never
+  skips the check.
+- **Cold rebuild.** Bump `FIXTURE_FORMAT_VERSION` in
+  `test_support/usage_scan.rs`, or delete the entry from the repository's
+  Actions caches.
+
+**Decision rule.** The job prints the restore time and hit, and on a miss
+each size's ageing time. If cold 5k ageing on Ubuntu exceeds 20 minutes, or
+a restore exceeds 2 minutes, the fixture switches to a bulk-seeded ledger
+written with the ledger's own encoders in batched commits.
+
+**Running it locally** on Unix, with an absolute scratch root `<root>`:
+
+```sh
+mise run //packages/kuru-memory:measure:usage-scan:fixture -- create --root <root> --conversations 1000
+mise run //packages/kuru-memory:measure:usage-scan:fixture -- create --root <root> --conversations 5000
+mise run //packages/kuru-memory:measure:age-store -- --profile release --data-dir <root>/data-1000 --conversations 1000 > <root>/age-1000.json
+mise run //packages/kuru-memory:measure:age-store -- --profile release --data-dir <root>/data-5000 --conversations 5000 > <root>/age-5000.json
+mise run //packages/kuru-memory:measure:usage-scan:fixture -- seal --root <root>
+mise run //packages/kuru-memory:measure:usage-scan -- --root <root> --evidence <dir> --samples 5 --assert
+```
+
+`create` refuses to run with `KURU_OPEN_TIMELINE` set, and `seal` refuses a
+store that holds a timeline. `measure:usage-scan` sets the variable itself.
+
+Every measured open leaves its timeline file in the store's services
+directory: as the timeline section above notes, nothing in Kuru removes them.
+The driver reads each open's file by its service generation, so files left by
+earlier runs never mix into a measurement. Still, measure a scratch root that
+is never sealed or cached again, or delete the files by hand.
 
 `store::engine_contract_tests` pins the Dolt behaviours that creating stores
 from a pre-migrated template relies on: root creation and bootstrap on a
