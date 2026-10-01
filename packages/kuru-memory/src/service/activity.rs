@@ -95,13 +95,6 @@ fn named_stage(name: &str) -> Option<MemoryOpenStage> {
         .find(|stage| stage_name(*stage) == Some(name))
 }
 
-/// Until the store reports the project-ownership wait only when its startup
-/// lock is busy, it reports that stage on every open, and forwarding it would
-/// show a wait that never happened. Removed with that store change.
-pub(crate) fn forwardable_before_store_stages(stage: MemoryOpenStage) -> bool {
-    stage != MemoryOpenStage::WaitingForProjectOwnership
-}
-
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ActivityRecord {
@@ -320,7 +313,7 @@ impl Feed {
     /// Hand one stage to the publisher without waiting for any write, and
     /// say whether it was published.
     fn push(&mut self, stage: MemoryOpenStage) -> bool {
-        if stage_name(stage).is_none() || !forwardable_before_store_stages(stage) {
+        if stage_name(stage).is_none() {
             return false;
         }
         self.stages.push(stage);
@@ -578,11 +571,7 @@ pub(crate) async fn open_local_forwarding(
 ) -> Result<MemoryStore> {
     let (mut progress, opening) = MemoryStore::open_observed(options);
     let mut opening = Box::pin(opening);
-    let mut forward = |stage| {
-        if forwardable_before_store_stages(stage) {
-            reporter.report(stage);
-        }
-    };
+    let mut forward = |stage| reporter.report(stage);
     let mut progress_open = true;
     let result = loop {
         tokio::select! {
@@ -926,19 +915,23 @@ mod tests {
             ..Writes::default()
         };
         let mut feed = Feed::start(directory(&data, &scope)?, tag.clone(), writes);
-        for unpublished in [Ready, StartingMemoryService, WaitingForProjectOwnership] {
+        for unpublished in [Ready, StartingMemoryService] {
             ensure!(!feed.push(unpublished), "{unpublished:?} was published");
         }
         let mut written = feed.written.clone();
         tokio::time::timeout(Duration::from_secs(10), async {
-            ensure!(feed.push(PreparingDatabase));
+            // The owner reports a wait only while the startup lock is busy,
+            // so the wait is published like any other stage it begins.
+            ensure!(feed.push(WaitingForProjectOwnership));
             // The first write fails; with no newer list it is written again.
             written.wait_for(|written| *written == 1).await?;
             ensure!(failures.load(Ordering::SeqCst) == 0);
-            ensure!(read_stages(&data, &scope, &tag)? == [PreparingDatabase]);
+            ensure!(read_stages(&data, &scope, &tag)? == [WaitingForProjectOwnership]);
             ensure!(feed.push(OpeningDatabase));
             written.wait_for(|written| *written == 2).await?;
-            ensure!(read_stages(&data, &scope, &tag)? == [PreparingDatabase, OpeningDatabase]);
+            ensure!(
+                read_stages(&data, &scope, &tag)? == [WaitingForProjectOwnership, OpeningDatabase]
+            );
             Ok::<(), anyhow::Error>(())
         })
         .await
@@ -1203,6 +1196,165 @@ mod tests {
         })
         .await
         .with_context(|| format!("forwarding fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    /// Spawn a real owner for `options` held at `stage` by the test-support
+    /// hold, wait until that stage is received, release the hold and finish.
+    /// Returns every stage the client saw and the open store.
+    async fn open_held_at(
+        options: &crate::store::OpenOptions,
+        project: &Path,
+        root: &Path,
+        stage: MemoryOpenStage,
+    ) -> Result<(Vec<MemoryOpenStage>, crate::MemoryStore)> {
+        let executable = options
+            .supervisor
+            .clone()
+            .context("fixture supervisor absent")?;
+        let holds = root.join("holds");
+        std::fs::create_dir(&holds)?;
+        let hold = holds.join(format!("{stage:?}.hold"));
+        std::fs::write(&hold, b"")?;
+        let environment = vec![(OPEN_HOLD_DIR_ENV.into(), holds.into_os_string())];
+        let mut seen = Vec::new();
+        let memory = with_owner_environment(environment, async {
+            let _gate = crate::spawn_gate::spawning().await;
+            let (mut progress, opening) = crate::MemoryStore::open_managed_observed(
+                options.clone(),
+                project.to_owned(),
+                executable,
+            );
+            let mut opening = Box::pin(opening);
+            until_stage(&mut progress, &mut opening, stage, &mut seen).await?;
+            std::fs::remove_file(&hold)?;
+            finish(progress, opening, &mut seen).await
+        })
+        .await?;
+        Ok((seen, memory))
+    }
+
+    // T1: the owner reports creation, and the starter forwards it, for a
+    // project that has no memory yet.
+    #[tokio::test]
+    async fn a_starter_forwards_the_creation_of_a_new_project() -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 1);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, _scope, _data, options) = owner_fixture(root.path())?;
+            let (seen, memory) =
+                open_held_at(&options, &project, root.path(), CreatingDatabase).await?;
+            let starting = seen
+                .iter()
+                .position(|stage| *stage == StartingMemoryService);
+            let creating = seen.iter().position(|stage| *stage == CreatingDatabase);
+            ensure!(
+                starting.is_some() && starting < creating,
+                "creation was not forwarded after the service start: {seen:?}"
+            );
+            ensure!(
+                seen.iter()
+                    .filter(|stage| **stage == CreatingDatabase)
+                    .count()
+                    == 1,
+                "{seen:?}"
+            );
+            for absent in [UpgradingDatabase, WaitingForProjectOwnership] {
+                ensure!(
+                    !seen.contains(&absent),
+                    "{absent:?} for a new project: {seen:?}"
+                );
+            }
+            assert_ready_once_and_last(&seen)?;
+            memory.close().await?;
+            await_managed_quiescence(&options).await
+        })
+        .await
+        .with_context(|| format!("creation fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    // T2: a store left at its released format is upgraded, and the starter
+    // forwards the upgrade, not a creation.
+    #[tokio::test]
+    async fn a_starter_forwards_the_upgrade_of_a_released_store() -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 1);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, _scope, _data, options) = owner_fixture(root.path())?;
+            {
+                let _gate = crate::spawn_gate::spawning().await;
+                crate::store::released_v1(&options).await?;
+            }
+            let (seen, memory) =
+                open_held_at(&options, &project, root.path(), UpgradingDatabase).await?;
+            ensure!(
+                seen.iter()
+                    .filter(|stage| **stage == UpgradingDatabase)
+                    .count()
+                    == 1,
+                "{seen:?}"
+            );
+            for absent in [CreatingDatabase, WaitingForProjectOwnership] {
+                ensure!(
+                    !seen.contains(&absent),
+                    "{absent:?} for an upgrade: {seen:?}"
+                );
+            }
+            assert_ready_once_and_last(&seen)?;
+            memory.close().await?;
+            await_managed_quiescence(&options).await
+        })
+        .await
+        .with_context(|| format!("upgrade fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    // The owner, not the starter, meets a busy project startup lock: it
+    // reports the wait, the starter forwards it after its own service start,
+    // and the wait ends with the lock.
+    #[tokio::test]
+    async fn a_starter_forwards_its_owners_wait_for_the_project_startup_lock() -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 1);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, _scope, _data, options) = owner_fixture(root.path())?;
+            let executable = options
+                .supervisor
+                .clone()
+                .context("fixture supervisor absent")?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let held = crate::store::hold_startup_lock(&options)?;
+            let (mut progress, opening) =
+                crate::MemoryStore::open_managed_observed(options.clone(), project, executable);
+            let mut opening = Box::pin(opening);
+            let mut seen = Vec::new();
+            until_stage(
+                &mut progress,
+                &mut opening,
+                WaitingForProjectOwnership,
+                &mut seen,
+            )
+            .await?;
+            ensure!(
+                seen == [StartingMemoryService, WaitingForProjectOwnership],
+                "{seen:?}"
+            );
+            drop(held);
+            let memory = finish(progress, opening, &mut seen).await?;
+            ensure!(
+                seen.iter()
+                    .filter(|stage| **stage == WaitingForProjectOwnership)
+                    .count()
+                    == 1,
+                "{seen:?}"
+            );
+            assert_ready_once_and_last(&seen)?;
+            memory.close().await?;
+            await_managed_quiescence(&options).await
+        })
+        .await
+        .with_context(|| format!("owner wait fixture exceeded its {deadline:?} deadline"))?
     }
 
     // T5

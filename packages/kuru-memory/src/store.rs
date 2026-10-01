@@ -1845,11 +1845,11 @@ impl MemoryStore {
             files::open_directory(&locks, Privacy::OwnerOnly, NameRetention::Pinned)?;
         let name = directory.file_name().context("project store has no name")?;
         let lock = lock_directory.lock_file(name)?;
-        progress.report(MemoryOpenStage::WaitingForProjectOwnership);
         let mut lock = Some(
-            acquire_lock(
+            acquire_lock_reporting(
                 lock,
                 Duration::from_secs(options.config.startup_timeout_secs),
+                progress,
             )
             .await?,
         );
@@ -1890,6 +1890,7 @@ impl MemoryStore {
             // store that went absent while the open waited for it.
             #[cfg(any(test, feature = "test-support"))]
             options.refuse_unwarmed_fixture()?;
+            progress.report(MemoryOpenStage::CreatingDatabase);
             let data = options.data_dir.clone();
             let scope = options.project_scope.clone();
             let legacy =
@@ -1989,6 +1990,7 @@ impl MemoryStore {
             );
         }
         let (server, pool) = if found < migrations::CURRENT_VERSION {
+            progress.report(MemoryOpenStage::UpgradingDatabase);
             #[cfg(test)]
             let (lock, migrated) =
                 run_migration_worker(server, pool, options.migration_hooks.clone()).await?;
@@ -7790,11 +7792,22 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     files::write(path, &serde_json::to_vec(value)?)
 }
 async fn acquire_lock(file: File, duration: Duration) -> Result<File> {
+    acquire_lock_reporting(file, duration, &mut ProgressReporter::silent()).await
+}
+/// `acquire_lock`, reporting the project-ownership wait once, before the first
+/// sleep, only when the lock is held by another process. A lock taken on the
+/// first attempt reports nothing.
+async fn acquire_lock_reporting(
+    file: File,
+    duration: Duration,
+    progress: &mut ProgressReporter,
+) -> Result<File> {
     let deadline = Instant::now() + duration;
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(file),
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                progress.report(MemoryOpenStage::WaitingForProjectOwnership);
                 tokio::time::sleep(Duration::from_millis(25)).await
             }
             Err(error) => {
@@ -7863,6 +7876,12 @@ pub(crate) fn test_supervisor() -> Result<PathBuf> {
     );
     Ok(helper)
 }
+
+/// Shared with the owner's open-activity tests, which need a store left at
+/// its released format and a project startup lock held as another process
+/// would hold it.
+#[cfg(test)]
+pub(crate) use tests::{hold_startup_lock, released_v1};
 
 #[cfg(test)]
 mod tests {
@@ -10058,9 +10077,9 @@ mod tests {
         while let Some(stage) = progress.recv().await {
             stages.push(stage);
         }
-        assert_eq!(
-            stages.first(),
-            Some(&MemoryOpenStage::WaitingForProjectOwnership)
+        assert!(
+            !stages.contains(&MemoryOpenStage::WaitingForProjectOwnership),
+            "an uncontended open reported a wait: {stages:?}"
         );
         assert!(stages.contains(&MemoryOpenStage::PreparingDatabase));
         assert!(stages.contains(&MemoryOpenStage::OpeningDatabase));
@@ -10072,6 +10091,212 @@ mod tests {
                 .count(),
             1
         );
+        Ok(())
+    }
+
+    /// Open `options` observed and return the outcome with every stage it
+    /// reported, in order.
+    async fn open_collecting(options: OpenOptions) -> (Result<MemoryStore>, Vec<MemoryOpenStage>) {
+        let (mut progress, opening) = MemoryStore::open_observed(options);
+        let result = opening.await;
+        let mut stages = Vec::new();
+        while let Some(stage) = progress.recv().await {
+            stages.push(stage);
+        }
+        (result, stages)
+    }
+
+    fn position(stages: &[MemoryOpenStage], stage: MemoryOpenStage) -> usize {
+        stages
+            .iter()
+            .position(|found| *found == stage)
+            .unwrap_or_else(|| panic!("{stage:?} was not reported: {stages:?}"))
+    }
+
+    fn count(stages: &[MemoryOpenStage], stage: MemoryOpenStage) -> usize {
+        stages.iter().filter(|found| **found == stage).count()
+    }
+
+    // A new project reports its creation once, after preparation begins and
+    // before ready, and neither a wait nor an upgrade.
+    #[tokio::test]
+    async fn observed_open_of_a_new_project_reports_creation_once() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().to_owned(),
+            format!("project/{}", "1".repeat(64)),
+        )?;
+        let (store, stages) = open_collecting(options).await;
+        store?.close().await?;
+        assert_eq!(count(&stages, MemoryOpenStage::CreatingDatabase), 1);
+        assert!(
+            position(&stages, MemoryOpenStage::PreparingDatabase)
+                < position(&stages, MemoryOpenStage::CreatingDatabase)
+        );
+        assert!(
+            position(&stages, MemoryOpenStage::CreatingDatabase)
+                < position(&stages, MemoryOpenStage::Ready)
+        );
+        assert_eq!(stages.last(), Some(&MemoryOpenStage::Ready));
+        for absent in [
+            MemoryOpenStage::UpgradingDatabase,
+            MemoryOpenStage::WaitingForProjectOwnership,
+        ] {
+            assert!(!stages.contains(&absent), "{absent:?}: {stages:?}");
+        }
+        Ok(())
+    }
+
+    // Reopening a current store creates and upgrades nothing.
+    #[tokio::test]
+    async fn observed_reopen_of_a_current_store_reports_neither_creation_nor_upgrade() -> Result<()>
+    {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().to_owned(),
+            format!("project/{}", "2".repeat(64)),
+        )?;
+        MemoryStore::open(options.clone()).await?.close().await?;
+        let (store, stages) = open_collecting(options).await;
+        store?.close().await?;
+        for absent in [
+            MemoryOpenStage::CreatingDatabase,
+            MemoryOpenStage::UpgradingDatabase,
+            MemoryOpenStage::WaitingForProjectOwnership,
+        ] {
+            assert!(!stages.contains(&absent), "{absent:?}: {stages:?}");
+        }
+        assert_eq!(stages.last(), Some(&MemoryOpenStage::Ready));
+        Ok(())
+    }
+
+    // A read-only open of a project with no memory fails before any creation
+    // begins, so the creation sentence is never reported.
+    #[tokio::test]
+    async fn observed_read_only_open_of_a_missing_project_reports_no_creation() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let mut options = crate::test_support::open_options(
+            root.path().to_owned(),
+            format!("project/{}", "3".repeat(64)),
+        )?;
+        options.read_only = true;
+        let (store, stages) = open_collecting(options).await;
+        assert!(store.is_err());
+        assert!(
+            !stages.contains(&MemoryOpenStage::CreatingDatabase),
+            "{stages:?}"
+        );
+        assert!(!stages.contains(&MemoryOpenStage::Ready), "{stages:?}");
+        Ok(())
+    }
+
+    // T11: a released v1 store reports its upgrade exactly once, before
+    // ready, and is not reported as created.
+    #[tokio::test]
+    async fn observed_open_of_a_released_store_reports_its_upgrade_once() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().to_owned(),
+            format!("project/{}", "4".repeat(64)),
+        )?;
+        released_v1(&options).await?;
+        let (store, stages) = open_collecting(options).await;
+        store?.close().await?;
+        assert_eq!(count(&stages, MemoryOpenStage::UpgradingDatabase), 1);
+        assert!(
+            position(&stages, MemoryOpenStage::UpgradingDatabase)
+                < position(&stages, MemoryOpenStage::Ready)
+        );
+        assert_eq!(stages.last(), Some(&MemoryOpenStage::Ready));
+        for absent in [
+            MemoryOpenStage::CreatingDatabase,
+            MemoryOpenStage::WaitingForProjectOwnership,
+        ] {
+            assert!(!stages.contains(&absent), "{absent:?}: {stages:?}");
+        }
+        Ok(())
+    }
+
+    // A read-only open refuses an upgrade, so it never reports one.
+    #[tokio::test]
+    async fn observed_read_only_open_of_a_released_store_reports_no_upgrade() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let mut options = crate::test_support::open_options(
+            root.path().to_owned(),
+            format!("project/{}", "5".repeat(64)),
+        )?;
+        released_v1(&options).await?;
+        options.read_only = true;
+        let (store, stages) = open_collecting(options).await;
+        assert!(store.is_err());
+        assert!(
+            !stages.contains(&MemoryOpenStage::UpgradingDatabase),
+            "{stages:?}"
+        );
+        Ok(())
+    }
+
+    /// Hold the project startup lock as another process would.
+    pub(crate) fn hold_startup_lock(options: &OpenOptions) -> Result<File> {
+        let directory = project_directory(&options.data_dir, &options.project_scope)?;
+        let parent = directory.parent().context("project store has no parent")?;
+        private_dir(&options.data_dir)?;
+        private_dir(parent)?;
+        let locks = parent.join("locks");
+        private_dir(&locks)?;
+        let lock_directory =
+            files::open_directory(&locks, Privacy::OwnerOnly, NameRetention::Pinned)?;
+        let lock = lock_directory.lock_file(directory.file_name().context("no store name")?)?;
+        lock.try_lock()?;
+        Ok(lock)
+    }
+
+    // T11: the wait is reported only while another process holds the startup
+    // lock, once, and the open then succeeds.
+    #[tokio::test]
+    async fn observed_open_reports_the_ownership_wait_only_while_the_lock_is_held() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().to_owned(),
+            format!("project/{}", "6".repeat(64)),
+        )?;
+        let held = hold_startup_lock(&options)?;
+        let (mut progress, opening) = MemoryStore::open_observed(options);
+        let mut opening = Box::pin(opening);
+        let mut stages = Vec::new();
+        let waiting = loop {
+            tokio::select! {
+                biased;
+                stage = progress.recv() => match stage {
+                    Some(stage) => {
+                        stages.push(stage);
+                        if stage == MemoryOpenStage::WaitingForProjectOwnership {
+                            break true;
+                        }
+                    }
+                    None => break false,
+                },
+                result = &mut opening => {
+                    panic!("the open finished while the lock was held: {:?}", result.map(|_| ()));
+                }
+            }
+        };
+        assert!(waiting, "no wait was reported: {stages:?}");
+        drop(held);
+        let store = opening.await?;
+        while let Some(stage) = progress.recv().await {
+            stages.push(stage);
+        }
+        store.close().await?;
+        assert_eq!(
+            count(&stages, MemoryOpenStage::WaitingForProjectOwnership),
+            1
+        );
+        assert_eq!(
+            stages.first(),
+            Some(&MemoryOpenStage::WaitingForProjectOwnership)
+        );
+        assert_eq!(stages.last(), Some(&MemoryOpenStage::Ready));
         Ok(())
     }
 
@@ -10253,7 +10478,7 @@ mod tests {
     /// Materialize a released v1 store without going through `open`: production
     /// writable open intentionally upgrades it immediately, so this fixture
     /// must stop a real v1 server and preserve the ordinary format-1 marker.
-    pub(super) async fn released_v1(options: &OpenOptions) -> Result<()> {
+    pub(crate) async fn released_v1(options: &OpenOptions) -> Result<()> {
         let directory = project_directory(&options.data_dir, &options.project_scope)?;
         private_dir(&options.data_dir)?;
         let parent = directory
