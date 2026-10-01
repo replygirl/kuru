@@ -350,7 +350,11 @@ Preserve a failed store and its logs before investigating; do not remove a held
 lockfile or replace the directory while a process is using it.
 
 Inspection commands attach read-only to an active memory service. Without one,
-they use an explicitly local read-only open and never elect an owner. Normal
+they use an explicitly local read-only open and never elect an owner. An
+inspection that meets a service that is still shutting down waits, within
+`memory.startup_timeout_secs`, until that service has reaped its engine and
+released its owner lock, then opens locally; it does not read through the
+retiring service's engine. Normal
 runtime command exit awaits attachment cleanup, including when the command
 reports an error; its service retires once its last attachment closes.
 Migration, recovery, purge, and other maintenance use explicit quiescence gates

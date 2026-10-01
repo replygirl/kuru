@@ -63,6 +63,12 @@ impl Sandbox {
         .unwrap()
     }
 
+    /// Inspect saved preferences after the CLI commands have exited. Their
+    /// managed service retires as soon as the last one exits, and its store's
+    /// Dolt endpoint stays published until that close reaps Dolt, so a direct
+    /// open could borrow a Dolt that is stopping. Await the owner's exit and
+    /// inspect through the product's read-only path, which decides from the
+    /// owner lock and opens this inspection's own generation.
     async fn preferences(&self) -> ProjectPreferences {
         let mut options = kuru_memory::test_support::open_options(
             self.data.clone(),
@@ -70,7 +76,17 @@ impl Sandbox {
         )
         .unwrap();
         options.read_only = true;
-        let memory = MemoryStore::open(options).await.unwrap();
+        let exited = options.clone();
+        tokio::task::spawn_blocking(move || memory::await_owner_exit(&exited))
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, opening) = MemoryStore::open_managed_observed(
+            options,
+            self.project.canonicalize().unwrap(),
+            PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+        );
+        let memory = opening.await.unwrap();
         let preferences = Harness::load_preferences(&memory, &self.project)
             .await
             .unwrap();

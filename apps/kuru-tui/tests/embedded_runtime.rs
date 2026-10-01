@@ -1017,7 +1017,14 @@ impl Installation {
         options.config = self.memory.clone();
         options.read_only = true;
         options.supervisor = Some(self.binary.clone());
-        let store = tokio::time::timeout(COMMAND_TIMEOUT, MemoryStore::open(options))
+        // The managed read-only path decides from the owner lock, so it never
+        // borrows the Dolt of an owner that is still retiring.
+        let (_, opening) = MemoryStore::open_managed_observed(
+            options,
+            self.project.canonicalize()?,
+            self.binary.clone(),
+        );
+        let store = tokio::time::timeout(COMMAND_TIMEOUT, opening)
             .await
             .context("read-only transcript reopen timed out")??;
         let transcript = store

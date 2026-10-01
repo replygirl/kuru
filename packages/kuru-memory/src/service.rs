@@ -784,10 +784,10 @@ async fn try_attach_observed(
     );
     let mut stream = match connect_local(data, scope, &record.address, HANDSHAKE_TIMEOUT).await {
         Ok(stream) => stream,
-        Err(error) if is_transport_unavailable(&error) => {
-            return Ok(Err(AttachMiss::TransportUnavailable));
-        }
-        Err(error) => return Err(error),
+        Err(error) => match connect_miss(&error) {
+            Some(miss) => return Ok(Err(miss)),
+            None => return Err(error),
+        },
     };
     match connect_handshake_presenting(&mut stream, &record.authority, starter_token).await {
         Ok(()) => {}
@@ -812,6 +812,26 @@ async fn try_attach_observed(
         #[cfg(any(test, feature = "test-support"))]
         reply_pause: None,
     }))
+}
+
+/// Whether a failed connect to a published endpoint found no usable owner,
+/// and which miss it was; `None` is a fault the caller reports.
+///
+/// A listener that closes while this connect is still queued in its backlog
+/// resets it: Linux delivers that reset from the connect itself, while Darwin
+/// completes the connect and the handshake then meets the closed peer. Either
+/// way it is the same peer-closed observation the handshake already maps, and
+/// never authority. The owner lock decides: a retiring owner reaps Dolt and
+/// releases it, while a live owner that keeps closing connections keeps it
+/// and is reported at the caller's existing deadline.
+fn connect_miss(error: &anyhow::Error) -> Option<AttachMiss> {
+    if is_transport_unavailable(error) {
+        Some(AttachMiss::TransportUnavailable)
+    } else if is_peer_closed(error) {
+        Some(AttachMiss::PeerClosed)
+    } else {
+        None
+    }
 }
 
 /// A published endpoint that cannot be reached is a transport observation
@@ -1678,6 +1698,11 @@ struct MaintenanceStep {
     lock_since: Option<tokio::time::Instant>,
     /// Retirement requests that found no live endpoint to ask.
     unanswered: u32,
+    /// Retirement requests whose connection the owner closed unanswered, at
+    /// connect or handshake. A retiring owner does this once or twice; a
+    /// count that keeps growing while the owner lock stays held names a live
+    /// owner that is closing connections.
+    peer_closed: u32,
     /// Retirement requests the owner refused because clients were attached.
     busy: u32,
 }
@@ -1714,15 +1739,16 @@ impl MaintenanceTrace {
         step.since = Some(tokio::time::Instant::now());
     }
 
-    fn record(&self, outcome: Option<bool>) {
+    fn record(&self, reply: RetirementReply) {
         let mut step = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match outcome {
-            None => step.unanswered = step.unanswered.saturating_add(1),
-            Some(false) => step.busy = step.busy.saturating_add(1),
-            Some(true) => {}
+        match reply {
+            RetirementReply::NoEndpoint => step.unanswered = step.unanswered.saturating_add(1),
+            RetirementReply::PeerClosed => step.peer_closed = step.peer_closed.saturating_add(1),
+            RetirementReply::Busy => step.busy = step.busy.saturating_add(1),
+            RetirementReply::Accepted => {}
         }
     }
 }
@@ -1749,10 +1775,11 @@ impl std::fmt::Display for MaintenanceTrace {
         };
         write!(
             formatter,
-            "maintenance {phase} for {}ms (this lock's wait {}ms); requests without a live endpoint={}; busy replies={}",
+            "maintenance {phase} for {}ms (this lock's wait {}ms); requests without a live endpoint={}; requests the owner closed unanswered={}; busy replies={}",
             elapsed(step.since),
             elapsed(step.lock_since),
             step.unanswered,
+            step.peer_closed,
             step.busy
         )
     }
@@ -1804,30 +1831,33 @@ pub(crate) async fn acquire_maintenance_permit_traced(
         }
         if !retirement_requested {
             trace.enter(MaintenancePhase::Requesting);
-            let outcome = tokio::time::timeout_at(deadline, request_idle_retirement(options))
+            let reply = tokio::time::timeout_at(deadline, request_idle_retirement(options))
                 .await
-                .context("memory maintenance owner-response deadline exceeded")??;
-            trace.record(outcome);
-            trace.enter(if outcome == Some(true) {
+                .with_context(|| {
+                    format!("memory maintenance owner-response deadline exceeded; {trace}")
+                })??;
+            trace.record(reply);
+            trace.enter(if reply == RetirementReply::Accepted {
                 MaintenancePhase::AwaitingRetirement
             } else {
                 MaintenancePhase::OwnerLock
             });
-            match outcome {
-                Some(true) => retirement_requested = true,
-                Some(false) => {
+            match reply {
+                RetirementReply::Accepted => retirement_requested = true,
+                RetirementReply::Busy => {
                     busy_observations += 1;
                     ensure!(
                         busy_observations < 10,
                         "memory service has active clients; close them before maintenance"
                     );
                 }
-                None => {}
+                // Neither is owner authority: wait for the owner lock.
+                RetirementReply::NoEndpoint | RetirementReply::PeerClosed => {}
             }
         }
         ensure!(
             tokio::time::Instant::now() < deadline,
-            "memory service owner is still active; maintenance cannot proceed"
+            "memory service owner is still active; maintenance cannot proceed; {trace}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
@@ -1839,12 +1869,27 @@ pub(crate) async fn acquire_maintenance_permit_traced(
     })
 }
 
+/// What one request for idle retirement observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetirementReply {
+    /// No endpoint record, or nothing listening at the published one.
+    NoEndpoint,
+    /// The owner closed the connection unanswered, at connect or handshake,
+    /// as a retiring owner closes one it will never accept.
+    PeerClosed,
+    /// The owner refused: clients are attached.
+    Busy,
+    Accepted,
+}
+
 /// The caller holds the start gate, so a successful idle retirement cannot
 /// race a replacement election while the owner reaps Dolt. A missing/stale
-/// endpoint is a wait condition; a valid owner with live clients refuses.
-async fn request_idle_retirement(options: &crate::store::OpenOptions) -> Result<Option<bool>> {
+/// endpoint and a connection the owner closed unanswered are wait
+/// conditions decided by the owner lock; a valid owner with live clients
+/// refuses.
+async fn request_idle_retirement(options: &crate::store::OpenOptions) -> Result<RetirementReply> {
     let Some(record) = EndpointRecord::read(&options.data_dir, &options.project_scope)? else {
-        return Ok(None);
+        return Ok(RetirementReply::NoEndpoint);
     };
     let stream = match connect_local(
         &options.data_dir,
@@ -1855,8 +1900,13 @@ async fn request_idle_retirement(options: &crate::store::OpenOptions) -> Result<
     .await
     {
         Ok(stream) => stream,
-        Err(error) if is_transport_unavailable(&error) => return Ok(None),
-        Err(error) => return Err(error).context("connect to memory service for maintenance"),
+        Err(error) => match connect_miss(&error) {
+            Some(AttachMiss::PeerClosed) => return Ok(RetirementReply::PeerClosed),
+            Some(AttachMiss::TransportUnavailable | AttachMiss::NoEndpoint) => {
+                return Ok(RetirementReply::NoEndpoint);
+            }
+            None => return Err(error).context("connect to memory service for maintenance"),
+        },
     };
     let mut attachment = ServiceAttachment {
         stream: Some(stream),
@@ -1877,13 +1927,14 @@ async fn request_idle_retirement(options: &crate::store::OpenOptions) -> Result<
         Ok(()) => {}
         // An owner retiring on its own closes a connection it will never
         // accept; wait for its owner lock as for a missing endpoint.
-        Err(error) if is_peer_closed(&error) => return Ok(None),
+        Err(error) if is_peer_closed(&error) => return Ok(RetirementReply::PeerClosed),
         Err(error) => return Err(error),
     }
     let result = attachment.call(ServiceCall::RetireIfIdle).await;
     attachment.close();
     match result? {
-        ServiceValue::Retirement { accepted } => Ok(Some(accepted)),
+        ServiceValue::Retirement { accepted: true } => Ok(RetirementReply::Accepted),
+        ServiceValue::Retirement { accepted: false } => Ok(RetirementReply::Busy),
         _ => bail!("memory service returned the wrong maintenance response"),
     }
 }
@@ -3140,7 +3191,7 @@ mod tests {
             request_idle_retirement(&options)
                 .await
                 .context("maintenance failed on a busy pipe")?
-                .is_none(),
+                == RetirementReply::NoEndpoint,
             "maintenance reached an owner through a busy pipe"
         );
 
@@ -3920,7 +3971,7 @@ mod tests {
             ))
             .await
             .context("maintenance failed on a retiring owner")?
-            .is_none(),
+                == RetirementReply::NoEndpoint,
             "maintenance reached a retired owner"
         );
 
@@ -7217,7 +7268,7 @@ mod tests {
                 request_idle_retirement(&options)
                     .await
                     .context("maintenance failed on a record without a listener")?
-                    .is_none(),
+                    == RetirementReply::NoEndpoint,
                 "maintenance read a record without a listener as an owner answer"
             );
 
@@ -7291,9 +7342,8 @@ mod tests {
             let (requested, closed) = tokio::join!(request_idle_retirement(&options), closed_peer);
             closed?;
             ensure!(
-                requested
-                    .context("maintenance treated a closing owner as an error")?
-                    .is_none(),
+                requested.context("maintenance treated a closing owner as an error")?
+                    == RetirementReply::PeerClosed,
                 "maintenance read a closed connection as an owner answer"
             );
             owner.close().await?;
@@ -7303,6 +7353,307 @@ mod tests {
         .await
         .with_context(|| {
             format!("maintenance race fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
+    // Signature 2's routing on every host. A connect that a listener had
+    // queued and then closed fails with a reset on Linux (CI job
+    // 110146577721): that is a peer-closed miss for maintenance and for an
+    // electing client, neither a fault nor "nothing is listening".
+    #[test]
+    fn a_connect_reset_by_a_retiring_owner_is_a_peer_closed_miss() {
+        let reset = anyhow::Error::new(io::Error::from(io::ErrorKind::ConnectionReset));
+        assert_eq!(connect_miss(&reset), Some(AttachMiss::PeerClosed));
+        let reset = reset.context("connect to memory service for maintenance");
+        assert!(is_peer_closed(&reset));
+        assert!(!is_transport_unavailable(&reset));
+        assert_eq!(connect_miss(&reset), Some(AttachMiss::PeerClosed));
+        let refused = anyhow::Error::new(io::Error::from(io::ErrorKind::ConnectionRefused));
+        assert_eq!(
+            connect_miss(&refused),
+            Some(AttachMiss::TransportUnavailable)
+        );
+        let denied = anyhow::Error::new(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!(connect_miss(&denied), None);
+        assert_eq!(
+            connect_miss(&anyhow::anyhow!("memory service connect deadline exceeded")),
+            None
+        );
+    }
+
+    // A live owner that keeps closing connections while it holds its lock
+    // looks, at each reset, like a retiring one. The lock decides: it is never
+    // released, so maintenance fails at its existing deadline and names the
+    // requests that owner closed unanswered.
+    #[tokio::test]
+    async fn maintenance_names_a_live_owner_that_keeps_closing_connections() -> Result<()> {
+        // Held for the whole test: it holds a real owner flock and never
+        // spawns; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        let root = crate::test_support::tempdir()?;
+        let (project, scope, data, mut options) = owner_fixture(root.path())?;
+        options.config.startup_timeout_secs = 1;
+        let owner = ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?
+            .context("fixture did not acquire service owner lock")?;
+        let (mut listener, address) = ServiceListener::bind(&data, &scope)?;
+        let mut endpoint_authority = authority();
+        endpoint_authority.project_path = project_path_bytes(&project);
+        endpoint_authority.project_scope = scope.clone();
+        let endpoint = EndpointRecord {
+            authority: endpoint_authority,
+            address,
+        };
+        endpoint.publish(&data, &owner)?;
+
+        let trace = MaintenanceTrace::default();
+        let closing = async {
+            loop {
+                if let Err(error) = listener.accept(HANDSHAKE_TIMEOUT).await {
+                    return error;
+                }
+            }
+        };
+        let error = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                acquired = acquire_maintenance_permit_traced(&options, &trace) => {
+                    acquired.map(drop).err().context("maintenance acquired a live owner's lock")
+                }
+                error = closing => Err(error).context("the closing owner stopped accepting"),
+            }
+        })
+        .await
+        .context("maintenance did not respect its owner deadline")??;
+        let step = *trace
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let message = format!("{error:#}");
+        // The deadline falls either between requests or inside one.
+        ensure!(
+            message.contains("memory service owner is still active")
+                || message.contains("memory maintenance owner-response deadline exceeded"),
+            "maintenance did not report the live owner at its deadline: {message}"
+        );
+        ensure!(
+            step.peer_closed > 0 && step.unanswered == 0,
+            "the closed requests were not counted as peer-closed: {message}"
+        );
+        ensure!(
+            message.contains(&format!(
+                "requests the owner closed unanswered={}",
+                step.peer_closed
+            )),
+            "the deadline error did not name the closed requests: {message}"
+        );
+
+        drop(listener);
+        endpoint.retire(&data, &owner)?;
+        Ok(())
+    }
+
+    // Signature 2 (CI job 110146577721): a maintenance connect that lands
+    // after the retiring owner stopped accepting but before it dropped its
+    // listener. Linux resets that queued connect; Darwin completes it and the
+    // handshake meets the closed peer. Both are "no owner yet", and the owner
+    // lock then orders maintenance after the reap.
+    #[tokio::test]
+    async fn maintenance_connect_queued_before_the_listener_dropped_waits_for_the_owner_lock()
+    -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let generation = owner.authority().service_generation.clone();
+            let pause = ClosePause::at_each(&[
+                ClosePoint::BeforeListenerDrop,
+                ClosePoint::AfterListenerDrop,
+                ClosePoint::AfterReap,
+            ]);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &scope, None).await?);
+            pause.entered.notified().await;
+
+            // Only Unix polls it before the listener drop.
+            #[cfg_attr(not(unix), allow(unused_mut))]
+            let mut requested = Box::pin(request_idle_retirement(&options));
+            // On Unix one poll queues the connect on the listener that no
+            // longer accepts and parks on its write readiness.
+            #[cfg(unix)]
+            ensure!(
+                futures::poll!(requested.as_mut()).is_pending(),
+                "the maintenance connect was not queued on the stopped listener"
+            );
+            pause.release.notify_one();
+            pause.entered.notified().await;
+            // The state a live owner that resets connections would also show.
+            let record = EndpointRecord::read(&data, &scope)?
+                .context("the record was retired before the listener closed")?;
+            ensure!(
+                record.authority.service_generation == generation,
+                "the published record named another generation"
+            );
+            ensure!(
+                !owner_lock_free(&options)?,
+                "the owner lock was released with the listener"
+            );
+            let reply = requested
+                .await
+                .context("maintenance failed on a connect queued on a retiring owner")?;
+            #[cfg(unix)]
+            ensure!(
+                reply == RetirementReply::PeerClosed,
+                "a connect queued on a retiring owner was not peer-closed: {reply:?}"
+            );
+            ensure!(
+                matches!(
+                    reply,
+                    RetirementReply::PeerClosed | RetirementReply::NoEndpoint
+                ),
+                "a retiring owner answered maintenance: {reply:?}"
+            );
+
+            let mut permit = Box::pin(acquire_maintenance_permit(&options));
+            ensure!(
+                futures::poll!(permit.as_mut()).is_pending(),
+                "maintenance acquired while the retiring owner held its lock"
+            );
+            pause.release.notify_one();
+            tokio::select! {
+                biased;
+                () = pause.entered.notified() => {}
+                acquired = permit.as_mut() => {
+                    let outcome = acquired.map(drop);
+                    bail!("maintenance finished before the owner reaped: {outcome:?}");
+                }
+            }
+            ensure!(
+                futures::poll!(permit.as_mut()).is_pending(),
+                "maintenance acquired while the reaped owner still held its lock"
+            );
+            pause.release.notify_one();
+            let permit = permit
+                .await
+                .context("maintenance failed after the owner released its lock")?;
+            served.await??;
+            drop(permit);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("queued maintenance connect fixture exceeded its {deadline:?} deadline")
+        })??;
+        Ok(())
+    }
+
+    // Signature 2, client half: an electing client's connect queued on the
+    // stopped listener is a peer-closed miss, and that client then elects a
+    // successor once the owner lock is released.
+    #[tokio::test]
+    async fn a_client_connect_queued_before_the_listener_dropped_is_a_peer_closed_miss()
+    -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh in-process owner and the spawned
+        // successor the racing client elects.
+        let deadline = crate::test_support::fixture_deadline(1, 1);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let executable = crate::store::test_supervisor()?;
+            let _gate = crate::spawn_gate::spawning().await;
+
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let generation = owner.authority().service_generation.clone();
+            let pause = ClosePause::at_each(&[
+                ClosePoint::BeforeListenerDrop,
+                ClosePoint::AfterListenerDrop,
+                ClosePoint::AfterReap,
+            ]);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &scope, None).await?);
+            pause.entered.notified().await;
+
+            // Only Unix polls it before the listener drop.
+            #[cfg_attr(not(unix), allow(unused_mut))]
+            let mut attaching = Box::pin(try_attach_observed(&data, &scope, &project, None));
+            #[cfg(unix)]
+            ensure!(
+                futures::poll!(attaching.as_mut()).is_pending(),
+                "the client connect was not queued on the stopped listener"
+            );
+            pause.release.notify_one();
+            pause.entered.notified().await;
+            ensure!(
+                !owner_lock_free(&options)?,
+                "the owner lock was released with the listener"
+            );
+            let observed = attaching
+                .await
+                .context("an electing client failed on a connect queued on a retiring owner")?;
+            #[cfg(unix)]
+            ensure!(
+                matches!(observed, Err(AttachMiss::PeerClosed)),
+                "a connect queued on a retiring owner was not a peer-closed miss: {:?}",
+                observed.as_ref().map(|_| ())
+            );
+            ensure!(
+                matches!(
+                    observed,
+                    Err(AttachMiss::PeerClosed | AttachMiss::TransportUnavailable)
+                ),
+                "a client attached to a retiring owner: {:?}",
+                observed.as_ref().map(|_| ())
+            );
+
+            let mut racing = Box::pin(attach_or_start(&options, &project, &executable));
+            #[cfg(unix)]
+            {
+                ensure!(
+                    futures::poll!(racing.as_mut()).is_pending(),
+                    "a client attached while the listener was closed"
+                );
+                ensure!(
+                    ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?.is_none(),
+                    "the racing client did not hold the start election"
+                );
+            }
+            pause.release.notify_one();
+            tokio::select! {
+                biased;
+                () = pause.entered.notified() => {}
+                attached = racing.as_mut() => {
+                    let outcome = attached.map(|_| ());
+                    bail!("the racing client finished before the owner reaped: {outcome:?}");
+                }
+            }
+            ensure!(
+                futures::poll!(racing.as_mut()).is_pending(),
+                "a client finished while the owner lock was still held"
+            );
+            pause.release.notify_one();
+            let successor = racing
+                .await
+                .context("the racing client failed after the owner released its lock")?;
+            ensure!(
+                successor.generation() != generation,
+                "the racing client reached the retiring generation"
+            );
+            served.await??;
+            drop(successor);
+            await_owner_release(&options).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("queued client connect fixture exceeded its {deadline:?} deadline")
         })??;
         Ok(())
     }
@@ -7354,6 +7705,144 @@ mod tests {
         })
         .await
         .with_context(|| format!("shutdown order fixture exceeded its {deadline:?} deadline"))??;
+        Ok(())
+    }
+
+    // T7i: a read-only inspection that arrives while the last client's owner
+    // retires, as a fixture or CLI inspection does right after a command
+    // exits. The service record is already gone but the store's own Dolt
+    // endpoint stays published until the reap, so only the owner lock tells
+    // that generation is still closing.
+    #[tokio::test]
+    async fn managed_inspection_meeting_a_retiring_owner_waits_for_its_reap_and_reads_its_own_generation()
+    -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner, and the inspection's local
+        // reopen after that owner released its lock. The borrowing open
+        // starts no Dolt.
+        let deadline = crate::test_support::fixture_deadline(1, 1);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let mut inspection = options.clone();
+            inspection.read_only = true;
+            let dolt_endpoint =
+                crate::store::project_directory(&data, &scope)?.join("endpoint.json");
+            let gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let pause =
+                ClosePause::at_each(&[ClosePoint::AfterEndpointRetire, ClosePoint::AfterReap]);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &scope, None).await?);
+            pause.entered.notified().await;
+
+            ensure!(
+                EndpointRecord::read(&data, &scope)?.is_none(),
+                "the service endpoint outlived its retirement step"
+            );
+            ensure!(
+                !owner_lock_free(&options)?,
+                "the owner lock was released before the reap"
+            );
+            ensure!(
+                !lifecycle_lease_free(&options)?,
+                "the lifecycle lease was released before the store closed"
+            );
+            ensure!(
+                dolt_endpoint.exists(),
+                "the store's Dolt endpoint was retired before the reap"
+            );
+
+            let mut managed = Box::pin(
+                crate::MemoryStore::open_managed_observed(
+                    inspection.clone(),
+                    project.clone(),
+                    crate::store::test_supervisor()?,
+                )
+                .1,
+            );
+            // Control, driven alongside the managed inspection: the direct
+            // open consults no service authority, so it borrows the retiring
+            // generation's still-published Dolt and reads through it. The
+            // managed inspection, polled first, must still be waiting after
+            // that complete borrowing open and read.
+            let control = async {
+                let borrowed = crate::MemoryStore::open(inspection.clone())
+                    .await
+                    .context("the direct read-only open did not borrow the retiring Dolt")?;
+                let revision = borrowed.revision().await;
+                Ok::<_, anyhow::Error>((borrowed, revision))
+            };
+            let (borrowed, revision) = tokio::select! {
+                biased;
+                opened = managed.as_mut() => {
+                    let outcome = opened.map(|_| ());
+                    bail!("the managed inspection opened while the retiring owner held its lock: {outcome:?}");
+                }
+                control = control => control?,
+            };
+            let revision = revision.context("the borrowed view did not read the retiring Dolt")?;
+            pause.release.notify_one();
+            tokio::select! {
+                biased;
+                () = pause.entered.notified() => {}
+                opened = managed.as_mut() => {
+                    let outcome = opened.map(|_| ());
+                    bail!("the managed inspection opened before the owner reaped: {outcome:?}");
+                }
+            }
+            ensure!(
+                lifecycle_lease_free(&options)?,
+                "the reap did not release the lifecycle lease"
+            );
+            ensure!(
+                !dolt_endpoint.exists(),
+                "the reap left the store's Dolt endpoint published"
+            );
+            ensure!(
+                !owner_lock_free(&options)?,
+                "the owner lock was released before the owner finished closing"
+            );
+            ensure!(
+                futures::poll!(managed.as_mut()).is_pending(),
+                "a managed inspection opened while the reaped owner still held its lock"
+            );
+            // No Dolt runs now: the borrowed view outlived the generation it
+            // read, while the managed inspection has not started its own.
+            ensure!(
+                borrowed.revision().await.is_err(),
+                "a borrowed read-only view still read after its generation was reaped"
+            );
+            let _ = borrowed.close().await;
+
+            // The owner lock release and the inspection's reacquisition of the
+            // store's locks run with every other in-binary spawn excluded.
+            let (memory, _gate) = crate::spawn_gate::excluding_spawns(gate, async {
+                pause.release.notify_one();
+                served.await??;
+                managed.await
+            })
+            .await
+            .context("the managed inspection failed after the owner released its lock")?;
+            ensure!(
+                format!("{memory:?}").contains(r#"backend: "local""#),
+                "the inspection attached instead of opening its own generation: {memory:?}"
+            );
+            let read = memory.revision().await;
+            let closed = memory.close().await;
+            ensure!(
+                read? == revision,
+                "the inspection read another revision than the retired generation committed"
+            );
+            closed?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("retiring-owner inspection fixture exceeded its {deadline:?} deadline")
+        })??;
         Ok(())
     }
 
