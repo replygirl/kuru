@@ -453,6 +453,206 @@ fn success(command: &mut Command, step: &str) {
     );
 }
 
+// The source-entrypoint probe traces itself so a timeout names the statement
+// stock PowerShell was resolving or executing. Every trace write is pure .NET
+// inside `try {} catch {}`: a mark or handler performs no command lookup of its
+// own (which could load modules) and a failed write cannot change the outcome.
+// `AppendAllText` opens, appends and closes per line, so completed lines
+// survive the timeout arm's Job termination.
+const PROBE_TRACE_LINE: &str = r#"try { $kuruTraceProcess = [Diagnostics.Process]::GetCurrentProcess(); [IO.File]::AppendAllText($env:KURU_PROBE_TRACE, ('{0} @EVENT@ {1} since_start_ms={2} cpu_ms={3}' -f [DateTime]::UtcNow.ToString('o'), @NAME@, [long]([DateTime]::Now - $kuruTraceProcess.StartTime).TotalMilliseconds, [long]$kuruTraceProcess.TotalProcessorTime.TotalMilliseconds) + "`n") } catch {}"#;
+const PROBE_TRACE_READ_LIMIT: u64 = 64 * 1024;
+const PROBE_TRACE_TAIL_LINES: usize = 40;
+
+fn probe_trace_line(event: &str, name: &str) -> String {
+    PROBE_TRACE_LINE
+        .replace("@EVENT@", event)
+        .replace("@NAME@", name)
+}
+
+// Prefix the engine's lookup hooks, then turn each `# trace: <label>` line
+// into an inline mark. Shared by the real probe and the parked scratch probe
+// so the deterministic test exercises the exact collection path.
+fn traced_probe(script: &str) -> String {
+    let mut traced = String::new();
+    for (property, event) in [
+        ("PreCommandLookupAction", "pre-lookup"),
+        ("PostCommandLookupAction", "post-lookup"),
+    ] {
+        traced.push_str(&format!(
+            "$ExecutionContext.InvokeCommand.{property} = {{ {} }}\n",
+            probe_trace_line(event, "$args[1].CommandName")
+        ));
+    }
+    for line in script.lines() {
+        let trimmed = line.trim_start();
+        match trimmed.strip_prefix("# trace: ") {
+            Some(label) => {
+                traced.push_str(&line[..line.len() - trimmed.len()]);
+                traced.push_str(&probe_trace_line("mark", &powershell_literal(label)));
+            }
+            None => traced.push_str(line),
+        }
+        traced.push('\n');
+    }
+    traced
+}
+
+// One-line reading of the last complete trace line, for the lead's question:
+// was the probe parked resolving a command (module discovery) or running one?
+fn probe_trace_classification(trace: &str) -> String {
+    let complete = trace.rsplit_once('\n').map_or("", |(complete, _)| complete);
+    let Some(last) = complete.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return "no complete trace line: stock PowerShell did not reach the probe's first statement"
+            .to_owned();
+    };
+    let mut fields = last.splitn(3, ' ');
+    let (_, event, rest) = (fields.next(), fields.next(), fields.next().unwrap_or(""));
+    let name = rest
+        .rsplit_once(" since_start_ms=")
+        .map_or(rest, |(name, _)| name);
+    match event {
+        Some("pre-lookup") => format!(
+            "parked in the command lookup of `{name}` (pre-lookup without post-lookup: resolution or module discovery)"
+        ),
+        Some("post-lookup") => format!("executing `{name}` after its lookup completed"),
+        Some("mark") => format!("past mark `{name}` with no later command lookup"),
+        _ => format!("unrecognized last trace line `{last}`"),
+    }
+}
+
+// Read at most the final 64 KiB (the newest lines matter) after the timeout arm
+// has terminated and reaped the probe, and quote the classified tail.
+fn probe_trace(path: &Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let read = || -> std::io::Result<(u64, Vec<u8>)> {
+        let mut file = File::open(path)?;
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(
+            length.saturating_sub(PROBE_TRACE_READ_LIMIT),
+        ))?;
+        let mut bytes = Vec::new();
+        file.take(PROBE_TRACE_READ_LIMIT).read_to_end(&mut bytes)?;
+        Ok((length, bytes))
+    };
+    match read() {
+        Ok((length, bytes)) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let lines: Vec<_> = text.lines().collect();
+            let tail = &lines[lines.len().saturating_sub(PROBE_TRACE_TAIL_LINES)..];
+            format!(
+                "probe trace {} ({length} bytes, last {} lines): {}\n{}",
+                path.display(),
+                tail.len(),
+                probe_trace_classification(&text),
+                tail.join("\n")
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => format!(
+            "probe trace {}: <no trace file>: {}",
+            path.display(),
+            probe_trace_classification("")
+        ),
+        Err(error) => format!("probe trace {}: unreadable: {error}", path.display()),
+    }
+}
+
+fn trace_failure(step: &str, error: &std::io::Error, trace: &Path) -> String {
+    format!("{step}: {error}\n{}", probe_trace(trace))
+}
+
+// `launch` with the probe's own trace appended after the native timeout
+// diagnostics. A successful launch reads and prints nothing.
+fn launch_traced(command: &mut Command, step: &str, trace: &Path) -> std::process::Output {
+    command
+        .output()
+        .unwrap_or_else(|error| panic!("{}", trace_failure(step, &error, trace)))
+}
+
+fn stock_powershell() -> std::path::PathBuf {
+    kuru_platform::windows::process::system_directory()
+        .unwrap()
+        .join("WindowsPowerShell/v1.0/powershell.exe")
+}
+
+#[test]
+fn probe_trace_classification_distinguishes_lookup_execution_and_marks() {
+    let line = |event: &str, name: &str| {
+        format!("2026-10-01T00:00:00.0000000Z {event} {name} since_start_ms=1 cpu_ms=2\n")
+    };
+    let pre = line("pre-lookup", "Split-Path");
+    assert_eq!(
+        probe_trace_classification(&pre),
+        "parked in the command lookup of `Split-Path` (pre-lookup without post-lookup: resolution or module discovery)"
+    );
+    let spaced = pre.clone() + &line("post-lookup", "C:\\checkout & spaced\\install.ps1");
+    assert_eq!(
+        probe_trace_classification(&spaced),
+        "executing `C:\\checkout & spaced\\install.ps1` after its lookup completed"
+    );
+    let partial = line("mark", "before-entrypoint") + "2026-10-01T00:00:01Z pre-lo";
+    assert_eq!(
+        probe_trace_classification(&partial),
+        "past mark `before-entrypoint` with no later command lookup"
+    );
+    assert!(probe_trace_classification("").starts_with("no complete trace line"));
+}
+
+// A scratch probe with the identical trace prelude parks in a script function
+// reading an anonymous pipe whose writer it holds itself. The function body is
+// pure .NET, so the park involves no module discovery. The 30 s bound exists
+// only for this test; the shared warm-up keeps machine-wide engine start out
+// of it, and a startup overrun reports `<no trace file>` rather than a name.
+#[tokio::test]
+async fn probe_trace_names_the_statement_a_parked_probe_is_executing() {
+    ensure_powershell_warm();
+    let root = tempfile::tempdir().unwrap();
+    let probe = root.path().join("parked-probe.ps1");
+    let trace = root.path().join("probe-trace.log");
+    fs::write(
+        &probe,
+        traced_probe(
+            r#"$ErrorActionPreference = 'Stop'
+# trace: probe-entered
+function Read-ProbePipeWithoutWriter {
+    $server = [IO.Pipes.AnonymousPipeServerStream]::new([IO.Pipes.PipeDirection]::In)
+    $null = $server.ReadByte()
+}
+Read-ProbePipeWithoutWriter
+"#,
+        ),
+    )
+    .unwrap();
+    let mut child = kuru_delivery::command::Command::new(stock_powershell());
+    child
+        .env_clear()
+        .current_dir(root.path())
+        .envs(fixture_environment(root.path()))
+        .env("KURU_PROBE_TRACE", &trace)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&probe);
+    let error = kuru_delivery::command::output(&mut child, std::time::Duration::from_secs(30))
+        .await
+        .expect_err("the parked probe must reach its bound");
+    let message = trace_failure("step: parked probe", &error, &trace);
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{message}");
+    assert!(
+        message.contains("executing `Read-ProbePipeWithoutWriter` after its lookup completed"),
+        "{message}"
+    );
+    assert!(message.contains(" mark probe-entered "), "{message}");
+    assert!(
+        message.contains(" pre-lookup Read-ProbePipeWithoutWriter "),
+        "{message}"
+    );
+}
+
 #[test]
 #[should_panic(expected = "step: launch of a missing fixture executable: ")]
 fn fixture_output_failure_names_its_step() {
@@ -896,7 +1096,9 @@ fn source_entrypoint_fixture(root: &Path) -> Command {
     let probe = root.join("source-entrypoint-probe.ps1");
     fs::write(
         &probe,
-        r#"$ErrorActionPreference = 'Stop'
+        traced_probe(
+            r#"$ErrorActionPreference = 'Stop'
+# trace: probe-entered
 function Snapshot {
     return @{
         no_hooks = [Environment]::GetEnvironmentVariable('MISE_NO_HOOKS', 'Process')
@@ -908,6 +1110,7 @@ function Snapshot {
 $before = Snapshot
 $failure = $null
 try {
+    # trace: before-entrypoint
     if ($env:KURU_ENTRYPOINT_INVALID) {
         & $env:KURU_ENTRYPOINT_SCRIPT -Source -Version '0.2.0' -InstallDir $env:KURU_ENTRYPOINT_INSTALL
     } else {
@@ -915,23 +1118,30 @@ try {
     }
 } catch {
     $failure = $_.Exception.Message
+    # trace: catch-entered
 } finally {
+    # trace: finally-entered
     $report = @{ before = $before; after = (Snapshot); failure = $failure }
     [IO.File]::WriteAllText($env:KURU_ENTRYPOINT_REPORT, ($report | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+    # trace: report-written
 }
-if ($null -ne $failure) { Write-Output $failure; exit 1 }
+if ($null -ne $failure) {
+    Write-Output $failure
+    # trace: before-exit
+    exit 1
+}
+# trace: probe-completed
 "#,
+        ),
     )
     .unwrap();
-    let powershell = kuru_platform::windows::process::system_directory()
-        .unwrap()
-        .join("WindowsPowerShell/v1.0/powershell.exe");
-    let mut child = command(root, &powershell);
+    let mut child = command(root, &stock_powershell());
     child
         .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
         .env("KURU_ENTRYPOINT_SCRIPT", &entrypoint)
         .env("KURU_ENTRYPOINT_INSTALL", ".\\installed & 日本語")
         .env("KURU_ENTRYPOINT_REPORT", root.join("restoration.json"))
+        .env("KURU_PROBE_TRACE", root.join("probe-trace.log"))
         .env("KURU_CLI_FIXTURE_SETUP_LOG", root.join("setup.jsonl"))
         .env("KURU_CLI_FIXTURE_SETUP_EXIT", "0")
         .args([
@@ -965,14 +1175,17 @@ fn source_install_entrypoint_scopes_first_mise_and_restores_environment_on_succe
             } else {
                 serde_json::json!({"no_hooks": null, "auto_install": null, "mbx": null, "install_dir": null})
             };
-            let output = launch(
+            let trace = root.path().join("probe-trace.log");
+            let output = launch_traced(
                 &mut child,
                 &format!("step: source-install entrypoint opposing={opposing} status={status}"),
+                &trace,
             );
             let diagnostic = format!(
-                "opposing={opposing}, status={status}: {}\n{}",
+                "opposing={opposing}, status={status}: {}\n{}\n{}",
                 String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr),
+                probe_trace(&trace)
             );
             assert_eq!(output.status.success(), status == 0, "{diagnostic}");
             let calls: Vec<serde_json::Value> = fs::read_to_string(root.path().join("setup.jsonl"))
@@ -1031,9 +1244,10 @@ fn source_install_entrypoint_rejects_release_options_before_mise_or_environment_
         .env("MISE_TASK_RUN_AUTO_INSTALL", "true")
         .env("KURU_MBX", "1")
         .env("KURU_INSTALL_DIR", "caller relative destination");
-    let output = launch(
+    let output = launch_traced(
         &mut child,
         "step: source-install entrypoint rejecting release options",
+        &root.path().join("probe-trace.log"),
     );
     assert!(!output.status.success());
     assert!(!root.path().join("setup.jsonl").exists());
