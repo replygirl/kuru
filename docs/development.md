@@ -1408,8 +1408,8 @@ MISE_OS=windows MISE_ARCH=aarch64 mise -C packages/kuru-delivery lock github:jdx
 Review the resulting `provenance_verified` metadata alongside URLs and checksums.
 This also keeps CI installation from creating uncommitted verification metadata.
 Run these lock refreshes with the CI-pinned mise version (2026.9.18) without
-`--upgrade`: lockfile revisions 2 and 3 are unreadable by mise below 2026.9.7
-and 2026.9.16, including the root `min_version` hard floor. mise 2026.9.18 keeps
+`--upgrade`: per the 2026.9.7 and 2026.9.16 release notes, lockfile revisions 2
+and 3 are unreadable by older mise, including the root `min_version` hard floor. mise 2026.9.18 keeps
 existing `provenance_verified` lines but did not add one to a cospec entry
 from which they were removed, where 2026.9.4 did. CI installs with
 `MISE_LOCKED=1` and never rewrites the lock, and `check:repo` reads no
