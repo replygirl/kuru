@@ -20,6 +20,17 @@ const SESSION_PREFIX: &str = "kuru.usage.v1/session/";
 const SESSION_INDEX_PREFIX: &str = "kuru.usage.v1/session-index/";
 const OWNED_PREFIX: &str = "kuru.usage.v1/";
 const PAGE_SIZE: i64 = 128;
+// Key-range paging. `state.key` is VARBINARY, so these compare and order by
+// bytes; Dolt derives a primary-key range from them only while the column
+// stays unwrapped (no `BINARY(...)`, which also forced a sort of every row).
+// The first page and later pages are separate strings so that no bind-time
+// `OR` decides whether the range survives planning.
+const RANGE_FIRST_PAGE: &str =
+    "SELECT `key`, value FROM state WHERE `key` >= ? AND `key` < ? ORDER BY `key` LIMIT ?";
+const RANGE_NEXT_PAGE: &str =
+    "SELECT `key`, value FROM state WHERE `key` > ? AND `key` < ? ORDER BY `key` LIMIT ?";
+const RANGE_ANY_FOR_UPDATE: &str =
+    "SELECT 1 FROM state WHERE `key` >= ? AND `key` < ? LIMIT 1 FOR UPDATE";
 
 #[derive(Clone, Debug)]
 pub struct UsageLedger {
@@ -195,10 +206,11 @@ impl UsageLedger {
         self.store.readable()?;
         let marker = read_marker(self.store.pool.as_ref(), session_id).await?;
         let mut fold = SessionFold::new(session_id, marker);
-        let mut after = None;
+        let indexed = KeyRange::prefix(&session_index_prefix(session_id))?;
+        let mut after: Option<Vec<u8>> = None;
         loop {
             let page =
-                session_index_page(self.store.pool.as_ref(), session_id, after.as_deref()).await?;
+                session_index_page(self.store.pool.as_ref(), &indexed, after.as_deref()).await?;
             if page.is_empty() {
                 break;
             }
@@ -223,11 +235,7 @@ impl UsageLedger {
                 );
                 fold.add(&record)?;
             }
-            after = page
-                .last()
-                .map(|(key, _)| String::from_utf8(key.clone()))
-                .transpose()
-                .context("usage session index key is not UTF-8")?;
+            after = page.last().map(|(key, _)| key.clone());
         }
         fold.finish()
     }
@@ -429,10 +437,11 @@ async fn validate_branch(pool: &MySqlPool) -> Result<u64> {
     }
     // Current usage receipts intentionally survive later ledger writes;
     // there is no one-row limit on an upgraded writable branch.
-    let mut after = None;
+    let owned = KeyRange::prefix(OWNED_PREFIX)?;
+    let mut after: Option<Vec<u8>> = None;
     let mut decoded = 0_u64;
     loop {
-        let rows = owned_state_page(pool, after.as_deref()).await?;
+        let rows = owned_state_page(pool, &owned, after.as_deref()).await?;
         if rows.is_empty() {
             break;
         }
@@ -471,11 +480,7 @@ async fn validate_branch(pool: &MySqlPool) -> Result<u64> {
                 bail!("usage ledger owns an unrecognized state key");
             }
         }
-        after = rows
-            .last()
-            .map(|(key, _)| String::from_utf8(key.clone()))
-            .transpose()
-            .context("usage ledger key is not UTF-8")?;
+        after = rows.last().map(|(key, _)| key.clone());
     }
     Ok(decoded)
 }
@@ -754,15 +759,14 @@ async fn session_has_records_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
     session_id: &str,
 ) -> Result<bool> {
-    let prefix = session_index_prefix(session_id);
-    Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM state WHERE LEFT(BINARY `key`, ?) = BINARY ? LIMIT 1 FOR UPDATE",
-    )
-    .bind(prefix.len() as i64)
-    .bind(prefix.as_bytes())
-    .fetch_one(&mut **transaction)
-    .await?
-        > 0)
+    let index = KeyRange::prefix(&session_index_prefix(session_id))?;
+    let (sql, [low, high]) = index.any_for_update();
+    Ok(sqlx::query(sql)
+        .bind(low)
+        .bind(high)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some())
 }
 
 async fn read_state(pool: &MySqlPool, key: &str) -> Result<Option<String>> {
@@ -777,41 +781,87 @@ async fn read_state(pool: &MySqlPool, key: &str) -> Result<Option<String>> {
     .map_err(Into::into)
 }
 
-async fn session_index_page(
-    pool: &MySqlPool,
-    session_id: &str,
-    after: Option<&str>,
-) -> Result<Vec<(Vec<u8>, String)>> {
-    let prefix = session_index_prefix(session_id);
-    tokio::time::timeout(
-        QUERY_TIMEOUT,
-        sqlx::query_as("SELECT `key`, value FROM state WHERE LEFT(BINARY `key`, ?) = BINARY ? AND (? IS NULL OR BINARY `key` > BINARY ?) ORDER BY BINARY `key` LIMIT ?")
-            .bind(prefix.len() as i64)
-            .bind(prefix.as_bytes())
-            .bind(after)
-            .bind(after)
-            .bind(PAGE_SIZE)
-            .fetch_all(pool),
-    )
-    .await
-    .context("usage ledger session index deadline exceeded")?
-    .map_err(Into::into)
+/// The half-open byte range `[start, end)` that holds exactly the keys
+/// beginning with one prefix.
+struct KeyRange {
+    start: Vec<u8>,
+    end: Vec<u8>,
 }
 
-async fn owned_state_page(pool: &MySqlPool, after: Option<&str>) -> Result<Vec<(Vec<u8>, String)>> {
-    tokio::time::timeout(
-        QUERY_TIMEOUT,
-        sqlx::query_as("SELECT `key`, value FROM state WHERE LEFT(BINARY `key`, ?) = BINARY ? AND (? IS NULL OR BINARY `key` > BINARY ?) ORDER BY BINARY `key` LIMIT ?")
-            .bind(OWNED_PREFIX.len() as i64)
-            .bind(OWNED_PREFIX.as_bytes())
-            .bind(after)
-            .bind(after)
-            .bind(PAGE_SIZE)
-            .fetch_all(pool),
-    )
-    .await
-    .context("usage ledger state validation deadline exceeded")?
-    .map_err(Into::into)
+impl KeyRange {
+    fn prefix(prefix: &str) -> Result<Self> {
+        let start = prefix.as_bytes().to_vec();
+        let end =
+            prefix_upper_bound(&start).context("usage ledger key prefix has no upper bound")?;
+        Ok(Self { start, end })
+    }
+
+    /// One page's exact SQL and its two byte arguments, in placeholder order;
+    /// `PAGE_SIZE` binds last.
+    fn page<'a>(&'a self, after: Option<&'a [u8]>) -> (&'static str, [&'a [u8]; 2]) {
+        match after {
+            None => (
+                RANGE_FIRST_PAGE,
+                [self.start.as_slice(), self.end.as_slice()],
+            ),
+            Some(after) => (RANGE_NEXT_PAGE, [after, self.end.as_slice()]),
+        }
+    }
+
+    /// The exact SQL and byte arguments that lock-read whether any key lies
+    /// in the range, without counting the rows.
+    fn any_for_update(&self) -> (&'static str, [&[u8]; 2]) {
+        (
+            RANGE_ANY_FOR_UPDATE,
+            [self.start.as_slice(), self.end.as_slice()],
+        )
+    }
+}
+
+/// The least byte string above every string that begins with `prefix`: the
+/// prefix up to its last byte below 0xFF, with that byte incremented. None
+/// when no byte can be incremented (empty or all 0xFF).
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last = prefix.iter().rposition(|byte| *byte != u8::MAX)?;
+    let mut end = prefix[..=last].to_vec();
+    end[last] += 1;
+    Some(end)
+}
+
+async fn range_page(
+    pool: &MySqlPool,
+    range: &KeyRange,
+    after: Option<&[u8]>,
+) -> sqlx::Result<Vec<(Vec<u8>, String)>> {
+    let (sql, [low, high]) = range.page(after);
+    sqlx::query_as(sql)
+        .bind(low)
+        .bind(high)
+        .bind(PAGE_SIZE)
+        .fetch_all(pool)
+        .await
+}
+
+async fn session_index_page(
+    pool: &MySqlPool,
+    index: &KeyRange,
+    after: Option<&[u8]>,
+) -> Result<Vec<(Vec<u8>, String)>> {
+    tokio::time::timeout(QUERY_TIMEOUT, range_page(pool, index, after))
+        .await
+        .context("usage ledger session index deadline exceeded")?
+        .map_err(Into::into)
+}
+
+async fn owned_state_page(
+    pool: &MySqlPool,
+    owned: &KeyRange,
+    after: Option<&[u8]>,
+) -> Result<Vec<(Vec<u8>, String)>> {
+    tokio::time::timeout(QUERY_TIMEOUT, range_page(pool, owned, after))
+        .await
+        .context("usage ledger state validation deadline exceeded")?
+        .map_err(Into::into)
 }
 
 fn record_key(invocation_id: &str) -> String {
@@ -2227,5 +2277,523 @@ mod tests {
         );
         assert_eq!(undecidable_record.usage.output_tokens, Some(20));
         Ok(())
+    }
+
+    // The paging queries before range paging, verbatim. Kept as the baseline
+    // the range queries must match key for key, and as the plan test's
+    // negative control.
+    const OLD_PAGE: &str = "SELECT `key`, value FROM state WHERE LEFT(BINARY `key`, ?) = BINARY ? AND (? IS NULL OR BINARY `key` > BINARY ?) ORDER BY BINARY `key` LIMIT ?";
+    const OLD_ANY_FOR_UPDATE: &str =
+        "SELECT COUNT(*) FROM state WHERE LEFT(BINARY `key`, ?) = BINARY ? LIMIT 1 FOR UPDATE";
+
+    #[test]
+    fn prefix_upper_bound_increments_the_last_byte_below_ff() -> Result<()> {
+        assert_eq!(
+            prefix_upper_bound(b"kuru.usage.v1/"),
+            Some(b"kuru.usage.v10".to_vec())
+        );
+        assert_eq!(prefix_upper_bound(b"a\xff"), Some(b"b".to_vec()));
+        assert_eq!(
+            prefix_upper_bound(b"a\xfe\xff\xff"),
+            Some(b"a\xff".to_vec())
+        );
+        assert_eq!(prefix_upper_bound(b"\x00"), Some(b"\x01".to_vec()));
+        assert_eq!(prefix_upper_bound(b"\xff\xff"), None);
+        assert_eq!(prefix_upper_bound(b""), None);
+        // Every prefix this module pages ends in `/`, whose bound is `0`.
+        for prefix in [
+            OWNED_PREFIX.to_owned(),
+            RECORD_PREFIX.to_owned(),
+            OBSERVATION_PREFIX.to_owned(),
+            SESSION_PREFIX.to_owned(),
+            SESSION_INDEX_PREFIX.to_owned(),
+            session_index_prefix("session"),
+        ] {
+            let range = KeyRange::prefix(&prefix)?;
+            let stem = prefix.strip_suffix('/').context("prefix without `/`")?;
+            ensure!(range.start == prefix.as_bytes() && range.end == format!("{stem}0").as_bytes());
+        }
+        let error = format!("{:#}", KeyRange::prefix("").err().context("empty prefix")?);
+        ensure!(error.contains("usage ledger key prefix has no upper bound"));
+        Ok(())
+    }
+
+    /// Walk `prefix` to exhaustion with the old query. Production bound the
+    /// cursor as UTF-8 text; `BINARY ?` casts the argument to the same bytes
+    /// either way, and binding bytes lets this walk pass non-UTF-8 keys.
+    async fn old_walk(pool: &MySqlPool, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let mut keys = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page: Vec<(Vec<u8>, String)> = sqlx::query_as(OLD_PAGE)
+                .bind(prefix.len() as i64)
+                .bind(prefix)
+                .bind(after.as_deref())
+                .bind(after.as_deref())
+                .bind(PAGE_SIZE)
+                .fetch_all(pool)
+                .await?;
+            let Some((last, _)) = page.last() else {
+                return Ok(keys);
+            };
+            after = Some(last.clone());
+            keys.extend(page.into_iter().map(|(key, _)| key));
+        }
+    }
+
+    /// Walk `range` to exhaustion through the production page function.
+    async fn range_walk(
+        pool: &MySqlPool,
+        range: &KeyRange,
+        session_index: bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut keys = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = if session_index {
+                session_index_page(pool, range, after.as_deref()).await?
+            } else {
+                owned_state_page(pool, range, after.as_deref()).await?
+            };
+            let Some((last, _)) = page.last() else {
+                return Ok(keys);
+            };
+            ensure!(page.len() as i64 <= PAGE_SIZE, "a page exceeded PAGE_SIZE");
+            after = Some(last.clone());
+            keys.extend(page.into_iter().map(|(key, _)| key));
+        }
+    }
+
+    async fn put_raw_keys(pool: &MySqlPool, keys: &[Vec<u8>]) -> Result<()> {
+        let mut transaction = pool.begin().await?;
+        for key in keys {
+            sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+                .bind(key.as_slice())
+                .bind("{}")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// The old and the range walk of `prefix` both equal the stored keys that
+    /// begin with it, in byte order.
+    async fn assert_same_walk(
+        pool: &MySqlPool,
+        stored: &std::collections::BTreeSet<Vec<u8>>,
+        prefix: &str,
+        session_index: bool,
+        expected_len: usize,
+    ) -> Result<()> {
+        let expected: Vec<Vec<u8>> = stored
+            .iter()
+            .filter(|key| key.starts_with(prefix.as_bytes()))
+            .cloned()
+            .collect();
+        ensure!(
+            expected.len() == expected_len,
+            "{prefix}: fixture holds {} keys, expected {expected_len}",
+            expected.len()
+        );
+        let old = old_walk(pool, prefix.as_bytes()).await?;
+        let new = range_walk(pool, &KeyRange::prefix(prefix)?, session_index).await?;
+        ensure!(
+            old == expected,
+            "{prefix}: the old walk differs from the stored keys"
+        );
+        ensure!(
+            new == old,
+            "{prefix}: the range walk differs from the old walk"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn range_paging_visits_exactly_the_old_key_sequence() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let ledger = store.usage_ledger()?;
+        let pool = ledger.store.pool.clone();
+        let mut stored: std::collections::BTreeSet<Vec<u8>> =
+            sqlx::query_scalar::<_, Vec<u8>>("SELECT `key` FROM state")
+                .fetch_all(pool.as_ref())
+                .await?
+                .into_iter()
+                .collect();
+        let owned_before = stored
+            .iter()
+            .filter(|key| key.starts_with(OWNED_PREFIX.as_bytes()))
+            .count();
+        let mut long = OWNED_PREFIX.as_bytes().to_vec();
+        long.resize(1024, b'z');
+        let inside: Vec<Vec<u8>> = vec![
+            b"kuru.usage.v1/".to_vec(),
+            b"kuru.usage.v1/\x00".to_vec(),
+            b"kuru.usage.v1/a\x00b".to_vec(),
+            b"kuru.usage.v1/\x7f".to_vec(),
+            b"kuru.usage.v1/\x80".to_vec(),
+            b"kuru.usage.v1/\xff".to_vec(),
+            b"kuru.usage.v1/\xff\xff\x00".to_vec(),
+            b"kuru.usage.v1/ ".to_vec(),
+            b"kuru.usage.v1/record/x".to_vec(),
+            b"kuru.usage.v1/record/x ".to_vec(),
+            b"kuru.usage.v1/RECORD/x".to_vec(),
+            long,
+        ];
+        // Keys that only resemble the prefix: proper prefixes of it, and keys
+        // that sort immediately before, at and after the range's edges.
+        let beside: Vec<Vec<u8>> = vec![
+            b"\x00".to_vec(),
+            b"kuru.usage.v1".to_vec(),
+            b"kuru.usage.v1\x00".to_vec(),
+            b"kuru.usage.v1.x".to_vec(),
+            b"kuru.usage.v1.\xff".to_vec(),
+            b"kuru.usage.v10".to_vec(),
+            b"kuru.usage.v10x".to_vec(),
+            b"kuru.usage.v0\xff\xff".to_vec(),
+            b"kuru.usage.v1\\x".to_vec(),
+            b"KURU.USAGE.V1/x".to_vec(),
+            b"\xff\xff".to_vec(),
+        ];
+        let mut fixture: Vec<Vec<u8>> = inside.into_iter().chain(beside).collect();
+        // Exactly one full page of owned keys, so the first page ends on the
+        // last key in range and the next page must come back empty.
+        let owned_now = |fixture: &[Vec<u8>]| {
+            owned_before
+                + fixture
+                    .iter()
+                    .filter(|key| key.starts_with(OWNED_PREFIX.as_bytes()))
+                    .count()
+        };
+        let mut filler = 0;
+        while owned_now(&fixture) < PAGE_SIZE as usize {
+            fixture.push(format!("{OWNED_PREFIX}filler/{filler:05}").into_bytes());
+            filler += 1;
+        }
+        put_raw_keys(pool.as_ref(), &fixture).await?;
+        stored.extend(fixture);
+        assert_same_walk(pool.as_ref(), &stored, OWNED_PREFIX, false, 128).await?;
+
+        // 129 owned keys: one past the first page.
+        let mut add_filler = |count: usize| -> Vec<Vec<u8>> {
+            let keys = (filler..filler + count)
+                .map(|filler| format!("{OWNED_PREFIX}filler/{filler:05}").into_bytes())
+                .collect();
+            filler += count;
+            keys
+        };
+        let one = add_filler(1);
+        put_raw_keys(pool.as_ref(), &one).await?;
+        stored.extend(one);
+        assert_same_walk(pool.as_ref(), &stored, OWNED_PREFIX, false, 129).await?;
+
+        // Exactly two full pages: the second page ends on the last key in
+        // range, and the third must come back empty.
+        let to_two_pages = add_filler(127);
+        put_raw_keys(pool.as_ref(), &to_two_pages).await?;
+        stored.extend(to_two_pages);
+        assert_same_walk(pool.as_ref(), &stored, OWNED_PREFIX, false, 256).await?;
+
+        // 257 owned keys: one past the second page.
+        let one_more = add_filler(1);
+        put_raw_keys(pool.as_ref(), &one_more).await?;
+        stored.extend(one_more);
+        assert_same_walk(pool.as_ref(), &stored, OWNED_PREFIX, false, 257).await?;
+
+        // A session index spanning three pages, with its own edge keys, and
+        // sessions whose only neighbours sit just outside their range.
+        let indexed = session_index_prefix("ordering-session");
+        let stem = indexed
+            .strip_suffix('/')
+            .context("index prefix without `/`")?;
+        let edge = session_index_prefix("edge-session");
+        let edge_stem = edge.strip_suffix('/').context("index prefix without `/`")?;
+        let bare = session_index_prefix("bare-session");
+        let mut index_keys: Vec<Vec<u8>> = (0..257)
+            .map(|n| format!("{indexed}{}", key_digest(&n.to_string())).into_bytes())
+            .collect();
+        index_keys.extend([
+            indexed.as_bytes().to_vec(),
+            [indexed.as_bytes(), b"\x00"].concat(),
+            [indexed.as_bytes(), b"\xff"].concat(),
+            stem.as_bytes().to_vec(),
+            format!("{stem}0").into_bytes(),
+            format!("{stem}0x").into_bytes(),
+            format!("{stem}.x").into_bytes(),
+            edge_stem.as_bytes().to_vec(),
+            format!("{edge_stem}0").into_bytes(),
+            [edge_stem.as_bytes(), b".\xff"].concat(),
+            bare.as_bytes().to_vec(),
+        ]);
+        put_raw_keys(pool.as_ref(), &index_keys).await?;
+        stored.extend(index_keys);
+        assert_same_walk(pool.as_ref(), &stored, &indexed, true, 260).await?;
+        let owned_total = stored
+            .iter()
+            .filter(|key| key.starts_with(OWNED_PREFIX.as_bytes()))
+            .count();
+        assert_same_walk(pool.as_ref(), &stored, OWNED_PREFIX, false, owned_total).await?;
+
+        // The existence probe agrees with the old COUNT(*) on each session.
+        let mut transaction = pool.begin().await?;
+        for (session, expected) in [
+            ("ordering-session", true),
+            ("bare-session", true),
+            ("edge-session", false),
+            ("empty-session", false),
+        ] {
+            let prefix = session_index_prefix(session);
+            let old: i64 = sqlx::query_scalar(OLD_ANY_FOR_UPDATE)
+                .bind(prefix.len() as i64)
+                .bind(prefix.as_bytes())
+                .fetch_one(&mut *transaction)
+                .await?;
+            let new = session_has_records_tx(&mut transaction, session).await?;
+            ensure!(
+                (old > 0) == expected && new == expected,
+                "{session}: old count {old}, new probe {new}, expected {expected}"
+            );
+        }
+        transaction.rollback().await?;
+
+        sqlx::query("CALL DOLT_RESET('--hard')")
+            .fetch_all(pool.as_ref())
+            .await?;
+        drop(pool);
+        drop(ledger);
+        store.close().await
+    }
+
+    #[tokio::test]
+    async fn session_pages_past_one_index_page_and_marks_refuse_recorded_sessions() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let ledger = store.usage_ledger()?;
+        let invocations = PAGE_SIZE as usize + 2;
+        for n in 0..invocations {
+            ledger
+                .admit(start("paged-session", &format!("invocation-{n}")))
+                .await?;
+        }
+        let usage = ledger.session("paged-session").await?;
+        ensure!(
+            usage.invocation_count == invocations as u64,
+            "session() folded {} of {invocations} invocations",
+            usage.invocation_count
+        );
+        // The only arm that reads the probe: no marker, yet index rows. A
+        // foreign commit plants an orphan index row for one session and,
+        // for another, keys just outside its index range on either side.
+        let orphan = session_index_key("orphan-session", "orphan-invocation");
+        let edge = session_index_prefix("edge-session");
+        let edge_stem = edge.strip_suffix('/').context("index prefix without `/`")?;
+        let pool = ledger.store.pool.clone();
+        for key in [
+            orphan.into_bytes(),
+            edge_stem.as_bytes().to_vec(),
+            format!("{edge_stem}0").into_bytes(),
+        ] {
+            sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+                .bind(key)
+                .bind("{}")
+                .execute(pool.as_ref())
+                .await?;
+        }
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'foreign usage write', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(pool.as_ref())
+            .await?;
+        drop(pool);
+        let refused = format!(
+            "{:#}",
+            ledger
+                .mark_new_session("orphan-session")
+                .await
+                .err()
+                .context("a session with index rows was marked new")?
+        );
+        ensure!(
+            refused.contains("usage session already has invocation records"),
+            "unexpected refusal: {refused}"
+        );
+        ledger.mark_new_session("edge-session").await?;
+        ensure!(ledger.session("edge-session").await?.historical_complete);
+        // Another session's records do not refuse a fresh mark.
+        ledger.mark_new_session("fresh-session").await?;
+        ensure!(ledger.session("fresh-session").await?.historical_complete);
+        drop(ledger);
+        store.close().await
+    }
+
+    enum PlanArg<'a> {
+        Bytes(&'a [u8]),
+        Text(Option<&'a str>),
+        Int(i64),
+    }
+
+    /// `EXPLAIN PLAN` for `sql` with `args` bound through sqlx as production
+    /// binds them. Dolt 2.3.5 prepares `EXPLAIN` with zero parameters and has
+    /// no `EXPLAIN` for an executed statement, so the bound values reach the
+    /// planner as session variables set by one bound `SET`, in place of each
+    /// `?`. A `LIMIT ?` takes its integer literally: Dolt refuses a variable
+    /// there.
+    async fn explain_bound(pool: &MySqlPool, sql: &str, args: &[PlanArg<'_>]) -> Result<String> {
+        ensure!(
+            sql.matches('?').count() == args.len(),
+            "argument count does not match {sql}"
+        );
+        let mut pieces = sql.split('?');
+        let mut explained = format!("EXPLAIN PLAN {}", pieces.next().unwrap_or_default());
+        let mut variables = Vec::new();
+        let mut bound = Vec::new();
+        for (n, (arg, piece)) in args.iter().zip(pieces).enumerate() {
+            match arg {
+                PlanArg::Int(value) if explained.ends_with("LIMIT ") => {
+                    explained.push_str(&value.to_string());
+                }
+                arg => {
+                    let variable = format!("@kuru_plan_{n}");
+                    explained.push_str(&variable);
+                    variables.push(format!("{variable} = ?"));
+                    bound.push(arg);
+                }
+            }
+            explained.push_str(piece);
+        }
+        let mut connection = pool.acquire().await?;
+        let set = format!("SET {}", variables.join(", "));
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(set));
+        for arg in bound {
+            query = match arg {
+                PlanArg::Bytes(value) => query.bind(*value),
+                PlanArg::Text(value) => query.bind(*value),
+                PlanArg::Int(value) => query.bind(*value),
+            };
+        }
+        query.execute(&mut *connection).await?;
+        let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(explained))
+            .fetch_all(&mut *connection)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|row| row.try_get::<String, _>(0))
+            .collect::<sqlx::Result<Vec<_>>>()?
+            .join("\n"))
+    }
+
+    /// The node names of an `EXPLAIN PLAN` tree, without the tree drawing.
+    fn plan_nodes(plan: &str) -> impl Iterator<Item = &str> {
+        plan.lines()
+            .map(|line| line.trim_start_matches(|c: char| c.is_whitespace() || "└├│─".contains(c)))
+    }
+
+    fn plan_bytes(bytes: &[u8]) -> String {
+        let bytes: Vec<String> = bytes.iter().map(u8::to_string).collect();
+        format!("[{}]", bytes.join(" "))
+    }
+
+    fn ensure_range_plan(
+        label: &str,
+        plan: &str,
+        low: &[u8],
+        low_inclusive: bool,
+        high: &[u8],
+    ) -> Result<()> {
+        let filter = format!(
+            "filters: [{{{}{}, {})}}]",
+            if low_inclusive { '[' } else { '(' },
+            plan_bytes(low),
+            plan_bytes(high)
+        );
+        ensure!(
+            plan_nodes(plan).any(|node| node == "IndexedTableAccess(state)")
+                && plan.contains("index: [state.key]")
+                && plan.contains(&filter)
+                && !plan.contains("TopN")
+                && !plan_nodes(plan).any(|node| node == "Table"),
+            "{label}: expected a bounded primary-key range read {filter} on the pinned Dolt; \
+             a Dolt upgrade that changes plan text must update this test deliberately. Plan:\n{plan}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bound_range_queries_plan_as_primary_key_ranges() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let ledger = store.usage_ledger()?;
+        let pool = ledger.store.pool.clone();
+        let after = session_key("plan-session").into_bytes();
+        let owned = KeyRange::prefix(OWNED_PREFIX)?;
+        let indexed = KeyRange::prefix(&session_index_prefix("plan-session"))?;
+        let index_after = session_index_key("plan-session", "plan-invocation").into_bytes();
+        for (label, range, after) in [
+            ("owned first page", &owned, None),
+            ("owned later page", &owned, Some(after.as_slice())),
+            ("session index first page", &indexed, None),
+            (
+                "session index later page",
+                &indexed,
+                Some(index_after.as_slice()),
+            ),
+        ] {
+            let (sql, [low, high]) = range.page(after);
+            let plan = explain_bound(
+                pool.as_ref(),
+                sql,
+                &[
+                    PlanArg::Bytes(low),
+                    PlanArg::Bytes(high),
+                    PlanArg::Int(PAGE_SIZE),
+                ],
+            )
+            .await?;
+            ensure_range_plan(label, &plan, low, after.is_none(), high)?;
+        }
+        let (sql, [low, high]) = indexed.any_for_update();
+        let plan = explain_bound(
+            pool.as_ref(),
+            sql,
+            &[PlanArg::Bytes(low), PlanArg::Bytes(high)],
+        )
+        .await?;
+        ensure_range_plan("session record probe", &plan, low, true, high)?;
+
+        // Negative control: the old queries, bound as production bound them,
+        // sort or read the whole table.
+        let after = std::str::from_utf8(&after)?;
+        for (label, after) in [("old first page", None), ("old later page", Some(after))] {
+            let plan = explain_bound(
+                pool.as_ref(),
+                OLD_PAGE,
+                &[
+                    PlanArg::Int(OWNED_PREFIX.len() as i64),
+                    PlanArg::Bytes(OWNED_PREFIX.as_bytes()),
+                    PlanArg::Text(after),
+                    PlanArg::Text(after),
+                    PlanArg::Int(PAGE_SIZE),
+                ],
+            )
+            .await?;
+            ensure!(
+                plan.contains("TopN") && plan_nodes(&plan).any(|node| node == "Table"),
+                "{label}: the old query no longer sorts a full table scan:\n{plan}"
+            );
+        }
+        let prefix = session_index_prefix("plan-session");
+        let plan = explain_bound(
+            pool.as_ref(),
+            OLD_ANY_FOR_UPDATE,
+            &[
+                PlanArg::Int(prefix.len() as i64),
+                PlanArg::Bytes(prefix.as_bytes()),
+            ],
+        )
+        .await?;
+        ensure!(
+            plan_nodes(&plan).any(|node| node == "Table"),
+            "old record probe no longer reads the full table:\n{plan}"
+        );
+        drop(pool);
+        drop(ledger);
+        store.close().await
     }
 }
