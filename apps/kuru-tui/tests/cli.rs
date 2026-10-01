@@ -3506,7 +3506,9 @@ fn marker(line: &str) -> Option<(&str, u128)> {
 fn cli_open_markers_are_written_to_standard_error_only_when_asked() {
     use kuru::memory_activity::{MARKER_PREFIX, MARKERS_ENV, OPENING, SENTENCES};
 
-    let env = cold_sandbox();
+    // A new project on the shared engine cache: no marker depends on unpacking
+    // the engine, which only adds to the open under the startup deadline.
+    let env = Sandbox::new();
     let marked = env
         .command()
         .env(MARKERS_ENV, "1")
