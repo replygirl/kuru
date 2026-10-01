@@ -143,6 +143,8 @@
   template path reports `OpeningDatabase` made the new PTY test fail with
   the waiting sentence named as having replaced the creating sentence;
   reverted.
-- Not run locally: `//apps/kuru-tui:test:embedded-runtime` (packaged
-  install and update acceptance; its depth-budget change is exercised only
-  in CI), Linux and Windows native tests, coverage (CI gate).
+- The packaged acceptance test
+  `packaged_install_and_update_preserve_complete_offline_memory` (the body of
+  `//apps/kuru-tui:test:embedded-runtime`) ran inside both kuru-tui runs and
+  passed with its raised depth budget.
+- Not run locally: Linux and Windows native tests, coverage (CI gate).

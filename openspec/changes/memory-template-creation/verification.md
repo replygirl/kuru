@@ -43,7 +43,7 @@
 ## 8. No regression to existing-project, cold-path or spawned-binary fixtures
 
 - [x] 8.1 @regression (agent) run `mise run //packages/kuru-memory:test` -> every test passes; observed 2026-10-01 on macOS: exit 0, lib 515 passed, 0 failed, 4 ignored
-- [x] 8.2 @regression (agent) run `mise run //apps/kuru-tui:test` and `mise run //packages/kuru-runtime:test` -> every test passes, including the fresh-cache fixtures whose depth budgets now cover the store template; observed 2026-10-01 on macOS: both exit 0 (kuru-runtime 220 passed; kuru-tui every target passed after the trust fixture depth fix)
+- [x] 8.2 @regression (agent) run `mise run //apps/kuru-tui:test` and `mise run //packages/kuru-runtime:test` -> every test passes, including the fresh-cache fixtures whose depth budgets now cover the store template; observed 2026-10-01 on macOS: both exit 0 (kuru-runtime 220 passed; kuru-tui every target passed after the trust fixture depth fix, including the packaged `packaged_install_and_update_preserve_complete_offline_memory`)
 
 ## 9. Documentation describes the new creation path
 
