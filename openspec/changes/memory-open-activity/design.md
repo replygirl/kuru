@@ -33,7 +33,7 @@ The owner records the cumulative ordered list of stages its observed open has be
 | S2 | `GETTING_READY` | `Getting Kuru's memory ready on this computer…` | This version's engine is not installed and the open waits for, unpacks or checks it |
 | S3 | `CREATING` | `Creating this project's memory…` | The project has no active memory and Kuru creates it, imports older memory or finishes an interrupted setup |
 | S4 | `UPGRADING` | `Upgrading this project's memory…` | An existing active store is upgraded to this version's format |
-| S5 | `WAITING` | `Waiting for another copy of Kuru that is using this project's memory…` | Another process holds the owner lock or the owner's startup lock and the open cannot go on |
+| S5 | `WAITING` | `Waiting for another copy of Kuru to finish with this project's memory…` | Another process holds the owner lock or the owner's startup lock and the open cannot go on |
 
 Leftover-file notices N1, N2 and N2' (the latter when `memory.cache_dir` is set) are kept as reworded constants in the same module and written on their own line after a successful in-process open. Rejected: a `Memory:` prefix or ready line (removed by decision).
 
