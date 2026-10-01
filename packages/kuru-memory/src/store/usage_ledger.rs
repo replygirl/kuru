@@ -554,6 +554,29 @@ pub(crate) struct UsageOpen {
     pub(crate) recorded: bool,
 }
 
+/// Record validated content on the usage head the way `establish` does,
+/// through `store`'s pool (a lost-reply fixture routes it), under the write
+/// guard. The head must lack its record.
+#[cfg(test)]
+pub(super) async fn record_unrecorded_head(store: &MemoryStore) -> Result<()> {
+    let _guard = store.shared.write.lock().await;
+    let check = bound_check(store.pool.as_ref()).await?;
+    ensure!(!check.bound, "the usage head already records its content");
+    record_validation(store, &store.pool, &check).await
+}
+
+/// Whether the usage head records this validator and the live content.
+#[cfg(test)]
+pub(super) async fn head_records_live_state(pool: &MySqlPool) -> Result<bool> {
+    Ok(bound_check(pool).await?.bound)
+}
+
+/// The live `state` content hash.
+#[cfg(test)]
+pub(super) async fn live_state_hash(pool: &MySqlPool) -> Result<String> {
+    state_hash(pool).await
+}
+
 /// The branch's working set, schema history and old receipts: flat checks
 /// that stay on every open.
 async fn validate_branch_state(pool: &MemoryPool) -> Result<()> {
@@ -4105,6 +4128,338 @@ mod tests {
         ensure!(any_owned(pool.as_ref()).await?);
         drop(pool);
         drop(ledger);
+        store.close().await
+    }
+
+    /// origin/main `d17dfe40`'s `validate_branch`, verbatim but for its name:
+    /// the check a binary that predates the validation record runs on every
+    /// writable open (twice, around `upgrade_usage`). It is deliberately not
+    /// `validate_owned_row`, so a change to the shared validator cannot hide
+    /// a difference here.
+    async fn older_validate_branch(pool: &MySqlPool) -> Result<u64> {
+        let dirty: i64 = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status").fetch_one(pool),
+        )
+        .await
+        .context("usage ledger working-set validation deadline exceeded")??;
+        ensure!(dirty == 0, "usage ledger branch has uncommitted changes");
+        let version = migrations::validate_historical(pool).await?;
+        if version <= 3 {
+            let old_receipts: Vec<(String, String)> = tokio::time::timeout(
+                QUERY_TIMEOUT,
+                sqlx::query_as("SELECT id, label FROM operations LIMIT 2").fetch_all(pool),
+            )
+            .await
+            .context("historical usage receipt validation deadline exceeded")??;
+            ensure!(
+                old_receipts.len() <= 1,
+                "historical usage receipt state is ambiguous"
+            );
+        }
+        let owned = KeyRange::prefix(OWNED_PREFIX)?;
+        let mut after: Option<Vec<u8>> = None;
+        let mut decoded = 0_u64;
+        loop {
+            let rows = owned_state_page(pool, &owned, after.as_deref()).await?;
+            if rows.is_empty() {
+                break;
+            }
+            decoded = decoded.saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+            for (key, value) in &rows {
+                let key =
+                    String::from_utf8(key.clone()).context("usage ledger key is not UTF-8")?;
+                if key.starts_with(SESSION_PREFIX) {
+                    let marker = decode_marker(value)?;
+                    ensure!(
+                        key == session_key(&marker.session_id),
+                        "usage marker key is not canonical"
+                    );
+                } else if key.starts_with(RECORD_PREFIX) {
+                    let record = decode_record(value)?;
+                    ensure!(
+                        key == record_key(&record.start.invocation_id),
+                        "usage ledger record key does not match its invocation"
+                    );
+                } else if key.starts_with(OBSERVATION_PREFIX) {
+                    let observation = decode_observation(value)?;
+                    ensure!(
+                        key == observation_key(
+                            &observation.invocation_id,
+                            observation.observation.sequence
+                        ),
+                        "usage observation key does not match its value"
+                    );
+                } else if key.starts_with(SESSION_INDEX_PREFIX) {
+                    let index = decode_session_index(value)?;
+                    ensure!(
+                        key == session_index_key(&index.session_id, &index.invocation_id)
+                            && index.record_key == record_key(&index.invocation_id),
+                        "usage session index is not canonical"
+                    );
+                } else {
+                    bail!("usage ledger owns an unrecognized state key");
+                }
+            }
+            after = rows.last().map(|(key, _)| key.clone());
+        }
+        Ok(decoded)
+    }
+
+    /// An older binary's `mark_new_session` write, as origin/main `d17dfe40`
+    /// commits it: no state precondition, no row validator, and a commit
+    /// message without a record.
+    async fn older_mark_new_session(pool: &MySqlPool, session_id: &str) -> Result<()> {
+        let operation = Uuid::new_v4().to_string();
+        let mut transaction = pool.begin().await?;
+        sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)")
+            .bind(session_key(session_id).as_bytes())
+            .bind(serde_json::to_string(&SessionMarker {
+                format: FORMAT,
+                session_id: session_id.into(),
+                historical_complete: true,
+            })?)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("INSERT INTO operations (id, label) VALUES (?, ?)")
+            .bind(&operation)
+            .bind("usage ledger v1")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
+            .bind(format!("usage ledger v1 [{operation}]"))
+            .bind(AUTHOR)
+            .fetch_all(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    // T13 (older binary): a ledger this binary wrote, with trailers on its
+    // writes and an extra record commit on HEAD, runs every read path an
+    // older binary's writable open runs (version, dolt_status,
+    // validate_historical, the scan, upgrade_usage, validate_usage, the scan
+    // again) without a difference; the older binary then writes as before,
+    // without a record, and this binary's next open scans once and records.
+    #[tokio::test]
+    async fn an_older_binary_reads_and_writes_a_recorded_ledger() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::warmed_open_options(
+            root.path().to_owned(),
+            format!("project/{}", "0".repeat(64)),
+        )
+        .await?;
+        let store = reopen(&root).await?;
+        let ledger = store.usage_ledger()?;
+        ledger.admit(start("older", "invocation-1")).await?;
+        ledger
+            .observe(
+                "invocation-1",
+                UsageObservation {
+                    sequence: 1,
+                    terminal: true,
+                    usage: Usage {
+                        input_tokens: Some(5),
+                        ..Usage::default()
+                    },
+                },
+            )
+            .await?;
+        ledger
+            .settle("invocation-1", InvocationOutcome::Succeeded)
+            .await?;
+        ledger.mark_new_session("newer").await?;
+        drop(ledger);
+        store.close().await?;
+        // An extra record commit on HEAD: a foreign head, then a reopen that
+        // scans and records.
+        foreign_empty_commit(&options, "foreign head").await?;
+        let store = reopen(&root).await?;
+        ensure!(usage_open(&store)?.recorded, "the reopen wrote no record");
+        store.close().await?;
+        let (head, message, _) = closed_usage_head(&options).await?;
+        ensure!(
+            parse_record(&message).is_some_and(|record| record.validator == VALIDATOR),
+            "HEAD is not a record commit: {message:?}"
+        );
+
+        let server = super::super::tests::released_server(&options).await?;
+        let pool = server.pool(BRANCH).await?;
+        let older = async {
+            ensure!(
+                migrations::version(pool.as_ref()).await? == migrations::USAGE_CURRENT_VERSION,
+                "the usage schema version changed"
+            );
+            let rows = older_validate_branch(pool.as_ref()).await?;
+            // Marker x2 (pre-ledger "older" and "newer"), record, index,
+            // observation.
+            ensure!(rows == 5, "the older scan decoded {rows} rows");
+            migrations::upgrade_usage(&server, pool.as_ref()).await?;
+            ensure!(
+                revision(pool.as_ref()).await? == head,
+                "the older upgrade step moved the usage head"
+            );
+            migrations::validate_usage(pool.as_ref()).await?;
+            ensure!(older_validate_branch(pool.as_ref()).await? == rows);
+            older_mark_new_session(pool.as_ref(), "written-by-older").await?;
+            ensure!(older_validate_branch(pool.as_ref()).await? == rows + 1);
+            ensure!(!bound_check(pool.as_ref()).await?.bound);
+            Ok(rows)
+        }
+        .await;
+        pool.close().await;
+        let closed = server.close().await;
+        let rows = older?;
+        closed?;
+
+        let store = reopen(&root).await?;
+        assert_eq!(
+            usage_open(&store)?,
+            UsageOpen {
+                bound: false,
+                scanned: Some(rows + 1),
+                rescanned: None,
+                recorded: true,
+            }
+        );
+        let ledger = store.usage_ledger()?;
+        ensure!(
+            ledger
+                .session("written-by-older")
+                .await?
+                .historical_complete
+        );
+        assert_eq!(ledger.session("older").await?.invocation_count, 1);
+        ledger.mark_new_session("after-older").await?;
+        drop(ledger);
+        store.close().await
+    }
+
+    /// Every SQL text in the workspace's product sources that reads a commit
+    /// message: a `dolt_log` or `dolt_commits` read naming `message`. Test
+    /// modules (`*tests.rs` files and each file's trailing `mod tests`) are
+    /// not product readers.
+    fn commit_message_readers() -> Vec<(String, String)> {
+        fn sources(directory: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    sources(&path, files);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = Vec::new();
+        for group in ["apps", "packages"] {
+            for crate_dir in std::fs::read_dir(workspace.join(group))
+                .expect("workspace group")
+                .flatten()
+            {
+                sources(&crate_dir.path().join("src"), &mut files);
+            }
+        }
+        files.sort();
+        assert!(files.len() > 50, "too few sources scanned: {}", files.len());
+        let mut readers = Vec::new();
+        for file in files {
+            let name = file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if name.ends_with("tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).expect("read source file");
+            let product = text
+                .find("#[cfg(test)]\nmod tests {")
+                .map_or(text.as_str(), |end| &text[..end]);
+            for line in product.lines() {
+                let lower = line.to_ascii_lowercase();
+                if (lower.contains("dolt_log") || lower.contains("dolt_commits"))
+                    && lower.contains("message")
+                {
+                    let relative = file
+                        .strip_prefix(&workspace)
+                        .unwrap_or(&file)
+                        .display()
+                        .to_string();
+                    readers.push((relative, line.trim().to_owned()));
+                }
+            }
+        }
+        readers
+    }
+
+    // T13 (parsers): the only product readers of commit messages are the
+    // opaque `revisions()` listing (main or candidate pools; the usage branch
+    // is reachable only through `UsageLedger`, which does not expose it), the
+    // template shape check (template builds only, before any ledger write)
+    // and this module's record reader. Other crates reach commit messages
+    // only through `revisions()`. A new reader must be added here deliberately
+    // and must ignore or strictly parse the record line.
+    #[test]
+    fn only_known_readers_parse_commit_messages() {
+        let readers = commit_message_readers();
+        let mut expected = [
+            (
+                "packages/kuru-memory/src/store.rs",
+                "\"SELECT commit_hash, message FROM dolt_log ORDER BY commit_order DESC, commit_hash ASC LIMIT ?\",",
+            ),
+            (
+                "packages/kuru-memory/src/store/migrations/template_shape.rs",
+                "\"SELECT CAST(committer AS CHAR), CAST(email AS CHAR), CAST(author AS CHAR), CAST(author_email AS CHAR), CAST(message AS CHAR) FROM dolt_log ORDER BY commit_order LIMIT ?\",",
+            ),
+            (
+                "packages/kuru-memory/src/store/usage_ledger.rs",
+                "sqlx::query_as(\"SELECT commit_hash, LEFT(message, ?) FROM dolt_log LIMIT 1\")",
+            ),
+        ];
+        let mut found: Vec<(&str, &str)> = readers
+            .iter()
+            .map(|(file, line)| (file.as_str(), line.as_str()))
+            .collect();
+        found.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            found, expected,
+            "commit-message readers changed; review each against the usage validation record"
+        );
+    }
+
+    // T13 (parsers, behaviour): the one generic reader returns usage commit
+    // messages verbatim, record line included, and parses nothing from them.
+    #[tokio::test]
+    async fn the_revision_listing_returns_record_messages_verbatim() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        store.usage_ledger()?.mark_new_session("listed").await?;
+        let pool = store
+            .shared
+            .usage_pool
+            .lock()
+            .expect("usage pool lock")
+            .clone()
+            .context("usage pool missing")?;
+        let usage = MemoryStore {
+            shared: store.shared.clone(),
+            pool,
+            branch: BRANCH.into(),
+            logical_receipt: None,
+        };
+        let revisions = usage.revisions(1).await?;
+        let live = state_hash(usage.pool.as_ref()).await?;
+        ensure!(revisions.len() == 1);
+        let message = &revisions[0].message;
+        ensure!(
+            message.starts_with("usage ledger v1 [")
+                && message.ends_with(&format!("\n\n{}", record_trailer(&live))),
+            "{message:?}"
+        );
+        drop(usage);
         store.close().await
     }
 }

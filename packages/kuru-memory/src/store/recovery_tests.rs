@@ -1597,6 +1597,311 @@ async fn promotion_receipt_keeps_base_target_and_refuses_divergent_history() {
     store.close().await.unwrap();
 }
 
+/// A writable store over a fresh project, for the usage lost-reply fixtures.
+async fn usage_fixture_store() -> Result<(crate::test_support::TempDir, OpenOptions, MemoryStore)> {
+    let root = crate::test_support::tempdir()?;
+    let options = crate::test_support::warmed_open_options(
+        root.path().to_owned(),
+        format!("project/{}", Uuid::new_v4().simple().to_string().repeat(2)),
+    )
+    .await?;
+    let store = crate::test_support::spawn_gated_open(options.clone()).await?;
+    Ok((root, options, store))
+}
+
+/// The usage branch as `usage_ledger()` builds it, so a proxy can route it.
+fn usage_branch_store(store: &MemoryStore) -> Result<MemoryStore> {
+    let pool = store
+        .shared
+        .usage_pool
+        .lock()
+        .expect("usage pool lock")
+        .clone()
+        .context("usage pool missing")?;
+    Ok(MemoryStore {
+        shared: store.shared.clone(),
+        pool,
+        branch: usage_ledger::BRANCH.into(),
+        logical_receipt: None,
+    })
+}
+
+fn usage_validated(store: &MemoryStore) -> Option<String> {
+    store
+        .shared
+        .usage_validated
+        .lock()
+        .expect("usage validated lock")
+        .clone()
+}
+
+fn usage_pending(store: &MemoryStore) -> bool {
+    store
+        .shared
+        .uncertain
+        .lock()
+        .expect("uncertain lock")
+        .is_some()
+}
+
+async fn usage_receipts(pool: &MySqlPool) -> Result<i64> {
+    Ok(tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar("SELECT COUNT(*) FROM operations").fetch_one(pool),
+    )
+    .await
+    .context("usage receipt count deadline exceeded")??)
+}
+
+/// A proxied view of the usage branch, checked to be that branch.
+async fn routed_usage_view(proxy: &AckDropProxy, usage: &MemoryStore) -> Result<MemoryStore> {
+    let view = proxy.view(usage).await;
+    ensure!(
+        revision(&view.pool).await? == revision(&usage.pool).await?,
+        "the proxied pool does not route the usage branch"
+    );
+    Ok(view)
+}
+
+async fn reopen_usage(options: OpenOptions) -> Result<(MemoryStore, usage_ledger::UsageOpen)> {
+    let reopened = crate::test_support::spawn_gated_open(options).await?;
+    let open = reopened
+        .shared
+        .usage_open
+        .lock()
+        .expect("usage open lock")
+        .clone()
+        .context("the reopen recorded no usage establishment")?;
+    Ok((reopened, open))
+}
+
+// Lost reply on a usage write that committed: the real COMMIT reply is
+// dropped after the usage head advanced. The write settles as committed, the
+// validated content is re-derived from the new head's record, and the next
+// write succeeds without a reopen.
+#[tokio::test]
+async fn lost_usage_write_reply_after_commit_advances_the_validated_state() -> Result<()> {
+    let (_root, options, store) = usage_fixture_store().await?;
+    store.usage_ledger()?.mark_new_session("recorded").await?;
+    let usage = usage_branch_store(&store)?;
+    let base = revision(&usage.pool).await?;
+    let before = usage_validated(&store).context("the open validated nothing")?;
+    let receipts = usage_receipts(&usage.pool).await?;
+    let proxy = AckDropProxy::start(
+        usage.pool.clone(),
+        "COMMIT",
+        DurableObservation::RevisionAdvanced { base: base.clone() },
+    )
+    .await;
+    let view = routed_usage_view(&proxy, &usage).await?;
+    tokio::time::timeout(
+        TEST_DEADLINE,
+        UsageLedger::new(view.clone()).mark_new_session("lost-reply"),
+    )
+    .await
+    .context("the lost-reply usage write did not settle")??;
+    ensure!(
+        proxy.discarded.load(Ordering::Acquire),
+        "fixture must discard an actual durable usage COMMIT reply"
+    );
+    ensure!(!usage_pending(&store), "the settled write stayed pending");
+    let head = revision(&usage.pool).await?;
+    ensure!(head != base, "the usage write did not commit");
+    let live = usage_ledger::live_state_hash(&usage.pool).await?;
+    ensure!(live != before, "the committed write did not change state");
+    ensure!(usage_ledger::head_records_live_state(&usage.pool).await?);
+    assert_eq!(usage_validated(&store), Some(live));
+    assert_eq!(usage_receipts(&usage.pool).await?, receipts + 1);
+    let ledger = store.usage_ledger()?;
+    ledger.mark_new_session("after").await?;
+    ensure!(ledger.session("lost-reply").await?.historical_complete);
+    ensure!(ledger.session("after").await?.historical_complete);
+    assert_eq!(usage_receipts(&usage.pool).await?, receipts + 2);
+    drop(ledger);
+    view.pool.close().await;
+    proxy.close().await;
+    drop(usage);
+    store.close().await?;
+
+    let (reopened, open) = reopen_usage(options).await?;
+    assert_eq!(
+        open,
+        usage_ledger::UsageOpen {
+            bound: true,
+            scanned: None,
+            rescanned: None,
+            recorded: false,
+        }
+    );
+    reopened.close().await
+}
+
+// Lost request on a usage write that never committed: the DOLT_COMMIT request
+// is dropped before the server sees it, on a ledger with no record yet (an
+// empty ledger). The write fails as not committed, the validated content is
+// kept because the live content is unchanged, and the retry succeeds.
+#[tokio::test]
+async fn absent_usage_write_keeps_the_validated_state_and_retries() -> Result<()> {
+    let (_root, options, store) = usage_fixture_store().await?;
+    let usage = usage_branch_store(&store)?;
+    let base = revision(&usage.pool).await?;
+    ensure!(!usage_ledger::head_records_live_state(&usage.pool).await?);
+    let before = usage_validated(&store).context("the open validated nothing")?;
+    let receipts = usage_receipts(&usage.pool).await?;
+    let proxy = ReservedAckDropProxy::reserve().await.start_absent_at(
+        usage.pool.clone(),
+        "CALL DOLT_COMMIT",
+        DurableObservation::RevisionAdvanced { base: base.clone() },
+    );
+    let view = routed_usage_view(&proxy, &usage).await?;
+    let error = tokio::time::timeout(
+        TEST_DEADLINE,
+        UsageLedger::new(view.clone()).mark_new_session("absent"),
+    )
+    .await
+    .context("the absent usage write did not settle")?
+    .expect_err("an undispatched usage commit appeared committed");
+    ensure!(
+        !error.is::<UsageLedgerStateChanged>(),
+        "an absent write was refused as a state change: {error:#}"
+    );
+    ensure!(
+        proxy.discarded.load(Ordering::Acquire),
+        "fixture must discard the usage DOLT_COMMIT request"
+    );
+    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
+    ensure!(!usage_pending(&store), "the settled write stayed pending");
+    assert_eq!(revision(&usage.pool).await?, base);
+    assert_eq!(usage_ledger::live_state_hash(&usage.pool).await?, before);
+    assert_eq!(usage_validated(&store), Some(before.clone()));
+    assert_eq!(usage_receipts(&usage.pool).await?, receipts);
+    let ledger = store.usage_ledger()?;
+    ledger.mark_new_session("absent").await?;
+    ensure!(ledger.session("absent").await?.historical_complete);
+    assert_eq!(usage_receipts(&usage.pool).await?, receipts + 1);
+    ensure!(usage_validated(&store) != Some(before));
+    drop(ledger);
+    view.pool.close().await;
+    proxy.close().await;
+    drop(usage);
+    store.close().await?;
+
+    let (reopened, open) = reopen_usage(options).await?;
+    assert_eq!(
+        open,
+        usage_ledger::UsageOpen {
+            bound: true,
+            scanned: None,
+            rescanned: None,
+            recorded: false,
+        }
+    );
+    reopened.close().await
+}
+
+#[tokio::test]
+async fn lost_validation_record_reply_after_commit_settles_as_recorded() -> Result<()> {
+    usage_validation_record_fixture(true).await
+}
+
+#[tokio::test]
+async fn absent_validation_record_settles_as_missing_and_rescans() -> Result<()> {
+    usage_validation_record_fixture(false).await
+}
+
+// The open's record commit with an uncertain outcome, through the real
+// lost-reply proxy: committed (the COMMIT reply is dropped after the head
+// advanced) settles as recorded; absent (the DOLT_COMMIT request is dropped)
+// settles as a missing record. Neither refuses: the open keeps the content
+// its scan validated, and a missing record only costs the next open a scan.
+async fn usage_validation_record_fixture(committed: bool) -> Result<()> {
+    let (_root, options, store) = usage_fixture_store().await?;
+    store.usage_ledger()?.mark_new_session("seeded").await?;
+    let usage = usage_branch_store(&store)?;
+    tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query("CALL DOLT_COMMIT('--allow-empty', '--message', ?, '--author', ?)")
+            .bind("usage head without a record")
+            .bind(AUTHOR)
+            .fetch_all(usage.pool.as_ref()),
+    )
+    .await
+    .context("usage record fixture foreign commit deadline exceeded")??;
+    ensure!(!usage_ledger::head_records_live_state(&usage.pool).await?);
+    let base = revision(&usage.pool).await?;
+    let live = usage_ledger::live_state_hash(&usage.pool).await?;
+    // As in `establish`: the open publishes its hash only after recording.
+    *store
+        .shared
+        .usage_validated
+        .lock()
+        .expect("usage validated lock") = None;
+    let observation = DurableObservation::RevisionAdvanced { base: base.clone() };
+    let proxy = if committed {
+        AckDropProxy::start(usage.pool.clone(), "COMMIT", observation).await
+    } else {
+        ReservedAckDropProxy::reserve().await.start_absent_at(
+            usage.pool.clone(),
+            "CALL DOLT_COMMIT",
+            observation,
+        )
+    };
+    let view = routed_usage_view(&proxy, &usage).await?;
+    tokio::time::timeout(TEST_DEADLINE, usage_ledger::record_unrecorded_head(&view))
+        .await
+        .context("the uncertain record commit did not settle")??;
+    ensure!(
+        proxy.discarded.load(Ordering::Acquire),
+        "fixture must discard the selected record commit packet"
+    );
+    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
+    ensure!(!usage_pending(&store), "the settled record stayed pending");
+    assert_eq!(usage_ledger::live_state_hash(&usage.pool).await?, live);
+    let head = revision(&usage.pool).await?;
+    if committed {
+        ensure!(head != base, "the record commit did not commit");
+        ensure!(usage_ledger::head_records_live_state(&usage.pool).await?);
+        let parents: Vec<String> = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? ORDER BY parent_index",
+        )
+        .bind(&head)
+        .fetch_all(usage.pool.as_ref())
+        .await?;
+        assert_eq!(parents, [base]);
+        assert_eq!(usage_validated(&store), Some(live));
+    } else {
+        assert_eq!(head, base);
+        ensure!(!usage_ledger::head_records_live_state(&usage.pool).await?);
+        assert_eq!(usage_validated(&store), None);
+    }
+    view.pool.close().await;
+    proxy.close().await;
+    drop(usage);
+    store.close().await?;
+
+    let (reopened, open) = reopen_usage(options).await?;
+    assert_eq!(
+        open,
+        if committed {
+            usage_ledger::UsageOpen {
+                bound: true,
+                scanned: None,
+                rescanned: None,
+                recorded: false,
+            }
+        } else {
+            usage_ledger::UsageOpen {
+                bound: false,
+                scanned: Some(1),
+                rescanned: None,
+                recorded: true,
+            }
+        }
+    );
+    reopened.usage_ledger()?.mark_new_session("after").await?;
+    reopened.close().await
+}
+
 const SCHEMA_BOUNDARY_TABLE: &str = "schema_transaction_probe";
 const SCHEMA_BOUNDARY_NAMESPACE: &str = "schema-boundary-source";
 const CANDIDATE_NAMESPACE: &str = "schema-boundary-candidate";
@@ -3101,11 +3406,21 @@ impl ReservedAckDropProxy {
         observer: Arc<MemoryPool>,
         observation: DurableObservation,
     ) -> AckDropProxy {
+        self.start_absent_at(observer, "CALL DOLT_MERGE", observation)
+    }
+
+    /// Drop the first request for `statement` before the server sees it.
+    fn start_absent_at(
+        self,
+        observer: Arc<MySqlPool>,
+        statement: &'static str,
+        observation: DurableObservation,
+    ) -> AckDropProxy {
         AckDropProxy::from_listener(
             self.listener,
             self.port,
             observer,
-            "CALL DOLT_MERGE",
+            statement,
             observation,
             self.discarded,
             DropKind::RequestBeforeDispatch,
