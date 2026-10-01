@@ -925,17 +925,25 @@ template key's lock while a copy or build runs (the build's exclusive lock as
 the build engine's reap guard, and every copy's lock held by the thread that
 writes it), in the ownership shape of the migration worker: the opening frame
 MUST NOT hold either lock while that work is in flight, a cancelled open MUST
-leave the worker to finish, and the startup lock MUST return only after every
-engine the worker started has been reaped. A later opener of the same project
+leave the worker to finish, and the startup lock MUST return only after the
+engine started on the project's stage has been reaped. The template build
+engine runs on the key's build store, never on the project's stage, and the
+key's exclusive lock, not the startup lock, is its reap guard: when that
+engine's supervisor overruns its reap allowance, the guard passes to the
+background reaper and MAY be released after the startup lock has returned.
+No product opener waits on that guard. A later opener of the same project
 waits for the startup lock within its own startup deadline, then reuses the
 stage the worker left ready or finds it preserved.
 
 Kuru MUST create the store cold instead, in a new staging directory and
-without surfacing an error, when the template cannot be used now: the key lock
-is held by another process, the template root or the key's lock file cannot be
-opened, locked or verified, the published template fails its structural check
-(it is then quarantined, identity-bound and best-effort), or the copy fails
-with a verdict against the template's bytes or an I/O error. A copy that wrote
+without surfacing an error, when a template this open did not build cannot be
+used now: the key lock is held by another process, the template root or the
+key's lock file cannot be opened, locked or verified, the published template
+fails its structural check (it is then quarantined, identity-bound and
+best-effort), or the copy from that template fails with a verdict against the
+template's bytes or an I/O error. This cold fallback MUST NOT apply to the
+copy from a template, or verified build stage, that this open's own build
+produced; that copy fails the open as described below. A copy that wrote
 anything MUST first be preserved under the interrupted-stage protocol without
 an engine start; only a verdict quarantines the template. A different project
 opened while a build for the same key is in progress MUST take the cold path
@@ -943,18 +951,25 @@ at once and MUST NOT read any unpublished build or capture stage.
 
 Any failure of a template build the open started (its engine, its own
 validation and shape assertions, its capture and byte scan, or its
-publication when no verified stage remains to copy from), and any failure of
-the copied stage's own engine start, MUST fail the open with its error and
-MUST NOT be retried in that open, on the template path or the cold path, so
-the schema chain never runs twice in one open. When that
-failure is a verdict against the template's bytes (adoption's placeholder,
-working-set or rewrite comparison, or the template shape), Kuru MUST also
-quarantine the published template the copy was taken from, bound to the
-identity it had when it was judged; every other failure, including a
-mismatched compiled template key, MUST leave every template untouched. The
-unready stage is preserved: by the next open's recovery without an engine
-start when the failure came before the stage's engine was serving, and by the
-staging job itself after.
+publication when no verified stage remains to copy from), any failure of the
+copy of this project's stage from the template that build published or from
+the build's verified stage, and any failure of the copied stage's own engine
+start, MUST fail the open with its error and MUST NOT be retried in that open,
+on the template path or the cold path, so the schema chain never runs twice
+in one open. The error MUST name the phase that failed: a failed copy after a
+successful build MUST NOT be reported as a failed build. When that
+failure is a verdict against the template's bytes (the copy's byte
+verification, adoption's placeholder, working-set or rewrite comparison, or
+the template shape), Kuru MUST also quarantine the published template the
+copy was taken from, bound to the identity it had when it was judged; a copy
+taken from the build's unpublished verified stage quarantines nothing and
+leaves that stage to the key's next sweep. Every other failure, including an
+I/O error during the copy and a mismatched compiled template key, MUST leave
+every template untouched. The unready stage is preserved: a copy remnant
+under the interrupted-stage protocol without an engine start, by the creation
+worker when the copy fails and otherwise by the next open's recovery, when
+the failure came before the stage's engine was serving, and by the staging
+job itself after.
 
 #### Scenario: An ordinary new project copies a warm template in two starts
 
@@ -985,7 +1000,7 @@ staging job itself after.
 
 - **WHEN** a new project's open meets a key lock another process holds, a
   lock or manifest error, a template that fails its structural check, or a
-  verdict or I/O error while copying
+  verdict or I/O error while copying a template this open did not build
 - **THEN** the open completes on the cold staged build without a
   template-specific error, any partial copy is preserved without an engine
   start, and only a verdict against the template's bytes quarantines it.
@@ -1006,6 +1021,20 @@ staging job itself after.
 - **THEN** the open fails with that error after the build engine's single
   start, makes no other engine start, runs no cold staged build, publishes
   and quarantines nothing, and leaves no store at the project's active path.
+
+#### Scenario: A failed copy from the template this open built fails the open without a cold retry
+
+- **WHEN** a new project's open builds and publishes the template for its key,
+  and copying this project's stage from that template fails with a verdict
+  against its bytes or an I/O error
+- **THEN** the open fails with an error that names the copy from the
+  template this open built and does not report a failed build. The build
+  engine's single start is the open's only engine start, and no cold staged
+  build runs. The copy remnant is preserved under the interrupted-stage
+  protocol without an engine start, and no store appears at the project's
+  active path. A verdict quarantines the template this open published, so
+  the next new project builds again. An I/O error leaves it published, so
+  the next new project copies it in two engine starts.
 
 #### Scenario: A concurrent new project never waits on another project's template build
 
