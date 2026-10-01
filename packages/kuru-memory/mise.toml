@@ -60,7 +60,8 @@ run = "cargo test -p kuru-memory --all-targets --all-features --locked --no-fail
 
 # Opt-in measurements, never part of `test`, coverage or CI partitions: the
 # harnesses are #[ignore]d and the Dolt trace is inert unless
-# KURU_TEST_DOLT_LOG_DIR is set. See docs/development.md.
+# KURU_TEST_DOLT_LOG_DIR is set. The usage-scan check below runs in its own
+# CI job. See docs/development.md.
 [tasks."measure:lifecycle"]
 description = "Run the ignored candidate-cleanup and close-time lifecycle measurements on demand"
 env.RUST_TEST_THREADS = "2"
@@ -78,6 +79,7 @@ run = "cargo test -p kuru-memory --lib --all-features --locked stage_worker::tes
 # Ages the one existing project store under --data-dir (create it with one
 # `kuru` run first) through the facade's real write paths while holding its
 # owner lock. Deterministic logical content per seed, size and turn count.
+# --profile release lets the usage-scan check reuse one release build.
 [tasks."measure:age-store"]
 description = "Age an isolated project store through the real write paths for open-time measurement"
 depends = ["bundle:prepare"]
@@ -86,8 +88,29 @@ flag "--data-dir <dir>" required=#true
 flag "--conversations <n>" required=#true
 flag "--turns <n>" default="1"
 flag "--seed <seed>" default="1"
+flag "--profile <profile>" default="dev"
 '''
-run = 'cargo run -p kuru-memory --features test-support --locked -- age-store --data-dir "${usage_data_dir?}" --conversations "${usage_conversations?}" --turns "${usage_turns?}" --seed "${usage_seed?}"'
+run = 'cargo run -p kuru-memory --features test-support --locked --profile "${usage_profile?}" -- age-store --data-dir "${usage_data_dir?}" --conversations "${usage_conversations?}" --turns "${usage_turns?}" --seed "${usage_seed?}"'
+
+# The usage-scan scaling check's aged fixture (Unix): print its cache key
+# from compiled constants (`key --root <dir> [--output <file>]`), create one
+# empty store per size (`create --root <dir> --conversations <n>`) and seal
+# the stores once measure:age-store has aged them (`seal --root <dir>`).
+# Never sets KURU_OPEN_TIMELINE, so the fixture holds no timeline. See
+# docs/development.md.
+[tasks."measure:usage-scan:fixture"]
+description = "Compute the usage-scan fixture key, create its stores or seal them (Unix)"
+depends = ["bundle:prepare"]
+run = "cargo run -p kuru-memory --features test-support --locked --profile release -- usage-scan-fixture"
+
+# Cold gated owner opens over the sealed fixture, asserting the provisional
+# growth bounds with --assert (Unix): `--root <dir> --evidence <dir>
+# [--samples <odd n>] [--assert] [--summary <file>]`.
+[tasks."measure:usage-scan"]
+description = "Measure the usage-ledger scan on aged stores from owner open timelines (Unix)"
+depends = ["bundle:prepare"]
+env.KURU_OPEN_TIMELINE = "1"
+run = "cargo run -p kuru-memory --features test-support --locked --profile release -- measure-usage-scan"
 
 [tasks."bundle:test-fixtures"]
 description = "Prepare the actual upstream Windows ZIP for host-independent decoder tests"

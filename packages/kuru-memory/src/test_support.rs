@@ -44,6 +44,10 @@ pub(crate) mod engine_ledger;
 /// Env-gated lifecycle ordering measurement trace (inert unless enabled).
 pub mod lifecycle_trace;
 pub(crate) mod template;
+/// The CI usage-scan scaling check over aged stores (`usage-scan-fixture`,
+/// `measure-usage-scan`); Unix only, where the owner timeline works.
+#[cfg(all(unix, feature = "test-support"))]
+pub mod usage_scan;
 #[cfg(windows)]
 pub mod windows;
 use crate::{MemoryStore, OpenOptions, PublicTurnRecord, SessionCatalogRecord, files};

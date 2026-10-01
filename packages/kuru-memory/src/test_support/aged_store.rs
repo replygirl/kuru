@@ -4,7 +4,8 @@
 //!
 //! It is a measurement aid, compiled only with test support, and reached
 //! through the `age-store` subcommand of this package's own binary (the
-//! `measure:age-store` mise task). It never runs in `test`, coverage or CI.
+//! `measure:age-store` mise task). It never runs in `test` or coverage; CI
+//! runs it only to build the usage-scan fixture (see `usage_scan`).
 //!
 //! Every conversation follows the runtime's order for one new session and
 //! `turns` single-invocation turns:
@@ -40,7 +41,7 @@ use std::{
 
 /// The JSON report's format tag.
 pub const REPORT_FORMAT: &str = "kuru.aged-store";
-const REPORT_FORMAT_VERSION: u32 = 1;
+pub const REPORT_FORMAT_VERSION: u32 = 1;
 /// Turns beyond this are not a realistic single conversation for the open
 /// measurement and would only slow the fixture.
 const MAX_TURNS: u32 = 64;
