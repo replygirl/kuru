@@ -1651,6 +1651,8 @@ async fn stopped_released_v1_store() -> MemoryStore {
             candidate_recovery_pause: None,
             candidate_cleanup_failure: None,
             apply_pause: StdMutex::new(None),
+            #[cfg(test)]
+            usage_open: StdMutex::new(None),
             _permit: None,
         }),
         pool,

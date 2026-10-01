@@ -282,6 +282,9 @@ struct Shared {
     candidate_cleanup_failure: Option<Arc<AtomicBool>>,
     #[cfg(test)]
     apply_pause: StdMutex<Option<Arc<ApplyPause>>>,
+    /// What this open's usage establishment did, for tests.
+    #[cfg(test)]
+    usage_open: StdMutex<Option<usage_ledger::UsageOpen>>,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -2121,6 +2124,8 @@ impl MemoryStore {
             candidate_cleanup_failure: options.candidate_cleanup_failure,
             #[cfg(test)]
             apply_pause: StdMutex::new(None),
+            #[cfg(test)]
+            usage_open: StdMutex::new(None),
             _permit: permit,
         });
         let store = Self {
@@ -11555,6 +11560,8 @@ mod tests {
                 candidate_recovery_pause: None,
                 candidate_cleanup_failure: None,
                 apply_pause: StdMutex::new(None),
+                #[cfg(test)]
+                usage_open: StdMutex::new(None),
                 _permit: None,
             }),
             pool: pool.clone(),

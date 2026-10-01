@@ -60,6 +60,7 @@ const RANGE_NEXT_PAGE: &str =
     "SELECT `key`, value FROM state WHERE `key` > ? AND `key` < ? ORDER BY `key` LIMIT ?";
 const RANGE_ANY_FOR_UPDATE: &str =
     "SELECT 1 FROM state WHERE `key` >= ? AND `key` < ? LIMIT 1 FOR UPDATE";
+const RANGE_ANY: &str = "SELECT 1 FROM state WHERE `key` >= ? AND `key` < ? LIMIT 1";
 
 /// The identity of [`validate_owned_row`] and the decoders it calls, bound to
 /// the release: every release boundary, in either direction, costs one full
@@ -480,28 +481,82 @@ pub(super) async fn establish(store: &MemoryStore) -> Result<()> {
     }
     let pool = store.shared.server.pool(BRANCH).await?;
     open_timeline::stamp(Event::UsagePool);
-    let rows = validate_branch(pool.as_ref()).await?;
-    open_timeline::usage_rows(rows);
+    // Pre-upgrade validation: an invalid ledger is never migrated.
+    validate_branch_state(pool.as_ref()).await?;
+    let before = bound_check(pool.as_ref()).await?;
+    open_timeline::stamp(Event::UsageBound);
+    let scanned = if before.bound {
+        None
+    } else {
+        Some(validate_owned_rows(pool.as_ref(), &before.state_hash).await?)
+    };
+    // 0 on a recorded reopen: the rows decoded between usage-bound and here.
+    open_timeline::usage_rows(scanned.unwrap_or(0));
     open_timeline::stamp(Event::UsageScan1);
     migrations::upgrade_usage(&store.shared.server, pool.as_ref()).await?;
     open_timeline::stamp(Event::UsageUpgrade);
     migrations::validate_usage(pool.as_ref()).await?;
     open_timeline::stamp(Event::UsageValidate);
-    validate_branch(pool.as_ref()).await?;
+    // D: the old second scan's flat checks stay; its owned walk runs only
+    // when the upgrade changed `state` (no usage migration does today).
+    validate_branch_state(pool.as_ref()).await?;
+    let after = bound_check(pool.as_ref()).await?;
+    let rescanned = if after.state_hash == before.state_hash {
+        None
+    } else {
+        Some(validate_owned_rows(pool.as_ref(), &after.state_hash).await?)
+    };
     open_timeline::stamp(Event::UsageScan2);
-    let validated = state_hash(pool.as_ref()).await?;
+    let recorded = if after.bound {
+        false
+    } else {
+        let owned = match rescanned.or(scanned) {
+            Some(rows) => rows > 0,
+            None => any_owned(pool.as_ref()).await?,
+        };
+        if owned {
+            record_validation(store, &pool, &after).await?;
+        }
+        owned
+    };
+    open_timeline::stamp(Event::UsageRecord);
+    #[cfg(test)]
+    {
+        *store.shared.usage_open.lock().expect("usage open lock") = Some(UsageOpen {
+            bound: before.bound,
+            scanned,
+            rescanned,
+            recorded,
+        });
+    }
+    #[cfg(not(test))]
+    let _ = recorded;
     *store
         .shared
         .usage_validated
         .lock()
-        .expect("usage validated lock") = Some(validated);
+        .expect("usage validated lock") = Some(after.state_hash);
     *store.shared.usage_pool.lock().expect("usage pool lock") = Some(pool);
     Ok(())
 }
 
-/// Validate the branch's working set, history and owned state; returns the
-/// number of owned-state rows decoded.
-async fn validate_branch(pool: &MemoryPool) -> Result<u64> {
+/// What one writable open's usage establishment did.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UsageOpen {
+    /// HEAD recorded this validator and the live content before the upgrade.
+    pub(crate) bound: bool,
+    /// Rows the pre-upgrade full scan decoded; `None` when Bound.
+    pub(crate) scanned: Option<u64>,
+    /// Rows a post-upgrade rescan decoded; `None` when `state` was unchanged.
+    pub(crate) rescanned: Option<u64>,
+    /// Whether the open wrote a record commit.
+    pub(crate) recorded: bool,
+}
+
+/// The branch's working set, schema history and old receipts: flat checks
+/// that stay on every open.
+async fn validate_branch_state(pool: &MemoryPool) -> Result<()> {
     let dirty: i64 = tokio::time::timeout(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status").fetch_one(pool),
@@ -524,6 +579,13 @@ async fn validate_branch(pool: &MemoryPool) -> Result<u64> {
     }
     // Current usage receipts intentionally survive later ledger writes;
     // there is no one-row limit on an upgraded writable branch.
+    Ok(())
+}
+
+/// The full scan: every owned row through [`validate_owned_row`]. The scan
+/// validates exactly the content named `expected`, read before it and
+/// checked again after it. Returns the number of owned rows decoded.
+async fn validate_owned_rows(pool: &MemoryPool, expected: &str) -> Result<u64> {
     let owned = KeyRange::prefix(OWNED_PREFIX)?;
     let mut after: Option<Vec<u8>> = None;
     let mut decoded = 0_u64;
@@ -538,7 +600,81 @@ async fn validate_branch(pool: &MemoryPool) -> Result<u64> {
         }
         after = rows.last().map(|(key, _)| key.clone());
     }
+    ensure!(
+        state_hash(pool).await? == expected,
+        "usage ledger state changed while it was being validated"
+    );
     Ok(decoded)
+}
+
+/// Whether any owned row exists: one primary-key range probe.
+async fn any_owned(pool: &MemoryPool) -> Result<bool> {
+    let owned = KeyRange::prefix(OWNED_PREFIX)?;
+    Ok(tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query(RANGE_ANY)
+            .bind(owned.start.as_slice())
+            .bind(owned.end.as_slice())
+            .fetch_optional(pool),
+    )
+    .await
+    .context("usage ledger owned-row probe deadline exceeded")??
+    .is_some())
+}
+
+/// Record validated content on a head that lacks its record: one empty
+/// commit in a short transaction, registered as an uncertain outcome and
+/// resolved inline under the open's write guard. Either definite outcome
+/// keeps the open: the scan already validated this content, and a missing
+/// record only means the next open scans again.
+async fn record_validation(
+    store: &MemoryStore,
+    pool: &Arc<MemoryPool>,
+    check: &BoundCheck,
+) -> Result<()> {
+    let (mut connection, id) = owned_connection(pool).await?;
+    *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
+        pool: pool.clone(),
+        connection: id,
+        receipt: Receipt::UsageValidation {
+            base_head: check.head.clone(),
+            state_hash: check.state_hash.clone(),
+        },
+    });
+    let result = tokio::time::timeout(QUERY_TIMEOUT, async {
+        let mut transaction = connection.begin().await?;
+        let head: String = sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')")
+            .fetch_one(&mut *transaction)
+            .await?;
+        let current = state_hash(&mut *transaction).await?;
+        if head != check.head || current != check.state_hash {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("CALL DOLT_COMMIT('--allow-empty', '--message', ?, '--author', ?)")
+            .bind(record_message(&check.state_hash))
+            .bind(AUTHOR)
+            .fetch_all(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok::<_, anyhow::Error>(true)
+    })
+    .await;
+    drop(connection);
+    match result {
+        Ok(Ok(true)) => {
+            *store.shared.uncertain.lock().expect("uncertain lock") = None;
+            Ok(())
+        }
+        Ok(Ok(false)) => {
+            store.resolve_uncertain().await?;
+            bail!("usage ledger state changed while it was being validated")
+        }
+        _ => {
+            store.resolve_uncertain().await?;
+            Ok(())
+        }
+    }
 }
 
 /// The validation record line for `state_hash` under this binary's validator.
@@ -2075,6 +2211,15 @@ mod tests {
     /// `rows` there as a foreign writer would: through a released server and
     /// raw SQL, never through `UsageLedger`.
     async fn plant(seeded: &Seeded, rows: &[(Vec<u8>, String)]) -> Result<()> {
+        plant_with_message(seeded, rows, "foreign usage write").await
+    }
+
+    /// [`plant`] with the foreign commit's message chosen by the caller.
+    async fn plant_with_message(
+        seeded: &Seeded,
+        rows: &[(Vec<u8>, String)],
+        message: &str,
+    ) -> Result<()> {
         let server = super::super::tests::released_server(&seeded.options).await?;
         let pool = server.pool(BRANCH).await?;
         let planted = async {
@@ -2099,7 +2244,8 @@ mod tests {
                 .execute(pool.as_ref())
                 .await?;
             }
-            sqlx::query("CALL DOLT_COMMIT('-Am', 'foreign usage write', '--author', ?)")
+            sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
+                .bind(message)
                 .bind(AUTHOR)
                 .fetch_all(pool.as_ref())
                 .await?;
@@ -2128,7 +2274,19 @@ mod tests {
         rows: &[(Vec<u8>, String)],
         expected: &str,
     ) -> Result<()> {
-        plant(seeded, rows).await?;
+        assert_reopen_refuses_with(seeded, case, rows, expected, "foreign usage write").await
+    }
+
+    /// [`assert_reopen_refuses`] with the foreign commit's message chosen by
+    /// the caller, for instance a copy of a valid validation record.
+    async fn assert_reopen_refuses_with(
+        seeded: &Seeded,
+        case: &str,
+        rows: &[(Vec<u8>, String)],
+        expected: &str,
+        message: &str,
+    ) -> Result<()> {
+        plant_with_message(seeded, rows, message).await?;
         match MemoryStore::open(seeded.options.clone()).await {
             Ok(store) => {
                 store.close().await?;
@@ -3525,5 +3683,367 @@ mod tests {
         ] {
             assert_eq!(parse_record(&message), None, "{case}: {message:?}");
         }
+    }
+
+    /// The usage branch's HEAD and HEAD's full message, through a released
+    /// server on the closed store.
+    async fn closed_usage_head(options: &OpenOptions) -> Result<(String, String, Vec<String>)> {
+        let server = super::super::tests::released_server(options).await?;
+        let pool = server.pool(BRANCH).await?;
+        let read = async {
+            let head = revision(pool.as_ref()).await?;
+            let (logged, message): (String, String) =
+                sqlx::query_as("SELECT commit_hash, message FROM dolt_log LIMIT 1")
+                    .fetch_one(pool.as_ref())
+                    .await?;
+            ensure!(logged == head, "dolt_log's first row is not HEAD");
+            let parents: Vec<String> = sqlx::query_scalar(
+                "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? ORDER BY parent_index",
+            )
+            .bind(&head)
+            .fetch_all(pool.as_ref())
+            .await?;
+            Ok((head, message, parents))
+        }
+        .await;
+        pool.close().await;
+        let closed = server.close().await;
+        read.and_then(|read| closed.map(|()| read))
+    }
+
+    /// Commit an empty foreign commit with `message` on the closed store's
+    /// usage branch, as an older binary or a manual edit would leave HEAD.
+    async fn foreign_empty_commit(options: &OpenOptions, message: &str) -> Result<()> {
+        let server = super::super::tests::released_server(options).await?;
+        let pool = server.pool(BRANCH).await?;
+        let committed =
+            sqlx::query("CALL DOLT_COMMIT('--allow-empty', '--message', ?, '--author', ?)")
+                .bind(message)
+                .bind(AUTHOR)
+                .fetch_all(pool.as_ref())
+                .await;
+        pool.close().await;
+        let closed = server.close().await;
+        committed?;
+        closed
+    }
+
+    fn usage_open(store: &MemoryStore) -> Result<UsageOpen> {
+        store
+            .shared
+            .usage_open
+            .lock()
+            .expect("usage open lock")
+            .clone()
+            .context("the open recorded no usage establishment")
+    }
+
+    async fn receipt_ids(store: &MemoryStore) -> Result<Vec<String>> {
+        let pool = store
+            .shared
+            .usage_pool
+            .lock()
+            .expect("usage pool lock")
+            .clone()
+            .context("usage pool missing")?;
+        Ok(sqlx::query_scalar("SELECT id FROM operations ORDER BY id")
+            .fetch_all(pool.as_ref())
+            .await?)
+    }
+
+    // T1 and T2 (design T10, T4): a head without a record (an older binary's
+    // write) gets one full scan and one record commit; the next reopen is
+    // Bound, decodes 0 rows and adds nothing; after one write, a reopen is
+    // Bound again with no record commit.
+    #[tokio::test]
+    async fn an_unrecorded_head_is_scanned_once_then_reopens_bound() -> Result<()> {
+        let seeded = seeded().await?;
+        let (written, message, _) = closed_usage_head(&seeded.options).await?;
+        ensure!(
+            parse_record(&message).is_some_and(|record| record.validator == VALIDATOR),
+            "a ledger write carried no record: {message:?}"
+        );
+        foreign_empty_commit(&seeded.options, "usage ledger v1 [older binary]").await?;
+        let (foreign, _, _) = closed_usage_head(&seeded.options).await?;
+        ensure!(foreign != written);
+
+        let store = MemoryStore::open(seeded.options.clone()).await?;
+        ensure!(
+            usage_open(&store)?
+                == UsageOpen {
+                    bound: false,
+                    scanned: Some(4),
+                    rescanned: None,
+                    recorded: true,
+                },
+            "{:?}",
+            usage_open(&store)?
+        );
+        let receipts = receipt_ids(&store).await?;
+        ensure!(receipts.len() == 4, "{receipts:?}");
+        let validated_hash = validated(&store).context("no validated content")?;
+        store.close().await?;
+        let (recorded, message, parents) = closed_usage_head(&seeded.options).await?;
+        ensure!(parents == [foreign.clone()], "{parents:?}");
+        ensure!(
+            message.starts_with("usage ledger validation v1\n\n")
+                && parse_record(&message)
+                    == Some(UsageRecord {
+                        validator: VALIDATOR,
+                        state_hash: &validated_hash,
+                    }),
+            "{message:?}"
+        );
+
+        let store = MemoryStore::open(seeded.options.clone()).await?;
+        ensure!(
+            usage_open(&store)?
+                == UsageOpen {
+                    bound: true,
+                    scanned: None,
+                    rescanned: None,
+                    recorded: false,
+                }
+        );
+        ensure!(receipt_ids(&store).await? == receipts);
+        let ledger = store.usage_ledger()?;
+        ledger
+            .admit(start(SEEDED_SESSION, "after-the-record"))
+            .await?;
+        drop(ledger);
+        store.close().await?;
+        let (written_again, _, parents) = closed_usage_head(&seeded.options).await?;
+        ensure!(parents == [recorded]);
+
+        let store = MemoryStore::open(seeded.options.clone()).await?;
+        ensure!(
+            usage_open(&store)?
+                == UsageOpen {
+                    bound: true,
+                    scanned: None,
+                    rescanned: None,
+                    recorded: false,
+                }
+        );
+        store.close().await?;
+        ensure!(closed_usage_head(&seeded.options).await?.0 == written_again);
+        Ok(())
+    }
+
+    // T3 (design T9): after a record, a foreign commit corrupts one owned
+    // row, (a) without a record, (b) copying HEAD's exact message with its
+    // record, (c) with a valid value under a non-canonical key and the copied
+    // record. Every reopen refuses: the stale record forces the scan.
+    #[tokio::test]
+    async fn corruption_after_a_record_refuses_the_reopen() -> Result<()> {
+        let seeded = seeded().await?;
+        let (_, recorded, _) = closed_usage_head(&seeded.options).await?;
+        ensure!(parse_record(&recorded).is_some(), "{recorded:?}");
+        let malformed = row(record_key(SEEDED_INVOCATION), "{\"start\":");
+        assert_reopen_refuses(
+            &seeded,
+            "(a) malformed, no record",
+            &malformed,
+            "usage ledger record is malformed",
+        )
+        .await?;
+        assert_reopen_refuses_with(
+            &seeded,
+            "(b) malformed, copied record",
+            &malformed,
+            "usage ledger record is malformed",
+            &recorded,
+        )
+        .await?;
+        assert_reopen_refuses_with(
+            &seeded,
+            "(c) non-canonical key, copied record",
+            &row(record_key("other-invocation"), seeded.record.clone()),
+            "usage ledger record key does not match its invocation",
+            &recorded,
+        )
+        .await?;
+        plant(&seeded, &[]).await?;
+        assert_seeded_usage_reads_back(&seeded).await
+    }
+
+    // T5 (design T11): another validator's record over the live content is
+    // Missing: the open scans and re-records under this validator. The same
+    // foreign record over an unknown class (the downgrade case) refuses.
+    #[tokio::test]
+    async fn another_validators_record_is_scanned_and_rerecorded() -> Result<()> {
+        let seeded = seeded().await?;
+        let store = MemoryStore::open(seeded.options.clone()).await?;
+        let live = validated(&store).context("no validated content")?;
+        store.close().await?;
+        let older = format!(
+            "usage ledger v1 [older]\n\nKuru-Usage-State: kuru.usage.state.v0+0.0.0 {live}"
+        );
+        foreign_empty_commit(&seeded.options, &older).await?;
+        let store = MemoryStore::open(seeded.options.clone()).await?;
+        ensure!(
+            usage_open(&store)?
+                == UsageOpen {
+                    bound: false,
+                    scanned: Some(4),
+                    rescanned: None,
+                    recorded: true,
+                }
+        );
+        store.close().await?;
+        let (_, message, _) = closed_usage_head(&seeded.options).await?;
+        ensure!(
+            parse_record(&message)
+                == Some(UsageRecord {
+                    validator: VALIDATOR,
+                    state_hash: &live,
+                })
+        );
+
+        // The downgrade case: a newer validator's record over content with a
+        // class this binary does not know. The record names the planted
+        // content's own hash, so only the validator differs.
+        let server = super::super::tests::released_server(&seeded.options).await?;
+        let pool = server.pool(BRANCH).await?;
+        let planted = async {
+            sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+                .bind(b"kuru.usage.v1/future/x".as_slice())
+                .bind("{\"future\":true}")
+                .execute(pool.as_ref())
+                .await?;
+            let hash = state_hash(pool.as_ref()).await?;
+            sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
+                .bind(format!(
+                    "usage ledger v1 [newer]\n\nKuru-Usage-State: kuru.usage.state.v2+9.9.9 {hash}"
+                ))
+                .bind(AUTHOR)
+                .fetch_all(pool.as_ref())
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        server.close().await?;
+        planted?;
+        let error = match MemoryStore::open(seeded.options.clone()).await {
+            Ok(store) => {
+                store.close().await?;
+                bail!("a newer validator's record activated an unknown class");
+            }
+            Err(error) => format!("{error:#}"),
+        };
+        ensure!(
+            error.contains("usage ledger owns an unrecognized state key"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    // T15: an empty ledger writes no record commit at open, so a fresh
+    // store's usage head is its creation head across reopens, and the first
+    // ledger write carries the record.
+    #[tokio::test]
+    async fn an_empty_ledger_writes_no_record() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::warmed_open_options(
+            root.path().to_owned(),
+            format!("project/{}", "0".repeat(64)),
+        )
+        .await?;
+        let store = MemoryStore::open(options.clone()).await?;
+        let first = usage_open(&store)?;
+        ensure!(
+            first
+                == UsageOpen {
+                    bound: false,
+                    scanned: Some(0),
+                    rescanned: None,
+                    recorded: false,
+                },
+            "{first:?}"
+        );
+        store.close().await?;
+        let (head, _, _) = closed_usage_head(&options).await?;
+        let store = MemoryStore::open(options.clone()).await?;
+        ensure!(usage_open(&store)? == first);
+        let ledger = store.usage_ledger()?;
+        ledger.mark_new_session("first").await?;
+        drop(ledger);
+        store.close().await?;
+        let (written, message, parents) = closed_usage_head(&options).await?;
+        ensure!(
+            parents == [head.clone()],
+            "the empty ledger gained a commit at open"
+        );
+        ensure!(written != head);
+        ensure!(
+            parse_record(&message).is_some_and(|record| record.validator == VALIDATOR),
+            "{message:?}"
+        );
+        let store = MemoryStore::open(options).await?;
+        ensure!(usage_open(&store)?.bound);
+        store.close().await
+    }
+
+    // T13 for the record commit: its receipt reconciles as not committed
+    // while HEAD is its base, as committed when HEAD records exactly its
+    // content on top of the base, and as ambiguous otherwise.
+    #[tokio::test]
+    async fn the_validation_record_receipt_reconciles() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let ledger = store.usage_ledger()?;
+        let pool = ledger.store.pool.clone();
+        let base = revision(pool.as_ref()).await?;
+        let live = state_hash(pool.as_ref()).await?;
+        let receipt = |base_head: &str| Receipt::UsageValidation {
+            base_head: base_head.into(),
+            state_hash: live.clone(),
+        };
+        let finished = || async {
+            let (_, id) = owned_connection(&pool).await?;
+            Ok::<_, anyhow::Error>(id)
+        };
+
+        set_pending(&ledger, finished().await?, receipt(&base));
+        assert_eq!(ledger.store.reconcile().await?, Some(false));
+        assert_eq!(validated(&store), Some(live.clone()));
+
+        sqlx::query("CALL DOLT_COMMIT('--allow-empty', '--message', ?, '--author', ?)")
+            .bind(record_message(&live))
+            .bind(AUTHOR)
+            .fetch_all(pool.as_ref())
+            .await?;
+        set_pending(&ledger, finished().await?, receipt(&base));
+        assert_eq!(ledger.store.reconcile().await?, Some(true));
+        assert_eq!(validated(&store), Some(live.clone()));
+        ledger.mark_new_session("after-record").await?;
+
+        let error = {
+            set_pending(&ledger, finished().await?, receipt(&base));
+            ledger.store.reconcile().await.unwrap_err()
+        };
+        ensure!(
+            format!("{error:#}").contains("cannot reconcile the usage validation record"),
+            "{error:#}"
+        );
+        ensure!(
+            ledger
+                .store
+                .shared
+                .uncertain
+                .lock()
+                .expect("uncertain lock")
+                .is_some(),
+            "an ambiguous record outcome was cleared"
+        );
+        *ledger
+            .store
+            .shared
+            .uncertain
+            .lock()
+            .expect("uncertain lock") = None;
+        drop(pool);
+        drop(ledger);
+        store.close().await
     }
 }

@@ -4588,6 +4588,44 @@ mod tests {
             .context("upgraded usage pool missing")?;
         assert_eq!(version(&usage).await?, 4);
         assert_ne!(revision(&usage).await?, old_usage_head);
+        // D (unit 7 T7): the pre-upgrade scan decodes the one owned row; the
+        // receipt upgrade leaves `state` byte-identical, so no second walk
+        // runs, and one record commit sits on the migration head.
+        assert_eq!(
+            store
+                .shared
+                .usage_open
+                .lock()
+                .expect("usage open lock")
+                .clone(),
+            Some(super::super::usage_ledger::UsageOpen {
+                bound: false,
+                scanned: Some(1),
+                rescanned: None,
+                recorded: true,
+            })
+        );
+        let (record_head, record_message): (String, String) = bounded_query(
+            sqlx::query_as("SELECT commit_hash, message FROM dolt_log LIMIT 1")
+                .fetch_one(usage.as_ref()),
+        )
+        .await?;
+        assert_eq!(record_head, revision(&usage).await?);
+        assert!(
+            record_message.starts_with("usage ledger validation v1\n\nKuru-Usage-State: "),
+            "{record_message:?}"
+        );
+        let migration_head = sole_parent(&usage, &record_head).await?;
+        let migration_message: String = bounded_query(
+            sqlx::query_scalar("SELECT message FROM dolt_log WHERE commit_hash = ?")
+                .bind(&migration_head)
+                .fetch_one(usage.as_ref()),
+        )
+        .await?;
+        assert!(
+            migration_message.starts_with("Upgrade Kuru memory schema 4"),
+            "{migration_message:?}"
+        );
         let legacy_format: i32 = bounded_query(
             sqlx::query_scalar("SELECT receipt_format FROM operations WHERE id = ?")
                 .bind(&old_receipt)
