@@ -466,15 +466,17 @@ pub(crate) async fn open_owner_store(
             activity_tag(token),
         ))
     });
+    // Both opens are boxed: held inline together they doubled the owner
+    // open's future, which then overflowed a 2 MiB Windows test thread.
     if target.is_none() && !fixture_stages {
-        return Ok((MemoryStore::open(options).await?, None));
+        return Ok((Box::pin(MemoryStore::open(options)).await?, None));
     }
     let (data_dir, scope) = (options.data_dir.clone(), options.project_scope.clone());
     #[cfg(any(test, feature = "test-support"))]
     let hold_limit = Duration::from_secs(options.config.startup_timeout_secs);
     let mut feed = target.map(|(directory, tag)| Feed::start(directory, tag, hooks.writes.clone()));
     let (mut progress, opening) = MemoryStore::open_observed(options);
-    tokio::pin!(opening);
+    let mut opening = Box::pin(opening);
     let mut progress_open = true;
     let result = loop {
         tokio::select! {
@@ -745,6 +747,24 @@ mod tests {
             assert!(!is_tag(&raw), "{raw}");
             assert!(!tag.contains(&raw));
         }
+    }
+
+    // Holding both store opens inline more than doubled the owner open's
+    // future; the frames that build it then overflowed 2 MiB Windows test
+    // threads. Building the futures runs nothing.
+    #[test]
+    fn the_owner_store_open_holds_no_store_open_inline() {
+        let options = OpenOptions::new(
+            PathBuf::from("unused"),
+            format!("project/{}", "a".repeat(64)),
+        );
+        let owner = open_owner_store(options.clone(), OwnerHooks::default());
+        let store = MemoryStore::open(options);
+        let (owner, store) = (size_of_val(&owner), size_of_val(&store));
+        assert!(
+            owner < store / 2,
+            "the owner's store open ({owner} bytes) holds a store open ({store} bytes) inline"
+        );
     }
 
     // T9
