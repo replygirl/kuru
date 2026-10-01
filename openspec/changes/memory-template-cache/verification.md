@@ -1,9 +1,18 @@
 # Verification
 
 Local evidence: macOS 27.0 arm64 (shared, loaded host), debug profile, pinned
-Dolt 2.3.5; the full `mise run //packages/kuru-memory:test` task (453 lib
-tests passed, 4 ignored) and the named tests below. Linux, Windows and
-coverage evidence comes only from CI on the pull request; none is claimed here.
+Dolt 2.3.5; the named tests below, and a full `mise run //packages/kuru-memory:test`
+run recorded earlier in this change's history (453 lib tests passed, 4 ignored
+at that point). Should-fix tests added afterward grew the lib binary to 467
+tests (observed via `cargo test -p kuru-memory --lib --locked -- --list`); the
+453/4 figures are a count from that earlier run, not a claim about the tests
+added since. Linux, Windows and coverage evidence comes only from CI on the
+pull request; none is claimed here. CI run 36812668480 (PR #147 head
+`73f4efd4`) passed `ci-gate` and every job; `git diff --stat 86a3ce27..73f4efd4`
+shows only this file changed, so the code this run covers is byte-identical to
+run 36811060688 on `86a3ce27`, already cited below. The head run's own
+macOS coverage merge (job 110214937301) reported 94.56% of lines (gate 90%),
+consistent with 86a3ce27's 94.57%.
 
 ## 1. A template builds once per key and is byte-identical to a cold store's schema [critical]
 
