@@ -98,3 +98,22 @@ from scratch.
       `//packages/kuru-memory:lint` exit 0;
       `//packages/kuru-memory:lint:windows` exit 0. hk pre-commit runs on
       the commit that records this evidence.
+
+## 5. Rebase integration against origin/main
+
+- [x] 5.1 Rebase `fix/memory-template-quarantine-identity` onto `origin/main`
+      (moved to `76ca2b5a` via #150/#151 between branch creation and PR
+      open). The rebase applied cleanly with no conflicts, but the pre-push
+      `typecheck` hook then failed: `create_unspawned`'s declared return
+      type (`Result<Created, CreationFailure>`) did not match `create_in`'s
+      actual return type (`Result<Created, CreateError>`) — a pre-existing
+      mismatch in this branch's own helper, exposed once the rebase forced
+      a fresh `cargo check`. Fixed by changing `create_unspawned`'s
+      signature to `Result<Created, CreateError>`, matching every call
+      site's existing `CreateError::Use(CreationFailure::..)` matches and
+      the `.map_err(failure)` use at the one call site that discards the
+      error type — no other code changed. Re-ran `format:check`,
+      `//packages/kuru-memory:typecheck`, `:lint`, `:lint:windows` (all
+      exit 0), and `//packages/kuru-memory:test -- store::creation_template::`
+      (exit 0, including the affected tests) after the fix. `mise.lock` was
+      not modified by the rebase.

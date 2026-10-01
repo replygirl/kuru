@@ -68,7 +68,7 @@ async fn create(root: &Path, engine: &Engine, stage: &Directory) -> Result<Creat
 /// would otherwise keep a just-released description locked until its exec
 /// (see `crate::spawn_gate`): the quarantine would be skipped, or the next
 /// shared lock reported busy.
-async fn create_unspawned(root: &Path, stage: &Directory) -> Result<Created, CreationFailure> {
+async fn create_unspawned(root: &Path, stage: &Directory) -> Result<Created, CreateError> {
     let _gate = crate::spawn_gate::locking_async().await;
     create_in(root, &no_engine(), stage).await
 }
