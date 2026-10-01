@@ -136,6 +136,22 @@ async fn clone_shared(root: &Path) -> Result<FileIdentity> {
     copied
 }
 
+/// Plant under `root`, for `key`, an abandoned build store (with no live
+/// lease) and an abandoned capture stage, holding no handle on either, and
+/// return their names.
+fn plant_abandoned(root: &Path, key: &str) -> Result<[String; 2]> {
+    let directory = open_root(root)?;
+    let build = format!(".build-{key}-{}", Uuid::new_v4());
+    directory
+        .create_private_directory(OsStr::new(&build))?
+        .create_private_directory(OsStr::new(BUILD_STORE))?
+        .create_private_directory(OsStr::new(DATA))?;
+    let stage = format!(".stage-{key}-{}", Uuid::new_v4());
+    let partial = directory.create_private_directory(OsStr::new(&stage))?;
+    files::write(&partial.path().join("partial"), b"a partial capture")?;
+    Ok([build, stage])
+}
+
 /// The template directory's identity, if it is published.
 fn published(root: &Path) -> Option<FileIdentity> {
     files::directory(&root.join(key()))
@@ -633,9 +649,17 @@ async fn structural_verdict_without_waiting_quarantines_and_never_rebuilds() -> 
     let mut manifest = read_manifest(&template)?;
     manifest.format += 1;
     write_manifest(&template, &manifest)?;
-    let refused = ensure_in(&root, &no_engine(), Wait::Never)
-        .await
-        .expect_err("a damaged template was accepted");
+    // A build store left beside the published template (its removal failed
+    // after publication) and an abandoned capture stage of this key, and
+    // another key's build store.
+    let abandoned = plant_abandoned(&root, key())?;
+    let other = plant_abandoned(&root, &"0".repeat(64))?;
+    let refused = {
+        // No engine starts; the sweep takes the abandoned build's lease.
+        let _gate = crate::spawn_gate::locking_async().await;
+        ensure_in(&root, &no_engine(), Wait::Never).await
+    }
+    .expect_err("a damaged template was accepted");
     ensure!(refused.is_verdict(), "{refused}");
     ensure!(published(&root).is_none(), "not quarantined");
     let quarantined = rejected(&root)?;
@@ -644,8 +668,18 @@ async fn structural_verdict_without_waiting_quarantines_and_never_rebuilds() -> 
     };
     assert_eq!(files::directory(&root.join(only))?.identity(), judged);
     let names = entries_of(&root)?;
+    // The quarantining holder sweeps this key's abandoned entries, as a
+    // build would, and builds nothing.
+    for gone in &abandoned {
+        ensure!(!names.contains(gone), "{gone} was not swept: {names:?}");
+    }
+    for kept in &other {
+        ensure!(names.contains(kept), "{kept} was removed: {names:?}");
+    }
     ensure!(
-        !names.iter().any(|name| name.starts_with(".build-")),
+        !names
+            .iter()
+            .any(|name| name.starts_with(&format!(".build-{}-", key()))),
         "a build started after the verdict: {names:?}"
     );
     // A warm-up quarantines and rebuilds.
@@ -881,6 +915,9 @@ async fn half_built_template_is_swept_after_quiescence_and_rebuilt() -> Result<(
     let capture = format!(".stage-{}-{}", key(), Uuid::new_v4());
     let partial = directory.create_private_directory(OsStr::new(&capture))?;
     files::write(&partial.path().join("partial"), b"a partial capture")?;
+    // An abandoned stage has no live handle; a held one would keep its name
+    // delete-pending on Windows.
+    drop(partial);
     let other = "0".repeat(64);
     let other_build = format!(".build-{other}-{}", Uuid::new_v4());
     abandoned_build(&other_build)?;
@@ -906,7 +943,15 @@ async fn half_built_template_is_swept_after_quiescence_and_rebuilt() -> Result<(
     let mut expected = vec![dead.clone(), capture.clone()];
     expected.sort();
     assert_eq!(removed, expected, "{:?}", report.swept);
-    assert_eq!(report.swept.left, std::slice::from_ref(&live));
+    let left: Vec<&str> = report
+        .swept
+        .left
+        .iter()
+        .map(|left| left.name.as_str())
+        .collect();
+    assert_eq!(left, [live.as_str()], "{:?}", report.swept);
+    // The held lease is why it was left, and the error says so.
+    ensure!(!report.swept.left[0].error.is_empty(), "{:?}", report.swept);
     ensure!(report.published);
     let names = entries_of(&root)?;
     for kept in [&live, &other_build, &other_stage] {

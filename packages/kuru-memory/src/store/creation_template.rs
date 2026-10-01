@@ -946,7 +946,14 @@ pub(crate) struct Engine {
 #[derive(Debug, Default)]
 pub(crate) struct Swept {
     pub(crate) removed: Vec<String>,
-    pub(crate) left: Vec<String>,
+    pub(crate) left: Vec<SweepLeft>,
+}
+
+/// An abandoned entry a sweep left for a later holder, and why.
+#[derive(Debug)]
+pub(crate) struct SweepLeft {
+    pub(crate) name: String,
+    pub(crate) error: String,
 }
 
 /// What one build did.
@@ -998,32 +1005,61 @@ async fn sweep(root: &Directory, key: &str, lifecycle_root: Option<&Path>) -> Sw
         match result {
             Ok(()) => swept.removed.push(name),
             Err(error) => {
+                let error = format!("{error:#}");
                 tracing::warn!(
                     entry = %name,
-                    error = %format!("{error:#}"),
+                    error = %error,
                     "store template sweep left an abandoned entry for a later holder"
                 );
-                swept.left.push(name);
+                swept.left.push(SweepLeft { name, error });
             }
         }
     }
     swept
 }
 
+/// Under an exclusive key lock already held for a quarantine: sweep this
+/// key's abandoned entries as a build would, so a build store left after
+/// its template was published does not outlive the next exclusive holder.
+/// Best-effort: an unusable lifecycle root skips the sweep with a warning.
+async fn sweep_held(root: &Directory, key: &str) -> Swept {
+    match build_lifecycle_root(root) {
+        Ok(lifecycle_root) => sweep(root, key, lifecycle_root.as_deref()).await,
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "store template sweep skipped: its lifecycle root is unusable"
+            );
+            Swept::default()
+        }
+    }
+}
+
 async fn sweep_build(path: &Path, lifecycle_root: Option<&Path>) -> Result<()> {
     let store = path.join(BUILD_STORE);
-    let lease = match fs::symlink_metadata(&store) {
+    match fs::symlink_metadata(&store) {
         Ok(metadata) if metadata.is_dir() => {
-            Some(Server::quiescence_at(&store, lifecycle_root, SWEEP_QUIESCENCE).await?)
+            // The lease proves no engine is live there.
+            let lease = Server::quiescence_at(&store, lifecycle_root, SWEEP_QUIESCENCE).await?;
+            remove_build_store(lease).context("remove the abandoned store template build store")?;
         }
-        Ok(_) => None,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
-    };
-    // The lease proves no engine is live there; it is held through removal.
-    files::directory(path)?.remove_tree()?;
-    drop(lease);
+    }
+    files::directory(path)?
+        .remove_tree()
+        .context("remove the emptied store template build directory")?;
     Ok(())
+}
+
+/// Remove a reaped build store through its own lifecycle lease, which this
+/// consumes. The lease's handle on the store is the one the removal
+/// consumes: a second handle opened beside it would keep the store's name
+/// delete-pending on Windows until the lease dropped, so its parent could
+/// not be removed.
+fn remove_build_store(lease: crate::server::LifecycleLease) -> Result<()> {
+    lease.remove_tree()
 }
 
 /// Build, capture, verify and publish this key's template. The caller holds
@@ -1153,18 +1189,19 @@ async fn capture(
         }
     };
     // The template is complete without the build store; a removal failure
-    // leaves it for a sweep.
-    let build = store.parent().map(Path::to_owned);
-    if let Some(build) = build
-        && let Err(error) = files::directory(&build).and_then(|build| Ok(build.remove_tree()?))
-    {
+    // leaves it for a sweep. The store goes through the lease's own handle
+    // (still the reap proof), and only then its emptied parent.
+    let removed = remove_build_store(lease).and_then(|()| match store.parent() {
+        Some(build) => Ok(files::directory(build)?.remove_tree()?),
+        None => Ok(()),
+    });
+    if let Err(error) = removed {
         tracing::warn!(
-            build = %build.display(),
+            build = %store.display(),
             error = %format!("{error:#}"),
             "store template build store left for a later sweep"
         );
     }
-    drop(lease);
     Ok((stage, manifest, needles))
 }
 
@@ -1320,6 +1357,7 @@ async fn quarantine(root: &Directory, key: &str, judged: FileIdentity) -> Quaran
     match try_key_lock(root, key, Mode::Exclusive) {
         Ok(Some(lock)) => {
             let moved = quarantine_held(root, key, judged);
+            sweep_held(root, key).await;
             drop(lock);
             moved
         }
@@ -1508,6 +1546,8 @@ pub(crate) async fn ensure_in(
             Inspection::Condemned { identity, failure } => {
                 let moved = identity.map(|identity| quarantine_held(&root, key, identity));
                 if matches!(wait, Wait::Never) {
+                    // A build would sweep; this holder builds nothing.
+                    sweep_held(&root, key).await;
                     drop(lock);
                     return Err(failure.context(
                         "the published store template failed its structural check".into(),
@@ -1609,6 +1649,7 @@ pub(crate) async fn create_in(
             {
                 let moved = quarantine_held(root, key, judged.identity);
                 account(root.path(), stage.path(), &moved);
+                sweep_held(root, key).await;
             }
             drop(lock);
             copied.map(|()| Created::Copied {
@@ -1621,6 +1662,7 @@ pub(crate) async fn create_in(
                 let moved = quarantine_held(root, key, identity);
                 account(root.path(), stage.path(), &moved);
             }
+            sweep_held(root, key).await;
             drop(lock);
             Err(failure)
         }

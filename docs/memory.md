@@ -312,6 +312,14 @@ bytes fails; an engine, I/O, lock or deadline failure leaves it in place. No
 caller ever waits for another process's build: a busy template means building
 the store without one.
 
+A build's own working store (`.build-<key>-<id>/`, which holds the build's
+private identity record and its database credentials) is removed once its
+template is captured. If that removal fails, or a builder stops before it,
+the next holder of the key's exclusive lock removes it, without waiting for an
+engine that has not yet stopped: the next build, or the next quarantine of
+that key's template. Until then it stays in the cache directory, which is
+private to your user.
+
 A template directory Kuru cannot read, for example one whose permissions are
 no longer private to your user, is an I/O failure rather than a verdict
 against its bytes, so it is never moved aside. Once new projects are created

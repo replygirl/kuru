@@ -33,8 +33,16 @@ the real schema-migration chain and the real usage-branch upgrade against a
 fixed placeholder identity on one engine, then validating that engine's
 active schema and the same shape assertion a copied stage validates after
 adoption, parameterized with the placeholder identity in place of an adopted
-one. A build MUST refuse to publish, and MUST leave any previously published
-template for its key untouched, unless every one of those assertions passes.
+one. That shape assertion MUST read every commit on the main branch and on the
+usage branch and compare each commit's committer, committer email, author,
+author email and message, and the history's length, with the history derived
+from the compiled registries: the engine's own first commit under its fixed
+system account, then commits under Kuru's fixed author with the
+initialization message, one upgrade message per executed step naming its
+retained attempt's operation, and the adoption message once adopted. A
+completed history read that differs is a verdict against the bytes. A build
+MUST refuse to publish, and MUST leave any previously published template for
+its key untouched, unless every one of those assertions passes.
 Before publication, the captured `data/` tree MUST be scanned for occurrences
 of the build directory's own absolute path, either engine secret used during
 the build, or the local host name, and publication MUST be refused if any
@@ -42,7 +50,11 @@ occurrence is found. Publication MUST be a rename that does not replace an
 existing published directory for the same key, verifying the moved
 directory's identity after the rename; on a publication failure the build's
 own verified, unpublished stage MAY still be copied by its own caller, and
-MUST be left in place for the next exclusive-lock holder to resolve.
+MUST be left in place for the next exclusive-lock holder to resolve. A holder
+of a key's exclusive lock that builds or quarantines MAY remove that same
+key's own abandoned build and capture-stage directories, without waiting for
+an engine that has not yet stopped: an entry whose engine lease is still held,
+or whose removal fails, MUST be left for a later holder.
 
 A verified copy of a published template MUST be obtained only under that
 key's shared lock, and MUST independently verify, while copying, that the

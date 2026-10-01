@@ -198,12 +198,18 @@ mod tests {
     /// written while a guard bound in the same scope is still held.
     #[test]
     fn no_spawn_guard_encloses_a_test_cache_warm_up() {
-        const WARM: [&str; 5] = [
+        // Direct warm-ups, then the helpers that warm first.
+        const WARM: [&str; 10] = [
             "warm_runtime_cache(",
             ".warmed()",
             "warmed_open_options(",
             "warmed_cache_dir(",
             "warm_blocking(",
+            "temporary()",
+            "temporary_cold()",
+            "open_temporary(",
+            "spawn_logged_owner(",
+            "cache_dir()",
         ];
         let mut files = Vec::new();
         let mut pending = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
@@ -267,6 +273,10 @@ mod tests {
                 }
             }
         }
+        println!(
+            "{guards_seen} spawn guards scanned, {} violations",
+            violations.len()
+        );
         assert!(
             guards_seen > 50,
             "the scan found only {guards_seen} spawn guards"
