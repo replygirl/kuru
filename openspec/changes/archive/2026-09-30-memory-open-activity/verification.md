@@ -30,7 +30,7 @@ Authored 2026-09-30 before implementation. Rows are ticked as evidence lands, wi
 - [x] 4.3 @integration (agent) T5 write-failure hook -> open succeeds and stages are exactly `[StartingMemoryService, Ready]`; observed 2026-09-30 on macOS (unit2-implementation-notes-2026-09-30.md)
 - [x] 4.4 @unit (agent) T9 codec -> round trip, unknown field, unknown stage name, over 4 KiB, wrong tag, raw-token tag rejected; observed 2026-09-30 on macOS (unit2-implementation-notes-2026-09-30.md)
 - [x] 4.5 @unit (agent) an owner opened with `starter_token = None` publishes no record -> record absent; observed 2026-09-30 on macOS (unit2-implementation-notes-2026-09-30.md)
-- [ ] 4.6 @integration (agent) T8 native on every CI platform: hold the record open, replace it, then retire while held -> replacement succeeds and reads back, the name is free at once for a fresh write, stage removal may be deferred; not yet run; Windows only in native CI
+- [~] 4.6 @integration (agent) T8 native on every CI platform: hold the record open, replace it, then retire while held expecting: replacement succeeds and reads back, the name is free at once for a fresh write, stage removal may be deferred; not yet run; Windows only in native CI -> defer: native CI only (Windows); not run locally
 
 ## 5. Retirement runs inside the owner's close, never detached
 
@@ -42,7 +42,7 @@ Authored 2026-09-30 before implementation. Rows are ticked as evidence lands, wi
 
 - [x] 6.1 @unit (agent) T13 renderer against a buffer -> `\r` rewrite with `width_cjk` padding; truncation keeps the ellipsis and no line exceeds `cols - 1` at 20, 3 and 2 columns; nothing when no room; erase on complete and abandon; non-terminal one line per change, whole lines, nothing at ready; failing sink switches off; N2 versus N2'; no `Memory:`; observed 2026-09-30 on macOS (unit2-implementation-notes-2026-09-30.md)
 - [x] 6.2 @e2e (agent) T18 Unix PTY via `/bin/sh -c 'exec "$0" 2>"$1"'` -> PTY bytes before the alternate screen contain S1 and the stderr file contains none of S1-S5; observed 2026-09-30 on macOS (unit2-implementation-notes-2026-09-30.md)
-- [ ] 6.3 @manual (human) run `kuru` on a terminal with an empty cache and a new project, resize narrow -> the sentence rewrites in place, stays on one line with its ellipsis and is gone before the interface appears; not yet run
+- [~] 6.3 @manual (human) run `kuru` on a terminal with an empty cache and a new project, resize narrow expecting: the sentence rewrites in place, stays on one line with its ellipsis and is gone before the interface appears; not yet run -> defer: manual human terminal check; not run
 
 ## 7. Marker lines for the open-time harness [critical]
 
@@ -57,9 +57,13 @@ Authored 2026-09-30 before implementation. Rows are ticked as evidence lands, wi
 
 ## 9. Open time is not slower
 
-- [ ] 9.1 @benchmark (agent) release-smoke medians for first launch and existing project, each iteration awaiting the previous owner's exit -> within noise of 6173 ms and 628 ms; not yet run
+- [~] 9.1 @benchmark (agent) release-smoke medians for first launch and existing project, each iteration awaiting the previous owner's exit expecting: within noise of 6173 ms and 628 ms; not yet run -> defer: release-smoke medians need a release build and quiet host; not run
 - [x] 9.2 @regression (agent) `//packages/kuru-memory:test`, `//apps/kuru-tui:test`, `lint` (host and Windows target), `format:check`, `typecheck` -> pass; observed 2026-09-30 on macOS: kuru-memory 449 lib tests and the other targets, kuru-tui 274 tests, lint, format:check, typecheck, all exit 0 (Windows-target lint last run at WP-D; no Rust changed since)
 
 ## 10. Windows hook forwarding
 
-- [ ] 10.1 @runtime (agent) native Windows CI: the two test-support variables reach the owner and T8 passes -> observed in CI only; not yet run, unverified on macOS
+- [~] 10.1 @runtime (agent) native Windows CI: the two test-support variables reach the owner and T8 passes expecting: observed in CI only; not yet run, unverified on macOS -> defer: native Windows CI only; unverified on macOS
+
+## Rebased onto origin/main 52f9869d (2026-09-30, macOS, MISE_LOCKED=1)
+
+Measured: `//packages/kuru-memory:test` 469 passed, 0 failed, 4 ignored, exit 0; `//apps/kuru-tui:test` exit 0, 0 failed; `lint`, `lint:windows`, `format:check`, `typecheck`, `docs:check` exit 0; `cospec validate --strict` 0 errors, 0 warnings. Not run: native Linux/macOS/Windows CI, Windows behaviour, release-smoke medians (9.1), manual terminal check (6.3). Rows 4.6, 6.3, 9.1 and 10.1 stay open and are deferred at archive.
