@@ -1324,6 +1324,8 @@ pub(crate) enum ClosePoint {
     AfterEndpointRetire,
     /// After the store close and Dolt reap, before the owner lock release.
     AfterReap,
+    /// After the owner lock release, before the gated open timeline write.
+    AfterRelease,
 }
 
 /// An owner-local test barrier at each of its [`ClosePoint`]s. Modelled on
@@ -1709,9 +1711,12 @@ impl ServiceOwner {
         #[cfg(test)]
         ClosePause::reached(pause, ClosePoint::AfterReap).await;
         let released = lock.release();
+        #[cfg(test)]
+        ClosePause::reached(pause, ClosePoint::AfterRelease).await;
         // Diagnostics only, after the release a successor's wait ends at: the
-        // name is this generation's own, and nothing here can fail, lengthen
-        // or reorder this close or a successor's open.
+        // name is this generation's own, and nothing here can fail or reorder
+        // this close or a successor's open. A gated close adds only this one
+        // create-only, unsynced write of a bounded size before it returns.
         #[cfg(test)]
         let timeline = timeline.or(open_timeline::installed());
         #[cfg(not(test))]

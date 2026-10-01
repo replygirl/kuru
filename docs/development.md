@@ -682,8 +682,9 @@ bounded log sealed when its endpoint is published, and writes the log once,
 after its close has released the owner lock, to
 `memory/services/<hash>/open-timeline-<service-generation>.json` in the data
 directory. The write is owner-private, create-only and deliberately not durable
-(no sync); a failed open writes nothing, and a failed write never fails or
-delays the open, serve or close. The file (`format` `kuru.open-timeline`,
+(no sync); a failed open writes nothing, and a failed write never fails the
+open, serve or close. The write never delays the open, serve or a successor's
+lock wait; a gated close returns after that one small write. The file (`format` `kuru.open-timeline`,
 `format_version` 1) holds `kuru_version`, `service_generation`, one wall-clock
 `anchor_unix_ns`, `events` as `{event, ns}` pairs, `counts.usage_rows` (the
 first usage-ledger scan's row count, or `null`), `dropped` and `late`; never a

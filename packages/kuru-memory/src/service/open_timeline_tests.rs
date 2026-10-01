@@ -117,6 +117,66 @@ async fn a_failed_record_write_leaves_the_close_unchanged() -> Result<()> {
     .with_context(|| format!("timeline failure fixture exceeded its {deadline:?} deadline"))?
 }
 
+// The spec's successor scenario: a successor opens, serves, closes and writes
+// its own record while its predecessor has released the owner lock but not
+// yet written; the predecessor's later write then adds only its own file.
+#[tokio::test]
+async fn a_successor_is_unaffected_by_its_predecessors_pending_record() -> Result<()> {
+    warm_runtime_cache().await?;
+    let deadline = fixture_deadline(1, 1);
+    tokio::time::timeout(deadline, async {
+        let root = tempfile::tempdir()?;
+        let (project, scope, data, options) = owner_fixture(root.path())?;
+        let services = EndpointRecord::directory(&data, &scope)?;
+        let _gate = crate::spawn_gate::spawning().await;
+        let predecessor = ServiceOwner::open(options.clone(), &project).await?;
+        let first = predecessor.authority().service_generation.clone();
+        let pause = ClosePause::at(ClosePoint::AfterRelease);
+        let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+        knobs.close_pause = Some(pause.clone());
+        knobs.timeline = Some(stamped_timeline());
+        let pending = tokio::spawn(predecessor.serve_with(knobs));
+        drop(attach_raw(&data, &scope, None).await?);
+        pause.entered.notified().await;
+        ensure!(
+            owner_lock_free(&options)?,
+            "the lock was held after release"
+        );
+        ensure!(timeline_names(&services)?.is_empty());
+
+        let successor = ServiceOwner::open(options.clone(), &project).await?;
+        let second = successor.authority().service_generation.clone();
+        ensure!(
+            second != first,
+            "the successor reused its predecessor's generation"
+        );
+        let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+        knobs.timeline = Some(stamped_timeline());
+        let served = tokio::spawn(successor.serve_with(knobs));
+        drop(attach_raw(&data, &scope, None).await?);
+        served.await??;
+        let names = timeline_names(&services)?;
+        ensure!(names == [file_name(&second)], "{names:?}");
+
+        pause.release.notify_one();
+        pending.await??;
+        ensure!(owner_lock_free(&options)?);
+        let mut expected = vec![file_name(&first), file_name(&second)];
+        expected.sort();
+        let names = timeline_names(&services)?;
+        ensure!(names == expected, "{names:?}");
+        for generation in [&first, &second] {
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(services.join(file_name(generation)))?)?;
+            ensure!(record["service_generation"] == generation.as_str());
+            ensure!(record["events"].as_array().map(Vec::len) == Some(Event::ALL.len()));
+        }
+        await_managed_quiescence(&options).await
+    })
+    .await
+    .with_context(|| format!("timeline successor fixture exceeded its {deadline:?} deadline"))?
+}
+
 /// Spawn one real owner (with `environment` added), keep its endpoint
 /// record, then release its starter and await its process exit.
 #[cfg(all(unix, feature = "test-support"))]
