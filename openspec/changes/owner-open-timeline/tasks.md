@@ -17,12 +17,12 @@ Work in `tmp/worktrees/perf-owner-start-split` (branch `perf/owner-start-split`,
 
 ## 3. Aged-store fixture (WP2: `src/test_support/aged_store.rs`, `src/test_support.rs`, `src/main.rs`, `packages/kuru-memory/mise.toml`)
 
-- [ ] 3.1 Add `aged_store` (argument parser, SplitMix64, `age_open_store`, `run`, `main`), the feature-gated `age-store` arm and the `measure:age-store` task, and verify test 10 (determinism, counts, wrapper) passes.
-- [ ] 3.2 Run the 100-conversation pilot in three parallel processes, apply the D7 rule, and record `r` and the chosen ladder in `tmp/roadmap/unit6b-notes-2026-10-01.md`.
+- [x] 3.1 Add `aged_store` (argument parser, SplitMix64, `age_open_store`, `claim` and `age_claimed` in place of `run`, `main`), the feature-gated `age-store` arm and the `measure:age-store` task, and verify test 10 (determinism, counts, wrapper) passes. Observed 2026-10-01 (macOS arm64): `//packages/kuru-memory:test -- -- aged_store no_spawn_guard_encloses` 8 passed, 0 failed (the 6 `aged_store` tests, the spawn-gate scan and the scope test the filter also matches).
+- [x] 3.2 Run the 100-conversation pilot in three parallel processes, apply the D7 rule, and record `r` and the chosen ladder in `tmp/roadmap/unit6b-notes-2026-10-01.md`. Observed 2026-10-01 (macOS arm64): `r` = 84.3-84.7 writes/s per process (1,000 writes in 11.91-11.97 s each), so `C_max = 270·r` ≈ 22.8k at 10 writes per conversation and the ladder is 1k, 5k, 20k; aging times are in the notes.
 
 ## 4. Documentation (WP3: `docs/development.md`)
 
-- [ ] 4.1 Document the variable, file, schema, 18 event names, accumulation, the Windows non-support and `measure:age-store`, and verify `mise run docs:check` passes. Partial, 2026-10-01: the owner open timeline paragraph landed (variable, file, schema, 18 names, accumulation, Windows) and `docs:check` exited 0; the `measure:age-store` lines remain with WP2.
+- [x] 4.1 Document the variable, file, schema, 18 event names, accumulation, the Windows non-support and `measure:age-store`, and verify `mise run docs:check` passes. Observed 2026-10-01: the owner open timeline paragraph (WP3) and the `measure:age-store` paragraph beside `measure:lifecycle` (WP2) landed; `docs:check` exited 0 after each.
 
 ## 5. Measurement and report (WP4, WP5: outside the repository)
 

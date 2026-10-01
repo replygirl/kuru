@@ -28,9 +28,9 @@ Authored 2026-10-01 before implementation; rows are ticked as evidence lands, wi
 
 ## 5. The aged-store fixture is deterministic and uses the real write paths [critical]
 
-- [ ] 5.1 @integration (agent) test 10 two template stores aged with seed 7, 3 conversations, 2 turns -> equal reports matching writes `3*(2+7*2) = 48` and usage rows `3*(1+3*2) = 21`, equal session catalog ids and labels, equal ledger sessions and transcript windows; a different seed gives different session ids
-- [ ] 5.2 @integration (agent) test 10 wrapper `aged_store::run` on a real warmed data directory with seed 7, 2, 1 -> report equals the inner function's for the same plan on a sibling store, and the owner lock is free afterwards
-- [ ] 5.3 @unit (agent) argument parser -> required flags, defaults, and rejection of bad numbers and unknown flags
+- [x] 5.1 @integration (agent) test 10 two template stores aged with seed 7, 3 conversations, 2 turns -> equal reports matching writes `3*(2+8*2) = 54` (reconciled from the source design's `2+7T`: the runtime's possible-dispatch journal `put` is copied) and usage rows `3*(1+3*2) = 21`, equal session catalog ids and labels, equal ledger sessions and transcript windows; a different seed gives different session ids; Observed 2026-10-01 (macOS arm64): `equal_plans_age_equal_content_with_the_stated_counts` ok
+- [x] 5.2 @integration (agent) test 10 wrapper (`aged_store::claim` then `age_claimed`, which `main` composes) on a real warmed data directory with seed 7, 2, 1 -> counts equal the formula the inner test checks for the inner function, and the owner lock is free afterwards; Observed 2026-10-01 (macOS arm64): `the_claimed_wrapper_ages_the_one_store_and_releases_its_lock` ok
+- [x] 5.3 @unit (agent) argument parser -> required flags, defaults, and rejection of bad numbers and unknown flags; Observed 2026-10-01 (macOS arm64): `parse_reads_flags_and_defaults`, `parse_refuses_malformed_arguments`, `the_report_line_has_its_format_and_exact_fields`, `generated_content_is_a_pure_function_of_seed_and_index` ok
 
 ## 6. Static checks
 

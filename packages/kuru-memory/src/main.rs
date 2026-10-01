@@ -30,7 +30,11 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         #[cfg(feature = "test-support")]
-        _ => anyhow::bail!("expected prefetch or an internal service entry"),
+        Some("age-store") => {
+            kuru_memory::test_support::aged_store::main(std::env::args_os().skip(2)).await
+        }
+        #[cfg(feature = "test-support")]
+        _ => anyhow::bail!("expected prefetch, age-store or an internal service entry"),
         #[cfg(not(feature = "test-support"))]
         _ => anyhow::bail!("expected an internal service entry"),
     }
