@@ -36,6 +36,19 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// lock, while attachments are live or while a new owner awaits its starter.
 const OWNER_LOCK_RECHECK_INTERVAL: Duration = Duration::from_secs(35);
 const MAX_ATTACHMENTS: usize = 32;
+/// How long a starting client sleeps between attach attempts while it waits
+/// for the owner it just spawned. A cadence, not a deadline: the readiness
+/// wait still ends only at `memory.startup_timeout_secs`. The owner binds its
+/// listener before publishing its endpoint record, so the poll after the
+/// record appears attaches, and the open waits about half this interval past
+/// readiness. A miss before publication costs one small private-file read, a
+/// non-blocking child status check and, on an observed open, one activity
+/// record read. A Unix connect without a listener is refused at once. A
+/// Windows pipe connect retries an absent or busy pipe inside one attempt
+/// every 5 ms (`kuru_platform::windows::pipe`) until its own deadline;
+/// attempts are serial, so this only adds a sleep after that connect returns,
+/// and at twice the pipe's retry interval never polls finer than it.
+const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(feature = "test-support")]
 const STARTUP_STAGE_DIAGNOSTIC_ENV: &str = "KURU_TEST_MEMORY_STARTUP_STAGES";
@@ -703,7 +716,26 @@ async fn attach_or_spawn_elected(
                 progress,
             );
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        #[cfg(test)]
+        readiness_poll_hook::missed(polls);
+        tokio::time::sleep(READINESS_POLL_INTERVAL).await;
+    }
+}
+
+/// Test-only observation of the readiness loop: a test scopes a callback
+/// that runs after each failed poll, before that poll's sleep.
+#[cfg(test)]
+mod readiness_poll_hook {
+    use std::cell::RefCell;
+
+    pub(super) type Hook = RefCell<Box<dyn FnMut(u32)>>;
+
+    tokio::task_local! {
+        pub(super) static MISSED: Hook;
+    }
+
+    pub(super) fn missed(polls: u32) {
+        let _ = MISSED.try_with(|hook| (hook.borrow_mut())(polls));
     }
 }
 
@@ -2952,9 +2984,12 @@ mod tests {
                 (1000..=*observed_ms).contains(&total),
                 "phases sum to {total} ms outside the 1 s bound and the {observed_ms} ms observed: {rendered}"
             );
-            // Each poll after the first follows a sleep of at least 100 ms.
+            // Each poll after the first follows one readiness sleep, so a 1 s
+            // wait now reports up to about a hundred polls, not about ten. The
+            // phases are differenced whole milliseconds, hence the 1 ms slack.
+            let interval = READINESS_POLL_INTERVAL.as_millis();
             ensure!(
-                polls >= 2 && (polls - 1) * 100 <= readiness,
+                polls >= 2 && (polls - 1) * interval <= readiness + 1,
                 "poll count {polls} is implausible for {readiness} ms of readiness: {rendered}"
             );
             ensure!(
@@ -3120,6 +3155,146 @@ mod tests {
             "a {held} ms start lock hold was not attributed to election: {}",
             failure.rendered
         );
+        Ok(())
+    }
+
+    /// The readiness loop sleeps exactly `READINESS_POLL_INTERVAL` between
+    /// polls and attaches on the poll after an endpoint appears. The spawned
+    /// owner never publishes; the test publishes a real listener and endpoint
+    /// record from the per-poll hook after failed poll `PUBLISH_AFTER`.
+    ///
+    /// Time is paused, and a miss before publication awaits nothing but its
+    /// sleep, so the recorded gaps are the cadence exactly. The clock resumes
+    /// before publication: the real socket handshake then runs on real time,
+    /// where an idle wait for the peer cannot auto-advance the paused clock
+    /// into the handshake deadline.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn readiness_polls_every_interval_and_attaches_on_the_next_poll() -> Result<()> {
+        use std::cell::RefCell;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::rc::Rc;
+        const PUBLISH_AFTER: u32 = 5;
+        type Served = tokio::task::JoinHandle<Result<Option<String>>>;
+        type Published = (ServiceLock, EndpointRecord, Served);
+        // The hook takes a real owner flock while this test's spawned owner
+        // exists, so every sibling spawn is excluded for the whole fixture;
+        // that exclusive guard also covers the client's own owner spawn. See
+        // `crate::spawn_gate`.
+        let _exclusive = crate::spawn_gate::locking_async().await;
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let data = root.path().join("private");
+        let options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+        let fifo = root.path().join("release");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let release = nix::fcntl::open(
+            &fifo,
+            nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NONBLOCK,
+            nix::sys::stat::Mode::empty(),
+        )?;
+        let script = root.path().join("silent-owner");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nIFS= read -r token < '{}'\n", fifo.display()),
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+        let mut endpoint_authority = authority();
+        endpoint_authority.project_path = project_path_bytes(&project);
+        endpoint_authority.project_scope = scope.clone();
+
+        let missed: Rc<RefCell<Vec<(u32, tokio::time::Instant)>>> = Rc::default();
+        let published: Rc<RefCell<Option<Published>>> = Rc::default();
+        let hook = {
+            let (missed, published) = (Rc::clone(&missed), Rc::clone(&published));
+            let (data, scope) = (data.clone(), scope.clone());
+            let authority = endpoint_authority.clone();
+            move |polls: u32| {
+                missed
+                    .borrow_mut()
+                    .push((polls, tokio::time::Instant::now()));
+                if polls != PUBLISH_AFTER {
+                    return;
+                }
+                tokio::time::resume();
+                let owner = ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)
+                    .expect("owner lock probe")
+                    .expect("the spawned fixture owner holds no owner lock");
+                let (mut listener, address) =
+                    ServiceListener::bind(&data, &scope).expect("bind fixture listener");
+                let endpoint = EndpointRecord {
+                    authority: authority.clone(),
+                    address,
+                };
+                endpoint
+                    .publish(&data, &owner)
+                    .expect("publish fixture endpoint");
+                let authority = authority.clone();
+                let served = tokio::spawn(async move {
+                    let mut stream = listener.accept(HANDSHAKE_TIMEOUT).await?;
+                    accept_handshake_presenting(&mut stream, &authority)
+                        .await?
+                        .map_err(|reason| anyhow::anyhow!(reason.diagnostic()))
+                });
+                *published.borrow_mut() = Some((owner, endpoint, served));
+            }
+        };
+        let attached = tokio::time::timeout(
+            Duration::from_secs(60),
+            readiness_poll_hook::MISSED.scope(
+                RefCell::new(Box::new(hook)),
+                attach_or_start(&options, &project, &script),
+            ),
+        )
+        .await;
+        nix::unistd::write(&release, b"finish\n")?;
+        let attached = attached
+            .context("cadence fixture exceeded its outer deadline")?
+            .context("the client did not attach to the published endpoint")?;
+        let (owner, endpoint, served) = published
+            .borrow_mut()
+            .take()
+            .context("the hook never published an endpoint")?;
+        let presented = served.await??;
+
+        let missed = missed.borrow();
+        let polls: Vec<u32> = missed.iter().map(|(polls, _)| *polls).collect();
+        ensure!(
+            polls == (1..=PUBLISH_AFTER).collect::<Vec<_>>(),
+            "an endpoint published after poll {PUBLISH_AFTER} was not attached on the next poll: missed {polls:?}"
+        );
+        let gaps: Vec<Duration> = missed
+            .windows(2)
+            .map(|pair| pair[1].1.duration_since(pair[0].1))
+            .collect();
+        ensure!(
+            gaps.iter().all(|gap| *gap == READINESS_POLL_INTERVAL),
+            "readiness polls were not {READINESS_POLL_INTERVAL:?} apart: {gaps:?}"
+        );
+        ensure!(
+            attached.generation() == endpoint_authority.service_generation,
+            "the client attached to another generation"
+        );
+        ensure!(
+            presented.is_some(),
+            "the starting client did not present its starter token"
+        );
+        drop(attached);
+        endpoint.retire(&data, &owner)?;
+        owner.release()?;
         Ok(())
     }
 

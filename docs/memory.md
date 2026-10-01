@@ -126,11 +126,13 @@ whole set; each ends with an ellipsis.
 
 The sentence follows the work being done, not a count of internal steps: stages
 that begin nothing a person would recognise keep the current sentence, and so
-does any stage added later. A wait shorter than one 100 ms tick may never be
-shown. On a terminal the sentence is rewritten in place on one line, shortened
-with its ellipsis kept when the terminal is narrow, and erased when memory is
-ready, so nothing remains. When standard error is not a terminal, each new
-sentence is written once, whole, on its own line. An interactive session whose
+does any stage added later. A stage shorter than one check may never be shown:
+while a new memory service starts Kuru checks its progress about every 10 ms,
+and while it waits for another copy of Kuru, every 100 ms. On a terminal the
+sentence is rewritten in place on one line, shortened with its ellipsis kept
+when the terminal is narrow, and erased when memory is ready, so nothing
+remains. When standard error is not a terminal, each new sentence is written
+once, whole, on its own line. An interactive session whose
 standard error is redirected but whose standard output is a terminal still shows
 the sentence on that terminal before the interface takes the screen; it is
 erased before the interface opens. That is the only case in which it goes
