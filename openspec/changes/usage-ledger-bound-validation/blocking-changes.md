@@ -12,4 +12,4 @@ None.
 
 ## Siblings
 
-- `ci/usage-scan-fixture-cache-budget` (separate small PR, in parallel) edits the fixture cache steps in `ci.yml` and the "fixture cache" bullets of `docs/development.md`. This change edits the same job's bounds text and comments. Expect textual overlap in `ci.yml` and `docs/development.md`; whichever lands second rebases.
+- `ci/usage-scan-fixture-cache-budget` (#165, merged 2026-10-01) removed the fixture cache steps from `ci.yml` and rewrote the fixture-cache text of `docs/development.md`. This change was rebased onto it: the job keeps #165's uncached in-job ageing, with this change's calibrated bounds, job and step names, comments and shape-test names.
