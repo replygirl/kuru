@@ -4,9 +4,11 @@
 //! callback inside the pool's ordinary acquire window. These tests count those
 //! authentications and hold any new one at an authentication gate, so a
 //! regression fails at the moment a new connection starts authenticating,
-//! never after a timer. Precondition kept by each test: nothing but the test's
-//! own sequential work (and the store's write workers it awaits) touches the
-//! gated pool while the gate is armed.
+//! never after a timer. A release gate likewise holds a connection's return
+//! before SQLx's release ping. Precondition kept by each test: nothing but the
+//! test's own sequential work (and the store's write workers it awaits)
+//! touches the gated pool while either gate is armed; SQLx's spawned
+//! drop-releases also pass the release gate.
 
 use super::*;
 use crate::server::{ConnectionGate, ConnectionObservation};
