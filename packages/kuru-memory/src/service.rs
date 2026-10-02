@@ -1465,6 +1465,10 @@ pub(crate) struct ServeKnobs {
     pub(crate) close_pause: Option<Arc<ClosePause>>,
     #[cfg(test)]
     pub(crate) dispatch_pause: Option<Arc<rpc::DispatchPause>>,
+    /// Test-only: every accept fails at once with this text, as a
+    /// non-timeout listener fault does.
+    #[cfg(test)]
+    pub(crate) accept_fault: Option<&'static str>,
     /// A test's own open timeline, written at close in place of the process
     /// timeline, which a test runner never installs.
     #[cfg(test)]
@@ -1483,6 +1487,7 @@ impl ServeKnobs {
             observer: None,
             close_pause: None,
             dispatch_pause: None,
+            accept_fault: None,
             timeline: None,
         }
     }
@@ -1513,6 +1518,9 @@ pub(crate) enum ClosePoint {
     BeforeListenerDrop,
     AfterListenerDrop,
     AfterEndpointRetire,
+    /// Immediately before the store close: after the activity record's
+    /// retirement or failing mark.
+    BeforeStoreClose,
     /// After the store close and Dolt reap, before the owner lock release.
     AfterReap,
     /// After the owner lock release, before the gated open timeline write.
@@ -1605,6 +1613,8 @@ impl ServiceOwner {
         .context("project already has a memory service owner; wait for its validated endpoint")?;
         lock.verify()?;
         open_timeline::stamp(open_timeline::Event::OwnerLock);
+        #[cfg(test)]
+        let end_pause = hooks.close_pause.clone();
         // On failure the store open retires its own record before returning,
         // while this owner lock is still held.
         let (store, activity) = activity::open_owner_store(options.clone(), hooks).await?;
@@ -1628,6 +1638,8 @@ impl ServiceOwner {
                 if let Some(publisher) = activity {
                     activity::retire(publisher, &options.data_dir, &options.project_scope).await;
                 }
+                #[cfg(test)]
+                ClosePause::reached(end_pause.as_deref(), ClosePoint::BeforeStoreClose).await;
                 if let Err(cleanup) = store.close().await {
                     return Err(error.context(format!(
                         "reap Dolt after memory service startup failed: {cleanup:#}"
@@ -1679,6 +1691,8 @@ impl ServiceOwner {
             close_pause: None,
             #[cfg(test)]
             dispatch_pause: None,
+            #[cfg(test)]
+            accept_fault: None,
             #[cfg(test)]
             timeline: None,
         }
@@ -1765,7 +1779,7 @@ impl ServiceOwner {
                 };
                 tokio::select! {
                     biased;
-                    accepted = self.listener.accept(accept_within) => match accepted {
+                    accepted = self.accept_once(knobs, accept_within) => match accepted {
                         Ok(stream) => {
                             if self.attach(stream, &mut attachments, &frame_budget, &retirement) {
                                 #[cfg(test)]
@@ -1784,7 +1798,7 @@ impl ServiceOwner {
                 }
             } else {
                 tokio::select! {
-                    accepted = self.listener.accept(knobs.recheck) => {
+                    accepted = self.accept_once(knobs, knobs.recheck) => {
                         match accepted {
                             Ok(stream) => {
                                 if self.attach(stream, &mut attachments, &frame_budget, &retirement) {
@@ -1815,6 +1829,17 @@ impl ServiceOwner {
             }
         }
         Ok(())
+    }
+
+    /// One listener accept, or a test's injected listener fault.
+    async fn accept_once(&mut self, knobs: &ServeKnobs, within: Duration) -> Result<LocalStream> {
+        #[cfg(test)]
+        if let Some(fault) = knobs.accept_fault {
+            anyhow::bail!(fault);
+        }
+        #[cfg(not(test))]
+        let _ = knobs;
+        self.listener.accept(within).await
     }
 
     fn attach(
@@ -1896,6 +1921,8 @@ impl ServiceOwner {
         if let Some(publisher) = activity {
             activity::retire(publisher, &data_dir, &record.authority.project_scope).await;
         }
+        #[cfg(test)]
+        ClosePause::reached(pause, ClosePoint::BeforeStoreClose).await;
         // A failed retirement still closes the store and reaps Dolt; the
         // owner lock is released only after that close has returned.
         let closed = store.close().await;

@@ -510,6 +510,10 @@ pub(crate) struct OwnerHooks {
     hold_dir: Option<PathBuf>,
     #[cfg(test)]
     hold: Option<(MemoryOpenStage, Arc<OpenHold>)>,
+    /// Pauses the owner's ending before its starter attached, after its
+    /// store opened, at that ending's [`super::ClosePoint`]s.
+    #[cfg(test)]
+    pub(crate) close_pause: Option<Arc<super::ClosePause>>,
 }
 
 impl OwnerHooks {
@@ -534,6 +538,8 @@ impl OwnerHooks {
                     .map(PathBuf::from),
                 #[cfg(test)]
                 hold: None,
+                #[cfg(test)]
+                close_pause: None,
             }
         }
         #[cfg(not(any(test, feature = "test-support")))]
@@ -757,6 +763,13 @@ impl Publisher {
             .await
             .map(|_| ())
             .context("the publisher stopped before writing every stage")
+    }
+
+    /// Wait until the publisher's task has returned, so the record holds
+    /// the last activity it will write while it lives.
+    pub(crate) async fn ended(&self) {
+        // The task owns the only sender; the wait ends when it drops.
+        let _ = self.written.clone().wait_for(|_| false).await;
     }
 }
 
@@ -1017,10 +1030,10 @@ mod tests {
     use crate::MemoryOpenProgress;
     use crate::service::tests::{attach_raw, owner_fixture, owner_lock_free};
     use crate::service::{
-        Admission, ClosePause, ClosePoint, ServiceLock, ServiceLockKind, ServiceOwner,
+        Admission, ClosePause, ClosePoint, ServeEvent, ServiceLock, ServiceLockKind, ServiceOwner,
     };
     use crate::test_support::{
-        await_managed_quiescence, fixture_deadline, observed, warm_runtime_cache,
+        await_managed_quiescence, fixture_deadline, next_event, observed, warm_runtime_cache,
     };
     use anyhow::bail;
     use futures::FutureExt as _;
@@ -1959,6 +1972,225 @@ mod tests {
         })
         .await
         .with_context(|| format!("failed publication fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    // An owner whose store opened but whose endpoint publication failed marks
+    // its record failing with that failure before its store closes, and
+    // retires the record after that close, before releasing its owner lock.
+    #[tokio::test]
+    async fn a_failed_endpoint_publication_marks_then_retires_the_record() -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, mut options) = owner_fixture(root.path())?;
+            let token = Uuid::new_v4();
+            options.starter_token = Some(token);
+            let tag = activity_tag(&token);
+            // A directory where the endpoint record would be published.
+            let services = crate::files::ensure_private_directory(&directory(&data, &scope)?)?;
+            std::fs::create_dir(services.path().join("endpoint.json"))?;
+            let pause = ClosePause::at(ClosePoint::BeforeStoreClose);
+            let hooks = OwnerHooks {
+                close_pause: Some(Arc::clone(&pause)),
+                ..OwnerHooks::default()
+            };
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut opening = Box::pin({
+                let options = options.clone();
+                async move { ServiceOwner::open_with_activity(options, &project, hooks).await }
+            });
+            tokio::select! {
+                biased;
+                () = pause.entered.notified() => {}
+                opened = opening.as_mut() => bail!(
+                    "the owner ended before closing its store: {:?}",
+                    opened.map(|_| ())
+                ),
+            }
+            // Read at the pause and checked after the release, so a failed
+            // check never leaves the owner holding its engine.
+            let held = observe(&data, &scope, &tag);
+            let lock_free = owner_lock_free(&options);
+            pause.release.notify_one();
+            let error = opening
+                .await
+                .err()
+                .context("the owner opened despite its occupied endpoint name")?;
+            let Observation::Record(activity) = held else {
+                bail!("before the store closed the record was {held:?}, not marked failing");
+            };
+            let reason = activity
+                .failure
+                .clone()
+                .context("the record is not marked failing")?;
+            ensure!(reason.contains("endpoint.json"), "{reason}");
+            ensure!(
+                format!("{error:#}").starts_with(reason.as_str()),
+                "the reason {reason:?} is not the returned failure {error:#}"
+            );
+            for secret in [
+                token.hyphenated().to_string(),
+                token.simple().to_string(),
+                tag.clone(),
+            ] {
+                ensure!(!reason.contains(&secret), "{reason}");
+            }
+            ensure!(activity.stages.contains(&OpeningDatabase), "{activity:?}");
+            ensure!(activity.progress > 0, "{activity:?}");
+            ensure!(
+                !lock_free?,
+                "the owner lock was free before the store closed"
+            );
+            ensure!(
+                !directory(&data, &scope)?.join(RECORD).exists(),
+                "the record outlived the owner's ending"
+            );
+            ensure!(owner_lock_free(&options)?);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("failed publication mark fixture exceeded its {deadline:?} deadline")
+        })?
+    }
+
+    // An owner whose serve loop fails before its starter attached marks its
+    // record failing, keeping its final activity, before its store closes,
+    // and retires the record after that close.
+    #[tokio::test]
+    async fn a_serve_error_before_the_starter_marks_then_retires_the_record() -> Result<()> {
+        const FAULT: &str = "test listener fault";
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, mut options) = owner_fixture(root.path())?;
+            let token = Uuid::new_v4();
+            options.starter_token = Some(token);
+            let tag = activity_tag(&token);
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            owner
+                .activity
+                .as_ref()
+                .context("a tokened owner kept no publisher")?
+                .ended()
+                .await;
+            let Observation::Record(published) = observe(&data, &scope, &tag) else {
+                bail!("the opened owner's record is not readable");
+            };
+            let pause = ClosePause::at(ClosePoint::BeforeStoreClose);
+            let (mut knobs, _events) = observed(Admission::Starter(token), None);
+            knobs.accept_fault = Some(FAULT);
+            knobs.close_pause = Some(Arc::clone(&pause));
+            let served = tokio::spawn(owner.serve_with(knobs));
+            pause.entered.notified().await;
+            // Read at the pause and checked after the release.
+            let held = observe(&data, &scope, &tag);
+            let endpoint = EndpointRecord::read(&data, &scope).map(|record| record.is_none());
+            let lock_free = owner_lock_free(&options);
+            pause.release.notify_one();
+            let error = served
+                .await?
+                .err()
+                .context("the owner served despite its listener fault")?;
+            ensure!(format!("{error:#}") == FAULT, "{error:#}");
+            let Observation::Record(activity) = held else {
+                bail!("before the store closed the record was {held:?}, not marked failing");
+            };
+            ensure!(
+                activity
+                    == Activity {
+                        failure: Some(FAULT.to_owned()),
+                        ..published.clone()
+                    },
+                "{activity:?} is not {published:?} marked failing"
+            );
+            ensure!(endpoint?, "the endpoint outlived the owner's ending");
+            ensure!(
+                !lock_free?,
+                "the owner lock was free before the store closed"
+            );
+            ensure!(
+                !directory(&data, &scope)?.join(RECORD).exists(),
+                "the record outlived the owner's ending"
+            );
+            ensure!(owner_lock_free(&options)?);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("serve error mark fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    // The invariant a retired record's report rests on: a healthy owner keeps
+    // its record, unmarked, from endpoint publication until its starter has
+    // attached and its endpoint is retired, and retires it before its store
+    // closes.
+    #[tokio::test]
+    async fn a_healthy_owner_keeps_its_record_until_its_starter_attaches() -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, mut options) = owner_fixture(root.path())?;
+            let token = Uuid::new_v4();
+            options.starter_token = Some(token);
+            let tag = activity_tag(&token);
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            owner
+                .activity
+                .as_ref()
+                .context("a tokened owner kept no publisher")?
+                .ended()
+                .await;
+            let Observation::Record(published) = observe(&data, &scope, &tag) else {
+                bail!("the opened owner's record is not readable");
+            };
+            ensure!(published.failure.is_none(), "{published:?}");
+            ensure!(published.progress > 0, "{published:?}");
+            let pause =
+                ClosePause::at_each(&[ClosePoint::AfterEndpointRetire, ClosePoint::AfterReap]);
+            let (mut knobs, mut events) = observed(Admission::Starter(token), None);
+            knobs.close_pause = Some(Arc::clone(&pause));
+            let served = tokio::spawn(owner.serve_with(knobs));
+            // In its loop, endpoint published, starter not attached.
+            let entered = next_event(&mut events).await?;
+            let waiting = observe(&data, &scope, &tag);
+            drop(attach_raw(&data, &scope, Some(token)).await?);
+            pause.entered.notified().await;
+            let endpoint = EndpointRecord::read(&data, &scope).map(|record| record.is_none());
+            let retiring = observe(&data, &scope, &tag);
+            pause.release.notify_one();
+            pause.entered.notified().await;
+            let reaped = directory(&data, &scope).map(|directory| directory.join(RECORD).exists());
+            let lock_free = owner_lock_free(&options);
+            pause.release.notify_one();
+            served.await??;
+            ensure!(
+                entered == ServeEvent::EnteredEmpty { reached: false },
+                "{entered:?}"
+            );
+            ensure!(
+                waiting == Observation::Record(published.clone()),
+                "before its starter attached the record was {waiting:?}"
+            );
+            ensure!(endpoint?, "the endpoint was not retired");
+            ensure!(
+                retiring == Observation::Record(published),
+                "after the endpoint retired the record was {retiring:?}"
+            );
+            ensure!(!reaped?, "the record outlived the store close");
+            ensure!(
+                !lock_free?,
+                "the owner lock was released before the reap ended"
+            );
+            ensure!(owner_lock_free(&options)?);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("healthy record fixture exceeded its {deadline:?} deadline"))?
     }
 
     #[cfg(unix)]
