@@ -671,15 +671,25 @@ impl Directory {
             .iter()
             .map(|anchor| (anchor.path.as_path(), anchor.identity))
             .collect();
-        native::remove_tree(&parent, &ancestor_paths, &path, name, root.file, identity).map_err(
-            |(phase, error)| RemovalError {
-                phase,
-                identity: Some(identity),
-                path: path.clone(),
-                descendant: None,
-                error,
-            },
-        )?;
+        // The native walk keeps `at` on the entry it is acting on, relative to
+        // the root, and leaves it empty once every descendant is gone.
+        let mut at = PathBuf::new();
+        let removal = native::remove_tree(
+            &parent,
+            &ancestor_paths,
+            &path,
+            name,
+            root.file,
+            identity,
+            &mut at,
+        );
+        removal.map_err(|(phase, error)| RemovalError {
+            phase,
+            identity: Some(identity),
+            path: path.clone(),
+            descendant: (!at.as_os_str().is_empty()).then_some(at),
+            error,
+        })?;
         Self::revalidate_ancestors(&anchors, retention).map_err(|error| RemovalError {
             phase: PublicationPhase::Uncertain,
             identity: Some(identity),

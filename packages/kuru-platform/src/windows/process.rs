@@ -30,9 +30,9 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_MORE_DATA, FILETIME,
-        GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-        SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,
+        ERROR_MORE_DATA, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
+        INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Globalization::{CSTR_EQUAL, CSTR_LESS_THAN, CompareStringOrdinal},
     Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
@@ -869,6 +869,87 @@ pub fn sample_process(handle: &OwnedHandle) -> io::Result<ProcessSample> {
         user_time: filetime_to_duration(user),
         working_set_bytes: counters.WorkingSetSize as u64,
     })
+}
+
+/// A process id bound to the creation time of the process that held it.
+///
+/// Diagnostics only: it confers no authority over that id, and nothing may
+/// signal, wait on or terminate a process because its stamp matches. An id can
+/// be reused once its process object is gone; the creation time tells a reused
+/// id apart from the original process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessStamp {
+    pub id: u32,
+    /// Creation time in FILETIME ticks (100 ns intervals since 1601-01-01 UTC).
+    pub created: u64,
+}
+
+impl NativeChild {
+    /// This child's id and creation time, read through the retained handle.
+    pub fn stamp(&self) -> io::Result<ProcessStamp> {
+        process_stamp(&self.process)
+    }
+}
+
+/// The id and creation time of the process a retained handle refers to. The
+/// handle needs only `PROCESS_QUERY_LIMITED_INFORMATION`.
+pub fn process_stamp(handle: &OwnedHandle) -> io::Result<ProcessStamp> {
+    // SAFETY: the owned handle is retained for this call; a non-process or a
+    // handle without query rights fails with zero.
+    let id = unsafe { GetProcessId(handle.as_raw_handle()) };
+    if id == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: the retained handle carries query rights; all four outputs are
+    // valid FILETIME locations for the duration of this call.
+    if unsafe {
+        GetProcessTimes(
+            handle.as_raw_handle(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ProcessStamp {
+        id,
+        created: (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime),
+    })
+}
+
+/// Whether a process object with exactly this stamp can still be opened.
+///
+/// A process object, and with it the image section of its executable, lives
+/// until the last handle to it closes, including after the process has exited.
+/// `true` therefore means that some handle, in this process or another one,
+/// still keeps that object (and its image) alive. `false` means no object with
+/// this id exists any more, or the id now names a later process. Any other
+/// failure to open or query it, such as access denied, is returned as an error
+/// rather than guessed. Diagnostics only: the result never authorizes acting
+/// on the process.
+pub fn process_object_retained(stamp: ProcessStamp) -> io::Result<bool> {
+    // SAFETY: query-only access by id; a null result is an error, never a handle.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, stamp.id) };
+    if raw.is_null() {
+        let error = io::Error::last_os_error();
+        // OpenProcess reports an id that names no process object as an
+        // invalid parameter.
+        return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: successful OpenProcess transfers one owned handle, closed on drop.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    Ok(process_stamp(&process)?.created == stamp.created)
 }
 
 fn filetime_to_duration(value: FILETIME) -> Duration {

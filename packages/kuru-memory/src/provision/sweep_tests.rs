@@ -482,6 +482,10 @@ async fn a_refused_leftovers_removal_is_reported() {
     assert_eq!(observed[0].message, KEPT_RECORD, "{observed:?}");
     assert_eq!(observed[0].stage, receipts, "{observed:?}");
     assert!(!observed[0].first_cause.is_empty(), "{observed:?}");
+    #[cfg(unix)]
+    assert!(observed[0].os_error.is_some(), "{observed:?}");
+    #[cfg(windows)]
+    assert_eq!(observed[0].os_error, Some(32), "{observed:?}");
 
     // Nothing holds it any more: the next sweep removes it.
     assert_eq!(sweep(&fixture).await, SweepOutcome::default());

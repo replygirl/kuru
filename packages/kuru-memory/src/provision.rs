@@ -203,6 +203,10 @@ const LEFTOVER_STAGE_RECEIPTS: &str = ".leftovers";
 /// installation that failed, was cancelled or unwound before publication.
 /// `attempts` and `elapsed` describe the bounded recovery window that actually
 /// ran, and are absent when the cause is not that exhaustion.
+/// `descendant` names the entry whose checked removal refused, relative to
+/// `stage`, when the cause carries one. `probe_child` is the probed engine's
+/// child process and whether its process object was still open when the
+/// refusal was recorded (Windows only; see [`ProbeChild`]).
 #[derive(Debug)]
 pub(crate) struct StageCleanupReport {
     pub stage: PathBuf,
@@ -215,6 +219,8 @@ pub(crate) struct StageCleanupReport {
     pub os_error: Option<i32>,
     pub attempts: Option<u32>,
     pub elapsed: Option<Duration>,
+    pub descendant: Option<String>,
+    pub probe_child: Option<ProbeChildObservation>,
     pub receipt_error: Option<String>,
 }
 
@@ -227,22 +233,96 @@ impl StageCleanupReport {
         } = failure;
         let exhausted = cause.downcast_ref::<crate::files::StageCleanupExhausted>();
         Self {
-            stage,
-            private,
             engine_version: DOLT_VERSION,
             target: asset.target.to_owned(),
             executable_sha256: asset.executable_sha256.to_owned(),
             published: true,
             attempts: exhausted.map(|exhausted| exhausted.attempts),
             elapsed: exhausted.map(|exhausted| exhausted.elapsed),
-            os_error: cause
-                .chain()
-                .filter_map(|error| error.downcast_ref::<std::io::Error>())
-                .find_map(std::io::Error::raw_os_error),
+            os_error: os_error(&cause),
+            descendant: refusing_descendant(&stage, &cause),
+            probe_child: None,
             first_cause: format!("{cause:#}"),
+            stage,
+            private,
             receipt_error: None,
         }
     }
+}
+
+/// The first native OS error in a cause chain.
+fn os_error(cause: &anyhow::Error) -> Option<i32> {
+    cause
+        .chain()
+        .filter_map(|error| error.downcast_ref::<std::io::Error>())
+        .find_map(std::io::Error::raw_os_error)
+}
+
+/// The descendant a checked tree removal in `cause` names, relative to
+/// `stage`. A lease removes the stage's `private` child, so its descendant is
+/// rebased onto the stage the receipt and every later sweep name.
+fn refusing_descendant(stage: &Path, cause: &anyhow::Error) -> Option<String> {
+    let removal = cause
+        .chain()
+        .find_map(|error| error.downcast_ref::<kuru_platform::fs::RemovalError>())?;
+    let descendant = removal.path.join(removal.descendant.as_ref()?);
+    let relative = descendant.strip_prefix(stage).unwrap_or(&descendant);
+    Some(relative.to_string_lossy().into_owned())
+}
+
+/// The cold probe's child process, recorded on the stage lease so that a
+/// refused removal can say whether the child's exited process object was
+/// still open. On Windows that object keeps the image section of the executed
+/// `probe` copy referenced, which refuses the copy's deletion. Only Windows
+/// records it: an exited process never blocks an unlink on Unix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProbeChild {
+    pub pid: u32,
+    /// Creation time in FILETIME ticks, which tells a reused id apart.
+    pub created: u64,
+}
+
+impl ProbeChild {
+    /// `retained` while a process object with exactly this identity can still
+    /// be opened (some handle, ours or another process's, keeps it alive),
+    /// `released` once none can, or `unknown: <cause>`. Diagnostics only: it
+    /// never decides how a stage is resolved and never authorizes acting on
+    /// the process.
+    fn state(self) -> String {
+        #[cfg(windows)]
+        {
+            use kuru_platform::windows::process::{ProcessStamp, process_object_retained};
+            match process_object_retained(ProcessStamp {
+                id: self.pid,
+                created: self.created,
+            }) {
+                Ok(true) => "retained".to_owned(),
+                Ok(false) => "released".to_owned(),
+                Err(error) => format!("unknown: {error}"),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self;
+            "unknown: process objects are observed only on Windows".to_owned()
+        }
+    }
+
+    fn observe(self) -> ProbeChildObservation {
+        ProbeChildObservation {
+            pid: self.pid,
+            created: self.created,
+            at_refusal: self.state(),
+        }
+    }
+}
+
+/// A [`ProbeChild`] and its state when a refusal was recorded.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ProbeChildObservation {
+    pub pid: u32,
+    pub created: u64,
+    pub at_refusal: String,
 }
 
 /// The receipt as it is stored: paths relative to the version directory, so a
@@ -260,12 +340,15 @@ struct StageCleanupReceipt<'a> {
     os_error: Option<i32>,
     attempts: Option<u32>,
     elapsed_ms: Option<u128>,
+    descendant: Option<&'a str>,
+    probe_child: Option<&'a ProbeChildObservation>,
     recorded_at: u64,
 }
 
 /// Record a retained stage so a later open can collect it. `published` says
 /// whether its engine was published and verified, or its installation stopped
-/// (an error or a cancelled caller) before publication.
+/// (an error or a cancelled caller) before publication. `probe_child` is the
+/// probed engine's child observed at this refusal, when the stage was probed.
 ///
 /// A receipt that cannot be written leaves the stage waiting for an operator;
 /// it never turns a published, verified engine into a failed open.
@@ -274,9 +357,11 @@ fn record_retained_stage(
     asset: Asset<'_>,
     failure: StageCleanupFailure,
     published: bool,
+    probe_child: Option<ProbeChildObservation>,
 ) -> StageCleanupReport {
     let mut report = StageCleanupReport::new(failure, asset);
     report.published = published;
+    report.probe_child = probe_child;
     if let Err(error) = write_stage_receipt(versions, &report) {
         report.receipt_error = Some(format!("{error:#}"));
     }
@@ -303,10 +388,9 @@ fn write_stage_receipt(versions: &Path, report: &StageCleanupReport) -> Result<(
         os_error: report.os_error,
         attempts: report.attempts,
         elapsed_ms: report.elapsed.map(|elapsed| elapsed.as_millis()),
-        recorded_at: std::time::SystemTime::UNIX_EPOCH
-            .elapsed()
-            .map(|since| since.as_secs())
-            .unwrap_or_default(),
+        descendant: report.descendant.as_deref(),
+        probe_child: report.probe_child.as_ref(),
+        recorded_at: unix_seconds(),
     };
     let bytes = serde_json::to_vec_pretty(&receipt)?;
     files::write(&receipts.join(format!("{}.json", receipt.stage)), &bytes)
@@ -369,6 +453,13 @@ fn report_leftover_stage_cap(outcome: SweepOutcome) {
         remaining = outcome.remaining,
         "retained private install stages reached their reporting cap"
     );
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::UNIX_EPOCH
+        .elapsed()
+        .map(|since| since.as_secs())
+        .unwrap_or_default()
 }
 
 fn relative_to(versions: &Path, path: &Path) -> Result<String> {
@@ -562,13 +653,20 @@ impl CheckedColdProbe {
             .spawn(move || {
                 // Keep the checked copy, stage and installation authority until
                 // the owned process is reaped, including after caller cancellation.
+                let mut retained = retained;
                 let result = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .context("create owned Dolt cold probe executor")
                     .and_then(|runtime| {
-                        self.revalidate()
-                            .and_then(|()| runtime.block_on(verify_version(&binary, &home)))
+                        self.revalidate().and_then(|()| {
+                            runtime.block_on(verify_version_recorded(
+                                &binary,
+                                &home,
+                                VERSION_TIMEOUT,
+                                &mut retained.probe_child,
+                            ))
+                        })
                     });
                 let _ = send.send((self, retained, result));
             })
@@ -792,6 +890,8 @@ struct StageLease {
     staging: Option<PrivateTemp>,
     lock: Option<CacheLock>,
     asset: Asset<'static>,
+    /// The cold probe's child, once the stage's engine has been probed.
+    probe_child: Option<ProbeChild>,
 }
 
 impl StageLease {
@@ -800,6 +900,7 @@ impl StageLease {
             staging: Some(staging),
             lock: Some(lock),
             asset,
+            probe_child: None,
         }
     }
 
@@ -850,7 +951,10 @@ impl StageLease {
                 "Dolt engine installation stopped before publication, and private stage cleanup failed"
             });
             let versions = failure.stage.parent().unwrap_or(Path::new("")).to_owned();
-            let report = record_retained_stage(&versions, self.asset, failure, published);
+            // Observed now, at the refusal, while the lock is still held.
+            let probe_child = self.probe_child.map(ProbeChild::observe);
+            let report =
+                record_retained_stage(&versions, self.asset, failure, published, probe_child);
             emit_retained_stage_diagnostic(&report);
             Some(report)
         });
@@ -1299,7 +1403,13 @@ struct StoredLeftoverStage {
 /// concurrent installer is writing right now, since that installer holds the
 /// same lock this caller does) is left exactly alone, and a removal that is
 /// rejected or uncertain leaves both the stage and its receipt for the next
-/// sweep - never a retry loop, never a deletion on uncertainty.
+/// sweep - never a retry loop, never a deletion on uncertainty. Each refusal
+/// is recorded in its receipt (`record_sweep_refusal`). Each receipt present
+/// when the sweep starts is attempted exactly once: the names are listed
+/// before any receipt is rewritten or removed.
+///
+/// A sweep that leaves no receipt removes the receipts folder itself, but only
+/// when nothing else is in it (`remove_empty_leftovers`).
 fn sweep_leftover_stages(versions: &Path, _lock: &CacheLock) -> SweepOutcome {
     let mut outcome = SweepOutcome::default();
     let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
@@ -1311,17 +1421,19 @@ fn sweep_leftover_stages(versions: &Path, _lock: &CacheLock) -> SweepOutcome {
     else {
         return outcome;
     };
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if !name.ends_with(".json") {
-            continue; // e.g. the `staging` directory `files::write` uses
-        }
+    let names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        // Skips e.g. the `staging` directory `files::write` uses.
+        .filter(|name| name.ends_with(".json"))
+        .collect();
+    for name in &names {
         sweep_one_leftover_stage(versions, &receipts, name, &mut outcome);
     }
     outcome.reached_cap = outcome.remaining >= LEFTOVER_STAGE_CAP;
+    if outcome.remaining == 0 {
+        remove_empty_leftovers(&receipts_path, receipts);
+    }
     outcome
 }
 
@@ -1372,20 +1484,154 @@ fn sweep_one_leftover_stage(
         return;
     }
     let stage = versions.join(&receipt.stage);
-    match fs::symlink_metadata(&stage) {
+    let refusal = match fs::symlink_metadata(&stage) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // The stage is already gone; only the receipt is left to collect.
             collect_leftover_receipt(receipts, name, outcome);
+            return;
         }
-        Err(_) => outcome.remaining += 1,
-        Ok(metadata) if !metadata.is_dir() => outcome.remaining += 1,
+        Err(error) => SweepRefusal::other("inspect", &anyhow::Error::from(error)),
+        Ok(metadata) if !metadata.is_dir() => SweepRefusal::other(
+            "inspect",
+            &anyhow::anyhow!("the receipted install stage is not a directory"),
+        ),
         Ok(_) => match files::open_directory(&stage, Privacy::OwnerOnly, NameRetention::Movable) {
             Ok(directory) => match directory.remove_tree() {
-                Ok(()) => collect_leftover_receipt(receipts, name, outcome),
-                Err(_) => outcome.remaining += 1, // Rejected or Uncertain: leave both
+                Ok(()) => {
+                    collect_leftover_receipt(receipts, name, outcome);
+                    return;
+                }
+                // Rejected or Uncertain: leave both.
+                Err(error) => SweepRefusal::removal(&error),
             },
-            Err(_) => outcome.remaining += 1,
+            Err(error) => SweepRefusal::other("open", &error),
         },
+    };
+    outcome.remaining += 1;
+    record_sweep_refusal(receipts.path(), name, &bytes, refusal);
+}
+
+/// Why one sweep left a receipted stage in place.
+struct SweepRefusal {
+    /// `Rejected` or `Uncertain` for a checked removal; `open` or `inspect`
+    /// when the stage could not be opened or is not a directory.
+    phase: String,
+    cause: String,
+    os_error: Option<i32>,
+    /// The refusing entry, relative to the stage.
+    descendant: Option<String>,
+}
+
+impl SweepRefusal {
+    fn removal(error: &kuru_platform::fs::RemovalError) -> Self {
+        Self {
+            phase: format!("{:?}", error.phase),
+            cause: error.to_string(),
+            os_error: std::error::Error::source(error)
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .and_then(std::io::Error::raw_os_error),
+            descendant: error
+                .descendant
+                .as_ref()
+                .map(|descendant| descendant.to_string_lossy().into_owned()),
+        }
+    }
+
+    fn other(phase: &str, error: &anyhow::Error) -> Self {
+        Self {
+            phase: phase.to_owned(),
+            cause: format!("{error:#}"),
+            os_error: os_error(error),
+            descendant: None,
+        }
+    }
+}
+
+/// Record a sweep's refusal in the receipt it read, under the lock the sweep
+/// holds: count it in `sweep_refusals` and replace `last_sweep_refusal`, so
+/// the receipt stays bounded. Every other field, including any this version
+/// does not know, is kept as it was, and `version` stays 1. When the receipt
+/// names a probe child, its state is observed now, at this refusal.
+///
+/// A rewrite that fails leaves the old receipt, which is still valid, and is
+/// reported to diagnostics. It never changes what the sweep did.
+fn record_sweep_refusal(receipts: &Path, name: &str, bytes: &[u8], refusal: SweepRefusal) {
+    let receipt = receipts.join(name);
+    let rewritten = (|| -> Result<()> {
+        let mut fields: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(bytes)?;
+        let probe_child_at_refusal = fields
+            .get("probe_child")
+            .and_then(|child| serde_json::from_value::<ProbeChild>(child.clone()).ok())
+            .map(ProbeChild::state);
+        let refusals = fields
+            .get("sweep_refusals")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
+        fields.insert("sweep_refusals".to_owned(), refusals.into());
+        fields.insert(
+            "last_sweep_refusal".to_owned(),
+            serde_json::json!({
+                "phase": refusal.phase,
+                "cause": refusal.cause,
+                "os_error": refusal.os_error,
+                "descendant": refusal.descendant,
+                "probe_child_at_refusal": probe_child_at_refusal,
+                "recorded_at": unix_seconds(),
+            }),
+        );
+        let updated = serde_json::to_vec_pretty(&fields)?;
+        ensure!(
+            updated.len() as u64 <= LEFTOVER_RECEIPT_LIMIT,
+            "the receipt with its refusal would exceed its size limit"
+        );
+        files::write(&receipt, &updated)
+    })();
+    if let Err(error) = rewritten {
+        tracing::warn!(
+            target: "kuru.memory",
+            stage = %receipt.display(),
+            first_cause = %format!("{error:#}"),
+            os_error = os_error(&error),
+            "leftover install stage refusal could not be recorded in its receipt"
+        );
+    }
+}
+
+/// Remove the receipts folder once a sweep has left no receipt in it, through
+/// one checked removal under the lock the sweep holds. Only an empty folder,
+/// or one whose only entry is an empty `staging` directory, is removed:
+/// `files::write` keeps a temporary record in `staging` as evidence of an
+/// uncertain publication, and nothing else is ever expected there. A refused
+/// or uncertain removal leaves the folder for the next sweep and is reported
+/// to diagnostics; it is never retried here.
+fn remove_empty_leftovers(receipts_path: &Path, receipts: Directory) {
+    let only_empty_staging = || -> std::io::Result<bool> {
+        for entry in fs::read_dir(receipts_path)? {
+            let entry = entry?;
+            if entry.file_name() != "staging" || !entry.file_type()?.is_dir() {
+                return Ok(false);
+            }
+            if fs::read_dir(entry.path())?.next().is_some() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    if !only_empty_staging().unwrap_or(false) {
+        return;
+    }
+    if let Err(error) = receipts.remove_tree() {
+        let os_error = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error);
+        tracing::warn!(
+            target: "kuru.memory",
+            stage = %receipts_path.display(),
+            first_cause = %error,
+            os_error,
+            "leftover install stage receipts folder kept after its removal was refused"
+        );
     }
 }
 
@@ -1413,7 +1659,11 @@ fn collect_leftover_receipt(receipts: &Directory, name: &str, outcome: &mut Swee
 /// into a blocking-pool task at all. Only once a receipt might exist does the
 /// rest - the directory scan, the non-blocking lock attempt, and the sweep's
 /// own removals - run through `spawn_blocking`, exactly like the cold path's
-/// extraction and probe work (`provision.rs` above).
+/// extraction and probe work (`provision.rs` above). The task is awaited, so
+/// the open returns only after its sweep. A busy lock skips the sweep
+/// silently: its holder sweeps when it acquires the lock, or is the receipt's
+/// writer. A lock attempt that fails with an error skips it too, and is
+/// reported to diagnostics without writing anything.
 async fn warm_sweep_if_receipted(cache: PathBuf, versions: PathBuf) {
     let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
     let is_leftovers_dir =
@@ -1436,10 +1686,20 @@ async fn warm_sweep_if_receipted(cache: PathBuf, versions: PathBuf) {
         if !has_receipt {
             return;
         }
-        if let Ok(Some(lock)) = try_cache_lock(&cache) {
-            let outcome = sweep_leftover_stages(&versions, &lock);
-            drop(lock);
-            report_leftover_stage_cap(outcome);
+        match try_cache_lock(&cache) {
+            Ok(Some(lock)) => {
+                let outcome = sweep_leftover_stages(&versions, &lock);
+                drop(lock);
+                report_leftover_stage_cap(outcome);
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                target: "kuru.memory",
+                stage = %receipts_path.display(),
+                first_cause = %format!("{error:#}"),
+                os_error = os_error(&error),
+                "leftover install stage sweep skipped after the installation lock attempt failed"
+            ),
         }
     })
     .await;
@@ -1574,6 +1834,18 @@ pub async fn verify_version(binary: &Path, private_home: &Path) -> Result<()> {
 }
 
 async fn verify_version_with_timeout(binary: &Path, home: &Path, timeout: Duration) -> Result<()> {
+    verify_version_recorded(binary, home, timeout, &mut None).await
+}
+
+/// [`verify_version_with_timeout`], recording the probe's child process in
+/// `probe_child` once it has started (Windows only). The child itself, and so
+/// every handle of ours to it, is dropped before this returns.
+async fn verify_version_recorded(
+    binary: &Path,
+    home: &Path,
+    timeout: Duration,
+    probe_child: &mut Option<ProbeChild>,
+) -> Result<()> {
     checked_regular(binary, true)?;
     prepare_private_home(home)?;
     let mut child = crate::engine::spawn(
@@ -1586,6 +1858,15 @@ async fn verify_version_with_timeout(binary: &Path, home: &Path, timeout: Durati
     )
     .await
     .context("start configured Dolt executable")?;
+    #[cfg(windows)]
+    {
+        *probe_child = child.stamp().ok().map(|stamp| ProbeChild {
+            pid: stamp.id,
+            created: stamp.created,
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = probe_child;
     let stdout = child.stdout().context("Dolt version stdout is missing")?;
     let stderr = child.stderr().context("Dolt version stderr is missing")?;
     let result = tokio::time::timeout(timeout, async {

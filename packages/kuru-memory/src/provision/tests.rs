@@ -1467,7 +1467,7 @@ fn a_receipt_that_cannot_be_written_is_recorded_on_the_report() {
         cause: anyhow::Error::msg("fixture cleanup failure"),
     };
 
-    let report = record_retained_stage(&versions, VALID_FIXTURE.spec(), failure, true);
+    let report = record_retained_stage(&versions, VALID_FIXTURE.spec(), failure, true, None);
 
     assert!(
         report.receipt_error.is_some(),

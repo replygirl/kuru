@@ -415,6 +415,7 @@ pub(super) fn remove_tree(
     _: &std::ffi::OsStr,
     held: File,
     expected: FileIdentity,
+    at: &mut PathBuf,
 ) -> Result<(), (PublicationPhase, io::Error)> {
     let mut removed = false;
     let _ancestors = pin_ancestors(ancestors, &mut removed)?;
@@ -423,7 +424,7 @@ pub(super) fn remove_tree(
     // there first. The absence check below still proves the outcome.
     match pin_directory(path, expected, &mut removed) {
         Ok(root_pin) => {
-            remove_children(path, root_pin, &mut removed, 0)?;
+            remove_children(path, root_pin, &mut removed, 0, at)?;
             remove_empty_directory(path, held, expected).map_err(|(failure, error)| {
                 (
                     if removed {
@@ -504,6 +505,7 @@ fn remove_children(
     pin: File,
     removed: &mut bool,
     depth: usize,
+    at: &mut PathBuf,
 ) -> Result<(), (PublicationPhase, io::Error)> {
     if depth >= MAX_TREE_DEPTH {
         return Err((
@@ -511,9 +513,14 @@ fn remove_children(
             invalid("checked tree removal depth exceeded"),
         ));
     }
+    // `at` names this directory while it is enumerated and each entry while it
+    // is removed, so a failure leaves it at what refused; success restores it.
+    let base = at.clone();
     for entry in std::fs::read_dir(directory).map_err(|error| (phase(*removed), error))? {
+        at.clone_from(&base);
         let entry = entry.map_err(|error| (phase(*removed), error))?;
         let name = entry.file_name();
+        *at = base.join(&name);
         component(&name).map_err(|error| (phase(*removed), error))?;
         let path = entry.path();
         #[cfg(test)]
@@ -571,7 +578,7 @@ fn remove_children(
             // it to that same full identity before walking by pathname.
             let directory_pin = pin_directory(&path, child_info.file.identity, removed)?;
             drop(child_pin);
-            remove_children(&path, directory_pin, removed, depth + 1)?;
+            remove_children(&path, directory_pin, removed, depth + 1, at)?;
             remove_empty_directory(&path, held, child_info.file.identity).map_err(
                 |(failure, error)| {
                     (
@@ -600,6 +607,7 @@ fn remove_children(
         *removed = true;
     }
     drop(pin);
+    *at = base;
     Ok(())
 }
 

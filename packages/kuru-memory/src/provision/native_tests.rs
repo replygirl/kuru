@@ -1556,8 +1556,21 @@ async fn cancelled_activation_recovery_receipts_a_held_stage_before_releasing_th
         "a refused teardown preserves the original private stage"
     );
     assert_cache_lock_released(&lock_path, lock_identity).await;
+    // Once nothing holds the stage, the next acquisition's sweep collects it
+    // and its receipt through the product's own checked removal.
     drop(holder);
-    fs::remove_dir_all(&stage_container).unwrap();
+    let lock = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let outcome = sweep_leftover_stages(&cache, &lock);
+    drop(lock);
+    assert_eq!(outcome.collected, 1, "{outcome:?}");
+    assert_eq!(outcome.remaining, 0, "{outcome:?}");
+    assert!(!stage_container.exists());
+    assert!(
+        !receipts[0].exists(),
+        "the collected stage takes its receipt"
+    );
 }
 
 #[cfg(windows)]
@@ -1828,11 +1841,18 @@ async fn actual_warm_cache_verifies_concurrently_while_installation_lock_is_held
 async fn concurrent_cold_windows_provision_publishes_one_verified_native_identity() {
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("concurrent empty cache café 東京");
+    // Created empty up front only so its canonical path, which every product
+    // record names, can scope this test's observers before either open runs.
+    private_directory(&cache).unwrap();
+    let scope = cache.canonicalize().unwrap();
     let config = MemoryConfig {
         offline: true,
         cache_dir: Some(cache.clone()),
         ..Default::default()
     };
+    let lock_path = scope.join(".install.lock");
+    let (retained_observer, retained) = observe_retained_stage_reports(&scope, &lock_path);
+    let (leftover_observer, leftovers) = observe_leftover_records(&scope);
     let start = tokio::sync::Barrier::new(2);
     let open = || async {
         start.wait().await;
@@ -1862,15 +1882,200 @@ async fn concurrent_cold_windows_provision_publishes_one_verified_native_identit
         assert_eq!(file.metadata().unwrap().len(), size);
         assert_eq!(hex_digest(&Sha256::digest(fs::read(path).unwrap())), digest);
     }
+    // The warm open attempts every receipt once under the free lock.
     let warm = provision(&config, &cache).await.unwrap();
     let (_parent, file) = files::read(&warm, Privacy::OwnerOnly).unwrap();
     assert_eq!(warm, first.0);
     assert_eq!(regular_file_info(&file).unwrap().identity, first.1);
-    let entries: Vec<_> = fs::read_dir(cache.join(DOLT_VERSION))
+    drop(file);
+    drop(_parent);
+    drop(retained_observer);
+    drop(leftover_observer);
+
+    // The contract (embedded-runtime "Install stage teardown ordering" and
+    // "Leftover stage collection"): a stage that outlived its bounded removal
+    // stays only with a receipt, written before the lock was released, whose
+    // first cause is one bounded recovery retries and in which every later
+    // acquisition recorded its refusal. Whether a stage remains is the
+    // environment's choice; every other outcome here is the product's.
+    let versions = scope.join(DOLT_VERSION);
+    let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
+    let receipts: Vec<(PathBuf, serde_json::Value)> = if receipts_path.is_dir() {
+        leftover_stage_receipts(&receipts_path)
+            .into_iter()
+            .map(|path| {
+                let receipt = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                (path, receipt)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let retained = std::mem::take(&mut *retained.lock().unwrap());
+    let leftovers = std::mem::take(&mut *leftovers.lock().unwrap());
+    let entries: Vec<String> = fs::read_dir(&versions)
         .unwrap()
-        .map(|entry| entry.unwrap().file_name())
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(entries, [std::ffi::OsString::from(BUNDLED_ASSET.target)]);
+    let mut evidence = format!(
+        "concurrent cold provision: versions {entries:?}; retained-stage reports {retained:?}; leftover records {leftovers:?}\n"
+    );
+    for (path, receipt) in &receipts {
+        evidence.push_str(&format!(
+            "receipt {}: {receipt:#}; retried class {:?}\n",
+            path.display(),
+            retried_cleanup_class(receipt)
+        ));
+    }
+    if !receipts.is_empty() || !retained.is_empty() || !leftovers.is_empty() {
+        report_evidence(&evidence);
+    }
+
+    let kept_folder = leftovers.iter().any(|record| {
+        record.stage == receipts_path && record.message.contains("receipts folder kept")
+    });
+    for entry in &entries {
+        if entry == BUNDLED_ASSET.target {
+            continue;
+        }
+        if entry == LEFTOVER_STAGE_RECEIPTS {
+            assert!(
+                !receipts.is_empty() || kept_folder,
+                "the receipts folder outlived its last receipt without a kept-folder record: {evidence}"
+            );
+            continue;
+        }
+        assert!(
+            entry.starts_with(".install-")
+                && receipts
+                    .iter()
+                    .any(|(_, receipt)| receipt["stage"] == entry.as_str()),
+            "every other entry is a receipted install stage: {entry}: {evidence}"
+        );
+    }
+    for (_, receipt) in &receipts {
+        assert_eq!(receipt["published"], true, "{evidence}");
+        if let Err(cause) = retried_cleanup_class(receipt) {
+            panic!("{cause}: {evidence}");
+        }
+        assert!(
+            receipt["probe_child"]["pid"]
+                .as_u64()
+                .is_some_and(|pid| pid > 0)
+                && receipt["probe_child"]["at_refusal"].is_string(),
+            "a probed stage records its probe child at the refusal: {evidence}"
+        );
+        assert!(
+            receipt["sweep_refusals"]
+                .as_u64()
+                .is_some_and(|count| count >= 1),
+            "the warm open's acquisition attempted the receipt and recorded its refusal: {evidence}"
+        );
+    }
+    assert!(
+        !leftovers
+            .iter()
+            .any(|record| record.message.contains("sweep skipped")
+                || record.message.contains("could not be recorded")),
+        "no acquisition skipped a sweep and every refusal was recorded: {evidence}"
+    );
+    // Only the installer that found no destination under the lock creates a
+    // stage, so at most one is ever retained. A later sweep may already have
+    // collected it, but a receipt that remains always had its report.
+    assert!(retained.len() <= 1, "{evidence}");
+    for (_, receipt) in &receipts {
+        assert!(
+            retained.iter().any(|report| report
+                .stage
+                .file_name()
+                .is_some_and(|name| receipt["stage"] == name.to_string_lossy().as_ref())),
+            "a remaining receipt was reported when it was written: {evidence}"
+        );
+    }
+    for report in &retained {
+        assert_eq!(report.published, Some(true), "{evidence}");
+        assert!(
+            report.receipted && report.lock_held,
+            "the stage is receipted before the lock is released: {evidence}"
+        );
+    }
+    let contender = open_regular(&lock_path).unwrap();
+    let _gate = crate::spawn_gate::locking_async().await;
+    contender
+        .try_lock()
+        .expect("every installer released the installation lock");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn forced_published_cleanup_failure_records_the_probe_child() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("forced cleanup cache 東京");
+    let config = MemoryConfig {
+        offline: true,
+        cache_dir: Some(cache.clone()),
+        ..Default::default()
+    };
+    // The lease resolves on this test's thread (the current-thread runtime
+    // drives the open), so the forced failure reaches exactly its release.
+    let binary = {
+        let _forced = files::ForcedStageCleanupFailure::new();
+        provision(&config, &cache).await.unwrap()
+    };
+    let versions = binary.parent().unwrap().parent().unwrap().to_owned();
+    let receipts = leftover_stage_receipts(&versions.join(LEFTOVER_STAGE_RECEIPTS));
+    assert_eq!(receipts.len(), 1, "the forced retention is receipted");
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipts[0]).unwrap()).unwrap();
+    report_evidence(&format!(
+        "forced published cleanup failure receipt: {receipt:#}\n"
+    ));
+    assert_eq!(receipt["published"], true);
+    let child = &receipt["probe_child"];
+    assert!(
+        child["pid"].as_u64().is_some_and(|pid| pid > 0),
+        "{receipt}"
+    );
+    assert!(
+        child["created"].as_u64().is_some_and(|created| created > 0),
+        "{receipt}"
+    );
+    let at_refusal = child["at_refusal"].as_str().unwrap_or_default();
+    assert!(
+        matches!(at_refusal, "retained" | "released") || at_refusal.starts_with("unknown: "),
+        "{receipt}"
+    );
+    let stage = versions.join(receipt["stage"].as_str().unwrap());
+
+    // The warm open attempts the receipt once: it either collects the stage
+    // and its receipt, or records the refusal in that receipt.
+    assert_eq!(provision(&config, &cache).await.unwrap(), binary);
+    if stage.exists() {
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipts[0]).unwrap()).unwrap();
+        report_evidence(&format!(
+            "forced stage refused its warm sweep: {receipt:#}\n"
+        ));
+        assert_eq!(receipt["sweep_refusals"], 1, "{receipt}");
+        assert!(
+            receipt["last_sweep_refusal"]["probe_child_at_refusal"].is_string(),
+            "{receipt}"
+        );
+    } else {
+        assert!(!receipts[0].exists(), "a collected stage takes its receipt");
+    }
+}
+
+/// Write test evidence straight to the process's standard error. Libtest
+/// captures only the `print!` family, and the coverage shard inherits the test
+/// binary's standard error, so this reaches the job log even when the test
+/// passes.
+#[cfg(windows)]
+fn report_evidence(evidence: &str) {
+    use std::io::Write;
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(evidence.as_bytes());
+    let _ = stderr.flush();
 }
 
 #[cfg(windows)]
