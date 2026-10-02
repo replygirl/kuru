@@ -423,6 +423,26 @@ captured database repository belongs to no store, so the fixture root's
 depth budget (`TempDir::with_depth_budget`) is the cache directory's own depth
 plus `test_support::TEMPLATE_DEPTH`.
 
+The native mise fixture (`windows_mise`, through the delivery package's
+`mise_acceptance` support) keeps its cold-cache assertion, then warms its own
+engine cache before its first launch, as `prefetch` warms the shared one: it
+provisions the engine into it within `test_support::engine_warm_up_bound()`,
+then calls `test_support::warm_template_cache` with the installed binary as
+the build's supervisor. That launch, run with `KURU_OPEN_MARKERS=1`, then
+copies the template with two engine starts instead of also unpacking the
+engine and building the template under one client wait; its standard error
+must show the opening sentence and never the getting-ready one. A
+`test_support::TemplateCacheReceipt` taken after the warm-up, whose
+`verify_used` fails on any other key, build or quarantine in the templates
+root, and the store's recorded template key
+(`test_support::store_template_key` equal to `test_support::template_key()`)
+prove the launches used it. Warm such a cache only for a binary built from
+the same commit. The packaged `embedded_runtime` fixture stays cold: it is the
+suite's proof that an installed executable unpacks its own engine and builds
+its own template in one launch. Its `--nocapture` run prints one
+`embedded_runtime first launch (cold cache, …): <ms> ms [<label>]` line per
+installation, a measurement with no threshold.
+
 `test_support::warm_runtime_cache()` warms both halves of the shared cache
 once per test process, before any fixture deadline: it provisions the engine,
 then checks the published template's structure under its shared key lock, or

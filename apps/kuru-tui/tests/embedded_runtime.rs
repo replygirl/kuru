@@ -21,7 +21,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Output,
-    time::Duration,
+    time::{Duration, Instant},
 };
 #[cfg(unix)]
 use std::{os::unix::fs::PermissionsExt, process::Stdio};
@@ -660,6 +660,7 @@ fn assert_bootstrap_phases(output: &Output) -> Result<()> {
 }
 
 struct Installation {
+    label: String,
     home: PathBuf,
     config: PathBuf,
     data: PathBuf,
@@ -696,6 +697,7 @@ impl Installation {
             "offline fixture must start with absent caches and data"
         );
         Ok(Self {
+            label: label.to_owned(),
             home,
             config,
             data,
@@ -963,10 +965,27 @@ impl Installation {
             !self.cache.exists() && !self.data.exists(),
             "cold launch must not reuse an engine or database"
         );
+        let started = Instant::now();
         let first = self
             .run(&["run", marker, "--json"])
             .await
             .context("first offline conversation from empty cache")?;
+        // A measurement for the install job's log only: no threshold.
+        let elapsed = started.elapsed().as_millis();
+        let binary = if std::env::var_os("KURU_EMBEDDED_TEST_BINARY").is_some() {
+            "KURU_EMBEDDED_TEST_BINARY executable"
+        } else {
+            "cargo test build"
+        };
+        let instrumented = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+            ", instrumented"
+        } else {
+            ""
+        };
+        eprintln!(
+            "embedded_runtime first launch (cold cache, {binary}{instrumented}): {elapsed} ms [{}]",
+            self.label
+        );
         let session = first["session"].as_str().context("session ID")?;
         ensure!(
             !first["text"].as_str().context("first response")?.is_empty(),
