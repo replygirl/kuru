@@ -966,6 +966,13 @@ pub(crate) async fn open_owner_store(
     match result {
         Ok(store) => Ok((store, publisher)),
         Err(error) => {
+            // Test support: the owner's own stderr names the failure before
+            // its record is retired, so a test's owner diagnostic already
+            // holds it when the starter sees the record gone. The process's
+            // final error report comes only after the owner lock is released
+            // and its runtime has shut down.
+            #[cfg(feature = "test-support")]
+            eprintln!("memory service owner open failed: {error:#}");
             if let Some(publisher) = publisher {
                 retire(publisher, &data_dir, &scope).await;
             }

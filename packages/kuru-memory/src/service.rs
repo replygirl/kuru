@@ -77,6 +77,25 @@ fn fixture_owner_diagnostic() -> Result<Option<File>> {
         .transpose()
 }
 
+/// The most of a private startup diagnostic that a failed start forwards.
+#[cfg(feature = "test-support")]
+const STARTUP_DIAGNOSTIC_FORWARD_LIMIT: u64 = 1024 * 1024;
+
+/// Append a failed start's private startup diagnostic, which holds its
+/// owner's stderr, to `forward`, the owner diagnostic file a test named.
+/// Best effort and bounded: it never changes the start's outcome.
+#[cfg(feature = "test-support")]
+fn forward_startup_diagnostic(diagnostic: &mut File, forward: &mut File) {
+    use std::io::Seek as _;
+
+    if diagnostic.rewind().is_ok() {
+        let _ = io::copy(
+            &mut (&*diagnostic).take(STARTUP_DIAGNOSTIC_FORWARD_LIMIT),
+            forward,
+        );
+    }
+}
+
 #[cfg(feature = "test-support")]
 fn fixture_startup_stages_enabled() -> bool {
     std::env::var_os(STARTUP_STAGE_DIAGNOSTIC_ENV).as_deref() == Some(OsStr::new("1"))
@@ -810,105 +829,121 @@ async fn attach_or_spawn_elected(
         .context("spawn elected memory service owner")?,
     );
     let spawned = tokio::time::Instant::now();
-    // Every starter reads its own owner's record, observed or not; only an
-    // observed open is shown its stages. The first window starts at spawn.
-    let mut owner = activity::OwnerWatch::new(activity::activity_tag(&starter_token), spawned);
-    let window = Duration::from_secs(options.config.startup_timeout_secs);
-    let mut polls: u32 = 0;
-    loop {
-        polls = polls.saturating_add(1);
-        let last_attach = match try_attach_observed(
-            &options.data_dir,
-            &options.project_scope,
-            project,
-            Some(starter_token),
-        )
-        .await
-        {
-            Ok(Ok(attached)) => return Ok(attached),
-            Ok(Err(miss)) => miss,
-            Err(error) => {
-                let child_state = match child.try_wait() {
-                    Ok(Some(status)) => format!("exited with {status}"),
-                    Ok(None) => "remained running".into(),
-                    Err(status_error) => {
-                        format!("status observation failed with {status_error}")
-                    }
-                };
-                return Err(error).with_context(|| {
-                    format!("attach after starting the elected memory service; child {child_state}")
-                });
-            }
-        };
-        // Exit evidence carries the last stage read at an earlier poll: this
-        // poll's read follows the exit check.
-        if let Some(status) = child.try_wait()? {
-            return Err(ReadinessFailure::OwnerExited {
-                status,
-                last_stage: owner.last_stage(),
-                seen: owner.seen(),
-                since: owner.last_progress().elapsed(),
-            }
-            .into());
-        }
-        // One bounded read per poll, after the attach attempt and the exit
-        // check and before the window check, so progress first visible at
-        // this poll counts at this poll. Only a change of the record moves
-        // the window; a missing, foreign, unreadable or unchanged record
-        // moves nothing, so a failed publication or read never extends it.
-        match owner.poll(&options.data_dir, &options.project_scope, progress) {
-            activity::Watched::Waiting => {}
-            activity::Watched::Retired => {
-                return Err(ReadinessFailure::OwnerRetired {
-                    last_stage: owner.last_stage(),
-                    seen: owner.seen(),
-                    since: owner.last_progress().elapsed(),
+    let outcome: Result<ServiceAttachment> = async {
+        // Every starter reads its own owner's record, observed or not; only an
+        // observed open is shown its stages. The first window starts at spawn.
+        let mut owner = activity::OwnerWatch::new(activity::activity_tag(&starter_token), spawned);
+        let window = Duration::from_secs(options.config.startup_timeout_secs);
+        let mut polls: u32 = 0;
+        loop {
+            polls = polls.saturating_add(1);
+            let last_attach = match try_attach_observed(
+                &options.data_dir,
+                &options.project_scope,
+                project,
+                Some(starter_token),
+            )
+            .await
+            {
+                Ok(Ok(attached)) => return Ok(attached),
+                Ok(Err(miss)) => miss,
+                Err(error) => {
+                    let child_state = match child.try_wait() {
+                        Ok(Some(status)) => format!("exited with {status}"),
+                        Ok(None) => "remained running".into(),
+                        Err(status_error) => {
+                            format!("status observation failed with {status_error}")
+                        }
+                    };
+                    return Err(error).with_context(|| {
+                        format!(
+                            "attach after starting the elected memory service; child {child_state}"
+                        )
+                    });
                 }
-                .into());
-            }
-            activity::Watched::Failing(reason) => {
-                return Err(ReadinessFailure::OwnerFailed {
-                    reason,
-                    last_stage: owner.last_stage(),
-                    seen: owner.seen(),
-                    since: owner.last_progress().elapsed(),
-                }
-                .into());
-            }
-        }
-        let now = tokio::time::Instant::now();
-        let since = now.saturating_duration_since(owner.last_progress());
-        if since >= window {
-            // Taken before any failure-only observation below.
-            let split = ReadinessSplit {
-                started,
-                elected,
-                probed,
-                spawned,
-                expired: now,
-                polls,
-                last_attach,
             };
-            #[cfg(feature = "test-support")]
-            let observations = startup_diagnostic
-                .as_mut()
-                .map(|diagnostic| fixture_startup_observations(options, diagnostic));
-            #[cfg(not(feature = "test-support"))]
-            let observations = None;
-            return Err(ReadinessFailure::Stalled {
-                last_stage: owner.last_stage(),
-                seen: owner.seen(),
-                since,
-                window,
-                observations,
-                split,
+            // Exit evidence carries the last stage read at an earlier poll: this
+            // poll's read follows the exit check.
+            if let Some(status) = child.try_wait()? {
+                return Err(ReadinessFailure::OwnerExited {
+                    status,
+                    last_stage: owner.last_stage(),
+                    seen: owner.seen(),
+                    since: owner.last_progress().elapsed(),
+                }
+                .into());
             }
-            .into());
+            // One bounded read per poll, after the attach attempt and the exit
+            // check and before the window check, so progress first visible at
+            // this poll counts at this poll. Only a change of the record moves
+            // the window; a missing, foreign, unreadable or unchanged record
+            // moves nothing, so a failed publication or read never extends it.
+            match owner.poll(&options.data_dir, &options.project_scope, progress) {
+                activity::Watched::Waiting => {}
+                activity::Watched::Retired => {
+                    return Err(ReadinessFailure::OwnerRetired {
+                        last_stage: owner.last_stage(),
+                        seen: owner.seen(),
+                        since: owner.last_progress().elapsed(),
+                    }
+                    .into());
+                }
+                activity::Watched::Failing(reason) => {
+                    return Err(ReadinessFailure::OwnerFailed {
+                        reason,
+                        last_stage: owner.last_stage(),
+                        seen: owner.seen(),
+                        since: owner.last_progress().elapsed(),
+                    }
+                    .into());
+                }
+            }
+            let now = tokio::time::Instant::now();
+            let since = now.saturating_duration_since(owner.last_progress());
+            if since >= window {
+                // Taken before any failure-only observation below.
+                let split = ReadinessSplit {
+                    started,
+                    elected,
+                    probed,
+                    spawned,
+                    expired: now,
+                    polls,
+                    last_attach,
+                };
+                #[cfg(feature = "test-support")]
+                let observations = startup_diagnostic
+                    .as_mut()
+                    .map(|diagnostic| fixture_startup_observations(options, diagnostic));
+                #[cfg(not(feature = "test-support"))]
+                let observations = None;
+                return Err(ReadinessFailure::Stalled {
+                    last_stage: owner.last_stage(),
+                    seen: owner.seen(),
+                    since,
+                    window,
+                    observations,
+                    split,
+                }
+                .into());
+            }
+            #[cfg(test)]
+            readiness_poll_hook::missed(polls);
+            tokio::time::sleep(READINESS_POLL_INTERVAL).await;
         }
-        #[cfg(test)]
-        readiness_poll_hook::missed(polls);
-        tokio::time::sleep(READINESS_POLL_INTERVAL).await;
     }
+    .await;
+    // Test support: a starter that collects its owner's stages sends that
+    // owner's stderr to a private file, so a failed start hands it on to the
+    // fixture's owner diagnostic as well.
+    #[cfg(feature = "test-support")]
+    if outcome.is_err()
+        && let Some(diagnostic) = startup_diagnostic.as_mut()
+        && let Ok(Some(mut forward)) = fixture_owner_diagnostic()
+    {
+        forward_startup_diagnostic(diagnostic, &mut forward);
+    }
+    outcome
 }
 
 /// Test-only observation of the readiness loop: a test scopes a callback
@@ -2998,6 +3033,38 @@ mod tests {
     use tokio::io::duplex;
 
     const FIXTURE_DIAGNOSTIC_TAIL_BYTES: u64 = 4 * 1024;
+
+    /// A failed start hands its owner's stderr, collected privately for its
+    /// stages, to the test's owner diagnostic: appended whole from the start,
+    /// after what the diagnostic already held, and bounded.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_failed_start_forwards_its_private_startup_diagnostic() {
+        let mut diagnostic = tempfile::tempfile().unwrap();
+        // The owner's writes leave the shared offset at the end.
+        diagnostic
+            .write_all(b"memory startup stage: OpeningDatabase\nError: owner failure\n")
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner-diagnostic.log");
+        std::fs::write(&path, b"earlier owner\n").unwrap();
+        let mut forward = File::options().append(true).open(&path).unwrap();
+        forward_startup_diagnostic(&mut diagnostic, &mut forward);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "earlier owner\nmemory startup stage: OpeningDatabase\nError: owner failure\n"
+        );
+
+        let mut large = tempfile::tempfile().unwrap();
+        large.set_len(STARTUP_DIAGNOSTIC_FORWARD_LIMIT + 1).unwrap();
+        large.seek(SeekFrom::End(0)).unwrap();
+        let mut bounded = tempfile::tempfile().unwrap();
+        forward_startup_diagnostic(&mut large, &mut bounded);
+        assert_eq!(
+            bounded.metadata().unwrap().len(),
+            STARTUP_DIAGNOSTIC_FORWARD_LIMIT
+        );
+    }
 
     #[derive(Default)]
     struct FixtureAttachObservations {
