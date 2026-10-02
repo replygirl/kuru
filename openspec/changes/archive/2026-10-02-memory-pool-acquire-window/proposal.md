@@ -34,11 +34,18 @@ loop until the window ends instead of reporting it at once
   statement budget; nothing is set above an existing budget (lead decision
   D-2 (a)): the diagnostic names whichever of the scope or the ceiling fired.
 - A receipt-bearing write takes one deadline before its acquire that covers the
-  acquire, the identity statement, any pre-`Pending` validation and the apply
-  (lead decision D-1 (a)), so every service write completes inside the
-  client's 35 s `OPERATION_TIMEOUT` by construction. The uncertain-write fence
-  is unchanged: `Pending` is still set only after the acquire and identity
-  statement.
+  acquire, the identity statement, any pre-`Pending` validation, the apply and
+  the session's return (lead decision D-1 (a)), so that work ends within one
+  `QUERY_TIMEOUT` and fits the client's 35 s `OPERATION_TIMEOUT`. A store
+  mutation, session catalog write, candidate creation and usage ledger change
+  take it once they hold the write lock, covering their pre-`Pending` reads;
+  the candidate promotion merge, transition, deletion and exclusion writes and
+  the usage validation record take it at their acquire. The write-lock wait,
+  those writers' earlier reads, post-apply reconciliation and multi-write
+  candidate operations stay outside it, so a service write as a whole is not
+  bounded by 35 s; past it, the outcome query and the uncertain-write fence
+  recover the outcome. The fence is unchanged: `Pending` is still set only
+  after the acquire and identity statement.
 - A post-open pool creation (first acquire, first release and identity
   verification) runs under one creation budget (lead decision D-3 (b)). The
   opening phase keeps its startup-derived first acquire, its 2 s floor and its

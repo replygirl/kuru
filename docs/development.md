@@ -1588,26 +1588,37 @@ statement or operation it serves, never by a shorter window of its own:
   acquisition outside any scope, or one whose scope deadline falls on the same
   timer tick; nothing is set above the budget it serves.
 - **Write budget.** A receipt-bearing write takes one deadline,
-  `QUERY_TIMEOUT`, as soon as it holds the store's write lock and before its
-  first pool acquisition, and spends it on every read before its pending
-  record (reconciling an earlier uncertain write, the schema check, a logical
-  receipt's match and its recorded outcome, a candidate creation's ref and
-  base reads), the acquisition, the `CONNECTION_ID()` identity statement, any
-  validation before its pending record (a session fork's source traversal),
-  the write and the session's return, and for a candidate creation the new
-  branch's pool creation. A contended acquisition therefore uses write time:
-  a write that then runs out after its pending record is an uncertain write,
-  reconciled by the existing fence. Each receipt-bearing service write ends
-  within `QUERY_TIMEOUT`, so its reply fits the client's `OPERATION_TIMEOUT` (35 s,
-  `QUERY_TIMEOUT` plus `REPLY_MARGIN` in `service/rpc.rs`) by construction.
-  Three things are not one write's work and keep their own bounds: the wait
-  for the write lock (the previous write's end); reconciliation after a
-  write that ends without its receipt, which stays on the fence's existing
-  path; and candidate promotion, abandonment and cleanup, which run several
-  writes, each under its own write budget, so such a call is several write
-  budgets.
-  An acquisition that fails returns before any statement and before the
-  pending record, so it never makes a write uncertain.
+  `QUERY_TIMEOUT`, before its pool acquisition and spends it on the
+  acquisition, the `CONNECTION_ID()` identity statement, any validation
+  before its pending record (a session fork's source traversal), the write
+  and the session's return, so these end within one `QUERY_TIMEOUT` from
+  before the acquisition. A store mutation, a session catalog write, a
+  candidate creation and a usage ledger change take that deadline as soon as
+  they hold the store's write lock, so it also covers every read before their
+  pending record (reconciling an earlier uncertain write, the schema check, a
+  logical receipt's match and its recorded outcome, a candidate creation's
+  ref and base reads) and, for a candidate creation, the new branch's pool
+  creation. A candidate promotion merge, status transition, deletion and
+  session exclusion, and the usage ledger's validation record, take their
+  deadline at their acquisition; their earlier reads (promotion's
+  reconciliation, ref, revision and working-set reads, session retirement,
+  the validation record's bound check) keep their own statement budgets. A
+  contended acquisition therefore uses write time: a write that then runs out
+  after its pending record is an uncertain write, reconciled by the existing
+  fence. An acquisition that fails returns before any statement and before
+  the pending record, so it never makes a write uncertain.
+
+  The client waits `OPERATION_TIMEOUT` (35 s, `QUERY_TIMEOUT` plus
+  `REPLY_MARGIN` in `service/rpc.rs`) for a reply. A write's own budget fits
+  that wait, but a service write as a whole is not bounded by it: the wait
+  for the write lock (the previous write's end), the earlier reads of the
+  writers that take their deadline at the acquisition, reconciliation after
+  a write that ends without its receipt (the fence's own path), and candidate
+  promotion, abandonment and cleanup, which run session retirement, pool
+  retirement and several writes, each under its own write budget, all add to
+  it. Past the client's wait, the outcome query (see
+  [memory service protocol](#memory-service-protocol)) and the uncertain-write
+  fence recover the write's outcome.
 - **Creation budget.** A pool created after memory is open (a candidate's or
   other branch's pool) runs its first acquisition, its first connection's
   return and identity verification under one `QUERY_TIMEOUT` budget, nested

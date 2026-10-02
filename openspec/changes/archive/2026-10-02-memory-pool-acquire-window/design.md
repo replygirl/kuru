@@ -22,8 +22,10 @@ notes); this artifact records the decisions it implements.
   serves, with a pool ceiling equal to the statement budget.
 - Name the deciding bound, the budget and the acquire's share in the typed
   diagnostic; keep execution expiry distinct from acquisition timeouts.
-- Keep every service write inside the client's 35 s `OPERATION_TIMEOUT` by
-  construction.
+- Bound each receipt-bearing write's acquisition, identity statement,
+  pre-`Pending` validation, apply and session return by one `QUERY_TIMEOUT`
+  from before its acquisition, so that work fits the client's 35 s
+  `OPERATION_TIMEOUT`, and name every path outside it.
 - Leave a diagnostics record for a slow pending acquisition.
 - End an authored identity rejection at once on every post-open path.
 
@@ -48,22 +50,36 @@ notes); this artifact records the decisions it implements.
   pool option change (an acquire that exhausts the caller's budget is reported
   as an untyped deadline).
 - **D-1 (a), lead decision: one write budget.** A receipt-bearing writer takes
-  `deadline = now + QUERY_TIMEOUT` as soon as it holds the store's write lock
-  and before its first acquire, and runs every pre-`Pending` read
-  (`resolve_uncertain`, `schema_version`, `operation_receipt_matches`,
+  `deadline = now + QUERY_TIMEOUT` before its acquire and runs the acquire,
+  the `CONNECTION_ID()` identity statement, any pre-`Pending` validation and
+  apply under `within_until(deadline, ..)`; the receipted release keeps that
+  deadline. `mutate`, `mutate_session_catalog`, `begin_candidate_with_id` and
+  the usage-ledger `change` take it as soon as they hold the store's write
+  lock, so it also covers their pre-`Pending` reads (`resolve_uncertain`,
+  `schema_version`, `operation_receipt_matches`,
   `load_session_lifecycle_outcome`, a candidate creation's `candidate_heads`
-  and `revision`), the acquire, the `CONNECTION_ID()` identity statement, any
-  pre-`Pending` validation and apply under `within_until(deadline, ..)`, and
-  a candidate creation's branch-pool creation in what remains; the receipted
-  release keeps that deadline. Outside it: the write-lock wait (the previous
-  write's end), reconciliation after an apply that ends without its receipt
-  (the fence's existing path), and the multi-write candidate operations
-  (promotion, abandonment, cleanup), whose writes each take one budget.
-  Each receipt-bearing service write therefore completes inside the client's 35 s
-  `OPERATION_TIMEOUT` (`QUERY_TIMEOUT` + `REPLY_MARGIN`, `service/rpc.rs:38`,
-  :699-702) by construction. `Pending` is still set after the acquire and
-  identity statement and before apply. Rejected: separate budgets, which let a
-  contended write run past the client's 35 s.
+  and `revision`) and, for a candidate creation, the branch-pool creation in
+  what remains. The candidate promotion merge (`store.rs:1108`), status
+  transition (:1402), deletion (:1492) and session exclusion (:1525), and the
+  usage-ledger `record_validation` (`usage_ledger.rs:663`), take it
+  immediately before their acquire; their earlier reads (promotion's
+  `resolve_uncertain`, `candidate_heads`, `revision` and
+  `ensure_branch_clean`, `retire_branch_sessions`, `bound_check`) keep their
+  own statement budgets [measured]. Moving those deadlines would change
+  retirement-deadline semantics the lead did not rule on.
+  So from before its acquire, each write's acquire, identity statement,
+  pre-`Pending` validation, apply and return end within one `QUERY_TIMEOUT`,
+  and that work fits the client's 35 s `OPERATION_TIMEOUT` (`QUERY_TIMEOUT` +
+  `REPLY_MARGIN`, `service/rpc.rs:38`, :714-715). A service write as a whole
+  is not bounded by 35 s: the write-lock wait (the previous write's end), the
+  earlier reads above, reconciliation after an apply that ends without its
+  receipt (the fence's existing path), and the multi-write candidate
+  operations (promotion, abandonment, cleanup, with session and pool
+  retirement between writes that each take one budget) add to it. Past the
+  client's wait, the outcome query and the uncertain-write fence are the
+  recovery path. `Pending` is still set after the acquire and identity
+  statement and before apply. Rejected: separate budgets for the acquire and
+  apply, which let a contended write's own work run past the client's 35 s.
 - **D-2 (a), lead decision: the bound names whichever timer fired.** The scope
   and SQLx's lifetime ceiling (`QUERY_TIMEOUT`) are the only deciding timers;
   when their deadlines coincide on one tick, `bound` names the one that fired.

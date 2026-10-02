@@ -11,7 +11,7 @@
 - [x] 2.2 Run post-open pool creation under one creation budget and verify a held first release ends creation at its budget with no pool retained
 - [x] 2.3 Make authored identity rejections terminal for every pool attempt and sticky on retained pools, and verify the retained-pool and creation rejection tests
 - [x] 2.4 Convert memory statement and operation budgets to `within`/`within_until`, wrap the unscoped explicit acquires, and verify the reviewed site list
-- [x] 2.5 Give each receipt-bearing writer one write deadline once it holds the write lock and before its first acquire, covering its pre-`Pending` reads, and verify the fence test (`acquire_failure_before_a_write_is_never_uncertain`) and the three one-write-budget tests
+- [x] 2.5 Give each receipt-bearing writer one write deadline before its acquire, taken once it holds the write lock and covering its pre-`Pending` reads for `mutate`, `mutate_session_catalog`, `begin_candidate_with_id` and the usage-ledger `change` (the promotion merge, transition, deletion and exclusion writers and `record_validation` take it at their acquire; their earlier reads keep their own statement budgets), and verify the fence test (`acquire_failure_before_a_write_is_never_uncertain`) and the three one-write-budget tests
 - [x] 2.6 Split `ORDINARY_POOL_WINDOW` into `OPENING_POOL_FLOOR`, `SLOW_ACQUIRE_THRESHOLD` and rpc.rs `PROBE_BUDGET` with values unchanged, and verify the compile-time handler budget assertion still holds
 
 ## 3. Documentation and evidence

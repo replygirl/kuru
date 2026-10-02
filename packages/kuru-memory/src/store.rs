@@ -2885,8 +2885,8 @@ impl MemoryStore {
         // One write budget, taken once this write holds the write lock and
         // before its first pool acquisition, bounds the reads before its
         // pending record, its acquisition, the fork validation, the write and
-        // its session's return, so the write ends inside the service client's
-        // wait.
+        // its session's return, so that work fits the service client's wait;
+        // the write-lock wait and a later reconciliation are outside it.
         let deadline = write_deadline();
         let receipted = crate::pool::within_until(deadline, async {
             ensure!(
@@ -3790,7 +3790,8 @@ impl MemoryStore {
         // One write budget, taken once this write holds the write lock and
         // before its first pool acquisition, bounds the reads before its
         // pending record, its acquisition, the write and its session's
-        // return, so the write ends inside the service client's wait.
+        // return, so that work fits the service client's wait; the write-lock
+        // wait and a later reconciliation are outside it.
         let deadline = write_deadline();
         let receipted = crate::pool::within_until(deadline, async {
             self.resolve_uncertain().await?;
@@ -7519,10 +7520,15 @@ fn decode_message(role: String, format: &str, content: &str) -> Result<Message> 
 }
 
 /// A new write budget, `QUERY_TIMEOUT` from now. A receipt-bearing writer
-/// takes it before its first pool acquisition (a store-level write as soon as
-/// it holds the write lock), so one budget bounds the reads before its
-/// pending record, the acquisition, the identity statement, the write and the
-/// session's return.
+/// takes it before its pool acquisition, so one budget bounds the
+/// acquisition, the identity statement, any validation before its pending
+/// record, the write and the session's return. `mutate`,
+/// `mutate_session_catalog`, `begin_candidate_with_id` and the usage ledger's
+/// `change` take it as soon as they hold the write lock, so it also bounds
+/// their reads before the pending record. The candidate promotion merge,
+/// transition, deletion and exclusion writers and the usage validation record
+/// take it at their acquisition; their earlier reads keep their own
+/// statement budgets.
 fn write_deadline() -> tokio::time::Instant {
     tokio::time::Instant::now() + QUERY_TIMEOUT
 }
