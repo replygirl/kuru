@@ -95,9 +95,11 @@ impl MemoryPool {
         })
     }
 
-    /// Mark the pool closed and wait for every checked-out session.
-    pub async fn close(&self) {
-        self.pool.close().await;
+    /// Mark the pool closed at once, then return the wait for every
+    /// checked-out session, as SQLx's `Pool::close` does: callers build every
+    /// close future before awaiting any, so no sibling pool keeps admitting.
+    pub fn close(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.pool.close()
     }
 
     pub fn is_closed(&self) -> bool {
