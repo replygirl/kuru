@@ -13,11 +13,14 @@
 - [x] 2.3 Add `PoolAcquireTimedOut` with its three wait classes, the anyhow context and the `Executor` carrier, and verify the contended, stalled-authentication and classifier tests pass
 - [x] 2.4 Log every timed-out acquisition with the typed fields from the pool funnel, so the service owner's log names the wait without changing the wire fault, and verify the warning is emitted where the diagnostic is built
 - [x] 2.5 Stop counting a pooled session as checked out once its release takes the connection, before awaiting SQLx's return, and verify a release cancelled at a test-only release gate leaves the count and the next timeout's wait class correct
+- [x] 2.6 Bound a new pool's inline first-connection release by its attempt's deadline, closing the connection when it expires, and verify a held first release still opens the pool with verification on its own connection
+- [x] 2.7 Name the no-callback wait class for what the counter can observe (no connection reaching Kuru's identity callback, including an unfinished TCP or MySQL handshake), and verify the classifier, Display, docs and specs agree
 
 ## 3. Receipted write sessions
 
 - [x] 3.1 Return write sessions to the pool only on a receipted success in `mutate`, `mutate_session_catalog` and the usage ledger's `change`, and verify the write regression tests pass
 - [x] 3.2 Add guard tests that an uncertain and a rejected write end their SQL sessions before reconciliation, and verify they pass
+- [x] 3.3 Bound each receipted write's session return by the write's own budget, one deadline taken before its apply, and verify a held return closes the connection and the write still returns `Ok`
 
 ## 4. Documentation and evidence
 

@@ -205,6 +205,8 @@ struct ServerInner {
     candidate_wait_observer: Mutex<Option<oneshot::Sender<()>>>,
     #[cfg(test)]
     next_pool_probe_delay: StdMutex<Option<(Duration, Arc<AtomicBool>)>>,
+    #[cfg(test)]
+    next_pool_first_release_hold: StdMutex<Option<tokio::sync::oneshot::Sender<ConnectionGate>>>,
     /// Every branch or revision a caller asked [`Server::pool`] for, in order.
     #[cfg(test)]
     pool_requests: StdMutex<Vec<String>>,
@@ -823,6 +825,8 @@ impl Server {
                         first_acquire_window: remaining,
                         identity_rejection_is_terminal: true,
                         _test_probe_delay: _initial_probe_delay,
+                        #[cfg(test)]
+                        _test_first_release_hold: None,
                     },
                 ),
             )
@@ -894,6 +898,8 @@ impl Server {
             candidate_wait_observer: Mutex::new(None),
             #[cfg(test)]
             next_pool_probe_delay: StdMutex::new(None),
+            #[cfg(test)]
+            next_pool_first_release_hold: StdMutex::new(None),
             #[cfg(test)]
             pool_requests: StdMutex::new(Vec::new()),
             owner: Mutex::new(owner),
@@ -1008,7 +1014,29 @@ impl Server {
                 .take(),
             #[cfg(not(test))]
             _test_probe_delay: None,
+            #[cfg(test)]
+            _test_first_release_hold: self
+                .0
+                .next_pool_first_release_hold
+                .lock()
+                .expect("pool first release hold lock")
+                .take(),
         }
+    }
+
+    /// Hold the next pool's first connection release before SQLx's ping,
+    /// until its attempt's deadline; the receiver gets the take-once gate.
+    #[cfg(test)]
+    pub(crate) fn hold_next_pool_first_release(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<ConnectionGate> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        *self
+            .0
+            .next_pool_first_release_hold
+            .lock()
+            .expect("pool first release hold lock") = Some(sender);
+        receiver
     }
 
     /// Delay the next pool's authentication callback after a real Dolt
@@ -1745,7 +1773,8 @@ fn valid_secret(secret: &str) -> bool {
 
 /// One pool's connection progress for its whole life: the latest
 /// authentication phase, the last callback rejection and how many new
-/// connections entered authentication. Retained with the pool.
+/// connections entered Kuru's identity callback (after their TCP connect and
+/// MySQL authentication). Retained with the pool.
 #[derive(Clone)]
 pub(crate) struct ConnectionObservation(Arc<ObservationShared>);
 
@@ -1805,8 +1834,10 @@ impl ConnectionObservation {
         self.0.authenticated.load(Ordering::SeqCst)
     }
 
-    /// Count a new connection entering authentication. Under an armed test
-    /// gate, the connection then waits until the gate is dropped.
+    /// Count a new connection entering Kuru's identity callback, its first
+    /// line: a TCP or MySQL handshake that never finishes is never counted.
+    /// Under an armed test gate, the connection then waits until the gate is
+    /// dropped.
     async fn authentication_entered(&self) {
         self.0.authenticated.fetch_add(1, Ordering::SeqCst);
         #[cfg(test)]
@@ -1828,12 +1859,14 @@ impl ConnectionObservation {
     /// armed test release gate, the return waits until the gate is dropped.
     #[cfg(test)]
     async fn release_entered(&self) {
-        let gate = self
-            .0
-            .release_gate
-            .lock()
-            .expect("release gate lock")
-            .clone();
+        let gate = {
+            let mut slot = self.0.release_gate.lock().expect("release gate lock");
+            if slot.as_ref().is_some_and(|gate| gate.once) {
+                slot.take()
+            } else {
+                slot.clone()
+            }
+        };
         if let Some(gate) = gate {
             gate.hold().await;
         }
@@ -1847,6 +1880,7 @@ impl ConnectionObservation {
         let shared = Arc::new(GateShared {
             entered: tokio::sync::watch::Sender::new(false),
             released: tokio::sync::watch::Sender::new(false),
+            once: false,
         });
         let previous = self
             .0
@@ -1868,9 +1902,22 @@ impl ConnectionObservation {
     /// without guessing how long the ping takes.
     #[cfg(test)]
     pub(crate) fn gate_releases(&self) -> ConnectionGate {
+        self.arm_release_gate(false)
+    }
+
+    /// Hold only the next return of a checked-out connection, as
+    /// [`Self::gate_releases`] does; later returns pass.
+    #[cfg(test)]
+    pub(crate) fn gate_next_release(&self) -> ConnectionGate {
+        self.arm_release_gate(true)
+    }
+
+    #[cfg(test)]
+    fn arm_release_gate(&self, once: bool) -> ConnectionGate {
         let shared = Arc::new(GateShared {
             entered: tokio::sync::watch::Sender::new(false),
             released: tokio::sync::watch::Sender::new(false),
+            once,
         });
         let previous = self
             .0
@@ -1941,6 +1988,8 @@ pub(crate) const AUTHENTICATION_GATE_PHASE: &str = "authentication gate entered"
 struct GateShared {
     entered: tokio::sync::watch::Sender<bool>,
     released: tokio::sync::watch::Sender<bool>,
+    /// Hold only the first connection that reaches the gate.
+    once: bool,
 }
 
 #[cfg(test)]
@@ -1980,7 +2029,13 @@ impl ConnectionGate {
 #[cfg(test)]
 impl Drop for ConnectionGate {
     fn drop(&mut self) {
-        if let Ok(mut gate) = (self.slot)(&self.observation.0).lock() {
+        // A take-once gate may already have left the slot; never disarm a
+        // different gate armed after it.
+        if let Ok(mut gate) = (self.slot)(&self.observation.0).lock()
+            && gate
+                .as_ref()
+                .is_some_and(|armed| Arc::ptr_eq(armed, &self.shared))
+        {
             gate.take();
         }
         self.shared.released.send_replace(true);
@@ -1997,6 +2052,10 @@ struct PoolAttemptOptions {
     /// When set, an authored identity rejection ends acquisition instead.
     identity_rejection_is_terminal: bool,
     _test_probe_delay: Option<(Duration, Arc<AtomicBool>)>,
+    /// Receives a take-once gate that holds the attempt's first connection
+    /// release before SQLx's ping.
+    #[cfg(test)]
+    _test_first_release_hold: Option<tokio::sync::oneshot::Sender<ConnectionGate>>,
 }
 
 impl PoolAttemptOptions {
@@ -2006,6 +2065,8 @@ impl PoolAttemptOptions {
             first_acquire_window: ORDINARY_POOL_WINDOW,
             identity_rejection_is_terminal: false,
             _test_probe_delay: None,
+            #[cfg(test)]
+            _test_first_release_hold: None,
         }
     }
 }
@@ -2208,7 +2269,23 @@ async fn connect_pool_attempt(
         Ok(mut connection) => {
             // Return the first connection inline so the next statement on
             // this pool reuses it instead of racing SQLx's spawned release.
-            connection.return_to_pool().await;
+            // The attempt's own deadline bounds the release ping: when it
+            // runs out the future is dropped, SQLx closes the connection, and
+            // the identity verification opens one under its own deadline.
+            #[cfg(test)]
+            if let Some(hold) = attempt._test_first_release_hold {
+                let _ = hold.send(observation.gate_next_release());
+            }
+            if timeout_at(first_deadline, connection.return_to_pool())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    branch,
+                    "memory pool's first connection release exceeded the attempt's deadline; \
+                     the connection was closed instead of returned to the pool"
+                );
+            }
             Ok(pool)
         }
         Err(error) => Err(error),

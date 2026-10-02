@@ -345,7 +345,7 @@ async fn stalled_authentication_names_the_new_connection_phase() -> Result<()> {
     let text = format!("{error:#}");
     ensure!(
         text.contains(
-            "for a new connection's authentication (connection phase: authentication gate entered)"
+            "for a new connection in Kuru's identity callback (connection phase: authentication gate entered)"
         ),
         "{text}"
     );
@@ -558,6 +558,150 @@ async fn rejected_write_closes_its_session() -> Result<()> {
         store.pool.authenticated() > authenticated,
         "reconciliation reused a session the rejected write should have ended"
     );
+    store.close().await?;
+    Ok(())
+}
+
+/// A receipted write's session release is bounded by the write's own budget.
+/// The release gate holds the return before SQLx's ping and never opens on
+/// its own, and the deadline has already passed, so only the bound can end
+/// the release: the connection is closed, not pooled, and stops counting.
+#[tokio::test]
+async fn receipted_release_past_its_deadline_closes_the_connection() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let pool = store.pool.clone();
+    let (session, id) = write_session(&pool).await?;
+    let (size, checked_out) = (pool.size(), pool.checked_out());
+    ensure!(checked_out >= 1, "the write session is not counted as held");
+    let gate = pool.observation().gate_releases();
+    // The outer timeout only turns an unbounded regression into a failure.
+    tokio::time::timeout(
+        QUERY_TIMEOUT,
+        session.settle_receipted(tokio::time::Instant::now()),
+    )
+    .await
+    .context("a receipted release past its deadline was not cut")?;
+    ensure!(
+        gate.was_entered(),
+        "the release did not reach the pool's return"
+    );
+    ensure!(
+        pool.checked_out() == checked_out - 1,
+        "an expired release left {} sessions counted as held, not {}",
+        pool.checked_out(),
+        checked_out - 1
+    );
+    ensure!(
+        pool.size() == size - 1,
+        "an expired release left its connection in the pool (size {} of {size})",
+        pool.size()
+    );
+    drop(gate);
+    await_session_end(&pool, id, QUERY_TIMEOUT).await?;
+    drop(pool);
+    store.close().await?;
+    Ok(())
+}
+
+/// A receipted write whose session release never finishes still returns
+/// `Ok` once its budget ends, and its session leaves the pool. The release
+/// gate holds the return indefinitely, so the write's own `QUERY_TIMEOUT`
+/// budget is the bound under test and this test waits it out; the outer
+/// timeout only turns an unbounded regression into a failure.
+#[tokio::test]
+async fn receipted_write_succeeds_when_its_release_outlasts_its_budget() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let pool = store.pool.clone();
+    store
+        .put("pool.session.warm", &serde_json::json!(0))
+        .await?;
+    ensure!(
+        (pool.size(), pool.num_idle()) == (1, 1),
+        "the pool does not hold exactly one idle session"
+    );
+    // The write reuses this idle session.
+    let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool.as_ref())
+        .await?;
+    let gate = pool.observation().gate_releases();
+    tokio::time::timeout(
+        QUERY_TIMEOUT * 2,
+        store.put("pool.session.held_release", &serde_json::json!(1)),
+    )
+    .await
+    .context("a receipted write whose release was held did not end with its budget")?
+    .context("a receipted write failed because its release outlasted its budget")?;
+    ensure!(
+        gate.was_entered(),
+        "the write's release did not reach the pool's return"
+    );
+    ensure!(
+        (pool.size(), pool.checked_out()) == (0, 0),
+        "the held release left its session in the pool (size {}, {} checked out)",
+        pool.size(),
+        pool.checked_out()
+    );
+    ensure!(
+        store
+            .shared
+            .uncertain
+            .lock()
+            .expect("uncertain lock")
+            .is_none()
+    );
+    // Later statements release through the pool; open the gate first.
+    drop(gate);
+    await_session_end(&pool, id, QUERY_TIMEOUT).await?;
+    ensure!(
+        store.get("pool.session.held_release").await? == Some(serde_json::json!(1)),
+        "the receipted write is not durable"
+    );
+    drop(pool);
+    store.close().await?;
+    Ok(())
+}
+
+/// A new branch pool's first connection release is bounded by the attempt's
+/// own deadline. The take-once gate holds that release indefinitely, so only
+/// the deadline ends it: the connection is closed and identity verification
+/// authenticates its own. The outer timeout only turns an unbounded
+/// regression into a failure.
+#[tokio::test]
+async fn first_connection_release_is_bounded_by_its_attempt_deadline() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let branch = "first_release_probe";
+    tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query("CALL DOLT_BRANCH(?)")
+            .bind(branch)
+            .fetch_all(store.pool.as_ref()),
+    )
+    .await
+    .context("probe branch creation deadline exceeded")??;
+    let mut hold = store.shared.server.hold_next_pool_first_release();
+    let pool = tokio::time::timeout(QUERY_TIMEOUT, store.shared.server.pool(branch))
+        .await
+        .context("a held first release kept the branch pool from opening")??;
+    let gate = hold
+        .try_recv()
+        .context("the pool attempt did not arm the first release hold")?;
+    ensure!(
+        gate.was_entered(),
+        "the first connection's release did not reach the pool's return"
+    );
+    ensure!(
+        pool.authenticated() == 2,
+        "{} connections authenticated; the closed first connection and verification's own were expected",
+        pool.authenticated()
+    );
+    ensure!(
+        (pool.size(), pool.num_idle()) == (1, 1),
+        "the pool holds {} connections, {} idle, after the first was closed",
+        pool.size(),
+        pool.num_idle()
+    );
+    drop(gate);
+    drop(pool);
     store.close().await?;
     Ok(())
 }

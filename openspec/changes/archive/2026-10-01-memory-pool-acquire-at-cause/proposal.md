@@ -47,8 +47,10 @@ candidates that this change does not remove.
   each statement's connection to the pool inline (SQLx's own eager release)
   before the statement's future completes, so sequential work on a pool reuses
   one authenticated session instead of racing the spawned release.
-  `Server::pool` releases the pool's first connection inline and runs the
-  identity verification on that same session.
+  `Server::pool` releases the pool's first connection inline, bounded by the
+  pool attempt's own deadline, and runs the identity verification on that same
+  session; a release that outlasts the deadline is dropped, so SQLx closes the
+  connection and verification opens its own under its own deadline.
 - A write session returns to the pool only after a receipted success
   (`Ok(Ok(_))`, the branch that already clears the uncertain-write record) in
   `mutate`, `mutate_session_catalog` and the usage ledger's `change`. Every
@@ -57,7 +59,12 @@ candidates that this change does not remove.
   `resolve_uncertain` runs, byte-for-byte today's fence. Each covered `apply`
   ends with `COMMIT` (or an explicit `ROLLBACK` for an unchanged usage
   settlement); no store write sets session variables, `USE`s a database,
-  checks out a Dolt branch or takes a named lock.
+  checks out a Dolt branch or takes a named lock. The receipted return is
+  bounded by the write's own `QUERY_TIMEOUT` budget, one deadline taken before
+  its apply: a return that outlasts it is dropped, SQLx closes the floating
+  connection and lowers the pool size, and the receipted write still returns
+  `Ok`. Without that bound an awaited release ping that stalled would hold the
+  write mutex, every later write and `MemoryStore::close`.
 - Candidate creation, promotion, transition, deletion and exclusion writers
   keep closing their sessions on every outcome. They always reconcile through
   the processlist, run `DOLT_BRANCH`/`DOLT_MERGE` procedures and are not the
@@ -66,12 +73,14 @@ candidates that this change does not remove.
   `PoolAcquireTimedOut`: the branch, pool `max`, `size`, idle and checked-out
   counts, elapsed wait, window, connections authenticated since the pool opened
   and during this wait, the wait class, and the connection phase only when a
-  connection entered authentication during this wait. Wait classes: `held
-  connections` (every permit held by Kuru work), `new connection`
-  (a connection started authenticating during the wait) and `idle check or
-  release` (capacity existed and no connection started authenticating: an
-  idle-connection ping, a release in flight, or a wait before the connect
-  started). The funnel's own `acquire`/`begin` return it as anyhow context over
+  connection entered Kuru's identity callback during this wait. The
+  connection counter moves on the callback's first line, after TCP and MySQL
+  authentication have finished. Wait classes: `held connections` (every
+  permit held by Kuru work), `new connection` (a new connection reached the
+  identity callback during the wait) and `no identity callback` (capacity
+  existed and no new connection reached the callback: an idle-connection
+  ping, a release in flight, or a TCP or MySQL handshake that did not finish,
+  which Kuru cannot tell apart). The funnel's own `acquire`/`begin` return it as anyhow context over
   the original `sqlx::Error::PoolTimedOut`; statements run through the
   `Executor` carry it as `sqlx::Error::Io` of kind `Other` whose payload is the
   typed diagnostic, so the existing `MemoryFailure` and fixture panic chains
@@ -83,8 +92,10 @@ candidates that this change does not remove.
   out` warning with the same typed fields, so the memory service owner's log
   names the wait even though the wire fault stays `StorageFailed` (carrying
   the diagnostic to clients is decision D3, deferred).
-- Test hooks: a per-pool authentication gate (no time involved) and an
-  authenticated-connection counter retained per pool.
+- Test hooks: a per-pool authentication gate and release gate (no time
+  involved; the release gate also has a take-once form that the next pool
+  attempt can arm on its first connection) and an identity-callback
+  connection counter retained per pool.
 
 Not changed: `ORDINARY_POOL_WINDOW` (2 s), `startup_timeout_secs`,
 `QUERY_TIMEOUT`, the opening-deadline first-acquire rule, pool `max = 4`, the

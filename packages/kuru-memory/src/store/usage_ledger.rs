@@ -339,8 +339,10 @@ impl UsageLedger {
                 connection: id,
                 receipt: Receipt::Operation(operation.clone()),
             });
-            let result = tokio::time::timeout(
-                QUERY_TIMEOUT,
+            // One budget bounds the write and its session's return.
+            let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
+            let result = tokio::time::timeout_at(
+                deadline,
                 apply_change(&mut connection, &operation, change),
             )
             .await;
@@ -349,7 +351,7 @@ impl UsageLedger {
                 // way the session is clean and the outcome receipted.
                 Ok(Ok(_)) => {
                     *store.shared.uncertain.lock().expect("uncertain lock") = None;
-                    connection.settle_receipted().await;
+                    connection.settle_receipted(deadline).await;
                     Ok(())
                 }
                 other => {

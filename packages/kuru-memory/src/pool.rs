@@ -385,13 +385,16 @@ pub enum PoolWait {
     /// Every permit was held by checked-out Kuru work: contention, or a
     /// holder that did not finish.
     HeldConnections,
-    /// Capacity existed and a new connection entered authentication during
-    /// this wait: TCP, MySQL authentication or Kuru's identity callback.
+    /// Capacity existed and a new connection reached Kuru's identity
+    /// callback during this wait, after its TCP connect and MySQL
+    /// authentication had finished.
     NewConnection,
-    /// Capacity existed and no new connection entered authentication during
-    /// this wait: an idle-connection check, a release still in flight, or a
-    /// connect that never reached the identity callback.
-    IdleCheckOrRelease,
+    /// Capacity existed and no new connection reached Kuru's identity
+    /// callback during this wait: an idle-connection check, a release still
+    /// in flight, or a TCP or MySQL handshake that did not finish. The
+    /// callback is the first point Kuru observes a new connection, so these
+    /// cannot be told apart.
+    NoIdentityCallback,
 }
 
 impl PoolWait {
@@ -401,7 +404,7 @@ impl PoolWait {
         } else if authenticated_during_wait > 0 {
             Self::NewConnection
         } else {
-            Self::IdleCheckOrRelease
+            Self::NoIdentityCallback
         }
     }
 
@@ -409,16 +412,16 @@ impl PoolWait {
         match self {
             Self::HeldConnections => "held connections",
             Self::NewConnection => "new connection",
-            Self::IdleCheckOrRelease => "idle check or release",
+            Self::NoIdentityCallback => "no identity callback",
         }
     }
 
     fn describe(self) -> &'static str {
         match self {
             Self::HeldConnections => "for a connection held by Kuru work (every permit held)",
-            Self::NewConnection => "for a new connection's authentication",
-            Self::IdleCheckOrRelease => {
-                "for an idle-connection check or a release, with no new connection authenticating"
+            Self::NewConnection => "for a new connection in Kuru's identity callback",
+            Self::NoIdentityCallback => {
+                "with no new connection reaching Kuru's identity callback (an idle-connection check, a release in flight, or a TCP or MySQL handshake that did not finish)"
             }
         }
     }
@@ -516,15 +519,17 @@ mod tests {
         assert_eq!(PoolWait::classify(4, 4, 0), PoolWait::HeldConnections);
         assert_eq!(PoolWait::classify(4, 4, 1), PoolWait::HeldConnections);
         assert_eq!(PoolWait::classify(4, 3, 1), PoolWait::NewConnection);
-        assert_eq!(PoolWait::classify(4, 0, 0), PoolWait::IdleCheckOrRelease);
-        assert_eq!(PoolWait::classify(4, 3, 0), PoolWait::IdleCheckOrRelease);
+        assert_eq!(PoolWait::classify(4, 0, 0), PoolWait::NoIdentityCallback);
+        assert_eq!(PoolWait::classify(4, 3, 0), PoolWait::NoIdentityCallback);
     }
 
     #[test]
     fn diagnostic_names_its_wait_and_omits_a_stale_phase() {
-        let idle = diagnostic(PoolWait::IdleCheckOrRelease, None).to_string();
+        let idle = diagnostic(PoolWait::NoIdentityCallback, None).to_string();
         assert!(
-            idle.contains("idle-connection check or a release"),
+            idle.contains(
+                "waiting with no new connection reaching Kuru's identity callback (an idle-connection check, a release in flight, or a TCP or MySQL handshake that did not finish)"
+            ),
             "{idle}"
         );
         assert!(!idle.contains("connection phase"), "{idle}");
@@ -539,7 +544,7 @@ mod tests {
         let new = diagnostic(PoolWait::NewConnection, Some("data directory query")).to_string();
         assert!(
             new.contains(
-                "for a new connection's authentication (connection phase: data directory query)"
+                "for a new connection in Kuru's identity callback (connection phase: data directory query)"
             ),
             "{new}"
         );

@@ -2878,8 +2878,10 @@ impl MemoryStore {
                 connection: id,
                 receipt: Receipt::Operation(operation.clone()),
             });
-            let result = tokio::time::timeout(
-                QUERY_TIMEOUT,
+            // One budget bounds the write and its session's return.
+            let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
+            let result = tokio::time::timeout_at(
+                deadline,
                 apply_session_lifecycle(
                     &mut connection,
                     &operation,
@@ -2891,7 +2893,7 @@ impl MemoryStore {
             .await;
             if let Ok(Ok(outcome)) = result {
                 *store.shared.uncertain.lock().expect("uncertain lock") = None;
-                connection.settle_receipted().await;
+                connection.settle_receipted(deadline).await;
                 return Ok(outcome);
             }
             // Not a receipted success: end the session before reconciling.
@@ -3741,8 +3743,10 @@ impl MemoryStore {
                 .lock()
                 .expect("apply pause lock")
                 .take();
-            let result = tokio::time::timeout(
-                QUERY_TIMEOUT,
+            // One budget bounds the write and its session's return.
+            let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
+            let result = tokio::time::timeout_at(
+                deadline,
                 apply(
                     &mut connection,
                     &operation,
@@ -3756,7 +3760,7 @@ impl MemoryStore {
             .await;
             if matches!(result, Ok(Ok(()))) {
                 *store.shared.uncertain.lock().expect("uncertain lock") = None;
-                connection.settle_receipted().await;
+                connection.settle_receipted(deadline).await;
                 return Ok(());
             }
             // Not a receipted success: end the session before reconciling.
@@ -7424,9 +7428,23 @@ impl WriteSession {
     /// `apply`, `apply_session_lifecycle` and the usage ledger's
     /// `apply_change`. A writer that changes session state must let the
     /// session drop instead.
-    async fn settle_receipted(mut self) {
-        if let Some(session) = self.0.take() {
-            session.release().await;
+    ///
+    /// `deadline` is the write's own budget, taken before its apply. SQLx's
+    /// release ping is bounded by what remains of it: when it runs out, the
+    /// release future is dropped, SQLx closes the floating connection and
+    /// lowers the pool size, and the session already stopped counting as
+    /// held when the release began. The write is receipted either way, so an
+    /// expired release never turns its success into an error.
+    async fn settle_receipted(mut self, deadline: tokio::time::Instant) {
+        if let Some(session) = self.0.take()
+            && tokio::time::timeout_at(deadline, session.release())
+                .await
+                .is_err()
+        {
+            tracing::warn!(
+                "receipted memory write's session release exceeded the write's budget; \
+                 the connection was closed instead of returned to the pool"
+            );
         }
     }
 }
