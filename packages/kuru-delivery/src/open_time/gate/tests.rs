@@ -103,8 +103,8 @@ fn both_derivation_runs_pass_the_ci_gate() {
         let text = render(&verdict, &ci_gate());
         assert!(text.contains("Open-time gate: passed"), "{text}");
         assert!(
-            text.contains("| new-project | 10 | 730 |")
-                || text.contains("| new-project | 10 | 732 |"),
+            text.contains("| new-project | 10 | 729.8 |")
+                || text.contains("| new-project | 10 | 731.9 |"),
             "{text}"
         );
         assert!(text.contains("| 890 | within |"), "{text}");
@@ -221,7 +221,7 @@ fn a_new_project_median_over_budget_fails_and_names_the_runs_over_it() {
     assert!(over.iter().all(|(_, ready)| *ready > 890.0));
     let text = render(&verdict, &ci_gate());
     assert!(
-        text.contains("new-project: median open to ready 932 ms is over the 890 ms budget"),
+        text.contains("new-project: median open to ready 931.9 ms is over the 890 ms budget"),
         "{text}"
     );
     assert!(text.contains("| 890 | over |"), "{text}");
@@ -245,7 +245,7 @@ fn assert_budget_boundary(runs: &[Run], case: Case, median_ms: u64) {
     assert_eq!(row.median_ms, median_ms as f64, "{row:?}");
     assert_eq!(row.budget_ms, median_ms);
     let text = render(&verdict, &gate);
-    let row = format!("| {} | 10 | {median_ms} |", case.label());
+    let row = format!("| {} | 10 | {:.1} |", case.label(), median_ms as f64);
     let line = text
         .lines()
         .find(|line| line.starts_with(&row))
@@ -334,7 +334,7 @@ fn a_cold_existing_median_over_budget_fails_on_its_own() {
     assert_eq!(iterations, expected);
     let text = render(&verdict, &ci_gate());
     assert!(
-        text.contains("cold-existing: median open to ready 599 ms is over the 585 ms budget"),
+        text.contains("cold-existing: median open to ready 599.3 ms is over the 585 ms budget"),
         "{text}"
     );
     assert!(text.contains("| 890 | within |"), "{text}");

@@ -1191,12 +1191,12 @@ the gating installation job, so its few seconds are on `ci-gate`'s critical
 path. The open-time job starts after `native-tests` succeeds, downloads that
 exact binary, builds only the delivery tool (which needs no engine bundle
 input) and runs `mise run //packages/kuru-delivery:measure:open-time` once: the
-main series, 10 iterations, with the gate variables set. At about 70 to 90 s
-per iteration (two 30 s retirement waits) it adds roughly 15 to 20 minutes to
-`ci-gate`'s critical path after `native-tests`. Nothing is rebuilt, and the
-measured executable embeds the engine its installation job verified. The
-control, coarse-period and ramp modes (below) are local-only and are not run in
-CI.
+main series, 10 iterations, with the gate variables set. Measured on three
+runs, the step takes about 3.5 minutes including compilation of the delivery
+tool, added to `ci-gate`'s critical path after `native-tests`. Nothing is
+rebuilt, and the measured executable embeds the engine its installation job
+verified. The control, coarse-period and ramp modes (below) are local-only
+and are not run in CI.
 
 The harness drives the binary from outside. Each iteration uses a fresh private
 scratch root with its own HOME, configuration, data directory, engine cache,
@@ -1343,14 +1343,15 @@ median is kept) and a 64 MiB write, fsync and read in the scratch root. Use the
 `open / CPU probe` ratio to compare runs of one runner label, such as a pull
 request's head against its base, not runners of different kinds.
 
-These modes are for local comparisons only; CI runs the main series alone, and
-the gate refuses to run in either of the first two.
 `KURU_OPEN_TIME_FILES=off` runs the control series: processes only.
 `KURU_OPEN_TIME_RETIRE_WAIT=off` runs the ramp: consecutive iterations start
 while earlier owners are still inside their idle window, so owners accumulate
 and the census shows it; there, the cold-existing case attaches to the owner
 the first launch just started, which its owner path reports. The iteration
 directories are kept until one final retirement wait after the last run.
+These modes (the control series and the ramp) are for local comparisons
+only; CI runs the main series alone, and the gate refuses to run in either
+of them.
 `KURU_OPEN_TIME_INTERVAL_MS` sets the sampling period.
 
 A failed open is a run with no readiness signal (neither a `ready` marker nor

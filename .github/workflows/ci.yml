@@ -610,8 +610,8 @@ jobs:
         with:
           name: ci-release-binary-${{ matrix.os }}
           path: ${{ runner.temp }}/kuru-release
-      # The main series only: 10 iterations, about 70-90 s each with two
-      # 30 s retirement waits.
+      # The main series only: 10 iterations. Measured on three runs at
+      # about 3.5 minutes total, including the delivery tool's compile time.
       - name: Measure and gate open time
         shell: bash
         env:
