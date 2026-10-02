@@ -1473,7 +1473,15 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
     // the merge accepts; failures publish diagnostics under a name it rejects.
     assert_eq!(workflow.matches("if: ${{ !cancelled() }}").count(), 1);
     assert!(!shards.contains("if: ${{ !cancelled() }}"));
-    assert_eq!(shards.matches("if: ${{ failure() }}").count(), 1);
+    // A host cancel or the job time limit also ends a stalled partition, so
+    // its diagnostics upload runs on cancellation as well as on failure.
+    assert_eq!(
+        shards
+            .matches("if: ${{ failure() || cancelled() }}")
+            .count(),
+        1
+    );
+    assert!(!shards.contains("if: ${{ failure() }}"));
     assert!(shards.contains(
         "name: ${{ inputs.artifact-prefix }}-coverage-diagnostics-${{ inputs.os }}-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}"
     ));
