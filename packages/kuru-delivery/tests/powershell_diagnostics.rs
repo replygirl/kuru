@@ -455,7 +455,13 @@ fn wrapper_waits_take_the_package_launch_budget_inside_the_shard_deadline() {
         let seconds: Vec<u64> = text
             .lines()
             .filter_map(|line| line.trim().strip_prefix(prefix.as_str()))
-            .map(|rest| rest.strip_suffix(");").unwrap().parse().unwrap())
+            .map(|rest| {
+                rest.strip_suffix(");")
+                    .and_then(|seconds| seconds.parse().ok())
+                    .unwrap_or_else(|| {
+                        panic!("{file} {name} is no longer a whole-second budget: {rest}")
+                    })
+            })
             .collect();
         assert_eq!(
             seconds,
