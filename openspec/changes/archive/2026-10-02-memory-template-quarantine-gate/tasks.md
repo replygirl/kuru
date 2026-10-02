@@ -429,12 +429,20 @@
       wording) is not part of the cospec record.
       CI evidence (run `36989424837`, head `0851eab8139039574917ae42a72262f5ae19c38d`,
       `gh pr checks 171 --repo replygirl/kuru`): every job passed except
-      the two Windows arm64 `dolt-windows-arm64` reproducibility legs,
-      which report `skipping` (unrelated cache-key gating, not a failure).
-      This closes what 5.2 named as not run: `native-tests (ubuntu-latest,
-      windows-latest, windows-11-arm, macos-latest) / Require native
-      coverage and installation checks` all pass; the coverage-merge jobs
-      for macOS, Ubuntu and Windows all pass. A green run does not by
-      itself prove the cross-test race is closed — it cannot be forced
-      from a test — so this does not change the 6.3/6.4 analysis, only
-      records that the previously-pending legs finished green.
+      four `skipping` rows, all `dolt-windows-arm64`-related: the wrapper
+      job on macos-latest, windows-latest and ubuntu-latest, plus the
+      nested "Reproducible Windows arm64 engine" job under windows-11-arm.
+      [read: `.github/workflows/native-tests.yml:46` and
+      `.github/workflows/bundle-build.yml:57`] The wrapper job runs only
+      `if: inputs.os == 'windows-11-arm'`, and the nested build job inside
+      it runs only `if: ${{ !inputs.ref }}` (a called workflow sees its
+      caller's event, so a dispatch with a ref, as native-tests.yml
+      passes, skips it); the sibling "Pin-verified Windows arm64 engine
+      input" leg still ran and passed. This closes what 5.2 named as not
+      run: `native-tests (ubuntu-latest, windows-latest, windows-11-arm,
+      macos-latest) / Require native coverage and installation checks`
+      all pass; the coverage-merge jobs for macOS, Ubuntu and Windows all
+      pass. A green run does not by itself prove the cross-test race is
+      closed — it cannot be forced from a test — so this does not change
+      the 6.3/6.4 analysis, only records that the previously-pending legs
+      finished green.
