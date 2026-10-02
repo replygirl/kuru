@@ -681,9 +681,10 @@ stages, count or failing mark restarts the `memory.startup_timeout_secs`
 window; a record it read that is gone, or one marked failing, ends the wait at
 once (see [configuration](configuration.md)). Gone means that the lookup of the
 record's name, or of its directory, found nothing (`files::is_missing_name`). A
-record replaced over its name after the client opened it is reported by the
-platform's handle check as unlinked, with no OS error code; that read decides
-nothing and the next poll's lookup does. Beyond extending or ending its own
+record replaced over its name after the client opened it fails the platform's
+handle check as unlinked, with no OS error code (Unix), or as delete-pending
+(Windows); either way it is not a missing name, that read decides nothing and
+the next poll's lookup does. Beyond extending or ending its own
 starter's readiness wait, the record grants no authority: election,
 attachment, recovery and retirement never read it, and a failed write never
 fails or delays the open. The owner always replaces it by publishing a complete
