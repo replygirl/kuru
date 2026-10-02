@@ -8,20 +8,70 @@ use anyhow::Context as _;
 /// subprocess fixtures must own this final step and await the close rather than
 /// leave independent Dolt processes accumulating across the parallel
 /// application suite.
+///
+/// It also owns the fixture's owner diagnostic file: a command-line child
+/// given [`ServiceCleanup::owner_diagnostic_path`] through
+/// `kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV` sends the stderr of any
+/// owner it elects there. Dropping the fixture writes that stderr to the
+/// test's captured output, and [`ServiceCleanup::release`] attaches it to a
+/// failed outcome, before the root is removed.
 pub struct ServiceCleanup {
     data: Vec<PathBuf>,
     root: Option<kuru_memory::test_support::TempDir>,
+    owner_diagnostic: PathBuf,
     pending: bool,
 }
+
+/// The name, in each fixture's private root, of its owner diagnostic file.
+const OWNER_DIAGNOSTIC: &str = "owner-diagnostic.log";
 
 impl ServiceCleanup {
     /// `root` is a guarded fixture root: after this cleanup awaits every
     /// project store's quiescence, its teardown checks the recorded result.
     pub fn new(root: kuru_memory::test_support::TempDir, data: &Path) -> Self {
+        // The owner diagnostic hook opens an existing file for append only.
+        drop(
+            kuru_platform::fs::Directory::open(
+                root.path(),
+                kuru_platform::fs::Privacy::OwnerOnly,
+                kuru_platform::fs::NameRetention::Pinned,
+            )
+            .and_then(|directory| directory.create_new(std::ffi::OsStr::new(OWNER_DIAGNOSTIC)))
+            .expect("create the fixture's owner diagnostic file"),
+        );
         Self {
             data: vec![data.to_owned()],
+            owner_diagnostic: root.path().join(OWNER_DIAGNOSTIC),
             root: Some(root),
             pending: true,
+        }
+    }
+
+    /// The file a command-line child names in
+    /// `kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV`, so the stderr of
+    /// any owner it elects reaches this fixture's failure output.
+    #[allow(
+        dead_code,
+        reason = "each integration-test crate compiles this shared support module independently"
+    )]
+    pub fn owner_diagnostic_path(&self) -> &Path {
+        &self.owner_diagnostic
+    }
+
+    /// What every owner this fixture's children elected wrote to stderr, as
+    /// a failure-message suffix; empty when no owner wrote anything.
+    pub fn owner_diagnostic(&self) -> String {
+        match std::fs::read(&self.owner_diagnostic) {
+            Ok(bytes) if bytes.is_empty() => String::new(),
+            Ok(bytes) => format!(
+                "\nowner stderr ({}):\n{}",
+                self.owner_diagnostic.display(),
+                String::from_utf8_lossy(&bytes)
+            ),
+            Err(error) => format!(
+                "\nowner stderr unreadable ({}): {error}",
+                self.owner_diagnostic.display()
+            ),
         }
     }
 
@@ -68,7 +118,15 @@ impl ServiceCleanup {
         reason = "each integration-test crate compiles this shared support module independently"
     )]
     pub fn release<T>(mut self, outcome: anyhow::Result<T>) -> anyhow::Result<T> {
-        let outcome = match (outcome, self.finish()) {
+        // Read after cleanup has awaited the owners it can find, so more of
+        // their stderr has landed; the file outlives cleanup either way.
+        let cleanup = self.finish();
+        let owner_diagnostic = self.owner_diagnostic();
+        let outcome = match outcome {
+            Err(error) if !owner_diagnostic.is_empty() => Err(error.context(owner_diagnostic)),
+            outcome => outcome,
+        };
+        let outcome = match (outcome, cleanup) {
             (outcome, Ok(())) => outcome,
             (Ok(_), Err(cleanup)) => Err(cleanup),
             (Err(error), Err(cleanup)) => Err(error.context(format!(
@@ -121,8 +179,22 @@ impl ServiceCleanup {
 
 impl Drop for ServiceCleanup {
     fn drop(&mut self) {
-        if let Err(error) = self.finish() {
-            if std::thread::panicking() {
+        // Show the owners' stderr after cleanup has awaited the owners it can
+        // find and while the file still exists: the guarded root is removed
+        // only after this body, or retained when cleanup fails. The test
+        // harness captures this and prints it only for a failing test, which
+        // covers a test that returns its error as well as one that panics.
+        let panicking = std::thread::panicking();
+        let pending = self.pending;
+        let finished = self.finish();
+        if pending {
+            let owner_diagnostic = self.owner_diagnostic();
+            if !owner_diagnostic.is_empty() {
+                eprintln!("managed-memory fixture{owner_diagnostic}");
+            }
+        }
+        if let Err(error) = finished {
+            if panicking {
                 eprintln!("managed-memory fixture cleanup failed: {error:#}");
             } else {
                 panic!("managed-memory fixture cleanup failed: {error:#}");

@@ -67,6 +67,11 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
                 "XDG_CONFIG_HOME",
                 memory::configuration_warmed(root.path()).await?,
             )
+            // A failing test shows the stderr of every owner this elects.
+            .env(
+                kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+                root.owner_diagnostic_path(),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;

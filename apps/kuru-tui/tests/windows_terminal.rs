@@ -160,8 +160,17 @@ impl Sandbox {
         }
         let startup =
             Duration::from_secs((configuration.memory.startup_timeout_secs + 5) * 2 + 13) + READY;
+        let temporary = memory::ServiceCleanup::new(temporary, &data);
+        // A failing test shows the stderr of every owner this elects.
+        environment.insert(
+            kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV.into(),
+            temporary
+                .owner_diagnostic_path()
+                .to_string_lossy()
+                .into_owned(),
+        );
         Ok(Self {
-            temporary: memory::ServiceCleanup::new(temporary, &data),
+            temporary,
             root,
             project,
             data,

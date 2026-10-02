@@ -52,7 +52,12 @@ impl Sandbox {
             .arg("--data-dir")
             .arg(data)
             .args(["--provider", provider, "--no-dream"])
-            .env("XDG_CONFIG_HOME", self.root.path().join("config"));
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+            // A failing test shows the stderr of every owner this elects.
+            .env(
+                kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+                self.root.owner_diagnostic_path(),
+            );
         command
     }
 

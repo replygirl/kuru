@@ -104,6 +104,11 @@ impl Sandbox {
         }
         command
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+            // A failing test shows the stderr of every owner this elects.
+            .env(
+                kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+                self.root.owner_diagnostic_path(),
+            )
             .env("KURU_SHELL_TURN_FIXTURE_KEY", "fixture-key")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
