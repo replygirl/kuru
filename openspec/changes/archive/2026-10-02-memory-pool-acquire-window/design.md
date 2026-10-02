@@ -48,10 +48,18 @@ notes); this artifact records the decisions it implements.
   pool option change (an acquire that exhausts the caller's budget is reported
   as an untyped deadline).
 - **D-1 (a), lead decision: one write budget.** A receipt-bearing writer takes
-  `deadline = now + QUERY_TIMEOUT` before its acquire and runs acquire, the
-  `CONNECTION_ID()` identity statement, any pre-`Pending` validation and apply
-  under `within_until(deadline, ..)`; the receipted release keeps that
-  deadline. Every service write therefore completes inside the client's 35 s
+  `deadline = now + QUERY_TIMEOUT` as soon as it holds the store's write lock
+  and before its first acquire, and runs every pre-`Pending` read
+  (`resolve_uncertain`, `schema_version`, `operation_receipt_matches`,
+  `load_session_lifecycle_outcome`, a candidate creation's `candidate_heads`
+  and `revision`), the acquire, the `CONNECTION_ID()` identity statement, any
+  pre-`Pending` validation and apply under `within_until(deadline, ..)`, and
+  a candidate creation's branch-pool creation in what remains; the receipted
+  release keeps that deadline. Outside it: the write-lock wait (the previous
+  write's end), reconciliation after an apply that ends without its receipt
+  (the fence's existing path), and the multi-write candidate operations
+  (promotion, abandonment, cleanup), whose writes each take one budget.
+  Every service write therefore completes inside the client's 35 s
   `OPERATION_TIMEOUT` (`QUERY_TIMEOUT` + `REPLY_MARGIN`, `service/rpc.rs:38`,
   :699-702) by construction. `Pending` is still set after the acquire and
   identity statement and before apply. Rejected: separate budgets, which let a
@@ -95,7 +103,9 @@ notes); this artifact records the decisions it implements.
   bound rule (the bound is the statement budget), but time-to-report of that
   terminal fault grows from 2 s to 30 s. Making a refused connect terminal,
   as an identity rejection is, is not part of this change; documented in
-  `docs/development.md` for a separate decision.
+  `docs/development.md` for a separate decision. Awaiting the lead's ruling
+  (accept and document, or treat a refused connect to the store's own
+  endpoint as terminal as C5 treats identity rejection); recorded in the PR.
 - [D-3 (b): `Server::pool` holds its pool map across post-open creation, now
   bounded by the 30 s creation budget instead of about 2 s + 2 s] → a stalled
   branch-pool creation delays every `Server::pool` call, cached lookups

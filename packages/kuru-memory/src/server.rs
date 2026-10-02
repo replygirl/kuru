@@ -1947,6 +1947,11 @@ struct ObservationShared {
     identity_rejection: tokio::sync::watch::Sender<Option<&'static str>>,
     #[cfg(test)]
     slow_acquire_records: tokio::sync::watch::Sender<u64>,
+    /// Each slow-acquire record's window (what its statement budget had left
+    /// when the acquisition began), or `None` when the pool ceiling bounded
+    /// it, in record order.
+    #[cfg(test)]
+    slow_acquire_windows: StdMutex<Vec<Option<Duration>>>,
     #[cfg(test)]
     first_release_cut: AtomicBool,
     #[cfg(test)]
@@ -1974,6 +1979,8 @@ impl ConnectionObservation {
             identity_rejection: tokio::sync::watch::Sender::new(None),
             #[cfg(test)]
             slow_acquire_records: tokio::sync::watch::Sender::new(0),
+            #[cfg(test)]
+            slow_acquire_windows: StdMutex::new(Vec::new()),
             #[cfg(test)]
             first_release_cut: AtomicBool::new(false),
             #[cfg(test)]
@@ -2044,6 +2051,25 @@ impl ConnectionObservation {
         self.0
             .slow_acquire_records
             .send_modify(|records| *records += 1);
+    }
+
+    /// Keep the window of the slow-acquire record about to be counted
+    /// (`None` for the pool ceiling).
+    #[cfg(test)]
+    pub(crate) fn slow_acquire_window(&self, window: Option<Duration>) {
+        if let Ok(mut windows) = self.0.slow_acquire_windows.lock() {
+            windows.push(window);
+        }
+    }
+
+    /// The windows of this pool's slow-acquire records, in order.
+    #[cfg(test)]
+    pub(crate) fn slow_acquire_windows(&self) -> Vec<Option<Duration>> {
+        self.0
+            .slow_acquire_windows
+            .lock()
+            .map(|windows| windows.clone())
+            .unwrap_or_default()
     }
 
     /// Slow-acquire records ("still waiting") this pool's acquisitions left.

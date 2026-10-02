@@ -2881,21 +2881,33 @@ impl MemoryStore {
         mutation: SessionLifecycleMutation,
     ) -> Result<SessionLifecycleOutcome> {
         self.writable()?;
-        ensure!(
-            self.schema_version().await? >= 7,
-            "session lifecycle requires an upgraded memory view"
-        );
         let guard = self.shared.write.clone().lock_owned().await;
-        self.resolve_uncertain().await?;
-        if let Some(receipt) = &self.logical_receipt
-            && operation_receipt_matches(&self.pool, receipt).await?
-        {
-            return load_session_lifecycle_outcome(
-                &self.pool,
-                &receipt.physical_id,
-                mutation.session_id(),
-            )
-            .await;
+        // One write budget, taken once this write holds the write lock and
+        // before its first pool acquisition, bounds the reads before its
+        // pending record, its acquisition, the fork validation, the write and
+        // its session's return, so the write ends inside the service client's
+        // wait.
+        let deadline = write_deadline();
+        let receipted = crate::pool::within_until(deadline, async {
+            ensure!(
+                self.schema_version().await? >= 7,
+                "session lifecycle requires an upgraded memory view"
+            );
+            self.resolve_uncertain().await?;
+            let Some(receipt) = &self.logical_receipt else {
+                return Ok(None);
+            };
+            if !operation_receipt_matches(&self.pool, receipt).await? {
+                return Ok(None);
+            }
+            load_session_lifecycle_outcome(&self.pool, &receipt.physical_id, mutation.session_id())
+                .await
+                .map(Some)
+        })
+        .await
+        .context("session lifecycle write deadline exceeded")??;
+        if let Some(outcome) = receipted {
+            return Ok(outcome);
         }
         let store = self.clone();
         let label = label.to_owned();
@@ -2907,10 +2919,6 @@ impl MemoryStore {
                 |receipt| receipt.physical_id.clone(),
             );
             let session_id = mutation.session_id().to_owned();
-            // One budget, taken before the acquisition, bounds the
-            // acquisition, the fork validation, the write and its session's
-            // return, so the write ends inside the service client's wait.
-            let deadline = write_deadline();
             let (mut connection, id) = write_session(&store.pool, deadline).await?;
             let mutation = match mutation {
                 SessionLifecycleMutation::Fork {
@@ -3779,15 +3787,26 @@ impl MemoryStore {
     async fn mutate(&self, label: &str, mutation: Mutation) -> Result<()> {
         self.writable()?;
         let guard = self.shared.write.clone().lock_owned().await;
-        self.resolve_uncertain().await?;
-        if let Some(receipt) = &self.logical_receipt {
+        // One write budget, taken once this write holds the write lock and
+        // before its first pool acquisition, bounds the reads before its
+        // pending record, its acquisition, the write and its session's
+        // return, so the write ends inside the service client's wait.
+        let deadline = write_deadline();
+        let receipted = crate::pool::within_until(deadline, async {
+            self.resolve_uncertain().await?;
+            let Some(receipt) = &self.logical_receipt else {
+                return Ok(false);
+            };
             ensure!(
                 self.schema_version().await? == migrations::CURRENT_VERSION,
                 "logical mutation receipts require upgraded writable memory"
             );
-            if operation_receipt_matches(&self.pool, receipt).await? {
-                return Ok(());
-            }
+            operation_receipt_matches(&self.pool, receipt).await
+        })
+        .await
+        .context("memory write deadline exceeded")??;
+        if receipted {
+            return Ok(());
         }
         let store = self.clone();
         let label = label.to_owned();
@@ -3798,10 +3817,6 @@ impl MemoryStore {
                 || Uuid::new_v4().to_string(),
                 |receipt| receipt.physical_id.clone(),
             );
-            // One budget, taken before the acquisition, bounds the
-            // acquisition, the write and its session's return, so the write
-            // ends inside the service client's wait.
-            let deadline = write_deadline();
             let (mut connection, id) = write_session(&store.pool, deadline).await?;
             *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: store.pool.clone(),
@@ -3965,21 +3980,29 @@ impl MemoryStore {
         self.writable()?;
         identifier("candidate label", label, 128)?;
         let guard = self.shared.write.clone().lock_owned().await;
-        self.resolve_uncertain().await?;
+        // One write budget, taken once this creation holds the write lock and
+        // before its first pool acquisition, bounds the reads before its
+        // pending record, its acquisition, the branch creation and the new
+        // branch's pool creation.
+        let deadline = write_deadline();
         let branch = self.candidate_branch_for_id(id);
         let names = CandidateNames::from_open(&branch)?;
-        let heads = candidate_heads(&self.pool, &names).await?;
-        ensure!(
-            heads.is_empty(),
-            "candidate creation identity already has a durable ref; inspect its exact outcome"
-        );
-        let base = self.revision().await?;
+        let base = crate::pool::within_until(deadline, async {
+            self.resolve_uncertain().await?;
+            let heads = candidate_heads(&self.pool, &names).await?;
+            ensure!(
+                heads.is_empty(),
+                "candidate creation identity already has a durable ref; inspect its exact outcome"
+            );
+            self.revision().await
+        })
+        .await
+        .context("candidate creation deadline exceeded")??;
         let worker = self.clone();
         let created_branch = branch.clone();
         let created_base = base.clone();
         tokio::spawn(async move {
             let _guard = guard;
-            let deadline = write_deadline();
             let (mut connection, connection_id) = owned_connection(&worker.pool, deadline).await?;
             *worker.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: worker.pool.clone(),
@@ -4006,7 +4029,12 @@ impl MemoryStore {
         })
         .await
         .context("candidate creation worker failed")??;
-        self.candidate_from_branch(branch, base).await
+        // The new branch's pool creation finishes the same call, so it nests
+        // in what remains of the write budget. A reply lost here is recovered
+        // by the creation identity's read-only lookup (`candidate_for_id`).
+        crate::pool::within_until(deadline, self.candidate_from_branch(branch, base))
+            .await
+            .context("candidate creation deadline exceeded")?
     }
 
     /// Read only the caller-derived branch identity. This never invokes branch
@@ -7491,8 +7519,10 @@ fn decode_message(role: String, format: &str, content: &str) -> Result<Message> 
 }
 
 /// A new write budget, `QUERY_TIMEOUT` from now. A receipt-bearing writer
-/// takes it before its pool acquisition, so one budget bounds the
-/// acquisition, the identity statement, the write and the session's return.
+/// takes it before its first pool acquisition (a store-level write as soon as
+/// it holds the write lock), so one budget bounds the reads before its
+/// pending record, the acquisition, the identity statement, the write and the
+/// session's return.
 fn write_deadline() -> tokio::time::Instant {
     tokio::time::Instant::now() + QUERY_TIMEOUT
 }

@@ -364,3 +364,165 @@ async fn retained_open_pools_acquire_under_their_statement_budget() -> Result<()
     store.close().await?;
     outcome
 }
+
+/// One write budget, taken as soon as a receipt-bearing write holds the
+/// store's write lock, bounds the reads before its pending record as well as
+/// its acquisition and apply. With every permit held, the write's first read
+/// waits past its slow-acquire record; a test acquisition queues behind it;
+/// one released session serves that read and then the queued acquisition, so
+/// the write's next acquisition (a second read, or the write's own) waits
+/// past its own record. That record's window (what was left of its budget when
+/// it began) is what the first read left of the one write budget, at most
+/// `QUERY_TIMEOUT` less the slow-acquire threshold, never a fresh statement
+/// budget, and the write is still before its pending record. Every wait is an event; the test adds no timer.
+async fn reads_before_a_write_spend_its_one_budget<'s>(
+    store: &'s MemoryStore,
+    what: &str,
+    mut write: Work<'s>,
+) -> Result<()> {
+    let pool = store.pool.clone();
+    let observation = pool.observation().clone();
+    let mut held = hold_every_session(&pool).await?;
+    let outcome = async {
+        let base = observation.slow_acquire_records();
+        until_slow_records(
+            &observation,
+            base + 1,
+            &mut [(&format!("{what}'s first read"), &mut write)],
+        )
+        .await?;
+        let mut queued = Box::pin(pool.acquire());
+        tokio::select! {
+            biased;
+            outcome = &mut write => bail!(
+                "{what} ended before a second acquisition queued: {}",
+                ended(&outcome)
+            ),
+            acquired = &mut queued => bail!(
+                "an acquisition completed with every permit held: {:?}",
+                acquired.map(drop).map_err(|error| format!("{error:#}"))
+            ),
+            () = observation.pending_acquires_reach(2) => {}
+        }
+        held.pop()
+            .context("no held session to release")?
+            .release()
+            .await;
+        let second = tokio::select! {
+            biased;
+            outcome = &mut write => bail!(
+                "{what} ended before its next acquisition waited: {}",
+                ended(&outcome)
+            ),
+            acquired = &mut queued => acquired?,
+        };
+        held.push(second);
+        until_slow_records(
+            &observation,
+            base + 2,
+            &mut [(&format!("{what}'s next acquisition"), &mut write)],
+        )
+        .await?;
+        let windows = observation.slow_acquire_windows();
+        let window = windows.last().copied().flatten().with_context(|| {
+            format!("{what}'s next acquisition recorded no statement budget: {windows:?}")
+        })?;
+        ensure!(
+            window <= QUERY_TIMEOUT.saturating_sub(crate::pool::SLOW_ACQUIRE_THRESHOLD),
+            "{what}'s next acquisition began with {window:?} of its budget left, not what \
+             its first read left of one write budget (records: {windows:?})"
+        );
+        ensure!(
+            store
+                .shared
+                .uncertain
+                .lock()
+                .expect("uncertain lock")
+                .is_none(),
+            "{what} recorded a pending write before its acquisition completed"
+        );
+        for session in held.drain(..) {
+            session.release().await;
+        }
+        (&mut write)
+            .await
+            .with_context(|| format!("{what} failed once its sessions were released"))
+    }
+    .await;
+    for session in held {
+        session.release().await;
+    }
+    outcome
+}
+
+#[tokio::test]
+async fn receipt_check_and_mutation_spend_one_write_budget() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let receipted =
+        store.with_logical_receipt(Uuid::new_v4(), "state.put_many", b"one write budget");
+    let outcome = async {
+        reads_before_a_write_spend_its_one_budget(
+            &store,
+            "a receipt-bearing mutation",
+            Box::pin(receipted.put("pool.budget.one_write", &serde_json::json!(1))),
+        )
+        .await?;
+        ensure!(
+            receipted.get("pool.budget.one_write").await? == Some(serde_json::json!(1)),
+            "the receipt-bearing mutation did not land"
+        );
+        Ok(())
+    }
+    .await;
+    drop(receipted);
+    store.close().await?;
+    outcome
+}
+
+#[tokio::test]
+async fn receipt_check_and_session_lifecycle_write_spend_one_write_budget() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let receipted = store.with_logical_receipt(
+        Uuid::new_v4(),
+        "view.create_session",
+        b"one session lifecycle budget",
+    );
+    let outcome = async {
+        reads_before_a_write_spend_its_one_budget(
+            &store,
+            "a receipt-bearing session lifecycle write",
+            Box::pin(async {
+                receipted
+                    .create_session_catalog("one-budget-session", Mode::Ifs, "one budget")
+                    .await
+                    .map(drop)
+            }),
+        )
+        .await?;
+        ensure!(
+            receipted
+                .session_catalog_record("one-budget-session")
+                .await?
+                .is_some(),
+            "the receipt-bearing session lifecycle write did not land"
+        );
+        Ok(())
+    }
+    .await;
+    drop(receipted);
+    store.close().await?;
+    outcome
+}
+
+#[tokio::test]
+async fn candidate_reads_and_creation_spend_one_write_budget() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let outcome = reads_before_a_write_spend_its_one_budget(
+        &store,
+        "a candidate creation",
+        Box::pin(async { store.begin_candidate("one budget").await.map(drop) }),
+    )
+    .await;
+    store.close().await?;
+    outcome
+}

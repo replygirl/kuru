@@ -494,8 +494,11 @@ impl MemoryPool {
         authenticated_before: u64,
         scope: Option<&BudgetScope>,
     ) {
-        self.slow_record(started, authenticated_before, scope)
-            .emit();
+        let record = self.slow_record(started, authenticated_before, scope);
+        record.emit();
+        #[cfg(test)]
+        self.observation
+            .slow_acquire_window(scope.map(|_| record.waiting.window));
         self.observation.slow_acquire_recorded();
     }
 

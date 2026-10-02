@@ -369,7 +369,14 @@ impl UsageLedger {
     async fn change(&self, change: Change) -> Result<()> {
         self.store.writable()?;
         let guard = self.store.shared.write.clone().lock_owned().await;
-        self.store.resolve_uncertain().await?;
+        // One write budget, taken once this write holds the write lock and
+        // before its first pool acquisition, bounds the reconciliation read
+        // before its pending record, its acquisition, the write and its
+        // session's return.
+        let deadline = write_deadline();
+        crate::pool::within_until(deadline, self.store.resolve_uncertain())
+            .await
+            .context("usage ledger write deadline exceeded")??;
         // Read only after reconciliation, which may have re-derived it.
         let validated = self
             .store
@@ -383,9 +390,6 @@ impl UsageLedger {
         tokio::spawn(async move {
             let _guard = guard;
             let operation = Uuid::new_v4().to_string();
-            // One budget, taken before the acquisition, bounds the
-            // acquisition, the write and its session's return.
-            let deadline = write_deadline();
             let (mut connection, id) = write_session(&store.pool, deadline).await?;
             *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: store.pool.clone(),

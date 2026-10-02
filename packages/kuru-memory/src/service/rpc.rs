@@ -699,10 +699,13 @@ const COMPLETED_RECEIPT_WINDOW: usize = 4096;
 /// What the operation budget allows beyond one memory statement budget
 /// (`QUERY_TIMEOUT`): the time an outcome handler keeps for writing its
 /// reply. A service write fits the same arithmetic by construction: one write
-/// budget, taken before its pool acquisition, bounds the acquisition, its
-/// identity statement, any validation before the write, the write and its
-/// session's return, so the write ends within `QUERY_TIMEOUT` and its reply
-/// has this margin left of the client's `OPERATION_TIMEOUT`.
+/// budget, taken as soon as the write holds the store's write lock and before
+/// its first pool acquisition, bounds the reads before its pending record,
+/// the acquisition, its identity statement, any validation before the write,
+/// the write and its session's return, so the write ends within
+/// `QUERY_TIMEOUT` and its reply has this margin left of the client's
+/// `OPERATION_TIMEOUT`. Reconciliation after a write that ends without its
+/// receipt stays on the uncertain-write fence's own path.
 const REPLY_MARGIN: std::time::Duration =
     OPERATION_TIMEOUT.saturating_sub(crate::store::QUERY_TIMEOUT);
 /// An outcome handler answers within this budget from its entry, so its reply
