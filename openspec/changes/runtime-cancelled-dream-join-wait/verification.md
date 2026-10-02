@@ -1,19 +1,20 @@
 # Verification
 
-## 1. The marker wait no longer races the pipeline's unbounded work [critical]
+## 1. The marker wait no longer races the pipeline on a flat number [critical]
 
-- [ ] 1.1 @regression (agent) inject a brief artificial delay ahead of the first hook's dispatch (long enough to exceed the old flat 10s marker wait, well inside the new backstop) and run the test against the fixed code, then again against the unmodified old code -> fixed code passes, old code fails with `Elapsed(())` at the old marker-wait line; record both outcomes and timings, and note this exercises the failure mode on demand rather than reproducing the original loaded-runner race.
-- [ ] 1.2 @unit (agent) run `cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_descendants` unmodified, several times in a loop, locally -> passes every run; record the observed wall-clock time for each re-derived wait as evidence the new bounds have real headroom over what was actually observed.
+- [x] 1.1 @regression (agent) run the paused-clock test where a synthetic operation progresses every two thirds of the derived gap bound and reaches its condition after more than 10 s, then temporarily replace the new wait with the old `timeout(10 s, poll)` shape -> new wait passes; the old shape fails with `Elapsed`; record both outcomes (the swap is not committed). Observed 2026-10-02 local macOS: `progressing_operation_beyond_a_flat_ten_seconds_reaches_its_event` passes; with the old shape swapped in it failed with "old flat 10 s wait expired on a progressing operation".
+- [x] 1.2 @unit (agent) run the paused-clock stall test where the operation marks one step and then makes no progress -> the wait reports a stall only after one full gap bound of silence and names the last completed step. Observed: `silent_operation_stalls_after_one_gap_and_names_its_last_step` passes.
+- [x] 1.3 @unit (agent) run the paused-clock early-finish test where the operation ends before its condition -> the wait returns the finished outcome instead of waiting out a bound. Observed: `operation_that_finishes_first_returns_its_outcome_without_waiting_a_bound` passes.
 
 ## 2. The dream-join wait no longer ties the product's own quiesce bound
 
-- [ ] 2.1 @unit (agent) assert that the join wait's computed bound is strictly greater than the value returned by the new `HookHost` quiesce-bound accessor -> confirms the bound is derived, not an equal literal that would eventually tie the product's own worst case.
+- [x] 2.1 @unit (agent) assert that the derived gap bound for the cancelled-dream fixture is strictly greater than `HookHost::quiesce_bound()` -> confirms the join bound is derived and encloses the product wait. Observed: `dream_gap_bound_takes_the_larger_stated_budget_above_quiesce` passes and the fixture's assertion holds (30 s > 10 s).
 
 ## 3. No behavioral regression elsewhere in the package
 
-- [ ] 3.1 @integration (agent) run `mise run //packages/kuru-runtime:test` (full package suite) -> all tests pass; record the pass count and any failures.
-- [ ] 3.2 @manual (agent) read the derivation comments on both re-derived bounds in the committed diff -> each states its terms and source (hook `timeout_ms`, the new quiesce accessor, and the named margins) rather than a bare literal.
+- [x] 3.1 @integration (agent) run `mise run //packages/kuru-runtime:test -- --lib hook_tests::` and then `mise run //packages/kuru-runtime:test` -> all tests pass; record the pass counts. Observed: `hook_tests::` 22 passed (32.45 s); full suite 224 passed, 0 failed (262.88 s).
+- [x] 3.2 @manual (agent) read the derivation comments in the committed diff -> each bound names its terms and sources (memory startup budget, hook timeout_ms, quiesce bound) rather than a bare literal. Observed: `dream_gap_bound` names `turn_admission_deadline()`, hook `timeout_ms` and `quiesce_bound()`; the fixture comment states the gap and its quiesce enclosure.
 
 ## 4. Deferred — cannot be run from this change record alone
 
-- [~] 4.1 @e2e (agent) observe the fixed test pass on the same macOS coverage partition under real CI load, the only environment the original failure was observed in -> defer: this change's apply step runs local cargo/mise commands only; CI execution happens on the next push and PR run, which this change record does not perform or rerun.
+- [~] 4.1 @e2e (agent) observe the fixed test pass on the macOS coverage partition under real CI load, the only environment the original failure was observed in -> defer: local runs cannot reproduce that runner; CI runs on the next push and PR run, and reruns are forbidden.

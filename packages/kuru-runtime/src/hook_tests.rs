@@ -1733,22 +1733,40 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
         survived.display()
     );
     let provider = CapturingProvider::new(ReplyPlan::DreamProposal);
+    let hook = shell_hook(&script);
     let hooks = LifecycleHooks {
-        post_tool: vec![shell_hook(&script)],
+        post_tool: vec![hook.clone()],
         ..LifecycleHooks::default()
     };
-    let harness = Harness::new(
+    let memory = MemoryStore::temporary().await.unwrap();
+    let mut harness = Harness::new(
         config(hooks),
         project.path(),
-        MemoryStore::temporary().await.unwrap(),
+        memory.clone(),
         provider,
         None,
     )
     .await
     .unwrap();
     let actor = harness.topology.parts[0].id.clone();
+    let timings = crate::step_timings::StepTimings::recording();
+    harness.step_timings = timings.clone();
+    let mut watch = DreamWatch {
+        timings,
+        events: harness.subscribe(),
+        seen: vec![],
+        hooks: harness.hook_host(),
+        memory,
+        files: vec![marker.clone(), survived.clone()],
+    };
+    // Each wait ends on its event; only one silent gap longer than the
+    // fixture's stated step budget fails it. The bound also encloses the
+    // product's own quiesce wait, which the cancelled join runs.
+    let gap = crate::progress_wait::dream_gap_bound(&hook, watch.hooks.quiesce_bound());
+    assert!(gap > watch.hooks.quiesce_bound());
     let cancellation = CancellationToken::new();
-    let running = tokio::spawn({
+    watch.timings.mark("setup finished; dream task spawning");
+    let mut running = tokio::spawn({
         let cancellation = cancellation.clone();
         async move {
             let mut harness = harness;
@@ -1756,18 +1774,52 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
             (harness, result)
         }
     });
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while !marker.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let waited = crate::progress_wait::until_event(
+        &mut running,
+        || marker.exists(),
+        || watch.progress(),
+        gap,
+    )
+    .await;
+    match waited {
+        crate::progress_wait::Waited::Reached => {}
+        crate::progress_wait::Waited::Finished(joined) => panic!(
+            "the dream finished before its second hook started: {}\n{}",
+            describe_joined_dream(joined),
+            watch.report(gap).await
+        ),
+        crate::progress_wait::Waited::Stalled { progress_changes } => {
+            let report = watch.report(gap).await;
+            cancellation.cancel();
+            panic!(
+                "the dream made no observable progress for {gap:?} before its second hook \
+                 started ({progress_changes} progress changes seen)\n{report}\n{}",
+                settle_stalled_dream(&mut running, gap).await
+            )
         }
-    })
-    .await
-    .unwrap();
+    }
+    watch.timings.mark("second hook started; cancelling");
     cancellation.cancel();
-    let (mut harness, result) = tokio::time::timeout(std::time::Duration::from_secs(10), running)
-        .await
-        .unwrap()
-        .unwrap();
+    let joined =
+        crate::progress_wait::until_event(&mut running, || false, || watch.progress(), gap).await;
+    let (mut harness, result) = match joined {
+        crate::progress_wait::Waited::Finished(Ok(joined)) => joined,
+        crate::progress_wait::Waited::Finished(Err(error)) => {
+            panic!(
+                "the cancelled dream task panicked: {error}\n{}",
+                watch.report(gap).await
+            )
+        }
+        crate::progress_wait::Waited::Reached => unreachable!("the join waits for no condition"),
+        crate::progress_wait::Waited::Stalled { progress_changes } => {
+            let report = watch.report(gap).await;
+            panic!(
+                "the cancelled dream made no observable progress for {gap:?} \
+                 ({progress_changes} progress changes seen)\n{report}\n{}",
+                settle_stalled_dream(&mut running, gap).await
+            )
+        }
+    };
     assert!(result.is_err());
     // The cancelled dream returned only after its owned hook tree was reaped.
     assert_eq!(harness.hook_host().in_flight_hooks(), 0);
@@ -1797,6 +1849,97 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
         survived.exists()
     );
     harness.shutdown(false).await.unwrap();
+}
+
+type DreamJoin = (Harness, Result<crate::DreamReport>);
+
+/// What the cancelled-dream fixture can observe of its running dream without
+/// touching the moved harness: step-timing marks, harness events and the hook
+/// host's in-flight workers are its progress; the rest is failure context.
+struct DreamWatch {
+    timings: crate::step_timings::StepTimings,
+    events: tokio::sync::broadcast::Receiver<crate::Event>,
+    seen: Vec<String>,
+    hooks: Arc<kuru_connectors::HookHost>,
+    memory: MemoryStore,
+    files: Vec<std::path::PathBuf>,
+}
+
+impl DreamWatch {
+    fn progress(&mut self) -> (usize, usize, usize) {
+        use tokio::sync::broadcast::error::TryRecvError;
+        loop {
+            match self.events.try_recv() {
+                Ok(event) => self
+                    .seen
+                    .push(format!("{event:?}").chars().take(240).collect()),
+                Err(TryRecvError::Lagged(skipped)) => {
+                    self.seen.push(format!("({skipped} events skipped)"));
+                }
+                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+            }
+        }
+        (
+            self.timings.completed(),
+            self.seen.len(),
+            self.hooks.in_flight_hooks(),
+        )
+    }
+
+    /// Read before anything cancels the dream. The candidate inventory is a
+    /// memory query, so it gets the same step budget and may be unavailable.
+    async fn report(&mut self, gap: std::time::Duration) -> String {
+        self.progress();
+        let steps = self.timings.render();
+        let files = self
+            .files
+            .iter()
+            .map(|file| format!("  {}: exists={}", file.display(), file.exists()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let candidates =
+            match tokio::time::timeout(gap, self.memory.candidate_inventory(None, 16)).await {
+                Ok(Ok(page)) => format!("{page:?}"),
+                Ok(Err(error)) => format!("unavailable: {error:#}"),
+                Err(_) => format!("unavailable: no reply within {gap:?}"),
+            };
+        format!(
+            "steps (time since the test created its recorder):\n{steps}\n\
+             in-flight hook workers: {}\nfiles:\n{files}\ncandidates: {candidates}\n\
+             events observed:\n  {}",
+            self.hooks.in_flight_hooks(),
+            self.seen.join("\n  ")
+        )
+    }
+}
+
+fn describe_joined_dream(joined: std::result::Result<DreamJoin, tokio::task::JoinError>) -> String {
+    match joined {
+        Ok((_, Ok(report))) => format!("Ok({report:?})"),
+        Ok((_, Err(error))) => format!(
+            "Err({error:#}); cancelled: {}",
+            crate::turn_was_cancelled(&error)
+        ),
+        Err(error) => format!("the task panicked or was aborted: {error}"),
+    }
+}
+
+/// After a stall has been reported and the dream cancelled, await it once
+/// more under the same step budget and abort it if it still does not finish.
+async fn settle_stalled_dream(
+    running: &mut tokio::task::JoinHandle<DreamJoin>,
+    gap: std::time::Duration,
+) -> String {
+    match tokio::time::timeout(gap, &mut *running).await {
+        Ok(joined) => format!(
+            "after cancellation the dream finished: {}",
+            describe_joined_dream(joined)
+        ),
+        Err(_) => {
+            running.abort();
+            format!("the dream did not finish within {gap:?} of cancellation; it was aborted")
+        }
+    }
 }
 
 #[tokio::test]

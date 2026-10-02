@@ -6,78 +6,63 @@
 `hook_tests::cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_descendants`
 failed in CI with `Elapsed(())` (PR #133 run 37038146977, head `f8a107fc` on
 main `a3de5346`, macos-latest coverage partition 2, job `110941628749`: 53
-passed, 1 failed in 53.42s). The failing assertion, confirmed by reading the
-job's own log output (not inferred from the stack text), is
-`hook_tests.rs:1765:6` — the close of the **marker wait** at lines 1759-1765
-(`tokio::time::timeout(Duration::from_secs(10), async { while
-!marker.exists() { ... } }).await.unwrap()`), not the dream-join wait two
-lines later at 1767-1770 as a first reading of the symptom suggests. The exact
-commit (`f8a107fc`) carries byte-identical lines 1755-1772, so this is a
-measured fact, not a guess from an approximate line number.
+passed, 1 failed in 53.42s). Measured from the job log: the panic is at
+`hook_tests.rs:1765:6`, the `.unwrap()` closing the **marker wait** (lines
+1759-1765: a flat `tokio::time::timeout(Duration::from_secs(10), ...)` polling
+for the second hook's marker file), not the dream-join wait at 1767-1770. The
+test was reported `FAILED` at 17:15:51.79; its earliest possible start under
+`RUST_TEST_THREADS=2` was 17:15:41.08 (inference from libtest's name-ordered
+scheduling), so it ran about 10.7 s: harness setup plus the whole 10 s wait.
+The concurrent slot meanwhile ran a sibling dream fixture
+(`dream_tool_rewrites...`) for about 13.9 s (inference, same scheduling); the
+same two tests take about 2 s and 6 s locally on an uninstrumented build. The
+log records no step timings, so which step was slow is not measured.
 
-That marker wait is a single flat 10-second deadline covering an entire
-multi-stage pipeline that has to run before the marker is even written:
-`reconcile()`, `acquire_dream_lease()`, `begin_candidate("dream")` (a Dolt
-write), the fake provider's dream-proposal completion, dispatch and settle of
-the **first** of two tool calls together with its post-tool hook (bounded by
-that hook's own stated `timeout_ms: 5_000`, i.e. half the test's total budget
-already spent on one component), `finish_post_tool_hooks` (another Dolt
-write, the candidate annotation), and only then dispatch of the **second**
-tool call whose shell hook writes the marker as its first action. None of
-that preceding Dolt/provider work is bounded by any budget the test states or
-derives — the 10 seconds is a number guessed at the runner's expected speed,
-not a sum of the stated costs it has to clear. On a loaded macOS coverage
-partition (an instrumented build, several concurrent test binaries, real Dolt
-I/O) that pipeline can exceed 10 seconds even though nothing is actually
-stuck: the test fails by construction, independent of whether the product
-code is behaving correctly.
+The marker appears only after the dream has run `reconcile()`, the dream
+lease, `begin_candidate`, the actor's reads, prompt append and usage
+admission, the fake provider call, the call-1 tool and summary appends, the
+first post-tool hook (bounded by its own `timeout_ms` 5 s plus owned
+cleanup), its annotation write, the call-2 tool append and the second hook's
+launch. Each memory step is bounded by the store's 30 s statement budget;
+the hook by its stated timeout. The test's 10 s is not derived from any of
+these: it is a number guessed at runner speed that decides the outcome while
+nothing is stuck.
 
-Separately — and this is a labelled inference, not something the failing run
-exercised — the same file's dream-join wait two lines later
-(`tokio::time::timeout(Duration::from_secs(10), running)`, lines 1767-1770)
-encloses the product's own cancellation-path hook-cleanup wait
-(`Harness::await_hook_cleanup` in `dream.rs:247`, which calls
-`HookHost::quiesce()` in `kuru-connectors/src/hooks.rs:421-441`, bounded by
-the private `QUIESCE = Duration::from_secs(10)` constant at `hooks.rs:39`,
-itself derived as `2 * CLEANUP` with its rationale stated in the adjacent
-doc comment). A test wait whose bound is numerically equal to, rather than
-strictly larger than, the product wait it encloses will eventually lose that
-race under load even when the product is behaving exactly to its own
-documented contract (`quiesce()` degrades to a reported `CleanupUnconfirmed`
-error on expiry; it does not hang or kill in-progress cleanup). This did not
-fire in the captured failure — the panic location rules it out for this
-run — but it is the same class of defect (a flat number racing a stated
-product budget with no margin) on the same cancellation path, so it is
-fixed in the same change rather than left for the next flake to find.
+The dream-join wait two lines later is a flat 10 s around the product's own
+cancellation wait, `Harness::await_hook_cleanup` -> `HookHost::quiesce()`,
+bounded by `QUIESCE` = 10 s (= 2 x `CLEANUP`, stated in `hooks.rs`). A test
+bound equal to the product bound it encloses can lose a tie under load while
+the product honours its contract. This did not fire in the captured run
+(labelled inference: same defect class, latent).
+
+The product cancellation path has no defect: `quiesce()` waits on the event
+(`active == 0`) under a stated derived bound and reports `CleanupUnconfirmed`
+on expiry instead of killing or abandoning progressing teardown; hook workers
+keep signal-before-reap ownership; `resolve_candidate_outcome` does no I/O and
+retains the exact candidate. No product behavior changes.
 
 ## What Changes
 
-- The marker wait in `cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_descendants`
-  stops using one flat, undersized guess for a multi-stage pipeline. It
-  splits into (a) an event-driven wait, with no flat deadline raced against
-  the pipeline's unbounded Dolt/provider work, for the one externally
-  observable progress signal that pipeline actually produces before the
-  marker — the first post-tool hook's own `"annotated"` observation on the
-  harness's event stream — guarded only by a generous deadlock backstop, not
-  a contested number; and (b) a short, explicitly derived bound for the one
-  remaining step that *is* budgeted — launching the second hook — stated in
-  terms of that hook's own configured `timeout_ms` plus a named scheduling
-  margin, instead of a bare `10`.
-- The dream-join wait in the same test is changed from a flat `10` to a bound
-  derived from the product's own `quiesce` cleanup bound (exposed from
-  `kuru-connectors` for test use, test-support-gated, following the existing
-  `HookHost::in_flight_hooks()` pattern) plus a stated margin, so the test
-  can no longer race the product's own documented worst case to a tie.
-- Both waits report concrete diagnostics on expiry (in-flight hook count,
-  marker/survived-file state, and the harness's step-timing marks captured
-  before the dream task was spawned) instead of a bare `Elapsed(())`.
-- No product cancellation-path behavior changes: `quiesce()`'s own bound is
-  already progress-aware (`wait_for(|state| state.active == 0)`) and
-  explicitly derived in its doc comment; it reports uncertainty on expiry
-  rather than abandoning in-progress teardown, so it already satisfies the
-  "never a flat number that abandons progressing teardown" bar and needs no
-  behavioral change — only its bound becomes visible to the test that must
-  not race it.
+- A platform-neutral `cfg(test)` progress-aware wait in `kuru-runtime`: it
+  ends on its event (a condition, or the watched task finishing), fails at
+  once if the task finishes before the condition, re-arms on every observed
+  progress signal and reports a stall only when one silent gap exceeds its
+  bound. Polling is cadence only.
+- The gap bound for dream fixtures is derived from stated budgets:
+  `max(turn_admission_deadline(), hook timeout_ms + HookHost quiesce bound)`.
+  `turn_admission_deadline()` is the existing runtime test helper (memory
+  startup budget, from which the Dolt listener derives its statement read
+  timeout). The bound is strictly above the product quiesce bound.
+- The cancelled-dream test records step timings, subscribes to harness events
+  and keeps the hook host before spawning; both its waits use the new wait.
+  A stall or early finish panics with step timings, observed events, in-flight
+  hooks, marker and descendant file state, and the candidate inventory.
+- `StepTimings::completed()` exposes the mark count as a progress signal.
+- `HookHost::quiesce_bound()` (`cfg(any(test, feature = "test-support"))`)
+  exposes the existing `QUIESCE` value, following `in_flight_hooks()`.
+- Paused-clock regression tests show the old flat 10 s shape failing a
+  progressing operation that the new wait accepts, and a stalled operation
+  reported with its last step.
 
 ## Capabilities
 
@@ -93,15 +78,13 @@ for an existing, already-correct product constant.
 
 ## Impact
 
-- `packages/kuru-runtime/src/hook_tests.rs` —
-  `cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_descendants`:
-  both waits re-derived; diagnostics added on expiry.
-- `packages/kuru-connectors/src/hooks.rs` — a `#[cfg(any(test, feature =
-  "test-support"))]` accessor exposing the `HookHost::quiesce()` cleanup
-  bound (currently the private `QUIESCE` constant), following the existing
-  `in_flight_hooks()` visibility pattern at `hooks.rs:447`. No change to
-  `quiesce()`'s behavior or bound value.
-- No `kuru-memory` changes.
+- `packages/kuru-runtime/src/hook_tests.rs`: the cancelled-dream test's waits
+  and expiry diagnostics.
+- `packages/kuru-runtime/src/progress_wait.rs` (new, `cfg(test)`), `lib.rs`
+  module declaration, `step_timings.rs` (`completed()`), `tests.rs`
+  (`turn_admission_deadline` visibility).
+- `packages/kuru-connectors/src/hooks.rs`: test-support accessor only.
+- No `kuru-memory` changes; no product behavior change.
 
 ## Surfaces
 

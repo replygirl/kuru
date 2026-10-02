@@ -52,7 +52,7 @@ impl Drop for ReleaseGateOnDrop {
 /// before any tool runs. The store's Dolt listener derives its statement read
 /// timeout from at least this startup budget, so the wait follows the same
 /// configured budget instead of a fixed literal.
-fn turn_admission_deadline() -> Duration {
+pub(crate) fn turn_admission_deadline() -> Duration {
     Duration::from_secs(MemoryConfig::default().startup_timeout_secs)
 }
 
