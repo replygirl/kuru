@@ -371,3 +371,122 @@ async fn stalled_authentication_names_the_new_connection_phase() -> Result<()> {
     store.close().await?;
     Ok(())
 }
+
+async fn session_is_listed(store: &MemoryStore, id: u64) -> Result<bool> {
+    let active: i64 = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.processlist WHERE ID = ?")
+            .bind(id)
+            .fetch_one(store.pool.as_ref()),
+    )
+    .await
+    .context("processlist read deadline exceeded")??;
+    Ok(active != 0)
+}
+
+/// Guard: a write whose outcome is uncertain never returns its session to the
+/// pool. The injected failure after `DOLT_COMMIT` settles by its receipt only
+/// after the original session has ended.
+#[tokio::test]
+async fn uncertain_write_still_ends_its_session_before_reconciliation() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let pause = Arc::new(ApplyPause::default());
+    pause.fail_after_commit.store(true, Ordering::SeqCst);
+    // Only the receipt point holds; the commit point passes straight through.
+    pause.dolt_committed.resume.notify_one();
+    *store.shared.apply_pause.lock().expect("apply pause lock") = Some(pause.clone());
+    let writer = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .put("pool.session.uncertain", &serde_json::json!(1))
+                .await
+        }
+    });
+    tokio::time::timeout(QUERY_TIMEOUT, pause.receipt_inserted.reached.notified())
+        .await
+        .context("write did not reach its receipt insert")?;
+    let id = store
+        .shared
+        .uncertain
+        .lock()
+        .expect("uncertain lock")
+        .as_ref()
+        .map(|pending| pending.connection)
+        .context("paused write recorded no pending session")?;
+    pause.receipt_inserted.resume.notify_one();
+    writer.await.context("write worker panicked")??;
+    ensure!(
+        !pause.fail_after_commit.load(Ordering::SeqCst),
+        "write did not take the injected post-commit failure"
+    );
+    ensure!(
+        store
+            .shared
+            .uncertain
+            .lock()
+            .expect("uncertain lock")
+            .is_none()
+    );
+    ensure!(
+        !session_is_listed(&store, id).await?,
+        "the uncertain write's session {id} is still open"
+    );
+    ensure!(
+        store.get("pool.session.uncertain").await? == Some(serde_json::json!(1)),
+        "the reconciled write is not durable"
+    );
+    store.close().await?;
+    Ok(())
+}
+
+/// Guard: a rejected write ends its session; only a receipted success may
+/// return one to the pool.
+#[tokio::test]
+async fn rejected_write_closes_its_session() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let record = ReasoningSummaryRecord {
+        session_id: "pool-session".into(),
+        turn_id: Some("turn".into()),
+        operation_id: None,
+        actor_id: "actor".into(),
+        invocation_id: "invocation".into(),
+        item_id: Some("item".into()),
+        output_index: Some(0),
+        summary_index: 0,
+        text: "first".into(),
+    };
+    store
+        .put_reasoning_summaries(std::slice::from_ref(&record))
+        .await?;
+    // The pool now holds exactly one session; the next write must use it.
+    ensure!(
+        (store.pool.size(), store.pool.num_idle()) == (1, 1),
+        "the pool does not hold exactly one idle session"
+    );
+    let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(store.pool.as_ref())
+        .await?;
+    let authenticated = store.pool.authenticated();
+    let mut conflicting = record;
+    conflicting.text = "conflicting".into();
+    let error = store
+        .put_reasoning_summaries(&[conflicting])
+        .await
+        .err()
+        .context("a conflicting reasoning summary was accepted")?;
+    ensure!(
+        error.downcast_ref::<ReasoningSummaryConflict>().is_some(),
+        "the rejection lost its typed conflict: {error:#}"
+    );
+    ensure!(
+        !session_is_listed(&store, id).await?,
+        "the rejected write's session {id} is still open"
+    );
+    ensure!(
+        store.pool.authenticated() > authenticated,
+        "reconciliation reused a session the rejected write should have ended"
+    );
+    store.close().await?;
+    Ok(())
+}

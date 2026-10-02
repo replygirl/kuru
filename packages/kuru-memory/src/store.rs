@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::pool::MemoryPool;
+use crate::pool::{MemoryPool, PooledSession};
 use anyhow::{Context, Result, bail, ensure};
 use futures::TryStreamExt;
 use kuru_core::{ContentBlock, MemoryConfig, Message, Mode};
@@ -2841,7 +2841,7 @@ impl MemoryStore {
                 |receipt| receipt.physical_id.clone(),
             );
             let session_id = mutation.session_id().to_owned();
-            let (mut connection, id) = owned_connection(&store.pool).await?;
+            let (mut connection, id) = write_session(&store.pool).await?;
             let mutation = match mutation {
                 SessionLifecycleMutation::Fork {
                     source_session_id,
@@ -2889,11 +2889,13 @@ impl MemoryStore {
                 ),
             )
             .await;
-            drop(connection);
             if let Ok(Ok(outcome)) = result {
                 *store.shared.uncertain.lock().expect("uncertain lock") = None;
+                connection.settle_receipted().await;
                 return Ok(outcome);
             }
+            // Not a receipted success: end the session before reconciling.
+            drop(connection);
             if store.resolve_uncertain().await? == Some(true) {
                 return load_session_lifecycle_outcome(&store.pool, &operation, &session_id).await;
             }
@@ -3726,7 +3728,7 @@ impl MemoryStore {
                 || Uuid::new_v4().to_string(),
                 |receipt| receipt.physical_id.clone(),
             );
-            let (mut connection, id) = owned_connection(&store.pool).await?;
+            let (mut connection, id) = write_session(&store.pool).await?;
             *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: store.pool.clone(),
                 connection: id,
@@ -3752,11 +3754,13 @@ impl MemoryStore {
                 ),
             )
             .await;
-            drop(connection);
             if matches!(result, Ok(Ok(()))) {
                 *store.shared.uncertain.lock().expect("uncertain lock") = None;
+                connection.settle_receipted().await;
                 return Ok(());
             }
+            // Not a receipted success: end the session before reconciling.
+            drop(connection);
             if store.resolve_uncertain().await? == Some(true) {
                 return Ok(());
             }
@@ -7403,6 +7407,67 @@ async fn owned_connection(pool: &MemoryPool) -> Result<(MySqlConnection, u64)> {
     .await
     .context("memory connection identity deadline exceeded")??;
     Ok((connection, id))
+}
+
+/// One receipt-bearing write's SQL session. Dropping it ends the session
+/// (detach, then drop: no `COM_QUIT`), exactly as a detached write connection
+/// always did, so any outcome that is not a receipted success leaves no
+/// session for `resolve_uncertain` to wait on but the one it observes ending.
+struct WriteSession(Option<PooledSession>);
+
+impl WriteSession {
+    /// Return the session to its pool after the write's receipted success.
+    ///
+    /// Only for writers whose apply ends with SQL `COMMIT` (or an explicit
+    /// `ROLLBACK` of an unchanged write) and that set no session variable,
+    /// `USE` no database, check out no Dolt branch and take no named lock:
+    /// `apply`, `apply_session_lifecycle` and the usage ledger's
+    /// `apply_change`. A writer that changes session state must let the
+    /// session drop instead.
+    async fn settle_receipted(mut self) {
+        if let Some(session) = self.0.take() {
+            session.release().await;
+        }
+    }
+}
+
+impl Drop for WriteSession {
+    fn drop(&mut self) {
+        if let Some(session) = self.0.take() {
+            drop(session.detach());
+        }
+    }
+}
+
+impl std::ops::Deref for WriteSession {
+    type Target = MySqlConnection;
+
+    fn deref(&self) -> &MySqlConnection {
+        self.0
+            .as_deref()
+            .expect("write session is open until settled")
+    }
+}
+
+impl std::ops::DerefMut for WriteSession {
+    fn deref_mut(&mut self) -> &mut MySqlConnection {
+        self.0
+            .as_deref_mut()
+            .expect("write session is open until settled")
+    }
+}
+
+/// A write session that stays pooled until its outcome is known; see
+/// [`WriteSession`]. `owned_connection` detaches at once instead.
+async fn write_session(pool: &MemoryPool) -> Result<(WriteSession, u64)> {
+    let mut session = WriteSession(Some(pool.acquire().await?));
+    let id = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(&mut *session),
+    )
+    .await
+    .context("memory connection identity deadline exceeded")??;
+    Ok((session, id))
 }
 
 async fn await_session_end(pool: &MemoryPool, id: u64, duration: Duration) -> Result<()> {

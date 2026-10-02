@@ -333,7 +333,7 @@ impl UsageLedger {
         tokio::spawn(async move {
             let _guard = guard;
             let operation = Uuid::new_v4().to_string();
-            let (mut connection, id) = owned_connection(&store.pool).await?;
+            let (mut connection, id) = write_session(&store.pool).await?;
             *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: store.pool.clone(),
                 connection: id,
@@ -344,17 +344,17 @@ impl UsageLedger {
                 apply_change(&mut connection, &operation, change),
             )
             .await;
-            drop(connection);
             match result {
-                Ok(Ok(false)) => {
+                // Committed, or an unchanged settlement rolled back: either
+                // way the session is clean and the outcome receipted.
+                Ok(Ok(_)) => {
                     *store.shared.uncertain.lock().expect("uncertain lock") = None;
-                    Ok(())
-                }
-                Ok(Ok(true)) => {
-                    *store.shared.uncertain.lock().expect("uncertain lock") = None;
+                    connection.settle_receipted().await;
                     Ok(())
                 }
                 other => {
+                    // Not a receipted success: end the session first.
+                    drop(connection);
                     if store.resolve_uncertain().await? == Some(true) {
                         return Ok(());
                     }
