@@ -234,6 +234,7 @@ const UNKEYED_MODULES: &[&str] = &[
     "advisory",
     "coverage",
     "docs",
+    "open_time",
     "published_windows",
     "repo",
     "shell_support",
