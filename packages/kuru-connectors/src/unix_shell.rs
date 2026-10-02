@@ -20,7 +20,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use kuru_platform::{
     fs::{Directory, NameRetention, Privacy},
-    unix::{GroupPresence, OwnedProcessGroup, Reap, RootState, Termination},
+    unix::{GroupPresence, OwnedProcessGroup, PermissionListing, Reap, RootState, Termination},
 };
 use serde_json::json;
 use tokio::{
@@ -1156,9 +1156,13 @@ fn retain_until_confirmed(
         test_hooks.await_retained_cleanup();
         #[cfg(test)]
         test_hooks.record_retained_observation();
+        // Each retained round may list once, within the interval it would
+        // otherwise sleep, and only after EPERM.
+        let mut listing = group.permission_listing(Instant::now() + retry_interval);
         if let Ok(Ok(Some(_))) = catch_unwind(AssertUnwindSafe(|| {
             cleanup_once(
                 group,
+                &mut listing,
                 #[cfg(test)]
                 test_hooks,
             )
@@ -1201,9 +1205,11 @@ fn cleanup_until(
     deadline: Instant,
     #[cfg(test)] test_hooks: &TestHooks,
 ) -> Result<ExitStatus> {
+    let mut listing = group.permission_listing(deadline);
     loop {
         if let Some(status) = cleanup_once(
             group,
+            &mut listing,
             #[cfg(test)]
             test_hooks,
         )? {
@@ -1218,6 +1224,7 @@ fn cleanup_until(
 
 fn cleanup_once(
     group: &mut OwnedProcessGroup,
+    listing: &mut PermissionListing,
     #[cfg(test)] test_hooks: &TestHooks,
 ) -> Result<Option<ExitStatus>> {
     #[cfg(test)]
@@ -1238,8 +1245,8 @@ fn cleanup_once(
         Termination::Disarmed(reason) => bail!("shell ownership lost: {reason:?}"),
     }
     match group.reap_if_exited() {
-        Reap::Reaped(status) => match group.presence_after_reap() {
-            GroupPresence::Absent => Ok(Some(status)),
+        Reap::Reaped(status) => match listing.resolve_blocking(group.presence_after_reap()) {
+            GroupPresence::Absent | GroupPresence::Recycled => Ok(Some(status)),
             GroupPresence::Present | GroupPresence::PermissionDenied => Ok(None),
             GroupPresence::ObservationError(kind) => {
                 bail!("shell group observation failed: {kind}")

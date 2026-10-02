@@ -154,11 +154,10 @@ pub async fn bounded_output(
 
 #[cfg(all(unix, feature = "tooling"))]
 mod bounded_unix {
+    use kuru_platform::unix::{GroupPresence, PermissionListing, group_presence_after_reap};
     use rustix::{
         io::Errno,
-        process::{
-            Pid, Signal, WaitId, WaitIdOptions, kill_process_group, test_kill_process_group, waitid,
-        },
+        process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid},
     };
     use std::{io, process::Stdio, time::Duration};
     use tokio::{
@@ -222,18 +221,24 @@ mod bounded_unix {
         }
     }
 
+    /// Poll signal zero until the reaped root's group is gone. The first
+    /// `EPERM` takes at most one bounded listing, off the executor and within
+    /// the time left before this fixed deadline, which tells a group recycled
+    /// by another user from a member of ours.
     async fn wait_for_group_gone_with(
-        mut observe: impl FnMut() -> Result<(), Errno>,
+        mut observe: impl FnMut() -> GroupPresence,
+        listing: impl FnOnce(std::time::Instant) -> PermissionListing,
     ) -> io::Result<()> {
         let deadline = Instant::now() + CLEANUP_TIMEOUT;
+        let mut listing = listing(deadline.into_std());
         loop {
-            let permission_pending = match observe() {
-                Err(Errno::SRCH) => return Ok(()),
-                Ok(()) => false,
-                Err(Errno::PERM) => true,
-                Err(error) => {
+            let permission_pending = match listing.resolve(observe()).await {
+                GroupPresence::Absent | GroupPresence::Recycled => return Ok(()),
+                GroupPresence::Present => false,
+                GroupPresence::PermissionDenied => true,
+                other => {
                     return Err(io::Error::other(format!(
-                        "post-cleanup process-group query: {error}"
+                        "post-cleanup process-group query: {other:?}"
                     )));
                 }
             };
@@ -241,7 +246,10 @@ mod bounded_unix {
                 if permission_pending {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "post-cleanup process-group permission persisted through cleanup deadline: EPERM",
+                        format!(
+                            "post-cleanup process-group permission persisted through cleanup deadline: EPERM; listing: {}",
+                            listing.evidence().unwrap_or("not taken")
+                        ),
                     ));
                 }
                 return Err(io::Error::new(
@@ -254,7 +262,12 @@ mod bounded_unix {
     }
 
     async fn wait_for_group_gone(pid: Pid) -> io::Result<()> {
-        wait_for_group_gone_with(|| test_kill_process_group(pid)).await
+        let group = pid.as_raw_nonzero().get().unsigned_abs();
+        wait_for_group_gone_with(
+            || group_presence_after_reap(group),
+            |deadline| PermissionListing::for_reaped_group(group, deadline),
+        )
+        .await
     }
 
     async fn stop_and_reap(child: &mut Child, pid: Pid) -> String {
@@ -308,9 +321,10 @@ mod bounded_unix {
         };
         match wait_for_group_gone(pid).await {
             Ok(()) => {
-                // macOS can reject signalling a group whose only member is an
-                // already-exited root. Successful post-reap absence proves no
-                // helper survived; it does not treat EPERM as ownership proof.
+                // macOS rejects signalling a group whose only member is an
+                // already-exited root, and another user may reuse the reaped
+                // group. Observed absence, or a listing with no member of
+                // ours, proves no helper survived; EPERM alone proves nothing.
             }
             Err(error) => {
                 if let Some(termination) = termination {
@@ -444,25 +458,81 @@ mod bounded_unix {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::collections::VecDeque;
+        use kuru_platform::unix::{GroupLister, snapshot::ProcessRow};
+        use std::{
+            collections::VecDeque,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+
+        fn row(uid: u32) -> ProcessRow {
+            ProcessRow {
+                pid: 40,
+                ppid: 1,
+                pgid: 40,
+                uid,
+                ruid: uid,
+                state: "S".to_owned(),
+                cpu_time: "0:00.00".to_owned(),
+                rss_kib: 1,
+                command: "member".to_owned(),
+            }
+        }
+
+        /// A listing of group 40 that counts its calls and returns `rows`
+        /// after sleeping `delay` (never longer than its budget).
+        fn listing(
+            calls: &Arc<AtomicUsize>,
+            rows: Vec<ProcessRow>,
+            delay: bool,
+        ) -> impl FnOnce(std::time::Instant) -> PermissionListing {
+            let calls = Arc::clone(calls);
+            move |deadline| {
+                let lister: GroupLister = Arc::new(move |group, budget| {
+                    assert_eq!(group, 40);
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if delay {
+                        std::thread::sleep(budget);
+                    }
+                    Ok(rows.clone())
+                });
+                PermissionListing::with_lister(40, deadline, lister)
+            }
+        }
+
+        fn ours() -> Vec<ProcessRow> {
+            vec![row(kuru_platform::unix::own_uids()[0])]
+        }
 
         #[tokio::test]
         async fn permission_then_absence_waits_for_observed_group_absence() {
-            let mut observed = VecDeque::from([Err(Errno::PERM), Err(Errno::SRCH)]);
-            wait_for_group_gone_with(|| observed.pop_front().expect("observer call"))
-                .await
-                .unwrap();
+            let calls = Arc::default();
+            let mut observed =
+                VecDeque::from([GroupPresence::PermissionDenied, GroupPresence::Absent]);
+            wait_for_group_gone_with(
+                || observed.pop_front().expect("observer call"),
+                listing(&calls, ours(), false),
+            )
+            .await
+            .unwrap();
             assert!(observed.is_empty(), "observer must wait for ESRCH");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
         }
 
         #[tokio::test]
         async fn persistent_permission_remains_a_bounded_error() {
+            let calls = Arc::default();
             let started = Instant::now();
             let mut observed = 0usize;
-            let error = wait_for_group_gone_with(|| {
-                observed += 1;
-                Err(Errno::PERM)
-            })
+            let error = wait_for_group_gone_with(
+                || {
+                    observed += 1;
+                    GroupPresence::PermissionDenied
+                },
+                listing(&calls, ours(), false),
+            )
             .await
             .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::TimedOut);
@@ -472,33 +542,86 @@ mod bounded_unix {
                     .contains("permission persisted through cleanup deadline: EPERM"),
                 "{error}"
             );
+            assert!(error.to_string().contains("a member of ours"), "{error}");
             assert!(started.elapsed() >= CLEANUP_TIMEOUT);
             assert!(
                 started.elapsed() < CLEANUP_TIMEOUT + Duration::from_secs(1),
                 "permission observation exceeded its fixed cleanup deadline"
             );
             assert!(observed > 1, "permission must be observed more than once");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "one listing per cleanup");
+        }
+
+        #[tokio::test]
+        async fn slow_listing_runs_once_and_keeps_the_cleanup_deadline() {
+            // Every poll reports EPERM and the one listing uses its whole
+            // budget: the cleanup still ends at its unchanged deadline.
+            let calls = Arc::default();
+            let started = Instant::now();
+            let mut observed = 0usize;
+            let error = wait_for_group_gone_with(
+                || {
+                    observed += 1;
+                    GroupPresence::PermissionDenied
+                },
+                listing(&calls, ours(), true),
+            )
+            .await
+            .unwrap_err();
+            let elapsed = started.elapsed();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "one listing per cleanup");
+            assert!(observed > 1, "signal zero keeps polling after the listing");
+            assert!(elapsed >= CLEANUP_TIMEOUT, "{elapsed:?}");
+            assert!(
+                elapsed < CLEANUP_TIMEOUT + Duration::from_millis(500),
+                "listing extended the cleanup bound: {elapsed:?}"
+            );
         }
 
         #[tokio::test]
         async fn existing_group_then_absence_preserves_success() {
-            let mut observed = VecDeque::from([Ok(()), Err(Errno::SRCH)]);
-            wait_for_group_gone_with(|| observed.pop_front().expect("observer call"))
-                .await
-                .unwrap();
+            let calls = Arc::default();
+            let mut observed = VecDeque::from([GroupPresence::Present, GroupPresence::Absent]);
+            wait_for_group_gone_with(
+                || observed.pop_front().expect("observer call"),
+                listing(&calls, ours(), false),
+            )
+            .await
+            .unwrap();
             assert!(observed.is_empty());
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "only EPERM lists");
         }
 
         #[tokio::test]
         async fn unexpected_group_observation_preserves_failure() {
-            let error = wait_for_group_gone_with(|| Err(Errno::INVAL))
-                .await
-                .unwrap_err()
-                .to_string();
+            let calls = Arc::default();
+            let error = wait_for_group_gone_with(
+                || GroupPresence::ObservationError(io::ErrorKind::InvalidInput),
+                listing(&calls, ours(), false),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
             assert!(
-                error.contains("post-cleanup process-group query: Invalid argument"),
+                error.contains("post-cleanup process-group query: ObservationError(InvalidInput)"),
                 "{error}"
             );
+        }
+
+        #[tokio::test]
+        async fn recycled_group_ends_the_wait_without_a_permission_timeout() {
+            let calls = Arc::default();
+            let started = Instant::now();
+            let foreign = row(4_000_000_000);
+            wait_for_group_gone_with(
+                || GroupPresence::PermissionDenied,
+                listing(&calls, vec![foreign], false),
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(started.elapsed() < CLEANUP_TIMEOUT);
         }
     }
 }

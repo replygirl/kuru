@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
-use kuru_platform::unix::snapshot;
-use rustix::process::{Pid, Signal, kill_process_group};
+use kuru_platform::unix::{GroupObservation, observe_group_after_reap, own_uids, snapshot};
+use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 use std::{
     io::{BufRead, BufReader},
     os::unix::process::CommandExt,
@@ -202,9 +202,14 @@ fn still_listed_reports_recorded_processes_until_they_are_gone() {
     let recorded = snapshot::tree(id).unwrap();
     assert!(recorded.iter().any(|row| row.pid == id));
     let live = snapshot::describe_still_listed(&recorded);
+    let live_rows = snapshot::still_listed(&recorded).unwrap();
     kill_process_group(Pid::from_raw(id as i32).unwrap(), Signal::KILL).unwrap();
     root.wait().unwrap();
     let gone = snapshot::describe_still_listed(&recorded);
+    let gone_rows = snapshot::still_listed(&recorded).unwrap();
+    assert!(live_rows.iter().any(|row| row.pid == id), "{live_rows:?}");
+    assert!(gone_rows.is_empty(), "{gone_rows:?}");
+    assert!(snapshot::still_listed_with(Path::new("/nonexistent/kuru-ps"), &recorded).is_err());
 
     assert!(live.contains("recorded processes remain listed"), "{live}");
     assert!(live.contains(&format!("pid={id} ")), "{live}");
@@ -214,4 +219,85 @@ fn still_listed_reports_recorded_processes_until_they_are_gone() {
     );
     let failed = snapshot::describe_still_listed_with(Path::new("/nonexistent/kuru-ps"), &recorded);
     assert!(failed.starts_with("snapshot unavailable: "), "{failed}");
+}
+
+/// A process group led by another user's long-lived process, with no member
+/// of ours: the state of a reaped group whose number another user took.
+fn foreign_group() -> u32 {
+    let own = own_uids();
+    assert!(
+        !own.contains(&0),
+        "this check needs an unprivileged runner; uid 0 may signal every group"
+    );
+    let rows = snapshot::processes().unwrap();
+    let ours = |row: &snapshot::ProcessRow| own.contains(&row.uid) || own.contains(&row.ruid);
+    let mut refused = Vec::new();
+    for leader in rows.iter().filter(|row| row.pid > 1 && row.pid == row.pgid) {
+        if rows.iter().any(|row| row.pgid == leader.pgid && ours(row)) {
+            continue;
+        }
+        // The pre-fix observation: signal zero is refused, which the old
+        // post-reap queries reported as an error rather than as absence.
+        match test_kill_process_group(Pid::from_raw(leader.pgid as i32).unwrap()) {
+            Err(rustix::io::Errno::PERM) => return leader.pgid,
+            result => refused.push(format!("{}:{result:?}", leader.pgid)),
+        }
+    }
+    panic!("no foreign process group refused signal zero; candidates={refused:?}");
+}
+
+#[test]
+fn foreign_group_is_classified_as_recycled_without_error() {
+    let group = foreign_group();
+    let observed = observe_group_after_reap(group);
+    let GroupObservation::Recycled(members) = &observed else {
+        panic!("group {group} was not classified as recycled: {observed}");
+    };
+    assert!(observed.none_of_ours(), "{observed}");
+    let own = own_uids();
+    assert!(
+        members
+            .iter()
+            .all(|row| row.pgid == group && !own.contains(&row.uid) && !own.contains(&row.ruid)),
+        "{observed}"
+    );
+    assert!(
+        observed.to_string().contains("recycled by another user"),
+        "{observed}"
+    );
+}
+
+#[test]
+fn live_group_of_ours_is_classified_as_a_survivor_with_its_listing() {
+    let mut root = Command::new("/bin/sleep")
+        .arg("41")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let id = root.id();
+    let observed = observe_group_after_reap(id);
+    // The unreaped root still anchors its group for this owned cleanup.
+    kill_process_group(Pid::from_raw(id as i32).unwrap(), Signal::KILL).unwrap();
+    root.wait().unwrap();
+    let after_reap = observe_group_after_reap(id);
+
+    let GroupObservation::Survivors(Ok(members)) = &observed else {
+        panic!("live group was not a survivor: {observed}");
+    };
+    assert!(!observed.none_of_ours());
+    assert!(
+        members
+            .iter()
+            .any(|row| row.pid == id && own_uids().contains(&row.uid)),
+        "{observed}"
+    );
+    assert!(
+        observed.to_string().contains(&format!("pid={id} ")),
+        "{observed}"
+    );
+    // The group is empty now unless another user's process already took it.
+    assert!(after_reap.none_of_ours(), "{after_reap}");
 }

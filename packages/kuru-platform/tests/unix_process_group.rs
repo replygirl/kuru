@@ -228,9 +228,10 @@ impl NativeFixture {
             Err("reap unavailable after lost ownership".to_owned())
         };
         let absence = if reap.is_ok() {
+            let mut listing = live.owner.permission_listing(deadline);
             loop {
-                match live.owner.presence_after_reap() {
-                    GroupPresence::Absent => break Ok(()),
+                match listing.resolve_blocking(live.owner.presence_after_reap()) {
+                    GroupPresence::Absent | GroupPresence::Recycled => break Ok(()),
                     GroupPresence::Present | GroupPresence::PermissionDenied
                         if Instant::now() < deadline =>
                     {
