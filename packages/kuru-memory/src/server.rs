@@ -659,11 +659,11 @@ impl Server {
                 .spawn()
                 .context("start memory lifetime supervisor")?;
             let spawned = Instant::now();
-            crate::open_timeline::stamp(crate::open_timeline::Event::SupervisorSpawned);
             // The test gate guards this process's child creation, not the
             // supervisor's later startup or the delayed authentication probe.
             #[cfg(test)]
             drop(creation);
+            crate::open_timeline::stamp(crate::open_timeline::Event::SupervisorSpawned);
             drop(_test_spawn_guard);
             let mut owner = Owner {
                 child: Some(child),
