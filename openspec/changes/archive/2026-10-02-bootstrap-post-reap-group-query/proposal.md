@@ -30,12 +30,15 @@ our own concurrent test processes fails the single-pid checks the other way.
   (`spawn_blocking`, or directly for the already-blocking shell cleanup) and
   limited to `min(SNAPSHOT_TIMEOUT, deadline - now)`. The listing classifies:
   - no listed member: `Absent`;
-  - only members whose real and effective user IDs differ from ours:
+  - only members whose real and effective user IDs differ from ours, one of
+    which is a new leader whose process ID equals the group number:
     `Recycled` (new `GroupPresence` variant), cleanup succeeds and the listing
     is retained as diagnostic evidence;
-  - a member of ours (zombies included) or an unavailable listing:
-    `PermissionDenied`, so the caller keeps its cheap signal-zero poll and
-    fails at its unchanged deadline.
+  - a member of ours (zombies included), other users' members without that
+    new leader, or an unavailable listing: `PermissionDenied`, so the caller
+    keeps its cheap signal-zero poll and fails at its unchanged deadline.
+    (`observe_group_after_reap` reports the leaderless case as `Unobserved`
+    with the rows.)
   No listing happens on `ESRCH`, on success, after the first listing, or with
   no budget left, so no cleanup bound grows and no retry or sleep is added.
   The Unix shell's retained-ownership rounds (which already retry with a
@@ -86,12 +89,41 @@ keeps `PermissionDenied`. The CI failure itself (`EPERM` 40 ms after a natural
 exit) matches a group number recycled by another user, which is the case the
 regression tests reproduce with a real foreign-uid group.
 
+### Decision: `Recycled` requires a new leader holding the group number
+
+`EPERM` followed by a listing of only other users' members also matches a
+descendant of our reaped root whose user ID changed (through `sudo` or a
+setuid program) and which the pre-reap group `SIGKILL` could not signal.
+Without further evidence that process would be dismissed as recycled and the
+cleanup would report success while it survives. The listing must therefore
+include a member of another user whose process ID equals the group number. Our
+reaped root was the group's original leader, so such a process is new, and
+POSIX `fork()` requires that a new process ID not match any active process
+group ID (Linux keeps the number allocated while it is referenced as a PGID;
+XNU checks process groups when allocating). A new leader holding the number
+therefore shows that the old group emptied completely, members of every user
+included, before the number was reissued. Inferred from the standard and the
+kernels' documented allocation; not measured, because the uid-changed
+descendant needs privilege escalation to reproduce. The real foreign-group
+regression fixtures already select groups whose leader has `pid == pgid`, and
+the CI failure shape (a number recycled within 40 ms) is one a new leader
+produces.
+
 ### Accepted residual
 
 If the single listing shows a member of ours and that member then exits and
 the number is recycled by another user before the next 10 ms poll, the cleanup
 reports `PermissionDenied` until its deadline and fails. That is a false
 failure, never a false pass, and it keeps the listing to one per cleanup.
+
+A recycled group whose new leader has already exited while other users'
+members remain lists no leader and likewise fails at the deadline (a false
+failure, never a false pass).
+
+The empty-listing `Absent` decision above rests on every process of ours being
+listed. A descendant whose user ID changed is listed by macOS `ps` and by
+Linux without `hidepid`; under Linux `hidepid` it could be hidden. That gap is
+outside this change and is named here, not closed.
 
 ## Capabilities
 

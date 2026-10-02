@@ -5,6 +5,7 @@
 - [x] 1.1 Keep `OwnedProcessGroup::presence_after_reap` a single signal-zero query and verify its unit tests still count one syscall
 - [x] 1.2 Add `PermissionListing` (at most one bounded off-executor listing per cleanup, budget `min(SNAPSHOT_TIMEOUT, deadline - now)`) and `GroupPresence::Recycled`, and verify unit tests for empty, foreign, own, unavailable, zero-budget, already-taken, invalid-group and join-failure listings
 - [x] 1.3 Add read-only `observe_group_after_reap` / `GroupObservation` and `snapshot` uid/ruid columns, `group_members_within`, `processes` and `still_listed`, and verify parser and member-selection unit tests
+- [x] 1.4 Classify a refused group as recycled only when a foreign member's process ID equals the group number, and verify unit tests that foreign members without that leader stay `PermissionDenied` / `Unobserved`
 
 ## 2. Cleanup callers
 
