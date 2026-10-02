@@ -29,8 +29,8 @@ Work in `tmp/worktrees/feat-readiness-owner-timeline` (branch `feat/readiness-ow
 
 ## 6. Enablement, fixtures and text
 
-- [ ] 6.1 Pin `KURU_OPEN_TIMELINE=0` in the ungated timeline and usage-scan tests, set the gate in the `coverage:shard` task environment, and forward it in the env-clearing kuru-tui fixtures, and verify the affected suites pass gated and ungated.
-- [ ] 6.2 Update `docs/development.md` and the in-code text that calls the timeline inert on Windows or close-only, and verify `mise run docs:check` passes.
+- [x] 6.1 Pin `KURU_OPEN_TIMELINE=0` in the ungated timeline and usage-scan tests, set the gate in the `coverage:shard` task environment, and forward it in the env-clearing kuru-tui fixtures, and verify the affected suites pass gated and ungated. Observed 2026-10-02 (macOS arm64): full `//packages/kuru-memory:test` ungated (`KURU_OPEN_TIMELINE` unset) exit 0, lib 625 passed 0 failed 6 ignored (805.94 s); the same with `KURU_OPEN_TIMELINE=1` exported exit 0, lib 625 passed 0 failed 6 ignored (813.90 s), integration binaries 10/5/12/1 passed in both. `//packages/kuru-delivery:test -- --test release_workflow usage_scan_scaling_is_a_required_job` 1 passed (pins the shard gate). The kuru-tui suite with the forwarding fixtures is run in 7.1.
+- [x] 6.2 Update `docs/development.md` and the in-code text that calls the timeline inert on Windows or close-only, and verify `mise run docs:check` passes. Observed 2026-10-02 (macOS arm64): `mise run docs:check` passed ("Public docs artifacts, local links and anchors passed").
 
 ## 7. Verification and archive
 
