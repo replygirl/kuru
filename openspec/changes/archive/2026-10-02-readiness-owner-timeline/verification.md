@@ -76,3 +76,13 @@ Measured on macOS arm64. The tree is head `0d75f9bd` plus the stamp move and thi
 - `mise run //packages/kuru-delivery:test`: exit 0, 358 passed, 0 failed.
 
 Still not run: any Linux or Windows leg, a coverage partition (where #173's coverage warm-up meets this change's `coverage:shard` gate; the code-read is above), and the PR's first-attempt CI. 5.1 and 5.2 remain deferred.
+
+## 2026-10-02 — Windows finding: first CI run red on the stale fixture
+
+The PR's first CI run (`37027098479`) was red only on Windows: the `windows-latest` coverage partition 2 job (`110904838845`) and the `windows-11-arm` behavior partition 2 job (`110904918720`). `service::tests::owner_timeline_clause_text_is_stable` failed at its stale case (`service.rs:3279`): expected `owner timeline: stale`, got the full clause with `owner-exec=0ms`. Rows 1.1 and 5.2 above hold for macOS only; 5.2's first-attempt requirement was not met by that run.
+
+Cause (code-read, measured from `owner_timeline_text`): the stale fixture built the spawn instant as `UNIX_EPOCH + Duration::from_nanos(MAIN_UNIX + 1)`, one nanosecond after the owner's anchor. `SystemTime` has 100 ns (FILETIME) resolution on Windows, so the 1 ns is truncated, `unix_ns(spawn_called)` equals the anchor, and `anchor < spawned` is false. The product comparison is sound; it is exact at the platform clock's resolution, and a real predecessor's anchor lies far more than one tick before a later spawn. Test-only defect.
+
+Fix: the fixture offset is `MS` (1 ms), which every platform clock keeps, and the comparison comment and the `owner_timeline_clause` doc comment say the comparison is at the platform clock's resolution. No product code changed. Other fixtures in the test checked: `MAIN_UNIX - 812_500_000` and `20_070 * MS + 900_000` are multiples of 100 ns, and `CREATE_START` (`9_930_123_456`, 56 ns past a tick) enters `now` only, where truncation moves `since-last` from 20070.9 ms to 20070.899944 ms, still `20070ms`. Other `SystemTime` constructions on the branch (`open_timeline.rs`, `lifecycle_trace.rs`, `engine_ledger.rs`, `provision.rs`) read the clock or subtract from `UNIX_EPOCH` and build no instant from raw nanoseconds.
+
+Measured (macOS arm64): `mise exec -- cargo test -p kuru-memory --lib owner_timeline_clause_text_is_stable` exit 0 (1 passed); `format:check` 0, `lint` 0, `lint:windows` 0, `typecheck` 0, `cospec validate --all --strict` 0 errors, 0 warnings. The Windows legs have not been rerun: the fix is to be confirmed by the PR's next CI run.

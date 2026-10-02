@@ -531,7 +531,9 @@ impl std::fmt::Display for ReadinessSplit {
 /// taken just before the spawn call, and `since-last` is `now` less the last
 /// line's wall-clock time: wall-clock differences across two processes, so
 /// a clock step skews them. An owner anchored before `spawn_called` is a
-/// predecessor's file with the same tag, reported only as `stale`. Lines
+/// predecessor's file with the same tag, reported only as `stale`; that
+/// comparison is at the platform clock's resolution (100 ns on Windows), so
+/// an anchor within one tick of `spawn_called` is not stale. Lines
 /// are `<name> <offset-ns> <unix-ns>`; a trailing partial line is still
 /// being written and ignored, and a malformed complete line is counted,
 /// never named. The clause never carries a path, token, scope or tag.
@@ -3274,10 +3276,12 @@ mod tests {
         assert_eq!(gated(spawned).as_deref(), Some("owner timeline: empty"));
 
         // A predecessor's file with this tag: its first stamp precedes this
-        // starter's spawn.
+        // starter's spawn. The offset is a whole millisecond because
+        // `SystemTime` keeps 100 ns on Windows: a 1 ns offset truncates to
+        // the anchor itself, which is not stale.
         crate::files::write(&stream, lines.as_bytes())?;
         assert_eq!(
-            gated(at(MAIN_UNIX + 1)).as_deref(),
+            gated(at(MAIN_UNIX + MS)).as_deref(),
             Some("owner timeline: stale")
         );
 
