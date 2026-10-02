@@ -1221,9 +1221,11 @@ async fn cleanup_owned(owner: &mut HookOwner, deadline: Instant) -> Result<()> {
 
 #[cfg(unix)]
 async fn ensure_group_absent(owner: &HookOwner, deadline: Instant) -> Result<()> {
+    // Signal zero is the poll; one bounded listing resolves EPERM at most once.
+    let mut listing = owner.permission_listing(deadline);
     loop {
-        match owner.presence_after_reap() {
-            GroupPresence::Absent => return Ok(()),
+        match listing.resolve(owner.presence_after_reap()).await {
+            GroupPresence::Absent | GroupPresence::Recycled => return Ok(()),
             GroupPresence::Present | GroupPresence::PermissionDenied => {}
             GroupPresence::ObservationError(_) | GroupPresence::InvalidPhase => {
                 bail!("lifecycle hook cleanup could not be confirmed")
@@ -1753,8 +1755,9 @@ mod tests {
 
     #[cfg(unix)]
     fn group_present(group: i32) -> bool {
-        // Signal 0 only probes existence; it never terminates anything.
-        nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), None).is_ok()
+        // Signal zero, and a listing when it is answered; it never terminates
+        // anything. A group recycled by another user is not ours.
+        !kuru_platform::unix::observe_group_after_reap(group.unsigned_abs()).none_of_ours()
     }
 
     #[cfg(unix)]

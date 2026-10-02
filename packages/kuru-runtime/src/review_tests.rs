@@ -769,6 +769,7 @@ async fn accepted_cognitive_writes_reconcile_before_cancellation_stops_peer_work
 #[cfg(unix)]
 #[tokio::test]
 async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() {
+    use kuru_platform::unix::snapshot;
     use nix::{errno::Errno, sys::signal, unistd::Pid};
 
     let (provider, _unused_receipt) = OneToolProvider::new(call(
@@ -865,8 +866,24 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match signal::kill(Pid::from_raw(pid), None) {
-                Ok(()) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
                 Err(Errno::ESRCH) => break,
+                // The ID may be reused once shutdown reaped the shell. The
+                // shell is this test process's direct child, so it remains,
+                // running or as an unreaped zombie, exactly while some row
+                // lists that ID under this parent; another user's or a
+                // non-child process holding the ID is not the shell.
+                Ok(()) | Err(Errno::EPERM) => {
+                    let parent = std::process::id();
+                    let unreaped: Vec<_> = snapshot::processes()
+                        .unwrap()
+                        .into_iter()
+                        .filter(|row| row.pid == pid.unsigned_abs() && row.ppid == parent)
+                        .collect();
+                    if unreaped.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
                 Err(error) => panic!("cannot inspect owned shell PID {pid}: {error}"),
             }
         }

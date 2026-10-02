@@ -9,16 +9,18 @@
 use rustix::{
     io::Errno,
     process::{
-        Pid, Signal, WaitId, WaitIdOptions, kill_process, kill_process_group,
+        Pid, Signal, WaitId, WaitIdOptions, geteuid, getuid, kill_process, kill_process_group,
         test_kill_process_group, waitid,
     },
 };
 #[cfg(test)]
 use std::cell::Cell;
 use std::{
-    io,
+    fmt, io,
     os::unix::process::CommandExt,
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus},
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 pub mod snapshot;
@@ -94,6 +96,16 @@ pub enum Reap {
 pub enum GroupPresence {
     Absent,
     Present,
+    /// Only from [`PermissionListing`]: signal zero was refused with `EPERM`,
+    /// and the one bounded listing showed only members running as another
+    /// user, among them a new leader whose process ID is the group number.
+    /// That leader shows the old group emptied before its number was reissued,
+    /// so no process of the reaped tree, under any user ID, is in the group.
+    /// (`EPERM` followed by an empty listing is [`Self::Absent`].)
+    Recycled,
+    /// Signal zero was refused with `EPERM`. [`PermissionListing`] keeps this
+    /// when the listing showed a member of ours, showed other users' members
+    /// without a new leader, or was unavailable.
     PermissionDenied,
     ObservationError(io::ErrorKind),
     /// Group presence is only meaningful after the standard child is reaped.
@@ -379,6 +391,332 @@ fn signal(result: rustix::io::Result<()>) -> SignalOutcome {
     }
 }
 
+/// Read-only evidence about a numeric process group whose leader the caller
+/// already reaped.
+///
+/// The group number may by now belong to anything. Nothing here signals
+/// anything except signal zero, and no variant authorizes a later signal: a
+/// caller that needs to terminate must do so before reaping, through
+/// [`OwnedProcessGroup`]. Cleanup loops use [`PermissionListing`] instead;
+/// this is a single-shot observation for assertions and diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GroupObservation {
+    /// Signal zero reported `ESRCH`, or it was refused with `EPERM` and the
+    /// following listing showed no member at all. Every process of ours is
+    /// listed, so an empty listing is direct evidence that none is in the
+    /// group, whatever the reason for the refusal.
+    Absent,
+    /// A member of ours may survive: signal zero succeeded, or it was refused
+    /// with `EPERM` while the listing showed a member whose effective or real
+    /// user ID is this process's real or effective user ID. Zombies count as
+    /// members. The listing is diagnostic, or the reason it was unavailable.
+    Survivors(Result<Vec<snapshot::ProcessRow>, String>),
+    /// Signal zero was refused with `EPERM` and the listing showed only
+    /// members of other users, among them a new leader whose process ID is
+    /// the group number. A new process ID never matches an active process
+    /// group ID (POSIX `fork()`), so the old group emptied completely before
+    /// the number was reissued: no process of the reaped tree, even one whose
+    /// user ID changed, is in it. The rows are diagnostic only.
+    Recycled(Vec<snapshot::ProcessRow>),
+    /// The group could not be classified: an invalid group number (0 and 1
+    /// would address our own group or broadcast), another errno, or `EPERM`
+    /// with an unavailable listing or with other users' members but no new
+    /// leader. Such members may be descendants of the reaped root that
+    /// changed user ID (for example through `sudo`), so they are not
+    /// dismissed.
+    Unobserved(String),
+}
+
+impl GroupObservation {
+    /// True only when evidence shows no process of ours is in the group.
+    pub fn none_of_ours(&self) -> bool {
+        matches!(self, Self::Absent | Self::Recycled(_))
+    }
+}
+
+impl fmt::Display for GroupObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => write!(formatter, "absent"),
+            Self::Survivors(Ok(members)) => {
+                write!(formatter, "survivors [{}]", rows(members))
+            }
+            Self::Survivors(Err(error)) => {
+                write!(formatter, "survivors (listing unavailable: {error})")
+            }
+            Self::Recycled(members) => write!(
+                formatter,
+                "recycled by another user ({} listed members) [{}]",
+                members.len(),
+                rows(members)
+            ),
+            Self::Unobserved(reason) => write!(formatter, "unobserved: {reason}"),
+        }
+    }
+}
+
+fn rows(rows: &[snapshot::ProcessRow]) -> String {
+    rows.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// [`OwnedProcessGroup::presence_after_reap`] for a numeric group whose
+/// leader the caller already reaped through its own retained child: one
+/// signal-zero query and nothing else. Resolve `EPERM` with one
+/// [`PermissionListing`] per cleanup. Group numbers 0 and 1, which would
+/// address our own group or broadcast, are an observation error. This grants
+/// no signal authority.
+pub fn group_presence_after_reap(group: u32) -> GroupPresence {
+    match reaped_group(group) {
+        Some(pid) => presence(test_kill_process_group(pid)),
+        None => GroupPresence::ObservationError(io::ErrorKind::InvalidInput),
+    }
+}
+
+/// Classify numeric process group `group` after its leader was reaped.
+///
+/// One signal-zero query decides absence. Only when that query is answered,
+/// either success or `EPERM`, does one [`snapshot::group_members`] listing
+/// run; there is no retry or wait. This grants no signal authority.
+pub fn observe_group_after_reap(group: u32) -> GroupObservation {
+    let Some(pid) = reaped_group(group) else {
+        return GroupObservation::Unobserved(format!("invalid process group {group}"));
+    };
+    classify_group(test_kill_process_group(pid), group, &own_uids(), || {
+        snapshot::group_members(group)
+    })
+}
+
+/// [`observe_group_after_reap`]'s decision for an already-made signal-zero
+/// query. `members` is called at most once, and only when the query was
+/// answered with success or `EPERM`.
+fn classify_group(
+    signal_zero: rustix::io::Result<()>,
+    group: u32,
+    own_uids: &[u32],
+    members: impl FnOnce() -> io::Result<Vec<snapshot::ProcessRow>>,
+) -> GroupObservation {
+    match signal_zero {
+        Err(Errno::SRCH) => GroupObservation::Absent,
+        Ok(()) => GroupObservation::Survivors(members().map_err(|error| error.to_string())),
+        Err(Errno::PERM) => match members() {
+            Ok(members) if members.is_empty() => GroupObservation::Absent,
+            Ok(members) if has_own_member(&members, own_uids) => {
+                GroupObservation::Survivors(Ok(members))
+            }
+            Ok(members) if has_new_leader(&members, group) => GroupObservation::Recycled(members),
+            Ok(members) => GroupObservation::Unobserved(format!(
+                "signal zero refused with EPERM; only other users' members listed, without a new leader pid={group} [{}]",
+                rows(&members)
+            )),
+            Err(error) => GroupObservation::Unobserved(format!(
+                "signal zero refused with EPERM; listing unavailable: {error}"
+            )),
+        },
+        Err(error) => GroupObservation::Unobserved(format!("signal zero failed: {error}")),
+    }
+}
+
+/// A reaped group number that addresses one group: 0 and 1 would address our
+/// own group or broadcast.
+fn reaped_group(group: u32) -> Option<Pid> {
+    i32::try_from(group)
+        .ok()
+        .filter(|group| *group > 1)
+        .and_then(Pid::from_raw)
+}
+
+/// This process's real and effective user IDs.
+pub fn own_uids() -> [u32; 2] {
+    [getuid().as_raw(), geteuid().as_raw()]
+}
+
+fn has_own_member(members: &[snapshot::ProcessRow], own_uids: &[u32]) -> bool {
+    members
+        .iter()
+        .any(|row| own_uids.contains(&row.uid) || own_uids.contains(&row.ruid))
+}
+
+/// Whether a listed member leads the group under the group's own number.
+///
+/// Our reaped root was the group's original leader, so a listed process with
+/// that process ID is a new process. POSIX `fork()` requires that a new
+/// process ID not match any active process group ID (Linux and XNU both keep
+/// such a number reserved), so the old group had no member left, of any user,
+/// when the number was reissued. Inferred from the standard; not measured.
+fn has_new_leader(members: &[snapshot::ProcessRow], group: u32) -> bool {
+    members.iter().any(|row| row.pid == group)
+}
+
+/// A bounded `ps` listing of one numeric group, given the time it may take.
+pub type GroupLister =
+    Arc<dyn Fn(u32, Duration) -> io::Result<Vec<snapshot::ProcessRow>> + Send + Sync>;
+
+/// One cleanup's resolution of `EPERM` from post-reap signal zero.
+///
+/// After the root is reaped, signal zero stays the cheap poll. Signal zero is
+/// refused with `EPERM` when no member it reaches may be signalled, which is
+/// also what a group number recycled by another user's process looks like.
+/// The first [`GroupPresence::PermissionDenied`] passed to [`Self::resolve`] or
+/// [`Self::resolve_blocking`] takes one bounded listing of the group's members,
+/// limited to [`snapshot::SNAPSHOT_TIMEOUT`] and to the time left before the
+/// cleanup deadline; [`Self::resolve`] runs it on a blocking thread so the
+/// async executor is never held. The listing yields
+/// [`GroupPresence::Absent`] when it lists no member,
+/// [`GroupPresence::Recycled`] when every listed member runs as another user
+/// and one of them is a new leader whose process ID is the group number, and
+/// otherwise leaves `PermissionDenied`, so the caller keeps polling and
+/// fails at its unchanged deadline. Every other observation, and every
+/// observation after the first listing or once no time is left, is returned
+/// unchanged. Nothing here signals anything.
+pub struct PermissionListing {
+    group: Option<u32>,
+    deadline: Instant,
+    listed: bool,
+    evidence: Option<String>,
+    lister: GroupLister,
+}
+
+impl fmt::Debug for PermissionListing {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PermissionListing")
+            .field("group", &self.group)
+            .field("deadline", &self.deadline)
+            .field("listed", &self.listed)
+            .field("evidence", &self.evidence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PermissionListing {
+    /// For the numeric group led by a root the caller itself spawned in a
+    /// fresh group and has already reaped. An invalid group number (0, 1 or
+    /// out of range) never lists.
+    pub fn for_reaped_group(group: u32, deadline: Instant) -> Self {
+        Self::with_lister(group, deadline, Arc::new(snapshot::group_members_within))
+    }
+
+    /// [`Self::for_reaped_group`] with an explicit lister, for tests.
+    pub fn with_lister(group: u32, deadline: Instant, lister: GroupLister) -> Self {
+        Self {
+            group: reaped_group(group).map(|_| group),
+            deadline,
+            listed: false,
+            evidence: None,
+            lister,
+        }
+    }
+
+    /// Whether this cleanup has taken its one listing.
+    pub fn listed(&self) -> bool {
+        self.listed
+    }
+
+    /// The listing's outcome, as diagnostic text, once it was taken.
+    pub fn evidence(&self) -> Option<&str> {
+        self.evidence.as_deref()
+    }
+
+    /// Resolve `presence`, listing on a blocking thread at most once.
+    pub async fn resolve(&mut self, presence: GroupPresence) -> GroupPresence {
+        let Some((group, budget)) = self.claim(presence) else {
+            return presence;
+        };
+        let lister = Arc::clone(&self.lister);
+        let listed = tokio::task::spawn_blocking(move || lister(group, budget))
+            .await
+            .unwrap_or_else(|error| Err(io::Error::other(format!("listing task: {error}"))));
+        self.settle(group, listed)
+    }
+
+    /// [`Self::resolve`] for a caller that already runs off the async executor.
+    pub fn resolve_blocking(&mut self, presence: GroupPresence) -> GroupPresence {
+        let Some((group, budget)) = self.claim(presence) else {
+            return presence;
+        };
+        let listed = (self.lister)(group, budget);
+        self.settle(group, listed)
+    }
+
+    fn claim(&mut self, presence: GroupPresence) -> Option<(u32, Duration)> {
+        if presence != GroupPresence::PermissionDenied || self.listed {
+            return None;
+        }
+        let group = self.group?;
+        let budget = self
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(snapshot::SNAPSHOT_TIMEOUT);
+        if budget.is_zero() {
+            return None;
+        }
+        self.listed = true;
+        Some((group, budget))
+    }
+
+    fn settle(
+        &mut self,
+        group: u32,
+        listed: io::Result<Vec<snapshot::ProcessRow>>,
+    ) -> GroupPresence {
+        let (presence, evidence) = listed_presence(listed, group, &own_uids());
+        self.evidence = Some(evidence);
+        presence
+    }
+}
+
+impl OwnedProcessGroup {
+    /// The [`PermissionListing`] for this owner's cleanup ending at `deadline`.
+    ///
+    /// It retains the group number privately for listing only; it is never a
+    /// basis for a signal.
+    pub fn permission_listing(&self, deadline: Instant) -> PermissionListing {
+        PermissionListing::for_reaped_group(
+            self.group.as_raw_nonzero().get().unsigned_abs(),
+            deadline,
+        )
+    }
+}
+
+/// How one listing taken after `EPERM` resolves a post-reap group.
+fn listed_presence(
+    listed: io::Result<Vec<snapshot::ProcessRow>>,
+    group: u32,
+    own_uids: &[u32],
+) -> (GroupPresence, String) {
+    match listed {
+        Ok(members) if members.is_empty() => {
+            (GroupPresence::Absent, "EPERM; no member listed".to_owned())
+        }
+        Ok(members) if has_own_member(&members, own_uids) => (
+            GroupPresence::PermissionDenied,
+            format!("EPERM; a member of ours is listed [{}]", rows(&members)),
+        ),
+        Ok(members) if !has_new_leader(&members, group) => (
+            GroupPresence::PermissionDenied,
+            format!(
+                "EPERM; only other users' members listed, without a new leader pid={group} [{}]",
+                rows(&members)
+            ),
+        ),
+        Ok(members) => (
+            GroupPresence::Recycled,
+            format!(
+                "EPERM; recycled by another user ({} listed members) [{}]",
+                members.len(),
+                rows(&members)
+            ),
+        ),
+        Err(error) => (
+            GroupPresence::PermissionDenied,
+            format!("EPERM; listing unavailable: {error}"),
+        ),
+    }
+}
+
 fn presence(result: rustix::io::Result<()>) -> GroupPresence {
     match result {
         Err(Errno::SRCH) => GroupPresence::Absent,
@@ -398,6 +736,314 @@ mod tests {
         assert_eq!(signal(Err(Errno::PERM)), SignalOutcome::PermissionDenied);
         assert_eq!(presence(Err(Errno::SRCH)), GroupPresence::Absent);
         assert_eq!(presence(Err(Errno::PERM)), GroupPresence::PermissionDenied);
+    }
+
+    fn member(pid: u32, uid: u32, ruid: u32, state: &str) -> snapshot::ProcessRow {
+        snapshot::ProcessRow {
+            pid,
+            ppid: 1,
+            pgid: 40,
+            uid,
+            ruid,
+            state: state.to_owned(),
+            cpu_time: "0:00.00".to_owned(),
+            rss_kib: 1,
+            command: format!("process {pid}"),
+        }
+    }
+
+    #[test]
+    fn group_classification_requires_evidence_before_ignoring_permission() {
+        let own = [501, 501];
+        let unlisted = || -> io::Result<Vec<snapshot::ProcessRow>> {
+            panic!("absence and other errors must not list")
+        };
+        assert_eq!(
+            classify_group(Err(Errno::SRCH), 40, &own, unlisted),
+            GroupObservation::Absent
+        );
+        assert!(matches!(
+            classify_group(Err(Errno::INVAL), 40, &own, unlisted),
+            GroupObservation::Unobserved(reason) if reason.contains("signal zero failed")
+        ));
+
+        let foreign = vec![member(40, 0, 0, "Ss"), member(41, 88, 88, "S")];
+        let recycled = classify_group(Err(Errno::PERM), 40, &own, || Ok(foreign.clone()));
+        assert_eq!(recycled, GroupObservation::Recycled(foreign));
+        assert!(recycled.none_of_ours());
+        assert!(recycled.to_string().contains("recycled by another user (2"));
+        // Other users' members without a new leader may be descendants of the
+        // reaped root whose user ID changed: never dismissed as recycled.
+        let leaderless = vec![member(41, 0, 0, "S"), member(42, 88, 88, "S")];
+        let ambiguous = classify_group(Err(Errno::PERM), 40, &own, || Ok(leaderless.clone()));
+        assert!(
+            matches!(&ambiguous, GroupObservation::Unobserved(reason)
+                if reason.contains("without a new leader pid=40") && reason.contains("pid=41 ")),
+            "{ambiguous}"
+        );
+        assert!(!ambiguous.none_of_ours());
+        // Members that exited after the refusal, or hidden foreign members,
+        // leave nothing listed and nothing of ours.
+        assert_eq!(
+            classify_group(Err(Errno::PERM), 40, &own, || Ok(Vec::new())),
+            GroupObservation::Absent
+        );
+
+        // A member running as us, by effective or real ID and even as a
+        // zombie, is never dismissed as recycled.
+        for ours in [
+            member(42, 501, 0, "S"),
+            member(42, 0, 501, "S"),
+            member(42, 501, 501, "Z"),
+        ] {
+            let rows = vec![member(40, 0, 0, "Ss"), ours];
+            let observed = classify_group(Err(Errno::PERM), 40, &own, || Ok(rows.clone()));
+            assert_eq!(observed, GroupObservation::Survivors(Ok(rows)));
+            assert!(!observed.none_of_ours());
+            assert!(observed.to_string().contains("pid=42 "), "{observed}");
+        }
+        let unavailable = classify_group(Err(Errno::PERM), 40, &own, || {
+            Err(io::Error::other("ps failed"))
+        });
+        assert!(!unavailable.none_of_ours());
+        assert!(
+            unavailable
+                .to_string()
+                .contains("listing unavailable: ps failed")
+        );
+
+        let live = classify_group(Ok(()), 40, &own, || Err(io::Error::other("ps failed")));
+        assert!(matches!(&live, GroupObservation::Survivors(Err(error)) if error == "ps failed"));
+        assert!(!live.none_of_ours());
+    }
+
+    #[test]
+    fn owned_listing_resolves_permission_only_with_foreign_evidence() {
+        let own = [501, 501];
+        let foreign = listed_presence(Ok(vec![member(40, 0, 0, "Ss")]), 40, &own);
+        assert_eq!(foreign.0, GroupPresence::Recycled);
+        assert!(
+            foreign.1.contains("recycled by another user (1"),
+            "{}",
+            foreign.1
+        );
+        let leaderless = listed_presence(
+            Ok(vec![member(41, 0, 0, "S"), member(42, 88, 88, "S")]),
+            40,
+            &own,
+        );
+        assert_eq!(leaderless.0, GroupPresence::PermissionDenied);
+        assert!(
+            leaderless.1.contains("without a new leader pid=40")
+                && leaderless.1.contains("pid=42 "),
+            "{}",
+            leaderless.1
+        );
+        let empty = listed_presence(Ok(Vec::new()), 40, &own);
+        assert_eq!(empty.0, GroupPresence::Absent);
+        assert!(empty.1.contains("no member listed"));
+        let ours = listed_presence(
+            Ok(vec![member(40, 0, 0, "Ss"), member(41, 501, 501, "Z")]),
+            40,
+            &own,
+        );
+        assert_eq!(ours.0, GroupPresence::PermissionDenied);
+        assert!(ours.1.contains("pid=41 "), "{}", ours.1);
+        let unavailable = listed_presence(Err(io::Error::other("ps")), 40, &own);
+        assert_eq!(unavailable.0, GroupPresence::PermissionDenied);
+        assert!(unavailable.1.contains("listing unavailable: ps"));
+    }
+
+    fn counting_lister(
+        calls: &Arc<std::sync::atomic::AtomicUsize>,
+        budgets: &Arc<std::sync::Mutex<Vec<Duration>>>,
+        rows: Vec<snapshot::ProcessRow>,
+    ) -> GroupLister {
+        let calls = Arc::clone(calls);
+        let budgets = Arc::clone(budgets);
+        Arc::new(move |group, budget| {
+            assert_eq!(group, 40);
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            budgets.lock().unwrap().push(budget);
+            Ok(rows.clone())
+        })
+    }
+
+    #[test]
+    fn permission_listing_lists_once_within_the_cleanup_budget() {
+        let calls = Arc::default();
+        let budgets = Arc::default();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        // The listing classifies against this process's real IDs, so the
+        // fixtures are built from them rather than from a host's usual uid.
+        let own = own_uids();
+        let [ruid, euid] = own;
+        let foreign = (0..).find(|uid| !own.contains(uid)).unwrap();
+        let mut listing = PermissionListing::with_lister(
+            40,
+            deadline,
+            counting_lister(&calls, &budgets, vec![member(40, euid, ruid, "Z")]),
+        );
+        assert!(!listing.listed());
+        assert!(format!("{listing:?}").contains("listed: false"));
+        // Signal-zero answers other than EPERM never list.
+        for presence in [
+            GroupPresence::Absent,
+            GroupPresence::Present,
+            GroupPresence::Recycled,
+            GroupPresence::ObservationError(io::ErrorKind::Other),
+            GroupPresence::InvalidPhase,
+        ] {
+            assert_eq!(listing.resolve_blocking(presence), presence);
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Repeated EPERM over one cleanup lists exactly once.
+        for _ in 0..5 {
+            assert_eq!(
+                listing.resolve_blocking(GroupPresence::PermissionDenied),
+                GroupPresence::PermissionDenied
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(listing.listed());
+        assert!(
+            listing
+                .evidence()
+                .is_some_and(|text| text.contains("a member of ours")),
+            "{listing:?}"
+        );
+        // The listing never outlasts the snapshot bound, even with a distant
+        // cleanup deadline.
+        assert_eq!(*budgets.lock().unwrap(), [snapshot::SNAPSHOT_TIMEOUT]);
+
+        // A near deadline bounds the listing to the time left.
+        let budgets = Arc::default();
+        let mut near = PermissionListing::with_lister(
+            40,
+            Instant::now() + Duration::from_millis(300),
+            counting_lister(&calls, &budgets, vec![member(40, foreign, foreign, "Ss")]),
+        );
+        assert_eq!(
+            near.resolve_blocking(GroupPresence::PermissionDenied),
+            GroupPresence::Recycled
+        );
+        let budget = budgets.lock().unwrap()[0];
+        assert!(budget <= Duration::from_millis(300), "{budget:?}");
+    }
+
+    #[test]
+    fn permission_listing_skips_spent_budgets_and_invalid_groups() {
+        let calls = Arc::default();
+        let budgets = Arc::default();
+        let mut spent = PermissionListing::with_lister(
+            40,
+            Instant::now(),
+            counting_lister(&calls, &budgets, Vec::new()),
+        );
+        assert_eq!(
+            spent.resolve_blocking(GroupPresence::PermissionDenied),
+            GroupPresence::PermissionDenied
+        );
+        assert!(!spent.listed());
+        assert_eq!(spent.evidence(), None);
+        for group in [0, 1, u32::MAX] {
+            let mut invalid = PermissionListing::with_lister(
+                group,
+                Instant::now() + Duration::from_secs(60),
+                counting_lister(&calls, &budgets, Vec::new()),
+            );
+            assert_eq!(
+                invalid.resolve_blocking(GroupPresence::PermissionDenied),
+                GroupPresence::PermissionDenied
+            );
+            assert!(!invalid.listed());
+            assert_eq!(
+                group_presence_after_reap(group),
+                GroupPresence::ObservationError(io::ErrorKind::InvalidInput)
+            );
+            assert!(matches!(
+                observe_group_after_reap(group),
+                GroupObservation::Unobserved(reason) if reason.contains("invalid process group")
+            ));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn permission_listing_runs_off_the_executor_and_reports_task_failure() {
+        let calls = Arc::default();
+        let budgets = Arc::default();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut empty = PermissionListing::with_lister(
+            40,
+            deadline,
+            counting_lister(&calls, &budgets, Vec::new()),
+        );
+        assert_eq!(
+            empty.resolve(GroupPresence::Present).await,
+            GroupPresence::Present
+        );
+        assert_eq!(
+            empty.resolve(GroupPresence::PermissionDenied).await,
+            GroupPresence::Absent
+        );
+        assert_eq!(
+            empty.resolve(GroupPresence::PermissionDenied).await,
+            GroupPresence::PermissionDenied
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut panicked =
+            PermissionListing::with_lister(40, deadline, Arc::new(|_, _| panic!("lister")));
+        assert_eq!(
+            panicked.resolve(GroupPresence::PermissionDenied).await,
+            GroupPresence::PermissionDenied
+        );
+        assert!(
+            panicked
+                .evidence()
+                .is_some_and(|text| text.contains("listing unavailable: listing task")),
+            "{panicked:?}"
+        );
+    }
+
+    #[test]
+    fn owned_listing_uses_the_real_listing_for_its_own_group() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut owner = OwnedProcessGroup::spawn(command).unwrap();
+        let mut listing = owner.permission_listing(Instant::now() + Duration::from_secs(5));
+        // Before EPERM nothing is listed; the real lister then finds no member
+        // of a group whose only member was reaped.
+        assert_eq!(
+            listing.resolve_blocking(GroupPresence::Absent),
+            GroupPresence::Absent
+        );
+        assert!(!listing.listed());
+        assert!(matches!(
+            owner.terminate_before_reap(),
+            Termination::Signalled(_)
+        ));
+        let reap_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match owner.reap_if_exited() {
+                Reap::Reaped(_) => break,
+                Reap::NotExited | Reap::Interrupted if Instant::now() < reap_deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => panic!("owned test root was not reaped: {other:?}"),
+            }
+        }
+        // The poll itself stays one signal-zero query; listing is separate.
+        let before = owner.syscall_count();
+        let presence = owner.presence_after_reap();
+        assert_eq!(owner.syscall_count(), before + 1, "{presence:?}");
+        let resolved = listing.resolve_blocking(GroupPresence::PermissionDenied);
+        assert!(listing.listed());
+        assert!(
+            matches!(resolved, GroupPresence::Absent | GroupPresence::Recycled),
+            "{resolved:?} {listing:?}"
+        );
     }
 
     #[test]
@@ -649,9 +1295,10 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let mut listing = owner.permission_listing(deadline);
         loop {
-            match owner.presence_after_reap() {
-                GroupPresence::Absent => return Ok(()),
+            match listing.resolve_blocking(owner.presence_after_reap()) {
+                GroupPresence::Absent | GroupPresence::Recycled => return Ok(()),
                 GroupPresence::Present | GroupPresence::PermissionDenied
                     if std::time::Instant::now() < deadline => {}
                 result => return Err(format!("test group cleanup: {result:?}")),

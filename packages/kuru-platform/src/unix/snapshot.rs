@@ -9,7 +9,10 @@
 //! The result is point-in-time text. Numeric IDs are printed, never signalled,
 //! waited for or otherwise acted on, so a reused ID can only mislabel a row.
 //! Callers take the snapshot while they still anchor the root's identity, for
-//! example before reaping it, and only on a failure path.
+//! example before reaping it, and only on a failure path. The one exception is
+//! [`group_members_within`], which a post-reap cleanup reads at most once, after
+//! signal zero was refused with `EPERM` and within the time left before its
+//! deadline, to tell a group recycled by another user from a survivor of ours.
 
 use std::{
     collections::BTreeSet,
@@ -38,6 +41,10 @@ pub struct ProcessRow {
     pub pid: u32,
     pub ppid: u32,
     pub pgid: u32,
+    /// Effective user ID.
+    pub uid: u32,
+    /// Real user ID.
+    pub ruid: u32,
     pub state: String,
     /// Cumulative CPU time in `ps`'s own `time` format.
     pub cpu_time: String,
@@ -50,8 +57,16 @@ impl fmt::Display for ProcessRow {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "pid={} ppid={} pgid={} stat={} time={} rss={}KiB args={}",
-            self.pid, self.ppid, self.pgid, self.state, self.cpu_time, self.rss_kib, self.command
+            "pid={} ppid={} pgid={} uid={} ruid={} stat={} time={} rss={}KiB args={}",
+            self.pid,
+            self.ppid,
+            self.pgid,
+            self.uid,
+            self.ruid,
+            self.state,
+            self.cpu_time,
+            self.rss_kib,
+            self.command
         )
     }
 }
@@ -64,6 +79,46 @@ pub fn tree(root: u32) -> io::Result<Vec<ProcessRow>> {
 /// [`tree`] through an explicit `ps` executable; a test seam for failures.
 pub fn tree_with(program: &Path, root: u32) -> io::Result<Vec<ProcessRow>> {
     Ok(select(parse(&list(program)?)?, root))
+}
+
+/// Every listed member of process group `group`, ordered by ID.
+///
+/// Unlike [`tree`], no parent closure is followed: the rows answer only which
+/// processes `ps` currently lists in that numeric group. A system that hides
+/// other users' processes (for example Linux `hidepid`) omits them; the
+/// caller's own processes are always listed.
+pub fn group_members(group: u32) -> io::Result<Vec<ProcessRow>> {
+    group_members_with(Path::new(PS), group)
+}
+
+/// [`group_members`] through an explicit `ps` executable.
+pub fn group_members_with(program: &Path, group: u32) -> io::Result<Vec<ProcessRow>> {
+    group_members_within_with(program, group, SNAPSHOT_TIMEOUT)
+}
+
+/// [`group_members`] bounded by `timeout`, which never exceeds
+/// [`SNAPSHOT_TIMEOUT`]. A zero timeout is a timed-out listing.
+pub fn group_members_within(group: u32, timeout: Duration) -> io::Result<Vec<ProcessRow>> {
+    group_members_within_with(Path::new(PS), group, timeout)
+}
+
+/// [`group_members_within`] through an explicit `ps` executable.
+pub fn group_members_within_with(
+    program: &Path,
+    group: u32,
+    timeout: Duration,
+) -> io::Result<Vec<ProcessRow>> {
+    Ok(members_of(
+        parse(&list_within(program, timeout.min(SNAPSHOT_TIMEOUT))?)?,
+        group,
+    ))
+}
+
+/// Every process `ps` lists, ordered by ID.
+pub fn processes() -> io::Result<Vec<ProcessRow>> {
+    let mut rows = parse(&list(Path::new(PS))?)?;
+    rows.sort_by_key(|row| row.pid);
+    Ok(rows)
 }
 
 /// Diagnostic text for `root`'s tree. A snapshot failure becomes
@@ -106,6 +161,17 @@ pub fn describe_still_listed(recorded: &[ProcessRow]) -> String {
 }
 
 /// [`describe_still_listed`] through an explicit `ps` executable.
+/// The `recorded` rows a fresh listing still shows, matched on process ID and
+/// command as in [`describe_still_listed`]. Never a basis for signalling.
+pub fn still_listed(recorded: &[ProcessRow]) -> io::Result<Vec<ProcessRow>> {
+    still_listed_with(Path::new(PS), recorded)
+}
+
+/// [`still_listed`] through an explicit `ps` executable.
+pub fn still_listed_with(program: &Path, recorded: &[ProcessRow]) -> io::Result<Vec<ProcessRow>> {
+    Ok(retain_listed(parse(&list(program)?)?, recorded))
+}
+
 pub fn describe_still_listed_with(program: &Path, recorded: &[ProcessRow]) -> String {
     match list(program).and_then(|output| parse(&output)) {
         Ok(rows) => {
@@ -143,6 +209,12 @@ fn retain_listed(listed: Vec<ProcessRow>, recorded: &[ProcessRow]) -> Vec<Proces
         .collect();
     live.sort_by_key(|row| row.pid);
     live
+}
+
+fn members_of(rows: Vec<ProcessRow>, group: u32) -> Vec<ProcessRow> {
+    let mut members: Vec<_> = rows.into_iter().filter(|row| row.pgid == group).collect();
+    members.sort_by_key(|row| row.pid);
+    members
 }
 
 fn select(rows: Vec<ProcessRow>, root: u32) -> Vec<ProcessRow> {
@@ -188,6 +260,17 @@ fn parse(output: &str) -> io::Result<Vec<ProcessRow>> {
         let pid = number("pid", next("pid")?)?;
         let ppid = number("ppid", next("ppid")?)?;
         let pgid = number("pgid", next("pgid")?)?;
+        // macOS prints IDs above i32::MAX, such as nobody's, as negative
+        // numbers; uid_t is the same 32 bits either way.
+        let user = |name: &str, value: &str| {
+            value
+                .parse::<u32>()
+                .ok()
+                .or_else(|| value.parse::<i32>().ok().map(|id| id as u32))
+                .ok_or_else(|| io::Error::other(format!("ps row has invalid {name}: {line:?}")))
+        };
+        let uid = user("uid", next("uid")?)?;
+        let ruid = user("ruid", next("ruid")?)?;
         let state = next("stat")?.to_owned();
         let cpu_time = next("time")?.to_owned();
         let rss_kib = number("rss", next("rss")?)?;
@@ -208,6 +291,8 @@ fn parse(output: &str) -> io::Result<Vec<ProcessRow>> {
             pid: id(pid, "pid")?,
             ppid: id(ppid, "ppid")?,
             pgid: id(pgid, "pgid")?,
+            uid,
+            ruid,
             state,
             cpu_time,
             rss_kib,
@@ -218,8 +303,22 @@ fn parse(output: &str) -> io::Result<Vec<ProcessRow>> {
 }
 
 fn list(program: &Path) -> io::Result<String> {
+    list_within(program, SNAPSHOT_TIMEOUT)
+}
+
+fn list_within(program: &Path, timeout: Duration) -> io::Result<String> {
+    if timeout.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("no time left to run {program:?}"),
+        ));
+    }
     let mut child = Command::new(program)
-        .args(["-A", "-o", "pid=,ppid=,pgid=,stat=,time=,rss=,args="])
+        .args([
+            "-A",
+            "-o",
+            "pid=,ppid=,pgid=,uid=,ruid=,stat=,time=,rss=,args=",
+        ])
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -259,7 +358,7 @@ fn list(program: &Path) -> io::Result<String> {
     drop(sender);
     // Both readers report EOF through the channel; the root is polled between
     // those bounded receives, and at the same interval once both have ended.
-    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let mut finished = 0;
     let mut status = None;
     loop {
@@ -298,7 +397,7 @@ fn list(program: &Path) -> io::Result<String> {
     if timed_out {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("{program:?} did not finish within {SNAPSHOT_TIMEOUT:?}"),
+            format!("{program:?} did not finish within {timeout:?}"),
         ));
     }
     stdout_result?;
@@ -325,6 +424,8 @@ mod tests {
             pid,
             ppid,
             pgid,
+            uid: 501,
+            ruid: 501,
             state: "S".to_owned(),
             cpu_time: "0:00.00".to_owned(),
             rss_kib: 1,
@@ -350,14 +451,47 @@ mod tests {
 
     #[test]
     fn parse_keeps_spaced_arguments_and_rejects_malformed_rows() {
-        let rows = parse("  7   1   7 Ss   0:01.50  2048 /bin/sh -c sleep 60\n\n").unwrap();
+        let rows =
+            parse("  7   1   7  501     0 Ss   0:01.50  2048 /bin/sh -c sleep 60\n\n").unwrap();
         assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].uid, rows[0].ruid), (501, 0));
+        let nobody = parse("854 1 854 -2 -2 Ss 0:00 1 dnsmasq\n").unwrap();
+        assert_eq!(
+            (nobody[0].uid, nobody[0].ruid),
+            (u32::MAX - 1, u32::MAX - 1)
+        );
+        assert!(parse("7 1 7 4294967296 0 S 0:00 1 cmd\n").is_err());
         assert_eq!(rows[0].command, "/bin/sh -c sleep 60");
         assert_eq!(rows[0].rss_kib, 2048);
         assert!(parse("7 1\n").is_err());
-        assert!(parse("x 1 7 S 0:00 1 cmd\n").is_err());
-        let long = format!("8 1 8 S 0:00 1 {}", "é".repeat(COMMAND_LIMIT));
+        assert!(parse("x 1 7 0 0 S 0:00 1 cmd\n").is_err());
+        assert!(parse("7 1 7 root 0 S 0:00 1 cmd\n").is_err());
+        let long = format!("8 1 8 0 0 S 0:00 1 {}", "é".repeat(COMMAND_LIMIT));
         assert!(parse(&long).unwrap()[0].command.ends_with("..."));
+    }
+
+    #[test]
+    fn group_listing_without_time_left_runs_nothing() {
+        // A program that cannot exist proves nothing was spawned.
+        let error =
+            group_members_within_with(Path::new("/nonexistent/kuru-ps"), 20, Duration::ZERO)
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(error.to_string().contains("no time left"), "{error}");
+        let error = group_members_with(Path::new("/nonexistent/kuru-ps"), 20).unwrap_err();
+        assert!(error.to_string().contains("spawn"), "{error}");
+    }
+
+    #[test]
+    fn group_members_follow_only_the_numeric_group() {
+        let rows = vec![
+            row(30, 1, 20),
+            row(20, 1, 20),
+            row(21, 20, 21),
+            row(9, 1, 9),
+        ];
+        let pids: Vec<_> = members_of(rows, 20).iter().map(|row| row.pid).collect();
+        assert_eq!(pids, [20, 30]);
     }
 
     #[test]

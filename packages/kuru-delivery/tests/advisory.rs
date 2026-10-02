@@ -366,7 +366,7 @@ async fn bounded_output_polls_unreaped_root_after_pipes_close_before_exit() {
 #[cfg(unix)]
 #[tokio::test]
 async fn bounded_output_cleans_silent_descendant_before_reaping_successful_root() {
-    use rustix::process::{Pid, test_kill_process_group};
+    use kuru_platform::unix::observe_group_after_reap;
 
     let root = tempfile::tempdir().unwrap();
     let identity = root.path().join("root-group");
@@ -387,16 +387,15 @@ async fn bounded_output_cleans_silent_descendant_before_reaping_successful_root(
     let group: i32 = fields.next().unwrap().parse().unwrap();
     assert!(fields.next().is_none());
     assert_eq!(root_pid, group);
-    assert!(matches!(
-        test_kill_process_group(Pid::from_raw(group).unwrap()),
-        Err(rustix::io::Errno::SRCH)
-    ));
+    // Read-only: the group is gone, or another user's new leader took its number.
+    let observed = observe_group_after_reap(group.unsigned_abs());
+    assert!(observed.none_of_ours(), "{observed}");
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn bounded_output_times_out_and_reaps_descendant_holding_inherited_output() {
-    use rustix::process::{Pid, test_kill_process_group};
+    use kuru_platform::unix::observe_group_after_reap;
 
     let root = tempfile::tempdir().unwrap();
     let marker = root.path().join("process-group");
@@ -422,10 +421,10 @@ async fn bounded_output_times_out_and_reaps_descendant_holding_inherited_output(
         pid, group,
         "the helper must create a fresh process group led by its root"
     );
-    let pid = Pid::from_raw(pid).unwrap();
+    let observed = observe_group_after_reap(pid.unsigned_abs());
     assert!(
-        matches!(test_kill_process_group(pid), Err(rustix::io::Errno::SRCH)),
-        "fixture process group survived bounded cleanup"
+        observed.none_of_ours(),
+        "fixture process group survived bounded cleanup: {observed}"
     );
 }
 

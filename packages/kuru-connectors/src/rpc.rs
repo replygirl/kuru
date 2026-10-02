@@ -828,9 +828,10 @@ async fn cleanup_owner(owner: &mut Owner, graceful: bool, deadline: Instant) -> 
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let mut listing = owner.permission_listing(deadline);
     loop {
-        match owner.presence_after_reap() {
-            GroupPresence::Absent => return true,
+        match listing.resolve(owner.presence_after_reap()).await {
+            GroupPresence::Absent | GroupPresence::Recycled => return true,
             GroupPresence::Present | GroupPresence::PermissionDenied => {}
             GroupPresence::ObservationError(_) | GroupPresence::InvalidPhase => return false,
         }
