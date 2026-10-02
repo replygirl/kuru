@@ -28,3 +28,4 @@
 - [x] 4.1 Document how to read a pool acquire timeout in `docs/development.md` and verify `mise run docs:check`
 - [x] 4.2 Measure per-pool authenticated connections across the same dream test after the fix and verify the numbers are recorded beside the before numbers
 - [x] 4.3 Run the kuru-memory and kuru-runtime suites, format, lint (host and Windows target) and typecheck, and verify observed results in verification.md
+- [x] 4.4 Record the lead's 2026-10-02 ruling deferring D2 to a follow-up change, the reduces-not-eliminates scope with the residual paths and their measured counts, and the open tracking item, and verify `cospec validate --all --strict`
