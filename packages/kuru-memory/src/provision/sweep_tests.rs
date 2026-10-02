@@ -592,3 +592,61 @@ fn a_stage_cleanup_report_names_the_refusing_descendant() {
     assert!(receipt["probe_child"].is_null(), "{receipt:?}");
     blocker.release();
 }
+
+#[tokio::test]
+async fn a_failed_probe_child_stamp_is_recorded_through_the_sweep_refusal() {
+    let fixture = fixture();
+    let stage = fixture.versions.join(".install-unstamped");
+    private_directory(&stage).unwrap();
+    let blocker = RemovalBlocker::place(&stage);
+    let failure = crate::files::StageCleanupFailure {
+        stage: stage.clone(),
+        private: stage.join("private"),
+        cause: anyhow::Error::msg("fixture cleanup failure"),
+    };
+    let mut report = StageCleanupReport::new(failure, BUNDLED_ASSET);
+    report.probe_child = Some(ProbeChildObservation::at_release(Err(
+        "stamp the probe child: fixture stamp failure".to_owned(),
+    )));
+    write_stage_receipt(&fixture.versions, &report).unwrap();
+
+    let receipt = receipt_of(&fixture.versions, &stage);
+    let recorded = read_json(&receipt);
+    assert_eq!(
+        recorded["probe_child"],
+        serde_json::json!({"error": "stamp the probe child: fixture stamp failure"}),
+        "a failed stamp is recorded with its cause: {recorded:?}"
+    );
+
+    let outcome = sweep(&fixture).await;
+    assert_eq!(outcome.remaining, 1);
+    let recorded = read_json(&receipt);
+    assert_eq!(
+        recorded["last_sweep_refusal"]["probe_child_at_refusal"],
+        "unknown: stamp the probe child: fixture stamp failure",
+        "a sweep refusal names why no child state could be observed: {recorded:?}"
+    );
+    assert_eq!(
+        recorded["probe_child"],
+        serde_json::json!({"error": "stamp the probe child: fixture stamp failure"}),
+        "the refusal keeps the release's record: {recorded:?}"
+    );
+    blocker.release();
+}
+
+#[test]
+fn a_stamped_probe_child_is_recorded_with_its_state() {
+    let observation = ProbeChildObservation::at_release(Ok(ProbeChild {
+        pid: 7,
+        created: 11,
+    }));
+    let value = serde_json::to_value(&observation).unwrap();
+    assert_eq!(value["pid"], 7, "{value}");
+    assert_eq!(value["created"], 11, "{value}");
+    assert!(value["at_refusal"].is_string(), "{value}");
+    assert!(value.get("error").is_none(), "{value}");
+    assert!(
+        probe_child_state_at_sweep(&value).is_some(),
+        "a stamped child is observed again at a sweep refusal"
+    );
+}

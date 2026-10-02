@@ -1963,7 +1963,8 @@ async fn concurrent_cold_windows_provision_publishes_one_verified_native_identit
                 .as_u64()
                 .is_some_and(|pid| pid > 0)
                 && receipt["probe_child"]["at_refusal"].is_string(),
-            "a probed stage records its probe child at the refusal: {evidence}"
+            "a probed stage records its probe child at the refusal (stamp error: {}): {evidence}",
+            receipt["probe_child"]["error"]
         );
         assert!(
             receipt["sweep_refusals"]
@@ -2034,7 +2035,8 @@ async fn forced_published_cleanup_failure_records_the_probe_child() {
     let child = &receipt["probe_child"];
     assert!(
         child["pid"].as_u64().is_some_and(|pid| pid > 0),
-        "{receipt}"
+        "the probe child was stamped (stamp error: {}): {receipt}",
+        child["error"]
     );
     assert!(
         child["created"].as_u64().is_some_and(|created| created > 0),

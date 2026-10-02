@@ -206,7 +206,8 @@ const LEFTOVER_STAGE_RECEIPTS: &str = ".leftovers";
 /// `descendant` names the entry whose checked removal refused, relative to
 /// `stage`, when the cause carries one. `probe_child` is the probed engine's
 /// child process and whether its process object was still open when the
-/// refusal was recorded (Windows only; see [`ProbeChild`]).
+/// refusal was recorded, or the cause its stamp failed with (Windows only; see
+/// [`ProbeChildObservation`]).
 #[derive(Debug)]
 pub(crate) struct StageCleanupReport {
     pub stage: PathBuf,
@@ -309,7 +310,7 @@ impl ProbeChild {
     }
 
     fn observe(self) -> ProbeChildObservation {
-        ProbeChildObservation {
+        ProbeChildObservation::Observed {
             pid: self.pid,
             created: self.created,
             at_refusal: self.state(),
@@ -317,12 +318,34 @@ impl ProbeChild {
     }
 }
 
-/// A [`ProbeChild`] and its state when a refusal was recorded.
+/// The cold probe's child as the stage lease holds it: its stamp, or why the
+/// stamp could not be taken. A failed stamp is kept so that the receipt says
+/// why it names no child, instead of recording nothing.
+pub(crate) type ProbeChildStamp = std::result::Result<ProbeChild, String>;
+
+/// A probed stage's child as a receipt records it at a refusal: a
+/// [`ProbeChild`] and its state then, or the cause its stamp failed with. The
+/// latter is stored as `{"error": "<cause>"}`.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct ProbeChildObservation {
-    pub pid: u32,
-    pub created: u64,
-    pub at_refusal: String,
+#[serde(untagged)]
+pub(crate) enum ProbeChildObservation {
+    Observed {
+        pid: u32,
+        created: u64,
+        at_refusal: String,
+    },
+    Unstamped {
+        error: String,
+    },
+}
+
+impl ProbeChildObservation {
+    fn at_release(stamp: ProbeChildStamp) -> Self {
+        match stamp {
+            Ok(child) => child.observe(),
+            Err(error) => Self::Unstamped { error },
+        }
+    }
 }
 
 /// The receipt as it is stored: paths relative to the version directory, so a
@@ -890,8 +913,9 @@ struct StageLease {
     staging: Option<PrivateTemp>,
     lock: Option<CacheLock>,
     asset: Asset<'static>,
-    /// The cold probe's child, once the stage's engine has been probed.
-    probe_child: Option<ProbeChild>,
+    /// The cold probe's child, or why it could not be stamped, once the
+    /// stage's engine has been probed.
+    probe_child: Option<ProbeChildStamp>,
 }
 
 impl StageLease {
@@ -952,7 +976,10 @@ impl StageLease {
             });
             let versions = failure.stage.parent().unwrap_or(Path::new("")).to_owned();
             // Observed now, at the refusal, while the lock is still held.
-            let probe_child = self.probe_child.map(ProbeChild::observe);
+            let probe_child = self
+                .probe_child
+                .take()
+                .map(ProbeChildObservation::at_release);
             let report =
                 record_retained_stage(&versions, self.asset, failure, published, probe_child);
             emit_retained_stage_diagnostic(&report);
@@ -1547,11 +1574,25 @@ impl SweepRefusal {
     }
 }
 
+/// A receipt's probe child observed at a sweep's refusal: its state when the
+/// receipt names a stamped child, `unknown: <cause>` when its stamp failed at
+/// the release, and nothing for any other value.
+fn probe_child_state_at_sweep(child: &serde_json::Value) -> Option<String> {
+    if let Ok(child) = serde_json::from_value::<ProbeChild>(child.clone()) {
+        return Some(child.state());
+    }
+    child
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(|error| format!("unknown: {error}"))
+}
+
 /// Record a sweep's refusal in the receipt it read, under the lock the sweep
 /// holds: count it in `sweep_refusals` and replace `last_sweep_refusal`, so
 /// the receipt stays bounded. Every other field, including any this version
 /// does not know, is kept as it was, and `version` stays 1. When the receipt
-/// names a probe child, its state is observed now, at this refusal.
+/// names a probe child, its state is observed now, at this refusal (see
+/// [`probe_child_state_at_sweep`]).
 ///
 /// A rewrite that fails leaves the old receipt, which is still valid, and is
 /// reported to diagnostics. It never changes what the sweep did.
@@ -1561,8 +1602,7 @@ fn record_sweep_refusal(receipts: &Path, name: &str, bytes: &[u8], refusal: Swee
         let mut fields: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(bytes)?;
         let probe_child_at_refusal = fields
             .get("probe_child")
-            .and_then(|child| serde_json::from_value::<ProbeChild>(child.clone()).ok())
-            .map(ProbeChild::state);
+            .and_then(probe_child_state_at_sweep);
         let refusals = fields
             .get("sweep_refusals")
             .and_then(serde_json::Value::as_u64)
@@ -1838,13 +1878,14 @@ async fn verify_version_with_timeout(binary: &Path, home: &Path, timeout: Durati
 }
 
 /// [`verify_version_with_timeout`], recording the probe's child process in
-/// `probe_child` once it has started (Windows only). The child itself, and so
-/// every handle of ours to it, is dropped before this returns.
+/// `probe_child` once it has started (Windows only), or the cause its stamp
+/// failed with. The child itself, and so every handle of ours to it, is
+/// dropped before this returns.
 async fn verify_version_recorded(
     binary: &Path,
     home: &Path,
     timeout: Duration,
-    probe_child: &mut Option<ProbeChild>,
+    probe_child: &mut Option<ProbeChildStamp>,
 ) -> Result<()> {
     checked_regular(binary, true)?;
     prepare_private_home(home)?;
@@ -1860,10 +1901,15 @@ async fn verify_version_recorded(
     .context("start configured Dolt executable")?;
     #[cfg(windows)]
     {
-        *probe_child = child.stamp().ok().map(|stamp| ProbeChild {
-            pid: stamp.id,
-            created: stamp.created,
-        });
+        *probe_child = Some(
+            child
+                .stamp()
+                .map(|stamp| ProbeChild {
+                    pid: stamp.id,
+                    created: stamp.created,
+                })
+                .map_err(|error| format!("stamp the probe child: {error}")),
+        );
     }
     #[cfg(not(windows))]
     let _ = probe_child;
