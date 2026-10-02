@@ -1812,7 +1812,7 @@ impl ServiceOwner {
                     biased;
                     accepted = self.accept_once(knobs, accept_within) => match accepted {
                         Ok(stream) => {
-                            if self.attach(stream, &mut attachments, &frame_budget, &retirement) {
+                            if self.attach(stream, &mut attachments, &frame_budget, retirement) {
                                 #[cfg(test)]
                                 {
                                     was_empty = false;
@@ -1832,7 +1832,7 @@ impl ServiceOwner {
                     accepted = self.accept_once(knobs, knobs.recheck) => {
                         match accepted {
                             Ok(stream) => {
-                                if self.attach(stream, &mut attachments, &frame_budget, &retirement) {
+                                if self.attach(stream, &mut attachments, &frame_budget, retirement) {
                                     #[cfg(test)]
                                     knobs.emit(ServeEvent::AttachmentAccepted {
                                         active: retirement.active(),
