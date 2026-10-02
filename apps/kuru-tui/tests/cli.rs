@@ -39,10 +39,16 @@ fn ensure_powershell_warm() {
     kuru_connectors::shell_warmup::ensure_stock_powershell_warm();
 }
 
+/// The name, in each sandbox's private root, of its owner diagnostic file.
+const OWNER_DIAGNOSTIC: &str = "owner-diagnostic.log";
+
 struct Sandbox {
     root: memory::ServiceCleanup,
     project: PathBuf,
     data: PathBuf,
+    /// The private file that receives the stderr of any owner a command of
+    /// this sandbox elects, so a failed open shows the owner's own error.
+    owner_diagnostic: PathBuf,
 }
 impl Sandbox {
     /// A sandbox for a plain `fn` test: warms the shared cache synchronously.
@@ -77,10 +83,23 @@ impl Sandbox {
         let data = root.path().join("data");
         std::fs::create_dir(&project).unwrap();
         memory::configuration_with(root.path(), cache).unwrap();
+        // The owner diagnostic hook opens an existing file for append only.
+        let owner_diagnostic = root.path().join(OWNER_DIAGNOSTIC);
+        drop(
+            kuru_platform::fs::Directory::open(
+                root.path(),
+                kuru_platform::fs::Privacy::OwnerOnly,
+                kuru_platform::fs::NameRetention::Pinned,
+            )
+            .unwrap()
+            .create_new(std::ffi::OsStr::new(OWNER_DIAGNOSTIC))
+            .unwrap(),
+        );
         Self {
             root: memory::ServiceCleanup::new(root, &data),
             project,
             data,
+            owner_diagnostic,
         }
     }
     fn command(&self) -> Command {
@@ -96,7 +115,11 @@ impl Sandbox {
             .arg("--data-dir")
             .arg(&self.data)
             .args(["--provider", provider, "--no-dream"])
-            .env("XDG_CONFIG_HOME", self.root.path().join("config"));
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+            .env(
+                kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+                &self.owner_diagnostic,
+            );
         command
     }
     fn run(&self, args: &[&str]) -> Output {
@@ -106,10 +129,20 @@ impl Sandbox {
         let output = self.run(args);
         assert!(
             output.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "{args:?}: {}{}",
+            String::from_utf8_lossy(&output.stderr),
+            self.owner_diagnostic()
         );
         String::from_utf8(output.stdout).unwrap()
+    }
+    /// What every owner this sandbox's commands elected wrote to stderr, for
+    /// a failure message.
+    fn owner_diagnostic(&self) -> String {
+        match std::fs::read(&self.owner_diagnostic) {
+            Ok(bytes) if bytes.is_empty() => String::new(),
+            Ok(bytes) => format!("\nowner stderr:\n{}", String::from_utf8_lossy(&bytes)),
+            Err(error) => format!("\nowner stderr unreadable: {error}"),
+        }
     }
 }
 
@@ -1550,9 +1583,15 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
     assert!(
         !env.run(&["--resume", "missing", "run", "no"])
             .status
-            .success()
+            .success(),
+        "a missing session resumed{}",
+        env.owner_diagnostic()
     );
-    assert!(!env.run(&["undo-dream"]).status.success());
+    assert!(
+        !env.run(&["undo-dream"]).status.success(),
+        "undo-dream succeeded with no dream{}",
+        env.owner_diagnostic()
+    );
     assert!(env.success(&["run", "plain answer"]).contains("demo"));
 }
 
