@@ -95,11 +95,29 @@ codebase already has.
   in its body. Windows-only functions and files and the one builder
   (`provision::isolated_command`) are exempt by name. A permanent synthetic
   negative test (`the_child_creation_scan_reports_an_ungated_construction`)
-  proves that the scan reports an ungated construction. The scan already
-  found one site: the macOS-only `/bin/hostname` helper in
-  `store/engine_contract_tests.rs`, now gated across creation only.
-- No change to the quarantine tests: `creation_template/tests.rs` and
-  `open_tests.rs` are byte-unchanged.
+  proves that the scan reports an ungated construction. Besides the three
+  product sites above, the scan found one more: the macOS-only
+  `/bin/hostname` helper in `store/engine_contract_tests.rs`, now gated
+  across creation only.
+- Quarantine assertions that run through an ordinary open
+  (`spawn_gated_open`, a shared guard only) name the designed skip. Under
+  `cfg(test)`, `creation_template::account` records every quarantine outcome
+  by template root (`creation_template/hooks.rs`). The helper
+  `creation_template::tests::quarantined_or_busy` accepts exactly one
+  attempt: the judged template moved, or `Skipped("the store template key
+  lock is busy")` with the judged template still published and nothing
+  quarantined. Every other outcome fails. Three open-path tests use it:
+  `damaged_templates_send_the_opener_cold_and_preserve_copy_remnants`,
+  `shape_verdict_on_the_copy_fails_the_open_and_quarantines_the_template`
+  and `adoption_verdict_quarantines_and_leaves_the_stage_in_place`.
+  `failed_copy_after_the_build_fails_the_open_without_a_cold_retry` is
+  unchanged: its quarantine runs under the exclusive lock its build holds.
+  Two `tests.rs` tests check the recorded skip deterministically.
+- The `spawn_gate` module doc names the cross-thread hang hazard: version
+  probes spawn on their own thread, which the exclusive holder's own child
+  creation cannot be matched to. The warm-up scan now also reports a
+  warm-up or a `provision(` call under a held `locking` guard, with its own
+  synthetic negative test.
 
 ## Impact
 
@@ -110,15 +128,25 @@ codebase already has.
   only on Unix, and no Windows arm was edited.
 - Files:
   - `packages/kuru-memory/src/spawn_gate.rs`: the gate, its tests and the
-    scan.
+    scans.
+  - `packages/kuru-memory/src/store/creation_template.rs`: one
+    `#[cfg(test)]` record in `account`, plus its doc line.
+  - `packages/kuru-memory/src/store/creation_template/{hooks.rs,tests.rs,open_tests.rs}`:
+    the quarantine record, `quarantined_or_busy`, and the three
+    assertions.
   - `packages/kuru-memory/src/{server.rs,engine.rs,service.rs}`: one
     `#[cfg(test)]` acquisition per spawn.
   - `packages/kuru-memory/src/store/engine_contract_tests.rs`: the hostname
     helper.
   - `openspec/changes/memory-template-quarantine-gate/`: this record.
-- Makes the failure family impossible in-process rather than rarer, for any
-  test that holds the exclusive guard across its release-to-try window. With
-  that guard held, no child creation in the binary can be in flight.
-  Residual [inferred]: a test that reaches a quarantine verdict while holding
-  only a *shared* guard is still not excluded from sibling spawns. That was
-  already true before this change, and the failing test is not such a test.
+- Makes the quarantine-verdict failure impossible in-process rather than
+  rarer. A test that holds the exclusive guard across its release-to-try
+  window has no child creation in flight in the binary, so its quarantine
+  cannot be skipped. A test that reaches the verdict through an ordinary
+  open holds only a shared guard and accepts the recorded designed skip.
+- Residual, not fixed here [read; reachability inferred]: `create_in`'s
+  shared-to-exclusive upgrade on an empty private root is a non-waiting try
+  as well. A busy upgrade sends the open cold (`creation_worker.rs:165`), so
+  an open-path test asserting a build through `spawn_gated_open` is exposed
+  to the same mechanism. Accepting cold there would change what those tests
+  test; tasks.md 6.3 records the finding for separate routing.

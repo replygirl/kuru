@@ -12,8 +12,8 @@
 use super::hooks::{Event, HOOKS, Hooks, LockStep, Pause, ReadFault};
 use super::tests::{
     CHILD_OUTCOME, DEPTH, clone_shared, engine, ensure, entries_of, failure, hold, key,
-    largest_file, published, read_manifest, rejected, release, spawn_child, wait_child,
-    write_manifest,
+    largest_file, published, quarantined_or_busy, read_manifest, rejected, release, spawn_child,
+    wait_child, write_manifest,
 };
 use super::*;
 use crate::server::{TemplateVerdict, read_identity_view};
@@ -901,10 +901,11 @@ async fn damaged_templates_send_the_opener_cold_and_preserve_copy_remnants() -> 
                     published(&root) == Some(template) && quarantined.is_empty(),
                     "{label}: the template was quarantined"
                 ),
-                _ => ensure!(
-                    published(&root).is_none() && quarantined.len() == 1,
-                    "{label}: the template was not quarantined: {quarantined:?}"
-                ),
+                // Quarantined, or the designed skip on a busy key lock.
+                _ => {
+                    quarantined_or_busy(&root, template)
+                        .with_context(|| format!("{label}: the template was not quarantined"))?;
+                }
             }
             match label {
                 "structure" => ensure!(
@@ -986,18 +987,17 @@ async fn shape_verdict_on_the_copy_fails_the_open_and_quarantines_the_template()
                 && read_identity_view(stage)?.template.as_deref() == Some(key()),
             "the preserved stage is not the unready copy"
         );
-        let quarantined = rejected(&root)?;
-        let [moved] = quarantined.as_slice() else {
-            bail!("not exactly one quarantined template: {quarantined:?}");
-        };
-        ensure!(
-            published(&root).is_none() && files::directory(&root.join(moved))?.identity() == flawed,
-            "the judged template was not the one quarantined"
-        );
+        // Quarantined, or the designed skip on a busy key lock.
+        let moved = quarantined_or_busy(&root, flawed)?;
         ensure!(
             starts_under(&options.data_dir)? == 1,
             "the failed open retried or reached its active start"
         );
+        if moved.is_none() {
+            // The skip leaves the flawed template published for the next
+            // copier to judge again; no new build follows it.
+            return Ok(());
+        }
         // The next new project pays one build, then copies the new template.
         let next = options_for(&fixture, &root, 'c').await?;
         let store = open(next.clone()).await?;
@@ -1430,14 +1430,8 @@ async fn adoption_verdict_quarantines_and_leaves_the_stage_in_place() -> Result<
                 && message.contains("is not the compiled template placeholder"),
             "the open did not fail with the adoption verdict: {message}"
         );
-        let quarantined = rejected(&root)?;
-        let [moved] = quarantined.as_slice() else {
-            bail!("not exactly one quarantined template: {quarantined:?}");
-        };
-        ensure!(
-            published(&root).is_none() && files::directory(&root.join(moved))?.identity() == flawed,
-            "the judged template was not the one quarantined"
-        );
+        // Quarantined, or the designed skip on a busy key lock.
+        quarantined_or_busy(&root, flawed)?;
         ensure!(!active(&options)?.exists(), "an active directory appeared");
         ensure!(
             interrupted(&options)?.is_empty(),

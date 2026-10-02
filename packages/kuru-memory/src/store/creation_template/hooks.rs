@@ -183,6 +183,47 @@ pub(super) async fn before_quarantine() {
     }
 }
 
+/// Every quarantine outcome this process reached, with the template root it
+/// was reached under. Process-wide rather than scoped: a quarantine after
+/// adoption runs in the creation worker, outside any [`HOOKS`] scope, and a
+/// test that names its own private template root reads only its own entries.
+static QUARANTINES: StdMutex<Vec<(PathBuf, Quarantine)>> = StdMutex::new(Vec::new());
+
+/// `root` as it is recorded and looked up: canonical when it resolves, so a
+/// test's path and the opened directory's path agree.
+fn root_key(root: &Path) -> PathBuf {
+    fs::canonicalize(root).unwrap_or_else(|_| root.to_owned())
+}
+
+/// Record a quarantine outcome under `root`; see [`quarantines`].
+pub(super) fn quarantined(root: &Path, moved: &Quarantine) {
+    let moved = match moved {
+        Quarantine::Moved(target) => Quarantine::Moved(target.clone()),
+        Quarantine::Skipped(reason) => Quarantine::Skipped(reason.clone()),
+    };
+    QUARANTINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((root_key(root), moved));
+}
+
+/// The quarantine outcomes reached under the template root `root`, in order.
+/// Tests otherwise see only the filesystem, which cannot tell a quarantine
+/// that was skipped by design from one that never ran.
+pub(crate) fn quarantines(root: &Path) -> Vec<Quarantine> {
+    let root = root_key(root);
+    QUARANTINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(at, _)| *at == root)
+        .map(|(_, moved)| match moved {
+            Quarantine::Moved(target) => Quarantine::Moved(target.clone()),
+            Quarantine::Skipped(reason) => Quarantine::Skipped(reason.clone()),
+        })
+        .collect()
+}
+
 pub(super) fn synced(path: &Path) {
     if let Some(events) = current().and_then(|hooks| hooks.events) {
         events

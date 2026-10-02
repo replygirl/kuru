@@ -166,15 +166,15 @@
       by grep of `Command::new(`, `NativeSpawnSpec::new(`,
       `isolated_command(`, `engine::spawn(` and by reading each site.
       Observed (grep over `src`, excluding `spawn_gate.rs`'s own fixtures;
-      line numbers at this revision; "fn" is the innermost enclosing
-      function):
+      line numbers refreshed by that grep on the final bytes of the review
+      round in section 6; "fn" is the innermost enclosing function):
       | site | fn | treatment |
       |---|---|---|
       | `engine.rs:32` (`isolated_command(`) | `spawn`, unix arm | newly gated: `child_creation` |
       | `engine.rs:51` (`NativeSpawnSpec::new(`) | `spawn`, windows arm | Windows-only arm, unchanged; the scan passes it because the shared fn body holds `child_creation` |
-      | `server.rs:631` (`Command::new(`) | `open_inner_with_probe_delay`, unix arm | newly gated: `child_creation`, dropped at the existing `_test_spawn_guard` release |
-      | `server.rs:706` (`NativeSpawnSpec::new(`) | `open_inner_with_probe_delay`, windows arm | Windows-only arm, unchanged |
-      | `server.rs:2308` (`engine::spawn(`) | `supervise_with_port_hook` | call, not a construction; gated inside `engine::spawn` |
+      | `server.rs:633` (`Command::new(`) | `open_inner_with_probe_delay`, unix arm | newly gated: `child_creation`, dropped at the existing `_test_spawn_guard` release |
+      | `server.rs:708` (`NativeSpawnSpec::new(`) | `open_inner_with_probe_delay`, windows arm | Windows-only arm, unchanged |
+      | `server.rs:2673` (`engine::spawn(`) | `supervise_with_port_hook` | call, not a construction; gated inside `engine::spawn` |
       | `service.rs:999` (`Command::new(`) | `spawn_service`, `#[cfg(unix)]` | newly gated: `child_creation` |
       | `service.rs:1031` (`NativeSpawnSpec::new(`) | `spawn_service`, `#[cfg(windows)]` | Windows-only fn, unchanged |
       | `service.rs:2900`, `:2935` (`/bin/sh`) | `starter_wait_surfaces_the_exited_child_stderr` | already gated: `spawning()` |
@@ -182,14 +182,14 @@
       | `service.rs:6898` (`Command::new(`) | `separate_cold_starters_share_one_owner_and_preserve_both_writes` | already gated: `spawning()` |
       | `server_tests.rs:65`, `:135` (`/bin/sh`) | two reap-guard tests | already gated: `spawning_blocking()` |
       | `server_tests.rs:220` (`engine::spawn(`) | `cleanup_observation_error_keeps_actual_lifecycle_lease_until_child_exit` | call; gated inside `engine::spawn`, outer `spawning()`/`locking_async` |
-      | `provision.rs:1557` (`Command::new(`) | `isolated_command` | the builder: constructs but never spawns; scan-exempt by name |
-      | `provision.rs:1579` (`engine::spawn(`) | `verify_version_with_timeout` | call; gated inside `engine::spawn` |
+      | `provision.rs:1857` (`Command::new(`) | `isolated_command` | the builder: constructs but never spawns; scan-exempt by name |
+      | `provision.rs:1892` (`engine::spawn(`) | `verify_version_recorded` | call; gated inside `engine::spawn`. Reached from the version probes on their own threads (`owned_probe`, `CheckedColdProbe::probe`); see the hang hazard in 6.2 |
       | `server/windows_fixture.rs:14`, `:76` | `unconfigured`, `partial_readiness` | Windows-only file |
       | `test_support/windows.rs:176` (`engine::spawn(`) | `forced_engine_cleanup` | Windows-only file; call |
       | `test_support/template.rs:846` (`Command::new(`) | `spawn_child`, `#[cfg(unix)]` | already gated: `spawning()` |
       | `test_support/template.rs:893` (`NativeSpawnSpec::new(`) | `spawn_child`, `#[cfg(windows)]` | Windows-only fn |
       | `store/engine_contract_tests.rs:283` (`/bin/hostname`) | `os_hostname`, `cfg(all(unix, not(linux)))` | **found by the scan, newly gated**: `child_creation` across creation only (`spawn()` then `wait_with_output()` outside the guard) |
-      | `store/creation_template/tests.rs:1923`, `:1969` | `spawn_child` unix/windows | already gated: `spawning()` |
+      | `store/creation_template/tests.rs:2037`, `:2083` | `spawn_child` unix/windows | already gated: `spawning()` |
       | `store/recovery_tests.rs:96`, `:142` | `spawn_process_loss_creator` unix/windows | already gated: `spawning()` |
 - [x] 4.2 Add `every_child_creation_takes_the_gate`: each construction's
       innermost enclosing function must contain a spawn-gate token
@@ -214,7 +214,8 @@
       `git diff 0e562595 -- packages/kuru-memory/src/store/creation_template/`
       is empty, `git log origin/main..HEAD -- …/creation_template/` lists no
       commit, and the working tree has no diff there. The quarantine tests
-      are untouched by this change. Rebased onto `origin/main` (new tip
+      are untouched by this change (at that revision; see 5.3 and 6.1).
+      Rebased onto `origin/main` (new tip
       `b9453c5b`); `cargo test -p kuru-memory --lib spawn_gate` re-run after
       the rebase: 8 passed, including `every_child_creation_takes_the_gate`
       against main's new `server.rs`/`engine.rs` lines.
@@ -284,7 +285,112 @@
       0, `//packages/kuru-memory:lint:windows` exit 0,
       `//packages/kuru-memory:typecheck` exit 0, `format:check` exit 0;
       `cargo test -p kuru-memory --lib spawn_gate` re-run after the field
-      change: 8 passed. Not run: `coverage` (CI-enforced, not a hook),
-      the Linux and Windows native test legs (CI), and
-      `mise run cospec -- apply` in this session (its status before the
-      session resumed is unknown here).
+      change: 8 passed. Not run: `coverage` (CI-enforced, not a hook) and
+      the Linux and Windows native test legs (CI). The apply gate was not
+      run in that session. It was run in the review round (section 6),
+      before any code change: `mise run cospec -- validate
+      memory-template-quarantine-gate --strict` exit 0 ("0 errors, 0
+      warnings"), then `mise run cospec -- apply
+      memory-template-quarantine-gate --json` exit 0, `gate.state` `clear`,
+      no hard or soft blockers, 15/15 tasks complete.
+- [x] 5.3 Note the scope of the 4.3 check: it held for the first revision.
+      Section 6 changes three quarantine assertions to name the designed
+      skip, which the brief allows ("unchanged except where an assertion
+      must name the designed skip").
+
+## 6. Review round on PR #171 (head `7156fd91`)
+
+- [x] 6.1 Resolve the shared-guard residual: an open-path quarantine
+      assertion that reaches `creation_template.rs::quarantine` (the
+      non-waiting exclusive try) while the test holds only
+      `spawn_gated_open`'s shared guard must name the designed skip —
+      verify by reading each named assertion's quarantine path, then the
+      diff and the tests.
+      Observed (read at `7156fd91`): three of the four named tests reach
+      `quarantine()`:
+      `damaged_templates_send_the_opener_cold_and_preserve_copy_remnants`
+      (structure and digest cases, via `condemn`),
+      `shape_verdict_on_the_copy_fails_the_open_and_quarantines_the_template`
+      and `adoption_verdict_quarantines_and_leaves_the_stage_in_place` (both
+      via `quarantine_after_adoption`). The fourth,
+      `failed_copy_after_the_build_fails_the_open_without_a_cold_retry`,
+      quarantines its verdict case with `quarantine_held` under the
+      exclusive lock its own build still holds (`create_in`'s
+      `Inspection::Absent` arm), so no busy skip can occur there. It is
+      left unchanged.
+      Change: under `cfg(test)`, `account()` (called after every quarantine
+      outcome) records it by template root in a process-wide registry
+      (`creation_template/hooks.rs`: `quarantined`, `quarantines`). It is
+      process-wide because `quarantine_after_adoption` runs in the creation
+      worker outside any `HOOKS` scope. `git diff -U0` of
+      `creation_template.rs` is one doc line and
+      `#[cfg(test)] hooks::quarantined(root, moved);`; no non-test line
+      changed. `tests.rs::quarantined_or_busy(root, judged)` requires
+      exactly one attempt for the test's private root. It accepts `Moved`
+      with the judged template moved, or `Skipped("the store template key
+      lock is busy")` with the judged template still published and nothing
+      quarantined. Any other outcome fails. The three tests call it. In the
+      shape test the skip ends the test before its "next project builds
+      again" step, which needs the move.
+      `a_busy_key_lock_skips_the_quarantine_and_keeps_the_older_one` now
+      asserts the recorded `[Moved, Skipped(busy)]` sequence. The new
+      `quarantined_or_busy_accepts_only_the_designed_skip` exercises the
+      accept branch and two rejections (no attempt; a template that is not
+      the published one) deterministically.
+      Remedy (a), holding `locking_async()` across a direct
+      `MemoryStore::open`, was rejected. It serialises every sibling spawn
+      for the whole open, and an open that reaches a version probe would
+      wait on itself (6.2).
+- [x] 6.2 Name the cross-thread hang hazard and scan for it — verify with a
+      synthetic negative test and the real-tree scan.
+      Observed: the `spawn_gate.rs` module doc now says the holder is
+      matched by thread or task only. The version probes
+      (`provision::owned_probe`, `CheckedColdProbe::probe`) run
+      `engine::spawn` on their own thread and runtime, so a `locking`
+      holder that triggers a cold managed provision or a configured-binary
+      `provision` waits on itself. It also says that
+      `every_child_creation_takes_the_gate` is per function, not per span.
+      `no_spawn_guard_encloses_a_test_cache_warm_up` now delegates to
+      `warm_ups_under_guards`, which also tracks `spawn_gate::locking`
+      bindings: a warm-up under either guard, or a word-bounded
+      `provision(` under an exclusive guard, is reported. The new
+      `the_warm_up_scan_reports_calls_under_a_held_guard` shows it reports
+      lines 3, 8 and 9 of its sample and accepts the shared-guard
+      `provision(`, the `gated_provision(` name, and calls after `drop` or
+      outside the guard's scope. Real tree: "144 spawn guards and 52
+      exclusive guards scanned, 0 violations"; "20 child constructions
+      scanned, 0 ungated". `cargo test -p kuru-memory --lib spawn_gate`:
+      9 passed.
+- [x] 6.3 Record a further finding with the same mechanism, not fixed here —
+      verify by reading `create_in` and `creation_worker.rs`.
+      Observed [read]: on an empty private root, `create_in` takes the
+      shared key lock, inspects `Absent`, drops it, and tries the exclusive
+      lock without waiting (`creation_template.rs:1825`). `Ok(None)` returns
+      `Created::Unavailable(Busy)`, which `creation_worker.rs:165` turns
+      into a cold open. [inferred] A sibling's child holding a duplicate of
+      the dropped shared lock makes that upgrade busy. An open-path test
+      that asserts a build on an empty private root through
+      `spawn_gated_open` (for example both cases of
+      `failed_copy_after_the_build_fails_the_open_without_a_cold_retry`)
+      would then fail. CI history was not searched for this shape.
+      Accepting cold there would change what those tests test, so the
+      finding is recorded in
+      `tmp/roadmap/store-creation-design/diag-quarantine-structure.md` and
+      reported for separate routing. This change's "impossible" claim
+      covers the quarantine verdict only.
+- [x] 6.4 Verify the review round — record each check.
+      Observed (macOS host, this worktree): `format:check`,
+      `//packages/kuru-memory:lint`, `//packages/kuru-memory:lint:windows`
+      and `//packages/kuru-memory:typecheck` exit 0.
+      `RUST_TEST_THREADS=2 cargo test -p kuru-memory --lib --all-features
+      --locked store::creation_template`: 50 passed, 0 failed, 153.27 s,
+      before the new helper test was added; the new test and
+      `quarantine_is_bound_to_the_judged_template` then passed, 2/2.
+      `mise run //packages/kuru-memory:test` (full package task,
+      `RUST_TEST_THREADS=2`) on the final source bytes of this round, task
+      exit 0: unittests `src/lib.rs` ok, 647 passed, 0 failed, 6 ignored,
+      813.53 s; bundle_build 10, memory 5, server_lifecycle 12 (17.84 s),
+      supervisor_snapshot 1, and the 0-test binaries ok. No test reached
+      its deadline. This run shows no regression or deadlock; it cannot
+      force the cross-test race, so the skip branch is covered by the two
+      deterministic tests in 6.1.

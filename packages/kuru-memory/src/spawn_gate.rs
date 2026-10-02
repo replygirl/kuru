@@ -48,7 +48,31 @@
 //! from every sibling and does not wait. The scan test
 //! `every_child_creation_takes_the_gate` fails when a function constructs a
 //! child process without any guard. A spawn that bypasses the gate reopens
-//! the window that a lock taker's exclusive guard is meant to close.
+//! the window that a lock taker's exclusive guard is meant to close. That
+//! scan is per function, not per span: a gate token anywhere in the
+//! enclosing function body satisfies it, even a [`locking`] guard scoped to a
+//! block the spawn lies outside, so a reviewer still checks that each guard
+//! spans its spawn.
+//!
+//! The holder is matched by thread or by tokio task, and nothing else. The
+//! Dolt version probes (`provision::owned_probe` and
+//! `CheckedColdProbe::probe`) run `engine::spawn` on a thread of their own
+//! with its own runtime, which matches neither. A test that holds
+//! [`locking`]/[`locking_async`] while it triggers one therefore waits on
+//! itself until its deadline. Both a cold managed provision and
+//! `provision::provision` with a configured `dolt_binary` (which always
+//! probes) trigger one. Warm the cache before taking the exclusive guard;
+//! `no_spawn_guard_encloses_a_test_cache_warm_up` reports a warm-up or a
+//! `provision(` call written while a [`locking`] guard is held, as well as a
+//! warm-up under a [`spawning`] guard.
+//!
+//! Only a test holding the exclusive guard across the release and the next
+//! non-waiting try is excluded from every sibling child creation. A test that
+//! reaches such a try holding only a shared guard (an ordinary open through
+//! `test_support::spawn_gated_open`) is not, by design: shared holders do not
+//! exclude one another. A best-effort try there can still find a sibling's
+//! duplicate, and such a test accepts the designed outcome (for the template
+//! quarantine, `creation_template::tests::quarantined_or_busy`).
 //!
 //! This module is test-only and touches no production code path: it compiles
 //! only under `cfg(test)`, so it is a strict no-op on every platform,
@@ -493,11 +517,56 @@ mod tests {
     /// form that calls it) holds a shared guard while it provisions and
     /// builds. The gate is fair, so a first warm-up started under a caller's
     /// own guard, with a writer queued, would wait behind that writer while
-    /// the writer waits for the caller. Fixtures therefore warm before they
-    /// take a guard; this scan of the crate's sources finds a warm-up call
-    /// written while a guard bound in the same scope is still held.
+    /// the writer waits for the caller. A first warm-up under the caller's
+    /// exclusive guard waits for that guard itself. A `provision(` call under
+    /// the exclusive guard can run a version probe on its own thread, whose
+    /// child creation waits for that guard too (see the module doc).
+    /// Fixtures therefore warm before they take a guard; this scan of the
+    /// crate's sources finds a warm-up call written while a guard bound in
+    /// the same scope is still held, and a `provision(` call written while an
+    /// exclusive guard is.
     #[test]
     fn no_spawn_guard_encloses_a_test_cache_warm_up() {
+        let mut violations = Vec::new();
+        let (mut guards_seen, mut exclusive_seen) = (0, 0);
+        for file in &crate_sources() {
+            let source = code_only(&std::fs::read_to_string(file).unwrap());
+            let scanned = warm_ups_under_guards(&file.display().to_string(), &source);
+            guards_seen += scanned.spawning;
+            exclusive_seen += scanned.exclusive;
+            violations.extend(scanned.violations);
+        }
+        println!(
+            "{guards_seen} spawn guards and {exclusive_seen} exclusive guards scanned, {} \
+             violations",
+            violations.len()
+        );
+        assert!(
+            guards_seen > 50,
+            "the scan found only {guards_seen} spawn guards"
+        );
+        assert!(
+            exclusive_seen > 20,
+            "the scan found only {exclusive_seen} exclusive guards"
+        );
+        assert!(
+            violations.is_empty(),
+            "warm the test cache before taking a spawn guard:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// What [`warm_ups_under_guards`] found in one source.
+    struct WarmUpScan {
+        spawning: usize,
+        exclusive: usize,
+        violations: Vec<String>,
+    }
+
+    /// The warm-ups `source` (already passed through [`code_only`]) writes
+    /// while a guard bound by `let` in an enclosing scope is still held, and
+    /// the `provision(` calls it writes while an exclusive guard is.
+    fn warm_ups_under_guards(label: &str, source: &str) -> WarmUpScan {
         // Direct warm-ups, then the helpers that warm first.
         const WARM: [&str; 10] = [
             "warm_runtime_cache(",
@@ -511,68 +580,112 @@ mod tests {
             "spawn_logged_owner(",
             "cache_dir()",
         ];
-        let mut violations = Vec::new();
-        let mut guards_seen = 0;
-        for file in &crate_sources() {
-            let source = code_only(&std::fs::read_to_string(file).unwrap());
-            // (binding, brace depth, line) of each guard still held.
-            let mut held: Vec<(String, usize, usize)> = Vec::new();
-            let mut depth = 0usize;
-            let mut line = 1;
-            let bytes = source.as_bytes();
-            for (index, byte) in bytes.iter().enumerate() {
-                let rest = &source[index..];
-                match byte {
-                    b'\n' => line += 1,
-                    b'{' => depth += 1,
-                    b'}' => {
-                        depth = depth.saturating_sub(1);
-                        held.retain(|(_, at, _)| *at <= depth);
-                    }
-                    _ => {}
+        // Calls that can probe the engine version on a thread of its own,
+        // flagged under an exclusive guard only.
+        const PROBES: [&str; 1] = ["provision("];
+        let mut scan = WarmUpScan {
+            spawning: 0,
+            exclusive: 0,
+            violations: Vec::new(),
+        };
+        // (binding, brace depth, line, exclusive) of each guard still held.
+        let mut held: Vec<(String, usize, usize, bool)> = Vec::new();
+        let mut depth = 0usize;
+        let mut line = 1;
+        let bytes = source.as_bytes();
+        for (index, byte) in bytes.iter().enumerate() {
+            let rest = &source[index..];
+            match byte {
+                b'\n' => line += 1,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    held.retain(|(_, at, _, _)| *at <= depth);
                 }
-                if rest.starts_with("spawn_gate::spawning") {
-                    guards_seen += 1;
-                    let start = source[..index].rfind('\n').map_or(0, |at| at + 1);
-                    let prefix = source[start..index].trim_start();
-                    if let Some(binding) = prefix.strip_prefix("let ").and_then(|after| {
-                        after
-                            .split(|c: char| !c.is_alphanumeric() && c != '_')
-                            .next()
-                    }) {
-                        held.push((binding.to_owned(), depth, line));
-                    }
-                } else if let Some(after) = rest.strip_prefix("drop(") {
-                    let binding: String = after
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .collect();
-                    held.retain(|(name, _, _)| *name != binding);
-                } else if let Some(warm) = WARM.iter().find(|warm| rest.starts_with(*warm)) {
-                    let start = source[..index].rfind('\n').map_or(0, |at| at + 1);
-                    let defining = source[start..index].contains("fn ");
-                    if !defining && let Some((name, _, at)) = held.last() {
-                        violations.push(format!(
-                            "{}:{line}: {warm} while the spawn guard `{name}` from line {at} is held",
-                            file.display()
-                        ));
-                    }
+                _ => {}
+            }
+            let boundary = index == 0
+                || !(bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_');
+            let exclusive = rest.starts_with("spawn_gate::locking");
+            if exclusive || rest.starts_with("spawn_gate::spawning") {
+                if exclusive {
+                    scan.exclusive += 1;
+                } else {
+                    scan.spawning += 1;
+                }
+                let start = source[..index].rfind('\n').map_or(0, |at| at + 1);
+                let prefix = source[start..index].trim_start();
+                if let Some(binding) = prefix.strip_prefix("let ").and_then(|after| {
+                    after
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .next()
+                }) {
+                    held.push((binding.to_owned(), depth, line, exclusive));
+                }
+            } else if let Some(after) = rest.strip_prefix("drop(") {
+                let binding: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                held.retain(|(name, _, _, _)| *name != binding);
+            } else if let Some((call, probe)) = WARM
+                .iter()
+                .map(|warm| (warm, false))
+                .chain(PROBES.iter().map(|probe| (probe, true)))
+                .find(|&(call, probe)| rest.starts_with(*call) && (!probe || boundary))
+            {
+                let start = source[..index].rfind('\n').map_or(0, |at| at + 1);
+                let defining = source[start..index].contains("fn ");
+                let guard = held
+                    .iter()
+                    .rev()
+                    .find(|(_, _, _, exclusive)| *exclusive || !probe);
+                if !defining && let Some((name, _, at, exclusive)) = guard {
+                    let kind = if *exclusive { "exclusive" } else { "spawn" };
+                    scan.violations.push(format!(
+                        "{label}:{line}: {call} while the {kind} guard `{name}` from line {at} is held"
+                    ));
                 }
             }
         }
-        println!(
-            "{guards_seen} spawn guards scanned, {} violations",
-            violations.len()
-        );
-        assert!(
-            guards_seen > 50,
-            "the scan found only {guards_seen} spawn guards"
-        );
-        assert!(
-            violations.is_empty(),
-            "warm the test cache before taking a spawn guard:\n{}",
-            violations.join("\n")
-        );
+        scan
+    }
+
+    /// The warm-up scan reports a warm-up under either guard and a
+    /// `provision(` call under an exclusive guard, and accepts a
+    /// `provision(` call under a shared guard, a call whose name only ends
+    /// in `provision(`, and a call after the guard's drop or scope.
+    #[test]
+    fn the_warm_up_scan_reports_calls_under_a_held_guard() {
+        let source = code_only(concat!(
+            "async fn shared() {\n",
+            "    let _gate = crate::spawn_gate::spawning().await;\n",
+            "    crate::test_support::warm_runtime_cache().await;\n",
+            "    crate::provision::provision(&config, &cache).await;\n",
+            "}\n",
+            "async fn exclusive() {\n",
+            "    let gate = crate::spawn_gate::locking_async().await;\n",
+            "    let store = MemoryStore::temporary().await;\n",
+            "    crate::provision::provision(&config, &cache).await;\n",
+            "    gated_provision(&config).await;\n",
+            "    drop(gate);\n",
+            "    crate::provision::provision(&config, &cache).await;\n",
+            "    {\n",
+            "        let _scoped = crate::spawn_gate::locking();\n",
+            "    }\n",
+            "    crate::provision::provision(&config, &cache).await;\n",
+            "}\n",
+        ));
+        let scan = warm_ups_under_guards("src/sample.rs", &source);
+        assert_eq!((scan.spawning, scan.exclusive), (1, 2));
+        let lines: Vec<_> = scan
+            .violations
+            .iter()
+            .map(|violation| violation.split(':').nth(1).unwrap())
+            .collect();
+        assert_eq!(lines, ["3", "8", "9"], "{:?}", scan.violations);
+        assert!(scan.violations[0].contains("the spawn guard `_gate`"));
+        assert!(scan.violations[2].contains("provision( while the exclusive guard `gate`"));
     }
 
     /// Every Rust source file of this crate, sorted.
