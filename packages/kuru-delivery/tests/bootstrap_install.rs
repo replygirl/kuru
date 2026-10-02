@@ -15,6 +15,7 @@ use kuru_delivery::{
     archive::{TARGETS, archive_name, digest, package},
     shell_support,
 };
+use kuru_platform::unix::{observe_group_after_reap, snapshot};
 use tokio::process::Command;
 
 #[path = "support/bootstrap_process.rs"]
@@ -361,6 +362,19 @@ impl Drop for ProcessGroup {
     }
 }
 
+/// Listed processes that are this fixture's download producer: its ID and a
+/// command carrying the fixture's private root, which `CURL_FIXTURE` sets as
+/// the producer's argv[0]. A reused ID running anything else never matches.
+fn producer_listed(fixture: &Fixture, producer: &str) -> Vec<snapshot::ProcessRow> {
+    let producer: u32 = producer.trim().parse().unwrap();
+    let tag = fixture.path("producer").display().to_string();
+    snapshot::processes()
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.pid == producer && row.command.starts_with(&tag))
+        .collect()
+}
+
 fn signal(kind: &str, pid: &str) -> bool {
     std::process::Command::new("/bin/bash")
         .args(["-c", "kill \"$1\" -- \"$2\"", "fixture", kind, pid])
@@ -410,11 +424,11 @@ esac
 case ${FIXTURE_TRANSPORT:-ok} in
   block)
     printf '%s\n' "$$" > "$FIXTURE_ROOT/producer-ready"
-    exec /bin/sleep 60 ;;
+    exec -a "$FIXTURE_ROOT/producer" /bin/sleep 60 ;;
   overflow-hold)
     printf '%s\n' "$$" > "$FIXTURE_ROOT/producer-ready"
     printf '%65537s' ''
-    exec /bin/sleep 60 ;;
+    exec -a "$FIXTURE_ROOT/producer" /bin/sleep 60 ;;
   fail-after-data)
     cat "$asset"
     exit 22 ;;
@@ -897,6 +911,70 @@ exit 0
     }
 }
 
+/// A process group led by another user's process with no member of ours: what
+/// a reaped bootstrap's group number looks like once another user reuses it.
+fn foreign_group() -> u32 {
+    use kuru_platform::unix::own_uids;
+    use rustix::process::{Pid, test_kill_process_group};
+
+    let own = own_uids();
+    assert!(
+        !own.contains(&0),
+        "this check needs an unprivileged runner; uid 0 may signal every group"
+    );
+    let rows = snapshot::processes().unwrap();
+    let ours = |row: &snapshot::ProcessRow| own.contains(&row.uid) || own.contains(&row.ruid);
+    let mut answered = Vec::new();
+    for leader in rows.iter().filter(|row| row.pid > 1 && row.pid == row.pgid) {
+        if rows.iter().any(|row| row.pgid == leader.pgid && ours(row)) {
+            continue;
+        }
+        match test_kill_process_group(Pid::from_raw(leader.pgid as i32).unwrap()) {
+            Err(rustix::io::Errno::PERM) => return leader.pgid,
+            result => answered.push(format!("{}:{result:?}", leader.pgid)),
+        }
+    }
+    panic!("no foreign process group refused signal zero; candidates={answered:?}");
+}
+
+#[test]
+fn post_reap_query_accepts_a_group_recycled_by_another_user() {
+    use rustix::process::Pid;
+
+    // The numeric group the reaped root led now belongs only to another
+    // user's process, so signal zero is refused with EPERM.
+    let group = foreign_group();
+    let observed = bootstrap_process::post_reap_group(Pid::from_raw(group as i32).unwrap())
+        .unwrap_or_else(|error| panic!("recycled group {group} was rejected: {error}"));
+    assert!(observed.contains("recycled by another user"), "{observed}");
+}
+
+#[test]
+fn post_reap_query_rejects_a_live_group_of_ours_with_its_listing() {
+    use rustix::process::{Pid, Signal, kill_process_group};
+    use std::os::unix::process::CommandExt;
+
+    let mut root = std::process::Command::new("/bin/sleep")
+        .arg("43")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = Pid::from_raw(root.id() as i32).unwrap();
+    let observed = bootstrap_process::post_reap_group(pid);
+    // The unreaped root still anchors its group for this owned cleanup.
+    kill_process_group(pid, Signal::KILL).unwrap();
+    root.wait().unwrap();
+    let error = observed.expect_err("a live group of ours was accepted");
+    assert!(
+        error.contains("bootstrap left a surviving process group after natural exit"),
+        "{error}"
+    );
+    assert!(error.contains(&format!("pid={} ", root.id())), "{error}");
+}
+
 #[tokio::test]
 async fn argument_and_source_validation_precedes_download_or_replacement() {
     let fixture = Fixture::new(TARGETS[0], "0.2.0");
@@ -1113,9 +1191,11 @@ async fn manifest_and_archive_downloads_are_bounded_including_a_producer_that_st
     );
     fixture.unchanged();
     let producer = fs::read_to_string(fixture.path("producer-ready")).unwrap();
+    // The producer's ID alone is not its identity once the run has reaped.
+    let survivors = producer_listed(&fixture, &producer);
     assert!(
-        !signal("-0", producer.trim()),
-        "oversized producer survived cleanup"
+        survivors.is_empty(),
+        "oversized producer survived cleanup: {survivors:?}"
     );
 }
 
@@ -1206,7 +1286,21 @@ async fn sigterm_during_download_reaps_both_children_and_preserves_the_previous_
     })
     .await
     .expect("fixture never acknowledged the blocked download");
-    assert!(signal("-0", producer.trim()));
+    // The unreaped root anchors its group, so the producer's row in that
+    // group is its recorded identity for the post-reap check.
+    let producer: u32 = producer.trim().parse().unwrap();
+    let recorded: Vec<_> = snapshot::group_members(pid)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.pid == producer)
+        .collect();
+    assert_eq!(recorded.len(), 1, "producer is not live in group {pid}");
+    assert!(
+        recorded[0]
+            .command
+            .starts_with(&fixture.path("producer").display().to_string()),
+        "{recorded:?}"
+    );
     assert!(signal("-TERM", &pid.to_string()));
     let capture = fixture.capture(
         child,
@@ -1221,13 +1315,16 @@ async fn sigterm_during_download_reaps_both_children_and_preserves_the_previous_
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let survivors = snapshot::still_listed(&recorded).unwrap();
     assert!(
-        !signal("-0", producer.trim()),
-        "download producer survived SIGTERM"
+        survivors.is_empty(),
+        "download producer survived SIGTERM: {survivors:?}"
     );
+    // Read-only: the group is gone, or only another user's processes reuse it.
+    let group = observe_group_after_reap(pid);
     assert!(
-        !signal("-0", &format!("-{pid}")),
-        "bootstrap left a live child in group {pid}"
+        group.none_of_ours(),
+        "bootstrap left a live child in group {pid}: {group}"
     );
     fixture.unchanged();
 }

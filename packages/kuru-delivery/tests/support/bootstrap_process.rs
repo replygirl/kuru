@@ -8,9 +8,8 @@ use std::{
     time::Duration,
 };
 
-use rustix::process::{
-    Pid, Signal, WaitId, WaitIdOptions, kill_process_group, test_kill_process_group, waitid,
-};
+use kuru_platform::unix::{GroupObservation, observe_group_after_reap};
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, ChildStderr, ChildStdout},
@@ -229,21 +228,17 @@ impl Owner {
         if let Some(error) = &self.stderr.error {
             errors.push(format!("stderr: {error}"));
         }
+        let mut group = None;
         if !terminate && self.root_reaped {
-            // This is only an existence query. A recycled group can cause a
-            // conservative rejection, never authority to signal it. In
-            // particular, EPERM is not absence on either supported Unix OS.
-            match test_kill_process_group(self.pid) {
-                Err(rustix::io::Errno::SRCH) => {}
-                Ok(()) => errors
-                    .push("bootstrap left a surviving process group after natural exit".to_owned()),
-                Err(error) => errors.push(format!("post-reap process group query: {error}")),
+            match post_reap_group(self.pid) {
+                Ok(observation) => group = Some(observation),
+                Err(error) => errors.push(error),
             }
         }
         self.cleanup_observed =
             errors.is_empty() && self.root_reaped && self.stdout.eof && self.stderr.eof;
         let diagnostic = format!(
-            "cleanup={} root_reaped={} cleanup_stdout_eof={} cleanup_stderr_eof={} errors={errors:?}",
+            "cleanup={} root_reaped={} cleanup_stdout_eof={} cleanup_stderr_eof={} post_reap_group={group:?} errors={errors:?}",
             if self.cleanup_observed {
                 "observed"
             } else {
@@ -254,6 +249,27 @@ impl Owner {
             self.stderr.eof,
         );
         (status, diagnostic)
+    }
+}
+
+/// The read-only post-reap query of the bootstrap's former group.
+///
+/// Signal zero alone cannot answer it: once the root is reaped, another user's
+/// process may lead the same numeric group, and EPERM then says nothing about
+/// ours. Absence, or listed evidence that only another user's processes are in
+/// the group, passes and is returned for the diagnostic. A member of ours, or
+/// an unclassifiable group, fails with the listing. Nothing here signals.
+pub fn post_reap_group(pid: Pid) -> Result<String, String> {
+    match observe_group_after_reap(pid.as_raw_nonzero().get().unsigned_abs()) {
+        observed @ (GroupObservation::Absent | GroupObservation::Recycled(_)) => {
+            Ok(observed.to_string())
+        }
+        observed @ GroupObservation::Survivors(_) => Err(format!(
+            "bootstrap left a surviving process group after natural exit: {observed}"
+        )),
+        observed @ GroupObservation::Unobserved(_) => {
+            Err(format!("post-reap process group query: {observed}"))
+        }
     }
 }
 
