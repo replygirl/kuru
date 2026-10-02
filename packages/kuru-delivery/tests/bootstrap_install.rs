@@ -1322,7 +1322,7 @@ async fn sigterm_during_download_reaps_both_children_and_preserves_the_previous_
         survivors.is_empty(),
         "download producer survived SIGTERM: {survivors:?}"
     );
-    // Read-only: the group is gone, or only another user's processes reuse it.
+    // Read-only: the group is gone, or another user's new leader took its number.
     let group = observe_group_after_reap(pid);
     assert!(
         group.none_of_ours(),

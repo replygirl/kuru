@@ -387,7 +387,7 @@ async fn bounded_output_cleans_silent_descendant_before_reaping_successful_root(
     let group: i32 = fields.next().unwrap().parse().unwrap();
     assert!(fields.next().is_none());
     assert_eq!(root_pid, group);
-    // Read-only: the group is gone, or only another user's processes reuse it.
+    // Read-only: the group is gone, or another user's new leader took its number.
     let observed = observe_group_after_reap(group.unsigned_abs());
     assert!(observed.none_of_ours(), "{observed}");
 }

@@ -256,9 +256,11 @@ impl Owner {
 ///
 /// Signal zero alone cannot answer it: once the root is reaped, another user's
 /// process may lead the same numeric group, and EPERM then says nothing about
-/// ours. Absence, or listed evidence that only another user's processes are in
-/// the group, passes and is returned for the diagnostic. A member of ours, or
-/// an unclassifiable group, fails with the listing. Nothing here signals.
+/// ours. Absence, or listed evidence that only other users' processes are in
+/// the group and one of them is a new leader holding the group number, passes
+/// and is returned for the diagnostic. A member of ours, other users' members
+/// without that leader, or an unclassifiable group fails with the listing.
+/// Nothing here signals.
 pub fn post_reap_group(pid: Pid) -> Result<String, String> {
     match observe_group_after_reap(pid.as_raw_nonzero().get().unsigned_abs()) {
         observed @ (GroupObservation::Absent | GroupObservation::Recycled(_)) => {
