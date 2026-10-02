@@ -775,12 +775,18 @@ impl Installation {
             ensure!(
                 bytes.len() as u64 == asset[size].as_u64().context("engine size")?
                     && archive::digest(&bytes) == asset[hash].as_str().context("engine digest")?,
-                "mise-installed engine {name} differs from embedded manifest"
+                "warm-up-provisioned engine {name}, which the installed binary verified, \
+                 differs from embedded manifest"
             );
         }
-        // A built engine also ships each pinned third-party notice it lists.
+        // The test process's warm-up extracted these bytes and the installed
+        // binary verified them in place; each pinned third-party notice the
+        // engine lists is among them.
         published_windows::verify_engine_notices(asset, |name| Ok(fs::read(engine.join(name))?))
-            .context("mise-installed engine notices differ from embedded manifest")?;
+            .context(
+                "warm-up-provisioned engine notices, which the installed binary verified, \
+                 differ from embedded manifest",
+            )?;
         // Every launch copied the warmed template: none built, replaced,
         // quarantined or keyed another, and the store records this key.
         receipt

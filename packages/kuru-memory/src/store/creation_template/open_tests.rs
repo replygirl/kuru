@@ -448,6 +448,31 @@ async fn fixture_cache_receipt_names_what_changed() -> Result<()> {
         ensure!(text.contains(&format!("{build}: built")), "{text}");
         fs::remove_dir(root.join(&build))?;
         receipt.verify_used()?;
+        // A republished template keeps its name, so no entry is added or
+        // missing: only the published directory's identity tells.
+        fn copy_tree(source: &Path, target: &Path) -> Result<()> {
+            files::private_dir(target)?;
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                let destination = target.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    copy_tree(&entry.path(), &destination)?;
+                } else {
+                    fs::copy(entry.path(), destination)?;
+                }
+            }
+            Ok(())
+        }
+        let copy = root.join(format!(".copy-{}-planted", key()));
+        copy_tree(&root.join(key()), &copy)?;
+        fs::remove_dir_all(root.join(key()))?;
+        fs::rename(&copy, root.join(key()))?;
+        let text = changed("a republished template")?;
+        ensure!(
+            text.contains(&format!("{}: republished, so built", key()))
+                && !text.contains("is missing"),
+            "{text}"
+        );
         let rejected = format!(".rejected-{}-planted", key());
         fs::rename(root.join(key()), root.join(&rejected))?;
         let text = changed(&rejected)?;
