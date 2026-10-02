@@ -9,8 +9,8 @@ Work in `tmp/worktrees/feat-readiness-owner-timeline` (branch `feat/readiness-ow
 
 ## 2. Red tests
 
-- [ ] 2.1 Add T3 `service::tests::owner_timeline_clause_text_is_stable` against a stub clause, and verify it fails on its exact-text assertion, with the message recorded in the commit body.
-- [ ] 2.2 Add T4 `service::tests::readiness_deadline_names_the_owner_event_it_was_held_at` (Unix, real owner) with the `create-start` FIFO hold, and verify it fails at its inhibitor's bound with the "never reached the create-start hold" diagnostic, recorded in the commit body.
+- [x] 2.1 Add T3 `service::tests::owner_timeline_clause_text_is_stable` against a stub clause, and verify it fails on its exact-text assertion, with the message recorded in the commit body. Observed 2026-10-02 (macOS arm64): `//packages/kuru-memory:test -- --lib -- owner_timeline_clause_text_is_stable` FAILED at `service.rs:3069` `assertion left == right failed`, left `Some("")`, right the exact clause.
+- [x] 2.2 Add T4 `service::tests::readiness_deadline_names_the_owner_event_it_was_held_at` (Unix, real owner) with the `create-start` FIFO hold, and verify it fails at its inhibitor's bound with the "never reached the create-start hold" diagnostic, recorded in the commit body. Observed 2026-10-02 (macOS arm64): FAILED with `Error: the owner never reached the create-start hold within 30 s (no timeline hold hook, or the owner stopped before it)`; the two-test run finished in 30.40 s and left no owner process.
 
 ## 3. Owner stream and events (`open_timeline.rs`, `service.rs`, `store.rs`, `provision.rs`, `server.rs` stamps)
 

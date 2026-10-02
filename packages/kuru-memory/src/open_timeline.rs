@@ -146,6 +146,25 @@ pub(crate) fn installed() -> Option<&'static Timeline> {
     INSTALLED.get()
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// One test's own starter-side gate, so an in-process starter is gated
+    /// or ungated without touching the runner's environment.
+    static GATE_OVERRIDE: bool;
+}
+
+/// Run `f` with this test's starter-side gate set to `gated`.
+#[cfg(test)]
+pub(crate) fn with_gate_sync<R>(gated: bool, f: impl FnOnce() -> R) -> R {
+    GATE_OVERRIDE.sync_scope(gated, f)
+}
+
+/// Run `future` with this test's starter-side gate set to `gated`.
+#[cfg(all(test, unix))]
+pub(crate) async fn with_gate<F: std::future::Future>(gated: bool, future: F) -> F::Output {
+    GATE_OVERRIDE.scope(gated, future).await
+}
+
 pub(crate) struct Timeline {
     anchor: Instant,
     anchor_unix_ns: u64,

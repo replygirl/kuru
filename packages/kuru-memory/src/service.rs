@@ -522,6 +522,19 @@ impl std::fmt::Display for ReadinessSplit {
     }
 }
 
+/// Red-test stub for the gated starter's owner timeline clause; the
+/// implementation replaces it in the next commit.
+#[cfg(test)]
+fn owner_timeline_clause(
+    _data_dir: &Path,
+    _scope: &str,
+    _tag: &str,
+    _spawn_called: std::time::SystemTime,
+    _now: std::time::SystemTime,
+) -> Option<String> {
+    Some(String::new())
+}
+
 /// Attach to a valid owner, or elect and start one while retaining a distinct
 /// short start lock. Endpoint readiness is the authenticated private handshake;
 /// the child holds the owner lock before publishing it. `progress` receives
@@ -3004,6 +3017,125 @@ mod tests {
         assert_eq!(AttachMiss::PeerClosed.as_str(), "peer-closed");
     }
 
+    /// The owner timeline clause a gated starter adds at its readiness
+    /// deadline, from its own owner's stream file only. Its text is what
+    /// the developer documentation reads the owner phase from.
+    #[test]
+    fn owner_timeline_clause_text_is_stable() -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        const MS: u64 = 1_000_000;
+        const MAIN_UNIX: u64 = 1_700_000_000_000_000_000;
+        const CREATE_START: u64 = 9_930_123_456;
+        let at = |ns: u64| UNIX_EPOCH + Duration::from_nanos(ns);
+        let root = crate::test_support::tempdir()?;
+        let data = root.path().join("private");
+        let hash = "0123456789abcdef".repeat(4);
+        let scope = format!("project/{hash}");
+        let directory = EndpointRecord::directory(&data, &scope)?;
+        crate::files::ensure_private_directory(&directory)?;
+        let token = uuid::Uuid::new_v4();
+        let tag = activity::activity_tag(&token);
+        let stream = directory.join(format!("open-stream-{tag}"));
+        // Another owner's stream, which this starter must never read.
+        crate::files::write(
+            &directory.join(format!(
+                "open-stream-{}",
+                activity::activity_tag(&uuid::Uuid::new_v4())
+            )),
+            format!(
+                "owner-main 0 {MAIN_UNIX}\nsupervisor-spawned {MS} {}\n",
+                MAIN_UNIX + MS
+            )
+            .as_bytes(),
+        )?;
+        let lines = format!(
+            "owner-main 0 {MAIN_UNIX}\n\
+             owner-lock 3400000 {}\n\
+             startup-lock 4900000 {}\n\
+             create-start {CREATE_START} {}\n",
+            MAIN_UNIX + 3_400_000,
+            MAIN_UNIX + 4_900_000,
+            MAIN_UNIX + CREATE_START,
+        );
+        // Spawned 812.5 ms before the owner's first stamp; read 20070.9 ms
+        // after its last.
+        let spawned = at(MAIN_UNIX - 812_500_000);
+        let now = at(MAIN_UNIX + CREATE_START + 20_070 * MS + 900_000);
+        let gated = |spawned: SystemTime| {
+            open_timeline::with_gate_sync(true, || {
+                owner_timeline_clause(&data, &scope, &tag, spawned, now)
+            })
+        };
+        let expected = "owner timeline: owner-exec=812ms; owner-main=0 owner-lock=3 startup-lock=4 create-start=9930 (ms); last=create-start +9930ms; since-last=20070ms";
+
+        crate::files::write(&stream, lines.as_bytes())?;
+        let clause = gated(spawned);
+        assert_eq!(clause.as_deref(), Some(expected));
+        let clause = clause.unwrap_or_default();
+        for private in [
+            tag.as_str(),
+            hash.as_str(),
+            &token.to_string(),
+            &data.display().to_string(),
+        ] {
+            assert!(
+                !clause.contains(private),
+                "the clause carries a private value: {clause}"
+            );
+        }
+
+        // A trailing partial line is still being written: ignored, uncounted.
+        crate::files::write(&stream, format!("{lines}supervisor-spawned 99").as_bytes())?;
+        assert_eq!(gated(spawned).as_deref(), Some(expected));
+
+        // Malformed complete lines are counted, never named.
+        crate::files::write(
+            &stream,
+            format!(
+                "Owner-Lock 1 2\nowner-lock x 3\n{lines}migrate-start 1\n\
+                 a-name-longer-than-thirty-two-bytes 1 2\n"
+            )
+            .as_bytes(),
+        )?;
+        assert_eq!(
+            gated(spawned).as_deref(),
+            Some(format!("{expected}; skipped=4").as_str())
+        );
+
+        // Created, with no complete line yet.
+        crate::files::write(&stream, b"owner-ma")?;
+        assert_eq!(gated(spawned).as_deref(), Some("owner timeline: empty"));
+
+        // A predecessor's file with this tag: its first stamp precedes this
+        // starter's spawn.
+        crate::files::write(&stream, lines.as_bytes())?;
+        assert_eq!(
+            gated(at(MAIN_UNIX + 1)).as_deref(),
+            Some("owner timeline: stale")
+        );
+
+        // Over the 8 KiB read limit.
+        crate::files::write(&stream, "x".repeat(8 * 1024 + 1).as_bytes())?;
+        assert_eq!(
+            gated(spawned).as_deref(),
+            Some("owner timeline: unreadable")
+        );
+
+        // An ungated starter reads nothing and adds no clause, whatever the
+        // runner's own environment holds.
+        crate::files::write(&stream, lines.as_bytes())?;
+        assert_eq!(
+            open_timeline::with_gate_sync(false, || {
+                owner_timeline_clause(&data, &scope, &tag, spawned, now)
+            }),
+            None
+        );
+
+        std::fs::remove_file(&stream)?;
+        assert_eq!(gated(spawned).as_deref(), Some("owner timeline: absent"));
+        Ok(())
+    }
+
     /// The failure of a launched owner that stays alive without publishing
     /// an endpoint until the lowered startup bound expires in the readiness
     /// loop, with its parsed client phase split.
@@ -3369,6 +3501,240 @@ mod tests {
         endpoint.retire(&data, &owner)?;
         owner.release()?;
         Ok(())
+    }
+
+    /// The test-support owner event hold's directory variable.
+    #[cfg(unix)]
+    const TIMELINE_HOLD_DIR_ENV: &str = "KURU_TEST_MEMORY_TIMELINE_HOLD_DIR";
+
+    /// One owner event hold: `<event>.entered` and `<event>.release` fifos in
+    /// the hold directory, each opened here read-write and non-blocking, so
+    /// the owner's non-blocking opens find a peer and neither end reports a
+    /// hang-up while this test holds them.
+    #[cfg(unix)]
+    struct EventHold {
+        event: &'static str,
+        entered: std::os::fd::OwnedFd,
+        release: std::os::fd::OwnedFd,
+    }
+
+    #[cfg(unix)]
+    impl EventHold {
+        fn create(directory: &Path, event: &'static str) -> Result<Self> {
+            let fifo = |suffix: &str| -> Result<std::os::fd::OwnedFd> {
+                let path = directory.join(format!("{event}.{suffix}"));
+                nix::unistd::mkfifo(
+                    &path,
+                    nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                )?;
+                Ok(nix::fcntl::open(
+                    &path,
+                    nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NONBLOCK,
+                    nix::sys::stat::Mode::empty(),
+                )?)
+            };
+            Ok(Self {
+                event,
+                entered: fifo("entered")?,
+                release: fifo("release")?,
+            })
+        }
+
+        /// A blocking wait, on its own handle, for the owner's one entered
+        /// byte, bounded by `bound` on the real clock.
+        fn entered_waiter(&self, bound: Duration) -> Result<impl FnOnce() -> Result<()> + use<>> {
+            let (event, entered) = (self.event, self.entered.try_clone()?);
+            Ok(move || {
+                use std::os::fd::AsFd as _;
+                let deadline = std::time::Instant::now() + bound;
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let timeout = nix::poll::PollTimeout::try_from(remaining)
+                        .unwrap_or(nix::poll::PollTimeout::MAX);
+                    let mut fds = [nix::poll::PollFd::new(
+                        entered.as_fd(),
+                        nix::poll::PollFlags::POLLIN,
+                    )];
+                    match nix::poll::poll(&mut fds, timeout) {
+                        Ok(0) => bail!(
+                            "the owner never reached the {event} hold within {} s (no timeline hold hook, or the owner stopped before it)",
+                            bound.as_secs()
+                        ),
+                        Ok(_) => break,
+                        // Interrupted, not expired: wait out the remainder.
+                        Err(nix::errno::Errno::EINTR) => {}
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("poll the {event} entered fifo"));
+                        }
+                    }
+                }
+                let mut byte = [0_u8; 1];
+                nix::unistd::read(&entered, &mut byte)
+                    .with_context(|| format!("read the {event} entered byte"))?;
+                Ok(())
+            })
+        }
+
+        fn release(&self) -> Result<()> {
+            nix::unistd::write(&self.release, b"r")
+                .with_context(|| format!("release the {} hold", self.event))?;
+            Ok(())
+        }
+    }
+
+    /// A gated starter whose real gated owner is held right after streaming
+    /// `create-start` reaches its default readiness deadline and names that
+    /// event as the owner's last.
+    ///
+    /// The client clock is paused only after the real-clock setup. A
+    /// blocking task waiting for the owner's entered byte is spawned before
+    /// the open is first polled; while it runs the paused clock cannot
+    /// auto-advance, so the starter's poll sleeps cannot reach the deadline
+    /// before the owner has streamed `create-start`. Its bound is the
+    /// configured startup budget on the real clock: reaching `create-start`
+    /// is a strict prefix of the open the product requires within that
+    /// budget. Afterwards virtual time runs to the deadline while the owner
+    /// stays held. `owner-exec` and `since-last` are real-clock differences
+    /// while the client phases are virtual, so only their presence is
+    /// asserted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_deadline_names_the_owner_event_it_was_held_at() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        let root = crate::test_support::tempdir()?;
+        let (project, scope, data, mut options) = owner_fixture(root.path())?;
+        let executable = options
+            .supervisor
+            .clone()
+            .context("fixture supervisor absent")?;
+        let token = uuid::Uuid::new_v4();
+        options.starter_token = Some(token);
+        let budget = Duration::from_secs(options.config.startup_timeout_secs);
+        let holds = root.path().join("holds");
+        std::fs::create_dir(&holds)?;
+        let held = EventHold::create(&holds, "create-start")?;
+        // Released ahead, so the owner passes it at once and only signals
+        // that its endpoint is published.
+        let published = EventHold::create(&holds, "endpoint-published")?;
+        published.release()?;
+        let environment = vec![
+            (OsString::from(open_timeline::ENV), OsString::from("1")),
+            (
+                OsString::from(TIMELINE_HOLD_DIR_ENV),
+                holds.clone().into_os_string(),
+            ),
+        ];
+        let reached_hold = held.entered_waiter(budget)?;
+
+        // Held across the owner spawn; see `crate::spawn_gate`.
+        let spawn_gate = crate::spawn_gate::spawning().await;
+        tokio::time::pause();
+        let inhibitor = tokio::task::spawn_blocking(reached_hold);
+        let (outcome, reached) = activity::with_owner_environment(
+            environment,
+            open_timeline::with_gate(true, async {
+                tokio::join!(attach_or_start(&options, &project, &executable), async {
+                    let reached = inhibitor
+                        .await
+                        .context("the hold waiter panicked")
+                        .and_then(|reached| reached);
+                    // Never handshake under a paused clock once the hold
+                    // was missed.
+                    if reached.is_err() {
+                        tokio::time::resume();
+                    }
+                    reached
+                })
+            }),
+        )
+        .await;
+        if reached.is_ok() {
+            tokio::time::resume();
+        }
+        drop(spawn_gate);
+
+        let verdict = (|| -> Result<()> {
+            reached
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            let error = outcome
+                .as_ref()
+                .err()
+                .context("an owner held at create-start was reported ready")?;
+            let rendered = format!("{error:#}");
+            ensure!(
+                rendered.starts_with("memory service readiness deadline exceeded"),
+                "readiness failure lost its leading text: {rendered}"
+            );
+            let (_, clause) = rendered
+                .split_once("owner timeline: ")
+                .with_context(|| format!("the deadline lacks the owner timeline: {rendered}"))?;
+            let (clause, split) = clause.split_once("; client phases: ").with_context(|| {
+                format!("the owner timeline precedes no client split: {rendered}")
+            })?;
+            let fields: Vec<&str> = clause.split("; ").collect();
+            ensure!(
+                fields.iter().any(|field| field.starts_with("owner-exec=")),
+                "the owner timeline lacks owner-exec: {rendered}"
+            );
+            ensure!(
+                fields
+                    .iter()
+                    .any(|field| field.starts_with("last=create-start ")),
+                "the owner timeline does not end at create-start: {rendered}"
+            );
+            let events: Vec<&str> = fields
+                .iter()
+                .find_map(|field| field.strip_suffix(" (ms)"))
+                .with_context(|| format!("the owner timeline lists no events: {rendered}"))?
+                .split(' ')
+                .filter_map(|event| event.split_once('=').map(|(name, _)| name))
+                .collect();
+            let position = |name: &str| events.iter().position(|event| *event == name);
+            let order = ["owner-main", "owner-lock", "startup-lock", "create-start"].map(position);
+            ensure!(
+                order.iter().all(Option::is_some) && order.is_sorted(),
+                "the owner timeline lacks the held prefix in order: {rendered}"
+            );
+            ensure!(
+                !clause.contains("supervisor-spawned"),
+                "a held owner streamed an engine start: {rendered}"
+            );
+            let split: std::collections::BTreeMap<&str, &str> = split
+                .split("; ")
+                .filter_map(|field| field.split_once('='))
+                .collect();
+            ensure!(
+                split.get("child") == Some(&"running")
+                    && split.get("last-attach") == Some(&"no-endpoint")
+                    && split.contains_key("readiness"),
+                "the client split no longer parses: {rendered}"
+            );
+            Ok(())
+        })();
+
+        // Cleanup on every path, on the real clock.
+        held.release()?;
+        let attachment = outcome.ok();
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        let cleanup = tokio::time::timeout(deadline, async {
+            if reached.is_ok() {
+                // The owner signals this hold only after publishing its
+                // endpoint; its starter attaches so it closes at once.
+                let bound = crate::test_support::fresh_open_budget();
+                tokio::task::spawn_blocking(published.entered_waiter(bound)?).await??;
+                drop(attach_raw(&data, &scope, Some(token)).await?);
+                await_owner_release(&options).await?;
+            }
+            drop(attachment);
+            crate::test_support::await_managed_quiescence(&options).await
+        })
+        .await
+        .with_context(|| format!("held-owner cleanup exceeded its {deadline:?} deadline"))
+        .and_then(|retired| retired.context("retire the held owner"));
+        // The verdict first: on a missed hold it carries the diagnostic.
+        verdict.and(cleanup)
     }
 
     #[tokio::test]
