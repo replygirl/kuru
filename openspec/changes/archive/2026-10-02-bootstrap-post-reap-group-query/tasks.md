@@ -14,7 +14,7 @@
 ## 3. Test identity
 
 - [x] 3.1 Replace the bootstrap capture cleanup query with `post_reap_group`, and verify the regression test against a real foreign-uid process group passes (and fails on the pre-fix query, which returns `EPERM`)
-- [x] 3.2 Replace numeric post-reap checks in `bootstrap_install.rs` (producer and group), `advisory.rs`, `coverage.rs`, `hooks.rs` and `kuru-runtime` `review_tests.rs` with listed evidence or recorded `(pid, command)` rows, and verify no `kill -0` / signal-zero-only post-reap assertion remains by grep
+- [x] 3.2 Replace numeric post-reap checks in `bootstrap_install.rs` (producer and group), `advisory.rs`, `coverage.rs`, `hooks.rs` and `kuru-runtime` `review_tests.rs` with listed evidence, recorded `(pid, command)` rows or, for the runtime's directly owned shell, a listed `(pid, ppid = test process)` row that also catches an unreaped zombie, and verify no `kill -0` / signal-zero-only post-reap assertion remains by grep
 
 ## 4. Verification
 

@@ -23,11 +23,12 @@ available and is not claimed.
 
 - [x] 4.1 @integration (agent) `bootstrap_install` producer tests (`manifest_and_archive_downloads_are_bounded_including_a_producer_that_stays_open`, `sigterm_during_download_reaps_both_children_and_preserves_the_previous_binary`) -> observed: both `ok` (bootstrap_install.rs:1157, 1268), using the `exec -a "$FIXTURE_ROOT/producer"` tag (verified to appear in `ps -o args=` with macOS `/bin/bash` 3.2.57) and recorded group rows
 - [x] 4.2 @integration (agent) `review_tests::cancelled_shell_turn_reaps_the_observed_owned_process_without_replay` and `hooks::tests::cancellation_awaits_reaping_the_started_owned_hook_tree` -> observed: `ok` in `mise run //packages/kuru-runtime:test -- cancelled_shell_turn` and `mise run //packages/kuru-connectors:test` (packages/kuru-runtime/src/review_tests.rs:771, packages/kuru-connectors/src/hooks.rs:1765)
+- [x] 4.3 @unit (agent) `unix_snapshot::an_unreaped_child_is_listed_under_its_parent_but_not_as_its_recorded_row` -> observed: `ok`; a killed, unreaped direct child is listed with `ppid` = the test process and state `Z`, while `still_listed` on its recorded running row is empty, and no `(pid, ppid)` row remains after reaping (packages/kuru-platform/tests/unix_snapshot.rs:227). Measured on macOS 27 with a perl fork probe: the unreaped child's row reads `<pid> <parent> ... Z 0:00.00 0 <defunct>`. The runtime shell check therefore keys on `(pid, ppid)` (packages/kuru-runtime/src/review_tests.rs:868-887) and needs no readiness poll for the exec'd command
 
 ## 5. Static and package checks
 
 - [x] 5.1 @integration (agent) `mise run //packages/kuru-platform:test` -> observed: exit 0, no failures
 - [x] 5.2 @integration (agent) `mise run //packages/kuru-delivery:test` -> observed: exit 0, no failures (lib 195 passed)
-- [x] 5.3 @integration (agent) `mise run //packages/kuru-connectors:test` (297 passed, exit 0) and `mise run //packages/kuru-runtime:test -- cancelled_shell_turn` (1 passed, exit 0) -> observed: pass; the full runtime suite was not run because only this test changed there
+- [x] 5.3 @integration (agent) `mise run //packages/kuru-connectors:test` (297 passed, exit 0) and `mise run //packages/kuru-runtime:test` (220 passed, exit 0, after the `(pid, ppid)` shell check) -> observed: pass
 - [x] 5.4 @integration (agent) `mise run format:check`, `mise run lint`, `mise run lint:windows`, `mise run typecheck`, `mise run lint:tooling` -> observed: each exit 0; hk pre-commit format, tooling and conventional steps passed on each commit
 - [~] 5.5 @runtime (agent) CI macOS coverage partition on the PR -> defer: no PR or CI run exists for this branch yet; it must pass before merge

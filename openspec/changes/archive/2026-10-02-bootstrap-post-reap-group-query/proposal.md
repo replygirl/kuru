@@ -51,7 +51,11 @@ our own concurrent test processes fails the single-pid checks the other way.
 - Test sites stop treating numeric IDs as identity: the bootstrap capture
   cleanup, delivery `advisory` and coverage tests, the hook group helper, the
   bootstrap producer checks (recorded `(pid, command)` rows or a per-fixture
-  `exec -a` command tag) and the runtime owned-shell shutdown check.
+  `exec -a` command tag) and the runtime owned-shell shutdown check. The
+  owned shell is the test process's direct child, so after `ESRCH` is not
+  returned it remains exactly while a fresh listing shows its ID under this
+  parent, running or as an unreaped zombie; a recorded `(pid, command)` row
+  would miss the zombie, whose arguments `ps` no longer prints.
 - Nothing here authorizes a signal: every new path is signal zero or `ps`.
 
 ### Decision: `EPERM` followed by an empty listing is `Absent`
