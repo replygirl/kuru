@@ -20,10 +20,12 @@ file (rust-lang/rust#114554). A retry or wider bound would only hide it.
   for that child to exit before using the file. The test process never opens a
   write descriptor to the stand-in, so no concurrently forked sibling can
   inherit one.
-- On Linux and macOS the test then scans the process's own descriptor table
-  (`/proc/self/fd`, `/dev/fd`) and asserts that none refers to the stand-in's
-  device and inode, which pins the invariant the fix relies on. The comment
-  records why creation must not go through a descriptor held here.
+- On Linux only, the test then scans the process's own descriptor table
+  (`/proc/self/fd`) and asserts that none refers to the stand-in's device and
+  inode, which pins the invariant the fix relies on. The scan is compiled out
+  elsewhere: macOS does not enforce ETXTBSY, and its `/dev/fd` entries report a
+  different device than the file. The comment records why creation must not go
+  through a descriptor held here.
 - A control test inherits a write descriptor into a live child with safe
   `Stdio` plumbing and shows that exec of the file is refused while the child
   holds it, so the mechanism is demonstrated rather than only described. It is
