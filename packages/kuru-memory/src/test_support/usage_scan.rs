@@ -2,8 +2,8 @@
 //! growth assertion CI runs (`usage-scan-scaling` in `ci.yml`).
 //!
 //! It is a measurement aid, compiled only with test support on Unix, where
-//! a spawned owner inherits `KURU_OPEN_TIMELINE`; the timeline is inert on
-//! Windows. Two subcommands of this package's own binary reach it:
+//! a spawned owner inherits `KURU_OPEN_TIMELINE` from the measuring task.
+//! Two subcommands of this package's own binary reach it:
 //!
 //! - `usage-scan-fixture create|seal` (`measure:usage-scan:fixture`): create
 //!   one empty project store per size with one ungated owner open, and seal

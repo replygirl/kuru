@@ -155,8 +155,11 @@ impl Sandbox {
             ("TERM".into(), "xterm-256color".into()),
             ("COLORTERM".into(), "truecolor".into()),
         ]);
-        if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
-            environment.insert("LLVM_PROFILE_FILE".into(), profile);
+        // The owner open timeline gate travels with the coverage destination.
+        for key in ["LLVM_PROFILE_FILE", "KURU_OPEN_TIMELINE"] {
+            if let Ok(value) = std::env::var(key) {
+                environment.insert(key.into(), value);
+            }
         }
         let startup =
             Duration::from_secs((configuration.memory.startup_timeout_secs + 5) * 2 + 13) + READY;
