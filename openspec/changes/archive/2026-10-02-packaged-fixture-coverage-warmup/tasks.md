@@ -79,7 +79,7 @@
       the only direct evidence available before CI.
 - [x] 3.3 Run `mise run //apps/kuru-tui:lint`, `format:check`, `typecheck`,
       and `docs:check`; record pass/fail for each.
-- [ ] 3.4 Name explicitly as unrun until this PR's own CI: windows-latest
+- [x] 3.4 Name explicitly as unrun until this PR's own CI: windows-latest
       coverage partitions green with no rerun, and the Installation job on
       every OS still printing `cold` — both observed from the PR's CI run,
       not manufactured locally.
@@ -145,6 +145,22 @@
 - 3.3: `mise run //apps/kuru-tui:typecheck` exit 0; `mise run
   //apps/kuru-tui:lint` exit 0; `mise run //apps/kuru-tui:lint:windows`
   exit 0; `mise run format:check` exit 0; `mise run docs:check` exit 0.
-- 3.4: unrun locally (by definition): windows-latest coverage partitions
-  green without a rerun, and the Installation job on every OS printing the
-  `cold` line; both to be observed from this PR's CI.
+- 3.4 (observed from PR #173's CI run 36992238354, head commit
+  c70ec5dac76e46171d0cf0cb9ea2b0de604c4fb4, no rerun): all eight
+  `native-tests (windows-latest) / Coverage partition` jobs passed. The
+  previously red test, `packaged_install_and_update_preserve_complete_offline_memory`,
+  ran in `windows-latest` coverage partition 2 (job 110791111140) and printed
+  `test packaged_install_and_update_preserve_complete_offline_memory ... ok`
+  (121.19s), not the prior `memory service readiness deadline exceeded`
+  failure; the test's own stdout lines were not captured for the passing
+  run (consistent with 3.2's note that `--nocapture` output is rejected
+  under a real coverage run). Every `Installation, offline runtime and
+  update` job printed the `cold` first-launch line unchanged: macOS (job
+  110791110751) `embedded_runtime first launch (cold, KURU_EMBEDDED_TEST_BINARY
+  executable): 7366 ms [direct]` / `8605 ms [updated]`; windows-11-arm (job
+  110791353845) `10507 ms [direct]` / `10299 ms [updated]`; windows-latest
+  (job 110791110854) `13979 ms [direct]` / `12003 ms [updated]`; ubuntu-latest
+  (job 110791110909) `3947 ms [direct]` / `4755 ms [updated]`. `gh pr checks
+  173` confirms the run's `head_sha` equals the PR head and every job in it
+  is `pass` or an expected `skipping` (the unrelated dolt-windows-arm64
+  lane).
