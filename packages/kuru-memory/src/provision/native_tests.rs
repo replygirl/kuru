@@ -14,7 +14,7 @@ const NOTICES: &[u8] = b"exact upstream notice fixture";
 /// [`cache_lock`], serialised against this lib's own spawning fixtures; see
 /// `crate::spawn_gate`. A single choke point so every real-cache-lock test
 /// below is covered without gating each call site by hand.
-async fn gated_cache_lock(directory: &Path, timeout: Duration) -> Result<CacheLock> {
+pub(super) async fn gated_cache_lock(directory: &Path, timeout: Duration) -> Result<CacheLock> {
     let _gate = crate::spawn_gate::locking_async().await;
     cache_lock(directory, timeout).await
 }
@@ -48,6 +48,8 @@ struct RetainedStageFields {
     message: String,
     stage: String,
     published: Option<bool>,
+    first_cause: String,
+    os_error: Option<i64>,
 }
 
 impl tracing::field::Visit for RetainedStageFields {
@@ -57,10 +59,17 @@ impl tracing::field::Visit for RetainedStageFields {
         }
     }
 
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        if field.name() == "os_error" {
+            self.os_error = Some(value);
+        }
+    }
+
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         match field.name() {
             "message" => self.message = format!("{value:?}"),
             "stage" => self.stage = format!("{value:?}"),
+            "first_cause" => self.first_cause = format!("{value:?}"),
             _ => {}
         }
     }
@@ -68,9 +77,17 @@ impl tracing::field::Visit for RetainedStageFields {
 
 type RetainedStageObserverFn = std::sync::Arc<dyn Fn(&RetainedStageFields) + Send + Sync>;
 
+/// The message prefix of every retained-stage diagnostic.
+const RETAINED_STAGE_PREFIX: &str = "retained private install stage";
+/// The message prefix of every leftover-collection diagnostic: a kept
+/// receipts folder, a skipped warm sweep and an unrecorded refusal.
+const LEFTOVER_RECORD_PREFIX: &str = "leftover install stage";
+
 struct RetainedStageObserverEntry {
     id: u64,
     scope: PathBuf,
+    /// Only events whose message starts with this prefix reach the observer.
+    prefix: &'static str,
     observer: RetainedStageObserverFn,
 }
 
@@ -120,7 +137,10 @@ impl tracing::Subscriber for RetainedStageRecorder {
         }
         let mut fields = RetainedStageFields::default();
         event.record(&mut fields);
-        if !fields.message.starts_with("retained private install stage") {
+        if ![RETAINED_STAGE_PREFIX, LEFTOVER_RECORD_PREFIX]
+            .iter()
+            .any(|prefix| fields.message.starts_with(prefix))
+        {
             return;
         }
         // Run the observers outside the registry lock: they inspect the
@@ -130,7 +150,9 @@ impl tracing::Subscriber for RetainedStageRecorder {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .filter(|entry| stage.starts_with(&entry.scope))
+            .filter(|entry| {
+                stage.starts_with(&entry.scope) && fields.message.starts_with(entry.prefix)
+            })
             .map(|entry| std::sync::Arc::clone(&entry.observer))
             .collect();
         for observer in observers {
@@ -197,7 +219,6 @@ pub(super) fn observe_retained_stage_reports(
     RetainedStageObserver,
     std::sync::Arc<std::sync::Mutex<Vec<RetainedStageObservation>>>,
 ) {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     install_retained_stage_recorder();
     let observed = std::sync::Arc::<std::sync::Mutex<Vec<_>>>::default();
     let sink = std::sync::Arc::clone(&observed);
@@ -226,16 +247,198 @@ pub(super) fn observe_retained_stage_reports(
             receipted,
         });
     };
-    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = NEXT_OBSERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     RETAINED_STAGE_OBSERVERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(RetainedStageObserverEntry {
             id,
             scope: scope.to_owned(),
+            prefix: RETAINED_STAGE_PREFIX,
             observer: std::sync::Arc::new(observer),
         });
     (RetainedStageObserver { id }, observed)
+}
+
+/// Identifies each registered observer for its unregistration.
+static NEXT_OBSERVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One `kuru.memory` leftover-collection record: a receipts folder kept after
+/// its removal was refused, a warm sweep skipped because its lock attempt
+/// failed, or a sweep refusal that could not be recorded in its receipt.
+#[derive(Debug, Clone)]
+pub(super) struct LeftoverRecord {
+    pub message: String,
+    /// The record's `stage` field: the `.leftovers` folder it concerns.
+    pub stage: PathBuf,
+    pub first_cause: String,
+    pub os_error: Option<i64>,
+}
+
+/// Observe every leftover-collection record whose `stage` lies under `scope`.
+///
+/// The observer only copies the event's fields. It never inspects the
+/// filesystem or a lock and never panics, because the product emits these
+/// records from sweeps that hold the installation lock.
+pub(super) fn observe_leftover_records(
+    scope: &Path,
+) -> (
+    RetainedStageObserver,
+    std::sync::Arc<std::sync::Mutex<Vec<LeftoverRecord>>>,
+) {
+    install_retained_stage_recorder();
+    let observed = std::sync::Arc::<std::sync::Mutex<Vec<_>>>::default();
+    let sink = std::sync::Arc::clone(&observed);
+    let observer = move |fields: &RetainedStageFields| {
+        sink.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(LeftoverRecord {
+                message: fields.message.clone(),
+                stage: PathBuf::from(&fields.stage),
+                first_cause: fields.first_cause.clone(),
+                os_error: fields.os_error,
+            });
+    };
+    let id = NEXT_OBSERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RETAINED_STAGE_OBSERVERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(RetainedStageObserverEntry {
+            id,
+            scope: scope.to_owned(),
+            prefix: LEFTOVER_RECORD_PREFIX,
+            observer: std::sync::Arc::new(observer),
+        });
+    (RetainedStageObserver { id }, observed)
+}
+
+/// What follows the bounded-recovery exhaustion in a receipt's `first_cause`:
+/// the first cause the window retried.
+const EXHAUSTION_TAIL: &str = "preserve the published stage for inspection: ";
+
+/// Classify a retained-stage receipt's first cause against the explicit table
+/// of causes the bounded stage-cleanup window retries
+/// (`files::close_windows_private_stage_with`), returning the matched row.
+///
+/// `attempts` is present exactly when that window ran out: every cause it does
+/// not retry returns before `wait_for_cleanup_retry` counts an attempt. A
+/// receipt without `attempts`, or whose first cause matches no row, is a
+/// product-path failure and not a transient hold, so it is refused here.
+pub(super) fn retried_cleanup_class(receipt: &serde_json::Value) -> Result<&'static str, String> {
+    if !receipt["attempts"].is_u64() {
+        return Err(format!(
+            "the bounded cleanup window did not run to exhaustion, so the first cause was not retried: {receipt}"
+        ));
+    }
+    let cause = receipt["first_cause"]
+        .as_str()
+        .ok_or_else(|| format!("the receipt has no first cause: {receipt}"))?;
+    let first = cause
+        .split_once(EXHAUSTION_TAIL)
+        .map(|(_, first)| first)
+        .ok_or_else(|| format!("the first cause does not follow the exhaustion: {receipt}"))?;
+    let os_error = receipt["os_error"].as_i64();
+    let removal =
+        first.starts_with("Rejected removal at ") || first.starts_with("Uncertain removal at ");
+    let row = match (first, os_error) {
+        (first, Some(5 | 32)) if first.starts_with("Rejected removal at ") => {
+            "rejected checked removal, native 5 or 32"
+        }
+        (first, _) if first.starts_with("Uncertain removal at ") => "uncertain checked removal",
+        ("private child became pending after checked removal", None) => "private child pending",
+        ("private temporary stage remained after checked removal", None) => {
+            "private child remained"
+        }
+        ("temporary stage container remained after removal", None) => "container remained",
+        (_, Some(5 | 32 | 145)) if !removal => {
+            "container pending open (5, 32) or container removal (32, 145)"
+        }
+        (_, None) if !removal => "container pending open, permission denied",
+        _ => {
+            return Err(format!(
+                "the first cause is not a class bounded recovery retries: {receipt}"
+            ));
+        }
+    };
+    Ok(row)
+}
+
+#[test]
+fn retried_cleanup_classes_match_the_bounded_recovery_table() {
+    let exhausted = |first: &str, os_error: serde_json::Value| {
+        serde_json::json!({
+            "first_cause": format!(
+                "Dolt engine publication succeeded, but private stage cleanup failed: remove private temporary stage at C:\\cache\\.install-x\\private: private temporary stage cleanup exhausted its bounded recovery after 88 reconcile attempts over 2.003s; {EXHAUSTION_TAIL}{first}"
+            ),
+            "os_error": os_error,
+            "attempts": 88,
+        })
+    };
+    for (first, os_error, row) in [
+        (
+            "Rejected removal at C:\\cache\\.install-x\\private: Access is denied. (os error 5)",
+            serde_json::json!(5),
+            "rejected checked removal, native 5 or 32",
+        ),
+        (
+            "Rejected removal at C:\\cache\\.install-x\\private: The process cannot access the file because it is being used by another process. (os error 32)",
+            serde_json::json!(32),
+            "rejected checked removal, native 5 or 32",
+        ),
+        (
+            "Uncertain removal at C:\\cache\\.install-x\\private: Access is denied. (os error 5)",
+            serde_json::json!(5),
+            "uncertain checked removal",
+        ),
+        (
+            "Uncertain removal at C:\\cache\\.install-x\\private: removed directory name is still occupied",
+            serde_json::Value::Null,
+            "uncertain checked removal",
+        ),
+        (
+            "private child became pending after checked removal",
+            serde_json::Value::Null,
+            "private child pending",
+        ),
+        (
+            "private temporary stage remained after checked removal",
+            serde_json::Value::Null,
+            "private child remained",
+        ),
+        (
+            "temporary stage container remained after removal",
+            serde_json::Value::Null,
+            "container remained",
+        ),
+        (
+            "The directory is not empty. (os error 145)",
+            serde_json::json!(145),
+            "container pending open (5, 32) or container removal (32, 145)",
+        ),
+    ] {
+        assert_eq!(
+            retried_cleanup_class(&exhausted(first, os_error)),
+            Ok(row),
+            "{first}"
+        );
+    }
+    // A rejected removal outside the sharing/denied pair is never retried.
+    assert!(
+        retried_cleanup_class(&exhausted(
+            "Rejected removal at C:\\cache\\.install-x\\private: The system cannot find the path specified. (os error 3)",
+            serde_json::json!(3),
+        ))
+        .is_err()
+    );
+    // A cause that returned at once carries no attempts: not retried.
+    assert!(
+        retried_cleanup_class(&serde_json::json!({
+            "first_cause": "Dolt engine publication succeeded, but private stage cleanup failed: Rejected removal at C:\\cache\\.install-x\\private: retained directory no longer has the expected identity",
+            "os_error": null,
+            "attempts": null,
+        }))
+        .is_err()
+    );
 }
 
 /// The `.json` receipts in a `.leftovers` directory. `files::write` keeps its
@@ -1353,8 +1556,21 @@ async fn cancelled_activation_recovery_receipts_a_held_stage_before_releasing_th
         "a refused teardown preserves the original private stage"
     );
     assert_cache_lock_released(&lock_path, lock_identity).await;
+    // Once nothing holds the stage, the next acquisition's sweep collects it
+    // and its receipt through the product's own checked removal.
     drop(holder);
-    fs::remove_dir_all(&stage_container).unwrap();
+    let lock = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let outcome = sweep_leftover_stages(&cache, &lock);
+    drop(lock);
+    assert_eq!(outcome.collected, 1, "{outcome:?}");
+    assert_eq!(outcome.remaining, 0, "{outcome:?}");
+    assert!(!stage_container.exists());
+    assert!(
+        !receipts[0].exists(),
+        "the collected stage takes its receipt"
+    );
 }
 
 #[cfg(windows)]
@@ -1625,11 +1841,18 @@ async fn actual_warm_cache_verifies_concurrently_while_installation_lock_is_held
 async fn concurrent_cold_windows_provision_publishes_one_verified_native_identity() {
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("concurrent empty cache café 東京");
+    // Created empty up front only so its canonical path, which every product
+    // record names, can scope this test's observers before either open runs.
+    private_directory(&cache).unwrap();
+    let scope = cache.canonicalize().unwrap();
     let config = MemoryConfig {
         offline: true,
         cache_dir: Some(cache.clone()),
         ..Default::default()
     };
+    let lock_path = scope.join(".install.lock");
+    let (retained_observer, retained) = observe_retained_stage_reports(&scope, &lock_path);
+    let (leftover_observer, leftovers) = observe_leftover_records(&scope);
     let start = tokio::sync::Barrier::new(2);
     let open = || async {
         start.wait().await;
@@ -1659,15 +1882,202 @@ async fn concurrent_cold_windows_provision_publishes_one_verified_native_identit
         assert_eq!(file.metadata().unwrap().len(), size);
         assert_eq!(hex_digest(&Sha256::digest(fs::read(path).unwrap())), digest);
     }
+    // The warm open attempts every receipt once under the free lock.
     let warm = provision(&config, &cache).await.unwrap();
     let (_parent, file) = files::read(&warm, Privacy::OwnerOnly).unwrap();
     assert_eq!(warm, first.0);
     assert_eq!(regular_file_info(&file).unwrap().identity, first.1);
-    let entries: Vec<_> = fs::read_dir(cache.join(DOLT_VERSION))
+    drop(file);
+    drop(_parent);
+    drop(retained_observer);
+    drop(leftover_observer);
+
+    // The contract (embedded-runtime "Install stage teardown ordering" and
+    // "Leftover stage collection"): a stage that outlived its bounded removal
+    // stays only with a receipt, written before the lock was released, whose
+    // first cause is one bounded recovery retries and in which every later
+    // acquisition recorded its refusal. Whether a stage remains is the
+    // environment's choice; every other outcome here is the product's.
+    let versions = scope.join(DOLT_VERSION);
+    let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
+    let receipts: Vec<(PathBuf, serde_json::Value)> = if receipts_path.is_dir() {
+        leftover_stage_receipts(&receipts_path)
+            .into_iter()
+            .map(|path| {
+                let receipt = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                (path, receipt)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let retained = std::mem::take(&mut *retained.lock().unwrap());
+    let leftovers = std::mem::take(&mut *leftovers.lock().unwrap());
+    let entries: Vec<String> = fs::read_dir(&versions)
         .unwrap()
-        .map(|entry| entry.unwrap().file_name())
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(entries, [std::ffi::OsString::from(BUNDLED_ASSET.target)]);
+    let mut evidence = format!(
+        "concurrent cold provision: versions {entries:?}; retained-stage reports {retained:?}; leftover records {leftovers:?}\n"
+    );
+    for (path, receipt) in &receipts {
+        evidence.push_str(&format!(
+            "receipt {}: {receipt:#}; retried class {:?}\n",
+            path.display(),
+            retried_cleanup_class(receipt)
+        ));
+    }
+    if !receipts.is_empty() || !retained.is_empty() || !leftovers.is_empty() {
+        report_evidence(&evidence);
+    }
+
+    let kept_folder = leftovers.iter().any(|record| {
+        record.stage == receipts_path && record.message.contains("receipts folder kept")
+    });
+    for entry in &entries {
+        if entry == BUNDLED_ASSET.target {
+            continue;
+        }
+        if entry == LEFTOVER_STAGE_RECEIPTS {
+            assert!(
+                !receipts.is_empty() || kept_folder,
+                "the receipts folder outlived its last receipt without a kept-folder record: {evidence}"
+            );
+            continue;
+        }
+        assert!(
+            entry.starts_with(".install-")
+                && receipts
+                    .iter()
+                    .any(|(_, receipt)| receipt["stage"] == entry.as_str()),
+            "every other entry is a receipted install stage: {entry}: {evidence}"
+        );
+    }
+    for (_, receipt) in &receipts {
+        assert_eq!(receipt["published"], true, "{evidence}");
+        if let Err(cause) = retried_cleanup_class(receipt) {
+            panic!("{cause}: {evidence}");
+        }
+        assert!(
+            receipt["probe_child"]["pid"]
+                .as_u64()
+                .is_some_and(|pid| pid > 0)
+                && receipt["probe_child"]["at_refusal"].is_string(),
+            "a probed stage records its probe child at the refusal (stamp error: {}): {evidence}",
+            receipt["probe_child"]["error"]
+        );
+        assert!(
+            receipt["sweep_refusals"]
+                .as_u64()
+                .is_some_and(|count| count >= 1),
+            "the warm open's acquisition attempted the receipt and recorded its refusal: {evidence}"
+        );
+    }
+    assert!(
+        !leftovers
+            .iter()
+            .any(|record| record.message.contains("sweep skipped")
+                || record.message.contains("could not be recorded")),
+        "no acquisition skipped a sweep and every refusal was recorded: {evidence}"
+    );
+    // Only the installer that found no destination under the lock creates a
+    // stage, so at most one is ever retained. A later sweep may already have
+    // collected it, but a receipt that remains always had its report.
+    assert!(retained.len() <= 1, "{evidence}");
+    for (_, receipt) in &receipts {
+        assert!(
+            retained.iter().any(|report| report
+                .stage
+                .file_name()
+                .is_some_and(|name| receipt["stage"] == name.to_string_lossy().as_ref())),
+            "a remaining receipt was reported when it was written: {evidence}"
+        );
+    }
+    for report in &retained {
+        assert_eq!(report.published, Some(true), "{evidence}");
+        assert!(
+            report.receipted && report.lock_held,
+            "the stage is receipted before the lock is released: {evidence}"
+        );
+    }
+    let contender = open_regular(&lock_path).unwrap();
+    let _gate = crate::spawn_gate::locking_async().await;
+    contender
+        .try_lock()
+        .expect("every installer released the installation lock");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn forced_published_cleanup_failure_records_the_probe_child() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("forced cleanup cache 東京");
+    let config = MemoryConfig {
+        offline: true,
+        cache_dir: Some(cache.clone()),
+        ..Default::default()
+    };
+    // The lease resolves on this test's thread (the current-thread runtime
+    // drives the open), so the forced failure reaches exactly its release.
+    let binary = {
+        let _forced = files::ForcedStageCleanupFailure::new();
+        provision(&config, &cache).await.unwrap()
+    };
+    let versions = binary.parent().unwrap().parent().unwrap().to_owned();
+    let receipts = leftover_stage_receipts(&versions.join(LEFTOVER_STAGE_RECEIPTS));
+    assert_eq!(receipts.len(), 1, "the forced retention is receipted");
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipts[0]).unwrap()).unwrap();
+    report_evidence(&format!(
+        "forced published cleanup failure receipt: {receipt:#}\n"
+    ));
+    assert_eq!(receipt["published"], true);
+    let child = &receipt["probe_child"];
+    assert!(
+        child["pid"].as_u64().is_some_and(|pid| pid > 0),
+        "the probe child was stamped (stamp error: {}): {receipt}",
+        child["error"]
+    );
+    assert!(
+        child["created"].as_u64().is_some_and(|created| created > 0),
+        "{receipt}"
+    );
+    let at_refusal = child["at_refusal"].as_str().unwrap_or_default();
+    assert!(
+        matches!(at_refusal, "retained" | "released") || at_refusal.starts_with("unknown: "),
+        "{receipt}"
+    );
+    let stage = versions.join(receipt["stage"].as_str().unwrap());
+
+    // The warm open attempts the receipt once: it either collects the stage
+    // and its receipt, or records the refusal in that receipt.
+    assert_eq!(provision(&config, &cache).await.unwrap(), binary);
+    if stage.exists() {
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipts[0]).unwrap()).unwrap();
+        report_evidence(&format!(
+            "forced stage refused its warm sweep: {receipt:#}\n"
+        ));
+        assert_eq!(receipt["sweep_refusals"], 1, "{receipt}");
+        assert!(
+            receipt["last_sweep_refusal"]["probe_child_at_refusal"].is_string(),
+            "{receipt}"
+        );
+    } else {
+        assert!(!receipts[0].exists(), "a collected stage takes its receipt");
+    }
+}
+
+/// Write test evidence straight to the process's standard error. Libtest
+/// captures only the `print!` family, and the coverage shard inherits the test
+/// binary's standard error, so this reaches the job log even when the test
+/// passes.
+#[cfg(windows)]
+fn report_evidence(evidence: &str) {
+    use std::io::Write;
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(evidence.as_bytes());
+    let _ = stderr.flush();
 }
 
 #[cfg(windows)]

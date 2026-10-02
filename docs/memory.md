@@ -502,8 +502,22 @@ conversations, notes and reachable Dolt revisions do not expire automatically.
 The bundled engine performs bounded, growth-triggered storage maintenance while
 Kuru owns it, but retained history can continue to grow. This maintenance is not
 secure erasure. If a private install stage cannot be removed after the engine is
-published and verified, Kuru keeps that stage with a receipt and collects it on a
-later open; leftover stages are counted, and a sweep that leaves at least a small
+published and verified, Kuru keeps that stage with a receipt. The next open that
+takes the installation lock tries once to remove each receipted stage before
+doing anything else under the lock. An open that finds the engine already
+installed never waits for that lock: if another copy of Kuru holds it, the open
+leaves the stage for a later one, and if the lock cannot be taken at all, it says
+so in diagnostics. When a removal is refused again, the stage and its receipt
+stay, and the receipt records how many sweeps were refused and the last refusal:
+its cause, its native error, the file or folder inside the stage that refused,
+and, on Windows, whether the process object of the engine's version probe was
+still open at that moment. The receipt records the same facts for the stage's
+first refusal, with the probe's process ID and start time, or why those could
+not be read. Receipts stay in a
+private folder and are never shown to a model or written to memory. Once a sweep has collected
+the last receipt, it removes the empty receipts folder too, in one attempt; a
+refused attempt is reported to diagnostics and left for the next sweep.
+Leftover stages are counted, and a sweep that leaves at least a small
 cap of them behind is reported to diagnostics. An installation that stops before
 publishing, after an error or a cancelled open, is handled the same way: a stage
 it cannot remove is receipted as unpublished and reported to diagnostics, and the

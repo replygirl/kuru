@@ -89,6 +89,12 @@ impl Child {
         self.inner.id()
     }
 
+    /// The owned child's id and creation time, for diagnostics only.
+    #[cfg(windows)]
+    pub(crate) fn stamp(&self) -> io::Result<kuru_platform::windows::process::ProcessStamp> {
+        self.inner.stamp()
+    }
+
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.inner.try_wait()
     }

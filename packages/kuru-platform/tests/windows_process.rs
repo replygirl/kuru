@@ -3,7 +3,8 @@
 use kuru_platform::windows::{
     pipe::{self, Pipe, PrivateListener, PrivateServiceListener},
     process::{
-        Console, Lifetime, NativeChild, NativeSpawnSpec, RootObservation, Stdio, sample_process,
+        Console, Lifetime, NativeChild, NativeSpawnSpec, ProcessStamp, RootObservation, Stdio,
+        current_process_handle, process_object_retained, process_stamp, sample_process,
     },
 };
 use std::{
@@ -1051,4 +1052,39 @@ async fn explicit_file_stdio_and_console_group_interrupt_work() {
             .unwrap()
             .contains("group-stopped")
     );
+}
+
+#[tokio::test]
+async fn process_object_retained_matches_only_the_exact_identity() {
+    let current = process_stamp(&current_process_handle().unwrap()).unwrap();
+    assert_eq!(current.id, std::process::id());
+    assert!(process_object_retained(current).unwrap());
+
+    let root = tempfile::tempdir().unwrap();
+    let mut child = idle(root.path()).await;
+    let stamp = child.stamp().unwrap();
+    assert_eq!(stamp.id, child.id());
+    assert_ne!(stamp.created, 0);
+    // A duplicated handle keeps the exited child's process object alive after
+    // the owner reaps and drops it: exactly the hold the measurement reports.
+    let retained = child.duplicate_process_handle().unwrap();
+    child.terminate().unwrap();
+    assert!(!child.wait(LIMIT).await.unwrap().success());
+    drop(child);
+    assert!(
+        process_object_retained(stamp).unwrap(),
+        "an exited process object that a handle still holds is retained"
+    );
+    // The same id with another creation time is a reused id, never the child.
+    assert!(
+        !process_object_retained(ProcessStamp {
+            id: stamp.id,
+            created: stamp.created + 1,
+        })
+        .unwrap()
+    );
+    // No control asserts `false` once our duplicate closes: another process
+    // may legitimately still hold the object, which is what the measurement
+    // exists to report.
+    drop(retained);
 }

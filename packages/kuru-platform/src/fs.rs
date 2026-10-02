@@ -237,11 +237,18 @@ impl std::error::Error for PublicationError {
 /// whose pending delete completed, or a root removed by an earlier attempt -
 /// completes that removal. Denied and uncertain results keep their meaning, and
 /// `path` always names the tree root, never the descendant that failed.
+///
+/// `descendant` names the entry a checked tree removal was acting on when it
+/// failed, relative to `path`: the entry itself, or the directory whose
+/// enumeration failed. It is `None` when the failure concerns the root or the
+/// removal of a single file. It is a locator for reporting only and confers no
+/// authority over that name.
 #[derive(Debug)]
 pub struct RemovalError {
     pub phase: PublicationPhase,
     pub identity: Option<FileIdentity>,
     pub path: PathBuf,
+    pub descendant: Option<PathBuf>,
     error: io::Error,
 }
 
@@ -602,6 +609,7 @@ impl Directory {
                 phase: PublicationPhase::Rejected,
                 identity: Some(identity),
                 path,
+                descendant: None,
                 error: invalid("cannot remove a filesystem root"),
             });
         }
@@ -609,12 +617,14 @@ impl Directory {
             phase: PublicationPhase::Rejected,
             identity: Some(identity),
             path: path.clone(),
+            descendant: None,
             error: invalid("missing directory name"),
         })?;
         component(name).map_err(|error| RemovalError {
             phase: PublicationPhase::Rejected,
             identity: Some(identity),
             path: path.clone(),
+            descendant: None,
             error,
         })?;
         if self.privacy != Privacy::OwnerOnly {
@@ -622,6 +632,7 @@ impl Directory {
                 phase: PublicationPhase::Rejected,
                 identity: Some(identity),
                 path,
+                descendant: None,
                 error: denied("checked tree removal requires an owner-private root"),
             });
         }
@@ -630,6 +641,7 @@ impl Directory {
                 phase: PublicationPhase::Rejected,
                 identity: Some(identity),
                 path,
+                descendant: None,
                 error: denied("checked tree removal requires a movable root handle"),
             });
         }
@@ -637,6 +649,7 @@ impl Directory {
             phase: PublicationPhase::Rejected,
             identity: Some(identity),
             path: path.clone(),
+            descendant: None,
             error,
         })?;
         let retention = self.retention;
@@ -651,24 +664,37 @@ impl Directory {
                 phase: PublicationPhase::Rejected,
                 identity: Some(identity),
                 path: path.clone(),
+                descendant: None,
                 error,
             })?;
         let ancestor_paths: Vec<_> = anchors
             .iter()
             .map(|anchor| (anchor.path.as_path(), anchor.identity))
             .collect();
-        native::remove_tree(&parent, &ancestor_paths, &path, name, root.file, identity).map_err(
-            |(phase, error)| RemovalError {
-                phase,
-                identity: Some(identity),
-                path: path.clone(),
-                error,
-            },
-        )?;
+        // The native walk keeps `at` on the entry it is acting on, relative to
+        // the root, and leaves it empty once every descendant is gone.
+        let mut at = PathBuf::new();
+        let removal = native::remove_tree(
+            &parent,
+            &ancestor_paths,
+            &path,
+            name,
+            root.file,
+            identity,
+            &mut at,
+        );
+        removal.map_err(|(phase, error)| RemovalError {
+            phase,
+            identity: Some(identity),
+            path: path.clone(),
+            descendant: (!at.as_os_str().is_empty()).then_some(at),
+            error,
+        })?;
         Self::revalidate_ancestors(&anchors, retention).map_err(|error| RemovalError {
             phase: PublicationPhase::Uncertain,
             identity: Some(identity),
             path,
+            descendant: None,
             error,
         })
     }
@@ -698,6 +724,7 @@ impl Directory {
             phase,
             identity,
             path: path.clone(),
+            descendant: None,
             error,
         };
         self.verify(name, &file)
@@ -1036,11 +1063,75 @@ mod tests {
 
         let error = root.remove_tree().unwrap_err();
         assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert_eq!(error.descendant.as_deref(), Some(Path::new("link")));
         assert!(temporary.path().join("root/link").is_symlink());
         assert_eq!(
             std::fs::read(temporary.path().join("outside/sentinel")).unwrap(),
             b"outside bytes"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_tree_removal_names_the_refusing_nested_descendant() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Directory::ensure_private(&temporary.path().join("root")).unwrap();
+        let nested = Directory::ensure_private(&root.path().join("sub")).unwrap();
+        let outside = Directory::ensure_private(&temporary.path().join("outside")).unwrap();
+        symlink(outside.path(), nested.path().join("link")).unwrap();
+        drop(nested);
+
+        let error = root.remove_tree().unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert!(error.path.ends_with("root"), "{error}");
+        assert_eq!(
+            error.descendant.as_deref(),
+            Some(Path::new("sub").join("link").as_path()),
+            "the refusing entry is named relative to the tree root: {error}"
+        );
+        assert!(temporary.path().join("root/sub/link").is_symlink());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn checked_tree_removal_names_a_held_nested_descendant() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Directory::ensure_private(&temporary.path().join("root")).unwrap();
+        let nested = Directory::ensure_private(&root.path().join("sub")).unwrap();
+        nested
+            .create_new(OsStr::new("held"))
+            .unwrap()
+            .write_all(b"held bytes")
+            .unwrap();
+        let held_path = nested.path().join("held");
+        drop(nested);
+        // Deny DELETE sharing, as a loaded image or a foreign scanner would;
+        // the only entry of the only subdirectory refuses before anything is
+        // removed, so the phase stays rejected.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&held_path)
+            .unwrap();
+
+        let error = root.remove_tree().unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Rejected, "{error}");
+        assert_eq!(error.error.raw_os_error(), Some(32), "{error}");
+        assert!(error.path.ends_with("root"), "{error}");
+        assert_eq!(
+            error.descendant.as_deref(),
+            Some(Path::new("sub").join("held").as_path()),
+            "the refusing entry is named relative to the tree root: {error}"
+        );
+        assert!(held_path.is_file());
+        drop(holder);
     }
 
     #[test]
@@ -1063,6 +1154,7 @@ mod tests {
 
         let error = root.remove_tree().unwrap_err();
         assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert_eq!(error.descendant, None, "a root failure names no descendant");
         assert_eq!(
             std::fs::read(root_path.join("replacement")).unwrap(),
             b"replacement bytes"

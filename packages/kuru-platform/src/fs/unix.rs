@@ -201,6 +201,7 @@ pub(super) fn remove_tree(
     name: &std::ffi::OsStr,
     held: File,
     expected: FileIdentity,
+    at: &mut PathBuf,
 ) -> Result<(), (PublicationPhase, io::Error)> {
     let mut removed = false;
     // A root that is already absent is the outcome this removal wants, not a
@@ -217,7 +218,7 @@ pub(super) fn remove_tree(
         }
         Err(failure) => return Err(failure),
     }
-    remove_children(&held, &mut removed, 0)?;
+    remove_children(&held, &mut removed, 0, at)?;
     verify_named(parent, name, expected, &mut removed)?;
     unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(|error| (phase(removed), error.into()))?;
     drop(held);
@@ -283,6 +284,7 @@ fn remove_children(
     directory: &File,
     removed: &mut bool,
     depth: usize,
+    at: &mut PathBuf,
 ) -> Result<(), (PublicationPhase, io::Error)> {
     if depth >= MAX_TREE_DEPTH {
         return Err((
@@ -290,13 +292,18 @@ fn remove_children(
             invalid("checked tree removal depth exceeded"),
         ));
     }
+    // `at` names this directory while it is enumerated and each entry while it
+    // is removed, so a failure leaves it at what refused; success restores it.
+    let base = at.clone();
     let mut entries = Dir::read_from(directory).map_err(|error| (phase(*removed), error.into()))?;
     while let Some(entry) = entries.read() {
+        at.clone_from(&base);
         let entry = entry.map_err(|error| (phase(*removed), error.into()))?;
         let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
         if matches!(name.as_bytes(), b"." | b"..") {
             continue;
         }
+        *at = base.join(name);
         #[cfg(test)]
         super::enumeration_seam::observe();
         let child = openat(
@@ -312,7 +319,7 @@ fn remove_children(
                 if !info.directory {
                     return Err((phase(*removed), denied("expected a regular directory")));
                 }
-                remove_children(&child, removed, depth + 1)?;
+                remove_children(&child, removed, depth + 1, at)?;
                 verify_named(directory, name, info.file.identity, removed)?;
                 unlinkat(directory, name, AtFlags::REMOVEDIR)
                     .map_err(|error| (phase(*removed), error.into()))?;
@@ -350,6 +357,7 @@ fn remove_children(
             Err(error) => return Err((phase(*removed), error.into())),
         }
     }
+    *at = base;
     Ok(())
 }
 
