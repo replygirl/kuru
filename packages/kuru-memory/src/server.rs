@@ -1754,6 +1754,8 @@ struct ObservationShared {
     authenticated: AtomicU64,
     #[cfg(test)]
     gate: StdMutex<Option<Arc<GateShared>>>,
+    #[cfg(test)]
+    release_gate: StdMutex<Option<Arc<GateShared>>>,
 }
 
 struct ConnectionProgress {
@@ -1771,6 +1773,8 @@ impl ConnectionObservation {
             authenticated: AtomicU64::new(0),
             #[cfg(test)]
             gate: StdMutex::new(None),
+            #[cfg(test)]
+            release_gate: StdMutex::new(None),
         }))
     }
 
@@ -1815,18 +1819,31 @@ impl ConnectionObservation {
                 .clone();
             if let Some(gate) = gate {
                 self.phase(AUTHENTICATION_GATE_PHASE);
-                gate.entered.send_replace(true);
-                let mut released = gate.released.subscribe();
-                let _ = released.wait_for(|released| *released).await;
+                gate.hold().await;
             }
+        }
+    }
+
+    /// A checked-out connection is being returned to this pool. Under an
+    /// armed test release gate, the return waits until the gate is dropped.
+    #[cfg(test)]
+    async fn release_entered(&self) {
+        let gate = self
+            .0
+            .release_gate
+            .lock()
+            .expect("release gate lock")
+            .clone();
+        if let Some(gate) = gate {
+            gate.hold().await;
         }
     }
 
     /// Hold every later new connection of this pool at the start of its
     /// authentication until the returned gate is dropped. No time elapses
-    /// inside the gate; tests observe [`AuthenticationGate::entered`].
+    /// inside the gate; tests observe [`ConnectionGate::entered`].
     #[cfg(test)]
-    pub(crate) fn gate_new_authentications(&self) -> AuthenticationGate {
+    pub(crate) fn gate_new_authentications(&self) -> ConnectionGate {
         let shared = Arc::new(GateShared {
             entered: tokio::sync::watch::Sender::new(false),
             released: tokio::sync::watch::Sender::new(false),
@@ -1838,9 +1855,34 @@ impl ConnectionObservation {
             .expect("authentication gate lock")
             .replace(shared.clone());
         assert!(previous.is_none(), "authentication gate already armed");
-        AuthenticationGate {
+        ConnectionGate {
             shared,
             observation: self.clone(),
+            slot: |shared| &shared.gate,
+        }
+    }
+
+    /// Hold every later return of a checked-out connection to this pool,
+    /// before SQLx's release ping, until the returned gate is dropped. A
+    /// held return stays pending, so a test can cancel a release mid-flight
+    /// without guessing how long the ping takes.
+    #[cfg(test)]
+    pub(crate) fn gate_releases(&self) -> ConnectionGate {
+        let shared = Arc::new(GateShared {
+            entered: tokio::sync::watch::Sender::new(false),
+            released: tokio::sync::watch::Sender::new(false),
+        });
+        let previous = self
+            .0
+            .release_gate
+            .lock()
+            .expect("release gate lock")
+            .replace(shared.clone());
+        assert!(previous.is_none(), "release gate already armed");
+        ConnectionGate {
+            shared,
+            observation: self.clone(),
+            slot: |shared| &shared.release_gate,
         }
     }
 
@@ -1901,16 +1943,28 @@ struct GateShared {
     released: tokio::sync::watch::Sender<bool>,
 }
 
-/// A test hold on one pool's new connections. Dropping it releases every held
-/// connection and disarms the pool.
 #[cfg(test)]
-pub(crate) struct AuthenticationGate {
+impl GateShared {
+    /// Report entry, then wait until the gate is dropped.
+    async fn hold(&self) {
+        self.entered.send_replace(true);
+        let mut released = self.released.subscribe();
+        let _ = released.wait_for(|released| *released).await;
+    }
+}
+
+/// A test hold on one pool's new connections (or, from
+/// [`ConnectionObservation::gate_releases`], on its connection returns).
+/// Dropping it releases every held connection and disarms the pool.
+#[cfg(test)]
+pub(crate) struct ConnectionGate {
     shared: Arc<GateShared>,
     observation: ConnectionObservation,
+    slot: fn(&ObservationShared) -> &StdMutex<Option<Arc<GateShared>>>,
 }
 
 #[cfg(test)]
-impl AuthenticationGate {
+impl ConnectionGate {
     /// Completes once a new connection of the gated pool has entered
     /// authentication.
     pub(crate) async fn entered(&self) {
@@ -1924,9 +1978,9 @@ impl AuthenticationGate {
 }
 
 #[cfg(test)]
-impl Drop for AuthenticationGate {
+impl Drop for ConnectionGate {
     fn drop(&mut self) {
-        if let Ok(mut gate) = self.observation.0.gate.lock() {
+        if let Ok(mut gate) = (self.slot)(&self.observation.0).lock() {
             gate.take();
         }
         self.shared.released.send_replace(true);
@@ -2117,8 +2171,19 @@ async fn connect_pool_attempt(
                 }
                 result
             })
+        });
+    #[cfg(test)]
+    let pool = {
+        let observation = observation.clone();
+        pool.after_release(move |_, _| {
+            let observation = observation.clone();
+            Box::pin(async move {
+                observation.release_entered().await;
+                Ok(true)
+            })
         })
-        .connect_lazy_with(options);
+    };
+    let pool = pool.connect_lazy_with(options);
     // Equivalent to `connect_with` (one acquire, then release) when the first
     // window equals the lifetime timeout. A longer opening window retries
     // timed-out acquires without changing any later acquire on this pool.

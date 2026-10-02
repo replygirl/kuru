@@ -9,7 +9,8 @@
 //! gated pool while the gate is armed.
 
 use super::*;
-use crate::server::{AuthenticationGate, ConnectionObservation};
+use crate::server::{ConnectionGate, ConnectionObservation};
+use futures::FutureExt;
 use kuru_core::{InvocationOutcome, InvocationStart, Usage, UsageObservation, UsagePhase};
 
 async fn observation(store: &MemoryStore, branch: &str) -> Result<ConnectionObservation> {
@@ -24,7 +25,7 @@ async fn observation(store: &MemoryStore, branch: &str) -> Result<ConnectionObse
 /// Run one step of sequential work; fail as soon as any new connection of the
 /// gated pool enters authentication instead of reusing the pooled session.
 async fn reusing<T>(
-    gate: &AuthenticationGate,
+    gate: &ConnectionGate,
     step: &str,
     work: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
@@ -367,6 +368,74 @@ async fn stalled_authentication_names_the_new_connection_phase() -> Result<()> {
 
     drop(gate);
     held.release().await;
+    drop(pool);
+    store.close().await?;
+    Ok(())
+}
+
+/// A release cancelled after SQLx has taken its connection (a statement
+/// timeout or a `select!` firing during the release ping) stops counting the
+/// session as held: SQLx closes the floating connection, and a later timed-out
+/// acquire still names the wait it actually had. With every other permit
+/// held, an inflated count would report held connections. The release gate
+/// holds the return before its ping, so the cancellation point involves no
+/// time.
+#[tokio::test]
+async fn cancelled_release_is_not_counted_as_a_held_connection() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let pool = store.pool.clone();
+    let max = pool.options().get_max_connections();
+    ensure!(max >= 2, "the main pool admits {max} connections");
+    let mut held = Vec::new();
+    for _ in 0..max {
+        held.push(pool.acquire().await?);
+    }
+    ensure!(pool.checked_out() == max);
+
+    let release_gate = pool.observation().gate_releases();
+    let releasing = held.pop().context("no session to release")?;
+    ensure!(
+        releasing.release().now_or_never().is_none(),
+        "the gated release completed"
+    );
+    ensure!(
+        release_gate.was_entered(),
+        "the release did not reach the pool's return"
+    );
+    drop(release_gate);
+    let holding = u32::try_from(held.len())?;
+    ensure!(
+        pool.checked_out() == holding,
+        "a cancelled release left {} sessions counted as held while {holding} are",
+        pool.checked_out()
+    );
+
+    let gate = pool.observation().gate_new_authentications();
+    let error = pool
+        .acquire()
+        .await
+        .err()
+        .context("a stalled authentication handed out a session")?;
+    ensure!(
+        gate.was_entered(),
+        "the acquisition did not open a connection"
+    );
+    let diagnostic = crate::pool::pool_acquire_timeout(&error)
+        .with_context(|| format!("stalled acquire carried no typed diagnostic: {error:#}"))?;
+    ensure!(
+        diagnostic.wait == crate::pool::PoolWait::NewConnection,
+        "{diagnostic}"
+    );
+    ensure!(
+        (diagnostic.checked_out, diagnostic.idle) == (holding, 0),
+        "{diagnostic}"
+    );
+    ensure!(diagnostic.size < diagnostic.max, "{diagnostic}");
+
+    drop(gate);
+    for session in held {
+        session.release().await;
+    }
     drop(pool);
     store.close().await?;
     Ok(())

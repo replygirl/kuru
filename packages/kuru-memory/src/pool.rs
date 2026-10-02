@@ -134,6 +134,12 @@ impl MemoryPool {
         &self.observation
     }
 
+    /// Sessions this funnel counts as held by Kuru work.
+    #[cfg(test)]
+    pub(crate) fn checked_out(&self) -> u32 {
+        self.checked_out.load(Ordering::SeqCst)
+    }
+
     async fn acquire_session(&self) -> std::result::Result<PooledSession, AcquireFailure> {
         let started = Instant::now();
         let authenticated_before = self.observation.authenticated();
@@ -214,10 +220,16 @@ impl PooledSession {
     /// so the connection is idle again before the caller's next statement.
     /// The caller must have left the session as it found it (no open
     /// transaction or session state).
+    ///
+    /// The session stops counting as held by Kuru work as soon as SQLx takes
+    /// its connection, before the release check is awaited: if this future is
+    /// cancelled there, SQLx closes the floating connection itself, and a
+    /// release still in flight is not a held permit.
     pub async fn release(mut self) {
         if let Some(mut connection) = self.connection.take() {
-            connection.return_to_pool().await;
+            let returning = connection.return_to_pool();
             self.checked_out.fetch_sub(1, Ordering::SeqCst);
+            returning.await;
         }
     }
 

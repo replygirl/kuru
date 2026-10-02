@@ -1445,7 +1445,10 @@ memory pool acquire on kuru/main timed out after 2.004 s (window 2.000 s) waitin
 The wait class says what to investigate:
 
 - `every permit held`: Kuru work held every connection. Look for contention
-  above the pool's maximum or a holder that did not finish.
+  above the pool's maximum or a holder that did not finish. The checked-out
+  count covers sessions Kuru work still holds; a session stops counting once
+  its release starts, including a release cancelled mid-flight, which SQLx
+  closes itself.
 - `a new connection's authentication`: a connection entered authentication
   during the wait. The phase shows how far it got: `after_connect not entered`
   is TCP or MySQL authentication; the other phases are Kuru's identity
