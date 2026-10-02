@@ -769,6 +769,7 @@ async fn accepted_cognitive_writes_reconcile_before_cancellation_stops_peer_work
 #[cfg(unix)]
 #[tokio::test]
 async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() {
+    use kuru_platform::unix::snapshot;
     use nix::{errno::Errno, sys::signal, unistd::Pid};
 
     let (provider, _unused_receipt) = OneToolProvider::new(call(
@@ -817,6 +818,23 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
     })
     .await
     .expect("shell never published its admitted process identity");
+    // The owner keeps the shell unreaped until cancellation, so its listed row
+    // after exec is the recorded identity for the post-shutdown check.
+    let recorded = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let rows: Vec<_> = snapshot::group_members(pid.unsigned_abs())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|row| row.pid == pid.unsigned_abs() && row.command == "/bin/sleep 120")
+                .collect();
+            if !rows.is_empty() {
+                break rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("held shell was never listed as its exec'd command");
     cancellation.cancel();
     let (mut harness, result, target) =
         tokio::time::timeout(std::time::Duration::from_secs(10), task)
@@ -865,8 +883,15 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match signal::kill(Pid::from_raw(pid), None) {
-                Ok(()) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
                 Err(Errno::ESRCH) => break,
+                // The ID may be reused once shutdown reaped the shell; only
+                // the recorded row decides whether the shell itself remains.
+                Ok(()) | Err(Errno::EPERM) => {
+                    if snapshot::still_listed(&recorded).unwrap().is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
                 Err(error) => panic!("cannot inspect owned shell PID {pid}: {error}"),
             }
         }
