@@ -25,16 +25,19 @@ async fn observation(store: &MemoryStore, branch: &str) -> Result<ConnectionObse
 }
 
 /// A fresh pool whose sequential open work reused one session authenticated
-/// exactly one connection, plus verification's own when the pool attempt's
-/// deadline cut the first connection's release (the bounded close the
-/// product allows, never churn).
+/// exactly one connection, plus one for each identity callback whose attempt
+/// was abandoned (an opening-phase first acquire retried after its window, or
+/// SQLx reconnecting after a callback error) and verification's own when the
+/// pool attempt's deadline cut the first connection's release. Each of those
+/// is a bounded attempt the product allows, never churn of a working session.
 fn ensure_one_working_session(observed: &ConnectionObservation, work: &str) -> Result<()> {
     let authenticated = observed.authenticated();
+    let abandoned = observed.abandoned_authentications();
     let cut = observed.first_release_cut();
     ensure!(
-        authenticated == 1 + u64::from(cut),
-        "{work} authenticated {authenticated} connections (first release cut: {cut}), \
-         not one working session"
+        authenticated == 1 + abandoned + u64::from(cut),
+        "{work} authenticated {authenticated} connections (abandoned attempts: {abandoned}, \
+         first release cut: {cut}), not one working session"
     );
     Ok(())
 }
@@ -708,6 +711,10 @@ async fn first_connection_release_is_bounded_by_its_attempt_deadline() -> Result
         "{} connections authenticated; the closed first connection and verification's own were expected",
         pool.authenticated()
     );
+    ensure!(
+        pool.observation().abandoned_authentications() == 0,
+        "the cut first connection was recorded as an abandoned callback"
+    );
     ensure_one_working_session(pool.observation(), "the pool with its first release cut")?;
     ensure!(
         (pool.size(), pool.num_idle()) == (1, 1),
@@ -719,4 +726,77 @@ async fn first_connection_release_is_bounded_by_its_attempt_deadline() -> Result
     drop(pool);
     store.close().await?;
     Ok(())
+}
+
+/// An opening-phase pool retries a first acquire whose identity callback
+/// outlasts SQLx's ordinary window, inside the remaining startup deadline.
+/// The cancelled callback is recorded as abandoned, and the pool still holds
+/// one working session. The stall is fixed at one instant past the ordinary
+/// window from the first callback, so that first callback is always cut by
+/// its window; how many retries a slow runner needs before that instant is
+/// not asserted, only that each is recorded.
+#[tokio::test]
+async fn opening_retry_after_a_timed_out_callback_is_one_working_session() -> Result<()> {
+    let root = crate::test_support::tempdir()?;
+    let config = kuru_core::MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+    let binary = {
+        let _gate = crate::spawn_gate::spawning().await;
+        crate::provision::provision(&config, &test_cache()).await?
+    };
+    let server = {
+        let _gate = crate::spawn_gate::spawning().await;
+        crate::server::Server::open(crate::server::ServerOptions {
+            binary,
+            directory: root.path().join("opening-retry"),
+            project_scope: "project/opening-retry".into(),
+            supervisor: test_supervisor()?,
+            timeout: Duration::from_secs(config.startup_timeout_secs),
+            read_only: false,
+            retained: None,
+            lifecycle_root: cfg!(windows).then(|| root.path().join("leases")),
+        })
+        .await?
+    };
+    // The server closes on every outcome, so a failed expectation reports
+    // itself rather than an unreaped fixture.
+    let outcome = async {
+        ensure!(
+            server.opening_deadline().is_some(),
+            "an owned start did not enter its opening phase"
+        );
+        let entered = Arc::new(AtomicBool::new(false));
+        server.delay_next_pool_authentication(
+            crate::server::ORDINARY_POOL_WINDOW * 3 / 2,
+            entered.clone(),
+        );
+        let pool = server
+            .pool("main")
+            .await
+            .context("the opening pool did not retry its timed-out first acquire")?;
+        ensure!(
+            entered.load(Ordering::SeqCst),
+            "the first authentication callback was not delayed"
+        );
+        let observed = pool.observation();
+        ensure_one_working_session(observed, "the opening pool after a timed-out first acquire")?;
+        ensure!(
+            observed.abandoned_authentications() >= 1,
+            "the timed-out first callback was not recorded as abandoned \
+             ({} connections authenticated)",
+            observed.authenticated()
+        );
+        ensure!(
+            (pool.size(), pool.num_idle()) == (1, 1),
+            "the pool holds {} connections, {} idle, after its retried first acquire",
+            pool.size(),
+            pool.num_idle()
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    server.close().await?;
+    outcome
 }

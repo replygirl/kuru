@@ -974,7 +974,7 @@ impl Server {
             .expect("opening deadline lock") = None;
     }
 
-    fn opening_deadline(&self) -> Option<Instant> {
+    pub(crate) fn opening_deadline(&self) -> Option<Instant> {
         *self
             .0
             .opening_deadline
@@ -1784,6 +1784,8 @@ struct ObservationShared {
     #[cfg(test)]
     first_release_cut: AtomicBool,
     #[cfg(test)]
+    abandoned: AtomicU64,
+    #[cfg(test)]
     gate: StdMutex<Option<Arc<GateShared>>>,
     #[cfg(test)]
     release_gate: StdMutex<Option<Arc<GateShared>>>,
@@ -1804,6 +1806,8 @@ impl ConnectionObservation {
             authenticated: AtomicU64::new(0),
             #[cfg(test)]
             first_release_cut: AtomicBool::new(false),
+            #[cfg(test)]
+            abandoned: AtomicU64::new(0),
             #[cfg(test)]
             gate: StdMutex::new(None),
             #[cfg(test)]
@@ -1847,14 +1851,29 @@ impl ConnectionObservation {
         self.0.first_release_cut.load(Ordering::SeqCst)
     }
 
+    /// Identity callbacks of this pool whose connection never reached the
+    /// pool: the callback was cancelled with its timed-out acquire (such as
+    /// an opening-phase first acquire that is then retried) or returned an
+    /// error, after which SQLx closes the connection and may connect again.
+    /// Each is one more authenticated connection that is an abandoned
+    /// attempt, not churn of a working session.
+    #[cfg(test)]
+    pub(crate) fn abandoned_authentications(&self) -> u64 {
+        self.0.abandoned.load(Ordering::SeqCst)
+    }
+
     /// Count a new connection entering Kuru's identity callback, its first
     /// line: a TCP or MySQL handshake that never finishes is never counted.
     /// Under an armed test gate, the connection then waits until the gate is
-    /// dropped.
-    async fn authentication_entered(&self) {
+    /// dropped. The returned attempt counts as abandoned unless the callback
+    /// completes it, including when it is cancelled while held at the gate.
+    async fn authentication_entered(&self) -> CallbackAttempt {
         self.0.authenticated.fetch_add(1, Ordering::SeqCst);
         #[cfg(test)]
         {
+            let attempt = CallbackAttempt {
+                observation: Some(self.clone()),
+            };
             let gate = self
                 .0
                 .gate
@@ -1865,7 +1884,10 @@ impl ConnectionObservation {
                 self.phase(AUTHENTICATION_GATE_PHASE);
                 gate.hold().await;
             }
+            attempt
         }
+        #[cfg(not(test))]
+        CallbackAttempt {}
     }
 
     /// A checked-out connection is being returned to this pool. Under an
@@ -1990,6 +2012,34 @@ impl ConnectionObservation {
         };
         progress.phase == "after_connect not entered"
             && matches!(error, sqlx::Error::Io(error) if error.kind() == std::io::ErrorKind::ConnectionReset)
+    }
+}
+
+/// One identity callback in flight. Under test, dropping it before
+/// [`Self::accepted`] records the callback as abandoned on its pool's
+/// observation; outside tests it carries nothing.
+struct CallbackAttempt {
+    #[cfg(test)]
+    observation: Option<ConnectionObservation>,
+}
+
+impl CallbackAttempt {
+    /// The callback accepted its connection, which SQLx now hands to the pool.
+    fn accepted(self) {
+        #[cfg(test)]
+        {
+            let mut attempt = self;
+            attempt.observation = None;
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CallbackAttempt {
+    fn drop(&mut self) {
+        if let Some(observation) = self.observation.take() {
+            observation.0.abandoned.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -2204,7 +2254,7 @@ async fn connect_pool_attempt(
             #[cfg(test)]
             let stalled_until = stalled_until.clone();
             Box::pin(async move {
-                observation.authentication_entered().await;
+                let attempt = observation.authentication_entered().await;
                 #[cfg(test)]
                 if let Some((delay, entered)) = test_probe_delay {
                     observation.phase("initial authentication callback entered");
@@ -2239,9 +2289,12 @@ async fn connect_pool_attempt(
                     Ok(())
                 }
                 .await;
-                if let Err(error) = &result {
-                    observation.rejected(error);
-                    rejection.record(error);
+                match &result {
+                    Ok(()) => attempt.accepted(),
+                    Err(error) => {
+                        observation.rejected(error);
+                        rejection.record(error);
+                    }
                 }
                 result
             })
