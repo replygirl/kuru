@@ -248,13 +248,36 @@ pub(super) fn write_progress_record(
     )
 }
 
+/// Test-only: [`write_progress_record`] with the failing mark and `reason`.
+#[cfg(test)]
+pub(super) fn write_failing_record(
+    data_dir: &Path,
+    scope: &str,
+    tag: &str,
+    stages: &[MemoryOpenStage],
+    progress: u64,
+    reason: &str,
+) -> Result<()> {
+    write_record(
+        &directory(data_dir, scope)?,
+        tag,
+        &Activity {
+            stages: stages.to_vec(),
+            progress,
+            failure: Some(reason.to_owned()),
+        },
+    )
+}
+
 /// Test-only: retire the record tagged `tag` exactly as its owner does.
 #[cfg(test)]
 pub(super) fn retire_tagged_record(data_dir: &Path, scope: &str, tag: &str) -> Result<()> {
     retire_record(&directory(data_dir, scope)?, tag)
 }
 
-/// The activity of the record tagged `tag`.
+/// Test-only: the activity of the record tagged `tag`, or why it cannot be
+/// read.
+#[cfg(test)]
 pub(crate) fn read_activity(data_dir: &Path, scope: &str, tag: &str) -> Result<Activity> {
     let bytes = crate::files::read_bytes(&directory(data_dir, scope)?.join(RECORD), RECORD_LIMIT)?;
     let (found, activity) = decode(&bytes)?;
@@ -265,30 +288,154 @@ pub(crate) fn read_activity(data_dir: &Path, scope: &str, tag: &str) -> Result<A
     Ok(activity)
 }
 
+#[cfg(test)]
 fn read_stages(data_dir: &Path, scope: &str, tag: &str) -> Result<Vec<MemoryOpenStage>> {
     read_activity(data_dir, scope, tag).map(|activity| activity.stages)
 }
 
-/// Forward, in order, the stages of the record tagged `tag` that this client
-/// has not yet forwarded. A missing, unreadable, foreign or concurrently
-/// replaced record is ignored for this poll only, never logged or counted.
-pub(crate) fn forward_new(
-    data_dir: &Path,
-    scope: &str,
-    tag: &str,
-    forwarded: &mut usize,
-    progress: &mut ProgressReporter,
-) {
-    if !progress.is_observed() {
-        return;
-    }
-    let Ok(stages) = read_stages(data_dir, scope, tag) else {
-        return;
+/// What one read of the record's name found.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Observation {
+    /// Opening the record's name, or the directory that holds it, found
+    /// nothing there.
+    Absent,
+    /// Something is there that cannot be presented this poll: another
+    /// owner's record, an undecodable or oversized one, a record replaced or
+    /// retired between its read and the check that its name still holds it,
+    /// or any other failure. It decides nothing.
+    Unusable,
+    /// The record tagged with this starter's tag.
+    Record(Activity),
+}
+
+/// One bounded read of the record tagged `tag`. Only a missing name is
+/// [`Observation::Absent`]; a failed verification after the read is
+/// [`Observation::Unusable`] even when the name has since gone, so a
+/// retirement is first seen as absent at the next read.
+pub(crate) fn observe(data_dir: &Path, scope: &str, tag: &str) -> Observation {
+    observe_then(data_dir, scope, tag, || {})
+}
+
+/// [`observe`] with a hook between reading the held record and verifying
+/// that its name still identifies it.
+fn observe_then(data_dir: &Path, scope: &str, tag: &str, between: impl FnOnce()) -> Observation {
+    let Ok(path) = directory(data_dir, scope).map(|directory| directory.join(RECORD)) else {
+        return Observation::Unusable;
     };
-    for stage in stages.iter().skip(*forwarded) {
-        progress.report(*stage);
+    let (parent, file) = match crate::files::read(&path, Privacy::OwnerOnly) {
+        Ok(opened) => opened,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Observation::Absent;
+        }
+        Err(_) => return Observation::Unusable,
+    };
+    let Ok(bytes) = crate::files::read_held_then(&parent, &path, file, RECORD_LIMIT, between)
+    else {
+        return Observation::Unusable;
+    };
+    match decode(&bytes) {
+        Ok((found, activity)) if found == tag => Observation::Record(activity),
+        _ => Observation::Unusable,
     }
-    *forwarded = (*forwarded).max(stages.len());
+}
+
+/// The elected starter's view of its own owner's record across readiness
+/// polls. Progress is a change of the whole record, timed on the starter's
+/// own clock when it is first read; the record carries no clock.
+pub(crate) struct OwnerWatch {
+    tag: String,
+    /// The last record read, which every later read is compared with.
+    last: Option<Activity>,
+    /// The stages already forwarded to an observing reporter.
+    forwarded: usize,
+    last_progress: tokio::time::Instant,
+}
+
+/// What one poll's read of the owner's record decided.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Watched {
+    /// The wait goes on: the record changed, is unchanged, unusable or not
+    /// yet written.
+    Waiting,
+    /// A record this starter had read is no longer under its name.
+    Retired,
+    /// The record is marked failing, with the reason it carries.
+    Failing(String),
+}
+
+impl OwnerWatch {
+    /// A watch of the record tagged `tag`, whose first window starts at
+    /// `spawned`.
+    pub(crate) fn new(tag: String, spawned: tokio::time::Instant) -> Self {
+        Self {
+            tag,
+            last: None,
+            forwarded: 0,
+            last_progress: spawned,
+        }
+    }
+
+    /// Read the record once and forward, in order, the stages an observing
+    /// `progress` has not yet received.
+    pub(crate) fn poll(
+        &mut self,
+        data_dir: &Path,
+        scope: &str,
+        progress: &mut ProgressReporter,
+    ) -> Watched {
+        let observation = observe(data_dir, scope, &self.tag);
+        self.saw(observation, progress)
+    }
+
+    fn saw(&mut self, observation: Observation, progress: &mut ProgressReporter) -> Watched {
+        match observation {
+            Observation::Record(activity) if self.last.as_ref() != Some(&activity) => {
+                if progress.is_observed() {
+                    for stage in activity.stages.iter().skip(self.forwarded) {
+                        progress.report(*stage);
+                    }
+                    self.forwarded = self.forwarded.max(activity.stages.len());
+                }
+                let failure = activity.failure.clone();
+                self.last = Some(activity);
+                // The failing mark ends the wait; it is not progress, so the
+                // time since progress stays measured from the change before.
+                match failure {
+                    Some(reason) => Watched::Failing(reason),
+                    None => {
+                        self.last_progress = tokio::time::Instant::now();
+                        Watched::Waiting
+                    }
+                }
+            }
+            Observation::Absent if self.last.is_some() => Watched::Retired,
+            Observation::Record(_) | Observation::Absent | Observation::Unusable => {
+                Watched::Waiting
+            }
+        }
+    }
+
+    /// The last stage of the last record read.
+    pub(crate) fn last_stage(&self) -> Option<MemoryOpenStage> {
+        self.last
+            .as_ref()
+            .and_then(|activity| activity.stages.last().copied())
+    }
+
+    /// The owner's progress count in the last record read.
+    pub(crate) fn seen(&self) -> u64 {
+        self.last.as_ref().map_or(0, |activity| activity.progress)
+    }
+
+    /// When this starter first read the last change that was progress, or
+    /// the spawn when it has read none.
+    pub(crate) fn last_progress(&self) -> tokio::time::Instant {
+        self.last_progress
+    }
 }
 
 /// Test-only: each successful record write and when it completed.
@@ -1265,9 +1412,9 @@ mod tests {
         let directory = directory(&data, &scope)?;
         let own = activity_tag(&Uuid::new_v4());
         let (mut progress, mut reporter) = ProgressReporter::observed();
-        let mut forwarded = 0;
-        forward_new(&data, &scope, &own, &mut forwarded, &mut reporter);
-        ensure!(forwarded == 0, "a missing record moved the client");
+        let mut watch = OwnerWatch::new(own.clone(), tokio::time::Instant::now());
+        ensure!(watch.poll(&data, &scope, &mut reporter) == Watched::Waiting);
+        ensure!(watch.last.is_none(), "a missing record moved the client");
 
         // Another owner's record, written by the publisher's own code.
         let token = Uuid::new_v4();
@@ -1276,11 +1423,9 @@ mod tests {
             &activity_tag(&token),
             &staged(&[UpgradingDatabase]),
         )?;
-        for start in [0, 1, 5] {
-            forwarded = start;
-            forward_new(&data, &scope, &own, &mut forwarded, &mut reporter);
-            ensure!(forwarded == start, "a foreign record moved the client");
-        }
+        ensure!(observe(&data, &scope, &own) == Observation::Unusable);
+        ensure!(watch.poll(&data, &scope, &mut reporter) == Watched::Waiting);
+        ensure!(watch.last.is_none(), "a foreign record moved the client");
         // A record carrying the raw token instead of its tag.
         crate::files::write(
             &directory.join(RECORD),
@@ -1289,22 +1434,26 @@ mod tests {
             )
             .as_bytes(),
         )?;
-        forwarded = 0;
         for tag in [activity_tag(&token), token.to_string()] {
-            forward_new(&data, &scope, &tag, &mut forwarded, &mut reporter);
+            ensure!(
+                observe(&data, &scope, &tag) == Observation::Unusable,
+                "{tag}"
+            );
         }
-        ensure!(forwarded == 0, "a raw-token record moved the client");
+        ensure!(watch.poll(&data, &scope, &mut reporter) == Watched::Waiting);
+        ensure!(watch.last.is_none(), "a raw-token record moved the client");
         // A record of its own owner over the size limit.
         let mut oversized = encode(&own, &staged(&[UpgradingDatabase]))?;
         oversized.resize(RECORD_LIMIT as usize + 1, b' ');
         crate::files::write(&directory.join(RECORD), &oversized)?;
-        forward_new(&data, &scope, &own, &mut forwarded, &mut reporter);
-        ensure!(forwarded == 0, "an oversized record moved the client");
+        ensure!(observe(&data, &scope, &own) == Observation::Unusable);
+        ensure!(watch.poll(&data, &scope, &mut reporter) == Watched::Waiting);
+        ensure!(watch.last.is_none(), "an oversized record moved the client");
         ensure!(received(&mut progress).is_empty());
 
         write_record(&directory, &own, &staged(&[PreparingDatabase]))?;
-        forward_new(&data, &scope, &own, &mut forwarded, &mut reporter);
-        ensure!(forwarded == 1);
+        ensure!(watch.poll(&data, &scope, &mut reporter) == Watched::Waiting);
+        ensure!(watch.forwarded == 1 && watch.last_stage() == Some(PreparingDatabase));
         ensure!(received(&mut progress) == [PreparingDatabase]);
         Ok(())
     }
@@ -1318,18 +1467,132 @@ mod tests {
         let tag = activity_tag(&Uuid::new_v4());
         for reads in 0_u32..(1 << SAMPLE.len()) {
             let (mut progress, mut reporter) = ProgressReporter::observed();
-            let mut forwarded = 0;
+            let mut watch = OwnerWatch::new(tag.clone(), tokio::time::Instant::now());
             for written in 1..=SAMPLE.len() {
                 write_record(&directory, &tag, &staged(&SAMPLE[..written]))?;
                 if reads & (1 << (written - 1)) != 0 {
-                    forward_new(&data, &scope, &tag, &mut forwarded, &mut reporter);
-                    ensure!(forwarded == written, "reads {reads:#b}");
+                    watch.poll(&data, &scope, &mut reporter);
+                    ensure!(watch.forwarded == written, "reads {reads:#b}");
                 }
             }
-            forward_new(&data, &scope, &tag, &mut forwarded, &mut reporter);
-            ensure!(forwarded == SAMPLE.len(), "reads {reads:#b}");
+            watch.poll(&data, &scope, &mut reporter);
+            ensure!(watch.forwarded == SAMPLE.len(), "reads {reads:#b}");
             ensure!(received(&mut progress) == SAMPLE, "reads {reads:#b}");
         }
+        Ok(())
+    }
+
+    // Only a missing name is absent. A record replaced or retired between
+    // its read and the check that its name still holds it is unusable for
+    // that read, and a retirement is then absent at the next read.
+    #[test]
+    fn only_a_missing_name_is_an_absent_record() -> Result<()> {
+        let (_root, data, scope) = record_fixture()?;
+        let tag = activity_tag(&Uuid::new_v4());
+        // Neither the directory nor the record exists yet.
+        ensure!(observe(&data, &scope, &tag) == Observation::Absent);
+        let directory = directory(&data, &scope)?;
+        write_record(&directory, &tag, &staged(&[PreparingDatabase]))?;
+        ensure!(observe(&data, &scope, &tag) == Observation::Record(staged(&[PreparingDatabase])));
+        // A concurrent replacement after the read.
+        let replaced = observe_then(&data, &scope, &tag, || {
+            write_record(
+                &directory,
+                &tag,
+                &staged(&[PreparingDatabase, OpeningDatabase]),
+            )
+            .expect("replace the record under the reader");
+        });
+        ensure!(replaced == Observation::Unusable, "{replaced:?}");
+        // A concurrent retirement after the read.
+        let retired = observe_then(&data, &scope, &tag, || {
+            retire_record(&directory, &tag).expect("retire the record under the reader");
+        });
+        ensure!(retired == Observation::Unusable, "{retired:?}");
+        ensure!(observe(&data, &scope, &tag) == Observation::Absent);
+        // An undecodable record of any tag.
+        crate::files::write(&directory.join(RECORD), b"{")?;
+        ensure!(observe(&data, &scope, &tag) == Observation::Unusable);
+        Ok(())
+    }
+
+    // Progress is a change of the record, timed when the starter reads it:
+    // a stale record with its tag counts once and never again, a lower count
+    // after it is a change and counts, and an unusable or absent read in
+    // between moves nothing. Retirement ends the wait only after a read.
+    #[tokio::test(start_paused = true)]
+    async fn a_change_of_the_record_is_progress_and_nothing_else_is() -> Result<()> {
+        let (_root, data, scope) = record_fixture()?;
+        let directory = directory(&data, &scope)?;
+        let tag = activity_tag(&Uuid::new_v4());
+        let mut reporter = ProgressReporter::silent();
+        let spawned = tokio::time::Instant::now();
+        let mut watch = OwnerWatch::new(tag.clone(), spawned);
+        let step = Duration::from_millis(10);
+        // Nothing written: absent before any read is not a retirement.
+        ensure!(watch.poll(&data, &scope, &mut reporter) == Watched::Waiting);
+        ensure!(watch.last_progress() == spawned && watch.seen() == 0);
+        let progressing = |progress: u64| Activity {
+            stages: vec![OpeningDatabase],
+            progress,
+            failure: None,
+        };
+        write_record(&directory, &tag, &progressing(80))?;
+        tokio::time::advance(step).await;
+        let stale = tokio::time::Instant::now();
+        ensure!(watch.poll(&data, &scope, &mut reporter) == Watched::Waiting);
+        ensure!(watch.last_progress() == stale && watch.seen() == 80);
+        tokio::time::advance(step).await;
+        ensure!(watch.poll(&data, &scope, &mut reporter) == Watched::Waiting);
+        ensure!(
+            watch.last_progress() == stale,
+            "an unchanged record counted again"
+        );
+        write_record(&directory, &activity_tag(&Uuid::new_v4()), &progressing(81))?;
+        tokio::time::advance(step).await;
+        ensure!(watch.poll(&data, &scope, &mut reporter) == Watched::Waiting);
+        ensure!(watch.last_progress() == stale, "a foreign record counted");
+        write_record(&directory, &tag, &progressing(1))?;
+        tokio::time::advance(step).await;
+        let renewed = tokio::time::Instant::now();
+        ensure!(watch.poll(&data, &scope, &mut reporter) == Watched::Waiting);
+        ensure!(
+            watch.last_progress() == renewed && watch.seen() == 1,
+            "a lower count was not a change"
+        );
+        retire_record(&directory, &tag)?;
+        ensure!(watch.poll(&data, &scope, &mut reporter) == Watched::Retired);
+        ensure!(watch.last_stage() == Some(OpeningDatabase) && watch.last_progress() == renewed);
+        Ok(())
+    }
+
+    // The failing mark ends the wait with its reason, and is not progress.
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_record_ends_the_wait_with_its_reason() -> Result<()> {
+        let (_root, data, scope) = record_fixture()?;
+        let directory = directory(&data, &scope)?;
+        let tag = activity_tag(&Uuid::new_v4());
+        let mut reporter = ProgressReporter::silent();
+        let mut watch = OwnerWatch::new(tag.clone(), tokio::time::Instant::now());
+        write_record(&directory, &tag, &staged(&[CreatingDatabase]))?;
+        ensure!(watch.poll(&data, &scope, &mut reporter) == Watched::Waiting);
+        let progressed = watch.last_progress();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let failing = Activity {
+            stages: vec![CreatingDatabase],
+            progress: 2,
+            failure: Some("open active main pool: refused".into()),
+        };
+        write_record(&directory, &tag, &failing)?;
+        ensure!(
+            watch.poll(&data, &scope, &mut reporter)
+                == Watched::Failing("open active main pool: refused".into())
+        );
+        ensure!(watch.last_stage() == Some(CreatingDatabase) && watch.seen() == 2);
+        ensure!(
+            watch.last_progress() == progressed,
+            "the failing mark counted as progress"
+        );
         Ok(())
     }
 
