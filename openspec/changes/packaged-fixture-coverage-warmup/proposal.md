@@ -31,12 +31,18 @@ separate, already-landing readiness-window change.
   (`kuru_memory::provision::provision`) and warms its store template
   (`kuru_memory::test_support::warm_template_cache`) with the installed
   packaged binary as supervisor, under `.context(...)`, before starting the
-  timed clock; after the launch it asserts `TemplateCacheReceipt::verify_used`
+  timed clock; the launch's standard error must show the opening sentence
+  and never the getting-ready one, as in #168; after the conversation it
+  asserts `TemplateCacheReceipt::verify_used`
   and that the store's recorded template key equals
   `kuru_memory::test_support::template_key()`. The printed first-launch line
   states `cold` or `warm (coverage)` from the same mode value that gated the
-  warm-up. `Cold` mode (the install job, every OS, uninstrumented) is
-  byte-for-byte unchanged in behavior and assertions.
+  warm-up. The mode is computed once in `packaged_roundtrip` and held by each
+  `Installation`, so the two call-site step contexts never say "cold" for a
+  warm launch (their cold wording is unchanged). `Cold` mode (the install
+  job, every OS, uninstrumented) is unchanged in behavior and assertions;
+  only its measurement line now reads `(cold, …)` instead of
+  `(cold cache, …)`.
 - A unit test for `launch_mode` pinning `Some(_) -> Warm` and `None -> Cold`,
   deterministic and independent of the ambient test-runner environment.
 - `docs/development.md`: one sentence beside #168's native-mise-fixture

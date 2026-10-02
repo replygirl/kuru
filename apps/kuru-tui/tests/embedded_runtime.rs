@@ -9,8 +9,10 @@ mod stock_powershell;
 mod update_profiles;
 
 use anyhow::{Context, Result, ensure};
+use kuru::memory_activity::{GETTING_READY, OPENING};
 use kuru_core::MemoryConfig;
 use kuru_delivery::{archive, command::Command, shell_support};
+use kuru_memory::test_support::{self, TemplateCacheReceipt};
 use kuru_memory::{MemoryStore, OpenOptions};
 use kuru_platform::fs::{Directory, regular_file_info};
 use serde_json::Value;
@@ -659,8 +661,85 @@ fn assert_bootstrap_phases(output: &Output) -> Result<()> {
     Ok(())
 }
 
+/// How an installation's first launch meets its engine cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchMode {
+    /// The launch unpacks its engine and builds its store template itself:
+    /// the install job's proof on every OS, and every uninstrumented run.
+    Cold,
+    /// Under coverage only, the test process first warms the fixture's own
+    /// cache, as the native mise fixture does, because an instrumented build
+    /// is not a product condition.
+    Warm,
+}
+
+impl LaunchMode {
+    /// The words of the printed first-launch line.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::Warm => "warm (coverage)",
+        }
+    }
+    /// The installation's memory as the step contexts name it.
+    fn memory(self) -> &'static str {
+        match self {
+            Self::Cold => "cold offline memory",
+            Self::Warm => "coverage-warmed offline memory",
+        }
+    }
+}
+
+/// Warm only when the coverage destination is set, which is also when the
+/// fixture packages its private instrumented copy and forwards that
+/// destination to every launch.
+fn launch_mode(profile_file: Option<&OsStr>) -> LaunchMode {
+    match profile_file {
+        Some(_) => LaunchMode::Warm,
+        None => LaunchMode::Cold,
+    }
+}
+
+/// The first launch's measurement line: no threshold.
+fn first_launch_line(mode: LaunchMode, binary: &str, elapsed_ms: u128, label: &str) -> String {
+    format!(
+        "embedded_runtime first launch ({}, {binary}): {elapsed_ms} ms [{label}]",
+        mode.label()
+    )
+}
+
+#[cfg(test)]
+mod launch_mode_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_coverage_destination_warms_the_first_launch() {
+        assert_eq!(
+            launch_mode(Some(OsStr::new("/coverage/kuru-%p-%m.profraw"))),
+            LaunchMode::Warm
+        );
+        assert_eq!(launch_mode(Some(OsStr::new(""))), LaunchMode::Warm);
+        assert_eq!(launch_mode(None), LaunchMode::Cold);
+    }
+
+    #[test]
+    fn the_first_launch_line_and_step_contexts_state_the_mode() {
+        assert_eq!(
+            first_launch_line(LaunchMode::Cold, "cargo test build", 8861, "direct"),
+            "embedded_runtime first launch (cold, cargo test build): 8861 ms [direct]"
+        );
+        assert_eq!(
+            first_launch_line(LaunchMode::Warm, "cargo test build", 4200, "updated"),
+            "embedded_runtime first launch (warm (coverage), cargo test build): 4200 ms [updated]"
+        );
+        assert_eq!(LaunchMode::Cold.memory(), "cold offline memory");
+        assert!(!LaunchMode::Warm.memory().contains("cold"));
+    }
+}
+
 struct Installation {
     label: String,
+    mode: LaunchMode,
     home: PathBuf,
     config: PathBuf,
     data: PathBuf,
@@ -672,7 +751,13 @@ struct Installation {
     memory: MemoryConfig,
 }
 impl Installation {
-    fn new(root: &Path, label: &str, project: &Path, binary: &Path) -> Result<Self> {
+    fn new(
+        root: &Path,
+        label: &str,
+        mode: LaunchMode,
+        project: &Path,
+        binary: &Path,
+    ) -> Result<Self> {
         let root = root.join(label);
         fs::create_dir(&root)?;
         let home = root.join("home");
@@ -698,6 +783,7 @@ impl Installation {
         );
         Ok(Self {
             label: label.to_owned(),
+            mode,
             home,
             config,
             data,
@@ -743,16 +829,43 @@ impl Installation {
         command
     }
     async fn run(&self, args: &[&str]) -> Result<Value> {
+        Ok(self.run_with_stderr(args).await?.0)
+    }
+    /// [`Self::run`], returning its standard error beside its JSON.
+    async fn run_with_stderr(&self, args: &[&str]) -> Result<(Value, String)> {
         let output = execute(self.command().args(["--provider", "demo"]).args(args))
             .await
             .with_context(|| format!("execute installed command {args:?}"))?;
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         ensure!(
             output.status.success(),
-            "installed command {args:?} failed: {}\n{}",
+            "installed command {args:?} failed: {}\n{stderr}",
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
         );
-        serde_json::from_slice(&output.stdout).context("installed command did not return JSON")
+        let json = serde_json::from_slice(&output.stdout)
+            .context("installed command did not return JSON")?;
+        Ok((json, stderr))
+    }
+
+    /// Under coverage only, warm this installation's own engine cache as the
+    /// native mise fixture warms its own: provision the embedded engine into
+    /// it (extract, probe once, activate), then build this build's store
+    /// template beside it with the installed binary as its supervisor. The
+    /// timed first launch then copies the template with two engine starts
+    /// instead of also extracting, probing and building under one client
+    /// wait. `provision` creates the cache privately, which the installed
+    /// binary's private-directory checks require: never create it here.
+    async fn warm_engine_cache(&self) -> Result<TemplateCacheReceipt> {
+        let started = Instant::now();
+        let bound = test_support::engine_warm_up_bound();
+        let engine = tokio::time::timeout(
+            bound,
+            kuru_memory::provision::provision(&self.memory, &self.cache),
+        )
+        .await
+        .with_context(|| format!("provision the fixture engine cache exceeded {bound:?}"))??;
+        test_support::warm_template_cache(&self.cache, &engine, &self.binary).await?;
+        TemplateCacheReceipt::snapshot(&self.cache, started.elapsed())
     }
 
     async fn retire_memory(&self) -> Result<()> {
@@ -965,11 +1078,26 @@ impl Installation {
             !self.cache.exists() && !self.data.exists(),
             "cold launch must not reuse an engine or database"
         );
+        // Before the clock, and inside the caller's error path, so a failed
+        // warm-up retains the fixture root and reports itself first.
+        let receipt = match self.mode {
+            LaunchMode::Cold => None,
+            LaunchMode::Warm => Some(self.warm_engine_cache().await.context(
+                "warm the packaged fixture's engine cache and store template before its first \
+                 launch (coverage)",
+            )?),
+        };
         let started = Instant::now();
-        let first = self
-            .run(&["run", marker, "--json"])
+        let (first, stderr) = self
+            .run_with_stderr(&["run", marker, "--json"])
             .await
-            .context("first offline conversation from empty cache")?;
+            .with_context(|| match &receipt {
+                None => "first offline conversation from empty cache".to_owned(),
+                Some(receipt) => format!(
+                    "first offline conversation after {receipt}; took {} ms",
+                    started.elapsed().as_millis()
+                ),
+            })?;
         // A measurement for the install job's log only: no threshold.
         let elapsed = started.elapsed().as_millis();
         let binary = if std::env::var_os("KURU_EMBEDDED_TEST_BINARY").is_some() {
@@ -977,15 +1105,19 @@ impl Installation {
         } else {
             "cargo test build"
         };
-        let instrumented = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-            ", instrumented"
-        } else {
-            ""
-        };
         eprintln!(
-            "embedded_runtime first launch (cold cache, {binary}{instrumented}): {elapsed} ms [{}]",
-            self.label
+            "{}",
+            first_launch_line(self.mode, binary, elapsed, &self.label)
         );
+        if let Some(receipt) = &receipt {
+            // The warm engine branch reports no unpacking stage, so the
+            // getting-ready sentence never appears; the opening one always does.
+            ensure!(
+                stderr.contains(OPENING) && !stderr.contains(GETTING_READY),
+                "first launch after {receipt} did not open its engine cache as warm \
+                 (took {elapsed} ms): {stderr}"
+            );
+        }
         let session = first["session"].as_str().context("session ID")?;
         ensure!(
             !first["text"].as_str().context("first response")?.is_empty(),
@@ -1113,6 +1245,19 @@ impl Installation {
             fs::read_dir(&self.empty_path)?.next().is_none(),
             "application installed an external PATH dependency"
         );
+        if let Some(receipt) = &receipt {
+            // Every launch copied the warmed template: none built, replaced,
+            // quarantined or keyed another, and the store records this key.
+            receipt
+                .verify_used()
+                .context("the installed binary did not use its warmed store template")?;
+            let recorded = test_support::store_template_key(&self.data, &scope)?;
+            ensure!(
+                recorded.as_deref() == Some(test_support::template_key()),
+                "the installed store records template {recorded:?}, not {}",
+                test_support::template_key()
+            );
+        }
         Ok(())
     }
 }
@@ -1544,6 +1689,7 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         }
         None => PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
     };
+    let mode = launch_mode(std::env::var_os("LLVM_PROFILE_FILE").as_deref());
     let needs_private_copy = explicit.is_none()
         && (std::env::var_os("LLVM_PROFILE_FILE").is_some()
             || (cfg!(unix) && fs::metadata(&selected)?.len() > archive::MAX_ARCHIVE_BYTES as u64));
@@ -1646,7 +1792,7 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
                 .context("generated man file")?,
         "direct installation changed its stable man page"
     );
-    let first = Installation::new(root, "direct", &project, &installed)?;
+    let first = Installation::new(root, "direct", mode, &project, &installed)?;
     first.native_auth_status().await?;
     let reported = execute(first.command().arg("--version"))
         .await
@@ -1663,7 +1809,7 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
             dolt_version,
         )
         .await
-        .context("verify the direct installation's cold offline memory")?;
+        .with_context(|| format!("verify the direct installation's {}", mode.memory()))?;
     first.api_key_access().await?;
     first
         .retire_memory()
@@ -1716,7 +1862,7 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         .await?;
     #[cfg(windows)]
     verify_installed_powershell_activation(root, &installed).await?;
-    let second = Installation::new(root, "updated", &project, &installed)?;
+    let second = Installation::new(root, "updated", mode, &project, &installed)?;
     second.native_auth_status().await?;
     second
         .conversation(
@@ -1725,7 +1871,7 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
             dolt_version,
         )
         .await
-        .context("verify the updated installation's cold offline memory")?;
+        .with_context(|| format!("verify the updated installation's {}", mode.memory()))?;
     second.api_key_access().await?;
     second
         .retire_memory()
@@ -1736,9 +1882,13 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         "self-update left an unexpected companion alongside Kuru and shell support"
     );
     eprintln!(
-        "embedded runtime accepted: target={target} executable_bytes={} archive_bytes={} engine={dolt_version}; direct install and self-update each persisted chat from an empty offline cache",
+        "embedded runtime accepted: target={target} executable_bytes={} archive_bytes={} engine={dolt_version}; direct install and self-update each persisted chat from {}",
         fs::metadata(&binary)?.len(),
-        fs::metadata(archive_path)?.len()
+        fs::metadata(archive_path)?.len(),
+        match mode {
+            LaunchMode::Cold => "an empty offline cache",
+            LaunchMode::Warm => "a coverage-warmed offline cache",
+        }
     );
     Ok(())
 }
