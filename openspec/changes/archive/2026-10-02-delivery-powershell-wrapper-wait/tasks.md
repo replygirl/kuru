@@ -97,7 +97,9 @@ and the new pin test
       pid=5144 mise.exe cpu=328ms; pid=8352 cmd.exe; pid=7108 pwsh.exe
       cpu=671ms working_set=83MB". Inference, not measured: about one CPU
       second in fifteen wall seconds means the wrapper was starved while
-      starting under coverage instrumentation, not hung. Basis of the bound:
+      starting on a busy coverage runner, not hung (none of mise.exe,
+      cmd.exe or pwsh.exe is itself instrumented; only the `kuru-delivery`
+      test binary is). Basis of the bound:
       not a measured derivation; it adopts the package's existing 180 s
       per-launch convention, and the checked constraint is that this
       binary's seven serial launch budgets (1260 s) stay under the 2100 s

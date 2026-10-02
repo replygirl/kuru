@@ -8,11 +8,12 @@ failed `cmd_mise_launches_published_windows_task_wrapper_before_cargo`
 (`packages/kuru-delivery/tests/powershell_diagnostics.rs:477-497`):
 `bounded_output(&mut child, Duration::from_secs(15), 16 * 1024)` timed out
 after `15013 ms` with `stdout_eof=false stderr_eof=false` while the
-mise → cmd → pwsh wrapper chain was still starting under coverage
-instrumentation (tree at expiry: `mise.exe cpu=328ms`, `cmd.exe`, `pwsh.exe
-cpu=671ms working_set=83MB`) — inference, not measured: the instrumented
-runner was simply slower to get the wrapper to the point `bounded_output`'s
-`capture_until` observes exit, not a hang. The sibling test at line 427 uses
+mise → cmd → pwsh wrapper chain was still starting on a busy coverage
+runner (tree at expiry: `mise.exe cpu=328ms`, `cmd.exe`, `pwsh.exe
+cpu=671ms working_set=83MB`; none of these three processes is itself
+instrumented — only the `kuru-delivery` test binary is) — inference, not
+measured: the busy runner was simply slower to get the wrapper to the point
+`bounded_output`'s `capture_until` observes exit, not a hang. The sibling test at line 427 uses
 an unrelated flat 30 s for the same cmd → kuru-delivery.exe shape. Neither
 literal states what it is bounding against; per the maintainer's standing
 principle, a wait must bound a stated budget or observed progress, not a
