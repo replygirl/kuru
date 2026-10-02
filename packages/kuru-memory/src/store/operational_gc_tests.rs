@@ -76,7 +76,7 @@ async fn lost_receipt_reply_settles_and_remains_indexed_after_later_write() -> R
     let first_revision = store.revision().await?;
 
     let operation = Uuid::new_v4().to_string();
-    let (mut connection, id) = owned_connection(&store.pool).await?;
+    let (mut connection, id) = owned_connection(&store.pool, write_deadline()).await?;
     apply(
         &mut connection,
         &operation,
@@ -161,7 +161,7 @@ async fn live_transition_session_blocks_abandon_until_exact_teardown() -> Result
     let target = candidate.view().revision().await?;
     ensure_branch_clean(&store, &names.open).await?;
 
-    let (mut connection, id) = owned_connection(&store.pool).await?;
+    let (mut connection, id) = owned_connection(&store.pool, write_deadline()).await?;
     *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
         pool: store.pool.clone(),
         connection: id,
@@ -347,7 +347,7 @@ async fn held_candidate_view_delays_explicit_abandonment_without_losing_history(
     let target = candidate.view().revision().await?;
     ensure_branch_clean(&store, &names.open).await?;
     let source_pool = store.shared.server.pool(&names.open).await?;
-    let (mut held, held_id) = owned_connection(&source_pool).await?;
+    let (mut held, held_id) = owned_connection(&source_pool, write_deadline()).await?;
     let database: String = sqlx::query_scalar("SELECT DATABASE()")
         .fetch_one(&mut held)
         .await?;
@@ -436,7 +436,7 @@ async fn candidate_source_admission_waits_for_server_session_before_status_renam
     let names = CandidateNames::from_open(&candidate.view.branch)?;
     let target = candidate.view().revision().await?;
     let pool = candidate.view.pool.clone();
-    let (mut held, id) = owned_connection(&pool).await?;
+    let (mut held, id) = owned_connection(&pool, write_deadline()).await?;
     let source_database: String = sqlx::query_scalar("SELECT DATABASE()")
         .fetch_one(&mut held)
         .await?;
@@ -998,7 +998,7 @@ async fn merged_promoting_candidate(
     let names = CandidateNames::from_open(&candidate.view.branch)?;
     let target = candidate.view().revision().await?;
     transition_candidate(store, &names.open, &names.promoting, &target).await?;
-    let (mut main, _) = owned_connection(&store.pool).await?;
+    let (mut main, _) = owned_connection(&store.pool, write_deadline()).await?;
     // The owned connections that issue checked branch procedures come from
     // this pool; its session must never hold a candidate branch itself.
     let main_database: String = sqlx::query_scalar("SELECT DATABASE()")

@@ -55,8 +55,9 @@ use uuid::Uuid;
 /// The floor of an opening server's pool attempt window and identity query,
 /// and the attach probe's window. Once memory is open, pool creation and
 /// every acquisition are bounded by the budget of the work they serve
-/// instead, with a pool ceiling of `QUERY_TIMEOUT`.
-pub(crate) const ORDINARY_POOL_WINDOW: Duration = Duration::from_secs(2);
+/// instead, with a pool ceiling of `QUERY_TIMEOUT`; the pool's 2 s
+/// slow-acquire record (`pool::SLOW_ACQUIRE_THRESHOLD`) only logs.
+pub(crate) const OPENING_POOL_FLOOR: Duration = Duration::from_secs(2);
 const DATA_DIRECTORY_MISMATCH: &str = "memory server data directory mismatch";
 const IDENTITY_MISMATCH: &str = "memory SQL project/instance identity mismatch";
 const RECORD_LIMIT: usize = 64 * 1024;
@@ -963,7 +964,7 @@ impl Server {
                 &pool,
                 &self.0.directory,
                 &self.0.identity,
-                Instant::now() + self.pool_attempt_window().unwrap_or(ORDINARY_POOL_WINDOW),
+                Instant::now() + self.pool_attempt_window().unwrap_or(OPENING_POOL_FLOOR),
             )
             .await
             .context("verify memory branch pool identity")?;
@@ -1042,15 +1043,15 @@ impl Server {
     }
 
     /// While opening, the remaining startup deadline that bounded this
-    /// server's own probe, never less than the ordinary window: a slow but
+    /// server's own probe, never less than the opening floor: a slow but
     /// healthy start must not leave the next open-sequence pool with less
-    /// than an ordinary attempt. Once open, `None`: the creation budget
-    /// bounds the attempt.
+    /// than the floor. Once open, `None`: the creation budget bounds the
+    /// attempt.
     fn pool_attempt_window(&self) -> Option<Duration> {
         self.opening_deadline().map(|deadline| {
             deadline
                 .saturating_duration_since(Instant::now())
-                .max(ORDINARY_POOL_WINDOW)
+                .max(OPENING_POOL_FLOOR)
         })
     }
 
@@ -1221,7 +1222,7 @@ impl Server {
         duration: Duration,
     ) -> Result<()> {
         let database = format!("kuru/{branch}");
-        timeout(duration, async {
+        crate::pool::within(duration, async {
             loop {
                 let active: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM information_schema.processlist WHERE BINARY DB = BINARY ?",
@@ -2029,6 +2030,14 @@ impl ConnectionObservation {
         *self.0.pending_acquires.borrow()
     }
 
+    /// Completes once at least `pending` acquisitions through the pool funnel
+    /// are waiting.
+    #[cfg(test)]
+    pub(crate) async fn pending_acquires_reach(&self, pending: u64) {
+        let mut receiver = self.0.pending_acquires.subscribe();
+        let _ = receiver.wait_for(|count| *count >= pending).await;
+    }
+
     /// One pending acquisition left its slow-acquire record.
     pub(crate) fn slow_acquire_recorded(&self) {
         #[cfg(test)]
@@ -2370,8 +2379,8 @@ struct PoolAttemptOptions {
 impl PoolAttemptOptions {
     fn ordinary() -> Self {
         Self {
-            acquire_timeout: ORDINARY_POOL_WINDOW,
-            first_acquire_window: Some(ORDINARY_POOL_WINDOW),
+            acquire_timeout: OPENING_POOL_FLOOR,
+            first_acquire_window: Some(OPENING_POOL_FLOOR),
             identity_rejection_is_terminal: false,
             _test_probe_delay: None,
             #[cfg(test)]
@@ -2609,7 +2618,7 @@ where
         pool,
         directory,
         identity,
-        Instant::now() + ORDINARY_POOL_WINDOW,
+        Instant::now() + OPENING_POOL_FLOOR,
     )
     .await
 }

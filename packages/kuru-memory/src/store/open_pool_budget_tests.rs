@@ -168,7 +168,7 @@ async fn contended_acquire_outlives_the_slow_threshold_within_its_statement_budg
 async fn stage_pool_uses_remaining_startup_budget_and_post_open_pools_are_statement_bounded()
 -> Result<()> {
     // Past the opening floor, well inside the startup budget.
-    let beyond_ordinary = crate::server::ORDINARY_POOL_WINDOW * 3 / 2;
+    let beyond_ordinary = crate::server::OPENING_POOL_FLOOR * 3 / 2;
 
     let root = crate::test_support::tempdir()?;
     let mut options = crate::test_support::warmed_open_options(

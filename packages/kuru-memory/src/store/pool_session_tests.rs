@@ -606,7 +606,7 @@ async fn rejected_write_closes_its_session() -> Result<()> {
 async fn receipted_release_past_its_deadline_closes_the_connection() -> Result<()> {
     let store = MemoryStore::temporary().await?;
     let pool = store.pool.clone();
-    let (session, id) = write_session(&pool).await?;
+    let (session, id) = write_session(&pool, write_deadline()).await?;
     let (size, checked_out) = (pool.size(), pool.checked_out());
     ensure!(checked_out >= 1, "the write session is not counted as held");
     let gate = pool.observation().gate_releases();
@@ -816,7 +816,7 @@ async fn opening_first_acquire_outlasting_the_floor_is_one_working_session() -> 
         );
         let entered = Arc::new(AtomicBool::new(false));
         server.delay_next_pool_authentication(
-            crate::server::ORDINARY_POOL_WINDOW * 3 / 2,
+            crate::server::OPENING_POOL_FLOOR * 3 / 2,
             entered.clone(),
         );
         let pool = server
@@ -902,6 +902,71 @@ async fn budget_elapsed_in_execution_is_not_an_acquire_timeout() -> Result<()> {
     )
     .await??;
     ensure!(one == 1, "the next statement read {one}");
+    drop(pool);
+    store.close().await?;
+    Ok(())
+}
+
+/// The uncertain-write fence: a write's acquisition precedes its pending
+/// record, so an acquisition that fails leaves no uncertain write. A plain
+/// store has no logical receipt and nothing pending, so the first acquisition
+/// `put` makes is its write session's. Every permit is held; once that
+/// acquisition is queued, the pool is marked closed (`MemoryPool::close`, a
+/// synchronous mark; not `MemoryStore::close`, which waits for the write
+/// guard the queued worker holds), which wakes it with SQLx's `PoolClosed`.
+#[tokio::test]
+async fn acquire_failure_before_a_write_is_never_uncertain() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let pool = store.pool.clone();
+    let max = pool.options().get_max_connections();
+    let mut held = Vec::new();
+    for _ in 0..max {
+        held.push(pool.acquire().await?);
+    }
+    let writer = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .put("pool.session.fenced", &serde_json::json!(1))
+                .await
+        }
+    });
+    tokio::pin!(writer);
+    tokio::select! {
+        biased;
+        outcome = &mut writer => bail!(
+            "the write ended before its acquisition queued: {:?}",
+            outcome.map(|result| result.map_err(|error| format!("{error:#}")))
+        ),
+        () = pool.observation().pending_acquires_reach(1) => {}
+    }
+    let closing = pool.close();
+    let error = match writer.await.context("write worker panicked")? {
+        Ok(()) => bail!("a write on a closed pool succeeded"),
+        Err(error) => error,
+    };
+    ensure!(
+        error.chain().any(|cause| matches!(
+            cause.downcast_ref::<sqlx::Error>(),
+            Some(sqlx::Error::PoolClosed)
+        )),
+        "the write's failure is not its acquisition's PoolClosed: {error:#}"
+    );
+    ensure!(
+        store
+            .shared
+            .uncertain
+            .lock()
+            .expect("uncertain lock")
+            .is_none(),
+        "a write whose acquisition failed left an uncertain record: {error:#}"
+    );
+    ensure!(
+        pool.pending_acquires() == 0,
+        "the failed acquisition is still counted as pending"
+    );
+    drop(held);
+    closing.await;
     drop(pool);
     store.close().await?;
     Ok(())

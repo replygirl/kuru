@@ -88,6 +88,25 @@ notes); this artifact records the decisions it implements.
   `resolve_uncertain` fence.
 - [Task-local scope lost across `tokio::spawn` or a stream polled after its
   scope] → falls back to the 30 s ceiling, typed as `PoolCeiling`.
+- [Engine gone: a refused TCP connect is retried by SQLx inside the
+  acquisition until its bound, measured as one service test growing from
+  4.3 s to 32.3 s (`managed_inspection_meeting_a_retiring_owner_waits_for_its_reap_and_reads_its_own_generation`,
+  whose borrowed store reads after its owner's Dolt is reaped)] → inside the
+  bound rule (the bound is the statement budget), but time-to-report of that
+  terminal fault grows from 2 s to 30 s. Making a refused connect terminal,
+  as an identity rejection is, is not part of this change; documented in
+  `docs/development.md` for a separate decision.
+- [D-3 (b): `Server::pool` holds its pool map across post-open creation, now
+  bounded by the 30 s creation budget instead of about 2 s + 2 s] → a stalled
+  branch-pool creation delays every `Server::pool` call, cached lookups
+  included, for up to that budget; main and usage pools are held by the store,
+  so the exposed paths are candidate creation and inspection, receipt checks
+  during reconciliation, export and migrations.
+- [Migration command connections (`owned_connection` in `migrations.rs`) set
+  no pending record] → their acquisition and identity statement share one
+  `QUERY_TIMEOUT`; each migration statement keeps its own `bounded_query`
+  budget, so a fixture pause between statements is not charged to the
+  connection.
 - [Coverage] → the opening retry branch (server.rs:2329) is reachable only
   with `startup_timeout_secs` over 30, and the opening first-release cut loses
   its only behavior test under D-3 (b); both line-coverage deltas are reported

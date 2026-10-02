@@ -1105,7 +1105,8 @@ impl Candidate {
             if current != base {
                 return Err(CandidateConflict.into());
             }
-            let (mut connection, id) = owned_connection(&live.pool).await?;
+            let deadline = write_deadline();
+            let (mut connection, id) = owned_connection(&live.pool, deadline).await?;
             *live.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: live.pool.clone(),
                 connection: id,
@@ -1114,8 +1115,8 @@ impl Candidate {
                     target: target.clone(),
                 },
             });
-            let result = tokio::time::timeout(
-                QUERY_TIMEOUT,
+            let result = crate::pool::within_until(
+                deadline,
                 sqlx::query("CALL DOLT_MERGE(?, '--ff-only')")
                     .bind(&names.promoting)
                     .fetch_all(&mut connection),
@@ -1249,7 +1250,7 @@ async fn candidate_heads(
     pool: &MemoryPool,
     names: &CandidateNames,
 ) -> Result<BTreeMap<String, String>> {
-    let rows: Vec<(String, String)> = tokio::time::timeout(
+    let rows: Vec<(String, String)> = crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_as(
             "SELECT name, hash FROM dolt_branches WHERE BINARY name = BINARY ? OR BINARY name = BINARY ? OR BINARY name = BINARY ? ORDER BY BINARY name LIMIT 4",
@@ -1291,7 +1292,7 @@ async fn candidate_branch_is_clean(store: &MemoryStore, branch: &str) -> Result<
         .pool(branch)
         .await
         .context(CandidateFailureStage::WorkingSetInspection)?;
-    let result = tokio::time::timeout(
+    let result = crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_status").fetch_one(pool.as_ref()),
     )
@@ -1398,7 +1399,8 @@ async fn transition_candidate_with_retirement_deadline(
         .await
         .context(CandidateFailureStage::PoolRetirement)?;
     let sessions = retire_branch_sessions(store, &source_admission, retirement_deadline).await?;
-    let (mut connection, id) = owned_connection(&store.pool).await?;
+    let deadline = write_deadline();
+    let (mut connection, id) = owned_connection(&store.pool, deadline).await?;
     *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
         pool: store.pool.clone(),
         connection: id,
@@ -1408,11 +1410,9 @@ async fn transition_candidate_with_retirement_deadline(
             expected: expected.to_owned(),
         },
     });
-    let result = tokio::time::timeout(
-        QUERY_TIMEOUT,
-        sessions.rename(status).fetch_all(&mut connection),
-    )
-    .await;
+    let result =
+        crate::pool::within_until(deadline, sessions.rename(status).fetch_all(&mut connection))
+            .await;
     drop(connection);
     let settled = store
         .resolve_uncertain()
@@ -1489,7 +1489,8 @@ async fn delete_candidate_ref(
         // qualified, which the wait above cannot.
         confirm_no_live_candidate_session(store, &sessions, expected).await?;
     }
-    let (mut connection, id) = owned_connection(&store.pool).await?;
+    let deadline = write_deadline();
+    let (mut connection, id) = owned_connection(&store.pool, deadline).await?;
     *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
         pool: store.pool.clone(),
         connection: id,
@@ -1498,11 +1499,9 @@ async fn delete_candidate_ref(
             expected: expected.to_owned(),
         },
     });
-    let result = tokio::time::timeout(
-        QUERY_TIMEOUT,
-        sessions.delete(force).fetch_all(&mut connection),
-    )
-    .await;
+    let result =
+        crate::pool::within_until(deadline, sessions.delete(force).fetch_all(&mut connection))
+            .await;
     drop(connection);
     let settled = store.resolve_uncertain().await? == Some(true);
     let after = candidate_heads(&store.pool, &CandidateNames::from_status_or_open(branch)?).await?;
@@ -1523,7 +1522,8 @@ async fn confirm_no_live_candidate_session(
     expected: &str,
 ) -> Result<()> {
     let branch = sessions.branch();
-    let (mut connection, id) = owned_connection(&store.pool).await?;
+    let deadline = write_deadline();
+    let (mut connection, id) = owned_connection(&store.pool, deadline).await?;
     *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
         pool: store.pool.clone(),
         connection: id,
@@ -1532,8 +1532,8 @@ async fn confirm_no_live_candidate_session(
             expected: expected.to_owned(),
         },
     });
-    let result = tokio::time::timeout(
-        QUERY_TIMEOUT,
+    let result = crate::pool::within_until(
+        deadline,
         sessions.exclusion_probe().fetch_all(&mut connection),
     )
     .await;
@@ -2180,7 +2180,8 @@ impl MemoryStore {
             drop(lock);
         }
         // Open-sequence pools, including recovery and the usage ledger above,
-        // shared this server's startup deadline. Later pools are ordinary.
+        // shared this server's startup deadline. Later pools are created
+        // under one creation budget.
         store.shared.server.finish_opening();
         open_timeline::stamp(open_timeline::Event::StoreReady);
         progress.report(MemoryOpenStage::Ready);
@@ -2403,7 +2404,7 @@ impl MemoryStore {
         if self.branch == "main" {
             Ok(migrations::CURRENT_VERSION)
         } else {
-            tokio::time::timeout(QUERY_TIMEOUT, migrations::validate_historical(&self.pool))
+            crate::pool::within(QUERY_TIMEOUT, migrations::validate_historical(&self.pool))
                 .await
                 .context("historical memory reader validation deadline exceeded")?
         }
@@ -2420,7 +2421,7 @@ impl MemoryStore {
         } else {
             "SELECT sequence, role, content FROM (SELECT sequence, role, content FROM messages WHERE namespace = ? ORDER BY sequence DESC LIMIT ?) AS recent ORDER BY sequence"
         };
-        let rows = tokio::time::timeout(
+        let rows = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query(query)
                 .bind(namespace.as_bytes())
@@ -2463,7 +2464,7 @@ impl MemoryStore {
         // Keep count and suffix in one branch-pinned read transaction. It is a
         // short snapshot query only; provider work never holds it.
         let mut transaction = self.pool.begin().await?;
-        let total_rows: i64 = tokio::time::timeout(
+        let total_rows: i64 = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE namespace = ?")
                 .bind(namespace.as_bytes())
@@ -2471,7 +2472,7 @@ impl MemoryStore {
         )
         .await
         .context("memory history count deadline exceeded")??;
-        let rows = tokio::time::timeout(
+        let rows = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query(query)
                 .bind(namespace.as_bytes())
@@ -2521,7 +2522,7 @@ impl MemoryStore {
             "session history requires an upgraded memory view"
         );
         let mut transaction = self.pool.begin().await?;
-        let total_rows: i64 = tokio::time::timeout(
+        let total_rows: i64 = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_scalar(
                 "SELECT COUNT(*) FROM messages WHERE namespace = ? AND session_id = ?",
@@ -2532,7 +2533,7 @@ impl MemoryStore {
         )
         .await
         .context("session history count deadline exceeded")??;
-        let mut messages = tokio::time::timeout(QUERY_TIMEOUT, async {
+        let mut messages = crate::pool::within(QUERY_TIMEOUT, async {
             let mut source = sqlx::query("SELECT sequence, role, content_format, content FROM messages WHERE namespace = ? AND session_id = ? ORDER BY sequence DESC LIMIT ?")
                 .bind(namespace.as_bytes())
                 .bind(session_id.as_bytes())
@@ -2582,13 +2583,13 @@ impl MemoryStore {
         );
         let _guard = self.shared.write.lock().await;
         let mut transaction = self.pool.begin().await?;
-        let captured_revision: String = tokio::time::timeout(
+        let captured_revision: String = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')").fetch_one(&mut *transaction),
         )
         .await
         .context("session cursor history revision deadline exceeded")??;
-        let total_rows: i64 = tokio::time::timeout(
+        let total_rows: i64 = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_scalar(
                 "SELECT COUNT(*) FROM messages WHERE namespace = ? AND session_id = ? AND sequence > ?",
@@ -2600,7 +2601,7 @@ impl MemoryStore {
         )
         .await
         .context("session cursor history count deadline exceeded")??;
-        let mut rows = tokio::time::timeout(QUERY_TIMEOUT, async {
+        let mut rows = crate::pool::within(QUERY_TIMEOUT, async {
             let mut source = sqlx::query("SELECT sequence, role, content_format, content FROM messages WHERE namespace = ? AND session_id = ? AND sequence > ? ORDER BY sequence DESC LIMIT ?")
                 .bind(namespace.as_bytes())
                 .bind(session_id.as_bytes())
@@ -2668,7 +2669,7 @@ impl MemoryStore {
         );
         let _guard = self.shared.write.lock().await;
         let mut transaction = self.pool.begin().await?;
-        let captured_revision: String = tokio::time::timeout(
+        let captured_revision: String = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')").fetch_one(&mut *transaction),
         )
@@ -2681,7 +2682,7 @@ impl MemoryStore {
             );
         }
         let state = lifecycle_state.map(session_lifecycle_sql);
-        let total_rows: i64 = tokio::time::timeout(
+        let total_rows: i64 = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_scalar(
                 "SELECT COUNT(*) FROM session_catalog WHERE ? IS NULL OR lifecycle_state = ?",
@@ -2713,7 +2714,7 @@ impl MemoryStore {
         let mut records = Vec::new();
         let mut budget = SessionSourceBudget::new(limit);
         let mut has_more = false;
-        while let Some(row) = tokio::time::timeout(QUERY_TIMEOUT, source.try_next())
+        while let Some(row) = crate::pool::within(QUERY_TIMEOUT, source.try_next())
             .await
             .context("session catalog row deadline exceeded")??
         {
@@ -2766,7 +2767,7 @@ impl MemoryStore {
             self.schema_version().await? >= 7,
             "session catalog requires an upgraded memory view"
         );
-        let row = tokio::time::timeout(
+        let row = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog WHERE session_id = ?")
                 .bind(session_id.as_bytes())
@@ -2906,7 +2907,11 @@ impl MemoryStore {
                 |receipt| receipt.physical_id.clone(),
             );
             let session_id = mutation.session_id().to_owned();
-            let (mut connection, id) = write_session(&store.pool).await?;
+            // One budget, taken before the acquisition, bounds the
+            // acquisition, the fork validation, the write and its session's
+            // return, so the write ends inside the service client's wait.
+            let deadline = write_deadline();
+            let (mut connection, id) = write_session(&store.pool, deadline).await?;
             let mutation = match mutation {
                 SessionLifecycleMutation::Fork {
                     source_session_id,
@@ -2916,8 +2921,8 @@ impl MemoryStore {
                     label,
                     validated: None,
                 } => {
-                    let validated = tokio::time::timeout(
-                        QUERY_TIMEOUT,
+                    let validated = crate::pool::within_until(
+                        deadline,
                         validate_session_fork_source(
                             &mut connection,
                             &source_session_id,
@@ -2943,9 +2948,7 @@ impl MemoryStore {
                 connection: id,
                 receipt: Receipt::Operation(operation.clone()),
             });
-            // One budget bounds the write and its session's return.
-            let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
-            let result = tokio::time::timeout_at(
+            let result = crate::pool::within_until(
                 deadline,
                 apply_session_lifecycle(
                     &mut connection,
@@ -3002,7 +3005,7 @@ impl MemoryStore {
 
         let _guard = self.shared.write.lock().await;
         let mut transaction = self.pool.begin().await?;
-        let captured_revision: String = tokio::time::timeout(
+        let captured_revision: String = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')").fetch_one(&mut *transaction),
         )
@@ -3015,7 +3018,7 @@ impl MemoryStore {
             );
         }
 
-        let catalog_row = tokio::time::timeout(
+        let catalog_row = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog WHERE session_id = ?")
                 .bind(session_id.as_bytes())
@@ -3037,7 +3040,7 @@ impl MemoryStore {
         }
 
         let pending = if let Some(pending_node_id) = &catalog.pending_node_id {
-            let pending = tokio::time::timeout(
+            let pending = crate::pool::within(
                 QUERY_TIMEOUT,
                 load_public_turn(&mut transaction, pending_node_id),
             )
@@ -3086,7 +3089,7 @@ impl MemoryStore {
         let mut found_requested_turn =
             !matches!(requested, Some(PublicTranscriptPosition::Turn { .. }));
         let mut current = page_head.clone();
-        tokio::time::timeout(QUERY_TIMEOUT, async {
+        crate::pool::within(QUERY_TIMEOUT, async {
             while let Some(node_id) = current {
                 let record = load_public_turn(&mut transaction, &node_id)
                     .await?
@@ -3149,7 +3152,7 @@ impl MemoryStore {
                 .bind(prefix.first_sequence)
                 .bind(legacy_start)
                 .fetch(&mut *transaction);
-            while let Some(row) = tokio::time::timeout(QUERY_TIMEOUT, source.try_next())
+            while let Some(row) = crate::pool::within(QUERY_TIMEOUT, source.try_next())
                 .await
                 .context("legacy public transcript row deadline exceeded")??
             {
@@ -3255,7 +3258,7 @@ impl MemoryStore {
         );
         let _guard = self.shared.write.lock().await;
         let captured_revision = revision(&self.pool).await?;
-        let rows = tokio::time::timeout(QUERY_TIMEOUT, async {
+        let rows = crate::pool::within(QUERY_TIMEOUT, async {
             let mut source = sqlx::query("SELECT sequence, role, content_format, content FROM messages WHERE namespace = ? AND session_id = ? AND sequence > ? ORDER BY sequence LIMIT ?")
                 .bind(source_namespace.as_bytes())
                 .bind(session_id.as_bytes())
@@ -3341,7 +3344,7 @@ impl MemoryStore {
             schema_version >= 5,
             "context summaries require an upgraded memory view"
         );
-        let row = tokio::time::timeout(
+        let row = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query("SELECT through_sequence, summary_id, source_view, source_revision FROM context_summary_cursors WHERE actor_namespace = ? AND session_id = ? AND source_namespace = ?")
                 .bind(actor_namespace.as_bytes())
@@ -3394,7 +3397,7 @@ impl MemoryStore {
         let _guard = self.shared.write.lock().await;
         let captured_revision = revision(&self.pool).await?;
         let mut transaction = self.pool.begin().await?;
-        let total_rows: i64 = tokio::time::timeout(QUERY_TIMEOUT, async {
+        let total_rows: i64 = crate::pool::within(QUERY_TIMEOUT, async {
             match (session_id, source_namespace) {
                 (Some(session_id), Some(source_namespace)) => sqlx::query_scalar(
                     "SELECT COUNT(*) FROM context_summary_cursors c JOIN context_summaries s ON s.summary_id = c.summary_id AND s.actor_namespace = c.actor_namespace AND s.session_id = c.session_id AND s.source_namespace = c.source_namespace WHERE s.actor_namespace = ? AND s.summary_namespace = ? AND s.session_id = ? AND s.source_namespace = ?",
@@ -3432,7 +3435,7 @@ impl MemoryStore {
         })
         .await
         .context("context summary count deadline exceeded")??;
-        let mut records = tokio::time::timeout(QUERY_TIMEOUT, async {
+        let mut records = crate::pool::within(QUERY_TIMEOUT, async {
             let select = if schema_version >= 6 {
                 "SELECT s.summary_id, s.actor_namespace, s.session_id, s.source_namespace, s.summary_namespace, s.source_view, s.source_revision, s.after_sequence, s.through_sequence, s.turn_id, s.operation_id, s.producer_actor_id, s.invocation_id, s.record_format, s.summary FROM context_summary_cursors c JOIN context_summaries s ON s.summary_id = c.summary_id AND s.actor_namespace = c.actor_namespace AND s.session_id = c.session_id AND s.source_namespace = c.source_namespace"
             } else {
@@ -3529,7 +3532,7 @@ impl MemoryStore {
         } else {
             "SELECT sequence, role, content FROM (SELECT sequence, role, content FROM messages WHERE namespace = ? ORDER BY sequence DESC LIMIT ?) AS recent ORDER BY sequence"
         };
-        let rows = tokio::time::timeout(
+        let rows = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query(query)
                 .bind(namespace.as_bytes())
@@ -3756,7 +3759,7 @@ impl MemoryStore {
     pub async fn get(&self, key: &str) -> Result<Option<Value>> {
         self.readable()?;
         identifier("state key", key, 1024)?;
-        let value: Option<String> = tokio::time::timeout(
+        let value: Option<String> = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
                 .bind(key.as_bytes())
@@ -3795,7 +3798,11 @@ impl MemoryStore {
                 || Uuid::new_v4().to_string(),
                 |receipt| receipt.physical_id.clone(),
             );
-            let (mut connection, id) = write_session(&store.pool).await?;
+            // One budget, taken before the acquisition, bounds the
+            // acquisition, the write and its session's return, so the write
+            // ends inside the service client's wait.
+            let deadline = write_deadline();
+            let (mut connection, id) = write_session(&store.pool, deadline).await?;
             *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: store.pool.clone(),
                 connection: id,
@@ -3808,9 +3815,7 @@ impl MemoryStore {
                 .lock()
                 .expect("apply pause lock")
                 .take();
-            // One budget bounds the write and its session's return.
-            let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
-            let result = tokio::time::timeout_at(
+            let result = crate::pool::within_until(
                 deadline,
                 apply(
                     &mut connection,
@@ -3974,7 +3979,8 @@ impl MemoryStore {
         let created_base = base.clone();
         tokio::spawn(async move {
             let _guard = guard;
-            let (mut connection, connection_id) = owned_connection(&worker.pool).await?;
+            let deadline = write_deadline();
+            let (mut connection, connection_id) = owned_connection(&worker.pool, deadline).await?;
             *worker.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: worker.pool.clone(),
                 connection: connection_id,
@@ -3983,8 +3989,8 @@ impl MemoryStore {
                     base: created_base.clone(),
                 },
             });
-            let result = tokio::time::timeout(
-                QUERY_TIMEOUT,
+            let result = crate::pool::within_until(
+                deadline,
                 sqlx::query("CALL DOLT_BRANCH(?, ?)")
                     .bind(&created_branch)
                     .bind(&created_base)
@@ -4021,7 +4027,7 @@ impl MemoryStore {
         // For an unresolved open ref, main remains an append-only history.
         // Its exact common ancestor is the original candidate creation base,
         // including after both heads advance. A resolved ref is rejected above.
-        let base = tokio::time::timeout(
+        let base = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_scalar::<_, String>("SELECT DOLT_MERGE_BASE(?, ?)")
                 .bind(&branch)
@@ -4062,7 +4068,7 @@ impl MemoryStore {
         );
         let _guard = self.shared.write.lock().await;
         self.resolve_uncertain().await?;
-        let suffixes: Vec<String> = tokio::time::timeout(
+        let suffixes: Vec<String> = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_scalar(
                 "SELECT suffix FROM (\
@@ -4136,7 +4142,7 @@ impl MemoryStore {
             // target equal to its base has no unique outcome after cleanup.
             CandidateRefState::TransitionUncertain
         } else {
-            let base: String = tokio::time::timeout(
+            let base: String = crate::pool::within(
                 QUERY_TIMEOUT,
                 sqlx::query_scalar("SELECT DOLT_MERGE_BASE(?, ?)")
                     .bind(&names.open)
@@ -4197,7 +4203,7 @@ impl MemoryStore {
                     .context(CandidateFailureStage::RefInspection),
             );
         }
-        let base: String = tokio::time::timeout(
+        let base: String = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_scalar("SELECT DOLT_MERGE_BASE(?, ?)")
                 .bind(&names.open)
@@ -4220,7 +4226,7 @@ impl MemoryStore {
         if Arc::strong_count(&pool) != 1 {
             return Err(CandidateRefRejected(CandidateRefRefusal::Active).into());
         }
-        tokio::time::timeout(QUERY_TIMEOUT, migrations::validate_current(&pool))
+        crate::pool::within(QUERY_TIMEOUT, migrations::validate_current(&pool))
             .await
             .map_err(|_| CandidateRefRejected(CandidateRefRefusal::SchemaUnverified))
             .context(CandidateFailureStage::SchemaValidation)?
@@ -4272,7 +4278,7 @@ impl MemoryStore {
         let target_is_ancestor = if current == target {
             Some(true)
         } else {
-            match tokio::time::timeout(
+            match crate::pool::within(
                 QUERY_TIMEOUT,
                 sqlx::query_scalar::<_, String>("SELECT DOLT_MERGE_BASE(?, ?)")
                     .bind(target)
@@ -4344,7 +4350,7 @@ impl MemoryStore {
     async fn recover_candidates(&self) -> Result<()> {
         let _guard = self.shared.write.lock().await;
         self.resolve_uncertain().await?;
-        let rows: Vec<(String, String)> = tokio::time::timeout(
+        let rows: Vec<(String, String)> = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_as(
                 "SELECT name, hash FROM dolt_branches WHERE LEFT(BINARY name, ?) = BINARY ? OR LEFT(BINARY name, ?) = BINARY ? ORDER BY BINARY name LIMIT ?",
@@ -4397,7 +4403,7 @@ impl MemoryStore {
                     continue;
                 }
                 let current = self.revision().await?;
-                let merge_base: String = tokio::time::timeout(
+                let merge_base: String = crate::pool::within(
                     QUERY_TIMEOUT,
                     sqlx::query_scalar("SELECT DOLT_MERGE_BASE(?, ?)")
                         .bind(&target)
@@ -4446,7 +4452,7 @@ impl MemoryStore {
     pub async fn revisions(&self, limit: usize) -> Result<Vec<Revision>> {
         self.readable()?;
         let limit = i64::try_from(limit).context("revision limit exceeds integer range")?;
-        let rows = tokio::time::timeout(
+        let rows = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query(
                 "SELECT commit_hash, message FROM dolt_log ORDER BY commit_order DESC, commit_hash ASC LIMIT ?",
@@ -6048,7 +6054,7 @@ async fn load_session_lifecycle_outcome(
     operation: &str,
     session_id: &str,
 ) -> Result<SessionLifecycleOutcome> {
-    let result_ref: Option<Option<String>> = tokio::time::timeout(
+    let result_ref: Option<Option<String>> = crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT result_ref FROM operations WHERE id = ?")
             .bind(operation)
@@ -7484,15 +7490,29 @@ fn decode_message(role: String, format: &str, content: &str) -> Result<Message> 
     }
 }
 
-async fn owned_connection(pool: &MemoryPool) -> Result<(MySqlConnection, u64)> {
-    let mut connection = pool.acquire().await?.detach();
-    let id = tokio::time::timeout(
-        QUERY_TIMEOUT,
-        sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(&mut connection),
-    )
+/// A new write budget, `QUERY_TIMEOUT` from now. A receipt-bearing writer
+/// takes it before its pool acquisition, so one budget bounds the
+/// acquisition, the identity statement, the write and the session's return.
+fn write_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + QUERY_TIMEOUT
+}
+
+/// A detached write connection and its server session id. `deadline` is the
+/// write's one budget, taken before this acquisition: the acquisition, the
+/// identity statement and the write's later statements all spend it.
+async fn owned_connection(
+    pool: &MemoryPool,
+    deadline: tokio::time::Instant,
+) -> Result<(MySqlConnection, u64)> {
+    crate::pool::within_until(deadline, async {
+        let mut connection = pool.acquire().await?.detach();
+        let id = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&mut connection)
+            .await?;
+        Ok::<_, anyhow::Error>((connection, id))
+    })
     .await
-    .context("memory connection identity deadline exceeded")??;
-    Ok((connection, id))
+    .context("memory connection identity deadline exceeded")?
 }
 
 /// One receipt-bearing write's SQL session. Dropping it ends the session
@@ -7511,15 +7531,15 @@ impl WriteSession {
     /// `apply_change`. A writer that changes session state must let the
     /// session drop instead.
     ///
-    /// `deadline` is the write's own budget, taken before its apply. SQLx's
-    /// release ping is bounded by what remains of it: when it runs out, the
+    /// `deadline` is the write's one budget, taken before its acquisition.
+    /// SQLx's release ping is bounded by what remains of it: when it runs out, the
     /// release future is dropped, SQLx closes the floating connection and
     /// lowers the pool size, and the session already stopped counting as
     /// held when the release began. The write is receipted either way, so an
     /// expired release never turns its success into an error.
     async fn settle_receipted(mut self, deadline: tokio::time::Instant) {
         if let Some(session) = self.0.take()
-            && tokio::time::timeout_at(deadline, session.release())
+            && crate::pool::within_until(deadline, session.release())
                 .await
                 .is_err()
         {
@@ -7558,20 +7578,25 @@ impl std::ops::DerefMut for WriteSession {
 }
 
 /// A write session that stays pooled until its outcome is known; see
-/// [`WriteSession`]. `owned_connection` detaches at once instead.
-async fn write_session(pool: &MemoryPool) -> Result<(WriteSession, u64)> {
-    let mut session = WriteSession(Some(pool.acquire().await?));
-    let id = tokio::time::timeout(
-        QUERY_TIMEOUT,
-        sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(&mut *session),
-    )
+/// [`WriteSession`]. `owned_connection` detaches at once instead. `deadline`
+/// is the write's one budget, as for `owned_connection`.
+async fn write_session(
+    pool: &MemoryPool,
+    deadline: tokio::time::Instant,
+) -> Result<(WriteSession, u64)> {
+    crate::pool::within_until(deadline, async {
+        let mut session = WriteSession(Some(pool.acquire().await?));
+        let id = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&mut *session)
+            .await?;
+        Ok::<_, anyhow::Error>((session, id))
+    })
     .await
-    .context("memory connection identity deadline exceeded")??;
-    Ok((session, id))
+    .context("memory connection identity deadline exceeded")?
 }
 
 async fn await_session_end(pool: &MemoryPool, id: u64, duration: Duration) -> Result<()> {
-    tokio::time::timeout(duration, async {
+    crate::pool::within(duration, async {
         loop {
             let active: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM information_schema.processlist WHERE ID = ?",
@@ -7605,7 +7630,7 @@ async fn await_branch_sessions_end(
 }
 
 async fn operation_exists(pool: &MemoryPool, operation: &str) -> Result<bool> {
-    let result: Option<String> = tokio::time::timeout(
+    let result: Option<String> = crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT id FROM operations WHERE id = ?")
             .bind(operation)
@@ -7632,7 +7657,7 @@ fn validate_logical_query(method: &str, argument_digest: &str) -> Result<()> {
 }
 
 async fn operation_receipt_matches(pool: &MemoryPool, expected: &LogicalReceipt) -> Result<bool> {
-    let row: Option<(i8, Option<String>, Option<String>)> = tokio::time::timeout(
+    let row: Option<(i8, Option<String>, Option<String>)> = crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_as(
             "SELECT receipt_format, method, request_digest FROM operations WHERE id = ? LIMIT 2",
@@ -7653,7 +7678,7 @@ async fn operation_receipt_matches(pool: &MemoryPool, expected: &LogicalReceipt)
     }
 }
 async fn revision(pool: &MemoryPool) -> Result<String> {
-    Ok(tokio::time::timeout(
+    Ok(crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')").fetch_one(pool),
     )
@@ -7693,7 +7718,7 @@ async fn validate_schema_v1(connection: &mut MySqlConnection) -> Result<()> {
         "SELECT `key`, value FROM state LIMIT 0",
         "SELECT id, label FROM operations LIMIT 0",
     ] {
-        tokio::time::timeout(
+        crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query(query).fetch_all(&mut *connection),
         )
@@ -7865,7 +7890,7 @@ async fn recover_staging(
                         revision(pool).await? == activation.initial_revision,
                         "interrupted import revision differs from its activation record"
                     );
-                    let dirty: i64 = tokio::time::timeout(
+                    let dirty: i64 = crate::pool::within(
                         QUERY_TIMEOUT,
                         sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status")
                             .fetch_one(pool.as_ref()),
@@ -12548,7 +12573,9 @@ mod tests {
         let store = MemoryStore::temporary().await.unwrap();
         store.put("one", &json!(1)).await.unwrap();
         let operation = Uuid::new_v4().to_string();
-        let (mut connection, id) = owned_connection(&store.pool).await.unwrap();
+        let (mut connection, id) = owned_connection(&store.pool, write_deadline())
+            .await
+            .unwrap();
         apply(
             &mut connection,
             &operation,

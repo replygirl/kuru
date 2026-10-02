@@ -111,42 +111,49 @@ impl InFlightSlot {
 /// `tokio::time::timeout` does, in a budget scope the pool funnel reads: an
 /// acquisition inside it is bounded by what remains of the earliest enclosing
 /// budget, and an expiry during that acquisition is reported as its typed
-/// [`PoolAcquireTimedOut`].
-pub async fn within<F: Future>(budget: Duration, work: F) -> Result<F::Output, BudgetElapsed> {
+/// [`PoolAcquireTimedOut`]. As with `timeout`, the deadline is taken when the
+/// future is created.
+///
+/// The work is boxed before the scope's future captures it: memory
+/// statements nest inside deep service and runtime futures, and an inline
+/// work future would add the scope's layers to every caller's layout.
+pub fn within<F: Future>(
+    budget: Duration,
+    work: F,
+) -> impl Future<Output = Result<F::Output, BudgetElapsed>> {
     scoped(
         Instant::now() + budget,
         budget,
-        work,
+        Box::pin(work),
         std::future::pending(),
     )
-    .await
 }
 
 /// [`within`] for work whose budget is a deadline, as
 /// `tokio::time::timeout_at` does.
-pub async fn within_until<F: Future>(
+pub fn within_until<F: Future>(
     deadline: Instant,
     work: F,
-) -> Result<F::Output, BudgetElapsed> {
+) -> impl Future<Output = Result<F::Output, BudgetElapsed>> {
     let budget = deadline.saturating_duration_since(Instant::now());
-    scoped(deadline, budget, work, std::future::pending()).await
+    scoped(deadline, budget, Box::pin(work), std::future::pending())
 }
 
 /// [`within`] whose scope also ends, through the same expiry path, as soon as
 /// `expire` completes: an event standing in for the deadline, never a bound.
 #[cfg(test)]
-pub(crate) async fn within_or<F: Future>(
+pub(crate) fn within_or<F: Future>(
     budget: Duration,
     work: F,
     expire: impl Future<Output = ()>,
-) -> Result<F::Output, BudgetElapsed> {
-    scoped(Instant::now() + budget, budget, work, expire).await
+) -> impl Future<Output = Result<F::Output, BudgetElapsed>> {
+    scoped(Instant::now() + budget, budget, Box::pin(work), expire)
 }
 
 async fn scoped<F: Future>(
     deadline: Instant,
     budget: Duration,
-    work: F,
+    work: std::pin::Pin<Box<F>>,
     expire: impl Future<Output = ()>,
 ) -> Result<F::Output, BudgetElapsed> {
     let scope = match BUDGET_SCOPE.try_with(BudgetScope::clone) {
@@ -317,13 +324,21 @@ impl MemoryPool {
     }
 
     /// Begin a read transaction on one session; commit or rollback returns the
-    /// session inline.
+    /// session inline. The acquisition and `BEGIN` share one statement budget
+    /// (`QUERY_TIMEOUT`), nested in any enclosing budget scope; the
+    /// transaction's statements keep their own budgets.
     pub async fn begin(&self) -> Result<MemoryTransaction> {
-        let mut session = self.acquire().await?;
-        <MySql as Database>::TransactionManager::begin(&mut *session, None).await?;
-        Ok(MemoryTransaction {
-            session: Some(session),
+        within(crate::store::QUERY_TIMEOUT, async {
+            let mut session = self.acquire().await?;
+            <MySql as Database>::TransactionManager::begin(&mut *session, None).await?;
+            Ok::<_, anyhow::Error>(MemoryTransaction {
+                session: Some(session),
+            })
         })
+        .await
+        .map_err(|elapsed| {
+            anyhow::Error::from(elapsed).context("memory transaction begin deadline exceeded")
+        })?
     }
 
     /// Mark the pool closed at once, then return the wait for every
@@ -471,14 +486,27 @@ impl MemoryPool {
         }
     }
 
-    /// The slow-acquire record of an acquisition still pending at the
-    /// threshold: what it waits for so far and how much of its bound remains.
+    /// Log the slow-acquire record of an acquisition still pending at the
+    /// threshold, and count it.
     fn still_waiting(
         &self,
         started: Instant,
         authenticated_before: u64,
         scope: Option<&BudgetScope>,
     ) {
+        self.slow_record(started, authenticated_before, scope)
+            .emit();
+        self.observation.slow_acquire_recorded();
+    }
+
+    /// What an acquisition pending since `started` waits for so far and how
+    /// much of its bound remains.
+    fn slow_record(
+        &self,
+        started: Instant,
+        authenticated_before: u64,
+        scope: Option<&BudgetScope>,
+    ) -> SlowAcquireRecord {
         let (bound, budget, window, remaining) = match scope {
             Some(scope) => (
                 AcquireBound::StatementBudget,
@@ -496,25 +524,11 @@ impl MemoryPool {
                 )
             }
         };
-        let waiting = self.diagnose(started, authenticated_before, bound, budget, window);
-        tracing::warn!(
-            branch = %waiting.branch,
-            wait = waiting.wait.label(),
-            bound = waiting.bound.label(),
-            budget_ms = millis(waiting.budget),
-            remaining_ms = millis(remaining),
-            max = waiting.max,
-            size = waiting.size,
-            idle = waiting.idle,
-            checked_out = waiting.checked_out,
-            pending = self.observation.pending_acquires(),
-            waited_ms = millis(waiting.waited),
-            authenticated_total = waiting.authenticated_total,
-            authenticated_during_wait = waiting.authenticated_during_wait,
-            phase = waiting.phase.unwrap_or("none"),
-            "memory pool acquire still waiting"
-        );
-        self.observation.slow_acquire_recorded();
+        SlowAcquireRecord {
+            waiting: self.diagnose(started, authenticated_before, bound, budget, window),
+            remaining,
+            pending: self.observation.pending_acquires(),
+        }
     }
 
     /// The `Executor` form: a timeout travels as `sqlx::Error::Io` of kind
@@ -529,6 +543,42 @@ impl MemoryPool {
                 }
                 AcquireFailure::Sqlx(error) => error,
             })
+    }
+}
+
+/// The diagnostics record of an acquisition still pending at the
+/// slow-acquire threshold. It never decides an outcome. Like
+/// [`PoolAcquireTimedOut`], it holds no SQL text, credentials, endpoints or
+/// paths: only the branch name, counts, durations and a phase label.
+#[derive(Clone, Debug)]
+struct SlowAcquireRecord {
+    waiting: PoolAcquireTimedOut,
+    /// What remains of the acquisition's bound.
+    remaining: Duration,
+    /// Acquisitions of the pool pending when the record was taken.
+    pending: u64,
+}
+
+impl SlowAcquireRecord {
+    fn emit(&self) {
+        let waiting = &self.waiting;
+        tracing::warn!(
+            branch = %waiting.branch,
+            wait = waiting.wait.label(),
+            bound = waiting.bound.label(),
+            budget_ms = millis(waiting.budget),
+            remaining_ms = millis(self.remaining),
+            max = waiting.max,
+            size = waiting.size,
+            idle = waiting.idle,
+            checked_out = waiting.checked_out,
+            pending = self.pending,
+            waited_ms = millis(waiting.waited),
+            authenticated_total = waiting.authenticated_total,
+            authenticated_during_wait = waiting.authenticated_during_wait,
+            phase = waiting.phase.unwrap_or("none"),
+            "memory pool acquire still waiting"
+        );
     }
 }
 
@@ -1100,6 +1150,73 @@ mod tests {
         );
         drop(listener);
         Ok(())
+    }
+
+    /// The slow-acquire record names its wait, bound, budget, what remains of
+    /// it and the pool's counts, inside and outside a budget scope, and holds
+    /// none of the pool's credentials, endpoint or database name. The record
+    /// is built as the funnel builds it; the lazy fixture pool never
+    /// connects.
+    #[tokio::test]
+    async fn slow_acquire_record_names_its_bound_and_holds_no_secret() {
+        let ceiling = Duration::from_secs(30);
+        let pool = MemoryPool::fixture(
+            sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(ceiling)
+                .connect_lazy_with(
+                    sqlx::mysql::MySqlConnectOptions::new()
+                        .host("198.51.100.7")
+                        .username("record_secret_user")
+                        .password("record-secret-password")
+                        .database("record_secret_database")
+                        .ssl_mode(sqlx::mysql::MySqlSslMode::Disabled),
+                ),
+            "main",
+        );
+        let ensure_secret_free = |record: &SlowAcquireRecord| {
+            let text = format!("{record:?}");
+            for secret in [
+                "198.51.100.7",
+                "record_secret_user",
+                "record-secret-password",
+                "record_secret_database",
+            ] {
+                assert!(!text.contains(secret), "{secret} in {text}");
+            }
+        };
+        let unscoped = pool.slow_record(Instant::now(), 0, None);
+        assert_eq!(unscoped.waiting.branch, "main");
+        assert_eq!(unscoped.waiting.bound, AcquireBound::PoolCeiling);
+        assert_eq!(
+            (unscoped.waiting.budget, unscoped.waiting.window),
+            (ceiling, ceiling)
+        );
+        assert!(unscoped.remaining <= ceiling);
+        assert_eq!(unscoped.waiting.wait, PoolWait::NoIdentityCallback);
+        assert_eq!(
+            (
+                unscoped.waiting.max,
+                unscoped.waiting.size,
+                unscoped.waiting.checked_out,
+                unscoped.pending
+            ),
+            (1, 0, 0, 0)
+        );
+        assert_eq!(unscoped.waiting.phase, None);
+        ensure_secret_free(&unscoped);
+        let budget = Duration::from_secs(5);
+        let scoped = within(budget, async {
+            let scope = BUDGET_SCOPE.try_with(BudgetScope::clone).ok();
+            pool.slow_record(Instant::now(), 0, scope.as_ref())
+        })
+        .await
+        .expect("the record is built at once");
+        assert_eq!(scoped.waiting.bound, AcquireBound::StatementBudget);
+        assert_eq!(scoped.waiting.budget, budget);
+        assert!(scoped.waiting.window <= budget);
+        assert!(scoped.remaining <= scoped.waiting.window);
+        ensure_secret_free(&scoped);
     }
 
     /// A nested scope ends at the earliest enclosing deadline and reports

@@ -696,15 +696,21 @@ impl AttachmentState {
 
 const COMPLETED_RECEIPT_WINDOW: usize = 4096;
 
-/// What the operation budget already allows beyond one guarded SQL read: the
-/// time an outcome handler keeps for writing its reply.
+/// What the operation budget allows beyond one memory statement budget
+/// (`QUERY_TIMEOUT`): the time an outcome handler keeps for writing its
+/// reply. A service write fits the same arithmetic by construction: one write
+/// budget, taken before its pool acquisition, bounds the acquisition, its
+/// identity statement, any validation before the write, the write and its
+/// session's return, so the write ends within `QUERY_TIMEOUT` and its reply
+/// has this margin left of the client's `OPERATION_TIMEOUT`.
 const REPLY_MARGIN: std::time::Duration =
     OPERATION_TIMEOUT.saturating_sub(crate::store::QUERY_TIMEOUT);
 /// An outcome handler answers within this budget from its entry, so its reply
 /// fits the client's `OPERATION_TIMEOUT` from sending the request.
 const HANDLER_BUDGET: std::time::Duration = OPERATION_TIMEOUT.saturating_sub(REPLY_MARGIN);
-/// One lock-free probe: a pool acquire and one point read.
-const PROBE_BUDGET: std::time::Duration = crate::server::ORDINARY_POOL_WINDOW;
+/// One lock-free probe: a pool acquire and one point read. Positive evidence
+/// only: a probe that does not finish within it answers nothing.
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 const _: () =
     assert!(HANDLER_BUDGET.as_nanos() > REPLY_MARGIN.as_nanos() + PROBE_BUDGET.as_nanos());
 

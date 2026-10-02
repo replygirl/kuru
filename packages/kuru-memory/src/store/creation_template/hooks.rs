@@ -256,11 +256,11 @@ async fn execute(main: &MemoryPool, statements: &[String]) -> Result<()> {
     if statements.is_empty() {
         return Ok(());
     }
-    let mut connection = tokio::time::timeout(QUERY_TIMEOUT, main.acquire())
+    let mut connection = crate::pool::within(QUERY_TIMEOUT, main.acquire())
         .await
         .context("injected build statement connection deadline exceeded")??;
     for statement in statements {
-        tokio::time::timeout(
+        crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query(sqlx::AssertSqlSafe(statement.clone())).execute(&mut *connection),
         )
