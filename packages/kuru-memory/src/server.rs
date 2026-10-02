@@ -2574,12 +2574,17 @@ async fn connect_pool_attempt(
         .first_acquire_window
         .map(|window| Instant::now() + window);
     let acquired = loop {
-        let acquiring = async {
+        // Boxed: SQLx's acquire, which establishes the lazy connection, is
+        // about eighty nested future layers, and this attempt already sits
+        // deep inside store and server opens (the select below adds more).
+        // Inline, it pushes every opener's layout past the compiler's query
+        // depth limit; one allocation per attempt keeps it bounded.
+        let acquiring = Box::pin(async {
             match first_deadline {
                 Some(deadline) => timeout_at(deadline, pool.acquire()).await,
                 None => Ok(pool.acquire().await),
             }
-        };
+        });
         let acquired = if attempt.identity_rejection_is_terminal {
             tokio::select! {
                 biased;
