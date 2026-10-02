@@ -100,7 +100,7 @@ async fn sequential_statements_authenticate_one_session() -> Result<()> {
     .await?;
     ensure!(all == [3, 4]);
     reusing(&gate, "execute", async {
-        Ok(sqlx::query("DO 5").execute(pool.as_ref()).await?)
+        Ok(sqlx::query("SELECT 5").execute(pool.as_ref()).await?)
     })
     .await?;
     let streamed: Vec<i64> = reusing(&gate, "fetch stream", async {
@@ -292,6 +292,82 @@ async fn candidate_view_writes_reuse_candidate_pool_sessions() -> Result<()> {
     drop(gate);
     drop(view);
     candidate.abandon().await?;
+    store.close().await?;
+    Ok(())
+}
+
+/// With spare capacity and the only session held, a new connection that
+/// stalls in authentication fails the acquisition naming that wait, both
+/// through the funnel's own acquire and through a statement. SQLx's own
+/// window is the bound under test; the gate involves no time.
+#[tokio::test]
+async fn stalled_authentication_names_the_new_connection_phase() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let pool = store.pool.clone();
+    let held = pool.acquire().await?;
+    let gate = pool.observation().gate_new_authentications();
+    let authenticated = pool.authenticated();
+
+    let error = pool
+        .acquire()
+        .await
+        .err()
+        .context("a stalled authentication handed out a session")?;
+    ensure!(
+        gate.was_entered(),
+        "the acquisition did not open a connection"
+    );
+    let diagnostic = crate::pool::pool_acquire_timeout(&error)
+        .with_context(|| format!("stalled acquire carried no typed diagnostic: {error:#}"))?;
+    ensure!(
+        diagnostic.wait == crate::pool::PoolWait::NewConnection,
+        "{diagnostic}"
+    );
+    ensure!(
+        diagnostic.phase == Some(crate::server::AUTHENTICATION_GATE_PHASE),
+        "{diagnostic}"
+    );
+    ensure!(diagnostic.authenticated_during_wait == 1, "{diagnostic}");
+    ensure!(
+        diagnostic.authenticated_total == authenticated + 1,
+        "{diagnostic}"
+    );
+    ensure!(
+        (diagnostic.checked_out, diagnostic.idle) == (1, 0),
+        "{diagnostic}"
+    );
+    ensure!(diagnostic.size < diagnostic.max, "{diagnostic}");
+    ensure!(diagnostic.window == crate::server::ORDINARY_POOL_WINDOW);
+    ensure!(diagnostic.waited >= diagnostic.window, "{diagnostic}");
+    let text = format!("{error:#}");
+    ensure!(
+        text.contains(
+            "for a new connection's authentication (connection phase: authentication gate entered)"
+        ),
+        "{text}"
+    );
+
+    // A statement through the `Executor` reports the same wait in its chain.
+    let error = anyhow::Error::from(
+        sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(pool.as_ref())
+            .await
+            .err()
+            .context("a stalled authentication ran a statement")?,
+    )
+    .context("memory read failed");
+    let diagnostic = crate::pool::pool_acquire_timeout(&error)
+        .with_context(|| format!("statement carried no typed diagnostic: {error:#}"))?;
+    ensure!(diagnostic.wait == crate::pool::PoolWait::NewConnection);
+    ensure!(diagnostic.authenticated_during_wait == 1, "{diagnostic}");
+    ensure!(
+        format!("{error:#}").contains("memory pool acquire on kuru/main timed out"),
+        "{error:#}"
+    );
+
+    drop(gate);
+    held.release().await;
+    drop(pool);
     store.close().await?;
     Ok(())
 }

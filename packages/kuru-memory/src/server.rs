@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{engine::Child, files};
+use crate::{engine::Child, files, pool::MemoryPool};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 #[cfg(windows)]
@@ -190,20 +190,12 @@ pub struct ServerOptions {
 #[derive(Clone)]
 pub struct Server(Arc<ServerInner>);
 
-/// A branch pool as the server retains it: the pool lives only while a store
-/// holds it; its connection observation is kept beside it.
-struct RetainedPool {
-    pool: Weak<MySqlPool>,
-    #[cfg(test)]
-    observation: ConnectionObservation,
-}
-
 struct ServerInner {
     directory: PathBuf,
     identity: Identity,
     endpoint: Endpoint,
     read_only: bool,
-    pools: Mutex<BTreeMap<String, RetainedPool>>,
+    pools: Mutex<BTreeMap<String, Weak<MemoryPool>>>,
     pool_admission: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
     /// The deadline that bounded this owned start's readiness and first
     /// authenticated probe. Pools the store opening requests from this server
@@ -436,7 +428,7 @@ enum Response {
     TemplateRejected(String),
 }
 
-async fn drain_closed_pools(pools: &[Arc<MySqlPool>]) {
+async fn drain_closed_pools(pools: &[Arc<MemoryPool>]) {
     // `Pool::close` marks its pool closed before returning the future. Build
     // all futures first so one slow MySQL QUIT cannot leave a sibling branch
     // pool admitting work while the exact owner is being reaped.
@@ -444,7 +436,7 @@ async fn drain_closed_pools(pools: &[Arc<MySqlPool>]) {
     futures::future::join_all(drains).await;
 }
 
-async fn close_pools_and_owner(pools: &[Arc<MySqlPool>], owner: Option<Owner>) -> Result<()> {
+async fn close_pools_and_owner(pools: &[Arc<MemoryPool>], owner: Option<Owner>) -> Result<()> {
     // Mark every pool closed and first allow ordinary graceful SQL teardown.
     // SQLx can stall while gracefully closing an idle MySQL socket even after
     // the accepted query's server session has ended. Reaping our exact engine
@@ -910,7 +902,7 @@ impl Server {
         }))
     }
 
-    pub async fn pool(&self, branch: &str) -> Result<Arc<MySqlPool>> {
+    pub async fn pool(&self, branch: &str) -> Result<Arc<MemoryPool>> {
         #[cfg(test)]
         self.0
             .pool_requests
@@ -923,14 +915,11 @@ impl Server {
             !self.0.closed.load(Ordering::Acquire),
             "memory server is closed"
         );
-        if let Some(pool) = pools
-            .get(branch)
-            .and_then(|retained| retained.pool.upgrade())
-        {
+        if let Some(pool) = pools.get(branch).and_then(Weak::upgrade) {
             return Ok(pool);
         }
-        pools.retain(|_, retained| retained.pool.strong_count() != 0);
-        let (pool, _observation) = connect_pool_with_timeout(
+        pools.retain(|_, pool| pool.strong_count() != 0);
+        let (pool, observation) = connect_pool_with_timeout(
             &self.0.identity,
             &self.0.endpoint,
             &self.0.directory,
@@ -941,6 +930,9 @@ impl Server {
         )
         .await
         .context("authenticate memory branch pool")?;
+        // The first connection is already idle again and the identity queries
+        // release inline through the funnel, so both reuse that one session.
+        let pool = MemoryPool::new(pool, branch, observation);
         verify_identity_until(
             &pool,
             &self.0.directory,
@@ -950,18 +942,11 @@ impl Server {
         .await
         .context("verify memory branch pool identity")?;
         let pool = Arc::new(pool);
-        pools.insert(
-            branch.to_owned(),
-            RetainedPool {
-                pool: Arc::downgrade(&pool),
-                #[cfg(test)]
-                observation: _observation,
-            },
-        );
+        pools.insert(branch.to_owned(), Arc::downgrade(&pool));
         Ok(pool)
     }
 
-    /// The retained connection observation of the live pool for `branch`.
+    /// The connection observation of the live pool for `branch`.
     #[cfg(test)]
     pub(crate) async fn pool_observation(&self, branch: &str) -> Option<ConnectionObservation> {
         self.0
@@ -969,8 +954,8 @@ impl Server {
             .lock()
             .await
             .get(branch)
-            .filter(|retained| retained.pool.strong_count() != 0)
-            .map(|retained| retained.observation.clone())
+            .and_then(Weak::upgrade)
+            .map(|pool| pool.observation().clone())
     }
 
     /// End the opening phase once the store that started this server is
@@ -1107,7 +1092,7 @@ impl Server {
     pub(crate) async fn retire_branch_sessions<'a>(
         &self,
         admission: &'a BranchAdmission,
-        observer: &MySqlPool,
+        observer: &MemoryPool,
         deadline: Duration,
     ) -> Result<SessionsEnded<'a>> {
         self.retire_pool(&admission.branch).await?;
@@ -1120,7 +1105,7 @@ impl Server {
     /// `kuru/<branch>`. Observation alone; it grants no branch procedure.
     pub(crate) async fn await_branch_sessions_end(
         &self,
-        observer: &MySqlPool,
+        observer: &MemoryPool,
         branch: &str,
         duration: Duration,
     ) -> Result<()> {
@@ -1157,7 +1142,7 @@ impl Server {
             .lock()
             .await
             .remove(branch)
-            .and_then(|retained| retained.pool.upgrade());
+            .and_then(|pool| pool.upgrade());
         if let Some(pool) = pool {
             timeout(CLOSE_GRACE, pool.close())
                 .await
@@ -1172,7 +1157,7 @@ impl Server {
         self.0.closed.store(true, Ordering::Release);
         let pools = std::mem::take(&mut *self.0.pools.lock().await)
             .values()
-            .filter_map(|retained| retained.pool.upgrade())
+            .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
         close_pools_and_owner(&pools, owner.take()).await
     }
@@ -1191,7 +1176,7 @@ impl Server {
         self.0.closed.store(true, Ordering::Release);
         let pools = std::mem::take(&mut *self.0.pools.lock().await)
             .values()
-            .filter_map(|retained| retained.pool.upgrade())
+            .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
         close_pools_and_owner(&pools, owner.take()).await?;
         Ok(self.take_reap_guard())
@@ -1795,8 +1780,23 @@ impl ConnectionObservation {
         }
     }
 
-    /// New connections that entered this pool's authentication callback.
+    /// An observation for a pool without the identity callback.
     #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Self::new()
+    }
+
+    /// The latest authentication phase any connection of this pool reached.
+    pub(crate) fn latest_phase(&self) -> &'static str {
+        self.0
+            .progress
+            .lock()
+            .map_or("connection observation unavailable", |progress| {
+                progress.phase
+            })
+    }
+
+    /// New connections that entered this pool's authentication callback.
     pub(crate) fn authenticated(&self) -> u64 {
         self.0.authenticated.load(Ordering::SeqCst)
     }
@@ -2139,14 +2139,22 @@ async fn connect_pool_attempt(
             Err(_) => break Err(sqlx::Error::PoolTimedOut),
         }
     };
-    let result = acquired.map(|connection| {
-        drop(connection);
-        pool
-    });
+    let result = match acquired {
+        Ok(mut connection) => {
+            // Return the first connection inline so the next statement on
+            // this pool reuses it instead of racing SQLx's spawned release.
+            connection.return_to_pool().await;
+            Ok(pool)
+        }
+        Err(error) => Err(error),
+    };
     Ok((result, observation))
 }
 
-async fn verify_identity(pool: &MySqlPool, directory: &Path, identity: &Identity) -> Result<()> {
+async fn verify_identity<'p, P>(pool: P, directory: &Path, identity: &Identity) -> Result<()>
+where
+    P: sqlx::Executor<'p, Database = sqlx::MySql> + Copy,
+{
     verify_identity_until(
         pool,
         directory,
@@ -2156,12 +2164,15 @@ async fn verify_identity(pool: &MySqlPool, directory: &Path, identity: &Identity
     .await
 }
 
-async fn verify_identity_until(
-    pool: &MySqlPool,
+async fn verify_identity_until<'p, P>(
+    pool: P,
     directory: &Path,
     identity: &Identity,
     deadline: Instant,
-) -> Result<()> {
+) -> Result<()>
+where
+    P: sqlx::Executor<'p, Database = sqlx::MySql> + Copy,
+{
     timeout_at(deadline, async {
         let datadir: String = sqlx::query_scalar("SELECT @@datadir")
             .fetch_one(pool)

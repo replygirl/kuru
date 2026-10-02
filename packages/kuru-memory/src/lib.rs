@@ -5,6 +5,7 @@ mod facade;
 mod files;
 mod migration;
 mod open_timeline;
+pub mod pool;
 mod progress;
 pub mod provision;
 pub mod server;

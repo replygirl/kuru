@@ -42,7 +42,7 @@ enum Expect {
 async fn verdicts(
     registry: Registry,
     server: &Server,
-    main: &MySqlPool,
+    main: &MemoryPool,
     prefix: &str,
 ) -> (Verdict, Verdict, Verdict) {
     let oracle = verdict(
@@ -86,7 +86,7 @@ fn assert_expected(label: &str, role: &str, observed: &Verdict, expect: Expect) 
 /// classification does (its refusal may name the record instead).
 async fn assert_parity(
     label: &str,
-    roles: &[(&str, &Server, &MySqlPool)],
+    roles: &[(&str, &Server, &MemoryPool)],
     expect: Expect,
 ) -> Vec<String> {
     let mut rows = Vec::new();
@@ -116,7 +116,7 @@ struct Ref {
     dirty: bool,
 }
 
-async fn refs(main: &MySqlPool) -> Result<BTreeMap<String, Ref>> {
+async fn refs(main: &MemoryPool) -> Result<BTreeMap<String, Ref>> {
     let rows = bounded_query(
         sqlx::query("SELECT name, hash, dirty FROM dolt_branches ORDER BY name LIMIT 200")
             .fetch_all(main),
@@ -135,7 +135,7 @@ async fn refs(main: &MySqlPool) -> Result<BTreeMap<String, Ref>> {
         .collect()
 }
 
-async fn status_rows(main: &MySqlPool, branch: &str) -> Result<Vec<(String, i64, String)>> {
+async fn status_rows(main: &MemoryPool, branch: &str) -> Result<Vec<(String, i64, String)>> {
     let rows = bounded_query(
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT table_name, staged, status FROM {} ORDER BY BINARY table_name, staged, BINARY status LIMIT 16",
@@ -225,7 +225,7 @@ async fn validates_at(server: &Server, commit: &str, expected: i32) -> Result<bo
     Ok(validated.is_ok())
 }
 
-async fn open_reader(store: &MemoryStore) -> Result<(Server, Arc<MySqlPool>)> {
+async fn open_reader(store: &MemoryStore) -> Result<(Server, Arc<MemoryPool>)> {
     let directory = store.shared.directory.clone();
     let data_dir = directory
         .parent()
@@ -265,7 +265,7 @@ async fn main_pool_classification_agrees_with_branch_pool_classification() -> Re
     let (reader_server, reader_pool) = open_reader(&store).await?;
     let outcome = async {
         let root_server = &store.shared.server;
-        let roles: [(&str, &Server, &MySqlPool); 2] = [
+        let roles: [(&str, &Server, &MemoryPool); 2] = [
             ("root", root_server, store.pool.as_ref()),
             ("kuru_reader", &reader_server, reader_pool.as_ref()),
         ];
@@ -519,7 +519,7 @@ struct IdentityRecord {
 
 /// Adopt main and the usage ledger to `instance` on one detached session, as
 /// a template-born store will: retained migration branches keep the old row.
-async fn adopt(main: &MySqlPool, scope: &str, from: &str, to: &str) -> Result<()> {
+async fn adopt(main: &MemoryPool, scope: &str, from: &str, to: &str) -> Result<()> {
     let mut connection = acquire(main).await?.detach();
     let adopted = async {
         for database in [
@@ -720,18 +720,21 @@ async fn historical_classification_opens_no_branch_or_commit_pools() -> Result<(
 
 /// A pool whose every acquire fails: any statement sent to it surfaces as a
 /// connection error, never as the input guard's message.
-fn unreachable_pool() -> MySqlPool {
-    MySqlPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(Duration::from_millis(200))
-        .connect_lazy_with(
-            MySqlConnectOptions::new()
-                .host("127.0.0.1")
-                .port(1)
-                .username("nobody")
-                .database(DATABASE)
-                .ssl_mode(MySqlSslMode::Disabled),
-        )
+fn unreachable_pool() -> MemoryPool {
+    MemoryPool::fixture(
+        MySqlPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy_with(
+                MySqlConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(1)
+                    .username("nobody")
+                    .database(DATABASE)
+                    .ssl_mode(MySqlSslMode::Disabled),
+            ),
+        "main",
+    )
 }
 
 #[tokio::test]
