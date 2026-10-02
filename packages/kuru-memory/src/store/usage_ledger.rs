@@ -567,13 +567,13 @@ pub(super) async fn record_unrecorded_head(store: &MemoryStore) -> Result<()> {
 
 /// Whether the usage head records this validator and the live content.
 #[cfg(test)]
-pub(super) async fn head_records_live_state(pool: &MySqlPool) -> Result<bool> {
+pub(super) async fn head_records_live_state(pool: &MemoryPool) -> Result<bool> {
     Ok(bound_check(pool).await?.bound)
 }
 
 /// The live `state` content hash.
 #[cfg(test)]
-pub(super) async fn live_state_hash(pool: &MySqlPool) -> Result<String> {
+pub(super) async fn live_state_hash(pool: &MemoryPool) -> Result<String> {
     state_hash(pool).await
 }
 
@@ -4136,7 +4136,7 @@ mod tests {
     /// writable open (twice, around `upgrade_usage`). It is deliberately not
     /// `validate_owned_row`, so a change to the shared validator cannot hide
     /// a difference here.
-    async fn older_validate_branch(pool: &MySqlPool) -> Result<u64> {
+    async fn older_validate_branch(pool: &MemoryPool) -> Result<u64> {
         let dirty: i64 = tokio::time::timeout(
             QUERY_TIMEOUT,
             sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status").fetch_one(pool),
@@ -4209,7 +4209,7 @@ mod tests {
     /// An older binary's `mark_new_session` write, as origin/main `d17dfe40`
     /// commits it: no state precondition, no row validator, and a commit
     /// message without a record.
-    async fn older_mark_new_session(pool: &MySqlPool, session_id: &str) -> Result<()> {
+    async fn older_mark_new_session(pool: &MemoryPool, session_id: &str) -> Result<()> {
         let operation = Uuid::new_v4().to_string();
         let mut transaction = pool.begin().await?;
         sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)")

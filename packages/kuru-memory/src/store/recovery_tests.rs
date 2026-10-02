@@ -1644,7 +1644,7 @@ fn usage_pending(store: &MemoryStore) -> bool {
         .is_some()
 }
 
-async fn usage_receipts(pool: &MySqlPool) -> Result<i64> {
+async fn usage_receipts(pool: &MemoryPool) -> Result<i64> {
     Ok(tokio::time::timeout(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT COUNT(*) FROM operations").fetch_one(pool),
@@ -3412,7 +3412,7 @@ impl ReservedAckDropProxy {
     /// Drop the first request for `statement` before the server sees it.
     fn start_absent_at(
         self,
-        observer: Arc<MySqlPool>,
+        observer: Arc<MemoryPool>,
         statement: &'static str,
         observation: DurableObservation,
     ) -> AckDropProxy {
