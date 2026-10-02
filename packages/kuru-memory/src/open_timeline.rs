@@ -389,9 +389,10 @@ impl Timeline {
         Ok(())
     }
 
-    /// Stop streaming and remove the stream file this owner created. A
-    /// removal a concurrent reader leaves uncertain on Windows is not
-    /// retried; nothing here fails or waits.
+    /// Stop streaming and remove the stream file this owner created, through
+    /// the checked removal: on Unix it syncs the directory once, as endpoint
+    /// publication does. A removal a concurrent reader leaves uncertain on
+    /// Windows is not retried; nothing here fails, waits or retries.
     pub(crate) fn end_stream(&self) {
         let stream = self
             .log

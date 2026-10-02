@@ -742,7 +742,9 @@ activity record. The file is owner-private and create-only. Each stamp adds
 one unsynced line of at most 62 bytes, `<event> <offset-ns> <unix-ns>`, and
 nothing else. The owner removes its stream while it holds owner authority:
 right after publishing its endpoint and before serving, or when its open
-fails, never in close. It never appends to or removes a stream it did not
+fails, never in close. That is one checked removal, which on Unix syncs the
+stream's directory once, as endpoint publication does; it never waits or
+retries. It never appends to or removes a stream it did not
 create, so a stream left by a killed owner stays until removed by hand.
 
 A starter whose own environment holds the variable exactly `1` reads its own
