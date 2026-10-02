@@ -587,7 +587,8 @@ jobs:
       # Retry rule, median budgets only: when the first series holds every
       # run, readiness and engine start check but misses a median budget,
       # the same command measures one more full main series (same n and
-      # cases, fresh scratch) and fails only if that series misses too.
+      # cases, fresh scratch) and fails only if that series fails a check
+      # too.
       # Runner noise moves medians, not counts: a count violation or a
       # failed open in either series fails at once, and there is never a
       # third series. A persistent miss is fixed by re-deriving the budgets
