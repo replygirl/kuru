@@ -31,7 +31,7 @@ mod served_owner;
 #[cfg(test)]
 pub(crate) use served_owner::{
     FixtureDeadline, ServeEvents, expect_events, expect_no_event, next_event, observed,
-    serve_without_deadline,
+    serve_without_deadline, settle,
 };
 /// Opt-in aged-store fixture for open-time measurement (`age-store`).
 pub mod aged_store;

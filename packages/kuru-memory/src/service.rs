@@ -5716,32 +5716,73 @@ mod tests {
 
     #[tokio::test]
     async fn crashed_owner_retains_accepted_receipt_after_sibling_write() -> Result<()> {
+        let (_, outcome) = crashed_owner_receipt_fixture(None).await?;
+        outcome
+    }
+
+    /// The failure the crash fixture's early-exit test injects.
+    const CRASH_FIXTURE_INJECTED: &str = "injected crash-fixture failure while its owner serves";
+
+    /// A crash fixture that fails while its spawned owner and that owner's
+    /// Dolt are running reports its own error, after the killed owner's
+    /// supervisor has reaped Dolt: the root is released, not kept, and no
+    /// teardown error or guard verdict is attached to the injected error.
+    #[tokio::test]
+    async fn crashed_owner_fixture_failure_is_reported_after_its_engine_quiesces() -> Result<()> {
+        let (root, outcome) = crashed_owner_receipt_fixture(Some(CRASH_FIXTURE_INJECTED)).await?;
+        let error = outcome
+            .err()
+            .context("the injected failure was not reported")?;
+        ensure!(
+            format!("{error:#}") == CRASH_FIXTURE_INJECTED,
+            "the fixture reported {error:#}"
+        );
+        ensure!(!root.exists(), "fixture root {} was kept", root.display());
+        Ok(())
+    }
+
+    /// A spawned owner accepts a write whose reply is lost, a sibling writes,
+    /// the owner crashes, and the elected successor recovers the accepted
+    /// receipt. Returns the fixture root's path and the fixture's outcome
+    /// after the root's release.
+    ///
+    /// The root and options live outside the timed stage. On every exit path
+    /// (success, a body error, `inject` failing the body while the owner
+    /// serves, or an elapsed deadline, which drops the stage and with it
+    /// `KillServiceOnDrop`), the fixture then awaits managed quiescence, so
+    /// the killed owner's supervisor has reaped Dolt (or a successor has
+    /// retired) before the root is released. A body error is returned first.
+    async fn crashed_owner_receipt_fixture(
+        inject: Option<&'static str>,
+    ) -> Result<(PathBuf, Result<()>)> {
         use tokio::io::AsyncWriteExt;
 
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: the fresh crashed spawned owner, then the elected successor that reopens
         // the store and maintenance retires.
         let budget = crate::test_support::fixture_deadline(1, 1);
+        let deadline =
+            crate::test_support::FixtureDeadline::start(budget, "crashed-owner receipt fixture");
         let fixture_deadline = tokio::time::Instant::now() + budget;
-        tokio::time::timeout_at(fixture_deadline, async {
-            let root = crate::test_support::tempdir()?;
-            let project = root.path().join("project");
-            std::fs::create_dir(&project)?;
-            let project = project.canonicalize()?;
-            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-            let scope = format!(
-                "project/{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let data = root.path().join("private");
-            let executable = crate::store::test_supervisor()?;
-            let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
-            options.config.cache_dir = Some(crate::store::test_cache());
-            options.config.offline = true;
-            options.supervisor = Some(executable.clone());
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let data = root.path().join("private");
+        let executable = crate::store::test_supervisor()?;
+        let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+        options.config.cache_dir = Some(crate::store::test_cache());
+        options.config.offline = true;
+        options.supervisor = Some(executable.clone());
+        let stage = deadline.run(async {
             let _gate = crate::spawn_gate::spawning().await;
             let diagnostic_path = root.path().join("crash-service.stderr");
             let mut diagnostic = File::options()
@@ -5901,6 +5942,9 @@ mod tests {
                 process.0.try_wait()?.is_none(),
                 "fixture owner exited before the deliberate crash"
             );
+            if let Some(failure) = inject {
+                bail!(failure);
+            }
             process.terminate()?;
             drop(sibling);
             tokio::time::timeout(Duration::from_secs(10), async {
@@ -5983,16 +6027,18 @@ mod tests {
                 .await
                 .context("successor did not retire for fixture maintenance")?;
             drop(permit);
-            // Both owners ran in other processes; record their store's
-            // quiescence before the guarded root drops.
-            crate::test_support::await_managed_quiescence(&options).await?;
             Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .with_context(|| {
-            format!("crashed-owner receipt fixture exceeded its {budget:?} deadline")
-        })??;
-        Ok(())
+        });
+        // Both owners ran in other processes. On every exit path, record
+        // their store's quiescence before the guarded root is released: the
+        // successor retires, or the killed owner's supervisor reaps Dolt.
+        let outcome = crate::test_support::settle(
+            stage.await,
+            crate::test_support::await_managed_quiescence(&options),
+        )
+        .await;
+        let path = root.path().to_path_buf();
+        Ok((path, root.release(outcome)))
     }
 
     #[tokio::test]

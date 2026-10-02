@@ -3,84 +3,64 @@
 ## Why
 
 `service::tests::crashed_owner_retains_accepted_receipt_after_sibling_write`
-failed in PR #133's run (36998368110, macos-latest coverage partition 1, job
-110810405623): the fixture-root guard (`test_support::fixture_dir`) panicked
-at teardown with "was released without awaited memory quiescence … store
-…/memory/e9e956f6…1 has no quiescence record". The test ran 158 other
-real-engine fixtures clean in the same partition, including several that
-specifically exercise crash/reap paths (`owner_retires_at_once_when_its_starter_detaches`,
-`rejected_publication_reaps_engine_before_owner_lock_releases`), and the
-successor election this test itself performs (`attach_or_spawn_elected`
-waiting on the owner lock, then `Server::open`/`open_inner` taking the
-project's lifecycle lease) cannot proceed while the crashed owner's
-lifetime-pipe supervisor still holds that lease and is still reaping Dolt —
-so the successor's later `attach_or_start` returning at all is itself
-evidence the product-side reap already completed.
+failed in PR #133's run 36998368110 (macos-latest coverage partition 1, job
+110810405623). The fixture-root guard panicked with "fixture root … was
+released without awaited memory quiescence … store …/memory/e9e956f6… has no
+quiescence record". The test ended at most 21.6 s after its binary started,
+while its `fixture_deadline(1, 1)` budget is over 96 s, so its body returned an
+early error. The guard's panic replaced that error, and it is not in the log.
 
-The test calls `test_support::await_managed_quiescence` exactly once, at the
-very end of its body, after the successor's maintenance permit is dropped.
-Every earlier fallible step (`?` on I/O and RPC calls, every `ensure!`, the
-`fixture_readiness_error` early returns, and the outer `tokio::time::timeout_at`
-cancelling the body on budget expiry) drops the fixture's `TempDir` without
-ever reaching that call. `TempDir`'s own `Drop` impl then runs the same
-unexplained-store scan and panics — and because the thread is not yet
-unwinding at that point, that panic *replaces* whatever error or timeout the
-body was actually returning, so the CI log shows only the guard's "no
-quiescence record" message with no trace of the real failure. This is the
-same failure the module's own `release(outcome)` helper and the
-`served_owner` test `a_body_error_is_returned_first_with_a_teardown_error_attached`
-exist to prevent; this fixture does not yet use that pattern.
+The product reaps the crashed owner's engine. The supervisor runs in its own
+process group and takes Dolt down on lifetime-pipe EOF. It holds the
+lifecycle lease until Dolt is reaped, and the successor's supervisor waits for
+that lease. The leak is in the fixture. Its root and its single
+`await_managed_quiescence` both lived inside the timed body, and quiescence
+was awaited only on the success tail. Every early `?`, `ensure!`, `bail!` or
+readiness return, and an elapsed deadline, dropped the root right after
+`KillServiceOnDrop` SIGKILLed the service without waiting. The orphaned
+supervisor was then still stopping Dolt. PR #125 named this class
+("guarded roots created inside a `tokio::time::timeout` future without serving
+an owner") as an open follow-on.
 
 ## What Changes
 
-Restructure the fixture so its `TempDir` is held outside the body's fallible
-`async` block and released through `TempDir::release(outcome)` on every exit
-path — the happy path, an early `?`/`ensure!` return, and an outer-deadline
-cancellation alike — instead of being dropped implicitly. Before `release`
-runs, the fixture performs its existing cleanup (killing the owner process via
-`KillServiceOnDrop`, which already happens on scope exit) and attempts
-`await_managed_quiescence` so a failing run still records quiescence and
-frees its temp directory when the owner and any successor have actually
-quiesced, bounded by the helper's own `SUPERVISOR_REAP_ALLOWANCE` wait with no
-new deadline. A body error is returned first, with any teardown violation
-attached as context, matching the `served_owner` contract already proven
-elsewhere in this module.
-
-Add a second, deterministic fixture that forces an early failure after the
-owner is killed (an injected `bail!`) and asserts: (a) the surfaced error is
-the injected failure, not the guard's "no quiescence record" message, and (b)
-the fixture root is actually released (not kept) once the killed owner's
-engine quiesces. This test fails today (it panics with the guard's message
-instead of the injected one) and passes once the restructure lands.
-
-No product code changes: `packages/kuru-memory/src/server.rs`'s crash/reap
-path, `attach_or_spawn_elected`, `ORDINARY_POOL_WINDOW` and the supervisor
-readiness deadline are untouched.
-
-## Capabilities
-
-### New Capabilities
-
-None.
-
-### Modified Capabilities
-
-None — the fixture-root quiescence guard's behavior was already correct and
-is not changing; this fixes the one test that did not use it on every exit
-path.
+- `packages/kuru-memory/src/service.rs` (tests module only):
+  - The crash-then-elect body moves into one fixture function,
+    `crashed_owner_receipt_fixture`, with the same steps and assertions. It
+    takes an optional injected failure. Its root and options sit outside the
+    timed stage, and the stage runs through `FixtureDeadline::run`. After the
+    stage, on every exit path (success, body error, elapsed deadline), it
+    awaits `await_managed_quiescence` through `settle`, and then releases the
+    root with `TempDir::release`. A body error is printed and returned first,
+    and any teardown failure or guard verdict is attached as context. The
+    success tail no longer calls `await_managed_quiescence` itself, so the
+    call still runs exactly once.
+  - `crashed_owner_retains_accepted_receipt_after_sibling_write` runs the
+    fixture without an injection and covers the same crash-recovery receipt
+    contract as before.
+  - New `crashed_owner_fixture_failure_is_reported_after_its_engine_quiesces`
+    injects a failure after the sibling's write and the owner-liveness check,
+    before the deliberate crash, while the owner's Dolt is certainly running.
+    It asserts two things. The reported error is exactly the injected text,
+    with no teardown error or guard verdict attached. The fixture root no
+    longer exists, so it was released and not kept. On the old structure this
+    test fails with the guard's panic.
+- `packages/kuru-memory/src/test_support.rs`: `settle` joins the existing
+  `cfg(test)` re-exports from `served_owner`.
 
 ## Impact
 
-- `packages/kuru-memory/src/service.rs` — restructures
-  `crashed_owner_retains_accepted_receipt_after_sibling_write` (test-only) and
-  adds one new `#[tokio::test]` fixture (test-only) exercising the same
-  crash-then-elect lifecycle with an injected early failure.
-- No changes to `packages/kuru-memory/src/server.rs`, `src/test_support.rs`,
-  or any other non-test file.
-
-## Surfaces
-
-- [ ] interactive
-- [ ] deploy
-- [ ] integration
-- [ ] agent-behavior
+- Test-only. No product code, spec, on-disk format or deadline changes.
+  `server.rs`, `attach_or_spawn_elected`, `ORDINARY_POOL_WINDOW` and the
+  supervisor readiness deadline are untouched.
+- The quiescence wait now runs after the fixture deadline's timed stage on
+  every path, following the `served_owner` precedent. It keeps its existing
+  bounds: 10 s in `retire_idle_service`, `startup_timeout_secs` in the
+  maintenance-permit loops, and `SUPERVISOR_REAP_ALLOWANCE` per store
+  directory.
+- Adds one real spawned-owner fixture (one fresh lifecycle plus the crashed
+  supervisor's reap) to the kuru-memory lib suite and its coverage partition.
+  The measured time is recorded in `tasks.md`.
+- Out of scope: the other guarded roots created inside timeout futures
+  (service.rs near 3682, 6008, 6212 and 6489; store.rs near 12818 and 13017).
+  They are not implicated in this failure.

@@ -1,4 +1,4 @@
-schema: fix
+schema: test
 created: 2026-10-02
-schemaVersion: 2
 skip_specs: true
+schemaVersion: 2
