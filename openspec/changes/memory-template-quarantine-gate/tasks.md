@@ -98,6 +98,22 @@ to gate, rather than author a fix.
       enough for one ungated `temporary()`/`temporary_cold()` call on the
       other thread to race the exclusive-lock try inside this test's
       write guard.
+- [x] 2.6 Look for supporting (not conclusive) evidence that an ungated
+      spawn was active during the failing run — verify by reading the job
+      log for a test that both finished close to the failure report and
+      calls `temporary()`/`temporary_cold()` directly.
+      Observed: the job log shows
+      `store::migrations::publication_record_tests::unrecorded_failed_attempt_is_still_fully_classified`
+      finishing in the same coverage partition before the "failures:"
+      block printed; reading it
+      (`publication_record_tests.rs:477-478`) shows it calls
+      `MemoryStore::temporary_cold().await?` directly, ungated. This is
+      supporting evidence only — cargo prints a binary's failures after
+      every test in it completes, so temporal proximity in the log does
+      not establish the exact-moment lock overlap; no log evidence
+      identifies which concurrent spawn, if any single one did, held the
+      flock duplicate at the critical instant. Recorded in proposal.md as
+      an explicit inference, not a proven cause.
 
 ## 3. Sweep every quarantine assertion in the two scoped files
 
