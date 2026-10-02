@@ -437,11 +437,17 @@ must show the opening sentence and never the getting-ready one. A
 root, and the store's recorded template key
 (`test_support::store_template_key` equal to `test_support::template_key()`)
 prove the launches used it. Warm such a cache only for a binary built from
-the same commit. The packaged `embedded_runtime` fixture stays cold: it is the
-suite's proof that an installed executable unpacks its own engine and builds
-its own template in one launch. Its `--nocapture` run prints one
-`embedded_runtime first launch (cold cache, …): <ms> ms [<label>]` line per
-installation, a measurement with no threshold.
+the same commit. The packaged `embedded_runtime` fixture stays cold in the
+Installation job on every OS: it is the suite's proof that an installed
+executable unpacks its own engine and builds its own template in one launch.
+Under coverage only (when `LLVM_PROFILE_FILE` is set), it warms each
+installation's own cache the same way before that installation's first launch,
+since an instrumented build is not a product condition, and checks the
+launch's standard error, the receipt and the store's template key as above.
+Its `--nocapture` run prints one
+`embedded_runtime first launch (cold, …): <ms> ms [<label>]` line per
+installation, or `(warm (coverage), …)` under coverage, a measurement with no
+threshold.
 
 `test_support::warm_runtime_cache()` warms both halves of the shared cache
 once per test process, before any fixture deadline: it provisions the engine,
