@@ -879,3 +879,64 @@ fn a_failure_reason_never_carries_a_connection_secret() {
         "pool refused [redacted] and [redacted] twice: [redacted]"
     );
 }
+
+/// A supervisor that takes its startup request and never answers reaches the
+/// one readiness deadline in its Ready-frame step: the outer cause is
+/// unchanged, the step is named, and the supervisor was reaped before the
+/// error returned. Real clock: the wait is the product's own deadline, the
+/// smallest startup timeout plus the supervisor transport allowance, because
+/// the reap after it polls on the clock that a paused test would race.
+#[tokio::test]
+async fn supervisor_readiness_deadline_names_its_part() -> Result<()> {
+    let root = fixture()?;
+    let script = root.path().join("silent-supervisor");
+    fs::write(&script, b"#!/bin/sh\ncat >/dev/null\n")?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    let directory = root.path().join("store");
+    let options = ServerOptions {
+        binary: "/unexecuted".into(),
+        directory: directory.clone(),
+        project_scope: "project/silent".into(),
+        supervisor: script,
+        timeout: Duration::from_millis(1),
+        read_only: false,
+        retained: None,
+        lifecycle_root: None,
+        ticks: None,
+    };
+    // Holds the spawn gate across the supervisor spawn only.
+    let error = Server::open_with_initial_probe_delay(
+        options,
+        Duration::ZERO,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .err()
+    .context("a silent supervisor was reported ready")?;
+    let rendered = format!("{error:#}");
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.to_string() == "memory supervisor readiness deadline exceeded"),
+        "the outer cause changed: {rendered}"
+    );
+    assert!(
+        rendered.starts_with(
+            "memory supervisor readiness deadline exceeded: the supervisor's Ready frame had not completed "
+        ) && rendered.contains(" ms after the supervisor was spawned: deadline has elapsed"),
+        "{rendered}"
+    );
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<tokio::time::error::Elapsed>()),
+        "{rendered}"
+    );
+    // The reap after the deadline succeeded: no cleanup failure was added.
+    assert!(
+        !rendered.contains("memory startup cleanup also failed"),
+        "{rendered}"
+    );
+    assert!(!directory.join("endpoint.json").exists());
+    Ok(())
+}

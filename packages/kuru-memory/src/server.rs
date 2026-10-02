@@ -665,10 +665,12 @@ impl Server {
             let child = command
                 .spawn()
                 .context("start memory lifetime supervisor")?;
+            let spawned = Instant::now();
             // The test gate guards this process's child creation, not the
             // supervisor's later startup or the delayed authentication probe.
             #[cfg(test)]
             drop(creation);
+            crate::open_timeline::stamp(crate::open_timeline::Event::SupervisorSpawned);
             drop(_test_spawn_guard);
             let mut owner = Owner {
                 child: Some(child),
@@ -696,16 +698,18 @@ impl Server {
                 .context("supervisor readiness pipe missing")?;
             owner.lifetime = Some(pipe::Sender::from_owned_fd(OwnedFd::from(lifetime))?);
             let mut output = pipe::Receiver::from_owned_fd(OwnedFd::from(output))?;
+            let step = ReadinessStep::new(ReadinessPart::Write);
             let response = timeout_at(startup_deadline, async {
                 write_frame(owner.lifetime.as_mut().expect("owned lifetime"), &request)
                     .await
                     .context("send memory supervisor startup request")?;
+                step.set(ReadinessPart::Read);
                 read_frame::<_, Response>(&mut output)
                     .await
                     .context("read memory supervisor readiness response")
             })
             .await
-            .context("memory supervisor readiness deadline exceeded")
+            .map_err(|elapsed| readiness_deadline(elapsed.into(), step.get(), spawned))
             .and_then(|response| response);
             (owner, response)
         };
@@ -742,6 +746,8 @@ impl Server {
                 .spawn()
                 .await
                 .context("start memory lifetime supervisor")?;
+            let spawned = Instant::now();
+            crate::open_timeline::stamp(crate::open_timeline::Event::SupervisorSpawned);
             drop(_test_spawn_guard);
             let accept = listener.accept(
                 &child,
@@ -759,22 +765,31 @@ impl Server {
                 #[cfg(any(test, feature = "test-support"))]
                 ledger: Some(crate::test_support::engine_ledger::register(&directory)),
             };
+            let step = ReadinessStep::new(ReadinessPart::Accept);
             let response = timeout_at(startup_deadline, async {
-                owner.lifetime = Some(
-                    accept
-                        .await
-                        .context("accept memory supervisor private channel")?,
-                );
+                // The accept's own timer runs to the same deadline. When it
+                // fires first, its timeout is this deadline, reported as one.
+                let accepted = accept.await.map_err(|error| {
+                    match readiness_deadline_part(&error, Instant::now(), startup_deadline) {
+                        Some(part) => readiness_deadline(error.into(), part, spawned),
+                        None => anyhow::Error::new(error)
+                            .context("accept memory supervisor private channel"),
+                    }
+                })?;
+                crate::open_timeline::stamp(crate::open_timeline::Event::ChannelAccepted);
+                owner.lifetime = Some(accepted);
                 let channel = owner.lifetime.as_mut().expect("owned lifetime");
+                step.set(ReadinessPart::Write);
                 write_frame(channel, &request)
                     .await
                     .context("send memory supervisor startup request")?;
+                step.set(ReadinessPart::Read);
                 read_frame::<_, Response>(channel)
                     .await
                     .context("read memory supervisor readiness response")
             })
             .await
-            .context("memory supervisor readiness deadline exceeded")
+            .map_err(|elapsed| readiness_deadline(elapsed.into(), step.get(), spawned))
             .and_then(|response| response);
             (owner, response)
         };
@@ -1335,6 +1350,80 @@ async fn finish_owner(owner: &mut Owner) -> Result<()> {
         let _ = observer.send(());
     }
     Ok(())
+}
+
+/// The step a supervisor start was in when its readiness deadline passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ReadinessPart {
+    /// Only a Windows start accepts a private channel.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Accept,
+    Write,
+    Read,
+}
+
+impl std::fmt::Display for ReadinessPart {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Accept => "the supervisor's private channel accept",
+            Self::Write => "the startup request write",
+            Self::Read => "the supervisor's Ready frame",
+        })
+    }
+}
+
+/// The current [`ReadinessPart`], set by the readiness steps and read after
+/// the deadline dropped them. Atomic only so the start stays `Send`.
+struct ReadinessStep(std::sync::atomic::AtomicU8);
+
+impl ReadinessStep {
+    fn new(part: ReadinessPart) -> Self {
+        Self(std::sync::atomic::AtomicU8::new(part as u8))
+    }
+
+    fn set(&self, part: ReadinessPart) {
+        self.0
+            .store(part as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn get(&self) -> ReadinessPart {
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => ReadinessPart::Accept,
+            1 => ReadinessPart::Write,
+            _ => ReadinessPart::Read,
+        }
+    }
+}
+
+/// The supervisor readiness deadline, naming the step it passed in. The
+/// outer cause text is unchanged; only the step between it and `cause` is
+/// new. The one deadline instant, and every bound, stay as they are.
+pub(crate) fn readiness_deadline(
+    cause: anyhow::Error,
+    part: ReadinessPart,
+    spawned: Instant,
+) -> anyhow::Error {
+    let elapsed = spawned.elapsed().as_millis();
+    cause
+        .context(format!(
+            "{part} had not completed {elapsed} ms after the supervisor was spawned"
+        ))
+        .context("memory supervisor readiness deadline exceeded")
+}
+
+/// A Windows accept fails with its own `TimedOut` when its timer, set to the
+/// same deadline, fires before the outer one; at or after that deadline it is
+/// the accept part of the deadline. `TimedOut` alone is not enough: other
+/// failures map to it too.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn readiness_deadline_part(
+    error: &std::io::Error,
+    now: Instant,
+    deadline: Instant,
+) -> Option<ReadinessPart> {
+    (error.kind() == std::io::ErrorKind::TimedOut && now >= deadline)
+        .then_some(ReadinessPart::Accept)
 }
 
 /// `text` without either connection secret of `identity`.

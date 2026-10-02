@@ -1908,11 +1908,12 @@ impl GroupProcess {
             }
             tokio::time::sleep(GROUP_POLL).await;
         };
+        let mut listing = self.owner.permission_listing(limit.into_std());
         loop {
-            let presence = self.owner.presence_after_reap();
+            let presence = listing.resolve(self.owner.presence_after_reap()).await;
             self.presence = Some(format!("{presence:?}"));
             match presence {
-                GroupPresence::Absent => return Ok(status),
+                GroupPresence::Absent | GroupPresence::Recycled => return Ok(status),
                 GroupPresence::Present | GroupPresence::PermissionDenied => {}
                 GroupPresence::ObservationError(_) | GroupPresence::InvalidPhase => {
                     return Err(std::io::Error::other(format!(
@@ -3283,7 +3284,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_runner_signal_terminates_its_group_and_exits_with_the_signal() {
-        use rustix::process::{Pid, Signal, kill_process, test_kill_process_group};
+        use kuru_platform::unix::observe_group_after_reap;
+        use rustix::process::{Pid, Signal, kill_process};
         use std::io::BufRead as _;
 
         assert_eq!(RunnerSignal::Interrupt.exit_code(), 130);
@@ -3356,10 +3358,9 @@ mod tests {
             "{seen:?}"
         );
         // Observation only: the runner reaped the root and saw the group absent.
-        assert_eq!(
-            test_kill_process_group(Pid::from_raw(group).unwrap()),
-            Err(rustix::io::Errno::SRCH)
-        );
+        // Another user may have reused the number since; ours must not remain.
+        let observed = observe_group_after_reap(group.unsigned_abs());
+        assert!(observed.none_of_ours(), "{observed}");
     }
 
     #[test]

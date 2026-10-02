@@ -683,8 +683,15 @@ async fn gated_opens_of_sealed_aged_stores_count_the_planned_rows() -> Result<()
     let evidence = root.path().join("evidence");
     let outcome = deadline
         .run(async {
+            // Only exactly `1` enables the timeline: pinned ungated whatever
+            // the runner's own environment holds.
+            let ungated = || vec![(OsString::from("KURU_OPEN_TIMELINE"), OsString::from("0"))];
             for &n in TINY.sizes {
-                create(&layout, &TINY, n, &engine).await?;
+                crate::service::activity::with_owner_environment(
+                    ungated(),
+                    create(&layout, &TINY, n, &engine),
+                )
+                .await?;
                 let names = timeline_files(&layout.data(n), &project_scope(&layout.project(n)?))?;
                 ensure!(names.is_empty(), "an ungated owner wrote {names:?}");
                 let gate = crate::spawn_gate::spawning().await;
@@ -800,9 +807,12 @@ async fn gated_opens_of_sealed_aged_stores_count_the_planned_rows() -> Result<()
             );
             // Without the gate an owner writes no timeline, and the
             // measurement fails by name.
-            let error = measure(&layout, &TINY, &engine, 0, 1, &evidence)
-                .await
-                .unwrap_err();
+            let error = crate::service::activity::with_owner_environment(
+                ungated(),
+                measure(&layout, &TINY, &engine, 0, 1, &evidence),
+            )
+            .await
+            .unwrap_err();
             ensure!(
                 format!("{error:#}").contains("wrote no open timeline"),
                 "{error:#}"

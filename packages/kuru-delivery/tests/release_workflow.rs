@@ -2153,6 +2153,27 @@ fn usage_scan_scaling_is_a_required_job_that_ages_its_fixture_uncached() {
     };
     assert!(task("measure:usage-scan").contains("env.KURU_OPEN_TIMELINE = \"1\"\n"));
     assert!(!task("measure:usage-scan:fixture").contains("KURU_OPEN_TIMELINE"));
+    // Coverage partitions run gated owners, task-scoped: never job-wide and
+    // never the uninstrumented partitions.
+    let delivery = fs::read_to_string(root.join("packages/kuru-delivery/mise.toml")).unwrap();
+    let section = |name: &str| {
+        delivery
+            .split(&format!("[{name}]\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing section {name}"))
+            .split("\n[")
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(section("tasks.\"coverage:shard\".env").contains("\nKURU_OPEN_TIMELINE = \"1\"\n"));
+    for name in [
+        "tasks.\"coverage:shard\"",
+        "tasks.\"test:partition\"",
+        "tasks.\"test:partition\".env",
+    ] {
+        assert!(!section(name).contains("KURU_OPEN_TIMELINE"), "{name}");
+    }
     assert!(ci.contains(
         "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling]"
     ));
