@@ -17,8 +17,8 @@
 //! Runner noise can move a median; it cannot change an engine start count.
 //! So a first series that holds every structural check but misses a median
 //! budget is measured once more, in full, and the gate fails only if that
-//! second series misses too ([`Decision`]). A structural violation in either
-//! series fails at once, and there is never a third series.
+//! second series fails a check too ([`Decision`]). A structural violation in
+//! either series fails at once, and there is never a third series.
 
 use std::{collections::BTreeMap, fmt::Write as _};
 
@@ -421,7 +421,7 @@ impl Decision {
             Self::Remeasure => {
                 "a second series decides: the first series held every run, readiness and \
                  engine start check but missed a median budget, so one more full series was \
-                 measured, and the gate fails only if that series misses too."
+                 measured, and the gate fails only if that series fails a check too."
             }
             Self::PassedOnSecond => {
                 "passed, decided by the second series: the first series missed a median \

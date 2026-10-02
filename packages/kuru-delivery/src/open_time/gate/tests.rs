@@ -607,6 +607,44 @@ mod decision {
     }
 
     #[test]
+    fn an_unexpected_owner_path_or_missing_case_in_the_first_series_is_never_measured_again() {
+        // A warm reopen on a path the gate does not list, beside a median
+        // miss: the unexpected path decides.
+        let mut runs = recorded(RUN_A);
+        for run in runs.iter_mut().filter(|run| run.case == Case::NewProject) {
+            run.ready_ms = run.ready_ms.map(|ready| ready + 200.0);
+        }
+        run_mut(&mut runs, Case::WarmReopen, 4).path = OwnerPath::NoOwnerObserved;
+        let unexpected_path = verdict(&runs);
+        assert!(
+            matches!(
+                unexpected_path.violations.as_slice(),
+                [Violation::UnexpectedPath { .. }]
+            ),
+            "{unexpected_path:?}"
+        );
+        let missing_case = verdict(
+            &recorded(RUN_A)
+                .into_iter()
+                .filter(|run| run.case != Case::NewProject)
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            matches!(
+                missing_case.violations.as_slice(),
+                [Violation::MissingCase { .. }]
+            ),
+            "{missing_case:?}"
+        );
+        for first in [unexpected_path, missing_case] {
+            let decision = Decision::decide(&first, None);
+            assert_eq!(decision, Decision::Failed, "{first:?}");
+            assert_eq!(decision.series(), Some(1));
+            assert_eq!(Decision::decide(&first, Some(&passing())), Decision::Failed);
+        }
+    }
+
+    #[test]
     fn a_median_miss_requests_a_second_series_which_passes_the_gate() {
         let first = median_miss(RUN_A);
         let decision = Decision::decide(&first, None);

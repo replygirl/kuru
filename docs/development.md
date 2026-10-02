@@ -1359,8 +1359,9 @@ first series misses a median budget with every other check holding does the
 same command measure a second series
 ([the retry rule](#the-gate-and-its-budgets)), adding roughly one more
 series' time (an estimate, not yet observed in CI). Nothing is rebuilt, and
-the measured executable embeds the engine its installation job verified. The control, coarse-period and ramp modes (below) are local-only
-and are not run in CI.
+the measured executable embeds the engine its installation job verified. The
+control, coarse-period and ramp modes (below) are local-only and are not run
+in CI.
 
 The harness drives the binary from outside. Each iteration uses a fresh private
 scratch root with its own HOME, configuration, data directory, engine cache,

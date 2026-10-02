@@ -869,7 +869,9 @@ pub async fn run(options: &Options) -> Result<Report> {
         &options.output.join(RECORDS),
     )
     .await;
-    let mut scratches = vec![scratch];
+    // One entry per series measured or attempted; `None` for a second series
+    // that stopped before it had a scratch root of its own.
+    let mut scratches = vec![Some(scratch)];
     let mut second = None;
     // A series stopped by an infrastructure failure is not gated: its
     // records are partial, and the failure is the result.
@@ -892,11 +894,14 @@ pub async fn run(options: &Options) -> Result<Report> {
                     .and_then(|()| scratch_root(&parent));
                 let measured = match prepared {
                     Ok((scratch, root)) => {
-                        scratches.push(scratch);
+                        scratches.push(Some(scratch));
                         let records = directory.join(RECORDS);
                         measure(options, &binary, &identity, &root, &records).await
                     }
-                    Err(error) => Measured::stopped(error),
+                    Err(error) => {
+                        scratches.push(None);
+                        Measured::stopped(error)
+                    }
                 };
                 let label = format!("{}, second series", options.label);
                 summary.push('\n');
@@ -970,15 +975,17 @@ pub async fn run(options: &Options) -> Result<Report> {
     let final_retire_wait_ms = first.final_retire_wait_ms;
     if let Some(error) = failure {
         // Leave the stopped series' scratch root for inspection when a
-        // process is still alive; any earlier one is removed.
-        let kept = scratches.pop().map(tempfile::TempDir::keep);
+        // process is still alive; any earlier one is removed. A second
+        // series that could not start has no root, so nothing is kept.
+        let kept = scratches.pop().flatten().map(tempfile::TempDir::keep);
         drop(scratches);
-        bail!(
-            "open-time measurement stopped after {records} records: {error:#}; scratch kept at {}",
-            kept.map_or_else(String::new, |kept| kept.display().to_string())
+        let kept = kept.map_or_else(
+            || "the stopped series had no scratch root, so none was kept".to_owned(),
+            |kept| format!("scratch kept at {}", kept.display()),
         );
+        bail!("open-time measurement stopped after {records} records: {error:#}; {kept}");
     }
-    for scratch in scratches {
+    for scratch in scratches.into_iter().flatten() {
         scratch.close().context("remove the scratch root")?;
     }
     Ok(Report {
