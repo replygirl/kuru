@@ -316,6 +316,145 @@ async fn second_project_reuses_template_without_build() -> Result<()> {
     fixture.release(outcome)
 }
 
+/// Warm the private engine cache `cache` as the native mise fixture warms
+/// its own (cospec change `installed-binary-template-warmup`): provision the
+/// engine into it within `engine_warm_up_bound`, then build this build's
+/// store template beside it with the test supervisor, and take the receipt.
+/// Neither call takes the spawn gate, so the caller holds it across this.
+async fn warm_fixture_cache(
+    cache: &Path,
+) -> Result<(PathBuf, crate::test_support::TemplateCacheReceipt)> {
+    let started = Instant::now();
+    let mut config = OpenOptions::new(PathBuf::new(), String::new()).config;
+    config.offline = true;
+    config.cache_dir = Some(cache.to_owned());
+    let bound = crate::test_support::engine_warm_up_bound();
+    let engine = tokio::time::timeout(bound, crate::provision::provision(&config, cache))
+        .await
+        .with_context(|| format!("provision the fixture engine cache exceeded {bound:?}"))??;
+    crate::test_support::warm_template_cache(cache, &engine, &test_supervisor()?).await?;
+    let receipt = crate::test_support::TemplateCacheReceipt::snapshot(cache, started.elapsed())?;
+    Ok((engine, receipt))
+}
+
+/// A fixture that warms its own empty engine cache (the engine, then the
+/// store template with a supervisor of this build) lets the first fresh
+/// open in that cache, on the product path (no `template_root`), copy the
+/// template with two engine starts instead of building it. The warm-up's
+/// build is the template root's only engine start, a second warm-up and the
+/// open leave its receipt valid, and the store records this build's key.
+#[tokio::test]
+async fn fixture_cache_warm_up_lets_a_fresh_open_copy_with_two_starts() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        let cache = fixture.path().join("cache");
+        // Warmed before the spawn gate held across the warm-up and the open.
+        let mut options = options(fixture.path().join("data"), &scope('e'), None).await?;
+        options.config.cache_dir = Some(cache.clone());
+        ensure!(
+            options.template_root.is_none() && !cache.exists(),
+            "the fixture cache is not cold or the open is not on the product path"
+        );
+        let _gate = crate::spawn_gate::spawning().await;
+        let (engine, receipt) = warm_fixture_cache(&cache).await?;
+        ensure!(
+            engine.starts_with(fs::canonicalize(&cache)?),
+            "the engine was not provisioned into the fixture cache: {}",
+            engine.display()
+        );
+        let root = root_in(&fs::canonicalize(&cache)?);
+        crate::test_support::warm_template_cache(&cache, &engine, &test_supervisor()?).await?;
+        receipt
+            .verify_used()
+            .context("a second warm-up changed the warmed cache")?;
+        let store = MemoryStore::open(options.clone()).await?;
+        let checked = async {
+            let starts = starts_under(&options.data_dir)?;
+            ensure!(
+                starts == u64::from(FreshOpen::Template.starts()),
+                "the open after the warm-up made {starts} engine starts"
+            );
+            ensure!(
+                starts_under(&root)? == 1,
+                "the template root saw other than the warm-up's one build start"
+            );
+            assert_template_born(&options, &store).await?;
+            let recorded =
+                crate::test_support::store_template_key(&options.data_dir, &options.project_scope)?;
+            ensure!(
+                crate::test_support::template_key() == key()
+                    && recorded.as_deref() == Some(key())
+                    && template_of(&options)? == recorded,
+                "the store records template {recorded:?}, not this build's {}",
+                key()
+            );
+            receipt
+                .verify_used()
+                .context("the open did not use the warmed template")
+        }
+        .await;
+        store.close().await?;
+        checked
+    }
+    .await;
+    fixture.release(outcome)
+}
+
+/// The warmed cache's receipt names what changed in its templates root:
+/// another key's lock is another template key, a build stage is a build,
+/// and a template moved to `.rejected-*` is a quarantine with the published
+/// template missing. Lock files are planted only in this private root.
+#[tokio::test]
+async fn fixture_cache_receipt_names_what_changed() -> Result<()> {
+    let fixture = fixture()?;
+    let outcome = async {
+        let cache = fixture.path().join("cache");
+        let receipt = {
+            let _gate = crate::spawn_gate::spawning().await;
+            warm_fixture_cache(&cache).await?.1
+        };
+        receipt.verify_used()?;
+        ensure!(
+            receipt.to_string().contains(key()),
+            "the receipt does not name its key: {receipt}"
+        );
+        let root = root_in(&fs::canonicalize(&cache)?);
+        let changed = |planted: &str| -> Result<String> {
+            let error = receipt
+                .verify_used()
+                .err()
+                .with_context(|| format!("the receipt accepted {planted}"))?;
+            Ok(format!("{error:#}"))
+        };
+        let other = format!("{}.lock", "a".repeat(64));
+        fs::write(root.join(&other), b"")?;
+        let text = changed(&other)?;
+        ensure!(
+            text.contains(&format!("{other}: another template key")),
+            "{text}"
+        );
+        fs::remove_file(root.join(&other))?;
+        receipt.verify_used()?;
+        let build = format!(".build-{}-planted", key());
+        fs::create_dir(root.join(&build))?;
+        let text = changed(&build)?;
+        ensure!(text.contains(&format!("{build}: built")), "{text}");
+        fs::remove_dir(root.join(&build))?;
+        receipt.verify_used()?;
+        let rejected = format!(".rejected-{}-planted", key());
+        fs::rename(root.join(key()), root.join(&rejected))?;
+        let text = changed(&rejected)?;
+        ensure!(
+            text.contains(&format!("{rejected}: quarantined"))
+                && text.contains(&format!("{} is missing", key())),
+            "{text}"
+        );
+        Ok(())
+    }
+    .await;
+    fixture.release(outcome)
+}
+
 /// T5, design 3.9: while the first new project is inside its template build,
 /// a second new project under the same key does not wait for it. It completes
 /// on the cold path with the cold start count, reads no unpublished name and

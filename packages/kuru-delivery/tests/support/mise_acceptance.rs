@@ -10,11 +10,13 @@ use axum::{
     http::{Method, Request, Response, StatusCode},
     routing::any,
 };
+use kuru::memory_activity::{CREATING, GETTING_READY, MARKER_PREFIX, MARKERS_ENV, OPENING};
 use kuru_delivery::{
     archive,
     command::{self, Command},
     published, published_windows, targets,
 };
+use kuru_memory::test_support::{self, TemplateCacheReceipt};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use kuru_platform::windows::process::configured_command;
 use serde_json::{Value, json};
@@ -24,7 +26,7 @@ use std::{
     path::{Path, PathBuf},
     process::Output,
     sync::{Arc, LazyLock, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[path = "../../src/mise_isolation.rs"]
@@ -524,6 +526,15 @@ impl Installation {
         Ok(())
     }
     async fn kuru(&self, args: &[&str]) -> Result<Value> {
+        Ok(self.kuru_with_stderr(args, &[]).await?.0)
+    }
+    /// [`Self::kuru`] with extra environment, returning its standard error
+    /// beside its JSON.
+    async fn kuru_with_stderr(
+        &self,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<(Value, String)> {
         let mut command = self.command();
         command
             .args(["exec", "--", "kuru", "-C"])
@@ -532,13 +543,16 @@ impl Installation {
             .arg(&self.kuru_data)
             .args(["--provider", "demo", "--mode", "freudian", "--no-dream"])
             .args(args);
+        for (name, value) in env {
+            command.env(name, value);
+        }
         let output = command::output(&mut command, DEADLINE).await?;
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         ensure!(
             output.status.success(),
-            "installed Kuru {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "installed Kuru {args:?} failed: {stderr}"
         );
-        Ok(serde_json::from_slice(&output.stdout)?)
+        Ok((serde_json::from_slice(&output.stdout)?, stderr))
     }
 
     async fn purge_with_installed_kuru(&self) -> Result<()> {
@@ -567,15 +581,39 @@ impl Installation {
         );
         Ok(())
     }
-    fn memory_options(&self, binary: &Path, scope: String) -> kuru_memory::OpenOptions {
-        let mut options = kuru_memory::OpenOptions::new(self.kuru_data.clone(), scope);
-        options.config = kuru_core::MemoryConfig {
+    fn memory_config(&self) -> kuru_core::MemoryConfig {
+        kuru_core::MemoryConfig {
             offline: true,
             cache_dir: Some(self.engine_cache.clone()),
             ..Default::default()
-        };
+        }
+    }
+    fn memory_options(&self, binary: &Path, scope: String) -> kuru_memory::OpenOptions {
+        let mut options = kuru_memory::OpenOptions::new(self.kuru_data.clone(), scope);
+        options.config = self.memory_config();
         options.supervisor = Some(binary.to_owned());
         options
+    }
+
+    /// Warm this fixture's own engine cache as the `prefetch` task warms the
+    /// shared test cache: provision the embedded engine into it (extract,
+    /// probe once, activate), then build this build's store template beside
+    /// it with the installed binary as its supervisor. The timed first launch
+    /// then finds both warm and copies the template with two engine starts,
+    /// instead of also extracting, probing and building under one client
+    /// wait. `provision` creates the cache privately, which the installed
+    /// binary's private-directory checks require: never create it here.
+    async fn warm_engine_cache(&self, binary: &Path) -> Result<TemplateCacheReceipt> {
+        let started = Instant::now();
+        let bound = test_support::engine_warm_up_bound();
+        let engine = tokio::time::timeout(
+            bound,
+            kuru_memory::provision::provision(&self.memory_config(), &self.engine_cache),
+        )
+        .await
+        .with_context(|| format!("provision the fixture engine cache exceeded {bound:?}"))??;
+        test_support::warm_template_cache(&self.engine_cache, &engine, binary).await?;
+        TemplateCacheReceipt::snapshot(&self.engine_cache, started.elapsed())
     }
 
     async fn conversation(&mut self, binary: &Path) -> Result<()> {
@@ -587,7 +625,12 @@ impl Installation {
         self.memory_cleanup
             .arm(self.memory_options(binary, scope.clone()));
         let result = async {
-            self.conversation_inner(binary, &scope).await?;
+            // After the cold assertion and the cleanup arming, so a failed
+            // warm-up retires, retains the root and reports itself first.
+            let receipt = self.warm_engine_cache(binary).await.context(
+                "warm the installed binary's engine cache and store template before its first launch",
+            )?;
+            self.conversation_inner(binary, &scope, &receipt).await?;
             self.purge_with_installed_kuru().await
         }
         .await;
@@ -606,9 +649,37 @@ impl Installation {
         }
     }
 
-    async fn conversation_inner(&self, binary: &Path, scope: &str) -> Result<()> {
+    async fn conversation_inner(
+        &self,
+        binary: &Path,
+        scope: &str,
+        receipt: &TemplateCacheReceipt,
+    ) -> Result<()> {
         let marker = "mise native cold marker violet-837";
-        let first = self.kuru(&["run", marker, "--json"]).await?;
+        let started = Instant::now();
+        let (first, stderr) = self
+            .kuru_with_stderr(&["run", marker, "--json"], &[(MARKERS_ENV, "1")])
+            .await
+            .with_context(|| {
+                format!(
+                    "first launch after {receipt}; took {} ms",
+                    started.elapsed().as_millis()
+                )
+            })?;
+        let launch = started.elapsed().as_millis();
+        let markers: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.starts_with(MARKER_PREFIX))
+            .collect();
+        // The warm engine branch reports no unpacking stage, so the getting
+        // ready sentence never appears; the opening sentence always does.
+        ensure!(
+            stderr.contains(OPENING) && !stderr.contains(GETTING_READY),
+            "first launch after {receipt} did not open its engine cache as warm \
+             (took {launch} ms; creating sentence shown: {}): {stderr}",
+            stderr.contains(CREATING)
+        );
+        println!("native mise first launch after {receipt}: {launch} ms; markers {markers:?}");
         let session = first["session"].as_str().context("first session ID")?;
         let before = self.kuru(&["memory", "status"]).await?;
         let second = self
@@ -706,6 +777,17 @@ impl Installation {
         // A built engine also ships each pinned third-party notice it lists.
         published_windows::verify_engine_notices(asset, |name| Ok(fs::read(engine.join(name))?))
             .context("mise-installed engine notices differ from embedded manifest")?;
+        // Every launch copied the warmed template: none built, replaced,
+        // quarantined or keyed another, and the store records this key.
+        receipt
+            .verify_used()
+            .context("the installed binary did not use its warmed store template")?;
+        let recorded = test_support::store_template_key(&self.kuru_data, scope)?;
+        ensure!(
+            recorded.as_deref() == Some(test_support::template_key()),
+            "the installed store records template {recorded:?}, not {}",
+            test_support::template_key()
+        );
         Ok(())
     }
 }

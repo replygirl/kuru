@@ -203,9 +203,7 @@ async fn warm_engine() -> Result<PathBuf> {
             let _gate = crate::spawn_gate::spawning().await;
             let config = OpenOptions::new(PathBuf::new(), String::new()).config;
             let cache = crate::store::test_cache();
-            let bound = crate::provision::LOCK_TIMEOUT
-                .saturating_add(crate::provision::VERSION_TIMEOUT)
-                .saturating_add(WARM_UP_MARGIN);
+            let bound = engine_warm_up_bound();
             match tokio::time::timeout(bound, crate::provision::provision(&config, &cache)).await {
                 Ok(Ok(binary)) => Ok(binary),
                 Ok(Err(error)) => Err(format!("warm test Dolt runtime cache: {error:#}")),
@@ -220,6 +218,16 @@ async fn warm_engine() -> Result<PathBuf> {
 /// Allowance beyond the provisioner's lock and probe budgets for extraction
 /// bookkeeping, so its own deadline errors are observed before the warm-up's.
 pub const WARM_UP_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The bound of one engine warm-up (`provision` into an engine cache): the
+/// provisioner's cache-lock peer budget plus its version-probe budget and
+/// [`WARM_UP_MARGIN`], so the product's own lock or probe error is observed
+/// before this bound, and an installing caller's extraction is covered.
+pub fn engine_warm_up_bound() -> Duration {
+    crate::provision::LOCK_TIMEOUT
+        .saturating_add(crate::provision::VERSION_TIMEOUT)
+        .saturating_add(WARM_UP_MARGIN)
+}
 
 /// The store template step's bound: the budget of four engine starts and
 /// three closes (which cover one build start, the chain and the capture with
@@ -347,6 +355,184 @@ pub async fn warm_template_cache(cache: &Path, engine: &Path, supervisor: &Path)
         }
         _ => Ok(()),
     })
+}
+
+/// This build's store template key: the key a store created from this
+/// build's template records in its identity.
+pub fn template_key() -> &'static str {
+    crate::store::creation_template::compiled_key()
+}
+
+/// The store template key a project's store records in its identity, or
+/// `None` when the store was created cold or has no identity record.
+pub fn store_template_key(data: &Path, scope: &str) -> Result<Option<String>> {
+    crate::server::stage_template_key(&crate::store::project_directory(data, scope)?)
+}
+
+/// What a fixture's own engine cache held right after its warm-up
+/// (`provision` into it, then [`warm_template_cache`]): the provisioned
+/// engine, and a store templates root holding exactly this build's published
+/// template and its key lock (and, on Windows, the build's lifecycle leases).
+/// [`Self::verify_used`] later proves that the launches against that cache
+/// used the template: they built, replaced, quarantined and keyed nothing
+/// else there.
+///
+/// Warm a cache only for a binary built from this same commit (an installed
+/// copy of this build, instrumented or not). Never use it with a binary from
+/// another commit: its compiled template key can differ, so as the warm-up's
+/// supervisor it refuses this process's key before writing anything (the
+/// warm-up fails), and its own launch would build its own template beside
+/// this one.
+pub struct TemplateCacheReceipt {
+    root: PathBuf,
+    key: &'static str,
+    identity: kuru_platform::fs::FileIdentity,
+    entries: Vec<String>,
+    lifecycles: Vec<String>,
+    warm_up: Duration,
+}
+
+impl TemplateCacheReceipt {
+    /// Take the receipt of the engine cache `cache`, which a warm-up that
+    /// took `warm_up` just provisioned and filled. Fails, naming each entry,
+    /// unless the engine is provisioned and the templates root holds only
+    /// this build's published template and its key lock.
+    pub fn snapshot(cache: &Path, warm_up: Duration) -> Result<Self> {
+        let cache = fs::canonicalize(cache)
+            .with_context(|| format!("resolve the warmed engine cache {}", cache.display()))?;
+        let engine = cache
+            .join(crate::provision::DOLT_VERSION)
+            .join(crate::catalog::BUNDLED_ASSET.target);
+        ensure!(
+            engine.is_dir(),
+            "the warmed engine cache has no provisioned engine at {}",
+            engine.display()
+        );
+        let root = crate::store::creation_template::root_in(&cache);
+        let key = template_key();
+        let manifest = root.join(key).join("manifest.json");
+        ensure!(
+            manifest.is_file(),
+            "the warmed engine cache has no published store template: {} is absent",
+            manifest.display()
+        );
+        let entries = Self::names(&root)?;
+        let lock = format!("{key}.lock");
+        let unexpected: Vec<String> = entries
+            .iter()
+            .filter(|name| {
+                **name != key && **name != lock && !(cfg!(windows) && *name == "lifecycles")
+            })
+            .map(|name| Self::describe(key, name))
+            .collect();
+        ensure!(
+            unexpected.is_empty() && entries.contains(&lock),
+            "the warmed store template root {} holds more or less than template {key} and its \
+             key lock: {entries:?}; {}",
+            root.display(),
+            unexpected.join("; ")
+        );
+        Ok(Self {
+            identity: crate::files::directory(&root.join(key))?.identity(),
+            lifecycles: Self::names(&root.join("lifecycles"))?,
+            root,
+            key,
+            entries,
+            warm_up,
+        })
+    }
+
+    /// Fail, naming every difference, unless the templates root still holds
+    /// exactly the names it held at [`Self::snapshot`], the same published
+    /// template directory and the same lifecycle leases: another key's
+    /// template or key lock means another template key, a `.rejected-*`
+    /// entry a quarantine, and a `.build-*` or `.stage-*` entry, a
+    /// republished template or a new lease a build.
+    pub fn verify_used(&self) -> Result<()> {
+        let mut changes = Vec::new();
+        let entries = Self::names(&self.root)?;
+        for name in entries.iter().filter(|name| !self.entries.contains(name)) {
+            changes.push(Self::describe(self.key, name));
+        }
+        for name in self.entries.iter().filter(|name| !entries.contains(name)) {
+            changes.push(format!("{name} is missing"));
+        }
+        if entries.iter().any(|name| name == self.key) {
+            let identity = crate::files::directory(&self.root.join(self.key))?.identity();
+            if identity != self.identity {
+                changes.push(format!("{}: republished, so built", self.key));
+            }
+        }
+        let lifecycles = Self::names(&self.root.join("lifecycles"))?;
+        for name in lifecycles
+            .iter()
+            .filter(|name| !self.lifecycles.contains(name))
+        {
+            changes.push(format!("lifecycles/{name}: a new build lease, so built"));
+        }
+        for name in self
+            .lifecycles
+            .iter()
+            .filter(|name| !lifecycles.contains(name))
+        {
+            changes.push(format!("lifecycles/{name} is missing"));
+        }
+        ensure!(
+            changes.is_empty(),
+            "the warmed store template cache changed after {self}: {}",
+            changes.join("; ")
+        );
+        Ok(())
+    }
+
+    /// The sorted names in `directory`, or none when it is absent.
+    fn names(directory: &Path) -> Result<Vec<String>> {
+        let entries = match fs::read_dir(directory) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            entries => entries
+                .with_context(|| format!("list the store template root {}", directory.display()))?,
+        };
+        let mut names = entries
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    }
+
+    /// What an added templates-root entry `name` means for the key `key`.
+    fn describe(key: &str, name: &str) -> String {
+        let stem = name.strip_suffix(".lock").unwrap_or(name);
+        let meaning = if name.starts_with(".rejected-") {
+            "quarantined"
+        } else if name.starts_with(".build-") || name.starts_with(".stage-") {
+            "built"
+        } else if stem == key {
+            "republished, so built"
+        } else if stem.len() == 64
+            && stem
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            "another template key"
+        } else if name == "lifecycles" {
+            "a build lease directory, so built"
+        } else {
+            "unexpected"
+        };
+        format!("{name}: {meaning}")
+    }
+}
+
+impl std::fmt::Display for TemplateCacheReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the warm-up of store template {} in {} ({} ms)",
+            self.key,
+            self.root.display(),
+            self.warm_up.as_millis()
+        )
+    }
 }
 
 /// Allowance for creating a fixture child process and its runtime before the
