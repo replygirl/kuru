@@ -522,6 +522,121 @@ impl std::fmt::Display for ReadinessSplit {
     }
 }
 
+/// The owner timeline clause a gated starter adds at its readiness deadline:
+/// one bounded read of its own owner's stream (named from the activity tag
+/// of the token it passed), with no wait and no retry, every error mapped to
+/// text. `None` when this starter is ungated: then nothing is read.
+///
+/// `owner-exec` is the owner's anchor less `spawn_called`, the instant
+/// taken just before the spawn call, and `since-last` is `now` less the last
+/// line's wall-clock time: wall-clock differences across two processes, so
+/// a clock step skews them. An owner anchored before `spawn_called` is a
+/// predecessor's file with the same tag, reported only as `stale`; that
+/// comparison is at the platform clock's resolution (100 ns on Windows), so
+/// an anchor within one tick of `spawn_called` is not stale. Lines
+/// are `<name> <offset-ns> <unix-ns>`; a trailing partial line is still
+/// being written and ignored, and a malformed complete line is counted,
+/// never named. The clause never carries a path, token, scope or tag.
+fn owner_timeline_clause(
+    data_dir: &Path,
+    scope: &str,
+    tag: &str,
+    spawn_called: std::time::SystemTime,
+    now: std::time::SystemTime,
+) -> Option<String> {
+    if !open_timeline::gate_set() {
+        return None;
+    }
+    let read = EndpointRecord::directory(data_dir, scope).and_then(|directory| {
+        crate::files::read_bytes(
+            &directory.join(open_timeline::stream_name(tag)),
+            open_timeline::MAX_BYTES as u64,
+        )
+    });
+    let bytes = match read {
+        Ok(bytes) => bytes,
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+            }) =>
+        {
+            return Some("owner timeline: absent".into());
+        }
+        Err(_) => return Some("owner timeline: unreadable".into()),
+    };
+    Some(owner_timeline_text(&bytes, spawn_called, now))
+}
+
+fn owner_timeline_text(
+    bytes: &[u8],
+    spawn_called: std::time::SystemTime,
+    now: std::time::SystemTime,
+) -> String {
+    const MS: u64 = 1_000_000;
+    fn unix_ns(time: std::time::SystemTime) -> u64 {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+            })
+    }
+    fn number(field: &str) -> Option<u64> {
+        field
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| field.parse().ok())
+            .flatten()
+    }
+    fn line(bytes: &[u8]) -> Option<(&str, u64, u64)> {
+        let mut fields = std::str::from_utf8(bytes).ok()?.split(' ');
+        let (name, offset, unix) = (fields.next()?, fields.next()?, fields.next()?);
+        let named = (1..=32).contains(&name.len())
+            && name
+                .bytes()
+                .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'));
+        (named && fields.next().is_none()).then_some(())?;
+        Some((name, number(offset)?, number(unix)?))
+    }
+    let mut events = Vec::new();
+    let mut skipped = 0_usize;
+    // Everything after the last newline is a line still being written.
+    if let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') {
+        for raw in bytes[..end].split(|byte| *byte == b'\n') {
+            match line(raw) {
+                Some(event) => events.push(event),
+                None => skipped += 1,
+            }
+        }
+    }
+    let skipped = if skipped == 0 {
+        String::new()
+    } else {
+        format!("; skipped={skipped}")
+    };
+    let (Some(&(_, first_offset, first_unix)), Some(&(last, last_offset, last_unix))) =
+        (events.first(), events.last())
+    else {
+        return format!("owner timeline: empty{skipped}");
+    };
+    let anchor = first_unix.saturating_sub(first_offset);
+    let spawned = unix_ns(spawn_called);
+    if anchor < spawned {
+        return "owner timeline: stale".into();
+    }
+    let listed = events
+        .iter()
+        .map(|(name, offset, _)| format!("{name}={}", offset / MS))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "owner timeline: owner-exec={}ms; {listed} (ms); last={last} +{}ms; since-last={}ms{skipped}",
+        (anchor - spawned) / MS,
+        last_offset / MS,
+        unix_ns(now).saturating_sub(last_unix) / MS,
+    )
+}
+
 /// Attach to a valid owner, or elect and start one while retaining a distinct
 /// short start lock. Endpoint readiness is the authenticated private handshake;
 /// the child holds the owner lock before publishing it. `progress` receives
@@ -647,6 +762,10 @@ async fn attach_or_spawn_elected(
         .is_observed()
         .then(|| activity::activity_tag(&starter_token));
     let mut forwarded = 0;
+    // Only a gated starter reads its owner's stream at the deadline. Taken
+    // before the spawn call: a Windows spawn awaits, and its owner may stamp
+    // before the call returns, which would read as stale.
+    let spawn_called = open_timeline::gate_set().then(std::time::SystemTime::now);
     let mut child = ServiceProcess::new(
         spawn_service(
             options,
@@ -701,11 +820,28 @@ async fn attach_or_spawn_elected(
                 last_attach,
             };
             #[cfg(feature = "test-support")]
-            if let Some(diagnostic) = &mut startup_diagnostic {
-                let observations = fixture_startup_observations(options, diagnostic);
-                bail!("memory service readiness deadline exceeded; {observations}; {split}");
+            let observations = startup_diagnostic
+                .as_mut()
+                .map(|diagnostic| fixture_startup_observations(options, diagnostic));
+            let owner_timeline = spawn_called
+                .and_then(|spawn_called| {
+                    owner_timeline_clause(
+                        &options.data_dir,
+                        &options.project_scope,
+                        &activity::activity_tag(&starter_token),
+                        spawn_called,
+                        std::time::SystemTime::now(),
+                    )
+                })
+                .map(|clause| format!("{clause}; "))
+                .unwrap_or_default();
+            #[cfg(feature = "test-support")]
+            if let Some(observations) = observations {
+                bail!(
+                    "memory service readiness deadline exceeded; {observations}; {owner_timeline}{split}"
+                );
             }
-            bail!("memory service readiness deadline exceeded; {split}");
+            bail!("memory service readiness deadline exceeded; {owner_timeline}{split}");
         }
         // After the deadline check and never after an attach, so the read can
         // neither move the deadline nor count as a poll.
@@ -1034,40 +1170,71 @@ async fn spawn_service(
     command.console = Console::PrivateHidden;
     command.stderr = stderr.map_or(Stdio::Null, |file| Stdio::Handle(file.into()));
     let system = kuru_platform::windows::process::system_directory()?;
-    let windows = system
-        .parent()
-        .context("Windows system directory has no parent")?;
-    command.environment = vec![
-        ("SystemRoot".into(), windows.as_os_str().into()),
-        ("WINDIR".into(), windows.as_os_str().into()),
-        ("PATH".into(), system.into_os_string()),
-    ];
-    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
-        command
-            .environment
-            .push(("LLVM_PROFILE_FILE".into(), profile));
-    }
+    #[cfg_attr(
+        not(any(test, feature = "test-support")),
+        expect(unused_mut, reason = "only test support adds layers")
+    )]
+    let mut layers: Vec<Vec<(OsString, OsString)>> = Vec::new();
     #[cfg(feature = "test-support")]
     if fixture_startup_stages_enabled() {
-        command
-            .environment
-            .push((STARTUP_STAGE_DIAGNOSTIC_ENV.into(), OsString::from("1")));
+        layers.push(vec![(
+            STARTUP_STAGE_DIAGNOSTIC_ENV.into(),
+            OsString::from("1"),
+        )]);
     }
     #[cfg(any(test, feature = "test-support"))]
-    command.environment.extend(activity::forwarded_test_hooks());
+    layers.push(activity::forwarded_test_hooks());
     // Test-support measurement only: forward the inert-by-default trace.
     #[cfg(any(test, feature = "test-support"))]
-    command
-        .environment
-        .extend(crate::test_support::lifecycle_trace::forwarded());
+    layers.push(crate::test_support::lifecycle_trace::forwarded());
     #[cfg(test)]
-    command
-        .environment
-        .extend(activity::owner_test_environment());
+    layers.push(activity::owner_test_environment());
+    command.environment = owner_environment(
+        system,
+        std::env::var_os("LLVM_PROFILE_FILE"),
+        open_timeline::gate_set(),
+        layers,
+    )
+    .context("compose the memory service environment")?;
     command
         .spawn()
         .await
         .context("start independent or outer-contained project memory service")
+}
+
+/// The Windows owner's explicit environment: the system variables, the
+/// coverage destination when set, and the timeline gate only when this
+/// starter's own gate is exactly `1`. Each later layer overrides the result
+/// so far through `merge_environment`, one layer at a time, so a key that
+/// arrives from two layers (a test's `KURU_OPEN_TIMELINE=0`, or a hook set
+/// both in the runner and a test's own scope) replaces its case-equivalent
+/// entry instead of becoming a duplicate the spawn would refuse.
+#[cfg(windows)]
+fn owner_environment(
+    system: PathBuf,
+    profile: Option<OsString>,
+    gate: bool,
+    layers: Vec<Vec<(OsString, OsString)>>,
+) -> io::Result<Vec<(OsString, OsString)>> {
+    let windows = system
+        .parent()
+        .ok_or_else(|| io::Error::other("Windows system directory has no parent"))?
+        .as_os_str()
+        .to_owned();
+    let mut base = vec![
+        ("SystemRoot".into(), windows.clone()),
+        ("WINDIR".into(), windows),
+        ("PATH".into(), system.into_os_string()),
+    ];
+    if let Some(profile) = profile {
+        base.push(("LLVM_PROFILE_FILE".into(), profile));
+    }
+    if gate {
+        base.push((open_timeline::ENV.into(), OsString::from("1")));
+    }
+    layers
+        .into_iter()
+        .try_fold(base, kuru_platform::windows::process::merge_environment)
 }
 
 #[cfg(unix)]
@@ -1417,10 +1584,22 @@ impl ServiceOwner {
         )?
         .context("project already has a memory service owner; wait for its validated endpoint")?;
         lock.verify()?;
+        // A gated owner's stream, named from its starter's token, exists
+        // only while this owner lock is held: it is removed before serving
+        // and on every failed open below, never in close.
+        if open_timeline::installed().is_some()
+            && let Some(token) = &options.starter_token
+            && let Ok(directory) =
+                EndpointRecord::directory(&options.data_dir, &options.project_scope)
+        {
+            open_timeline::stream_to(&directory, &activity::activity_tag(token));
+        }
         open_timeline::stamp(open_timeline::Event::OwnerLock);
         // On failure the store open retires its own record before returning,
         // while this owner lock is still held.
-        let (store, activity) = activity::open_owner_store(options.clone(), hooks).await?;
+        let (store, activity) = activity::open_owner_store(options.clone(), hooks)
+            .await
+            .inspect_err(|_| open_timeline::end_stream())?;
         let prepared = async {
             let (listener, address) =
                 ServiceListener::bind(&options.data_dir, &options.project_scope)?;
@@ -1430,12 +1609,15 @@ impl ServiceOwner {
                     .await?;
             record.publish(&options.data_dir, &lock)?;
             open_timeline::stamp(open_timeline::Event::EndpointPublished);
+            // Before serving and before this open returns.
+            open_timeline::end_stream();
             Ok::<_, anyhow::Error>((listener, record))
         }
         .await;
         let (listener, record) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
+                open_timeline::end_stream();
                 // A failed listener or publication must still reap Dolt while
                 // this process retains its service-owner authority.
                 if let Some(publisher) = activity {
@@ -3004,6 +3186,202 @@ mod tests {
         assert_eq!(AttachMiss::PeerClosed.as_str(), "peer-closed");
     }
 
+    /// The owner timeline clause a gated starter adds at its readiness
+    /// deadline, from its own owner's stream file only. Its text is what
+    /// the developer documentation reads the owner phase from.
+    #[test]
+    fn owner_timeline_clause_text_is_stable() -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        const MS: u64 = 1_000_000;
+        const MAIN_UNIX: u64 = 1_700_000_000_000_000_000;
+        const CREATE_START: u64 = 9_930_123_456;
+        let at = |ns: u64| UNIX_EPOCH + Duration::from_nanos(ns);
+        let root = crate::test_support::tempdir()?;
+        let data = root.path().join("private");
+        let hash = "0123456789abcdef".repeat(4);
+        let scope = format!("project/{hash}");
+        let directory = EndpointRecord::directory(&data, &scope)?;
+        crate::files::ensure_private_directory(&directory)?;
+        let token = uuid::Uuid::new_v4();
+        let tag = activity::activity_tag(&token);
+        let stream = directory.join(format!("open-stream-{tag}"));
+        // Another owner's stream, which this starter must never read.
+        crate::files::write(
+            &directory.join(format!(
+                "open-stream-{}",
+                activity::activity_tag(&uuid::Uuid::new_v4())
+            )),
+            format!(
+                "owner-main 0 {MAIN_UNIX}\nsupervisor-spawned {MS} {}\n",
+                MAIN_UNIX + MS
+            )
+            .as_bytes(),
+        )?;
+        let lines = format!(
+            "owner-main 0 {MAIN_UNIX}\n\
+             owner-lock 3400000 {}\n\
+             startup-lock 4900000 {}\n\
+             create-start {CREATE_START} {}\n",
+            MAIN_UNIX + 3_400_000,
+            MAIN_UNIX + 4_900_000,
+            MAIN_UNIX + CREATE_START,
+        );
+        // Spawned 812.5 ms before the owner's first stamp; read 20070.9 ms
+        // after its last.
+        let spawned = at(MAIN_UNIX - 812_500_000);
+        let now = at(MAIN_UNIX + CREATE_START + 20_070 * MS + 900_000);
+        let gated = |spawned: SystemTime| {
+            open_timeline::with_gate_sync(true, || {
+                owner_timeline_clause(&data, &scope, &tag, spawned, now)
+            })
+        };
+        let expected = "owner timeline: owner-exec=812ms; owner-main=0 owner-lock=3 startup-lock=4 create-start=9930 (ms); last=create-start +9930ms; since-last=20070ms";
+
+        crate::files::write(&stream, lines.as_bytes())?;
+        let clause = gated(spawned);
+        assert_eq!(clause.as_deref(), Some(expected));
+        let clause = clause.unwrap_or_default();
+        for private in [
+            tag.as_str(),
+            hash.as_str(),
+            &token.to_string(),
+            &data.display().to_string(),
+        ] {
+            assert!(
+                !clause.contains(private),
+                "the clause carries a private value: {clause}"
+            );
+        }
+
+        // A trailing partial line is still being written: ignored, uncounted.
+        crate::files::write(&stream, format!("{lines}supervisor-spawned 99").as_bytes())?;
+        assert_eq!(gated(spawned).as_deref(), Some(expected));
+
+        // Malformed complete lines are counted, never named.
+        crate::files::write(
+            &stream,
+            format!(
+                "Owner-Lock 1 2\nowner-lock x 3\n{lines}migrate-start 1\n\
+                 a-name-longer-than-thirty-two-bytes 1 2\n"
+            )
+            .as_bytes(),
+        )?;
+        assert_eq!(
+            gated(spawned).as_deref(),
+            Some(format!("{expected}; skipped=4").as_str())
+        );
+
+        // Created, with no complete line yet.
+        crate::files::write(&stream, b"owner-ma")?;
+        assert_eq!(gated(spawned).as_deref(), Some("owner timeline: empty"));
+
+        // A predecessor's file with this tag: its first stamp precedes this
+        // starter's spawn. The offset is a whole millisecond because
+        // `SystemTime` keeps 100 ns on Windows: a 1 ns offset truncates to
+        // the anchor itself, which is not stale.
+        crate::files::write(&stream, lines.as_bytes())?;
+        assert_eq!(
+            gated(at(MAIN_UNIX + MS)).as_deref(),
+            Some("owner timeline: stale")
+        );
+
+        // Over the 8 KiB read limit.
+        crate::files::write(&stream, "x".repeat(8 * 1024 + 1).as_bytes())?;
+        assert_eq!(
+            gated(spawned).as_deref(),
+            Some("owner timeline: unreadable")
+        );
+
+        // An ungated starter reads nothing and adds no clause, whatever the
+        // runner's own environment holds.
+        crate::files::write(&stream, lines.as_bytes())?;
+        assert_eq!(
+            open_timeline::with_gate_sync(false, || {
+                owner_timeline_clause(&data, &scope, &tag, spawned, now)
+            }),
+            None
+        );
+
+        std::fs::remove_file(&stream)?;
+        assert_eq!(gated(spawned).as_deref(), Some("owner timeline: absent"));
+        Ok(())
+    }
+
+    /// The Windows owner's explicit environment carries the timeline gate
+    /// only when the starter's own gate is set, which only exactly `1` is;
+    /// a test's layer overrides it in place, and no key is ever duplicated.
+    #[cfg(windows)]
+    #[test]
+    fn the_owner_environment_forwards_only_an_exact_gate() -> Result<()> {
+        use kuru_platform::windows::process::environment_key_eq;
+        let system = PathBuf::from(r"C:\Windows\System32");
+        let gate = |environment: &[(OsString, OsString)]| {
+            environment
+                .iter()
+                .filter(|(key, _)| environment_key_eq(key, OsStr::new(open_timeline::ENV)))
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+        };
+        let unique = |environment: &[(OsString, OsString)]| {
+            environment.iter().enumerate().all(|(index, (key, _))| {
+                environment[index + 1..]
+                    .iter()
+                    .all(|(other, _)| !environment_key_eq(key, other))
+            })
+        };
+        for (gated, expected) in [(true, vec![OsString::from("1")]), (false, Vec::new())] {
+            let environment = owner_environment(
+                system.clone(),
+                Some(OsString::from("profile-%p.profraw")),
+                open_timeline::with_gate_sync(gated, open_timeline::gate_set),
+                Vec::new(),
+            )?;
+            assert_eq!(gate(&environment), expected, "gated={gated}");
+            assert!(unique(&environment));
+            for key in ["SystemRoot", "WINDIR", "PATH", "LLVM_PROFILE_FILE"] {
+                assert!(
+                    environment
+                        .iter()
+                        .any(|(name, _)| environment_key_eq(name, OsStr::new(key))),
+                    "{key} missing"
+                );
+            }
+        }
+        // A test's own `0`, in any case, replaces a forwarded `1`; its `1`
+        // never duplicates it; the same hook from two layers stays single.
+        let hook = (
+            OsString::from("KURU_TEST_MEMORY_OPEN_HOLD_DIR"),
+            OsString::from(r"C:\holds"),
+        );
+        for (layer, expected) in [
+            (
+                vec![(OsString::from(open_timeline::ENV), OsString::from("0"))],
+                "0",
+            ),
+            (
+                vec![(OsString::from("kuru_open_timeline"), OsString::from("0"))],
+                "0",
+            ),
+            (
+                vec![(OsString::from(open_timeline::ENV), OsString::from("1"))],
+                "1",
+            ),
+        ] {
+            let environment = owner_environment(
+                system.clone(),
+                None,
+                true,
+                vec![vec![hook.clone()], layer, vec![hook.clone()]],
+            )?;
+            assert_eq!(gate(&environment), [OsString::from(expected)]);
+            assert!(unique(&environment));
+        }
+        // Duplicates within one layer are still refused, as the spawn would.
+        let duplicated = vec![vec![hook.clone(), hook]];
+        assert!(owner_environment(system, None, false, duplicated).is_err());
+        Ok(())
+    }
+
     /// The failure of a launched owner that stays alive without publishing
     /// an endpoint until the lowered startup bound expires in the readiness
     /// loop, with its parsed client phase split.
@@ -3369,6 +3747,236 @@ mod tests {
         endpoint.retire(&data, &owner)?;
         owner.release()?;
         Ok(())
+    }
+
+    /// One owner event hold: `<event>.entered` and `<event>.release` fifos in
+    /// the hold directory, each opened here read-write and non-blocking, so
+    /// the owner's non-blocking opens find a peer and neither end reports a
+    /// hang-up while this test holds them.
+    #[cfg(unix)]
+    struct EventHold {
+        event: &'static str,
+        entered: std::os::fd::OwnedFd,
+        release: std::os::fd::OwnedFd,
+    }
+
+    #[cfg(unix)]
+    impl EventHold {
+        fn create(directory: &Path, event: &'static str) -> Result<Self> {
+            let fifo = |suffix: &str| -> Result<std::os::fd::OwnedFd> {
+                let path = directory.join(format!("{event}.{suffix}"));
+                nix::unistd::mkfifo(
+                    &path,
+                    nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                )?;
+                Ok(nix::fcntl::open(
+                    &path,
+                    nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NONBLOCK,
+                    nix::sys::stat::Mode::empty(),
+                )?)
+            };
+            Ok(Self {
+                event,
+                entered: fifo("entered")?,
+                release: fifo("release")?,
+            })
+        }
+
+        /// A blocking wait, on its own handle, for the owner's one entered
+        /// byte, bounded by `bound` on the real clock.
+        fn entered_waiter(&self, bound: Duration) -> Result<impl FnOnce() -> Result<()> + use<>> {
+            let (event, entered) = (self.event, self.entered.try_clone()?);
+            Ok(move || {
+                use std::os::fd::AsFd as _;
+                let deadline = std::time::Instant::now() + bound;
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let timeout = nix::poll::PollTimeout::try_from(remaining)
+                        .unwrap_or(nix::poll::PollTimeout::MAX);
+                    let mut fds = [nix::poll::PollFd::new(
+                        entered.as_fd(),
+                        nix::poll::PollFlags::POLLIN,
+                    )];
+                    match nix::poll::poll(&mut fds, timeout) {
+                        Ok(0) => bail!(
+                            "the owner never reached the {event} hold within {} s (no timeline hold hook, or the owner stopped before it)",
+                            bound.as_secs()
+                        ),
+                        Ok(_) => break,
+                        // Interrupted, not expired: wait out the remainder.
+                        Err(nix::errno::Errno::EINTR) => {}
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("poll the {event} entered fifo"));
+                        }
+                    }
+                }
+                let mut byte = [0_u8; 1];
+                nix::unistd::read(&entered, &mut byte)
+                    .with_context(|| format!("read the {event} entered byte"))?;
+                Ok(())
+            })
+        }
+
+        fn release(&self) -> Result<()> {
+            nix::unistd::write(&self.release, b"r")
+                .with_context(|| format!("release the {} hold", self.event))?;
+            Ok(())
+        }
+    }
+
+    /// A gated starter whose real gated owner is held right after streaming
+    /// `create-start` reaches its default readiness deadline and names that
+    /// event as the owner's last.
+    ///
+    /// The client clock is paused only after the real-clock setup. A
+    /// blocking task waiting for the owner's entered byte is spawned before
+    /// the open is first polled; while it runs the paused clock cannot
+    /// auto-advance, so the starter's poll sleeps cannot reach the deadline
+    /// before the owner has streamed `create-start`. Its bound is the
+    /// configured startup budget on the real clock: reaching `create-start`
+    /// is a strict prefix of the open the product requires within that
+    /// budget. Afterwards virtual time runs to the deadline while the owner
+    /// stays held. `owner-exec` and `since-last` are real-clock differences
+    /// while the client phases are virtual, so only their presence is
+    /// asserted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_deadline_names_the_owner_event_it_was_held_at() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        let root = crate::test_support::tempdir()?;
+        let (project, scope, data, mut options) = owner_fixture(root.path())?;
+        let executable = options
+            .supervisor
+            .clone()
+            .context("fixture supervisor absent")?;
+        let token = uuid::Uuid::new_v4();
+        options.starter_token = Some(token);
+        let budget = Duration::from_secs(options.config.startup_timeout_secs);
+        let holds = root.path().join("holds");
+        std::fs::create_dir(&holds)?;
+        let held = EventHold::create(&holds, "create-start")?;
+        // Released ahead, so the owner passes it at once and only signals
+        // that its endpoint is published.
+        let published = EventHold::create(&holds, "endpoint-published")?;
+        published.release()?;
+        let environment = vec![
+            (OsString::from(open_timeline::ENV), OsString::from("1")),
+            (
+                OsString::from(open_timeline::hold::DIR_ENV),
+                holds.clone().into_os_string(),
+            ),
+        ];
+        let reached_hold = held.entered_waiter(budget)?;
+
+        // Held across the owner spawn; see `crate::spawn_gate`.
+        let spawn_gate = crate::spawn_gate::spawning().await;
+        tokio::time::pause();
+        let inhibitor = tokio::task::spawn_blocking(reached_hold);
+        let (outcome, reached) = activity::with_owner_environment(
+            environment,
+            open_timeline::with_gate(true, async {
+                tokio::join!(attach_or_start(&options, &project, &executable), async {
+                    let reached = inhibitor
+                        .await
+                        .context("the hold waiter panicked")
+                        .and_then(|reached| reached);
+                    // Never handshake under a paused clock once the hold
+                    // was missed.
+                    if reached.is_err() {
+                        tokio::time::resume();
+                    }
+                    reached
+                })
+            }),
+        )
+        .await;
+        if reached.is_ok() {
+            tokio::time::resume();
+        }
+        drop(spawn_gate);
+
+        let verdict = (|| -> Result<()> {
+            reached
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            let error = outcome
+                .as_ref()
+                .err()
+                .context("an owner held at create-start was reported ready")?;
+            let rendered = format!("{error:#}");
+            ensure!(
+                rendered.starts_with("memory service readiness deadline exceeded"),
+                "readiness failure lost its leading text: {rendered}"
+            );
+            let (_, clause) = rendered
+                .split_once("owner timeline: ")
+                .with_context(|| format!("the deadline lacks the owner timeline: {rendered}"))?;
+            let (clause, split) = clause.split_once("; client phases: ").with_context(|| {
+                format!("the owner timeline precedes no client split: {rendered}")
+            })?;
+            let fields: Vec<&str> = clause.split("; ").collect();
+            ensure!(
+                fields.iter().any(|field| field.starts_with("owner-exec=")),
+                "the owner timeline lacks owner-exec: {rendered}"
+            );
+            ensure!(
+                fields
+                    .iter()
+                    .any(|field| field.starts_with("last=create-start ")),
+                "the owner timeline does not end at create-start: {rendered}"
+            );
+            let events: Vec<&str> = fields
+                .iter()
+                .find_map(|field| field.strip_suffix(" (ms)"))
+                .with_context(|| format!("the owner timeline lists no events: {rendered}"))?
+                .split(' ')
+                .filter_map(|event| event.split_once('=').map(|(name, _)| name))
+                .collect();
+            let position = |name: &str| events.iter().position(|event| *event == name);
+            let order = ["owner-main", "owner-lock", "startup-lock", "create-start"].map(position);
+            ensure!(
+                order.iter().all(Option::is_some) && order.is_sorted(),
+                "the owner timeline lacks the held prefix in order: {rendered}"
+            );
+            ensure!(
+                !clause.contains("supervisor-spawned"),
+                "a held owner streamed an engine start: {rendered}"
+            );
+            let split: std::collections::BTreeMap<&str, &str> = split
+                .split("; ")
+                .filter_map(|field| field.split_once('='))
+                .collect();
+            ensure!(
+                split.get("child") == Some(&"running")
+                    && split.get("last-attach") == Some(&"no-endpoint")
+                    && split.contains_key("readiness"),
+                "the client split no longer parses: {rendered}"
+            );
+            Ok(())
+        })();
+
+        // Cleanup on every path, on the real clock.
+        held.release()?;
+        let attachment = outcome.ok();
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        let cleanup = tokio::time::timeout(deadline, async {
+            if reached.is_ok() {
+                // The owner signals this hold only after publishing its
+                // endpoint; its starter attaches so it closes at once.
+                let bound = crate::test_support::fresh_open_budget();
+                tokio::task::spawn_blocking(published.entered_waiter(bound)?).await??;
+                drop(attach_raw(&data, &scope, Some(token)).await?);
+                await_owner_release(&options).await?;
+            }
+            drop(attachment);
+            crate::test_support::await_managed_quiescence(&options).await
+        })
+        .await
+        .with_context(|| format!("held-owner cleanup exceeded its {deadline:?} deadline"))
+        .and_then(|retired| retired.context("retire the held owner"));
+        // The verdict first: on a missed hold it carries the diagnostic.
+        verdict.and(cleanup)
     }
 
     #[tokio::test]

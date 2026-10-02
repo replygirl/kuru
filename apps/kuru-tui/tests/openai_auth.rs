@@ -46,7 +46,8 @@ impl Environment {
             .env("TMPDIR", self.root.join("tmp"))
             .env("TEMP", self.root.join("tmp"))
             .env("TMP", self.root.join("tmp"));
-        for key in ["SystemRoot", "LLVM_PROFILE_FILE"] {
+        // The owner open timeline gate travels with the coverage destination.
+        for key in ["SystemRoot", "LLVM_PROFILE_FILE", "KURU_OPEN_TIMELINE"] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
             }

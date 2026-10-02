@@ -699,34 +699,98 @@ open waits for it and shows the waiting sentence.
 With `KURU_OPEN_TIMELINE=1` (exactly `1`; unset or any other value changes
 nothing) the project memory service owner records where its own open spends
 its time. Like the markers, this is a release-binary feature documented here
-only. Only the owner process reads the variable, once at its start; on Unix it
-inherits it from the command that started it, and the engine supervisor, whose
-environment is cleared, never sees it. Windows is not supported: its owner is
-started with an explicit environment that does not carry the variable. The
-owner stamps named events as nanosecond offsets from one monotonic anchor, in a
+only. The owner reads the variable once at its start. On Unix it inherits it
+from the command that started it; on Windows the starter forwards it in the
+owner's explicit environment only when its own value is exactly `1`. The
+engine supervisor, whose environment is cleared, never sees it. The owner
+stamps named events as nanosecond offsets from one monotonic anchor, in a
 bounded log sealed when its endpoint is published, and writes the log once,
 after its close has released the owner lock, to
 `memory/services/<hash>/open-timeline-<service-generation>.json` in the data
 directory. The write is owner-private, create-only and deliberately not durable
-(no sync); a failed open writes nothing, and a failed write never fails the
-open, serve or close. The write never delays the open, serve or a successor's
-lock wait; a gated close returns after that one small write. The file (`format` `kuru.open-timeline`,
-`format_version` 1) holds `kuru_version`, `service_generation`, one wall-clock
-`anchor_unix_ns`, `events` as `{event, ns}` pairs, `counts.usage_rows` (the
-first usage-ledger scan's row count, or `null`), `dropped` and `late`; never a
-path, scope, SQL, identity, credential or content. An existing-project open
-records, in order: `owner-main`, `owner-lock`, `cache-verify-start`,
-`cache-verify-end`, `supervisor-ready`, `probe-verified`, `main-pool`,
-`version-read`, `validate-active`, `candidate-recovery`, `usage-pool`,
-`usage-bound`, `usage-scan-1`, `usage-upgrade`, `usage-validate`,
-`usage-scan-2`, `usage-record`, `store-ready`, `listener-bound` and
-`endpoint-published`; creation and upgrade opens repeat some of them.
-`usage-bound` follows the read of the usage head's validation record (see
+(no sync); a failed write never fails the open, serve or close, and a gated
+close returns after that one small write. The file (`format`
+`kuru.open-timeline`, `format_version` 1) holds `kuru_version`,
+`service_generation`, one wall-clock `anchor_unix_ns`, `events` as
+`{event, ns}` pairs, `counts.usage_rows` (the first usage-ledger scan's row
+count, or `null`), `dropped` and `late`; never a path, scope, SQL, identity,
+credential or content. The events, in canonical order, are `owner-main`,
+`owner-lock`, `startup-lock`, `extract-start`, `extract-end`,
+`cache-verify-start`, `cache-verify-end`, `create-start`,
+`supervisor-spawned`, `channel-accepted` (Windows only), `supervisor-ready`,
+`probe-verified`, `template-copied`, `cold-created`, `activated`,
+`main-pool`, `version-read`, `migrate-start`, `migrate-end`,
+`validate-active`, `candidate-recovery`, `usage-pool`, `usage-bound`,
+`usage-scan-1`, `usage-upgrade`, `usage-validate`, `usage-scan-2`,
+`usage-record`, `store-ready`, `listener-bound` and `endpoint-published`. An
+existing-project open on Unix records all of them except extraction, creation,
+activation, migration and `channel-accepted`. Creation, extraction and upgrade
+opens add those, and the per-engine-start events (`supervisor-spawned`,
+`channel-accepted`, `supervisor-ready`, `probe-verified`) repeat once per
+start. `usage-bound` follows the read of the usage head's validation record
+(see
 [the usage ledger validation record](memory.md#usage-ledger-validation-record)),
 and `usage-scan-1` then closes the owned-row walk, which a recorded reopen
-skips: its `counts.usage_rows` is 0. Each gated owner run leaves one file of a few
-kilobytes. Nothing in Kuru reads, lists or removes these files, so delete them
-by hand, or measure in a scratch data directory.
+skips: its `counts.usage_rows` is 0. Each gated owner run leaves one file of a
+few kilobytes. Kuru never reads, lists or removes
+these files, so delete them by hand, or measure in a scratch data directory.
+
+A gated owner started with a starter token (every owner Kuru starts) also
+streams each stamp as it is taken to `memory/services/<hash>/open-stream-<tag>`,
+where the tag is the keyed digest of that token that also names its open
+activity record. The file is owner-private and create-only. Each stamp adds
+one unsynced line of at most 62 bytes, `<event> <offset-ns> <unix-ns>`, and
+nothing else. The owner removes its stream while it holds owner authority:
+right after publishing its endpoint and before serving, or when its open
+fails, never in close. That is one checked removal, which on Unix syncs the
+stream's directory once, as endpoint publication does; it never waits or
+retries. It never appends to or removes a stream it did not
+create, so a stream left by a killed owner stays until removed by hand.
+
+A starter whose own environment holds the variable exactly `1` reads its own
+owner's stream once when its readiness deadline passes and adds an owner
+timeline clause before the client phase split:
+
+```text
+memory service readiness deadline exceeded; owner timeline: owner-exec=812ms; owner-main=0 owner-lock=3 startup-lock=4 create-start=9930 (ms); last=create-start +9930ms; since-last=20070ms; client phases: ...
+```
+
+`owner-exec` is the time from just before the spawn to the owner's first
+stamp. The events are offsets in milliseconds from that stamp, `last` is the
+owner's last event and `since-last` the time from it to the deadline. A
+trailing `skipped=<n>` counts malformed lines. `owner-exec` and `since-last` are
+wall-clock differences between two processes, so a clock step skews them.
+Instead of events the clause can be exactly `owner timeline: absent` (no
+stream: the owner never reached its owner lock, could not create the file, or
+published and removed it after the starter's last poll), `empty` (created, no
+complete line yet), `stale` (the file's first stamp precedes the spawn: a
+predecessor with the same token, possible only when a test reuses a token) or
+`unreadable`. An ungated starter reads nothing and its error is unchanged.
+Read the phase from `last`: `owner-lock` points at the project startup lock
+wait, `extract-start` at extraction, `cache-verify-start` at runtime
+verification, `create-start` at preparation before the first engine start,
+`supervisor-spawned` without `channel-accepted` at supervisor start-up on
+Windows, `channel-accepted` at the engine start inside the supervisor,
+`migrate-start` at the migration, and `template-copied` or `cold-created` at
+the reap before activation. Many `supervisor-spawned` entries with ordinary
+gaps point at repeated engine starts.
+
+The engine supervisor's readiness deadline names the step that had not
+completed, under its unchanged outer cause, for example `memory supervisor
+readiness deadline exceeded: the supervisor's Ready frame had not completed
+32004 ms after the supervisor was spawned: deadline has elapsed`. The step is
+`the supervisor's private channel accept` (Windows), `the startup request
+write` or `the supervisor's Ready frame`. On Windows a channel accept that
+times out on its own timer at the same deadline is reported as the accept
+step.
+
+Every coverage partition runs gated: the `coverage:shard` task sets
+`KURU_OPEN_TIMELINE=1` in its own environment, and the env-clearing
+command-line fixtures forward it beside `LLVM_PROFILE_FILE`. A test that needs
+an ungated owner or starter must pin it: `KURU_OPEN_TIMELINE=0` in the owner
+environment (`activity::with_owner_environment`) and, for an in-process
+starter, `open_timeline::with_gate` or `with_gate_sync`, never the runner's
+own environment.
 
 A lost-reply test that pauses a request with the fixture reply pause
 (`ReplyPause`, or `test_support::ReplyBarrier` outside kuru-memory), cancels it
@@ -824,7 +888,7 @@ The required CI job `usage-scan-scaling` ("Usage scan scaling (ubuntu-latest,
 calibrated bounds)" in `ci.yml`, listed in `ci-gate`) fails when the
 usage-ledger startup scan grows faster than linearly with ledger size, or when
 a reopen of an already validated ledger decodes any usage row. It runs on
-Ubuntu only, because the owner open timeline is inert on Windows.
+Ubuntu only, because the check is compiled only on Unix.
 
 - **Fixture.** Two aged stores at 1,000 and 5,000 conversations (seed 1, one
   turn). Each holds exactly 4,000 and 20,000 owned usage rows: one session

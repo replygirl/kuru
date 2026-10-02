@@ -125,7 +125,8 @@ impl Terminal {
         command.arg(directory);
         command.cwd(directory);
         command.env_clear();
-        for key in ["SystemRoot", "LLVM_PROFILE_FILE"] {
+        // The owner open timeline gate travels with the coverage destination.
+        for key in ["SystemRoot", "LLVM_PROFILE_FILE", "KURU_OPEN_TIMELINE"] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
             }

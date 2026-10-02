@@ -37,6 +37,8 @@ fn fixture_environment(root: &Path) -> Vec<(OsString, OsString)> {
         "PROCESSOR_ARCHITECTURE",
         "PROCESSOR_ARCHITEW6432",
         "LLVM_PROFILE_FILE",
+        // The owner open timeline gate travels with the coverage destination.
+        "KURU_OPEN_TIMELINE",
     ] {
         if let Some(value) = std::env::var_os(key) {
             environment.push((key.into(), value));

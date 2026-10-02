@@ -548,8 +548,8 @@ jobs:
     # the full validation; the open after it finds the record. The bounds
     # (K=6 over a 100 ms floor, a 1 s ceiling) are calibrated from four
     # Ubuntu runs of the earlier provisional bounds; the arithmetic is in the
-    # check's output and in docs/development.md. Unix only: the owner timeline
-    # is inert on Windows.
+    # check's output and in docs/development.md. Unix only: the check is
+    # compiled only on Unix.
     name: Usage scan scaling (ubuntu-latest, calibrated bounds)
     needs: bundle-inputs
     runs-on: ubuntu-latest

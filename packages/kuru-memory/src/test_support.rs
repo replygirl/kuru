@@ -45,7 +45,7 @@ pub(crate) mod engine_ledger;
 pub mod lifecycle_trace;
 pub(crate) mod template;
 /// The CI usage-scan scaling check over aged stores (`usage-scan-fixture`,
-/// `measure-usage-scan`); Unix only, where the owner timeline works.
+/// `measure-usage-scan`); compiled only on Unix, where its CI job runs.
 #[cfg(all(unix, feature = "test-support"))]
 pub mod usage_scan;
 #[cfg(windows)]
@@ -1166,6 +1166,17 @@ mod fixture_diagnostic_tests {
             .context("open staged memory server")
     }
 
+    /// The supervisor readiness deadline as a start reports it now, with its
+    /// step between the unchanged outer cause and the timer's own error.
+    fn split_readiness_error() -> Error {
+        crate::server::readiness_deadline(
+            anyhow::anyhow!("deadline has elapsed"),
+            crate::server::ReadinessPart::Read,
+            tokio::time::Instant::now(),
+        )
+        .context("open staged memory server")
+    }
+
     fn bootstrap_error() -> Error {
         anyhow::anyhow!(
             "Dolt database bootstrap deadline exceeded while verifying the project identity"
@@ -1215,6 +1226,18 @@ mod fixture_diagnostic_tests {
         assert!(format!("{exited:#}").contains("fixture-private-log"));
         assert!(readiness_rendered.contains(&log.display().to_string()));
         assert!(readiness_rendered.contains("memory supervisor readiness deadline exceeded"));
+        let split_rendered = format!(
+            "{:#}",
+            fixture_startup_error(&options, split_readiness_error())
+        );
+        assert!(
+            split_rendered.contains("fixture-private-log"),
+            "{split_rendered}"
+        );
+        assert!(
+            split_rendered.contains("the supervisor's Ready frame had not completed"),
+            "{split_rendered}"
+        );
         let bootstrap_captured = fixture_startup_error(&options, bootstrap_error());
         let bootstrap_rendered = format!("{bootstrap_captured:#}");
         assert!(bootstrap_rendered.contains("fixture-private-log"));

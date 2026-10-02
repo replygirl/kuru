@@ -1923,6 +1923,7 @@ impl MemoryStore {
             .await?,
         );
         lock_directory.verify(name, lock.as_ref().expect("startup lock"))?;
+        open_timeline::stamp(open_timeline::Event::StartupLock);
         purge::ensure_open_allowed(&options.data_dir, &options.project_scope)?;
         let binary = provision::provision_observed(
             &options.config,
@@ -1960,6 +1961,7 @@ impl MemoryStore {
             #[cfg(any(test, feature = "test-support"))]
             options.refuse_unwarmed_fixture()?;
             progress.report(MemoryOpenStage::CreatingDatabase);
+            open_timeline::stamp(open_timeline::Event::CreateStart);
             let data = options.data_dir.clone();
             let scope = options.project_scope.clone();
             let legacy =
@@ -2017,6 +2019,7 @@ impl MemoryStore {
                 lock = Some(returned_lock);
                 match created {
                     creation_worker::Outcome::Ready => {
+                        open_timeline::stamp(open_timeline::Event::TemplateCopied);
                         let lease =
                             Server::quiescence_at(&staging, lifecycle_root.as_deref(), timeout)
                                 .await?;
@@ -2058,6 +2061,7 @@ impl MemoryStore {
                 .move_to(&directory)
                 .context("cannot activate validated Dolt memory")?;
             drop(staging);
+            open_timeline::stamp(open_timeline::Event::Activated);
         }
         read_activation(&directory, &options.project_scope)?;
         progress.report(MemoryOpenStage::OpeningDatabase);
@@ -2101,12 +2105,14 @@ impl MemoryStore {
         }
         let (server, pool) = if found < migrations::CURRENT_VERSION {
             progress.report(MemoryOpenStage::UpgradingDatabase);
+            open_timeline::stamp(open_timeline::Event::MigrateStart);
             #[cfg(test)]
             let (lock, migrated) =
                 run_migration_worker(server, pool, options.migration_hooks.clone()).await?;
             #[cfg(not(test))]
             let (lock, migrated) = run_migration_worker(server, pool).await?;
             migrated?;
+            open_timeline::stamp(open_timeline::Event::MigrateEnd);
             progress.report(MemoryOpenStage::OpeningDatabase);
             let server = Server::open_with_guard(make_options(directory.clone(), false), lock)
                 .await
@@ -2223,6 +2229,7 @@ impl MemoryStore {
                 .build_cold(lock.take().expect("startup lock"), marker_pause, progress)
                 .await?,
         );
+        open_timeline::stamp(open_timeline::Event::ColdCreated);
         let lease = Server::quiescence_at(staging, lifecycle_root, timeout).await?;
         Ok(StoppedStage { _lease: lease })
     }

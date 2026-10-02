@@ -43,9 +43,7 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(all(not(unix), feature = "test-support"))]
         Some("usage-scan-fixture" | "measure-usage-scan") => {
-            anyhow::bail!(
-                "the usage-scan check runs on Unix only; the owner open timeline is inert on Windows"
-            )
+            anyhow::bail!("the usage-scan check runs on Unix only")
         }
         #[cfg(feature = "test-support")]
         _ => anyhow::bail!(
