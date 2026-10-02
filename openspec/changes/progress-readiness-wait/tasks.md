@@ -1,0 +1,36 @@
+# Tasks
+
+Work in `tmp/worktrees/feat-progress-readiness-wait` (branch `feat/progress-readiness-wait`, from `origin/main` `b9453c5b`); the root checkout stays read-only. Every command runs through mise. Never commit `mise.lock`; never bypass hk hooks; no sleep in a test body, no retry that hides a fault, no overall cap. Tasks are ticked as their evidence lands in `verification.md`.
+
+## 1. Change artifacts
+
+- [x] 1.1 Author proposal, blocking-changes, specs, design, tasks and verification, run `mise run cospec -- validate progress-readiness-wait --strict`, and verify it reports no error. Observed 2026-10-02 (macOS arm64): `0 errors, 0 warnings — validation passed`, after adding the `## Operational surface` section that the interactive surface requires.
+- [x] 1.2 Run `mise run cospec -- apply progress-readiness-wait --json`, read its context files, and verify the gate exit code is 0, or that every soft blocker of exit 3 is resolved or acknowledged in writing. Observed 2026-10-02: exit 0, gate state `clear`, no hard or soft blockers; the context files are this change's six artifacts.
+
+## 2. Stand-in owner and red readiness tests
+
+- [ ] 2.1 Add the `test-support` stand-in mode at the top of `service_entry` (`KURU_TEST_MEMORY_SERVICE_STAND_IN`, no lock, no write, 10 ms real-time release poll under a 120 s bound, exit with the file's decimal status) and verify a test spawning the prepared snapshot through `with_owner_environment` observes the stand-in alive and then its exit status.
+- [ ] 2.2 Add R1-R4 (advancing owner waited for, stalled owner abandoned with its stage, exited owner fails at once with its stage, retired record fails at once) beside the cadence test, without `cfg(unix)`, with the test-only format-2 record writer and retirement wrapper and a `ReadinessFailure` stub carrying main's behaviour, and verify each compiles and fails on the unchanged loop at its stated behavioural assertion, quoting each failure message in the commit body.
+
+## 3. Owner progress, failing mark and reason
+
+- [ ] 3.1 Change the record to format 2 only (`progress`, optional `failing` and `reason`, `deny_unknown_fields`, 4 KiB), and verify the unit tests that format 1 and 3 are rejected, that every field round-trips and that an oversized reason is truncated at a character boundary within the limit.
+- [ ] 3.2 Create one progress counter per open in `MemoryStore::open_observed`, carried on `ProgressReporter` and `ServerOptions`, and verify two concurrent in-process opens advance independent counters.
+- [ ] 3.3 Advance at every `report` call, at every open milestone stamped inside the open (stamp and advance paired), per 8 MiB of extraction and warm-cache hashing and per completed migration step, and verify by a site audit recorded in `verification.md` with file:line for every site and every audited non-site (port retry, pool acquire loop, startup lock wait, test hold loop), plus a unit test that extraction ticks per 8 MiB.
+- [ ] 3.4 Audit every `close_failed_open` caller and the creation and migration worker failure paths, confirm with file:line that each `Err` always propagates out of the open, then set the failing mark and the bounded reason immediately before the close at those sites, and verify a test in which an open fails after starting its engine finds the record marked failing with the reason before that close and retired after it.
+- [ ] 3.5 Make the publisher write a stage change at once and coalesce progress-only changes at most every 250 ms with a trailing-edge flush, and verify with the existing `Writes` gate seam that progress-only writes are spaced, stage changes are not delayed and the last value is always written.
+
+## 4. Client readiness wait
+
+- [ ] 4.1 Replace the flat readiness deadline with the progress window (read every poll after attach and `try_wait`, change detection, first window from spawn, election and previous-owner waits unchanged) and the typed `ReadinessFailure` with its four leading texts, and verify R1-R4 pass, the stale same-tag record counts once and never again, the observation classes (`NotFound` is `Absent`, a failed verify under a concurrent replace is `Unusable`), and a failing record ends the wait at once with its reason.
+- [ ] 4.2 Verify the existing readiness tests pass with only the edits the design lists: the phase-split test and its two held-lock variants, the cadence test (gaps still exactly 10 ms), the activity format tests updated to format 2, and the CLI progress and new-project tests.
+
+## 5. Documentation and follow-ons
+
+- [ ] 5.1 Update `docs/configuration.md` and `apps/kuru-docs/reference/configuration.md` (new meaning, definition of progress, each error's report, each engine start still bounded), `docs/release.md` (both mixed-version directions) and `docs/development.md` (progress field, progress-point rule, stand-in mode), and verify `mise run docs:check` passes.
+- [ ] 5.2 Record the sign-of-life indicator follow-on in `tmp/roadmap/dx-followons.md`, and verify the entry names this change and the unchanged sentence contract.
+
+## 6. Verification and archive
+
+- [ ] 6.1 Run `mise run //packages/kuru-memory:test`, the `//apps/kuru-tui:test` binaries that exercise the starter, `mise run //packages/kuru-core:test`, `format:check`, `lint`, `lint:windows`, `typecheck`, `docs:check` and `cospec:managed:check`, and verify each exits 0, recording counts and any unrun check with its reason.
+- [ ] 6.2 Complete the tasks above, run `mise run cospec -- validate progress-readiness-wait --strict` and `mise run cospec -- archive progress-readiness-wait`, and verify the archive directory exists and no active record remains on the branch before the final commit.
