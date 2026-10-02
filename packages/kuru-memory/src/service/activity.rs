@@ -2,6 +2,12 @@
 //! begun, published beside its endpoint so the client that started it can say
 //! what Kuru is doing before that endpoint exists.
 //!
+//! The record also carries the open's own progress count, which advances only
+//! at bounded one-shot points of that open, and, once an open that will fail
+//! is about to close the engine it started, a failing mark with the failure's
+//! own text. Its starter's readiness wait may only be extended by a change of
+//! the record and only ended by its retirement or that mark.
+//!
 //! The record grants nothing. Election, attachment, recovery and retirement
 //! never read it, and a client presents only the record tagged from the
 //! starter token it passed. The tag is derived from that token, never the
@@ -25,19 +31,32 @@ use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
 use super::EndpointRecord;
-use crate::progress::{MemoryOpenStage, ProgressReporter};
+use crate::progress::{MemoryOpenStage, OpenAdvance, ProgressReporter};
 use crate::store::{MemoryStore, OpenOptions};
 
 const RECORD: &str = "activity.json";
 /// Private stage for a record leaving its name; never read as a record.
 const RETIRED_RECORD: &str = "activity.retired";
 const RECORD_LIMIT: u64 = 4 * 1024;
-const FORMAT: u32 = 1;
+/// Format 2 adds the progress count and the failing mark; format 1 is not
+/// read. One binary is both client and owner, so a mismatch arises only from
+/// an in-place replacement between a client's start and its spawn.
+const FORMAT: u32 = 2;
+/// The failure reason's bound in bytes, before JSON escaping. Control
+/// characters become spaces first, so escaping at most doubles it and the
+/// whole record stays within [`RECORD_LIMIT`].
+const REASON_LIMIT: usize = 1024;
+/// Stands in for a starter token or tag found in a failure reason.
+const REDACTED: &str = "[redacted]";
 /// Separates this tag from any other digest of the same token.
 const TAG_CONTEXT: &[u8] = b"kuru-open-activity-v1\0";
 /// After a failed write the publisher waits this long, or for a newer list,
 /// then writes the latest list again. It never retries the open.
 const REWRITE_AFTER: Duration = Duration::from_millis(100);
+/// A change of the progress count alone is written at most this often; the
+/// latest count is always written once the spacing has passed. A stage
+/// change or the failing mark is written at once.
+const PROGRESS_SPACING: Duration = Duration::from_millis(250);
 
 /// Test-support hook: `1` makes every write of an owner's record fail.
 #[cfg(any(test, feature = "test-support"))]
@@ -101,10 +120,45 @@ struct ActivityRecord {
     format: u32,
     tag: String,
     stages: Vec<String>,
+    progress: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    failing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
-fn encode(tag: &str, stages: &[MemoryOpenStage]) -> Result<Vec<u8>> {
-    let stages = stages
+/// What one owner's record says about its open.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Activity {
+    /// The published stages its open has begun, in order.
+    pub(crate) stages: Vec<MemoryOpenStage>,
+    /// The open's progress count.
+    pub(crate) progress: u64,
+    /// The failure reason, present exactly when the open is marked failing.
+    pub(crate) failure: Option<String>,
+}
+
+/// `text` with control characters as spaces, cut at a character boundary to
+/// at most [`REASON_LIMIT`] bytes.
+fn bounded_reason(text: &str) -> String {
+    let mut reason = String::with_capacity(text.len().min(REASON_LIMIT));
+    for character in text.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if reason.len() + character.len_utf8() > REASON_LIMIT {
+            break;
+        }
+        reason.push(character);
+    }
+    reason
+}
+
+fn encode(tag: &str, activity: &Activity) -> Result<Vec<u8>> {
+    let stages = activity
+        .stages
         .iter()
         .map(|stage| {
             stage_name(*stage)
@@ -116,6 +170,9 @@ fn encode(tag: &str, stages: &[MemoryOpenStage]) -> Result<Vec<u8>> {
         format: FORMAT,
         tag: tag.to_owned(),
         stages,
+        progress: activity.progress,
+        failing: activity.failure.is_some(),
+        reason: activity.failure.as_deref().map(bounded_reason),
     })?;
     ensure!(
         bytes.len() as u64 <= RECORD_LIMIT,
@@ -124,9 +181,10 @@ fn encode(tag: &str, stages: &[MemoryOpenStage]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// A record's tag and stages. An unknown field, format, tag shape or stage
-/// name makes the whole record unreadable.
-fn decode(bytes: &[u8]) -> Result<(String, Vec<MemoryOpenStage>)> {
+/// A record's tag and activity. An unknown field, format, tag shape or stage
+/// name, a failing mark without its reason or a reason without the mark
+/// makes the whole record unreadable.
+fn decode(bytes: &[u8]) -> Result<(String, Activity)> {
     let record: ActivityRecord =
         serde_json::from_slice(bytes).context("decode open activity record")?;
     ensure!(
@@ -138,12 +196,23 @@ fn decode(bytes: &[u8]) -> Result<(String, Vec<MemoryOpenStage>)> {
         record.stages.len() <= MemoryOpenStage::ALL.len(),
         "open activity record lists too many stages"
     );
+    ensure!(
+        record.failing == record.reason.is_some(),
+        "open activity record has a failing mark without its reason"
+    );
     let stages = record
         .stages
         .iter()
         .map(|name| named_stage(name).context("unknown open stage in activity record"))
         .collect::<Result<_>>()?;
-    Ok((record.tag, stages))
+    Ok((
+        record.tag,
+        Activity {
+            stages,
+            progress: record.progress,
+            failure: record.reason,
+        },
+    ))
 }
 
 /// The owner-private directory that also holds the endpoint record.
@@ -151,14 +220,14 @@ fn directory(data_dir: &Path, scope: &str) -> Result<PathBuf> {
     EndpointRecord::directory(data_dir, scope)
 }
 
-fn write_record(directory: &Path, tag: &str, stages: &[MemoryOpenStage]) -> Result<()> {
-    let bytes = encode(tag, stages)?;
+fn write_record(directory: &Path, tag: &str, activity: &Activity) -> Result<()> {
+    let bytes = encode(tag, activity)?;
     crate::files::ensure_private_directory(directory)?;
     crate::files::write(&directory.join(RECORD), &bytes)
 }
 
-/// Test-only: publish a format-2 record for `tag` as its owner would, with
-/// `stages` and the progress count `progress`, through the same private
+/// Test-only: publish a record for `tag` as its owner would, with `stages`
+/// and the progress count `progress`, through the same encoding and private
 /// staged write.
 #[cfg(test)]
 pub(super) fn write_progress_record(
@@ -168,19 +237,15 @@ pub(super) fn write_progress_record(
     stages: &[MemoryOpenStage],
     progress: u64,
 ) -> Result<()> {
-    let stages: Vec<&str> = stages
-        .iter()
-        .map(|stage| stage_name(*stage).context("open stage is not published"))
-        .collect::<Result<_>>()?;
-    let bytes = serde_json::to_vec(&serde_json::json!({
-        "format": 2,
-        "tag": tag,
-        "stages": stages,
-        "progress": progress,
-    }))?;
-    let directory = directory(data_dir, scope)?;
-    crate::files::ensure_private_directory(&directory)?;
-    crate::files::write(&directory.join(RECORD), &bytes)
+    write_record(
+        &directory(data_dir, scope)?,
+        tag,
+        &Activity {
+            stages: stages.to_vec(),
+            progress,
+            failure: None,
+        },
+    )
 }
 
 /// Test-only: retire the record tagged `tag` exactly as its owner does.
@@ -189,14 +254,19 @@ pub(super) fn retire_tagged_record(data_dir: &Path, scope: &str, tag: &str) -> R
     retire_record(&directory(data_dir, scope)?, tag)
 }
 
-fn read_stages(data_dir: &Path, scope: &str, tag: &str) -> Result<Vec<MemoryOpenStage>> {
+/// The activity of the record tagged `tag`.
+pub(crate) fn read_activity(data_dir: &Path, scope: &str, tag: &str) -> Result<Activity> {
     let bytes = crate::files::read_bytes(&directory(data_dir, scope)?.join(RECORD), RECORD_LIMIT)?;
-    let (found, stages) = decode(&bytes)?;
+    let (found, activity) = decode(&bytes)?;
     ensure!(
         found == tag,
         "open activity record belongs to another owner"
     );
-    Ok(stages)
+    Ok(activity)
+}
+
+fn read_stages(data_dir: &Path, scope: &str, tag: &str) -> Result<Vec<MemoryOpenStage>> {
+    read_activity(data_dir, scope, tag).map(|activity| activity.stages)
 }
 
 /// Forward, in order, the stages of the record tagged `tag` that this client
@@ -221,6 +291,10 @@ pub(crate) fn forward_new(
     *forwarded = (*forwarded).max(stages.len());
 }
 
+/// Test-only: each successful record write and when it completed.
+#[cfg(test)]
+type WriteLog = watch::Sender<Vec<(tokio::time::Instant, Activity)>>;
+
 /// How the publisher writes; inert in a release build.
 #[derive(Clone, Default)]
 pub(crate) struct Writes {
@@ -232,15 +306,16 @@ pub(crate) struct Writes {
     /// Each write first takes a permit; a closed gate fails it.
     #[cfg(test)]
     gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Every successful write, with the instant it completed.
+    #[cfg(test)]
+    log: Option<Arc<WriteLog>>,
+    /// Record writes in `log` without touching the filesystem.
+    #[cfg(test)]
+    no_io: bool,
 }
 
 impl Writes {
-    async fn write(
-        &self,
-        directory: &Path,
-        tag: &str,
-        stages: Arc<[MemoryOpenStage]>,
-    ) -> Result<()> {
+    async fn write(&self, directory: &Path, tag: &str, activity: Activity) -> Result<()> {
         #[cfg(test)]
         let _permit = match &self.gate {
             Some(gate) => Some(gate.acquire().await?),
@@ -260,8 +335,23 @@ impl Writes {
         }
         #[cfg(any(test, feature = "test-support"))]
         ensure!(!self.fail, "test-support open activity write failure");
-        let (directory, tag) = (directory.to_owned(), tag.to_owned());
-        tokio::task::spawn_blocking(move || write_record(&directory, &tag, &stages)).await?
+        #[cfg(test)]
+        let logged = activity.clone();
+        #[cfg(test)]
+        let skip = self.no_io;
+        #[cfg(not(test))]
+        let skip = false;
+        if !skip {
+            let (directory, tag) = (directory.to_owned(), tag.to_owned());
+            tokio::task::spawn_blocking(move || write_record(&directory, &tag, &activity))
+                .await??;
+        }
+        #[cfg(test)]
+        if let Some(log) = &self.log {
+            let now = tokio::time::Instant::now();
+            log.send_modify(|writes| writes.push((now, logged)));
+        }
+        Ok(())
     }
 }
 
@@ -287,6 +377,10 @@ impl OwnerHooks {
                     failures: None,
                     #[cfg(test)]
                     gate: None,
+                    #[cfg(test)]
+                    log: None,
+                    #[cfg(test)]
+                    no_io: false,
                 },
                 hold_dir: std::env::var_os(OPEN_HOLD_DIR_ENV)
                     .filter(|directory| !directory.is_empty())
@@ -321,14 +415,39 @@ struct Feed {
     written: watch::Receiver<usize>,
 }
 
+/// What the publisher reads from its open, and what it never writes.
+struct Source {
+    stages: watch::Receiver<Arc<[MemoryOpenStage]>>,
+    /// The open's progress count and failing mark; `None` publishes stages
+    /// only, as an open that does not count.
+    ticks: Option<watch::Receiver<OpenAdvance>>,
+    /// Whether the counter can still change; its last value stays readable.
+    ticks_live: bool,
+    /// Text that must not reach the record: the starter token's spellings
+    /// and the tag.
+    redact: Vec<String>,
+}
+
 impl Feed {
-    fn start(directory: PathBuf, tag: String, writes: Writes) -> Self {
+    fn start(
+        directory: PathBuf,
+        tag: String,
+        redact: Vec<String>,
+        writes: Writes,
+        ticks: Option<watch::Receiver<OpenAdvance>>,
+    ) -> Self {
         let (sender, stages) = watch::channel(Arc::<[MemoryOpenStage]>::from([]));
         let (written_sender, _written) = watch::channel(0);
+        let source = Source {
+            stages,
+            ticks_live: ticks.is_some(),
+            ticks,
+            redact,
+        };
         let task = tokio::spawn(publish(
             directory,
             tag.clone(),
-            stages,
+            source,
             writes,
             written_sender,
         ));
@@ -353,8 +472,8 @@ impl Feed {
         true
     }
 
-    /// End the feed with its open. The publisher may finish the latest list,
-    /// then stops; it never removes the record.
+    /// End the feed with its open. The publisher may finish the latest
+    /// activity, then stops; it never removes the record.
     fn finish(self) -> Publisher {
         drop(self.sender);
         Publisher {
@@ -368,34 +487,103 @@ impl Feed {
     }
 }
 
-/// Writes the latest cumulative list whenever it changes, on its own task, so
-/// nothing in the open, endpoint publication or serving waits for a write.
+impl Source {
+    /// The latest activity, marking both inputs seen.
+    fn latest(&mut self) -> Activity {
+        let stages = self.stages.borrow_and_update().to_vec();
+        let advance = self
+            .ticks
+            .as_mut()
+            .map(|ticks| ticks.borrow_and_update().clone())
+            .unwrap_or_default();
+        Activity {
+            stages,
+            progress: advance.count,
+            failure: advance.failure.map(|reason| {
+                self.redact
+                    .iter()
+                    .filter(|text| !text.is_empty())
+                    .fold(reason.to_string(), |reason, text| {
+                        reason.replace(text.as_str(), REDACTED)
+                    })
+            }),
+        }
+    }
+
+    /// Wait for either input to change. A closed counter is no longer
+    /// waited for; a closed stage feed returns at once, so the caller sees
+    /// that its open has ended.
+    async fn changed(&mut self) {
+        let live = self.ticks_live;
+        let ticks = async {
+            match self.ticks.as_mut() {
+                Some(ticks) if live => ticks.changed().await.is_ok(),
+                _ => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = self.stages.changed() => {}
+            live = ticks => self.ticks_live = live,
+        }
+    }
+}
+
+/// Writes the latest activity on its own task, so nothing in the open,
+/// endpoint publication or serving waits for a write. A stage change or the
+/// failing mark is written at once; a change of the progress count alone at
+/// most every [`PROGRESS_SPACING`], always followed by the latest count. When
+/// the open has ended it writes any unwritten activity once and stops.
 async fn publish(
     directory: PathBuf,
     tag: String,
-    mut stages: watch::Receiver<Arc<[MemoryOpenStage]>>,
+    mut source: Source,
     writes: Writes,
     written: watch::Sender<usize>,
 ) {
-    // `changed` still yields a list sent just before the open ended.
-    while stages.changed().await.is_ok() {
-        loop {
-            let latest = Arc::clone(&stages.borrow_and_update());
-            let length = latest.len();
-            if writes.write(&directory, &tag, latest).await.is_ok() {
-                written.send_replace(length);
-                break;
+    // The record a reader can see, and the last activity this task tried to
+    // write; a failed attempt waits for a newer stage or failing mark, or
+    // for `REWRITE_AFTER`.
+    let mut published = Activity::default();
+    let mut attempted = Activity::default();
+    let mut not_before: Option<tokio::time::Instant> = None;
+    loop {
+        let latest = source.latest();
+        // `has_changed` fails only once the open has dropped its feed;
+        // `latest` already holds a list sent just before that.
+        let ended = source.stages.has_changed().is_err();
+        if latest == published {
+            if ended {
+                return;
             }
-            // The latest list holds every earlier one, so writing it again
-            // repairs whatever a reader missed. Ends once the open has.
-            tokio::select! {
-                changed = stages.changed() => if changed.is_err() {
+        } else {
+            let urgent = latest.stages != attempted.stages || latest.failure != attempted.failure;
+            let due = not_before.is_none_or(|at| tokio::time::Instant::now() >= at);
+            if ended || urgent || due {
+                attempted = latest.clone();
+                let stages = latest.stages.len();
+                if writes.write(&directory, &tag, latest.clone()).await.is_ok() {
+                    published = latest;
+                    written.send_replace(stages);
+                    not_before = Some(tokio::time::Instant::now() + PROGRESS_SPACING);
+                } else if ended {
                     return;
-                },
-                () = tokio::time::sleep(REWRITE_AFTER) => if stages.has_changed().is_err() {
-                    return;
-                },
+                } else {
+                    // The latest activity holds every earlier one, so writing
+                    // it again repairs whatever a reader missed.
+                    not_before = Some(tokio::time::Instant::now() + REWRITE_AFTER);
+                }
+                continue;
             }
+        }
+        let pending = latest != published;
+        tokio::select! {
+            () = source.changed() => {}
+            () = async {
+                match not_before {
+                    Some(at) if pending => tokio::time::sleep_until(at).await,
+                    _ => std::future::pending().await,
+                }
+            } => {}
         }
     }
 }
@@ -493,9 +681,18 @@ pub(crate) async fn open_owner_store(
     let fixture_stages = false;
     // An owner from a starter that predates the token publishes nothing.
     let target = options.starter_token.as_ref().and_then(|token| {
+        let tag = activity_tag(token);
+        // A failure reason is the open's own error text; none of these
+        // spellings may reach the record.
+        let redact = vec![
+            token.hyphenated().to_string(),
+            token.simple().to_string(),
+            tag.clone(),
+        ];
         Some((
             directory(&options.data_dir, &options.project_scope).ok()?,
-            activity_tag(token),
+            tag,
+            redact,
         ))
     });
     // Both opens are boxed: held inline together they doubled the owner
@@ -506,8 +703,16 @@ pub(crate) async fn open_owner_store(
     let (data_dir, scope) = (options.data_dir.clone(), options.project_scope.clone());
     #[cfg(any(test, feature = "test-support"))]
     let hold_limit = Duration::from_secs(options.config.startup_timeout_secs);
-    let mut feed = target.map(|(directory, tag)| Feed::start(directory, tag, hooks.writes.clone()));
     let (mut progress, opening) = MemoryStore::open_observed(options);
+    let mut feed = target.map(|(directory, tag, redact)| {
+        Feed::start(
+            directory,
+            tag,
+            redact,
+            hooks.writes.clone(),
+            progress.ticks(),
+        )
+    });
     let mut opening = Box::pin(opening);
     let mut progress_open = true;
     let result = loop {
@@ -691,6 +896,14 @@ mod tests {
         OpeningDatabase,
     ];
 
+    /// Activity naming only `stages`, as an open that does not count.
+    fn staged(stages: &[MemoryOpenStage]) -> Activity {
+        Activity {
+            stages: stages.to_vec(),
+            ..Activity::default()
+        }
+    }
+
     /// A private data directory and a well-formed scope, with no engine.
     fn record_fixture() -> Result<(tempfile::TempDir, PathBuf, String)> {
         let root = tempfile::tempdir()?;
@@ -816,10 +1029,13 @@ mod tests {
             StartingMemoryService,
         ] {
             ensure!(!published.contains(&unpublished), "{unpublished:?}");
-            ensure!(encode(&tag, &[unpublished]).is_err(), "{unpublished:?}");
+            ensure!(
+                encode(&tag, &staged(&[unpublished])).is_err(),
+                "{unpublished:?}"
+            );
         }
-        let (found, stages) = decode(&encode(&tag, &published)?)?;
-        ensure!(found == tag && stages == published, "{stages:?}");
+        let (found, activity) = decode(&encode(&tag, &staged(&published))?)?;
+        ensure!(found == tag && activity.stages == published, "{activity:?}");
         Ok(())
     }
 
@@ -831,22 +1047,214 @@ mod tests {
         let upper = tag.to_uppercase();
         ensure!(
             decode(
-                format!(r#"{{"format":1,"tag":"{tag}","stages":["PreparingDatabase"]}}"#)
-                    .as_bytes()
-            )
-            .is_ok()
+                format!(
+                    r#"{{"format":2,"tag":"{tag}","stages":["PreparingDatabase"],"progress":3}}"#
+                )
+                .as_bytes()
+            )?
+            .1 == Activity {
+                stages: vec![PreparingDatabase],
+                progress: 3,
+                failure: None,
+            }
         );
         for invalid in [
-            format!(r#"{{"format":1,"tag":"{tag}","stages":[],"token":"{token}"}}"#),
-            format!(r#"{{"format":1,"tag":"{tag}","stages":["Teleporting"]}}"#),
-            format!(r#"{{"format":1,"tag":"{tag}","stages":["Ready"]}}"#),
+            // Format 1 is no longer read, and no later format is guessed at.
+            format!(r#"{{"format":1,"tag":"{tag}","stages":["PreparingDatabase"]}}"#),
+            format!(r#"{{"format":3,"tag":"{tag}","stages":[],"progress":0}}"#),
+            format!(r#"{{"format":2,"tag":"{tag}","stages":[],"progress":0,"token":"{token}"}}"#),
+            format!(r#"{{"format":2,"tag":"{tag}","stages":["Teleporting"],"progress":0}}"#),
+            format!(r#"{{"format":2,"tag":"{tag}","stages":["Ready"],"progress":0}}"#),
             format!(r#"{{"format":2,"tag":"{tag}","stages":[]}}"#),
-            format!(r#"{{"format":1,"tag":"{token}","stages":[]}}"#),
-            format!(r#"{{"format":1,"tag":"{upper}","stages":[]}}"#),
-            r#"{"format":1,"stages":[]}"#.to_owned(),
+            format!(r#"{{"format":2,"tag":"{tag}","stages":[],"progress":-1}}"#),
+            format!(r#"{{"format":2,"tag":"{tag}","stages":[],"progress":0,"failing":true}}"#),
+            format!(r#"{{"format":2,"tag":"{tag}","stages":[],"progress":0,"reason":"x"}}"#),
+            format!(
+                r#"{{"format":2,"tag":"{tag}","stages":[],"progress":0,"failing":false,"reason":"x"}}"#
+            ),
+            format!(r#"{{"format":2,"tag":"{token}","stages":[],"progress":0}}"#),
+            format!(r#"{{"format":2,"tag":"{upper}","stages":[],"progress":0}}"#),
+            r#"{"format":2,"stages":[],"progress":0}"#.to_owned(),
         ] {
             ensure!(decode(invalid.as_bytes()).is_err(), "{invalid}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn the_record_round_trips_progress_and_the_failing_mark() -> Result<()> {
+        let tag = activity_tag(&Uuid::new_v4());
+        for activity in [
+            Activity {
+                stages: vec![PreparingDatabase, OpeningDatabase],
+                progress: 41,
+                failure: None,
+            },
+            Activity {
+                stages: vec![CreatingDatabase],
+                progress: u64::MAX,
+                failure: Some("open active main pool: refused".into()),
+            },
+        ] {
+            let (found, decoded) = decode(&encode(&tag, &activity)?)?;
+            ensure!(found == tag && decoded == activity, "{decoded:?}");
+        }
+        Ok(())
+    }
+
+    // A reason is cut at a character boundary, and quotes and backslashes,
+    // which escaping doubles, still keep the whole record within its limit.
+    #[test]
+    fn an_oversized_reason_is_bounded_within_the_record_limit() -> Result<()> {
+        let tag = activity_tag(&Uuid::new_v4());
+        let stages: Vec<_> = MemoryOpenStage::ALL
+            .into_iter()
+            .filter(|stage| stage_name(*stage).is_some())
+            .collect();
+        for (text, expected) in [
+            ("é".repeat(3000), "é".repeat(REASON_LIMIT / 2)),
+            ("\"".repeat(3000), "\"".repeat(REASON_LIMIT)),
+            ("a\nb\u{7}c".to_owned(), "a b c".to_owned()),
+            (
+                format!("x{}", "東".repeat(400)),
+                format!("x{}", "東".repeat(341)),
+            ),
+        ] {
+            let activity = Activity {
+                stages: stages.clone(),
+                progress: u64::MAX,
+                failure: Some(text),
+            };
+            let bytes = encode(&tag, &activity)?;
+            ensure!(bytes.len() as u64 <= RECORD_LIMIT, "{}", bytes.len());
+            let (_, decoded) = decode(&bytes)?;
+            let reason = decoded.failure.context("the reason was dropped")?;
+            ensure!(reason.len() <= REASON_LIMIT, "{}", reason.len());
+            ensure!(reason == expected, "{reason}");
+        }
+        Ok(())
+    }
+
+    /// A publisher whose writes are only logged, with `ticks` as its open's
+    /// counter.
+    fn logged_feed(
+        redact: Vec<String>,
+    ) -> Result<(
+        Feed,
+        crate::progress::OpenTicks,
+        Arc<WriteLog>,
+        tempfile::TempDir,
+    )> {
+        let (root, data, scope) = record_fixture()?;
+        let log = Arc::new(watch::channel(Vec::new()).0);
+        let writes = Writes {
+            log: Some(Arc::clone(&log)),
+            no_io: true,
+            ..Writes::default()
+        };
+        let (ticks, advance) = crate::progress::OpenTicks::new();
+        let feed = Feed::start(
+            directory(&data, &scope)?,
+            activity_tag(&Uuid::new_v4()),
+            redact,
+            writes,
+            Some(advance),
+        );
+        Ok((feed, ticks, log, root))
+    }
+
+    async fn writes_reach(
+        log: &WriteLog,
+        count: usize,
+    ) -> Result<Vec<(tokio::time::Instant, Activity)>> {
+        Ok(log
+            .subscribe()
+            .wait_for(|writes| writes.len() >= count)
+            .await?
+            .clone())
+    }
+
+    // Paused clock: the log's instants are the publisher's own decisions.
+    #[tokio::test(start_paused = true)]
+    async fn a_publisher_spaces_progress_writes_and_always_writes_the_latest() -> Result<()> {
+        let (mut feed, ticks, log, _root) = logged_feed(Vec::new())?;
+        let start = tokio::time::Instant::now();
+        let at = |writes: &[(tokio::time::Instant, Activity)], index: usize| {
+            writes[index].0.duration_since(start)
+        };
+        // The first change is written at once.
+        ticks.advance();
+        let writes = writes_reach(&log, 1).await?;
+        ensure!(at(&writes, 0).is_zero() && writes[0].1.progress == 1);
+        // A stage change is written at once, inside the spacing, with the
+        // latest count; the counts before it are coalesced into it.
+        for _ in 0..5 {
+            ticks.advance();
+        }
+        ensure!(feed.push(PreparingDatabase));
+        let writes = writes_reach(&log, 2).await?;
+        ensure!(at(&writes, 1).is_zero(), "{:?}", at(&writes, 1));
+        ensure!(writes[1].1.stages == [PreparingDatabase] && writes[1].1.progress == 6);
+        // A count alone waits for the spacing, then is written.
+        ticks.advance();
+        let writes = writes_reach(&log, 3).await?;
+        ensure!(at(&writes, 2) == PROGRESS_SPACING && writes[2].1.progress == 7);
+        // Several counts inside one spacing: only the latest is written.
+        ticks.advance();
+        ticks.advance();
+        let writes = writes_reach(&log, 4).await?;
+        ensure!(at(&writes, 3) == 2 * PROGRESS_SPACING && writes[3].1.progress == 9);
+        // The failing mark is written at once, inside the spacing.
+        ticks.mark_failing(&anyhow::anyhow!("refused"));
+        let writes = writes_reach(&log, 5).await?;
+        ensure!(at(&writes, 4) == 2 * PROGRESS_SPACING);
+        ensure!(writes[4].1.failure.as_deref() == Some("refused"));
+        // A count still unwritten when the open ends is written at once.
+        ticks.advance();
+        let publisher = feed.finish();
+        publisher.task.await?;
+        let writes = log.borrow().clone();
+        ensure!(writes.len() == 6, "{writes:?}");
+        ensure!(at(&writes, 5) == 2 * PROGRESS_SPACING && writes[5].1.progress == 10);
+        ensure!(writes[5].1.failure.as_deref() == Some("refused"));
+        Ok(())
+    }
+
+    // Writes stop once the open has ended and its last activity is written:
+    // a counter that outlives the open (its server keeps it) changes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_publisher_ends_with_its_open_while_its_counter_lives() -> Result<()> {
+        let (mut feed, ticks, log, _root) = logged_feed(Vec::new())?;
+        ensure!(feed.push(OpeningDatabase));
+        writes_reach(&log, 1).await?;
+        let publisher = feed.finish();
+        publisher.task.await?;
+        ticks.advance();
+        ensure!(log.borrow().len() == 1, "{:?}", log.borrow());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_reason_never_carries_the_starter_token_or_tag() -> Result<()> {
+        let token = Uuid::new_v4();
+        let tag = activity_tag(&token);
+        let redact = vec![
+            token.hyphenated().to_string(),
+            token.simple().to_string(),
+            tag.clone(),
+        ];
+        let (feed, ticks, log, _root) = logged_feed(redact)?;
+        ticks.mark_failing(&anyhow::anyhow!(
+            "starter {token} ({}) tagged {tag} refused",
+            token.simple()
+        ));
+        let writes = writes_reach(&log, 1).await?;
+        let reason = writes[0].1.failure.clone().context("no reason written")?;
+        ensure!(
+            reason == format!("starter {REDACTED} ({REDACTED}) tagged {REDACTED} refused"),
+            "{reason}"
+        );
+        feed.finish().task.await?;
         Ok(())
     }
 
@@ -863,7 +1271,11 @@ mod tests {
 
         // Another owner's record, written by the publisher's own code.
         let token = Uuid::new_v4();
-        write_record(&directory, &activity_tag(&token), &[UpgradingDatabase])?;
+        write_record(
+            &directory,
+            &activity_tag(&token),
+            &staged(&[UpgradingDatabase]),
+        )?;
         for start in [0, 1, 5] {
             forwarded = start;
             forward_new(&data, &scope, &own, &mut forwarded, &mut reporter);
@@ -872,7 +1284,10 @@ mod tests {
         // A record carrying the raw token instead of its tag.
         crate::files::write(
             &directory.join(RECORD),
-            format!(r#"{{"format":1,"tag":"{token}","stages":["UpgradingDatabase"]}}"#).as_bytes(),
+            format!(
+                r#"{{"format":2,"tag":"{token}","stages":["UpgradingDatabase"],"progress":1}}"#
+            )
+            .as_bytes(),
         )?;
         forwarded = 0;
         for tag in [activity_tag(&token), token.to_string()] {
@@ -880,14 +1295,14 @@ mod tests {
         }
         ensure!(forwarded == 0, "a raw-token record moved the client");
         // A record of its own owner over the size limit.
-        let mut oversized = encode(&own, &[UpgradingDatabase])?;
+        let mut oversized = encode(&own, &staged(&[UpgradingDatabase]))?;
         oversized.resize(RECORD_LIMIT as usize + 1, b' ');
         crate::files::write(&directory.join(RECORD), &oversized)?;
         forward_new(&data, &scope, &own, &mut forwarded, &mut reporter);
         ensure!(forwarded == 0, "an oversized record moved the client");
         ensure!(received(&mut progress).is_empty());
 
-        write_record(&directory, &own, &[PreparingDatabase])?;
+        write_record(&directory, &own, &staged(&[PreparingDatabase]))?;
         forward_new(&data, &scope, &own, &mut forwarded, &mut reporter);
         ensure!(forwarded == 1);
         ensure!(received(&mut progress) == [PreparingDatabase]);
@@ -905,7 +1320,7 @@ mod tests {
             let (mut progress, mut reporter) = ProgressReporter::observed();
             let mut forwarded = 0;
             for written in 1..=SAMPLE.len() {
-                write_record(&directory, &tag, &SAMPLE[..written])?;
+                write_record(&directory, &tag, &staged(&SAMPLE[..written]))?;
                 if reads & (1 << (written - 1)) != 0 {
                     forward_new(&data, &scope, &tag, &mut forwarded, &mut reporter);
                     ensure!(forwarded == written, "reads {reads:#b}");
@@ -923,10 +1338,10 @@ mod tests {
         let (_root, data, scope) = record_fixture()?;
         let directory = directory(&data, &scope)?;
         let (own, foreign) = (activity_tag(&Uuid::new_v4()), activity_tag(&Uuid::new_v4()));
-        write_record(&directory, &foreign, &[PreparingDatabase])?;
+        write_record(&directory, &foreign, &staged(&[PreparingDatabase]))?;
         ensure!(retire_record(&directory, &own).is_err());
         ensure!(read_stages(&data, &scope, &foreign)? == [PreparingDatabase]);
-        write_record(&directory, &own, &[PreparingDatabase])?;
+        write_record(&directory, &own, &staged(&[PreparingDatabase]))?;
         retire_record(&directory, &own)?;
         ensure!(!directory.join(RECORD).exists(), "the own record remained");
         ensure!(
@@ -942,9 +1357,13 @@ mod tests {
         let (_root, data, scope) = record_fixture()?;
         let directory = directory(&data, &scope)?;
         let tag = activity_tag(&Uuid::new_v4());
-        write_record(&directory, &tag, &[PreparingDatabase])?;
+        write_record(&directory, &tag, &staged(&[PreparingDatabase]))?;
         let held = crate::files::read(&directory.join(RECORD), Privacy::OwnerOnly)?;
-        write_record(&directory, &tag, &[PreparingDatabase, OpeningDatabase])?;
+        write_record(
+            &directory,
+            &tag,
+            &staged(&[PreparingDatabase, OpeningDatabase]),
+        )?;
         ensure!(read_stages(&data, &scope, &tag)? == [PreparingDatabase, OpeningDatabase]);
         let replacement = crate::files::read(&directory.join(RECORD), Privacy::OwnerOnly)?;
         // Removal of the staged record may wait for these readers.
@@ -953,7 +1372,7 @@ mod tests {
             read_stages(&data, &scope, &tag).is_err(),
             "the name kept the record"
         );
-        write_record(&directory, &tag, &[CreatingDatabase])?;
+        write_record(&directory, &tag, &staged(&[CreatingDatabase]))?;
         ensure!(read_stages(&data, &scope, &tag)? == [CreatingDatabase]);
         drop((held, replacement));
         Ok(())
@@ -968,7 +1387,13 @@ mod tests {
             failures: Some(Arc::clone(&failures)),
             ..Writes::default()
         };
-        let mut feed = Feed::start(directory(&data, &scope)?, tag.clone(), writes);
+        let mut feed = Feed::start(
+            directory(&data, &scope)?,
+            tag.clone(),
+            Vec::new(),
+            writes,
+            None,
+        );
         for unpublished in [Ready, StartingMemoryService] {
             ensure!(!feed.push(unpublished), "{unpublished:?} was published");
         }
@@ -1098,6 +1523,117 @@ mod tests {
         .with_context(|| format!("record retirement fixture exceeded its {deadline:?} deadline"))?
     }
 
+    // An open that fails after starting its engine marks its record failing,
+    // with the failure's own text, before that engine's close begins, and
+    // retires the record after the close.
+    #[tokio::test]
+    async fn a_failed_open_marks_its_record_failing_before_closing_its_engine() -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (_project, scope, data, mut options) = owner_fixture(root.path())?;
+            let token = Uuid::new_v4();
+            options.starter_token = Some(token);
+            crate::store::refuse_active_validation(&mut options);
+            let log = Arc::new(watch::channel(Vec::new()).0);
+            let hooks = OwnerHooks {
+                writes: Writes {
+                    log: Some(Arc::clone(&log)),
+                    ..Writes::default()
+                },
+                ..OwnerHooks::default()
+            };
+            let pause = Arc::new(crate::store::failed_open_close::Pause::default());
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut opening = Box::pin(crate::store::failed_open_close::scope(
+                Arc::clone(&pause),
+                open_owner_store(options, hooks),
+            ));
+            tokio::select! {
+                biased;
+                () = pause.entered.notified() => {}
+                opened = opening.as_mut() => bail!(
+                    "the open ended before closing a failed engine: {:?}",
+                    opened.map(|_| ())
+                ),
+            }
+            // The close has not begun: the open waits at the pause.
+            log.subscribe()
+                .wait_for(|writes| {
+                    writes
+                        .iter()
+                        .any(|(_, activity)| activity.failure.is_some())
+                })
+                .await?;
+            let activity = read_activity(&data, &scope, &activity_tag(&token))?;
+            let reason = activity
+                .failure
+                .clone()
+                .context("the record is not marked failing")?;
+            ensure!(
+                reason.contains(crate::store::ACTIVE_VALIDATION_REFUSAL),
+                "{reason}"
+            );
+            ensure!(activity.stages.contains(&OpeningDatabase), "{activity:?}");
+            ensure!(activity.progress > 0, "{activity:?}");
+            pause.release.notify_one();
+            let error = opening
+                .await
+                .err()
+                .context("the open succeeded despite its refused validation")?;
+            ensure!(
+                format!("{error:#}").contains(crate::store::ACTIVE_VALIDATION_REFUSAL),
+                "{error:#}"
+            );
+            ensure!(
+                !directory(&data, &scope)?.join(RECORD).exists(),
+                "the failed open left its record"
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("failing mark fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    // Two opens in one process: each advances only its own count.
+    #[tokio::test]
+    async fn concurrent_opens_advance_independent_counts() -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(2, 0);
+        tokio::time::timeout(deadline, async {
+            let (first_root, second_root) = (tempfile::tempdir()?, tempfile::tempdir()?);
+            let (_, _, _, first) = owner_fixture(first_root.path())?;
+            let (_, _, _, second) = owner_fixture(second_root.path())?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let (first_progress, first_open) = MemoryStore::open_observed(first);
+            let (second_progress, second_open) = MemoryStore::open_observed(second);
+            let first_count = first_progress
+                .ticks()
+                .context("first open counts nothing")?;
+            let second_count = second_progress
+                .ticks()
+                .context("second open counts nothing")?;
+            let first_store = first_open.await?;
+            let first_total = first_count.borrow().count;
+            ensure!(first_total > 0, "the first open never advanced");
+            ensure!(
+                second_count.borrow().count == 0,
+                "the first open advanced the second open's count"
+            );
+            let second_store = second_open.await?;
+            ensure!(second_count.borrow().count > 0);
+            ensure!(
+                first_count.borrow().count == first_total,
+                "the second open advanced the first open's count"
+            );
+            first_store.close().await?;
+            second_store.close().await
+        })
+        .await
+        .with_context(|| format!("concurrent counts fixture exceeded its {deadline:?} deadline"))?
+    }
+
     /// Open an owner holding at `stage`, assert its record holds that stage,
     /// then release it and return the failed open's error.
     async fn failed_open_after_publishing(
@@ -1203,7 +1739,7 @@ mod tests {
             write_record(
                 &directory(&data, &scope)?,
                 &activity_tag(&Uuid::new_v4()),
-                &[UpgradingDatabase],
+                &staged(&[UpgradingDatabase]),
             )?;
             let environment = vec![(OPEN_HOLD_DIR_ENV.into(), holds.clone().into_os_string())];
             let mut seen = Vec::new();

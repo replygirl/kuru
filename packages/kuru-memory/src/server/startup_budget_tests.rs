@@ -22,6 +22,7 @@ async fn initial_authentication_uses_remaining_startup_budget_and_reaps_on_expir
         read_only: false,
         retained: None,
         lifecycle_root: lifecycle_root.clone(),
+        ticks: None,
     };
 
     // This delay runs inside SQLx acquisition after a real Dolt connection.
@@ -107,6 +108,7 @@ async fn opening_pool_identity_rejection_is_terminal() -> Result<()> {
             read_only: false,
             retained: None,
             lifecycle_root: cfg!(windows).then(|| root.path().join("leases")),
+            ticks: None,
         })
         .await?
     };

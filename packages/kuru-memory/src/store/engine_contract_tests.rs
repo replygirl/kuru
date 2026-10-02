@@ -363,6 +363,7 @@ async fn start(data_dir: &Path, store: &Path, scope: &str, read_only: bool) -> R
         read_only,
         retained: None,
         lifecycle_root: lifecycle_root(data_dir),
+        ticks: None,
     };
     let opened = {
         let _gate = crate::spawn_gate::spawning().await;

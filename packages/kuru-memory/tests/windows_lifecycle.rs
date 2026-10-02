@@ -43,6 +43,7 @@ fn options(root: &Path, binary: PathBuf) -> ServerOptions {
         read_only: false,
         retained: None,
         lifecycle_root: Some(root.join("lifecycles")),
+        ticks: None,
     }
 }
 
@@ -204,6 +205,7 @@ async fn marker_rows(
         read_only: true,
         retained: None,
         lifecycle_root: Some(options.data_dir.join("memory/lifecycles")),
+        ticks: None,
     })
     .await?;
     let pool = server.pool("main").await?;

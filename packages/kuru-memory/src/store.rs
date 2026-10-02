@@ -1882,7 +1882,8 @@ impl MemoryStore {
         MemoryOpenProgress,
         impl std::future::Future<Output = Result<Self>> + Send + 'static,
     ) {
-        let (progress, reporter) = ProgressReporter::observed();
+        // One counter for this open alone; see `ProgressReporter::ticks`.
+        let (progress, reporter) = ProgressReporter::observed_counting();
         let opening = async move {
             let mut reporter = reporter;
             Self::open_inner(options, None, None, None, &mut reporter).await
@@ -1939,6 +1940,9 @@ impl MemoryStore {
         let lifecycle_root = None;
         #[cfg(windows)]
         let lifecycle_root = Some(options.data_dir.join("memory/lifecycles"));
+        // Every engine start of this open, its workers' included, advances
+        // this open's own counter.
+        let ticks = progress.ticks().cloned();
         let make_options = |path: PathBuf, read_only| ServerOptions {
             binary: binary.clone(),
             directory: path,
@@ -1948,6 +1952,7 @@ impl MemoryStore {
             read_only,
             retained: temporary.clone(),
             lifecycle_root: lifecycle_root.clone(),
+            ticks: ticks.clone(),
         };
         progress.report(MemoryOpenStage::PreparingDatabase);
         if !Self::exists(&options.data_dir, &options.project_scope)? {
@@ -2005,6 +2010,7 @@ impl MemoryStore {
                         binary: binary.clone(),
                         supervisor: supervisor.clone(),
                         timeout,
+                        ticks: ticks.clone(),
                     },
                     base: make_options(staging.clone(), false),
                     stage: staging.clone(),
@@ -2071,7 +2077,7 @@ impl MemoryStore {
             Ok(pool) => pool,
             Err(error) => return Err(close_failed_open(&server, error).await),
         };
-        open_timeline::stamp(open_timeline::Event::MainPool);
+        progress.milestone(open_timeline::Event::MainPool);
         let inspected = async {
             let found = migrations::version(&pool).await?;
             if (options.read_only && found < migrations::CURRENT_VERSION)
@@ -2090,14 +2096,16 @@ impl MemoryStore {
             Ok(found) => found,
             Err(error) => return Err(close_failed_open(&server, error).await),
         };
-        open_timeline::stamp(open_timeline::Event::VersionRead);
+        progress.milestone(open_timeline::Event::VersionRead);
         if options.read_only && found < migrations::CURRENT_VERSION {
-            let lock: File = server.close_installed_guard().await?;
-            drop(lock);
-            bail!(
+            let error = anyhow::anyhow!(
                 "memory schema version {found} requires writable upgrade to {}",
                 migrations::CURRENT_VERSION
             );
+            server.mark_open_failing(&error);
+            let lock: File = server.close_installed_guard().await?;
+            drop(lock);
+            return Err(error);
         }
         let (server, pool) = if found < migrations::CURRENT_VERSION {
             progress.report(MemoryOpenStage::UpgradingDatabase);
@@ -2128,10 +2136,17 @@ impl MemoryStore {
             }
             migrations::validate_active(&pool).await
         };
+        #[cfg(test)]
+        let validated = validated.and_then(|()| {
+            options
+                .validation_probe
+                .as_ref()
+                .map_or(Ok(()), stage_worker::ValidationProbe::active_outcome)
+        });
         if let Err(error) = validated {
             return Err(close_failed_open(&server, error).await);
         }
-        open_timeline::stamp(open_timeline::Event::ValidateActive);
+        progress.milestone(open_timeline::Event::ValidateActive);
         let shared = Arc::new(Shared {
             server,
             directory,
@@ -2162,8 +2177,9 @@ impl MemoryStore {
         if !options.read_only {
             // The recovery worker closes its server before reporting failure.
             run_candidate_recovery_worker(&store).await?;
-            open_timeline::stamp(open_timeline::Event::CandidateRecovery);
+            progress.milestone(open_timeline::Event::CandidateRecovery);
             if let Err(error) = usage_ledger::establish(&store).await {
+                store.shared.server.mark_open_failing(&error);
                 // Recovery already released the startup guard to this store,
                 // so close the server itself rather than its installed guard.
                 let closed = store.shared.server.close().await;
@@ -2176,7 +2192,7 @@ impl MemoryStore {
         // Open-sequence pools, including recovery and the usage ledger above,
         // shared this server's startup deadline. Later pools are ordinary.
         store.shared.server.finish_opening();
-        open_timeline::stamp(open_timeline::Event::StoreReady);
+        progress.milestone(open_timeline::Event::StoreReady);
         progress.report(MemoryOpenStage::Ready);
         Ok(store)
     }
@@ -4638,6 +4654,10 @@ async fn run_migration_worker(
         };
         #[cfg(not(test))]
         let upgrade = migrations::upgrade(&server, &pool).await;
+        // The open returns this failure (`migrated?`) after the close below.
+        if let Err(error) = &upgrade {
+            server.mark_open_failing(error);
+        }
         let cleanup = close_migration_worker(server, pool).await;
         let outcome = match (upgrade, cleanup) {
             (upgrade, Ok(lock)) => Ok((lock, upgrade)),
@@ -4665,6 +4685,8 @@ async fn run_candidate_recovery_worker(store: &MemoryStore) -> Result<()> {
                 }
             }
             Err(error) => {
+                // The opener returns this failure after the close below.
+                worker_store.shared.server.mark_open_failing(&error);
                 let cleanup = close_candidate_recovery_worker(worker_store).await;
                 let outcome = match cleanup {
                     Ok(()) => Err(error),
@@ -4714,9 +4736,58 @@ fn with_close_failure(error: anyhow::Error, closed: Result<()>) -> anyhow::Error
 /// `Err` from `MemoryStore::open` therefore means Dolt is reaped, and a caller
 /// may release or remove the directory. A close that exceeds its bound keeps
 /// the guard with the supervisor observer and is attached to `error`.
+///
+/// Every caller returns this error from the open, so the open is marked
+/// failing, with the error's own text, before the close begins.
 async fn close_failed_open(server: &Server, error: anyhow::Error) -> anyhow::Error {
+    server.mark_open_failing(&error);
+    #[cfg(test)]
+    failed_open_close::reach().await;
     let closed = server.close_installed_guard().await.map(drop);
     with_close_failure(error, closed)
+}
+
+#[cfg(test)]
+pub(crate) use stage_worker::ACTIVE_VALIDATION_REFUSAL;
+
+/// Test-only: make `options`' active open fail its validation after its
+/// engine started, with `stage_worker::ACTIVE_VALIDATION_REFUSAL`.
+#[cfg(test)]
+pub(crate) fn refuse_active_validation(options: &mut OpenOptions) {
+    options.validation_probe = Some(stage_worker::ValidationProbe {
+        refuse_active: true,
+        ..stage_worker::ValidationProbe::default()
+    });
+}
+
+/// Test-only pause between a failed open's failing mark and its engine's
+/// close, scoped to one test's own open task.
+#[cfg(test)]
+pub(crate) mod failed_open_close {
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    pub(crate) struct Pause {
+        pub(crate) entered: tokio::sync::Notify,
+        pub(crate) release: tokio::sync::Notify,
+    }
+
+    tokio::task_local! {
+        static PAUSE: Arc<Pause>;
+    }
+
+    /// Run `future` with every failed-open close on its own task pausing.
+    pub(crate) async fn scope<F: Future>(pause: Arc<Pause>, future: F) -> F::Output {
+        PAUSE.scope(pause, future).await
+    }
+
+    pub(super) async fn reach() {
+        let Ok(pause) = PAUSE.try_with(Arc::clone) else {
+            return;
+        };
+        pause.entered.notify_one();
+        pause.release.notified().await;
+    }
 }
 
 async fn close_migration_worker(server: Server, _pool: Arc<MemoryPool>) -> Result<File> {
@@ -10775,6 +10846,7 @@ mod tests {
             read_only: false,
             retained: None,
             lifecycle_root: cfg!(windows).then(|| options.data_dir.join("memory/lifecycles")),
+            ticks: None,
         })
         .await?;
         let pool = server.pool("main").await?;
@@ -10810,6 +10882,7 @@ mod tests {
             read_only: false,
             retained: None,
             lifecycle_root: cfg!(windows).then(|| options.data_dir.join("memory/lifecycles")),
+            ticks: None,
         })
         .await
     }
@@ -13401,6 +13474,7 @@ mod tests {
             } else {
                 None
             },
+            ticks: None,
         })
         .await
         .unwrap();

@@ -99,6 +99,7 @@ async fn interrupted_migration_close_handoff_retains_guard_until_supervisor_quie
                 read_only: false,
                 retained: Some(root.clone()),
                 lifecycle_root: lifecycle_root.clone(),
+                ticks: None,
             },
             guard,
         )
@@ -234,6 +235,7 @@ async fn inspection_owned_old_schema_blocks_writer_without_mutation() -> Result<
         read_only: true,
         retained: None,
         lifecycle_root: cfg!(windows).then(|| options.data_dir.join("memory/lifecycles")),
+        ticks: None,
     })
     .await?;
     let inspected = inspector.pool("main").await?;

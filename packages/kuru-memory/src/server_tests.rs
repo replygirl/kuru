@@ -435,6 +435,7 @@ async fn open_rejects_invalid_options_before_executable_lookup() -> Result<()> {
         read_only: false,
         retained: None,
         lifecycle_root: None,
+        ticks: None,
     };
     let mut invalid = options();
     invalid.timeout = Duration::ZERO;
@@ -585,6 +586,7 @@ async fn closing_an_attached_handle_does_not_establish_quiescence() -> Result<()
         read_only: false,
         retained: None,
         lifecycle_root: None,
+        ticks: None,
     };
     let (owner, attached) = {
         // Held across both owned-supervisor spawns; see `crate::spawn_gate`.

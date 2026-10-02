@@ -262,6 +262,7 @@ fn template_engine(binary: PathBuf) -> Result<crate::store::creation_template::E
         binary,
         supervisor: crate::store::test_supervisor()?,
         timeout: default_startup(),
+        ticks: None,
     })
 }
 
@@ -333,6 +334,7 @@ pub async fn warm_template_cache(cache: &Path, engine: &Path, supervisor: &Path)
         binary: engine.to_owned(),
         supervisor: supervisor.to_owned(),
         timeout: default_startup(),
+        ticks: None,
     };
     let root = crate::store::creation_template::root_in(&cache);
     tokio::time::timeout(

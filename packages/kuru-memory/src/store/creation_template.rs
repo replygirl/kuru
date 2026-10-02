@@ -959,6 +959,8 @@ pub(crate) struct Engine {
     pub(crate) binary: PathBuf,
     pub(crate) supervisor: PathBuf,
     pub(crate) timeout: Duration,
+    /// The counter of the open this build serves, if it counts.
+    pub(crate) ticks: Option<crate::progress::OpenTicks>,
 }
 
 /// Abandoned build and capture stages of one key a sweep removed or left.
@@ -1130,6 +1132,7 @@ async fn build(
         read_only,
         retained: None,
         lifecycle_root: lifecycle_root.clone(),
+        ticks: engine.ticks.clone(),
     };
     let worker = stage_worker::StageWorker {
         make_options: &make_options,

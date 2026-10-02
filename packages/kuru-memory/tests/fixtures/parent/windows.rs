@@ -79,6 +79,7 @@ pub async fn run() -> Result<()> {
         read_only: false,
         retained: None,
         lifecycle_root: Some(root.join("lifecycles")),
+        ticks: None,
     };
     if mode == "partial-ready" {
         partial_readiness(options, &mut parent).await?;

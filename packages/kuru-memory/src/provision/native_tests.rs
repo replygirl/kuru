@@ -2316,3 +2316,34 @@ fn built_zip_extraction_accepts_exactly_the_declared_notices() {
         );
     }
 }
+
+// Extraction and warm verification each advance the open's count once per
+// 8 MiB of the engine's payload, across its files, never for a remainder.
+#[tokio::test]
+async fn extraction_and_warm_verification_advance_once_per_eight_mebibytes() {
+    let payload = BUNDLED_ASSET.executable_bytes
+        + BUNDLED_ASSET.license_bytes
+        + BUNDLED_ASSET
+            .notices
+            .iter()
+            .map(|notice| notice.bytes)
+            .sum::<u64>();
+    let expected = payload / crate::progress::BYTES_PER_ADVANCE;
+    assert!(expected > 0, "the pinned payload is under 8 MiB");
+    let root = crate::test_support::tempdir().unwrap();
+    let candidate = root.path().join("runtime");
+    let (extracted, extraction) = OpenTicks::new();
+    extract_ticking(
+        EMBEDDED_ARCHIVE,
+        &candidate,
+        BUNDLED_ASSET,
+        Some(&extracted),
+    )
+    .unwrap();
+    assert_eq!(extraction.borrow().count, expected);
+    let (hashed, hashing) = OpenTicks::new();
+    verified_cache_ticking(&candidate, BUNDLED_ASSET, Some(hashed))
+        .await
+        .unwrap();
+    assert_eq!(hashing.borrow().count, expected);
+}

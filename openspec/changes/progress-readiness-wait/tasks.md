@@ -14,11 +14,11 @@ Work in `tmp/worktrees/feat-progress-readiness-wait` (branch `feat/progress-read
 
 ## 3. Owner progress, failing mark and reason
 
-- [ ] 3.1 Change the record to format 2 only (`progress`, optional `failing` and `reason`, `deny_unknown_fields`, 4 KiB), and verify the unit tests that format 1 and 3 are rejected, that every field round-trips and that an oversized reason is truncated at a character boundary within the limit.
-- [ ] 3.2 Create one progress counter per open in `MemoryStore::open_observed`, carried on `ProgressReporter` and `ServerOptions`, and verify two concurrent in-process opens advance independent counters.
-- [ ] 3.3 Advance at every `report` call, at every open milestone stamped inside the open (stamp and advance paired), per 8 MiB of extraction and warm-cache hashing and per completed migration step, and verify by a site audit recorded in `verification.md` with file:line for every site and every audited non-site (port retry, pool acquire loop, startup lock wait, test hold loop), plus a unit test that extraction ticks per 8 MiB.
-- [ ] 3.4 Audit every `close_failed_open` caller and the creation and migration worker failure paths, confirm with file:line that each `Err` always propagates out of the open, then set the failing mark and the bounded reason immediately before the close at those sites, and verify a test in which an open fails after starting its engine finds the record marked failing with the reason before that close and retired after it.
-- [ ] 3.5 Make the publisher write a stage change at once and coalesce progress-only changes at most every 250 ms with a trailing-edge flush, and verify with the existing `Writes` gate seam that progress-only writes are spaced, stage changes are not delayed and the last value is always written.
+- [x] 3.1 Change the record to format 2 only (`progress`, optional `failing` and `reason`, `deny_unknown_fields`, 4 KiB), and verify the unit tests that format 1 and 3 are rejected, that every field round-trips and that an oversized reason is truncated at a character boundary within the limit. Observed 2026-10-02 (macOS arm64): verification 5.1.
+- [x] 3.2 Create one progress counter per open in `MemoryStore::open_observed`, carried on `ProgressReporter` and `ServerOptions`, and verify two concurrent in-process opens advance independent counters. Observed 2026-10-02 (macOS arm64): verification 4.2.
+- [x] 3.3 Advance at every `report` call, at every open milestone stamped inside the open (stamp and advance paired), per 8 MiB of extraction and warm-cache hashing and per completed migration step, and verify by a site audit recorded in `verification.md` with file:line for every site and every audited non-site (port retry, pool acquire loop, startup lock wait, test hold loop), plus a unit test that extraction ticks per 8 MiB. Observed 2026-10-02: audit in verification 4.1, tests in 4.2.
+- [x] 3.4 Audit every `close_failed_open` caller and the creation and migration worker failure paths, confirm with file:line that each `Err` always propagates out of the open, then set the failing mark and the bounded reason immediately before the close at those sites, and verify a test in which an open fails after starting its engine finds the record marked failing with the reason before that close and retired after it. Observed 2026-10-02 (macOS arm64): audit in verification 3.4 (all six `close_failed_open` callers plus every other failure close inside the open, as the spec sentence requires), owner-side test in 3.3; the failure reason lands in this change with the mark.
+- [x] 3.5 Make the publisher write a stage change at once and coalesce progress-only changes at most every 250 ms with a trailing-edge flush, and verify with the existing `Writes` gate seam that progress-only writes are spaced, stage changes are not delayed and the last value is always written. Observed 2026-10-02 (macOS arm64): verification 4.3; the seam gained a write log and a no-I/O mode so the paused clock cannot advance past a blocking write.
 
 ## 4. Client readiness wait
 
@@ -28,7 +28,7 @@ Work in `tmp/worktrees/feat-progress-readiness-wait` (branch `feat/progress-read
 ## 5. Documentation and follow-ons
 
 - [ ] 5.1 Update `docs/configuration.md` and `apps/kuru-docs/reference/configuration.md` (new meaning, definition of progress, each error's report, each engine start still bounded), `docs/release.md` (both mixed-version directions) and `docs/development.md` (progress field, progress-point rule, stand-in mode), and verify `mise run docs:check` passes.
-- [ ] 5.2 Record the sign-of-life indicator follow-on in `tmp/roadmap/dx-followons.md`, and verify the entry names this change and the unchanged sentence contract.
+- [x] 5.2 Record the sign-of-life indicator follow-on in `tmp/roadmap/dx-followons.md`, and verify the entry names this change and the unchanged sentence contract. Done 2026-10-02 in step 1 (`tmp/roadmap/dx-followons.md`, 2026-10-02 section).
 
 ## 6. Verification and archive
 

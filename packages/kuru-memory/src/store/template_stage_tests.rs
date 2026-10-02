@@ -69,6 +69,7 @@ async fn server_options(
         read_only,
         retained: None,
         lifecycle_root: lifecycle_root(data_dir),
+        ticks: None,
     })
 }
 
@@ -1594,6 +1595,7 @@ async fn template_born_store_matches_cold_store() -> Result<()> {
                     .config
                     .startup_timeout_secs,
             ),
+            ticks: None,
         };
         let born_dir = root.path().join("template-born");
         let born_scope = scope('a');

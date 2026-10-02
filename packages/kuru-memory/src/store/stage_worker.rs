@@ -121,7 +121,14 @@ pub(super) struct ValidationProbe {
     /// Leave an uncommitted table on the cold stage's `main` just before its
     /// validation, which then fails.
     pub(super) dirty_cold_stage: bool,
+    /// Fail the active open's validation, after its engine started, with
+    /// [`ACTIVE_VALIDATION_REFUSAL`].
+    pub(super) refuse_active: bool,
 }
+
+/// The text of a refused active validation.
+#[cfg(test)]
+pub(crate) const ACTIVE_VALIDATION_REFUSAL: &str = "test active validation refusal";
 
 #[cfg(test)]
 impl ValidationProbe {
@@ -133,6 +140,12 @@ impl ValidationProbe {
             .lock()
             .expect("validation probe")
             .push((directory.to_owned(), identity));
+    }
+
+    /// The active open's validation outcome under this probe.
+    pub(super) fn active_outcome(&self) -> Result<()> {
+        ensure!(!self.refuse_active, ACTIVE_VALIDATION_REFUSAL);
+        Ok(())
     }
 
     async fn before_cold_stage_validation(&self, stage: &Path, pool: &MemoryPool) -> Result<()> {
@@ -326,6 +339,11 @@ where
             Ok::<_, anyhow::Error>(hostname)
         }
         .await;
+        // The open returns a build failure after this close
+        // (`CreateError::Build`).
+        if let Err(error) = &built {
+            server.mark_open_failing(error);
+        }
         match (built, close_migration_worker(server, pool).await) {
             (Ok(hostname), Ok(guard)) => Ok((guard, hostname)),
             (Err(error), Ok(guard)) => {
@@ -390,6 +408,10 @@ impl StageSession {
     /// the lock is still held.
     async fn finish(mut self, server: Server, pool: Arc<MemoryPool>) -> Result<File> {
         let activated = self.activate(&server, &pool).await;
+        // The open returns an activation failure after this close.
+        if let Err((_, error)) = &activated {
+            server.mark_open_failing(error);
+        }
         match (activated, close_migration_worker(server, pool).await) {
             (Ok(()), Ok(returned_lock)) => Ok(returned_lock),
             (Err((phase, error)), Ok(returned_lock)) => {

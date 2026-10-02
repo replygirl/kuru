@@ -676,6 +676,7 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
         read_only: true,
         retained: None,
         lifecycle_root: cfg!(windows).then(|| options.data_dir.join("memory/lifecycles")),
+        ticks: None,
     })
     .await?;
     let inspected_state = async {
@@ -974,6 +975,7 @@ async fn observe_stopped_stage(
         read_only: true,
         retained: None,
         lifecycle_root: cfg!(windows).then(|| options.data_dir.join("memory/lifecycles")),
+        ticks: None,
     })
     .await?;
     let observed = async {
@@ -1937,6 +1939,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
         read_only: false,
         retained: Some(root),
         lifecycle_root: cfg!(windows).then(|| options.data_dir.join("memory/lifecycles")),
+        ticks: None,
     })
     .await
     .unwrap();

@@ -4,7 +4,7 @@ use crate::MemoryOpenStage;
 pub use crate::catalog::DOLT_VERSION;
 use crate::catalog::{Asset, BUNDLED_ASSET, EMBEDDED_ARCHIVE, MAX_COMPRESSED, MAX_EXPANDED};
 use crate::files::{self, PrivateTemp, StageCleanupFailure};
-use crate::progress::ProgressReporter;
+use crate::progress::{ByteTicks, OpenTicks, ProgressReporter, TickingWriter};
 use anyhow::{Context, Result, bail, ensure};
 use flate2::bufread::GzDecoder;
 use kuru_core::MemoryConfig;
@@ -84,7 +84,12 @@ async fn provision_managed_observed(
     archive: Cow<'static, [u8]>,
     progress: &mut ProgressReporter,
 ) -> Result<PathBuf> {
-    provision_with_extractor_observed(config, default_cache, asset, archive, extract, progress)
+    // The extraction advances this open's counter per 8 MiB written.
+    let ticks = progress.ticks().cloned();
+    let extractor = move |archive: &[u8], destination: &Path, asset: Asset<'static>| {
+        extract_ticking(archive, destination, asset, ticks.as_ref())
+    };
+    provision_with_extractor_observed(config, default_cache, asset, archive, extractor, progress)
         .await
 }
 
@@ -129,7 +134,7 @@ async fn provision_with_extractor_observed(
         // no lock is taken unless a receipt exists, and none is waited for.
         warm_sweep_if_receipted(cache, versions).await;
         progress.report(MemoryOpenStage::VerifyingRuntimeCache);
-        return verify_existing_cache(&destination, asset).await;
+        return verify_existing_cache(&destination, asset, progress.ticks()).await;
     }
     progress.report(MemoryOpenStage::WaitingForRuntimeCache);
     let lock = cache_lock(&cache, LOCK_TIMEOUT).await?;
@@ -140,7 +145,7 @@ async fn provision_with_extractor_observed(
     if destination_exists(&destination)? {
         drop(lock);
         progress.report(MemoryOpenStage::VerifyingRuntimeCache);
-        return verify_existing_cache(&destination, asset).await;
+        return verify_existing_cache(&destination, asset, progress.ticks()).await;
     }
     // From here the stage and the lock travel as one lease, so every exit -
     // an error, a cancelled caller or a worker that outlives it - resolves
@@ -501,19 +506,35 @@ fn destination_exists(path: &Path) -> Result<bool> {
     }
 }
 
-async fn verify_existing_cache(destination: &Path, asset: Asset<'_>) -> Result<PathBuf> {
-    crate::open_timeline::stamp(crate::open_timeline::Event::CacheVerifyStart);
-    let verified = verified_cache(destination, asset).await.with_context(|| {
-        format!(
-            "Dolt cache is invalid at {}; preserve or remove that version directory and retry",
-            destination.display()
-        )
-    });
-    crate::open_timeline::stamp(crate::open_timeline::Event::CacheVerifyEnd);
+async fn verify_existing_cache(
+    destination: &Path,
+    asset: Asset<'_>,
+    ticks: Option<&OpenTicks>,
+) -> Result<PathBuf> {
+    crate::progress::milestone(ticks, crate::open_timeline::Event::CacheVerifyStart);
+    let verified = verified_cache_ticking(destination, asset, ticks.cloned())
+        .await
+        .with_context(|| {
+            format!(
+                "Dolt cache is invalid at {}; preserve or remove that version directory and retry",
+                destination.display()
+            )
+        });
+    crate::progress::milestone(ticks, crate::open_timeline::Event::CacheVerifyEnd);
     verified
 }
 
+#[cfg(all(test, unix))]
 async fn verified_cache(directory: &Path, asset: Asset<'_>) -> Result<PathBuf> {
+    verified_cache_ticking(directory, asset, None).await
+}
+
+/// Verify the published cache, advancing `ticks` per 8 MiB hashed.
+async fn verified_cache_ticking(
+    directory: &Path,
+    asset: Asset<'_>,
+    ticks: Option<OpenTicks>,
+) -> Result<PathBuf> {
     let binary = directory.join(asset.executable_name);
     let directory_path = directory.to_owned();
     let executable_name = asset.executable_name.to_owned();
@@ -538,7 +559,7 @@ async fn verified_cache(directory: &Path, asset: Asset<'_>) -> Result<PathBuf> {
     // therefore identifies the same bytes that probe ran; a warm open launches
     // no process of its own.
     tokio::task::spawn_blocking(move || {
-        CheckedCache::open_and_verify(
+        CheckedCache::open_and_verify_ticking(
             &directory_path,
             &executable_name,
             executable_bytes,
@@ -546,6 +567,7 @@ async fn verified_cache(directory: &Path, asset: Asset<'_>) -> Result<PathBuf> {
             license_bytes,
             &license_sha256,
             &notices,
+            &mut ByteTicks::new(ticks.as_ref()),
         )
     })
     .await??;
@@ -561,6 +583,7 @@ struct CheckedCache {
 }
 
 impl CheckedCache {
+    #[cfg(test)]
     fn open_and_verify(
         path: &Path,
         executable_name: &str,
@@ -570,30 +593,65 @@ impl CheckedCache {
         license_sha256: &str,
         notices: &[(String, u64, String)],
     ) -> Result<Self> {
+        Self::open_and_verify_ticking(
+            path,
+            executable_name,
+            executable_bytes,
+            executable_sha256,
+            license_bytes,
+            license_sha256,
+            notices,
+            &mut ByteTicks::new(None),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pinned payload inventory plus the open's byte counter"
+    )]
+    fn open_and_verify_ticking(
+        path: &Path,
+        executable_name: &str,
+        executable_bytes: u64,
+        executable_sha256: &str,
+        license_bytes: u64,
+        license_sha256: &str,
+        notices: &[(String, u64, String)],
+        hashed: &mut ByteTicks<'_>,
+    ) -> Result<Self> {
         let directory = files::directory(path)?;
         let executable_name = std::ffi::OsString::from(executable_name);
         let mut executable = directory.read(&executable_name)?;
         let mut licenses = directory.read(std::ffi::OsStr::new("LICENSES"))?;
-        verify_payload_file(
+        verify_payload_file_ticking(
             &mut executable,
             executable_bytes,
             executable_sha256,
             true,
             &path.join(&executable_name),
+            hashed,
         )?;
-        verify_payload_file(
+        verify_payload_file_ticking(
             &mut licenses,
             license_bytes,
             license_sha256,
             false,
             &path.join("LICENSES"),
+            hashed,
         )?;
         let notices = notices
             .iter()
             .map(|(name, bytes, sha256)| {
                 let name = std::ffi::OsString::from(name);
                 let mut file = directory.read(&name)?;
-                verify_payload_file(&mut file, *bytes, sha256, false, &path.join(&name))?;
+                verify_payload_file_ticking(
+                    &mut file,
+                    *bytes,
+                    sha256,
+                    false,
+                    &path.join(&name),
+                    hashed,
+                )?;
                 Ok((name, file))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -787,7 +845,19 @@ fn prepare_cold_probe_with(
     })
 }
 
+#[cfg(test)]
 fn extract(archive: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
+    extract_ticking(archive, destination, asset, None)
+}
+
+/// Extract the pinned archive, advancing `ticks` per 8 MiB of payload
+/// written.
+fn extract_ticking(
+    archive: &[u8],
+    destination: &Path,
+    asset: Asset<'_>,
+    ticks: Option<&OpenTicks>,
+) -> Result<()> {
     ensure!(
         asset.compressed_bytes > 0 && asset.compressed_bytes <= MAX_COMPRESSED,
         "pinned Dolt archive exceeds compressed byte budget"
@@ -804,8 +874,9 @@ fn extract(archive: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
         asset.expanded_bytes <= MAX_EXPANDED,
         "pinned Dolt archive exceeds expanded byte budget"
     );
+    let mut written = ByteTicks::new(ticks);
     if asset.format == "zip" {
-        return extract_zip(archive, destination, asset);
+        return extract_zip(archive, destination, asset, &mut written);
     }
     ensure!(
         asset.format == "tar.gz",
@@ -872,7 +943,7 @@ fn extract(archive: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
         );
         let path = destination.join(output);
         let mut file = new_private_file(&path)?;
-        let copied = std::io::copy(&mut entry, &mut file)?;
+        let copied = std::io::copy(&mut entry, &mut TickingWriter::new(&mut file, &mut written))?;
         ensure!(copied == length, "Dolt archive payload is truncated");
         seal_private(&file, output == "dolt")?;
         file.sync_all()?;
@@ -1207,7 +1278,12 @@ fn activate_once(source: &Directory, destination: &Path) -> Result<files::Direct
     }
 }
 
-fn extract_zip(bytes: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
+fn extract_zip(
+    bytes: &[u8],
+    destination: &Path,
+    asset: Asset<'_>,
+    written: &mut ByteTicks<'_>,
+) -> Result<()> {
     use kuru_archive::zip::{Archive, Limits, MemberKind, MemberSpec};
     let directory = format!("{}/", asset.stem);
     let bin_directory = format!("{}/bin/", asset.stem);
@@ -1297,7 +1373,7 @@ fn extract_zip(bytes: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()>
     for (member, output, size, digest, executable) in payloads {
         let mut file = parent.create_new(std::ffi::OsStr::new(output))?;
         ensure!(
-            archive.copy(member, &mut file)? == size,
+            archive.copy(member, &mut TickingWriter::new(&mut file, written))? == size,
             "Dolt ZIP payload size mismatch"
         );
         file.sync_all()?;
@@ -1788,6 +1864,25 @@ fn verify_payload_file(
     executable: bool,
     path: &Path,
 ) -> Result<()> {
+    verify_payload_file_ticking(
+        file,
+        size,
+        expected,
+        executable,
+        path,
+        &mut ByteTicks::new(None),
+    )
+}
+
+/// `verify_payload_file`, advancing `hashed` per 8 MiB hashed.
+fn verify_payload_file_ticking(
+    file: &mut File,
+    size: u64,
+    expected: &str,
+    executable: bool,
+    path: &Path,
+    hashed: &mut ByteTicks<'_>,
+) -> Result<()> {
     let metadata = file.metadata()?;
     #[cfg(unix)]
     ensure!(
@@ -1810,6 +1905,7 @@ fn verify_payload_file(
             break;
         }
         digest.update(&buffer[..count]);
+        hashed.add(count);
     }
     ensure!(
         hex_digest(&digest.finalize()) == expected,
