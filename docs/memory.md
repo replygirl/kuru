@@ -202,13 +202,17 @@ The sentence does not estimate time and does not prove a stage succeeded; the
 command's ordinary result remains authoritative. The sentence cannot fail or
 delay the open: the owner publishes what it is doing in a small activity record
 that grants no authority, is never read to elect, attach, recover or retire, and
-is removed when the owner closes. If the record cannot be written the command
-shows only the opening sentence. When an inspection command's own open installs
-the engine and cannot remove leftover setup files, it prints one notice on a
-line of its own after the sentence is erased and memory is ready, "Kuru could
-not remove some leftover setup files; it will try again on a later start." when
-the stage is receipted, otherwise the not-retried notice quoted below. A service
-started on behalf of a command has no terminal and reports none.
+is removed when the owner closes. The command that started the service also
+reads that record to keep waiting while the service makes progress, and to
+report at once when the service's open failed or ended (see
+[configuration](configuration.md)). If the record cannot be written the command
+shows only the opening sentence and its wait sees no progress. When an
+inspection command's own open installs the engine and cannot remove leftover
+setup files, it prints one notice on a line of its own after the sentence is
+erased and memory is ready, "Kuru could not remove some leftover setup files; it
+will try again on a later start." when the stage is receipted, otherwise the
+not-retried notice quoted below. A service started on behalf of a command has no
+terminal and reports none.
 
 Writable runtime commands attach to the private project memory service while
 retaining the existing one-conversation driver lease. This phase does not admit
