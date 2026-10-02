@@ -14,7 +14,7 @@ const NOTICES: &[u8] = b"exact upstream notice fixture";
 /// [`cache_lock`], serialised against this lib's own spawning fixtures; see
 /// `crate::spawn_gate`. A single choke point so every real-cache-lock test
 /// below is covered without gating each call site by hand.
-async fn gated_cache_lock(directory: &Path, timeout: Duration) -> Result<CacheLock> {
+pub(super) async fn gated_cache_lock(directory: &Path, timeout: Duration) -> Result<CacheLock> {
     let _gate = crate::spawn_gate::locking_async().await;
     cache_lock(directory, timeout).await
 }
@@ -48,6 +48,8 @@ struct RetainedStageFields {
     message: String,
     stage: String,
     published: Option<bool>,
+    first_cause: String,
+    os_error: Option<i64>,
 }
 
 impl tracing::field::Visit for RetainedStageFields {
@@ -57,10 +59,17 @@ impl tracing::field::Visit for RetainedStageFields {
         }
     }
 
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        if field.name() == "os_error" {
+            self.os_error = Some(value);
+        }
+    }
+
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         match field.name() {
             "message" => self.message = format!("{value:?}"),
             "stage" => self.stage = format!("{value:?}"),
+            "first_cause" => self.first_cause = format!("{value:?}"),
             _ => {}
         }
     }
@@ -68,9 +77,17 @@ impl tracing::field::Visit for RetainedStageFields {
 
 type RetainedStageObserverFn = std::sync::Arc<dyn Fn(&RetainedStageFields) + Send + Sync>;
 
+/// The message prefix of every retained-stage diagnostic.
+const RETAINED_STAGE_PREFIX: &str = "retained private install stage";
+/// The message prefix of every leftover-collection diagnostic: a kept
+/// receipts folder, a skipped warm sweep and an unrecorded refusal.
+const LEFTOVER_RECORD_PREFIX: &str = "leftover install stage";
+
 struct RetainedStageObserverEntry {
     id: u64,
     scope: PathBuf,
+    /// Only events whose message starts with this prefix reach the observer.
+    prefix: &'static str,
     observer: RetainedStageObserverFn,
 }
 
@@ -120,7 +137,10 @@ impl tracing::Subscriber for RetainedStageRecorder {
         }
         let mut fields = RetainedStageFields::default();
         event.record(&mut fields);
-        if !fields.message.starts_with("retained private install stage") {
+        if ![RETAINED_STAGE_PREFIX, LEFTOVER_RECORD_PREFIX]
+            .iter()
+            .any(|prefix| fields.message.starts_with(prefix))
+        {
             return;
         }
         // Run the observers outside the registry lock: they inspect the
@@ -130,7 +150,9 @@ impl tracing::Subscriber for RetainedStageRecorder {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .filter(|entry| stage.starts_with(&entry.scope))
+            .filter(|entry| {
+                stage.starts_with(&entry.scope) && fields.message.starts_with(entry.prefix)
+            })
             .map(|entry| std::sync::Arc::clone(&entry.observer))
             .collect();
         for observer in observers {
@@ -197,7 +219,6 @@ pub(super) fn observe_retained_stage_reports(
     RetainedStageObserver,
     std::sync::Arc<std::sync::Mutex<Vec<RetainedStageObservation>>>,
 ) {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     install_retained_stage_recorder();
     let observed = std::sync::Arc::<std::sync::Mutex<Vec<_>>>::default();
     let sink = std::sync::Arc::clone(&observed);
@@ -226,16 +247,198 @@ pub(super) fn observe_retained_stage_reports(
             receipted,
         });
     };
-    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = NEXT_OBSERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     RETAINED_STAGE_OBSERVERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(RetainedStageObserverEntry {
             id,
             scope: scope.to_owned(),
+            prefix: RETAINED_STAGE_PREFIX,
             observer: std::sync::Arc::new(observer),
         });
     (RetainedStageObserver { id }, observed)
+}
+
+/// Identifies each registered observer for its unregistration.
+static NEXT_OBSERVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One `kuru.memory` leftover-collection record: a receipts folder kept after
+/// its removal was refused, a warm sweep skipped because its lock attempt
+/// failed, or a sweep refusal that could not be recorded in its receipt.
+#[derive(Debug, Clone)]
+pub(super) struct LeftoverRecord {
+    pub message: String,
+    /// The record's `stage` field: the `.leftovers` folder it concerns.
+    pub stage: PathBuf,
+    pub first_cause: String,
+    pub os_error: Option<i64>,
+}
+
+/// Observe every leftover-collection record whose `stage` lies under `scope`.
+///
+/// The observer only copies the event's fields. It never inspects the
+/// filesystem or a lock and never panics, because the product emits these
+/// records from sweeps that hold the installation lock.
+pub(super) fn observe_leftover_records(
+    scope: &Path,
+) -> (
+    RetainedStageObserver,
+    std::sync::Arc<std::sync::Mutex<Vec<LeftoverRecord>>>,
+) {
+    install_retained_stage_recorder();
+    let observed = std::sync::Arc::<std::sync::Mutex<Vec<_>>>::default();
+    let sink = std::sync::Arc::clone(&observed);
+    let observer = move |fields: &RetainedStageFields| {
+        sink.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(LeftoverRecord {
+                message: fields.message.clone(),
+                stage: PathBuf::from(&fields.stage),
+                first_cause: fields.first_cause.clone(),
+                os_error: fields.os_error,
+            });
+    };
+    let id = NEXT_OBSERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RETAINED_STAGE_OBSERVERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(RetainedStageObserverEntry {
+            id,
+            scope: scope.to_owned(),
+            prefix: LEFTOVER_RECORD_PREFIX,
+            observer: std::sync::Arc::new(observer),
+        });
+    (RetainedStageObserver { id }, observed)
+}
+
+/// What follows the bounded-recovery exhaustion in a receipt's `first_cause`:
+/// the first cause the window retried.
+const EXHAUSTION_TAIL: &str = "preserve the published stage for inspection: ";
+
+/// Classify a retained-stage receipt's first cause against the explicit table
+/// of causes the bounded stage-cleanup window retries
+/// (`files::close_windows_private_stage_with`), returning the matched row.
+///
+/// `attempts` is present exactly when that window ran out: every cause it does
+/// not retry returns before `wait_for_cleanup_retry` counts an attempt. A
+/// receipt without `attempts`, or whose first cause matches no row, is a
+/// product-path failure and not a transient hold, so it is refused here.
+pub(super) fn retried_cleanup_class(receipt: &serde_json::Value) -> Result<&'static str, String> {
+    if !receipt["attempts"].is_u64() {
+        return Err(format!(
+            "the bounded cleanup window did not run to exhaustion, so the first cause was not retried: {receipt}"
+        ));
+    }
+    let cause = receipt["first_cause"]
+        .as_str()
+        .ok_or_else(|| format!("the receipt has no first cause: {receipt}"))?;
+    let first = cause
+        .split_once(EXHAUSTION_TAIL)
+        .map(|(_, first)| first)
+        .ok_or_else(|| format!("the first cause does not follow the exhaustion: {receipt}"))?;
+    let os_error = receipt["os_error"].as_i64();
+    let removal =
+        first.starts_with("Rejected removal at ") || first.starts_with("Uncertain removal at ");
+    let row = match (first, os_error) {
+        (first, Some(5 | 32)) if first.starts_with("Rejected removal at ") => {
+            "rejected checked removal, native 5 or 32"
+        }
+        (first, _) if first.starts_with("Uncertain removal at ") => "uncertain checked removal",
+        ("private child became pending after checked removal", None) => "private child pending",
+        ("private temporary stage remained after checked removal", None) => {
+            "private child remained"
+        }
+        ("temporary stage container remained after removal", None) => "container remained",
+        (_, Some(5 | 32 | 145)) if !removal => {
+            "container pending open (5, 32) or container removal (32, 145)"
+        }
+        (_, None) if !removal => "container pending open, permission denied",
+        _ => {
+            return Err(format!(
+                "the first cause is not a class bounded recovery retries: {receipt}"
+            ));
+        }
+    };
+    Ok(row)
+}
+
+#[test]
+fn retried_cleanup_classes_match_the_bounded_recovery_table() {
+    let exhausted = |first: &str, os_error: serde_json::Value| {
+        serde_json::json!({
+            "first_cause": format!(
+                "Dolt engine publication succeeded, but private stage cleanup failed: remove private temporary stage at C:\\cache\\.install-x\\private: private temporary stage cleanup exhausted its bounded recovery after 88 reconcile attempts over 2.003s; {EXHAUSTION_TAIL}{first}"
+            ),
+            "os_error": os_error,
+            "attempts": 88,
+        })
+    };
+    for (first, os_error, row) in [
+        (
+            "Rejected removal at C:\\cache\\.install-x\\private: Access is denied. (os error 5)",
+            serde_json::json!(5),
+            "rejected checked removal, native 5 or 32",
+        ),
+        (
+            "Rejected removal at C:\\cache\\.install-x\\private: The process cannot access the file because it is being used by another process. (os error 32)",
+            serde_json::json!(32),
+            "rejected checked removal, native 5 or 32",
+        ),
+        (
+            "Uncertain removal at C:\\cache\\.install-x\\private: Access is denied. (os error 5)",
+            serde_json::json!(5),
+            "uncertain checked removal",
+        ),
+        (
+            "Uncertain removal at C:\\cache\\.install-x\\private: removed directory name is still occupied",
+            serde_json::Value::Null,
+            "uncertain checked removal",
+        ),
+        (
+            "private child became pending after checked removal",
+            serde_json::Value::Null,
+            "private child pending",
+        ),
+        (
+            "private temporary stage remained after checked removal",
+            serde_json::Value::Null,
+            "private child remained",
+        ),
+        (
+            "temporary stage container remained after removal",
+            serde_json::Value::Null,
+            "container remained",
+        ),
+        (
+            "The directory is not empty. (os error 145)",
+            serde_json::json!(145),
+            "container pending open (5, 32) or container removal (32, 145)",
+        ),
+    ] {
+        assert_eq!(
+            retried_cleanup_class(&exhausted(first, os_error)),
+            Ok(row),
+            "{first}"
+        );
+    }
+    // A rejected removal outside the sharing/denied pair is never retried.
+    assert!(
+        retried_cleanup_class(&exhausted(
+            "Rejected removal at C:\\cache\\.install-x\\private: The system cannot find the path specified. (os error 3)",
+            serde_json::json!(3),
+        ))
+        .is_err()
+    );
+    // A cause that returned at once carries no attempts: not retried.
+    assert!(
+        retried_cleanup_class(&serde_json::json!({
+            "first_cause": "Dolt engine publication succeeded, but private stage cleanup failed: Rejected removal at C:\\cache\\.install-x\\private: retained directory no longer has the expected identity",
+            "os_error": null,
+            "attempts": null,
+        }))
+        .is_err()
+    );
 }
 
 /// The `.json` receipts in a `.leftovers` directory. `files::write` keeps its

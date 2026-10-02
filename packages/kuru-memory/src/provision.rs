@@ -1635,5 +1635,7 @@ async fn bounded_output(reader: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod native_tests;
+#[cfg(test)]
+mod sweep_tests;
 #[cfg(all(test, unix))]
 mod tests;
