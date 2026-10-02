@@ -378,22 +378,37 @@ impl MemoryPool {
     }
 
     async fn acquire_session(&self) -> std::result::Result<PooledSession, AcquireFailure> {
+        // An authored identity rejection is sticky for the pool's life: the
+        // same endpoint cannot answer differently, so not even an idle
+        // session is handed out.
+        if let Some(rejection) = self.observation.identity_rejection() {
+            return Err(AcquireFailure::Sqlx(rejection));
+        }
         let started = Instant::now();
         let authenticated_before = self.observation.authenticated();
         let scope = BUDGET_SCOPE.try_with(BudgetScope::clone).ok();
         let _pending =
             PendingAcquire::register(self, scope.as_ref(), started, authenticated_before);
-        let acquiring = self.pool.acquire();
-        tokio::pin!(acquiring);
-        let mut slow = false;
-        let acquired = tokio::select! {
-            biased;
-            acquired = &mut acquiring => acquired,
-            () = sleep_until(started + SLOW_ACQUIRE_THRESHOLD) => {
-                slow = true;
-                self.still_waiting(started, authenticated_before, scope.as_ref());
-                acquiring.await
+        let acquiring = async {
+            let acquiring = self.pool.acquire();
+            tokio::pin!(acquiring);
+            tokio::select! {
+                biased;
+                acquired = &mut acquiring => (acquired, false),
+                () = sleep_until(started + SLOW_ACQUIRE_THRESHOLD) => {
+                    self.still_waiting(started, authenticated_before, scope.as_ref());
+                    (acquiring.await, true)
+                }
             }
+        };
+        // The rejection is polled first, so one that lands with an idle
+        // session on the same poll still ends the acquisition with its cause.
+        let (acquired, slow) = tokio::select! {
+            biased;
+            rejection = self.observation.identity_rejected() => {
+                return Err(AcquireFailure::Sqlx(rejection));
+            }
+            acquired = acquiring => acquired,
         };
         match acquired {
             Ok(connection) => {
@@ -1013,6 +1028,78 @@ mod tests {
             execution.to_string(),
             "memory statement budget of 30.000 s elapsed"
         );
+    }
+
+    /// Outside any budget scope, the pool's own lifetime ceiling ends an
+    /// acquisition, through the funnel's acquire (context over SQLx's
+    /// `PoolTimedOut`) and through a statement (the `Executor` carrier). The
+    /// fixture's listener completes TCP but never sends a MySQL greeting, so
+    /// no connection reaches an identity callback; the fixture's own pool
+    /// option is the bound under test.
+    #[tokio::test]
+    async fn unscoped_acquire_reports_the_pool_ceiling() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let ceiling = Duration::from_millis(500);
+        let pool = MemoryPool::fixture(
+            sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(ceiling)
+                .connect_lazy_with(
+                    sqlx::mysql::MySqlConnectOptions::new()
+                        .host("127.0.0.1")
+                        .port(listener.local_addr()?.port())
+                        .ssl_mode(sqlx::mysql::MySqlSslMode::Disabled),
+                ),
+            "main",
+        );
+        let ensure_ceiling = |error: &anyhow::Error| -> Result<()> {
+            let diagnostic = pool_acquire_timeout(error)
+                .ok_or_else(|| anyhow::anyhow!("no typed diagnostic: {error:#}"))?;
+            anyhow::ensure!(
+                diagnostic.bound == AcquireBound::PoolCeiling,
+                "{diagnostic}"
+            );
+            anyhow::ensure!(
+                (diagnostic.budget, diagnostic.window) == (ceiling, ceiling),
+                "{diagnostic}"
+            );
+            anyhow::ensure!(diagnostic.waited >= ceiling, "{diagnostic}");
+            anyhow::ensure!(
+                diagnostic.wait == PoolWait::NoIdentityCallback,
+                "{diagnostic}"
+            );
+            anyhow::ensure!(
+                format!("{error:#}").contains("(pool ceiling 0.500 s)"),
+                "{error:#}"
+            );
+            Ok(())
+        };
+        let error = match pool.acquire().await {
+            Ok(_) => anyhow::bail!("a server that never greets handed out a session"),
+            Err(error) => error,
+        };
+        ensure_ceiling(&error)?;
+        anyhow::ensure!(
+            error.chain().any(|cause| matches!(
+                cause.downcast_ref::<sqlx::Error>(),
+                Some(sqlx::Error::PoolTimedOut)
+            )),
+            "the ceiling's diagnostic lost SQLx's pool timeout: {error:#}"
+        );
+        let error = match sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(&pool)
+            .await
+        {
+            Ok(_) => anyhow::bail!("a server that never greets ran a statement"),
+            Err(error) => anyhow::Error::from(error),
+        };
+        ensure_ceiling(&error)?;
+        anyhow::ensure!(
+            pool.pending_acquires() == 0,
+            "an acquisition is still pending"
+        );
+        drop(listener);
+        Ok(())
     }
 
     /// A nested scope ends at the earliest enclosing deadline and reports

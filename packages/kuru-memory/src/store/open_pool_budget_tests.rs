@@ -271,10 +271,13 @@ async fn stage_pool_uses_remaining_startup_budget_and_post_open_pools_are_statem
     Ok(())
 }
 
-/// SQLx keeps a pool's acquire timeout for its whole life. Pools created while
-/// the store was opening must still be ordinary once it reports ready.
+/// SQLx keeps a pool's acquire timeout for its whole life: pools created while
+/// the store was opening keep the statement-budget ceiling once it reports
+/// ready, and an acquisition inside a budget scope ends at that budget, naming
+/// it as the bound. Every permit is held, so no session can be won before any
+/// budget: the budget assumes no runner speed, and the test adds no timer.
 #[tokio::test]
-async fn retained_open_pools_keep_the_ordinary_acquire_window() -> Result<()> {
+async fn retained_open_pools_acquire_under_their_statement_budget() -> Result<()> {
     let root = crate::test_support::tempdir()?;
     let options = crate::test_support::warmed_open_options(
         root.path().join("retained"),
@@ -289,54 +292,75 @@ async fn retained_open_pools_keep_the_ordinary_acquire_window() -> Result<()> {
         .expect("usage pool lock")
         .clone()
         .context("writable store did not retain its usage-ledger pool")?;
-    for (name, pool) in [("main", &store.pool), ("usage ledger", &usage)] {
-        assert_eq!(
-            pool.options().get_acquire_timeout(),
-            crate::server::ORDINARY_POOL_WINDOW,
-            "retained {name} pool kept an opening-phase acquire window"
-        );
-    }
-
-    // Contend the retained main pool: with every connection held, the next
-    // acquire must end at the ordinary window, not a startup-length one, and
-    // name a wait for held connections. SQLx's own window is the bound under
-    // test; the test adds no timer.
     let max = store.pool.options().get_max_connections();
-    let mut held = Vec::new();
-    for _ in 0..max {
-        held.push(store.pool.acquire().await?);
+    let held = hold_every_session(&store.pool).await?;
+    let budget = Duration::from_millis(500);
+    let outcome = async {
+        for (name, pool) in [("main", &store.pool), ("usage ledger", &usage)] {
+            ensure!(
+                pool.options().get_acquire_timeout() == QUERY_TIMEOUT,
+                "retained {name} pool's acquisition ceiling is {:?}, not the statement budget",
+                pool.options().get_acquire_timeout()
+            );
+        }
+        let elapsed = match crate::pool::within(budget, store.pool.acquire()).await {
+            Err(elapsed) => elapsed,
+            Ok(Ok(_)) => bail!("a contended retained pool handed out a fifth session"),
+            Ok(Err(error)) => bail!("a contended acquisition failed before its budget: {error:#}"),
+        };
+        ensure!(elapsed.budget == budget, "{elapsed}");
+        let error = anyhow::Error::from(elapsed).context("memory read deadline exceeded");
+        ensure!(
+            !pool_timed_out(&error),
+            "SQLx's pool ceiling, not the statement budget, ended the wait: {error:#}"
+        );
+        let diagnostic = crate::pool::pool_acquire_timeout(&error)
+            .with_context(|| format!("contended acquire carried no typed diagnostic: {error:#}"))?;
+        ensure!(
+            diagnostic.wait == crate::pool::PoolWait::HeldConnections,
+            "{diagnostic}"
+        );
+        ensure!(
+            diagnostic.bound == crate::pool::AcquireBound::StatementBudget,
+            "{diagnostic}"
+        );
+        ensure!(diagnostic.budget == budget, "{diagnostic}");
+        // The acquisition's share is what was left of the budget when it
+        // began, and the scope ended it no earlier than that.
+        ensure!(diagnostic.window <= budget, "{diagnostic}");
+        ensure!(diagnostic.waited >= diagnostic.window, "{diagnostic}");
+        ensure!(diagnostic.branch == "main", "{diagnostic}");
+        ensure!(
+            (diagnostic.max, diagnostic.size) == (max, max),
+            "{diagnostic}"
+        );
+        ensure!(
+            (diagnostic.idle, diagnostic.checked_out) == (0, max),
+            "{diagnostic}"
+        );
+        ensure!(diagnostic.authenticated_during_wait == 0, "{diagnostic}");
+        ensure!(diagnostic.phase.is_none(), "{diagnostic}");
+        let text = format!("{error:#}");
+        ensure!(
+            text.contains(
+                "memory statement budget of 0.500 s elapsed while acquiring a pool session"
+            ) && text.contains("memory pool acquire on kuru/main timed out")
+                && text.contains("(statement budget 0.500 s,")
+                && text.contains("every permit held")
+                && text.contains(&format!(
+                    "pool size {max} of {max}, 0 idle, {max} checked out"
+                )),
+            "contended acquire diagnostic is incomplete: {text}"
+        );
+        ensure!(
+            store.pool.pending_acquires() == 0,
+            "the ended acquisition is still counted as pending"
+        );
+        Ok(())
     }
-    let error = store
-        .pool
-        .acquire()
-        .await
-        .err()
-        .context("a contended retained pool handed out a fifth session")?;
-    assert!(
-        pool_timed_out(&error),
-        "contended retained pool lost SQLx's pool timeout: {error:#}"
-    );
-    let diagnostic = crate::pool::pool_acquire_timeout(&error)
-        .with_context(|| format!("contended acquire carried no typed diagnostic: {error:#}"))?;
-    assert_eq!(diagnostic.wait, crate::pool::PoolWait::HeldConnections);
-    assert_eq!(diagnostic.branch, "main");
-    assert_eq!((diagnostic.max, diagnostic.size), (max, max));
-    assert_eq!((diagnostic.idle, diagnostic.checked_out), (0, max));
-    assert_eq!(diagnostic.window, crate::server::ORDINARY_POOL_WINDOW);
-    assert!(diagnostic.waited >= diagnostic.window, "{diagnostic}");
-    assert_eq!(diagnostic.authenticated_during_wait, 0);
-    assert_eq!(diagnostic.phase, None);
-    let text = format!("{error:#}");
-    assert!(
-        text.contains("memory pool acquire on kuru/main timed out")
-            && text.contains("every permit held")
-            && text.contains(&format!(
-                "pool size {max} of {max}, 0 idle, {max} checked out"
-            )),
-        "contended acquire diagnostic is incomplete: {text}"
-    );
+    .await;
     drop(held);
     drop(usage);
     store.close().await?;
-    Ok(())
+    outcome
 }
