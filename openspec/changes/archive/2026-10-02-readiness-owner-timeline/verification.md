@@ -55,3 +55,9 @@ Measured (macOS arm64, head `1d26e184`, runs sequential):
 - `//apps/kuru-tui:test` with `KURU_OPEN_TIMELINE=1` exported at `6de27eac` (tree of `1d26e184` plus this ledger): exit 0, 275 passed, 0 failed, task 417.47 s. Its ungated run was not repeated on the rebased head.
 
 Still not run: any Linux or Windows leg, the PR's first-attempt CI (5.1, 5.2 remain deferred).
+
+## 2026-10-02 — review fix: stale "inert on Windows" text
+
+Review finding: `.github/workflows/ci.yml` (the `usage-scan-scaling` job comment, then lines 551-552) still said "Unix only: the owner timeline is inert on Windows", although a Windows starter now forwards exactly `1` to its owner (`packages/kuru-memory/src/service.rs:1226-1228`, `owner_environment`) and `docs/development.md:885` already says the check runs on Ubuntu only "because the check is compiled only on Unix". Task 6.2 was ticked with that site missed. A search of `packages`, `apps`, `docs`, `.github` and `scripts` found one more: the `usage_scan` module doc at `packages/kuru-memory/src/test_support.rs:48` ("Unix only, where the owner timeline works"); the module is `#[cfg(all(unix, feature = "test-support"))]` (`:49`). Both comments now say the check is compiled only on Unix. This is a comment-only edit: no workflow step, job, runner, environment or gate changes, so the design's Operational surface statement ("No workflow file ... changes") stays true in substance.
+
+Measured (macOS arm64, on `3b02b06f` plus this edit): `mise run //packages/kuru-delivery:test` exit 0 (`release_workflow` 35 passed, which parses `ci.yml`; the whole delivery suite also passed), `mise run format:check` 0, `mise run lint:tooling` 0.

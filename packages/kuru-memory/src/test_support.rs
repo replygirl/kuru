@@ -45,7 +45,7 @@ pub(crate) mod engine_ledger;
 pub mod lifecycle_trace;
 pub(crate) mod template;
 /// The CI usage-scan scaling check over aged stores (`usage-scan-fixture`,
-/// `measure-usage-scan`); Unix only, where the owner timeline works.
+/// `measure-usage-scan`); compiled only on Unix, where its CI job runs.
 #[cfg(all(unix, feature = "test-support"))]
 pub mod usage_scan;
 #[cfg(windows)]
