@@ -169,7 +169,7 @@ description = "Open-time measurement of a release kuru executable from outside t
 # The gate applies to the main series only (files and retirement wait on);
 # without the gate variables the task is report only and only an
 # infrastructure failure exits non-zero. ci.yml's open-time job sets them;
-# see docs/development.md#open-time-report for the budget rule.
+# see docs/development.md#open-time-gate for the budget rule.
 dir = "{{config_root}}/../.."
 run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- open-time"
 

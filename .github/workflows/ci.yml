@@ -551,7 +551,7 @@ jobs:
     # local-only (measure:open-time with their variables). Measured on
     # ubuntu-latest only; macOS numbers come from one-off local runs, and
     # Windows open time is not measured. See
-    # docs/development.md#open-time-report, which also says how to re-derive
+    # docs/development.md#open-time-gate, which also says how to re-derive
     # a budget after a deliberate startup change.
     name: Open-time gate (${{ matrix.os }})
     needs: native-tests
@@ -784,6 +784,7 @@ jobs:
             ${{ runner.temp }}/kuru-usage-scan/fixture.json
             ${{ runner.temp }}/kuru-usage-scan/age-*.json
             ${{ runner.temp }}/kuru-usage-scan/create-*.log
+          if-no-files-found: warn
 
   ci-gate:
     if: always()
