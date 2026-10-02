@@ -969,6 +969,10 @@ mod tests {
                 other => panic!("owned test root was not reaped: {other:?}"),
             }
         }
+        // The poll itself stays one signal-zero query; listing is separate.
+        let before = owner.syscall_count();
+        let presence = owner.presence_after_reap();
+        assert_eq!(owner.syscall_count(), before + 1, "{presence:?}");
         let resolved = listing.resolve_blocking(GroupPresence::PermissionDenied);
         assert!(listing.listed());
         assert!(
