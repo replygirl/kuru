@@ -956,8 +956,13 @@ impl Server {
     /// open then returns.
     pub(crate) fn mark_open_failing(&self, error: &anyhow::Error) {
         if let Some(ticks) = &self.0.ticks {
-            ticks.mark_failing_with(redact_identity(format!("{error:#}"), &self.0.identity));
+            ticks.mark_failing_with(self.failure_reason(error));
         }
+    }
+
+    /// `error`'s own text with this server's identity secrets replaced.
+    pub(crate) fn failure_reason(&self, error: &anyhow::Error) -> String {
+        redact_identity(format!("{error:#}"), &self.0.identity)
     }
 
     pub async fn pool(&self, branch: &str) -> Result<Arc<MemoryPool>> {

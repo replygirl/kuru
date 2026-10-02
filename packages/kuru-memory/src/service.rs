@@ -1618,6 +1618,8 @@ impl ServiceOwner {
         // On failure the store open retires its own record before returning,
         // while this owner lock is still held.
         let (store, activity) = activity::open_owner_store(options.clone(), hooks).await?;
+        // Kept out of the failing mark of a publication that fails.
+        let mut connection_secret = None;
         let prepared = async {
             let (listener, address) =
                 ServiceListener::bind(&options.data_dir, &options.project_scope)?;
@@ -1625,6 +1627,7 @@ impl ServiceOwner {
             let record =
                 EndpointRecord::for_store(project_path, &options.project_scope, &store, address)
                     .await?;
+            connection_secret = Some(record.authority.connection_secret.clone());
             record.publish(&options.data_dir, &lock)?;
             open_timeline::stamp(open_timeline::Event::EndpointPublished);
             Ok::<_, anyhow::Error>((listener, record))
@@ -1634,13 +1637,22 @@ impl ServiceOwner {
             Ok(prepared) => prepared,
             Err(error) => {
                 // A failed listener or publication must still reap Dolt while
-                // this process retains its service-owner authority.
-                if let Some(publisher) = activity {
-                    activity::retire(publisher, &options.data_dir, &options.project_scope).await;
-                }
-                #[cfg(test)]
-                ClosePause::reached(end_pause.as_deref(), ClosePoint::BeforeStoreClose).await;
-                if let Err(cleanup) = store.close().await {
+                // this process retains its service-owner authority. This
+                // owner will not serve its starter, so its record carries the
+                // failure.
+                let closed = close_store_and_record(
+                    store,
+                    activity,
+                    &lock,
+                    &options.data_dir,
+                    &options.project_scope,
+                    Some(&error),
+                    connection_secret.as_deref(),
+                    #[cfg(test)]
+                    end_pause.as_deref(),
+                )
+                .await;
+                if let Err(cleanup) = closed {
                     return Err(error.context(format!(
                         "reap Dolt after memory service startup failed: {cleanup:#}"
                     )));
@@ -1713,20 +1725,39 @@ impl ServiceOwner {
     }
 
     async fn serve_knobs(mut self, knobs: ServeKnobs) -> Result<()> {
-        let served = self.serve_until_retired(&knobs).await;
+        let (served, reached) = self.serve_until_retired(&knobs).await;
+        // An owner whose loop failed before its starter attached will not
+        // serve that starter: its record carries the failure.
+        let unserved = served.as_ref().err().filter(|_| !reached);
         #[cfg(test)]
         let closed = self
-            .close_paused(knobs.close_pause.as_deref(), knobs.timeline.as_deref())
+            .close_paused(
+                unserved,
+                knobs.close_pause.as_deref(),
+                knobs.timeline.as_deref(),
+            )
             .await;
         #[cfg(not(test))]
-        let closed = self.close_paused().await;
+        let closed = self.close_paused(unserved).await;
         served.and(closed)
     }
 
-    async fn serve_until_retired(&mut self, knobs: &ServeKnobs) -> Result<()> {
+    /// Serve until retirement, and say whether the starter had attached.
+    async fn serve_until_retired(&mut self, knobs: &ServeKnobs) -> (Result<()>, bool) {
+        let retirement = std::sync::Arc::new(rpc::Retirement::new(knobs.admission));
+        let served = self.serve_attachments(knobs, &retirement).await;
+        // Every attachment task was joined, or aborted and drained, before
+        // the loop returned, which orders its `reached` write before this read.
+        (served, retirement.reached())
+    }
+
+    async fn serve_attachments(
+        &mut self,
+        knobs: &ServeKnobs,
+        retirement: &std::sync::Arc<rpc::Retirement>,
+    ) -> Result<()> {
         let mut attachments = tokio::task::JoinSet::new();
         let frame_budget = std::sync::Arc::new(tokio::sync::Semaphore::new(rpc::FRAME_BUDGET_MIB));
-        let retirement = std::sync::Arc::new(rpc::Retirement::new(knobs.admission));
         #[cfg(test)]
         if let Some(pause) = &knobs.dispatch_pause {
             retirement.pause_next_dispatch(pause.clone());
@@ -1888,14 +1919,17 @@ impl ServiceOwner {
     /// existing lifecycle authority.
     pub async fn close(self) -> Result<()> {
         #[cfg(test)]
-        let closed = self.close_paused(None, None).await;
+        let closed = self.close_paused(None, None, None).await;
         #[cfg(not(test))]
-        let closed = self.close_paused().await;
+        let closed = self.close_paused(None).await;
         closed
     }
 
+    /// The close, given the failure that ended an owner before its starter
+    /// attached, if one did.
     async fn close_paused(
         self,
+        unserved: Option<&anyhow::Error>,
         #[cfg(test)] pause: Option<&ClosePause>,
         #[cfg(test)] timeline: Option<&crate::open_timeline::Timeline>,
     ) -> Result<()> {
@@ -1916,16 +1950,20 @@ impl ServiceOwner {
         let retired = record.retire(&data_dir, &lock);
         #[cfg(test)]
         ClosePause::reached(pause, ClosePoint::AfterEndpointRetire).await;
-        // Still under owner authority, so no successor's record can share the
-        // name yet. Best effort: a failure here never fails the close.
-        if let Some(publisher) = activity {
-            activity::retire(publisher, &data_dir, &record.authority.project_scope).await;
-        }
-        #[cfg(test)]
-        ClosePause::reached(pause, ClosePoint::BeforeStoreClose).await;
         // A failed retirement still closes the store and reaps Dolt; the
         // owner lock is released only after that close has returned.
-        let closed = store.close().await;
+        let closed = close_store_and_record(
+            store,
+            activity,
+            &lock,
+            &data_dir,
+            &record.authority.project_scope,
+            unserved,
+            Some(&record.authority.connection_secret),
+            #[cfg(test)]
+            pause,
+        )
+        .await;
         #[cfg(test)]
         ClosePause::reached(pause, ClosePoint::AfterReap).await;
         let released = lock.release();
@@ -1948,6 +1986,59 @@ impl ServiceOwner {
         }
         retired.and(closed).and(released)
     }
+}
+
+/// Close an owner's store and retire its activity record, in one order for
+/// both of its endings. Still under owner authority, so no successor's record
+/// can share the name yet; best effort: no failure of the record's mark or
+/// retirement fails the close.
+///
+/// An owner whose store opened but which ends before its starter attached
+/// (`unserved`) marks its record failing with that error's own text, the
+/// store's identity secrets and `connection_secret` redacted, and awaits that
+/// write as retirement already awaits the publisher. It then closes its store
+/// and reaps Dolt, and only then retires the record, so its starter reads
+/// the reason at once instead of a retirement that carries none. The mark is
+/// written only under verified owner authority, since the write replaces
+/// whatever record holds the name; without it, or when the write fails, and
+/// for every other ending, the record is retired before the store closes.
+/// The record is retired whatever the close returns.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one ending order for both owner endings; the test pause is cfg(test)"
+)]
+async fn close_store_and_record(
+    store: crate::store::MemoryStore,
+    mut activity: Option<activity::Publisher>,
+    lock: &ServiceLock,
+    data_dir: &Path,
+    scope: &str,
+    unserved: Option<&anyhow::Error>,
+    connection_secret: Option<&str>,
+    #[cfg(test)] pause: Option<&ClosePause>,
+) -> Result<()> {
+    let mut marked = false;
+    if let (Some(publisher), Some(error)) = (activity.as_mut(), unserved)
+        && lock.verify().is_ok()
+    {
+        let reason = connection_secret
+            .filter(|secret| !secret.is_empty())
+            .into_iter()
+            .fold(store.failure_reason(error), |reason, secret| {
+                reason.replace(secret, "[redacted]")
+            });
+        marked = publisher.mark_failing(&reason).await;
+    }
+    if !marked && let Some(publisher) = activity.take() {
+        activity::retire(publisher, data_dir, scope).await;
+    }
+    #[cfg(test)]
+    ClosePause::reached(pause, ClosePoint::BeforeStoreClose).await;
+    let closed = store.close().await;
+    if let Some(publisher) = activity {
+        activity::retire(publisher, data_dir, scope).await;
+    }
+    closed
 }
 
 fn is_accept_timeout(error: &anyhow::Error) -> bool {

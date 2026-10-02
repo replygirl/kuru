@@ -561,11 +561,30 @@ pub(crate) struct OpenHold {
 struct Feed {
     stages: Vec<MemoryOpenStage>,
     sender: watch::Sender<Arc<[MemoryOpenStage]>>,
-    task: tokio::task::JoinHandle<()>,
-    tag: String,
+    task: tokio::task::JoinHandle<Activity>,
+    target: Target,
     /// The length of the last list written.
     #[cfg(any(test, feature = "test-support"))]
     written: watch::Receiver<usize>,
+}
+
+/// Where and how one owner's record is written, and the text its failure
+/// reason must never carry: the starter token's spellings and the tag.
+struct Target {
+    directory: PathBuf,
+    tag: String,
+    redact: Vec<String>,
+    writes: Writes,
+}
+
+/// `reason` with every non-empty spelling in `redact` replaced.
+fn redacted(reason: &str, redact: &[String]) -> String {
+    redact
+        .iter()
+        .filter(|text| !text.is_empty())
+        .fold(reason.to_owned(), |reason, text| {
+            reason.replace(text.as_str(), REDACTED)
+        })
 }
 
 /// What the publisher reads from its open, and what it never writes.
@@ -595,20 +614,25 @@ impl Feed {
             stages,
             ticks_live: ticks.is_some(),
             ticks,
-            redact,
+            redact: redact.clone(),
         };
         let task = tokio::spawn(publish(
-            directory,
+            directory.clone(),
             tag.clone(),
             source,
-            writes,
+            writes.clone(),
             written_sender,
         ));
         Self {
             stages: Vec::new(),
             sender,
             task,
-            tag,
+            target: Target {
+                directory,
+                tag,
+                redact,
+                writes,
+            },
             #[cfg(any(test, feature = "test-support"))]
             written: _written,
         }
@@ -630,8 +654,8 @@ impl Feed {
     fn finish(self) -> Publisher {
         drop(self.sender);
         Publisher {
-            task: self.task,
-            tag: self.tag,
+            task: Some(self.task),
+            target: self.target,
             #[cfg(test)]
             written: self.written,
             #[cfg(test)]
@@ -652,14 +676,9 @@ impl Source {
         Activity {
             stages,
             progress: advance.count,
-            failure: advance.failure.map(|reason| {
-                self.redact
-                    .iter()
-                    .filter(|text| !text.is_empty())
-                    .fold(reason.to_string(), |reason, text| {
-                        reason.replace(text.as_str(), REDACTED)
-                    })
-            }),
+            failure: advance
+                .failure
+                .map(|reason| redacted(&reason, &self.redact)),
         }
     }
 
@@ -685,14 +704,15 @@ impl Source {
 /// endpoint publication or serving waits for a write. A stage change or the
 /// failing mark is written at once; a change of the progress count alone at
 /// most every [`PROGRESS_SPACING`], always followed by the latest count. When
-/// the open has ended it writes any unwritten activity once and stops.
+/// the open has ended it writes any unwritten activity once and stops,
+/// returning that latest activity whether or not its write succeeded.
 async fn publish(
     directory: PathBuf,
     tag: String,
     mut source: Source,
     writes: Writes,
     written: watch::Sender<usize>,
-) {
+) -> Activity {
     // The record a reader can see, and the last activity this task tried to
     // write; a failed attempt waits for a newer stage or failing mark, or
     // for `REWRITE_AFTER`.
@@ -706,7 +726,7 @@ async fn publish(
         let ended = source.stages.has_changed().is_err();
         if latest == published {
             if ended {
-                return;
+                return latest;
             }
         } else {
             let urgent = latest.stages != attempted.stages || latest.failure != attempted.failure;
@@ -719,7 +739,7 @@ async fn publish(
                     written.send_replace(stages);
                     not_before = Some(tokio::time::Instant::now() + PROGRESS_SPACING);
                 } else if ended {
-                    return;
+                    return latest;
                 } else {
                     // The latest activity holds every earlier one, so writing
                     // it again repairs whatever a reader missed.
@@ -744,16 +764,57 @@ async fn publish(
 /// The finished publisher of one owner's record, kept until the owner retires
 /// that record within its own close or failed open.
 pub(crate) struct Publisher {
-    task: tokio::task::JoinHandle<()>,
-    tag: String,
+    /// The publisher's task until it is joined, by a failing mark or by
+    /// retirement.
+    task: Option<tokio::task::JoinHandle<Activity>>,
+    target: Target,
     #[cfg(test)]
     written: watch::Receiver<usize>,
     #[cfg(test)]
     published: usize,
 }
 
+impl Publisher {
+    /// Mark the record failing with `reason`, for an owner whose store opened
+    /// but which ends before its starter attached. Joins the publisher, then
+    /// writes its last activity once more with the failing mark and `reason`,
+    /// redacted and bounded as an open's own mark is, and awaits that write
+    /// on this task, so no later write can follow the record's retirement.
+    /// Says whether the marked record was written; call only while holding
+    /// verified owner authority, since the write replaces whatever record
+    /// holds the name.
+    pub(crate) async fn mark_failing(&mut self, reason: &str) -> bool {
+        let Some(task) = self.task.take() else {
+            return false;
+        };
+        let Ok(last) = task.await else {
+            return false;
+        };
+        let Target {
+            directory,
+            tag,
+            redact,
+            writes,
+        } = &self.target;
+        let marked = Activity {
+            failure: Some(redacted(reason, redact)),
+            ..last
+        };
+        writes.write(directory, tag, marked).await.is_ok()
+    }
+}
+
 #[cfg(test)]
 impl Publisher {
+    /// Join the publisher's task and return the last activity it saw.
+    pub(crate) async fn join(mut self) -> Result<Activity> {
+        Ok(self
+            .task
+            .take()
+            .context("the publisher was already joined")?
+            .await?)
+    }
+
     /// Wait until the publisher wrote every stage its open handed it.
     pub(crate) async fn settled(&self) -> Result<()> {
         let published = self.published;
@@ -918,10 +979,17 @@ pub(crate) async fn open_owner_store(
 /// owner lock, after the publisher's open has ended. Best effort: no failure
 /// here can fail a close or change an open's outcome.
 pub(crate) async fn retire(publisher: Publisher, data_dir: &Path, scope: &str) {
-    let Publisher { task, tag, .. } = publisher;
+    let Publisher {
+        task,
+        target: Target { tag, .. },
+        ..
+    } = publisher;
     // The task ends with its open. Joining it first means no late write can
-    // recreate the record after its retirement.
-    let _ = task.await;
+    // recreate the record after its retirement; a failing mark has already
+    // joined it and awaited its own write.
+    if let Some(task) = task {
+        let _ = task.await;
+    }
     let Ok(directory) = directory(data_dir, scope) else {
         return;
     };
@@ -1372,7 +1440,7 @@ mod tests {
         // A count still unwritten when the open ends is written at once.
         ticks.advance();
         let publisher = feed.finish();
-        publisher.task.await?;
+        publisher.join().await?;
         let writes = log.borrow().clone();
         ensure!(writes.len() == 6, "{writes:?}");
         ensure!(at(&writes, 5) == 2 * PROGRESS_SPACING && writes[5].1.progress == 10);
@@ -1388,7 +1456,7 @@ mod tests {
         ensure!(feed.push(OpeningDatabase));
         writes_reach(&log, 1).await?;
         let publisher = feed.finish();
-        publisher.task.await?;
+        publisher.join().await?;
         ticks.advance();
         ensure!(log.borrow().len() == 1, "{:?}", log.borrow());
         Ok(())
@@ -1414,7 +1482,7 @@ mod tests {
             reason == format!("starter {REDACTED} ({REDACTED}) tagged {REDACTED} refused"),
             "{reason}"
         );
-        feed.finish().task.await?;
+        feed.finish().join().await?;
         Ok(())
     }
 

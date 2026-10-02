@@ -1679,6 +1679,12 @@ pub(crate) const SCHEMA_VERSIONS: [i32; 2] = [
 ];
 
 impl MemoryStore {
+    /// `error`'s own text with this store's identity secrets replaced, for
+    /// an owner's failing mark.
+    pub(crate) fn failure_reason(&self, error: &anyhow::Error) -> String {
+        self.shared.server.failure_reason(error)
+    }
+
     /// Usage-scan driver forcing step: give the usage branch one empty commit
     /// whose message carries no validation record, as a binary that does not
     /// write one would leave it. The next writable open then finds no record
