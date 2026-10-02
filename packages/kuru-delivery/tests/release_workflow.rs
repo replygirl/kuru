@@ -1620,6 +1620,15 @@ fn windows_on_arm_partitions_are_uninstrumented_behavioral_evidence_with_an_impo
         "          install_args: ${{ inputs.os == 'windows-11-arm' && 'rust github:aligned-team/cospec' || 'rust aqua:taiki-e/cargo-llvm-cov github:aligned-team/cospec' }}\n"
     ));
     assert_eq!(shards.matches("install_args:").count(), 1);
+    // The installed cospec executes once before any test bounds its calls.
+    let tools = steps
+        .iter()
+        .position(|step| step.starts_with("uses: jdx/mise-action@"))
+        .unwrap();
+    assert_eq!(
+        steps[tools + 1],
+        "name: Execute the installed cospec once\n        shell: bash\n        run: time cospec --version"
+    );
 
     // Each Windows on Arm job imports the pinned engine before anything
     // builds; bundle:prepare checks the committed pin again.
