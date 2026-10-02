@@ -15,6 +15,7 @@
 - [x] 2.5 Stop counting a pooled session as checked out once its release takes the connection, before awaiting SQLx's return, and verify a release cancelled at a test-only release gate leaves the count and the next timeout's wait class correct
 - [x] 2.6 Bound a new pool's inline first-connection release by its attempt's deadline, closing the connection when it expires, and verify a held first release still opens the pool with verification on its own connection
 - [x] 2.7 Name the no-callback wait class for what the counter can observe (no connection reaching Kuru's identity callback, including an unfinished TCP or MySQL handshake), and verify the classifier, Display, docs and specs agree
+- [x] 2.8 Record on the pool's observation when its first release is cut at the attempt's deadline, and verify the session-count tests accept exactly that one extra authentication and still fail on churn
 
 ## 3. Receipted write sessions
 

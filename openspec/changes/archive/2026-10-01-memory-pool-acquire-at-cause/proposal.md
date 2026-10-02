@@ -103,7 +103,7 @@ Dolt listener limits, the `after_connect` identity checks, the uncertain-write
 fence, candidate retirement ordering. Nothing retries `PoolTimedOut`; no test
 sleeps.
 
-### Decision D2 (pending the lead): the ordinary acquire window
+### Decision D2 (open, awaiting the maintainer): the ordinary acquire window
 
 `ORDINARY_POOL_WINDOW` was sized for authenticating a pool, but through SQLx's
 per-pool `acquire_timeout` it bounds every statement's acquire ahead of the
@@ -111,10 +111,30 @@ statement's own product budget (`QUERY_TIMEOUT`, 30 s). The budget-derived
 shape is: once open, a statement's acquire shares that statement's
 `QUERY_TIMEOUT`; opening-phase first acquisitions keep the remaining startup
 deadline; `open_pool_budget_tests.rs` changes from "ordinary window" to
-"statement budget". That changes a codified product bound and is the lead's
-decision; this change does **not** take it. With the 2 s window kept, the
-family is **reduced, not eliminated**. Remaining exposures, each now reported
-by its wait class instead of a bare error:
+"statement budget". That changes a codified product bound and is the
+maintainer's decision. **No D2 decision is recorded, and this change does not
+take one.** The two options are:
+
+- (a) adopt the budget-derived acquire above, in this change or a follow-up
+  change; or
+- (b) the maintainer explicitly accepts residuals 1 and 2 below, with the
+  runtime pool timeout family kept open.
+
+Lengthening the 2 s window is neither option and is not a cure.
+
+**This change reduces the runtime pool timeout family; it does not eliminate
+it.** Under the lead's elimination rule it is not the family's resolution: its
+PR description must say "reduces, does not eliminate", it must not close the
+family's tracking item, and it merges only once the maintainer's D2 decision
+is recorded here or in a follow-up change.
+
+Residuals 1 and 2 are the inferred path of the main failure (run 36930175874,
+job 110597536829, partition 8, `mode_baseline_tests.rs:550`): an inference from code and
+from the measured counts below, since nothing in that log discriminates the
+waits (see "Evidence limits"). With the fix, one local run of that test still
+authenticates 14 candidate-pool and 20-23 main-pool connections, each under the
+2 s window. Remaining exposures, each now reported by its wait class instead of
+a bare error:
 
 1. Concurrent growth of a fresh pool: up to `max` (4) new connections
    authenticate under 2 s when concurrent work starts on a young pool (the
