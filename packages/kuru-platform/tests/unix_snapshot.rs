@@ -305,6 +305,8 @@ fn foreign_group_is_classified_as_recycled_without_error() {
             .all(|row| row.pgid == group && !own.contains(&row.uid) && !own.contains(&row.ruid)),
         "{observed}"
     );
+    // The new leader holding the group number is the evidence of recycling.
+    assert!(members.iter().any(|row| row.pid == group), "{observed}");
     assert!(
         observed.to_string().contains("recycled by another user"),
         "{observed}"

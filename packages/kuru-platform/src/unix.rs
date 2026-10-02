@@ -98,11 +98,14 @@ pub enum GroupPresence {
     Present,
     /// Only from [`PermissionListing`]: signal zero was refused with `EPERM`,
     /// and the one bounded listing showed only members running as another
-    /// user. No process of ours is in the group; its number was recycled after
-    /// the reap. (`EPERM` followed by an empty listing is [`Self::Absent`].)
+    /// user, among them a new leader whose process ID is the group number.
+    /// That leader shows the old group emptied before its number was reissued,
+    /// so no process of the reaped tree, under any user ID, is in the group.
+    /// (`EPERM` followed by an empty listing is [`Self::Absent`].)
     Recycled,
     /// Signal zero was refused with `EPERM`. [`PermissionListing`] keeps this
-    /// when the listing showed a member of ours or was unavailable.
+    /// when the listing showed a member of ours, showed other users' members
+    /// without a new leader, or was unavailable.
     PermissionDenied,
     ObservationError(io::ErrorKind),
     /// Group presence is only meaningful after the standard child is reaped.
@@ -409,13 +412,18 @@ pub enum GroupObservation {
     /// members. The listing is diagnostic, or the reason it was unavailable.
     Survivors(Result<Vec<snapshot::ProcessRow>, String>),
     /// Signal zero was refused with `EPERM` and the listing showed only
-    /// members of other users. Every process of ours is permitted to receive
-    /// our signals, and the listing confirms it: none is in the group, whose
-    /// identity was recycled. The rows are diagnostic only.
+    /// members of other users, among them a new leader whose process ID is
+    /// the group number. A new process ID never matches an active process
+    /// group ID (POSIX `fork()`), so the old group emptied completely before
+    /// the number was reissued: no process of the reaped tree, even one whose
+    /// user ID changed, is in it. The rows are diagnostic only.
     Recycled(Vec<snapshot::ProcessRow>),
     /// The group could not be classified: an invalid group number (0 and 1
     /// would address our own group or broadcast), another errno, or `EPERM`
-    /// with an unavailable listing.
+    /// with an unavailable listing or with other users' members but no new
+    /// leader. Such members may be descendants of the reaped root that
+    /// changed user ID (for example through `sudo`), so they are not
+    /// dismissed.
     Unobserved(String),
 }
 
@@ -476,7 +484,7 @@ pub fn observe_group_after_reap(group: u32) -> GroupObservation {
     let Some(pid) = reaped_group(group) else {
         return GroupObservation::Unobserved(format!("invalid process group {group}"));
     };
-    classify_group(test_kill_process_group(pid), &own_uids(), || {
+    classify_group(test_kill_process_group(pid), group, &own_uids(), || {
         snapshot::group_members(group)
     })
 }
@@ -486,6 +494,7 @@ pub fn observe_group_after_reap(group: u32) -> GroupObservation {
 /// answered with success or `EPERM`.
 fn classify_group(
     signal_zero: rustix::io::Result<()>,
+    group: u32,
     own_uids: &[u32],
     members: impl FnOnce() -> io::Result<Vec<snapshot::ProcessRow>>,
 ) -> GroupObservation {
@@ -497,7 +506,11 @@ fn classify_group(
             Ok(members) if has_own_member(&members, own_uids) => {
                 GroupObservation::Survivors(Ok(members))
             }
-            Ok(members) => GroupObservation::Recycled(members),
+            Ok(members) if has_new_leader(&members, group) => GroupObservation::Recycled(members),
+            Ok(members) => GroupObservation::Unobserved(format!(
+                "signal zero refused with EPERM; only other users' members listed, without a new leader pid={group} [{}]",
+                rows(&members)
+            )),
             Err(error) => GroupObservation::Unobserved(format!(
                 "signal zero refused with EPERM; listing unavailable: {error}"
             )),
@@ -526,6 +539,17 @@ fn has_own_member(members: &[snapshot::ProcessRow], own_uids: &[u32]) -> bool {
         .any(|row| own_uids.contains(&row.uid) || own_uids.contains(&row.ruid))
 }
 
+/// Whether a listed member leads the group under the group's own number.
+///
+/// Our reaped root was the group's original leader, so a listed process with
+/// that process ID is a new process. POSIX `fork()` requires that a new
+/// process ID not match any active process group ID (Linux and XNU both keep
+/// such a number reserved), so the old group had no member left, of any user,
+/// when the number was reissued. Inferred from the standard; not measured.
+fn has_new_leader(members: &[snapshot::ProcessRow], group: u32) -> bool {
+    members.iter().any(|row| row.pid == group)
+}
+
 /// A bounded `ps` listing of one numeric group, given the time it may take.
 pub type GroupLister =
     Arc<dyn Fn(u32, Duration) -> io::Result<Vec<snapshot::ProcessRow>> + Send + Sync>;
@@ -541,8 +565,9 @@ pub type GroupLister =
 /// cleanup deadline; [`Self::resolve`] runs it on a blocking thread so the
 /// async executor is never held. The listing yields
 /// [`GroupPresence::Absent`] when it lists no member,
-/// [`GroupPresence::Recycled`] when every listed member runs as another user,
-/// and otherwise leaves `PermissionDenied`, so the caller keeps polling and
+/// [`GroupPresence::Recycled`] when every listed member runs as another user
+/// and one of them is a new leader whose process ID is the group number, and
+/// otherwise leaves `PermissionDenied`, so the caller keeps polling and
 /// fails at its unchanged deadline. Every other observation, and every
 /// observation after the first listing or once no time is left, is returned
 /// unchanged. Nothing here signals anything.
@@ -604,7 +629,7 @@ impl PermissionListing {
         let listed = tokio::task::spawn_blocking(move || lister(group, budget))
             .await
             .unwrap_or_else(|error| Err(io::Error::other(format!("listing task: {error}"))));
-        self.settle(listed)
+        self.settle(group, listed)
     }
 
     /// [`Self::resolve`] for a caller that already runs off the async executor.
@@ -613,7 +638,7 @@ impl PermissionListing {
             return presence;
         };
         let listed = (self.lister)(group, budget);
-        self.settle(listed)
+        self.settle(group, listed)
     }
 
     fn claim(&mut self, presence: GroupPresence) -> Option<(u32, Duration)> {
@@ -632,8 +657,12 @@ impl PermissionListing {
         Some((group, budget))
     }
 
-    fn settle(&mut self, listed: io::Result<Vec<snapshot::ProcessRow>>) -> GroupPresence {
-        let (presence, evidence) = listed_presence(listed, &own_uids());
+    fn settle(
+        &mut self,
+        group: u32,
+        listed: io::Result<Vec<snapshot::ProcessRow>>,
+    ) -> GroupPresence {
+        let (presence, evidence) = listed_presence(listed, group, &own_uids());
         self.evidence = Some(evidence);
         presence
     }
@@ -655,6 +684,7 @@ impl OwnedProcessGroup {
 /// How one listing taken after `EPERM` resolves a post-reap group.
 fn listed_presence(
     listed: io::Result<Vec<snapshot::ProcessRow>>,
+    group: u32,
     own_uids: &[u32],
 ) -> (GroupPresence, String) {
     match listed {
@@ -664,6 +694,13 @@ fn listed_presence(
         Ok(members) if has_own_member(&members, own_uids) => (
             GroupPresence::PermissionDenied,
             format!("EPERM; a member of ours is listed [{}]", rows(&members)),
+        ),
+        Ok(members) if !has_new_leader(&members, group) => (
+            GroupPresence::PermissionDenied,
+            format!(
+                "EPERM; only other users' members listed, without a new leader pid={group} [{}]",
+                rows(&members)
+            ),
         ),
         Ok(members) => (
             GroupPresence::Recycled,
@@ -722,23 +759,33 @@ mod tests {
             panic!("absence and other errors must not list")
         };
         assert_eq!(
-            classify_group(Err(Errno::SRCH), &own, unlisted),
+            classify_group(Err(Errno::SRCH), 40, &own, unlisted),
             GroupObservation::Absent
         );
         assert!(matches!(
-            classify_group(Err(Errno::INVAL), &own, unlisted),
+            classify_group(Err(Errno::INVAL), 40, &own, unlisted),
             GroupObservation::Unobserved(reason) if reason.contains("signal zero failed")
         ));
 
         let foreign = vec![member(40, 0, 0, "Ss"), member(41, 88, 88, "S")];
-        let recycled = classify_group(Err(Errno::PERM), &own, || Ok(foreign.clone()));
+        let recycled = classify_group(Err(Errno::PERM), 40, &own, || Ok(foreign.clone()));
         assert_eq!(recycled, GroupObservation::Recycled(foreign));
         assert!(recycled.none_of_ours());
         assert!(recycled.to_string().contains("recycled by another user (2"));
+        // Other users' members without a new leader may be descendants of the
+        // reaped root whose user ID changed: never dismissed as recycled.
+        let leaderless = vec![member(41, 0, 0, "S"), member(42, 88, 88, "S")];
+        let ambiguous = classify_group(Err(Errno::PERM), 40, &own, || Ok(leaderless.clone()));
+        assert!(
+            matches!(&ambiguous, GroupObservation::Unobserved(reason)
+                if reason.contains("without a new leader pid=40") && reason.contains("pid=41 ")),
+            "{ambiguous}"
+        );
+        assert!(!ambiguous.none_of_ours());
         // Members that exited after the refusal, or hidden foreign members,
         // leave nothing listed and nothing of ours.
         assert_eq!(
-            classify_group(Err(Errno::PERM), &own, || Ok(Vec::new())),
+            classify_group(Err(Errno::PERM), 40, &own, || Ok(Vec::new())),
             GroupObservation::Absent
         );
 
@@ -750,12 +797,12 @@ mod tests {
             member(42, 501, 501, "Z"),
         ] {
             let rows = vec![member(40, 0, 0, "Ss"), ours];
-            let observed = classify_group(Err(Errno::PERM), &own, || Ok(rows.clone()));
+            let observed = classify_group(Err(Errno::PERM), 40, &own, || Ok(rows.clone()));
             assert_eq!(observed, GroupObservation::Survivors(Ok(rows)));
             assert!(!observed.none_of_ours());
             assert!(observed.to_string().contains("pid=42 "), "{observed}");
         }
-        let unavailable = classify_group(Err(Errno::PERM), &own, || {
+        let unavailable = classify_group(Err(Errno::PERM), 40, &own, || {
             Err(io::Error::other("ps failed"))
         });
         assert!(!unavailable.none_of_ours());
@@ -765,7 +812,7 @@ mod tests {
                 .contains("listing unavailable: ps failed")
         );
 
-        let live = classify_group(Ok(()), &own, || Err(io::Error::other("ps failed")));
+        let live = classify_group(Ok(()), 40, &own, || Err(io::Error::other("ps failed")));
         assert!(matches!(&live, GroupObservation::Survivors(Err(error)) if error == "ps failed"));
         assert!(!live.none_of_ours());
     }
@@ -773,23 +820,36 @@ mod tests {
     #[test]
     fn owned_listing_resolves_permission_only_with_foreign_evidence() {
         let own = [501, 501];
-        let foreign = listed_presence(Ok(vec![member(40, 0, 0, "Ss")]), &own);
+        let foreign = listed_presence(Ok(vec![member(40, 0, 0, "Ss")]), 40, &own);
         assert_eq!(foreign.0, GroupPresence::Recycled);
         assert!(
             foreign.1.contains("recycled by another user (1"),
             "{}",
             foreign.1
         );
-        let empty = listed_presence(Ok(Vec::new()), &own);
+        let leaderless = listed_presence(
+            Ok(vec![member(41, 0, 0, "S"), member(42, 88, 88, "S")]),
+            40,
+            &own,
+        );
+        assert_eq!(leaderless.0, GroupPresence::PermissionDenied);
+        assert!(
+            leaderless.1.contains("without a new leader pid=40")
+                && leaderless.1.contains("pid=42 "),
+            "{}",
+            leaderless.1
+        );
+        let empty = listed_presence(Ok(Vec::new()), 40, &own);
         assert_eq!(empty.0, GroupPresence::Absent);
         assert!(empty.1.contains("no member listed"));
         let ours = listed_presence(
             Ok(vec![member(40, 0, 0, "Ss"), member(41, 501, 501, "Z")]),
+            40,
             &own,
         );
         assert_eq!(ours.0, GroupPresence::PermissionDenied);
         assert!(ours.1.contains("pid=41 "), "{}", ours.1);
-        let unavailable = listed_presence(Err(io::Error::other("ps")), &own);
+        let unavailable = listed_presence(Err(io::Error::other("ps")), 40, &own);
         assert_eq!(unavailable.0, GroupPresence::PermissionDenied);
         assert!(unavailable.1.contains("listing unavailable: ps"));
     }

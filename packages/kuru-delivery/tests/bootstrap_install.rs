@@ -947,6 +947,8 @@ fn post_reap_query_accepts_a_group_recycled_by_another_user() {
     let observed = bootstrap_process::post_reap_group(Pid::from_raw(group as i32).unwrap())
         .unwrap_or_else(|error| panic!("recycled group {group} was rejected: {error}"));
     assert!(observed.contains("recycled by another user"), "{observed}");
+    // The new leader holding the group number is the evidence of recycling.
+    assert!(observed.contains(&format!("pid={group} ")), "{observed}");
 }
 
 #[test]
