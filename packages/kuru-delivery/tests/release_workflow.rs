@@ -2017,7 +2017,7 @@ fn arm64_memory_suite_runs_as_gated_uninstrumented_partitions() {
             .starts_with("      - name: Require every memory partition job to have succeeded\n")
     );
     assert!(ci.contains(
-        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling]"
+        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling, open-time]"
     ));
 }
 
@@ -2073,7 +2073,7 @@ fn native_platform_runs_windows_on_arm_as_separately_named_behavioral_evidence()
     );
     assert!(!job.contains("KURU_COVERAGE_"));
     assert!(ci.contains(
-        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling]"
+        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling, open-time]"
     ));
 }
 
@@ -2184,8 +2184,74 @@ fn usage_scan_scaling_is_a_required_job_that_ages_its_fixture_uncached() {
         assert!(!section(name).contains("KURU_OPEN_TIMELINE"), "{name}");
     }
     assert!(ci.contains(
-        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling]"
+        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling, open-time]"
     ));
+}
+
+/// The open-time gate is required: no job-level escape, the main series
+/// only, every gate variable set in the job, and a hard upload of the binary
+/// it measures. The budgets' derivation is pinned by the delivery unit test
+/// over the two derivation runs' records.
+#[test]
+fn open_time_is_a_required_gate_on_the_main_series() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let job = workflow_job(&ci, "open-time", "usage-scan-scaling");
+    for required in [
+        "    name: Open-time gate (${{ matrix.os }})\n",
+        "    needs: native-tests\n",
+        "        os: [ubuntu-latest]\n",
+        "      KURU_OPEN_TIME_EXPECT_FIRST_LAUNCH_STARTS: \"3\"\n",
+        "      KURU_OPEN_TIME_EXPECT_COLD_EXISTING_STARTS: \"1\"\n",
+        "      KURU_OPEN_TIME_EXPECT_WARM_REOPEN_STARTS: attached=0,spawned-owner=1\n",
+        "      KURU_OPEN_TIME_EXPECT_NEW_PROJECT_STARTS: \"2\"\n",
+        "      KURU_OPEN_TIME_BUDGET_NEW_PROJECT_MS: \"890\"\n",
+        "      KURU_OPEN_TIME_BUDGET_COLD_EXISTING_MS: \"585\"\n",
+        "36949202478",
+        "36952763676",
+        "name: ci-release-binary-${{ matrix.os }}\n",
+    ] {
+        assert!(job.contains(required), "open-time lost {required}");
+    }
+    let header = job.split("    steps:\n").next().unwrap();
+    for forbidden in ["continue-on-error", "\n    if:"] {
+        assert!(!header.contains(forbidden), "open-time job has {forbidden}");
+    }
+    for forbidden in [
+        "continue-on-error",
+        "KURU_OPEN_TIME_FILES",
+        "KURU_OPEN_TIME_RETIRE_WAIT",
+        "KURU_OPEN_TIME_INTERVAL_MS",
+        "workflow_dispatch",
+    ] {
+        assert!(!job.contains(forbidden), "open-time uses {forbidden}");
+    }
+    let steps = workflow_steps(job);
+    let measured: Vec<&String> = steps
+        .iter()
+        .filter(|step| step.contains("mise run //packages/kuru-delivery:measure:open-time"))
+        .collect();
+    assert_eq!(measured.len(), 1, "one main series");
+    let measure = named_step(&steps, "Measure and gate open time");
+    assert!(!measure.contains("\n        if:"));
+    assert!(step_env(measure).contains("KURU_OPEN_TIME_ITERATIONS: \"10\"\n"));
+    assert!(
+        named_step(&steps, "Upload the open-time records").contains("if: ${{ !cancelled() }}\n")
+    );
+    let gate = workflow_job(&ci, "ci-gate", "\u{0}");
+    assert!(gate.contains(", usage-scan-scaling, open-time]\n"));
+
+    let native = native_workflow();
+    let upload = native
+        .split("      - name: Publish the installed release binary for the open-time gate\n")
+        .nth(1)
+        .expect("the release-binary upload step")
+        .split("\n      - ")
+        .next()
+        .unwrap();
+    assert!(upload.starts_with("        if: runner.os == 'Linux'\n"));
+    assert!(!upload.contains("continue-on-error"), "{upload}");
+    assert!(upload.contains("if-no-files-found: error\n"));
 }
 
 /// Rust compiles `cfg(windows)` items only for a Windows target, so the
@@ -2227,7 +2293,7 @@ fn windows_only_rust_is_linted_by_a_required_static_job() {
             .contains("rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1\n")
     );
     assert!(ci.contains(
-        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling]"
+        "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling, open-time]"
     ));
 
     // The root task aggregates package-owned tasks, and every package with

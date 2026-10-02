@@ -575,16 +575,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Source installation failed' }
           & "$env:KURU_INSTALL_DIR/kuru.exe" --version
           if ($LASTEXITCODE -ne 0) { throw 'Installed Kuru failed' }
-      # ci.yml's report-only open-time job measures this exact installed
-      # release build, before any later step runs it. Publishing never fails
-      # this gating job. Uploaded only on Linux, the only OS the open-time
-      # job runs on (ubuntu-latest is the sole caller that runs on runner.os
-      # == 'Linux'); one name without the attempt, as for the bundle inputs,
-      # so a rerun of that job alone finds it. Every step-level OS selection
-      # in this workflow uses the runner, never the caller's label.
-      - name: Publish the installed release binary for the open-time report
+      # ci.yml's open-time gate measures this exact installed release build,
+      # before any later step runs it. A gate input is a hard step: a failed
+      # upload fails this installation job. Uploaded only on Linux, the only
+      # OS the open-time gate runs on (ubuntu-latest is the sole caller that
+      # runs on runner.os == 'Linux'); one name without the attempt, as for
+      # the bundle inputs, so a rerun of that job alone finds it. Every
+      # step-level OS selection in this workflow uses the runner, never the
+      # caller's label.
+      - name: Publish the installed release binary for the open-time gate
         if: runner.os == 'Linux'
-        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ inputs.artifact-prefix }}-release-binary-${{ inputs.os }}
