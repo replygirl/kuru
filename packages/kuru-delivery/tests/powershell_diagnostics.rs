@@ -397,11 +397,96 @@ fn coverage_tasks_run_the_rust_orchestrator_without_shell_metacharacters() {
     assert!(manifest.contains("[tasks.\"coverage:workspace\"]"));
 }
 
+/// Bound for one wrapper launch these tests wait on, from spawn to both pipes'
+/// EOF and the process tree's exit; the wait itself ends on that event.
+///
+/// It covers the longest launch shape here: mise starting and resolving the
+/// task, its `cmd.exe` inline shell, stock PowerShell starting with its module
+/// prelude, and the wrapper's diagnostic write. The orchestrator shape (`cmd.exe`
+/// or nothing, then the delivery binary) is a strict subset, so both call sites
+/// share it. Every launch may run instrumented on a busy coverage runner.
+///
+/// It is not a new guess at runner speed: it adopts the delivery package's
+/// existing per-launch fixture budget for mise and stock PowerShell commands,
+/// held by `DEADLINE` in `support/mise_acceptance.rs` and
+/// `support/previous_updater.rs` and by `TIMEOUT` in `bootstrap_windows.rs`.
+/// The pin test below fails if those diverge from this value.
+///
+/// Measured (main run 37036793207, job 110937162182): the former flat 15 s
+/// expired at 15013 ms with neither pipe at EOF, the tree `mise.exe`
+/// cpu=328ms, `cmd.exe`, `pwsh.exe` cpu=671ms. Inference: about one CPU second
+/// in fifteen wall seconds is a starved start, not a hang.
+///
+/// A launch that really stalls still fails here with `bounded_output`'s tree
+/// diagnostics, because one budget sits far inside the coverage shard's inner
+/// test deadline (`coverage::shard_deadline`: the job limit less its evidence
+/// reserve), which the pin test also checks against the workflow's limit. Each
+/// test unwraps its first expiry, so a stall costs one budget per test, not one
+/// per loop iteration.
+const WRAPPER_LAUNCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Every wrapper wait in this file takes the stated budget rather than a flat
+/// literal, that budget is the package's per-launch fixture budget, and it
+/// expires inside every coverage shard's inner test deadline.
+#[test]
+fn wrapper_waits_take_the_package_launch_budget_inside_the_shard_deadline() {
+    let package = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Split so this test's own needles are not counted as call sites.
+    let call = ["bounded_", "output("].concat();
+    let budgeted = format!("{call}&mutchild,{},", "WRAPPER_LAUNCH_BUDGET");
+    let source: String = include_str!("powershell_diagnostics.rs")
+        .split_whitespace()
+        .collect();
+    let calls = source.matches(&call).count();
+    assert!(calls >= 2, "expected both wrapper waits, found {calls}");
+    assert_eq!(
+        source.matches(&budgeted).count(),
+        calls,
+        "a wrapper wait no longer takes WRAPPER_LAUNCH_BUDGET"
+    );
+
+    for (file, name) in [
+        ("tests/support/mise_acceptance.rs", "DEADLINE"),
+        ("tests/support/previous_updater.rs", "DEADLINE"),
+        ("tests/bootstrap_windows.rs", "TIMEOUT"),
+    ] {
+        let text = std::fs::read_to_string(package.join(file)).unwrap();
+        let prefix = format!("const {name}: Duration = Duration::from_secs(");
+        let seconds: Vec<u64> = text
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(prefix.as_str()))
+            .map(|rest| rest.strip_suffix(");").unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(
+            seconds,
+            [WRAPPER_LAUNCH_BUDGET.as_secs()],
+            "{file} {name} no longer matches the package launch budget"
+        );
+    }
+
+    let mut limits = Vec::new();
+    for workflow in ["ci.yml", "native-tests.yml"] {
+        let text = std::fs::read_to_string(package.join("../../.github/workflows").join(workflow))
+            .unwrap();
+        limits.extend(
+            text.lines()
+                .filter_map(|line| line.trim().strip_prefix("KURU_COVERAGE_JOB_MINUTES: \""))
+                .map(|value| value.strip_suffix('"').unwrap().parse::<u64>().unwrap()),
+        );
+    }
+    assert!(!limits.is_empty(), "no coverage job limit found");
+    for minutes in limits {
+        let window = kuru_delivery::coverage::shard_deadline(0, minutes).unwrap();
+        assert!(
+            WRAPPER_LAUNCH_BUDGET.as_secs() < window,
+            "a {minutes}-minute coverage job leaves {window} s, within one launch budget"
+        );
+    }
+}
+
 /// Launch the orchestrator's delivery binary exactly as a coverage task does,
 /// with every coverage input removed, and return its combined diagnostics.
 async fn orchestrator_without_inputs(task: &str, through_cmd: bool) -> (bool, String) {
-    use std::time::Duration;
-
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let run = coverage_task_run(task);
     // Cargo's own `run` prefix builds this same binary; a test cannot invoke
@@ -424,7 +509,7 @@ async fn orchestrator_without_inputs(task: &str, through_cmd: bool) -> (bool, St
         }
     }
     let output =
-        kuru_delivery::command::bounded_output(&mut child, Duration::from_secs(30), 16 * 1024)
+        kuru_delivery::command::bounded_output(&mut child, WRAPPER_LAUNCH_BUDGET, 16 * 1024)
             .await
             .unwrap();
     (
@@ -476,8 +561,6 @@ async fn coverage_orchestrator_refuses_missing_inputs_before_any_effect() {
 #[cfg(windows)]
 #[tokio::test]
 async fn cmd_mise_launches_published_windows_task_wrapper_before_cargo() {
-    use std::time::Duration;
-
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut child = kuru_delivery::command::rooted(&root, "mise");
     child.args(["run", "//packages/kuru-delivery:verify:published-windows"]);
@@ -492,7 +575,7 @@ async fn cmd_mise_launches_published_windows_task_wrapper_before_cargo() {
         child.env_remove(variable);
     }
     let output =
-        kuru_delivery::command::bounded_output(&mut child, Duration::from_secs(15), 16 * 1024)
+        kuru_delivery::command::bounded_output(&mut child, WRAPPER_LAUNCH_BUDGET, 16 * 1024)
             .await
             .unwrap();
     assert!(!output.status.success());

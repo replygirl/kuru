@@ -25,13 +25,19 @@ candidate.
   flat `Duration::from_secs(15)` / `Duration::from_secs(30)` literals passed
   to `bounded_output` (lines 495 and 427) with one named, derived bound
   shared by both call sites. `bounded_output`'s own wait is already
-  event-driven (`capture_until` polls real process exit and both pipe EOFs,
-  not a blind sleep); only the two call-site numbers are unexplained guesses,
-  so the derivation lives beside the call sites in this test file, not in
-  `command.rs`.
-- Add one `#[cfg(windows)]` unit or integration test on the new constant/
-  helper that pins its shape (what it is derived from) and fails if a flat,
-  undocumented literal is reintroduced in its place.
+  event-driven (it ends when both pipes reach EOF and the process tree exits:
+  `capture_until` on Unix, `output_with_limit_and_timeout` on Windows, not a
+  blind sleep); only the two call-site numbers are unexplained guesses, so
+  the derivation lives beside the call sites in this test file, not in
+  `command.rs`. The bound, `WRAPPER_LAUNCH_BUDGET`, adopts the package's
+  existing 180 s per-launch fixture budget for mise and stock PowerShell
+  commands (`DEADLINE` in `support/mise_acceptance.rs` and
+  `support/previous_updater.rs`, `TIMEOUT` in `bootstrap_windows.rs`).
+- Add one deterministic test, not `cfg(windows)`-gated, that fails if a
+  wrapper wait takes anything but that bound, if the bound diverges from the
+  package's per-launch budget, or if it no longer expires strictly inside
+  the coverage shard's inner deadline (`coverage::shard_deadline` for each
+  workflow `KURU_COVERAGE_JOB_MINUTES`).
 - No change to `kuru_delivery::command::bounded_output` or
   `output_with_limit_and_timeout` (the "no Unix-side change" non-goal is
   about `command.rs`'s `bounded_unix` implementation specifically), or to
