@@ -147,7 +147,7 @@ description = "Run the previous published release's own updater against this tre
 run = "cargo test -p kuru-delivery --features tooling --locked --test previous_release_update previous_published_release_updates_to_this_tree -- --ignored --exact --nocapture --test-threads=1"
 
 [tasks."measure:open-time"]
-description = "Report-only open-time measurement of a release kuru executable, from outside the binary"
+description = "Open-time measurement of a release kuru executable from outside the binary; gates engine starts and two median budgets when the gate variables are set"
 # Inputs: KURU_OPEN_TIME_BINARY (required) is the release-profile kuru to
 # measure and KURU_OPEN_TIME_OUTPUT (required) receives records.jsonl and
 # summary.md. KURU_OPEN_TIME_SCRATCH (parent of the private scratch root),
@@ -156,8 +156,20 @@ description = "Report-only open-time measurement of a release kuru executable, f
 # KURU_OPEN_TIME_FILES (on, or off for the processes-only control) and
 # KURU_OPEN_TIME_RETIRE_WAIT (on, or off for the ramp series) are optional;
 # GITHUB_STEP_SUMMARY, when set, also receives the summary. Offline demo
-# conversations only: no network, login or credential store. Measured times are
-# never compared with a budget; only an infrastructure failure exits non-zero.
+# conversations only: no network, login or credential store.
+# Gate, all six or none: KURU_OPEN_TIME_EXPECT_FIRST_LAUNCH_STARTS,
+# KURU_OPEN_TIME_EXPECT_COLD_EXISTING_STARTS and
+# KURU_OPEN_TIME_EXPECT_NEW_PROJECT_STARTS (exact engine starts of every run
+# of the case), KURU_OPEN_TIME_EXPECT_WARM_REOPEN_STARTS (per owner path, for
+# example attached=0,spawned-owner=1; a path not listed fails), and
+# KURU_OPEN_TIME_BUDGET_NEW_PROJECT_MS and
+# KURU_OPEN_TIME_BUDGET_COLD_EXISTING_MS (budgets for the median open to
+# ready). Counts are checked first, the medians only once every count holds;
+# any violation exits non-zero after the records and summary are written.
+# The gate applies to the main series only (files and retirement wait on);
+# without the gate variables the task is report only and only an
+# infrastructure failure exits non-zero. ci.yml's open-time job sets them;
+# see docs/development.md#open-time-report for the budget rule.
 dir = "{{config_root}}/../.."
 run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- open-time"
 

@@ -192,8 +192,8 @@ supported-platform proof of that whole suite; nothing is subset. The Windows
 offline build-input check (`bundle:verify-native-build`) has no test inventory
 to partition and stays in the Windows installation job.
 Windows primitives retain a separate native coverage job for early feedback. The
-required `ci-gate` accepts only success from every branch of this graph. The
-report-only `open-time` job is outside that graph; see
+required `ci-gate` accepts only success from every branch of this graph,
+including the `open-time` gate that follows `native-tests`; see
 [open-time report](#open-time-report).
 
 Windows on Arm (`windows-11-arm`) runs the same partitioned workspace suites as
@@ -1174,26 +1174,29 @@ dependency seed directory to import (below); leave it unset locally.
 
 ## Open-time report
 
-`ci.yml`'s `Open-time report (ubuntu-latest)` job measures how long the release
+`ci.yml`'s `Open-time gate (ubuntu-latest)` job measures how long the release
 `kuru` takes to open project memory, as a user would see it, on ubuntu-latest
-only. It is **report only**: it never compares a time with a budget, `ci-gate`
-does not need it, and job-level `continue-on-error` keeps even its own failures
-(a missing artifact, a runner problem) out of the run's result. It is the first
-form of the open-time budget check, not a check yet. This CI job is the way to
-measure open time in CI; to measure it on a developer machine, run the harness
-locally (see below).
+only, and **gates** on it: exact engine starts per case and the median open
+time of the `new-project` and `cold-existing` cases against fixed budgets (see
+[the gate](#the-gate-and-its-budgets)). `ci-gate` needs it, so a violation, or
+any failure of the job itself, fails the run. macOS numbers come from one-off
+local runs of the same harness, not a CI job; Windows open time is not
+measured. To measure open time on a developer machine, run the harness locally
+(see below).
 
 The ubuntu-latest installation job publishes the release executable it has just
-installed as `ci-release-binary-ubuntu-latest` (a step that cannot fail that
-job). That upload (about 71 MB) runs inside the gating installation job, so its
-few seconds are on `ci-gate`'s critical path; the measurement itself is not.
-The open-time job starts after `native-tests`, downloads that exact binary,
-builds only the delivery tool (which needs no engine bundle input) and runs
-`mise run //packages/kuru-delivery:measure:open-time` four times: the main
-series (10 iterations), a control series with file observation off (5), a
-series with a coarse 200 ms sampling period (3) that shows the observer's own
-effect, and a ramp without retirement waits (6). Nothing is rebuilt, and the
-measured executable embeds the engine its installation job verified.
+installed as `ci-release-binary-ubuntu-latest`. A gate input is a hard step: a
+failed upload fails that installation job. The upload (about 71 MB) runs inside
+the gating installation job, so its few seconds are on `ci-gate`'s critical
+path. The open-time job starts after `native-tests` succeeds, downloads that
+exact binary, builds only the delivery tool (which needs no engine bundle
+input) and runs `mise run //packages/kuru-delivery:measure:open-time` once: the
+main series, 10 iterations, with the gate variables set. At about 70 to 90 s
+per iteration (two 30 s retirement waits) it adds roughly 15 to 20 minutes to
+`ci-gate`'s critical path after `native-tests`. Nothing is rebuilt, and the
+measured executable embeds the engine its installation job verified. The
+control, coarse-period and ramp modes (below) are local-only and are not run in
+CI.
 
 The harness drives the binary from outside. Each iteration uses a fresh private
 scratch root with its own HOME, configuration, data directory, engine cache,
@@ -1216,11 +1219,14 @@ network, login or credential store), in this order:
    always had.
 
 Engine starts per case (the structure table's first column) are the
-acceptance numbers for store creation work. Today a release build shows 4 for
-`first-launch`, 1 for `cold-existing`, 0 for an attaching `warm-reopen` and 4
-for `new-project`, which creates its store through the same three staging
-engines and the active one; a per-machine store template is expected to bring
-`new-project` to 2.
+acceptance numbers for store creation work, and the gate holds them exactly.
+Since the per-machine store template (`d717b4fd`), a release build shows 3 for
+`first-launch` (it builds the template once), 2 for `new-project` (a template
+copy: one staging engine, then the active one), 1 for `cold-existing`, and for
+`warm-reopen` 0 when it attaches to the live owner and 1 when it spawns a new
+owner. Owner retirement is immediate, so the warm reopen usually spawns: every
+one of the 20 warm reopens in the two derivation runs did. Before the template
+a release build showed 4 for both `first-launch` and `new-project`.
 
 Every run gets an explicit, otherwise cleared environment: private `HOME`,
 configuration, cache, data and temporary directories, an empty `PATH`, and
@@ -1337,6 +1343,8 @@ median is kept) and a 64 MiB write, fsync and read in the scratch root. Use the
 `open / CPU probe` ratio to compare runs of one runner label, such as a pull
 request's head against its base, not runners of different kinds.
 
+These modes are for local comparisons only; CI runs the main series alone, and
+the gate refuses to run in either of the first two.
 `KURU_OPEN_TIME_FILES=off` runs the control series: processes only.
 `KURU_OPEN_TIME_RETIRE_WAIT=off` runs the ramp: consecutive iterations start
 while earlier owners are still inside their idle window, so owners accumulate
@@ -1347,19 +1355,24 @@ directories are kept until one final retirement wait after the last run.
 
 A failed open is a run with no readiness signal (neither a `ready` marker nor
 `Memory: ready.`); a command that fails after that line is counted separately.
-Both are results, recorded with the exit status and first error line. Only an infrastructure failure, such as a process that has not
-retired after 120 s (polled every 100 ms), stops the series with a non-zero
-exit, and that process is never killed. The sampling period and the retirement
+Both are results, recorded with the exit status and first error line; under
+the gate a failed open is also a violation, reported after the series
+completes. Only an infrastructure failure, such as a process that has not
+retired after 120 s (polled every 100 ms), stops the series early with a
+non-zero exit (a stopped series is not gated), and that process is never
+killed. The sampling period and the retirement
 poll belong to this unshipped measurement tool; they are stated in every summary
 and are not waits in product or test code.
 
-To read the output, open the job summary. For each series it has the partition
+To read the output, open the job summary. It has the partition
 of the open per case (n, median, minimum, maximum and spread of each stage), the
 totals with the milestones they pass through, other times (exit, lifetimes,
 probes, the recorded bracket), every open sample in run order, and per-case
-engine starts, owner path, load and census. Download the
-`ci-open-time-ubuntu-latest-attempt-<n>` artifact for each series' `records.jsonl`, one
-`kuru.open-time.v3` JSON object per run, and `summary.md`. Version 3 added the
+engine starts, owner path, load and census, followed by the gate's section:
+the expected engine starts, both gated medians with their budgets, and every
+violation. Download the `ci-open-time-ubuntu-latest-attempt-<n>` artifact,
+uploaded after a failed gate too, for `main/records.jsonl`, one
+`kuru.open-time.v3` JSON object per run, and `main/summary.md`. Version 3 added the
 `new-project` case, `stages.ready_signal` and `stages.markers`, and names the
 final milestone `ready` for either signal. Records hold no path, credential or
 memory content.
@@ -1395,12 +1408,63 @@ private scratch root), `KURU_OPEN_TIME_LABEL` and the mode variables above are
 optional. A busy machine distorts the numbers; the recorded load shows by how
 much.
 
-Phase 2 turns this job into the budget check by adding a comparison step after
-the measurement: probe-normalised medians of the pull request's head against
-its base, and an absolute ceiling well under `startup_timeout_secs`, using
-margins taken from the spread this job has recorded. Only then does it
-drop `continue-on-error` and join `ci-gate`'s needs. Until then, nothing reads
-these numbers automatically.
+Add the gate variables (below) to gate a local run as CI does; the budgets
+were derived on ubuntu-latest and do not carry over to another machine.
+
+### The gate and its budgets
+
+With every one of its six variables set, the command gates the series; with
+none it is report only, and setting some but not all is an error before
+anything is measured. The gate applies to the main series only (file
+observation and retirement waits on). `ci.yml` sets, in the job's `env`:
+
+| variable | CI value | checks |
+|---|---|---|
+| `KURU_OPEN_TIME_EXPECT_FIRST_LAUNCH_STARTS` | `3` | engine starts of every `first-launch` run |
+| `KURU_OPEN_TIME_EXPECT_COLD_EXISTING_STARTS` | `1` | engine starts of every `cold-existing` run |
+| `KURU_OPEN_TIME_EXPECT_WARM_REOPEN_STARTS` | `attached=0,spawned-owner=1` | engine starts of every `warm-reopen` run, keyed on its owner path; a path not listed fails |
+| `KURU_OPEN_TIME_EXPECT_NEW_PROJECT_STARTS` | `2` | engine starts of every `new-project` run |
+| `KURU_OPEN_TIME_BUDGET_NEW_PROJECT_MS` | `890` | median `new-project` open to ready |
+| `KURU_OPEN_TIME_BUDGET_COLD_EXISTING_MS` | `585` | median `cold-existing` open to ready |
+
+The checks run in order. First, over every case: the case has runs, every run
+opened (a readiness signal), and every run's engine starts equal its
+expectation. Only when all of those hold, the `new-project` median open to
+ready and then the `cold-existing` one must each be at most its budget. Any
+violation is written to the summary, naming the case, the observed and the
+expected value or budget, and the iterations that violated it, after every
+record has been written; the command then exits non-zero. `first-launch` and
+`warm-reopen` open times are reported but not gated.
+
+Each budget follows one rule: the highest median of the case across two
+post-fix derivation runs of the main series, plus three times the largest
+within-run spread (maximum minus minimum) of that case, rounded up to a whole
+millisecond. The current budgets derive from CI runs 36949202478 and
+36952763676, both measuring main at `0e562595`: `new-project` medians 729.8
+and 731.9 ms with spreads 52.6 and 39.8 ms give 731.9 + 3 × 52.6 = 889.7, so
+890 ms; `cold-existing` medians 399.3 and 387.0 ms with spreads 61.7 and
+23.5 ms give 399.3 + 3 × 61.7 = 584.4, so 585 ms. A unit test recomputes both
+budgets from those two runs' recorded fixtures and checks `ci.yml` against
+them.
+
+After a deliberate startup change (one that changes engine starts per case or
+moves the gated medians), re-derive in the same pull request:
+
+1. Update the expected engine starts in `ci.yml` to what the change is meant to
+   produce, and confirm them from the change's own measured records, never from
+   expectation alone.
+2. Take the gate job's records from two pushes of the change, each a distinct
+   commit carrying the new startup path, never a rerun of one job (while the
+   old budgets fail the job, its uploaded records still carry every
+   measurement).
+3. From each run's `main/records.jsonl`, take the median and the spread of
+   `stages.ready_ms` for `new-project` and `cold-existing`, apply the rule above
+   to both runs together, and set the two budgets in `ci.yml`, with the run ids
+   and arithmetic in the comment beside them.
+4. Replace the gate's recorded fixtures in
+   `packages/kuru-delivery/src/open_time/testdata/gate-*.jsonl` with those two
+   runs' records, trimmed to the fields the gate reads, and update the unit
+   tests' expected medians and budgets.
 
 ## Shared build cache
 

@@ -1,5 +1,5 @@
-//! Report-only open-time measurement of a release `kuru` executable, driven
-//! from outside the binary.
+//! Open-time measurement of a release `kuru` executable, driven from outside
+//! the binary, and an optional gate over its records.
 //!
 //! Each iteration runs four cases in a fresh scratch root, with its own
 //! HOME, configuration, data directory, engine cache and two project
@@ -21,16 +21,21 @@
 //! markers and of exit, what [`observe`] saw, a [`census`] before and after
 //! the run, host load before and after, and a fixed CPU and IO calibration
 //! probe. It writes one `kuru.open-time.v3` JSON line per run and a Markdown
-//! summary. It never
-//! compares a time with a budget: a slow or failed open is a result, and only
-//! an infrastructure failure (a missing binary, an unwritable output, a
-//! process that does not retire) makes it fail.
+//! summary. Without a [`gate::Gate`] it is report only: a slow or failed open
+//! is a result, and only an infrastructure failure (a missing binary, an
+//! unwritable output, a process that does not retire) makes it fail. With a
+//! gate, the completed main series is also checked against exact engine
+//! starts per case and the `new-project` and `cold-existing` median budgets
+//! ([`gate`]); the verdict is appended to the summary and returned, and the
+//! command exits non-zero on a violation after every record is written.
 //!
-//! Two modes serve comparisons: with file observation off (the control) the
-//! observer lists processes only, and with the retirement wait off (the ramp)
-//! consecutive runs start while earlier owners are still alive.
+//! Two modes serve local comparisons and are never gated: with file
+//! observation off (the control) the observer lists processes only, and with
+//! the retirement wait off (the ramp) consecutive runs start while earlier
+//! owners are still alive.
 
 pub mod census;
+pub mod gate;
 mod launch;
 pub mod observe;
 pub mod report;
@@ -46,7 +51,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use census::Census;
@@ -96,6 +101,8 @@ pub struct Options {
     /// Bound on one command; past it the command is stopped and recorded.
     pub run_bound: Duration,
     pub prompt: String,
+    /// Gate the main series; requires file observation and retirement waits.
+    pub gate: Option<gate::Gate>,
 }
 
 impl Options {
@@ -112,11 +119,12 @@ impl Options {
             retire_wait: true,
             run_bound: Duration::from_secs(180),
             prompt: "measure".into(),
+            gate: None,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Case {
     FirstLaunch,
@@ -291,6 +299,8 @@ pub struct Report {
     /// The ramp series' single wait for every owner to retire.
     pub final_retire_wait_ms: Option<f64>,
     pub summary: String,
+    /// The gate's verdict over the completed series, when gated.
+    pub gate: Option<gate::Verdict>,
 }
 
 /// One iteration's private directories.
@@ -693,6 +703,13 @@ async fn version(binary: &Path, scratch: &Path, bound: Duration) -> Result<Strin
 /// infrastructure failure part way still leaves every completed run.
 pub async fn run(options: &Options) -> Result<Report> {
     ensure!(options.iterations > 0, "at least one iteration is required");
+    // The budgets derive from the main series; the control lists no files
+    // and the ramp changes owner paths, so neither is gated.
+    ensure!(
+        options.gate.is_none() || (options.files && options.retire_wait),
+        "the open-time gate applies to the main series only: file observation and \
+         retirement waits must both be on"
+    );
     let binary = plain(&options.binary)
         .with_context(|| format!("measured binary {}", options.binary.display()))?;
     ensure!(binary.is_file(), "{} is not a file", binary.display());
@@ -772,12 +789,27 @@ pub async fn run(options: &Options) -> Result<Report> {
             }
         }
     }
-    let mut summary = report::summary(&series.records, &options.label);
+    let mut summary = report::summary_of(&series.records, &options.label, options.gate.is_some());
     if let Some(wait) = final_retire_wait_ms {
         summary.push_str(&format!(
             "\nFinal wait for every owner of the ramp to retire: {wait:.0} ms.\n"
         ));
     }
+    // A series stopped by an infrastructure failure is not gated: its
+    // records are partial, and the failure is the result.
+    let verdict = match (&options.gate, &failure) {
+        (Some(gate), None) => {
+            let runs: Vec<gate::Run> = series.records.iter().map(gate::Run::from).collect();
+            let verdict = gate::evaluate(&runs, gate);
+            summary.push_str(&gate::render(&verdict, gate));
+            Some(verdict)
+        }
+        (Some(_), Some(_)) => {
+            summary.push_str("\n## Open-time gate: not evaluated\n\nThe series stopped.\n");
+            None
+        }
+        (None, _) => None,
+    };
     fs::write(options.output.join(SUMMARY), &summary)?;
     if let Some(path) = &options.summary {
         let mut file = fs::OpenOptions::new()
@@ -812,5 +844,6 @@ pub async fn run(options: &Options) -> Result<Report> {
         failed_after_open,
         final_retire_wait_ms,
         summary,
+        gate: verdict,
     })
 }

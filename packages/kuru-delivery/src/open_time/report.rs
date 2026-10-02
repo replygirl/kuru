@@ -22,7 +22,8 @@
 //! to the end of this one). A stage between two sampled milestones is off by
 //! less than one bracket either way, and each stage keeps its bounds. A
 //! negative stage means two milestones fell within one bracket, seen in the
-//! other order. Nothing here compares a time with a budget.
+//! other order. Nothing here compares a time with a budget; the gate does,
+//! in [`super::gate`].
 
 use std::{collections::BTreeMap, fmt::Write as _};
 
@@ -245,7 +246,7 @@ pub struct Counts {
     pub engine_marker_intervals: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OwnerPath {
     /// A new owner process started: election, spawn and a full open.
@@ -257,12 +258,19 @@ pub enum OwnerPath {
 }
 
 impl OwnerPath {
-    fn label(self) -> &'static str {
+    pub const ALL: [Self; 3] = [Self::SpawnedOwner, Self::Attached, Self::NoOwnerObserved];
+
+    pub fn label(self) -> &'static str {
         match self {
             Self::SpawnedOwner => "spawned-owner",
             Self::Attached => "attached",
             Self::NoOwnerObserved => "no-owner-observed",
         }
+    }
+
+    /// The path a record's label names.
+    pub fn parse(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|path| path.label() == label)
     }
 }
 
@@ -792,17 +800,31 @@ fn describe(records: &[Record]) -> String {
 /// with their parts, other times, every open sample, and structural counts
 /// and the census.
 pub fn summary(records: &[Record], label: &str) -> String {
+    summary_of(records, label, false)
+}
+
+/// The summary; with `gated` its heading and preamble name the gate whose
+/// section follows it instead of saying no budget is applied.
+pub fn summary_of(records: &[Record], label: &str, gated: bool) -> String {
     let mut text = String::new();
     let failed = records.iter().filter(|record| !record.opened()).count();
     let after = records
         .iter()
         .filter(|record| record.opened() && !record.outcome.success)
         .count();
-    let _ = writeln!(text, "## Kuru open time: {label} (report only)\n");
+    let (mode, budget) = if gated {
+        (
+            "gate",
+            "The open-time gate after these tables checks engine starts and two medians.",
+        )
+    } else {
+        ("report only", "No budget is applied.")
+    };
+    let _ = writeln!(text, "## Kuru open time: {label} ({mode})\n");
     let _ = writeln!(
         text,
         "Release binary measured from outside, {} runs; {failed} of {} runs failed to open \
-         (no readiness signal); {after} commands failed after opening. No budget is applied. \
+         (no readiness signal); {after} commands failed after opening. {budget} \
          Times are milliseconds from process start; ratios are unitless. Ready is a \
          `kuru-open-marker v1 ready` line or, from a binary without markers, `Memory: ready.`; \
          the ready signal column says which.\n",

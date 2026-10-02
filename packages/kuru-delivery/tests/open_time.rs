@@ -388,3 +388,121 @@ async fn either_readiness_signal_ends_the_open_and_the_record_names_it() {
         }
     }
 }
+
+/// The `kuru-delivery open-time` command against the fixture, with only the
+/// given `KURU_OPEN_TIME_*` variables: none is inherited, and no CI job
+/// summary is written.
+async fn command(root: &Path, gate: &[(&str, &str)]) -> std::process::Output {
+    use kuru_delivery::command::{Command, output};
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kuru-delivery"));
+    command.arg("open-time").kill_on_drop(true);
+    for (name, _) in std::env::vars_os() {
+        let text = name.to_string_lossy();
+        if text.starts_with("KURU_OPEN_TIME_") || text == "GITHUB_STEP_SUMMARY" {
+            command.env_remove(&name);
+        }
+    }
+    command
+        .env(
+            "KURU_OPEN_TIME_BINARY",
+            env!("CARGO_BIN_EXE_kuru-delivery-fixture"),
+        )
+        .env("KURU_OPEN_TIME_OUTPUT", root.join("output"))
+        .env("KURU_OPEN_TIME_SCRATCH", root.join("scratch"))
+        .env("KURU_OPEN_TIME_ITERATIONS", "1")
+        .env("KURU_OPEN_TIME_LABEL", "fixture");
+    for (name, value) in gate {
+        command.env(name, value);
+    }
+    output(&mut command, Duration::from_secs(600))
+        .await
+        .expect("open-time command exceeded its fixture deadline or failed to start")
+}
+
+/// The fixture starts no owner and no engine, so every case starts 0
+/// engines and the warm reopen observes no owner.
+fn fixture_gate(first_launch: &'static str) -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("KURU_OPEN_TIME_EXPECT_FIRST_LAUNCH_STARTS", first_launch),
+        ("KURU_OPEN_TIME_EXPECT_COLD_EXISTING_STARTS", "0"),
+        (
+            "KURU_OPEN_TIME_EXPECT_WARM_REOPEN_STARTS",
+            "no-owner-observed=0",
+        ),
+        ("KURU_OPEN_TIME_EXPECT_NEW_PROJECT_STARTS", "0"),
+        ("KURU_OPEN_TIME_BUDGET_NEW_PROJECT_MS", "60000"),
+        ("KURU_OPEN_TIME_BUDGET_COLD_EXISTING_MS", "60000"),
+    ]
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_gate_passes_and_fails_the_command_after_writing_every_record() {
+    let root = tempfile::tempdir().unwrap();
+    let passed = command(root.path(), &fixture_gate("0")).await;
+    let (stdout, stderr) = (text(&passed.stdout), text(&passed.stderr));
+    assert!(passed.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("Open-time gate passed."), "{stdout}");
+    assert_eq!(records(root.path()).len(), 4);
+    let summary = fs::read_to_string(root.path().join("output/summary.md")).unwrap();
+    assert!(summary.contains("(gate)"), "{summary}");
+    assert!(summary.contains("## Open-time gate: passed"), "{summary}");
+
+    let root = tempfile::tempdir().unwrap();
+    let failed = command(root.path(), &fixture_gate("3")).await;
+    let (stdout, stderr) = (text(&failed.stdout), text(&failed.stderr));
+    assert!(!failed.status.success(), "{stdout}\n{stderr}");
+    assert!(stderr.contains("open-time gate failed"), "{stderr}");
+    assert!(
+        stderr.contains("first-launch: 0 engine starts, expected 3, in iteration 1"),
+        "{stderr}"
+    );
+    // Every record and the summary are written before the command fails.
+    assert_eq!(records(root.path()).len(), 4);
+    let summary = fs::read_to_string(root.path().join("output/summary.md")).unwrap();
+    assert!(summary.contains("## Open-time gate: failed"), "{summary}");
+    assert!(summary.contains("Medians not checked"), "{summary}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_gate_variables_the_command_is_report_only_and_a_partial_gate_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let report = command(root.path(), &[]).await;
+    let stdout = text(&report.stdout);
+    assert!(
+        report.status.success(),
+        "{stdout}\n{}",
+        text(&report.stderr)
+    );
+    assert!(stdout.contains("(report only)"), "{stdout}");
+    assert!(stdout.contains("No budget is applied."), "{stdout}");
+    assert!(!stdout.contains("Open-time gate"), "{stdout}");
+
+    // One variable without the rest is refused before anything is measured.
+    let root = tempfile::tempdir().unwrap();
+    let partial = command(
+        root.path(),
+        &[("KURU_OPEN_TIME_BUDGET_NEW_PROJECT_MS", "890")],
+    )
+    .await;
+    let stderr = text(&partial.stderr);
+    assert!(!partial.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("missing KURU_OPEN_TIME_EXPECT_FIRST_LAUNCH_STARTS"),
+        "{stderr}"
+    );
+    assert!(!root.path().join("output").exists());
+
+    // The gate applies to the main series only.
+    let root = tempfile::tempdir().unwrap();
+    let mut control = fixture_gate("0");
+    control.push(("KURU_OPEN_TIME_FILES", "off"));
+    let refused = command(root.path(), &control).await;
+    let stderr = text(&refused.stderr);
+    assert!(!refused.status.success(), "{stderr}");
+    assert!(stderr.contains("main series only"), "{stderr}");
+    assert!(!root.path().join("output").exists());
+}
