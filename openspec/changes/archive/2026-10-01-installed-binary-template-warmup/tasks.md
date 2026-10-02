@@ -44,7 +44,10 @@
       --all-features -D warnings`) is its local compile gate: exit 0.
       `mise exec` forwarding a variable set on its own process to the
       child was checked on macOS (`KURU_OPEN_MARKERS=1` seen by `sh -c`);
-      the same on the pinned Windows mise is inferred, not observed.
+      the same on the pinned Windows mise is inferred, not observed, and a
+      passing coverage partition captures the printed marker list, so the
+      harness comment marks the markers as best-effort diagnostics; no
+      assertion depends on them.
 - [x] 2.5 In `packaged_install_and_update_preserve_complete_offline_memory`
       (`apps/kuru-tui/tests/embedded_runtime.rs`, which stays cold — no
       warm-up), print one clearly labelled line with the wall time from
@@ -62,12 +65,16 @@
       plus `, instrumented` under `LLVM_PROFILE_FILE`) instead of asserting
       "release", since the selected executable is not always a release
       build.
-- [ ] 2.2 Run `windows_mise` on native Windows in the worktree and record the
+- [ ] 2.2 (deferred at archive: no native Windows host locally) Run `windows_mise` on native Windows in the worktree and record the
       pass with the new assertions and the printed warm-up/launch timings.
       Unrun: no native Windows host is available locally (macOS); verified
       instead by the Windows coverage partitions in CI (task 4.2) and by
-      reading the code.
-- [ ] 2.3 Run it twice more from fresh roots and record first-launch wall
+      reading the code. Observed in CI (run 36956677170, d37823ed): the test
+      passed with the new assertions on windows-latest (job 110681317355);
+      the warm-up and launch timings were not printed, because a passing
+      coverage partition captures test output, so the marker list it prints
+      is also unobserved there.
+- [ ] 2.3 (deferred at archive: no native Windows host locally) Run it twice more from fresh roots and record first-launch wall
       times for comparison against the one known passing sample (48.40 s
       total test time, job 110506119241 — not an isolated launch-time
       baseline, the only pre-change passing sample available); expect a
@@ -75,7 +82,7 @@
       Unrun: as 2.2. Coverage rejects `--nocapture`, so a passing partition
       prints nothing; the first release's `verify:staged-windows` run prints
       one sample.
-- [ ] 2.4 Throwaway, uncommitted: pass a bogus supervisor path into the
+- [ ] 2.4 (deferred at archive: no native Windows host locally) Throwaway, uncommitted: pass a bogus supervisor path into the
       warm-up and confirm the warm-up error appears first in the failure
       context, with the fixture root retained (R4) — do not commit this run.
       Unrun (no native Windows host). Replaced by reading the error path: a
@@ -123,12 +130,34 @@
       `//apps/kuru-tui`, `//packages/kuru-delivery` and
       `//packages/kuru-memory`; `format:check`; `typecheck`; `docs:check`;
       `cospec:managed:check`.
-- [ ] 4.2 Confirm CI is green on the branch's own pushed commits — Windows
+- [x] 4.2 Confirm CI is green on the branch's own pushed commits — Windows
       coverage partitions in particular — without any rerun (a failure is a
       defect to diagnose, not to rerun past). Note `verify:staged-windows` as
       unrun until the next release.
+      Observed (CI run 36956677170 on d37823ed, the implementation commit,
+      first attempt, no rerun): conclusion success, every job success or
+      skipped. By test name, read from each job log in turn:
+      `native_mise_github_backend_installs_and_activates_real_offline_kuru`
+      ok on windows-latest coverage partition 5 (job 110681317355; 56.46 s
+      test time, against the one pre-change passing sample of 48.40 s, a
+      single sample of each, not a launch-time comparison);
+      `fixture_cache_warm_up_lets_a_fresh_open_copy_with_two_starts` ok on
+      windows-latest partition 3 (job 110681317287) and
+      `fixture_cache_receipt_names_what_changed` ok on partition 4 (job
+      110681317272), so the Windows `lifecycles` branch and T2's rename ran
+      natively. The `embedded_runtime first launch (cold cache,
+      KURU_EMBEDDED_TEST_BINARY executable)` line appears twice in each
+      Installation log: ubuntu-latest 4644/4679 ms (job 110681317150),
+      macos-latest 4878/4510 ms (job 110681317096), windows-latest
+      10467/12128 ms (job 110681317023), windows-11-arm 12173/11371 ms (job
+      110681364557), for `[direct]`/`[updated]`. One green run is not a
+      flake rate: the failure family was 4 of 37 runs before this change.
+      Later commits on the branch change only comments and these artifacts.
+      `verify:staged-windows` is unrun until the next release.
 
 ## 5. Close-out
 
-- [ ] 5.1 `mise run cospec -- validate installed-binary-template-warmup --strict`,
+- [x] 5.1 `mise run cospec -- validate installed-binary-template-warmup --strict`,
       then archive before merge.
+      Observed: strict validation passed (0 errors, 0 warnings) before the
+      archive; the archive is in the branch's final commit.
