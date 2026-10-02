@@ -1,30 +1,38 @@
 # Verification
 
+All local runs: macOS arm64, uninstrumented debug build, pinned Dolt 2.3.5,
+2026-10-01 to 2026-10-02. "Red" is commit 40862567 (hooks and tests on
+origin/main 0e562595 code); "green" is the named later commit on
+`fix/memory-pool-acquire-at-cause`.
+
 ## 1. Sequential work reuses one authenticated session [critical]
 
-- [ ] 1.1 @regression (agent) `sequential_statements_authenticate_one_session` on a live isolated store -> red on origin/main (more than one authenticated connection on a fresh branch pool), green after the fix
-- [ ] 1.2 @regression (agent) `fresh_open_authenticates_one_session_per_pool` -> red on origin/main, green after the fix: main and usage pools each authenticated one connection after a warmed open
-- [ ] 1.3 @regression (agent) `receipted_writes_reuse_their_pooled_session` -> red on origin/main (the second write enters the authentication gate), green after the fix; usage-ledger writes on the usage pool included
-- [ ] 1.4 @regression (agent) `candidate_view_writes_reuse_candidate_pool_sessions` -> red on origin/main, green after the fix
+- [x] 1.1 @regression (agent) `sequential_statements_authenticate_one_session` on a live isolated store -> red at 40862567: `creating and verifying the pool authenticated 2 connections, not one`; green at 0c5167b4 (funnel + inline first-connection release): creation and identity verification authenticate one connection and `fetch_one`, `fetch_optional`, `fetch_all`, `execute`, a streamed `fetch`, a read transaction and a statement after it never enter the authentication gate. Observed 2026-10-02
+- [x] 1.2 @regression (agent) `fresh_open_authenticates_one_session_per_pool` -> red at 40862567: `the open sequence authenticated 2 connections on main, not one`; green at 0c5167b4: main and usage pools each authenticate exactly one connection across a warmed open. Observed 2026-10-02
+- [x] 1.3 @regression (agent) `receipted_writes_reuse_their_pooled_session` (put, append_message, append_session_message, put_reasoning_summaries twice each, create_session_catalog, then usage mark_new_session, admit, observe and settle twice) -> red at 40862567 (`append_session_message opened a new pool connection`) and still red at 0c5167b4 (`append_message opened a new pool connection`: inline release alone does not stop write detaches); green at 14c8bd4e (receipted write sessions): no write on the main or usage pool enters the gate and neither pool's authentication count moves. Observed 2026-10-02
+- [x] 1.4 @regression (agent) `candidate_view_writes_reuse_candidate_pool_sessions` -> red at 40862567 and 0c5167b4 (`candidate append_session_message opened a new pool connection`); green at 14c8bd4e: four rounds of candidate-view `put` and `append_session_message` never enter the candidate pool's gate. Observed 2026-10-02
 
 ## 2. The uncertain-write fence is unchanged [critical]
 
-- [ ] 2.1 @integration (agent) `uncertain_write_still_ends_its_session_before_reconciliation` -> the injected post-commit failure settles by its receipt, its connection id is absent from the processlist, the pool is one connection smaller
-- [ ] 2.2 @integration (agent) `rejected_write_closes_its_session` -> a reasoning-summary conflict returns the typed conflict and its session is absent from the processlist
+- [x] 2.1 @integration (agent) `uncertain_write_still_ends_its_session_before_reconciliation` -> green at 14c8bd4e: the injected failure after `DOLT_COMMIT` settles by its receipt, the pending record is cleared, the write's recorded `CONNECTION_ID()` is absent from `information_schema.processlist`, and the value is durable. Negative control: with the non-receipted branch of `mutate` changed to return its session to the pool, it fails with `memory outcome is uncertain; original SQL session has not finished`. Observed 2026-10-02
+- [x] 2.2 @integration (agent) `rejected_write_closes_its_session` -> green at 14c8bd4e: with the pool holding exactly one idle session, a conflicting reasoning-summary write returns the typed `ReasoningSummaryConflict`, that session is absent from the processlist and reconciliation authenticated a new connection. Negative control as 2.1: fails with `memory SQL session teardown deadline exceeded`. Observed 2026-10-02
 
 ## 3. A timed-out acquire names its wait
 
-- [ ] 3.1 @integration (agent) `contended_acquire_names_held_connections` -> held-connections class, size, checked-out and window named; chain still holds SQLx's pool timeout
-- [ ] 3.2 @integration (agent) `stalled_authentication_names_the_new_connection_phase` -> new-connection class, the gate's phase, one authentication during the wait
-- [ ] 3.3 @unit (agent) wait classifier and carrier tests -> the idle-check-or-release class has no phase; the carrier is `Io` of kind `Other` with the typed payload
-- [ ] 3.4 @unit (agent) service owner storage-failure mapping test -> still `StorageFailed`, typed warning emitted
+- [x] 3.1 @integration (agent) `open_pool_budget_tests::retained_open_pools_keep_the_ordinary_acquire_window` (contended part rewritten) -> green at 0c5167b4: with `max` sessions held, the next acquire fails at SQLx's own 2 s window (no test timer) with `HeldConnections`, size and checked-out equal to `max`, 0 idle, window `ORDINARY_POOL_WINDOW`, no phase, and the chain still holds `sqlx::Error::PoolTimedOut`. Observed 2026-10-02
+- [x] 3.2 @integration (agent) `stalled_authentication_names_the_new_connection_phase` -> green at 0c5167b4: with the only session held and the gate armed, the funnel's acquire and a statement through the `Executor` each fail with `NewConnection`, phase `authentication gate entered`, one authentication during the wait, checked out 1, idle 0, size below max; observed text `memory pool acquire on kuru/main timed out after 2.002 s (window 2.000 s) waiting for a new connection's authentication (connection phase: authentication gate entered); pool size 1 of 4, 0 idle, 1 checked out; 2 connections authenticated since the pool opened, 1 during this wait`. Observed 2026-10-02
+- [x] 3.3 @unit (agent) `pool::tests` (`waits_are_classified_by_permits_and_authentications_during_the_wait`, `diagnostic_names_its_wait_and_omits_a_stale_phase`, `executor_carrier_is_typed_and_not_a_classified_io_kind`) -> the idle-check-or-release class (capacity, no authentication during the wait) prints no phase; the carrier is `sqlx::Error::Io` of kind `Other` (not `TimedOut` or `ConnectionReset`, the kinds Kuru's classifiers match) and `pool_acquire_timeout` finds both forms through anyhow context. Observed 2026-10-02
+- [~] 3.4 @integration (agent) idle-check-or-release class from a live stalled idle ping -> defer: no fixture can stall Dolt's reply to `COM_PING` without a sleep or suspending the owned engine; the class is pinned by the classifier unit test only
+- [~] 3.5 @unit (agent) the pool's `memory pool acquire timed out` warning observed by a recorder -> defer: the kuru-memory test binary's only process-wide tracing recorder is `provision/native_tests.rs`'s retained-stage recorder (thread-scoped capture is banned by `clippy.toml`), and that file is being changed concurrently by the provision-leftover-stage branch; the warning is emitted at the site that builds the diagnostic asserted in 3.1 and 3.2
 
 ## 4. Exposure measurement
 
-- [ ] 4.1 @benchmark (agent) per-pool authenticated connections across one `all_four_modes_keep_builtin_dream_requests_and_own_memory_isolation` run, before and after -> numbers recorded
+- [x] 4.1 @benchmark (agent) per-pool new-connection authentications across one `mode_baseline_tests::all_four_modes_keep_builtin_dream_requests_and_own_memory_isolation` run (uncommitted `eprintln!` at the authentication callback's entry, grouped by branch class) -> before (40862567 code): main 80, usage 68, candidates 66, promoting refs 16, startup probe 6; after (14c8bd4e, two runs): main 23 and 20, usage 5 and 4, candidates 14 and 14, promoting refs 8 and 8, startup probe 6 and 4. Observed 2026-10-02
 
 ## 5. Suites and static checks
 
-- [ ] 5.1 @regression (agent) `mise run //packages/kuru-memory:test`, `mise run //packages/kuru-runtime:test` -> exit 0
-- [ ] 5.2 @regression (agent) `mise run format:check`, `mise run lint`, `mise run lint:windows`, `mise run typecheck`, `mise run docs:check` -> exit 0
-- [ ] 5.3 @runtime (agent) native Windows and Linux coverage partitions -> CI on the PR
+- [x] 5.1 @regression (agent) `mise run //packages/kuru-memory:test` at 14c8bd4e -> lib 593 passed, 9 failed, 6 ignored (805.9 s); every other target passed (bundle_build 10, memory 5, server_lifecycle 12, supervisor_snapshot 1). All 9 failures were the host disk filling during the run (shared with other worktrees' concurrent suites; 120 MiB free when first observed): seven report `No space left on device (os error 28)` or SQLite `disk I/O error`, `staged_open_error_returns_only_after_its_server_is_reaped` failed its precondition (`assertion failed: entered.load`) and `cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries` failed `migration worker did not reach its accepted cancellation boundary: deadline has elapsed`; attributing those two to the same disk pressure is an inference from their passing rerun. The 9 (plus `a_failed_close_is_attached_to_the_open_error`) rerun together passed, 10 of 10 (67.9 s). A second clean full run was not attempted while the disk stayed at 1-4 GiB free. Observed 2026-10-02
+- [x] 5.2 @regression (agent) `mise run //packages/kuru-runtime:test` at 14c8bd4e -> exit 0; lib 220 passed, including the three tests of this family (`mode_baseline_tests::all_four_modes_keep_builtin_dream_requests_and_own_memory_isolation`, `accounting_tests::admitted_without_observation_remains_incomplete_and_unknown`, `review_tests::unavailable_mcp_status_stays_out_of_provider_input_and_memory`). Observed 2026-10-02
+- [x] 5.3 @regression (agent) `mise run format:check`, `mise run lint`, `mise run typecheck`, `mise run docs:check`, `mise run //packages/kuru-memory:lint:windows` -> exit 0 for each. Observed 2026-10-02
+- [~] 5.4 @regression (agent) root `mise run lint:windows` -> defer: only kuru-memory's Rust changed and its Windows-target clippy passed (5.3); the root aggregate compiles every crate for the Windows target and was not started with 1.2 GiB of shared disk left; CI's static lint job runs it on the PR
+- [~] 5.5 @runtime (agent) native Windows and Linux coverage partitions -> defer: no local Windows or Linux host; CI runs them on the PR

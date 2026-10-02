@@ -1424,6 +1424,46 @@ intentional overrides such as the temporary release index. Keep new repository
 subprocesses on that path and exercise foreign hook environments through child
 processes with temporary repositories. See [Git's hook documentation](https://git-scm.com/docs/githooks).
 
+## Memory pool acquire timeouts
+
+Every store pool is a `MemoryPool` (`packages/kuru-memory/src/pool.rs`). Each
+statement returns its connection to the pool before its future completes, so
+sequential work reuses one authenticated session. A receipt-bearing write
+returns its session only after a receipted success; any other outcome ends the
+session before the uncertain-write fence reconciles it. A new connection still
+runs TCP, MySQL authentication and the identity callback inside the pool's
+ordinary acquire window (`ORDINARY_POOL_WINDOW`, 2 s).
+
+An acquisition that reaches that window fails with a `PoolAcquireTimedOut`
+diagnostic instead of SQLx's bare `pool timed out while waiting for an open
+connection`, for example:
+
+```text
+memory pool acquire on kuru/main timed out after 2.004 s (window 2.000 s) waiting for a new connection's authentication (connection phase: data directory query); pool size 1 of 4, 0 idle, 1 checked out; 3 connections authenticated since the pool opened, 1 during this wait
+```
+
+The wait class says what to investigate:
+
+- `every permit held`: Kuru work held every connection. Look for contention
+  above the pool's maximum or a holder that did not finish.
+- `a new connection's authentication`: a connection entered authentication
+  during the wait. The phase shows how far it got: `after_connect not entered`
+  is TCP or MySQL authentication; the other phases are Kuru's identity
+  callback.
+- `an idle-connection check or a release`: capacity existed and no new
+  connection started authenticating, so the wait was SQLx's ping of an idle
+  connection, a release still in flight, or a connect that never reached the
+  callback. No phase is printed, because the pool's latest phase would be
+  stale.
+
+The diagnostic contains no SQL text, credentials, endpoints or paths. Through
+the pool's own `acquire` it is context over SQLx's `PoolTimedOut`; through a
+statement it is a `sqlx::Error::Io` of kind `Other`, so it reads
+`error communicating with database: memory pool acquire ...`. Use
+`kuru_memory::pool::pool_acquire_timeout` to find it in an error chain. The
+pool also logs each timeout as a `memory pool acquire timed out` warning with
+the same fields.
+
 ## Memory service protocol
 
 Each typed memory service operation (`ServiceCall`, `ViewOperation` and

@@ -79,6 +79,10 @@ candidates that this change does not remove.
   an accept timeout or an uncertain write: the only `sqlx::Error::Io`
   classifier matches `ConnectionReset` during pool creation, and the service's
   timeout classifiers match `io::ErrorKind::TimedOut` only.
+- The pool logs every timed-out acquisition as a `memory pool acquire timed
+  out` warning with the same typed fields, so the memory service owner's log
+  names the wait even though the wire fault stays `StorageFailed` (carrying
+  the diagnostic to clients is decision D3, deferred).
 - Test hooks: a per-pool authentication gate (no time involved) and an
   authenticated-connection counter retained per pool.
 
@@ -137,7 +141,31 @@ by its wait class instead of a bare error:
   for that write up to `CLOSE_GRACE` (8 s) and then reaps the owned engine and
   drains again, where before the pool closed at once and the detached write
   died with the engine: same end state, different timing. The service owner
-  shuts its store down through `MemoryStore::close`.
+  shuts its store down through `MemoryStore::close` (write mutex first).
+  `close_failed_open` and the migration-worker close run on the opening task
+  after its own sequential work has stopped, so no write session is in flight
+  there.
+
+## Measured exposure
+
+Per-pool new-connection authentications across one local run of
+`mode_baseline_tests::all_four_modes_keep_builtin_dream_requests_and_own_memory_isolation`
+(four modes, four dreams; macOS arm64, uninstrumented debug build; counted by
+an uncommitted `eprintln!` at the authentication callback's entry, grouped by
+branch class; candidate and promoting branches summed over the four dreams):
+
+| Pool | Before (origin/main) | After (two runs) |
+|---|---|---|
+| main (store pools, max 4) | 80 | 23, 20 |
+| usage ledger | 68 | 5, 4 |
+| dream candidates | 66 | 14, 14 |
+| promoting refs | 16 | 8, 8 |
+| startup probe (max 1) | 6 | 6, 4 |
+
+The remaining main-pool authentications are the candidate lifecycle
+writers' detached sessions (residual 2) plus one per open; the remaining
+candidate authentications are the participants' concurrent growth of each
+fresh candidate pool (residual 1).
 
 ## Capabilities
 
@@ -163,9 +191,6 @@ by its wait class instead of a bare error:
   `store/stage_worker.rs`, `store/creation_template/hooks.rs`: pool type,
   read-transaction sessions released inline, `WriteSession` with
   `settle_receipted`.
-- `packages/kuru-memory/src/service/rpc.rs`: the owner logs a storage failure
-  carrying `PoolAcquireTimedOut` with its typed fields; the wire fault is
-  unchanged (`StorageFailed`; carrying it is decision D3, deferred).
 - `Cargo.toml`, `packages/kuru-memory/Cargo.toml`, `Cargo.lock`: exact
   `sqlx-core = "=0.9.0"` (already locked) for the `Executor` stream helper.
 - `docs/development.md`: reading a pool acquire timeout diagnostic.
