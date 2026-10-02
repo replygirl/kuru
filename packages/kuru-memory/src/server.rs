@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -190,12 +190,20 @@ pub struct ServerOptions {
 #[derive(Clone)]
 pub struct Server(Arc<ServerInner>);
 
+/// A branch pool as the server retains it: the pool lives only while a store
+/// holds it; its connection observation is kept beside it.
+struct RetainedPool {
+    pool: Weak<MySqlPool>,
+    #[cfg(test)]
+    observation: ConnectionObservation,
+}
+
 struct ServerInner {
     directory: PathBuf,
     identity: Identity,
     endpoint: Endpoint,
     read_only: bool,
-    pools: Mutex<BTreeMap<String, Weak<MySqlPool>>>,
+    pools: Mutex<BTreeMap<String, RetainedPool>>,
     pool_admission: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
     /// The deadline that bounded this owned start's readiness and first
     /// authenticated probe. Pools the store opening requests from this server
@@ -828,7 +836,8 @@ impl Server {
             )
             .await
             .context("post-readiness memory authentication deadline exceeded")?
-            .context("authenticate post-readiness memory connection")?;
+            .context("authenticate post-readiness memory connection")?
+            .0;
             let verification =
                 verify_identity_until(&probe, &directory, &identity, startup_deadline)
                     .await
@@ -914,11 +923,14 @@ impl Server {
             !self.0.closed.load(Ordering::Acquire),
             "memory server is closed"
         );
-        if let Some(pool) = pools.get(branch).and_then(Weak::upgrade) {
+        if let Some(pool) = pools
+            .get(branch)
+            .and_then(|retained| retained.pool.upgrade())
+        {
             return Ok(pool);
         }
-        pools.retain(|_, pool| pool.strong_count() != 0);
-        let pool = connect_pool_with_timeout(
+        pools.retain(|_, retained| retained.pool.strong_count() != 0);
+        let (pool, _observation) = connect_pool_with_timeout(
             &self.0.identity,
             &self.0.endpoint,
             &self.0.directory,
@@ -938,8 +950,27 @@ impl Server {
         .await
         .context("verify memory branch pool identity")?;
         let pool = Arc::new(pool);
-        pools.insert(branch.to_owned(), Arc::downgrade(&pool));
+        pools.insert(
+            branch.to_owned(),
+            RetainedPool {
+                pool: Arc::downgrade(&pool),
+                #[cfg(test)]
+                observation: _observation,
+            },
+        );
         Ok(pool)
+    }
+
+    /// The retained connection observation of the live pool for `branch`.
+    #[cfg(test)]
+    pub(crate) async fn pool_observation(&self, branch: &str) -> Option<ConnectionObservation> {
+        self.0
+            .pools
+            .lock()
+            .await
+            .get(branch)
+            .filter(|retained| retained.pool.strong_count() != 0)
+            .map(|retained| retained.observation.clone())
     }
 
     /// End the opening phase once the store that started this server is
@@ -1126,7 +1157,7 @@ impl Server {
             .lock()
             .await
             .remove(branch)
-            .and_then(|pool| pool.upgrade());
+            .and_then(|retained| retained.pool.upgrade());
         if let Some(pool) = pool {
             timeout(CLOSE_GRACE, pool.close())
                 .await
@@ -1141,7 +1172,7 @@ impl Server {
         self.0.closed.store(true, Ordering::Release);
         let pools = std::mem::take(&mut *self.0.pools.lock().await)
             .values()
-            .filter_map(Weak::upgrade)
+            .filter_map(|retained| retained.pool.upgrade())
             .collect::<Vec<_>>();
         close_pools_and_owner(&pools, owner.take()).await
     }
@@ -1160,7 +1191,7 @@ impl Server {
         self.0.closed.store(true, Ordering::Release);
         let pools = std::mem::take(&mut *self.0.pools.lock().await)
             .values()
-            .filter_map(Weak::upgrade)
+            .filter_map(|retained| retained.pool.upgrade())
             .collect::<Vec<_>>();
         close_pools_and_owner(&pools, owner.take()).await?;
         Ok(self.take_reap_guard())
@@ -1727,8 +1758,18 @@ fn valid_secret(secret: &str) -> bool {
     secret.len() == 64 && secret.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// One pool's connection progress for its whole life: the latest
+/// authentication phase, the last callback rejection and how many new
+/// connections entered authentication. Retained with the pool.
 #[derive(Clone)]
-struct ConnectionObservation(Arc<StdMutex<ConnectionProgress>>);
+pub(crate) struct ConnectionObservation(Arc<ObservationShared>);
+
+struct ObservationShared {
+    progress: StdMutex<ConnectionProgress>,
+    authenticated: AtomicU64,
+    #[cfg(test)]
+    gate: StdMutex<Option<Arc<GateShared>>>,
+}
 
 struct ConnectionProgress {
     phase: &'static str,
@@ -1737,15 +1778,69 @@ struct ConnectionProgress {
 
 impl ConnectionObservation {
     fn new() -> Self {
-        Self(Arc::new(StdMutex::new(ConnectionProgress {
-            phase: "after_connect not entered",
-            last_failure: None,
-        })))
+        Self(Arc::new(ObservationShared {
+            progress: StdMutex::new(ConnectionProgress {
+                phase: "after_connect not entered",
+                last_failure: None,
+            }),
+            authenticated: AtomicU64::new(0),
+            #[cfg(test)]
+            gate: StdMutex::new(None),
+        }))
     }
 
     fn phase(&self, phase: &'static str) {
-        if let Ok(mut progress) = self.0.lock() {
+        if let Ok(mut progress) = self.0.progress.lock() {
             progress.phase = phase;
+        }
+    }
+
+    /// New connections that entered this pool's authentication callback.
+    #[cfg(test)]
+    pub(crate) fn authenticated(&self) -> u64 {
+        self.0.authenticated.load(Ordering::SeqCst)
+    }
+
+    /// Count a new connection entering authentication. Under an armed test
+    /// gate, the connection then waits until the gate is dropped.
+    async fn authentication_entered(&self) {
+        self.0.authenticated.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        {
+            let gate = self
+                .0
+                .gate
+                .lock()
+                .expect("authentication gate lock")
+                .clone();
+            if let Some(gate) = gate {
+                self.phase(AUTHENTICATION_GATE_PHASE);
+                gate.entered.send_replace(true);
+                let mut released = gate.released.subscribe();
+                let _ = released.wait_for(|released| *released).await;
+            }
+        }
+    }
+
+    /// Hold every later new connection of this pool at the start of its
+    /// authentication until the returned gate is dropped. No time elapses
+    /// inside the gate; tests observe [`AuthenticationGate::entered`].
+    #[cfg(test)]
+    pub(crate) fn gate_new_authentications(&self) -> AuthenticationGate {
+        let shared = Arc::new(GateShared {
+            entered: tokio::sync::watch::Sender::new(false),
+            released: tokio::sync::watch::Sender::new(false),
+        });
+        let previous = self
+            .0
+            .gate
+            .lock()
+            .expect("authentication gate lock")
+            .replace(shared.clone());
+        assert!(previous.is_none(), "authentication gate already armed");
+        AuthenticationGate {
+            shared,
+            observation: self.clone(),
         }
     }
 
@@ -1753,7 +1848,7 @@ impl ConnectionObservation {
         // SQLx discards callback errors while retrying acquisition. Keep only
         // authored messages or static error classes, never SQL payloads or
         // connection options. A later attempt may be in a different phase.
-        let Ok(mut progress) = self.0.lock() else {
+        let Ok(mut progress) = self.0.progress.lock() else {
             return;
         };
         let cause = match error {
@@ -1774,8 +1869,8 @@ impl ConnectionObservation {
         progress.last_failure = Some((progress.phase, cause));
     }
 
-    fn diagnostic(&self) -> String {
-        let Ok(progress) = self.0.lock() else {
+    pub(crate) fn diagnostic(&self) -> String {
+        let Ok(progress) = self.0.progress.lock() else {
             return "connection observation unavailable".into();
         };
         let mut diagnostic = format!("connection phase: {}", progress.phase);
@@ -1788,11 +1883,53 @@ impl ConnectionObservation {
     }
 
     fn is_pre_callback_connection_reset(&self, error: &sqlx::Error) -> bool {
-        let Ok(progress) = self.0.lock() else {
+        let Ok(progress) = self.0.progress.lock() else {
             return false;
         };
         progress.phase == "after_connect not entered"
             && matches!(error, sqlx::Error::Io(error) if error.kind() == std::io::ErrorKind::ConnectionReset)
+    }
+}
+
+/// The phase a gated new connection reports while held.
+#[cfg(test)]
+pub(crate) const AUTHENTICATION_GATE_PHASE: &str = "authentication gate entered";
+
+#[cfg(test)]
+struct GateShared {
+    entered: tokio::sync::watch::Sender<bool>,
+    released: tokio::sync::watch::Sender<bool>,
+}
+
+/// A test hold on one pool's new connections. Dropping it releases every held
+/// connection and disarms the pool.
+#[cfg(test)]
+pub(crate) struct AuthenticationGate {
+    shared: Arc<GateShared>,
+    observation: ConnectionObservation,
+}
+
+#[cfg(test)]
+impl AuthenticationGate {
+    /// Completes once a new connection of the gated pool has entered
+    /// authentication.
+    pub(crate) async fn entered(&self) {
+        let mut entered = self.shared.entered.subscribe();
+        let _ = entered.wait_for(|entered| *entered).await;
+    }
+
+    pub(crate) fn was_entered(&self) -> bool {
+        *self.shared.entered.borrow()
+    }
+}
+
+#[cfg(test)]
+impl Drop for AuthenticationGate {
+    fn drop(&mut self) {
+        if let Ok(mut gate) = self.observation.0.gate.lock() {
+            gate.take();
+        }
+        self.shared.released.send_replace(true);
     }
 }
 
@@ -1867,12 +2004,15 @@ async fn connect_pool_with_timeout(
     read_only: bool,
     max: u32,
     attempt: PoolAttemptOptions,
-) -> Result<MySqlPool> {
+) -> Result<(MySqlPool, ConnectionObservation)> {
     let (result, observation) = connect_pool_attempt(
         identity, endpoint, directory, branch, read_only, max, attempt,
     )
     .await?;
-    result.map_err(|error| connection_error(error, &observation))
+    match result {
+        Ok(pool) => Ok((pool, observation)),
+        Err(error) => Err(connection_error(error, &observation)),
+    }
 }
 
 fn connection_error(error: sqlx::Error, observation: &ConnectionObservation) -> anyhow::Error {
@@ -1936,6 +2076,7 @@ async fn connect_pool_attempt(
             #[cfg(test)]
             let stalled_until = stalled_until.clone();
             Box::pin(async move {
+                observation.authentication_entered().await;
                 #[cfg(test)]
                 if let Some((delay, entered)) = test_probe_delay {
                     observation.phase("initial authentication callback entered");

@@ -53,6 +53,9 @@ mod open_pool_budget_tests;
 #[path = "store/operational_gc_tests.rs"]
 mod operational_gc_tests;
 #[cfg(test)]
+#[path = "store/pool_session_tests.rs"]
+mod pool_session_tests;
+#[cfg(test)]
 #[path = "store/template_stage_tests.rs"]
 pub(crate) mod template_stage_tests;
 #[cfg(test)]
