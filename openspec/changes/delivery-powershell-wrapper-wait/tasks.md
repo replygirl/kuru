@@ -16,19 +16,25 @@ and the new pin test
       bare `Duration::from_secs(15)` or `Duration::from_secs(30)` remains at
       either call site and the comment states what it derives from.
       Done: `WRAPPER_LAUNCH_BUDGET` (180 s). No reusable support helper
-      exists (the package's per-launch budgets are private constants, and
+      exists (the package's per-launch bounds are private constants, and
       importing `support/mise_acceptance.rs` would compile that whole module
-      into this test binary), so the constant lives in this file and adopts
-      the delivery package's existing per-launch fixture budget for mise and
-      stock PowerShell commands: `DEADLINE` in `support/mise_acceptance.rs`
-      and `support/previous_updater.rs`, `TIMEOUT` in `bootstrap_windows.rs`,
-      each 180 s. Its comment names what it covers (mise start and task
-      resolution, the `cmd.exe` inline shell, stock PowerShell start with its
-      module prelude, the wrapper's diagnostic write; the orchestrator shape
-      is a strict subset), the measured failure, and why expiry still yields
-      `bounded_output`'s tree diagnostics (one budget sits far inside the
-      coverage shard's inner deadline, `shard_deadline` = 45 min job limit
-      less the 10 min `EVIDENCE_RESERVE` = 2100 s). Observed in the diff.
+      into this test binary), so the constant lives in this file. Its comment
+      says truthfully what the value is: the package's 180 s convention for
+      mise and PowerShell fixture launches (`DEADLINE` in
+      `support/mise_acceptance.rs` and `support/previous_updater.rs`,
+      `TIMEOUT` in `bootstrap_windows.rs`), coincident uncommented literals
+      that state no derivation of their own; adopting it avoids a fourth,
+      different guess, and the pin keeps them equal so a reasoned change to
+      any of them forces this bound to be revisited. It describes the actual
+      longest shape (mise resolving `verify:published-windows`, the
+      `cmd.exe /d /s /c` inline shell, then `pwsh.exe` PowerShell 7
+      `-NoProfile` running `support/verify-published-windows.ps1`, which has
+      no module prelude and throws on the missing release variables before
+      `Get-Command` or `cargo`; the orchestrator shape is a strict subset),
+      the measured failure, and that a real stall still fails with
+      `bounded_output`'s tree diagnostics at the first expiry in each test.
+      What the value must satisfy is checked by the pin test (2.1). Observed
+      in the diff.
 - [x] 1.2 Replace the `Duration::from_secs(15)` argument to `bounded_output`
       in `cmd_mise_launches_published_windows_task_wrapper_before_cargo`
       with the new bound and verify by reading the diff. Done; its now-unused
@@ -42,7 +48,8 @@ and the new pin test
       diagnostic text changed and verify by reading the diff against the
       pre-change file. Observed: `git diff | grep -E "^[-+].*(Published
       Windows verification requires|MISSING_INPUTS|is not recognized)"`
-      printed nothing.
+      printed nothing for the test bodies; the only new `MISSING_INPUTS`
+      reference is the `WRAPPER_LAUNCHES` count, which reads its length.
 - [x] 1.5 Confirm `bounded_output` and `output_with_limit_and_timeout` in
       `packages/kuru-delivery/src/command.rs` are untouched and verify with
       `git diff`. Observed: `git diff -- packages/kuru-delivery/src` is empty.
@@ -53,17 +60,29 @@ and the new pin test
       wrapper wait regresses to a flat literal, and verify by running it
       locally and by observing it fail under a mutation. Done:
       `wrapper_waits_take_the_package_launch_budget_inside_the_shard_deadline`
-      reads this file's own source (whitespace-normalized) and requires at
-      least two `bounded_output` call sites, every one taking
-      `WRAPPER_LAUNCH_BUDGET`; requires the three sibling package budgets to
-      equal it; and requires it to be strictly below
-      `kuru_delivery::coverage::shard_deadline(0, minutes)` for every
-      `KURU_COVERAGE_JOB_MINUTES` in `.github/workflows/ci.yml` and
-      `native-tests.yml`. Observed locally (darwin): passes. Mutation
-      observed: with one call site temporarily restored to
-      `std::time::Duration::from_secs(15)` it failed with "a wrapper wait no
-      longer takes WRAPPER_LAUNCH_BUDGET, left: 1, right: 2"; the file was
-      then restored. No `#[cfg(windows)]` stalled-child test was added:
+      reads this file's own source (whitespace-normalized) and requires
+      exactly two `bounded_output` call sites, both taking
+      `WRAPPER_LAUNCH_BUDGET`, and exactly two `orchestrator_without_inputs`
+      callers; requires the three sibling package constants to equal the
+      budget; and requires `WRAPPER_LAUNCHES` (2 x `MISSING_INPUTS.len()` + 1
+      = 7, the Windows launch count; Unix makes a subset) serial budgets,
+      7 x 180 = 1260 s, to be strictly below
+      `kuru_delivery::coverage::shard_deadline(0, minutes)` (45 min less the
+      10 min evidence reserve = 2100 s) for every `KURU_COVERAGE_JOB_MINUTES`
+      in `.github/workflows/ci.yml` and `native-tests.yml`. Its comment states
+      that the deadline check is a sanity bound for this binary alone, not a
+      guarantee, because the shard deadline is shared with every other test
+      binary in the partition. Observed locally (darwin): passes. Mutations
+      observed, each restored afterward: one call site restored to
+      `std::time::Duration::from_secs(15)` failed "a wrapper wait no longer
+      takes WRAPPER_LAUNCH_BUDGET, left: 1, right: 2"; the budget set to
+      400 s failed "tests/support/mise_acceptance.rs DEADLINE no longer
+      matches the package launch convention"; a third
+      `orchestrator_without_inputs(task, true)` caller failed "the
+      orchestrator launch callers changed; update WRAPPER_LAUNCHES, left: 3,
+      right: 2"; `WRAPPER_LAUNCHES` set to 12 failed "a 45-minute coverage
+      job leaves 2100 s, within this binary's 12 serial launch budgets
+      (2160 s)". No `#[cfg(windows)]` stalled-child test was added:
       `bounded_output`'s expiry diagnostics are unchanged and already covered
       by its own tests in `command.rs`.
 
@@ -78,9 +97,11 @@ and the new pin test
       pid=5144 mise.exe cpu=328ms; pid=8352 cmd.exe; pid=7108 pwsh.exe
       cpu=671ms working_set=83MB". Inference, not measured: about one CPU
       second in fifteen wall seconds means the wrapper was starved while
-      starting under coverage instrumentation, not hung. Derivation: the
-      bound adopts the package's 180 s per-launch fixture budget (12 times
-      the expired 15 s) and stays under the 2100 s shard window.
+      starting under coverage instrumentation, not hung. Basis of the bound:
+      not a measured derivation; it adopts the package's existing 180 s
+      per-launch convention, and the checked constraint is that this
+      binary's seven serial launch budgets (1260 s) stay under the 2100 s
+      shard window.
 - [x] 3.2 Re-check `docs/development.md` for an existing description of these
       bounds and verify either one sentence is added or none exists. Observed:
       grep for `bounded_output`, `powershell_diagnostics`, `published-windows`,
@@ -88,15 +109,21 @@ and the new pin test
       wrapper line; no docs edit was made.
 - [x] 3.3 Run the cross-platform call site and the pin test locally and name
       the Windows-only tests as unrun, and verify by recorded results.
-      Observed on darwin: `cargo test -p kuru-delivery --all-features --locked
-      --test powershell_diagnostics` 10 passed, including
+      Observed on darwin after the review follow-up: `cargo test -p
+      kuru-delivery --all-features --locked --test powershell_diagnostics`
+      10 passed, including
       `coverage_orchestrator_refuses_missing_inputs_before_any_effect` and the
-      pin test; `mise run //packages/kuru-delivery:test` exit 0;
-      `//packages/kuru-delivery:lint` exit 0; `//packages/kuru-delivery:typecheck`
-      exit 0; `//packages/kuru-delivery:lint:windows` (clippy for
+      pin test; `//packages/kuru-delivery:test` exit 0 (every result line
+      "ok", none failed); `//packages/kuru-delivery:lint` exit 0;
+      `//packages/kuru-delivery:typecheck` exit 0;
+      `//packages/kuru-delivery:lint:windows` (clippy for
       x86_64-pc-windows-msvc, which compiles the two `#[cfg(windows)]` tests)
-      exit 0; `format:check` exit 0. Not run here:
+      exit 0; `//:format:check` exit 0. Not run here:
       `cmd_mise_launches_published_windows_task_wrapper_before_cargo` and
       `cmd_launches_the_exact_coverage_tasks_and_reaches_input_validation`
-      are `#[cfg(windows)]` and this worktree is macOS; their evidence comes
-      from the PR's native Windows coverage partitions.
+      are `#[cfg(windows)]` and this worktree is macOS; their native evidence
+      is recorded in 3.4.
+- [ ] 3.4 Record the native Windows evidence for the two `#[cfg(windows)]`
+      tests from the windows-latest coverage partitions of the PR head that
+      carries the final code, and verify by the `test ... ok` lines in the
+      fetched job logs, not by the job's green check.

@@ -28,16 +28,24 @@ candidate.
   event-driven (it ends when both pipes reach EOF and the process tree exits:
   `capture_until` on Unix, `output_with_limit_and_timeout` on Windows, not a
   blind sleep); only the two call-site numbers are unexplained guesses, so
-  the derivation lives beside the call sites in this test file, not in
+  the reasoning lives beside the call sites in this test file, not in
   `command.rs`. The bound, `WRAPPER_LAUNCH_BUDGET`, adopts the package's
-  existing 180 s per-launch fixture budget for mise and stock PowerShell
-  commands (`DEADLINE` in `support/mise_acceptance.rs` and
-  `support/previous_updater.rs`, `TIMEOUT` in `bootstrap_windows.rs`).
+  existing 180 s per-launch convention for mise and PowerShell fixture
+  launches (`DEADLINE` in `support/mise_acceptance.rs` and
+  `support/previous_updater.rs`, `TIMEOUT` in `bootstrap_windows.rs`). Those
+  are coincident uncommented literals, not a derived budget; the comment says
+  so, and adopting them avoids a fourth, different guess. What the value must
+  satisfy is stated and checked: this binary's launches fit inside the
+  coverage shard's inner test deadline.
 - Add one deterministic test, not `cfg(windows)`-gated, that fails if a
-  wrapper wait takes anything but that bound, if the bound diverges from the
-  package's per-launch budget, or if it no longer expires strictly inside
-  the coverage shard's inner deadline (`coverage::shard_deadline` for each
-  workflow `KURU_COVERAGE_JOB_MINUTES`).
+  wrapper wait takes anything but that bound, if the launch call sites change
+  without updating the modelled launch count (`WRAPPER_LAUNCHES`, seven on
+  Windows), if the bound diverges from the package convention, or if
+  `WRAPPER_LAUNCHES` serial budgets no longer fit strictly inside the
+  coverage shard's inner deadline (`coverage::shard_deadline` for each
+  workflow `KURU_COVERAGE_JOB_MINUTES`). That last check is a sanity bound
+  for this binary alone, not a guarantee: the shard deadline is shared with
+  every other test binary in the partition.
 - No change to `kuru_delivery::command::bounded_output` or
   `output_with_limit_and_timeout` (the "no Unix-side change" non-goal is
   about `command.rs`'s `bounded_unix` implementation specifically), or to

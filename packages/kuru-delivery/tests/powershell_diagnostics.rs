@@ -400,49 +400,73 @@ fn coverage_tasks_run_the_rust_orchestrator_without_shell_metacharacters() {
 /// Bound for one wrapper launch these tests wait on, from spawn to both pipes'
 /// EOF and the process tree's exit; the wait itself ends on that event.
 ///
-/// It covers the longest launch shape here: mise starting and resolving the
-/// task, its `cmd.exe` inline shell, stock PowerShell starting with its module
-/// prelude, and the wrapper's diagnostic write. The orchestrator shape (`cmd.exe`
-/// or nothing, then the delivery binary) is a strict subset, so both call sites
-/// share it. Every launch may run instrumented on a busy coverage runner.
+/// The longest launch shape here is the published-Windows task: mise starting
+/// and resolving `verify:published-windows`, its `cmd.exe /d /s /c` inline
+/// shell, then `pwsh.exe` (PowerShell 7, `-NoProfile`) running
+/// `support/verify-published-windows.ps1`, which has no module prelude and
+/// throws on the missing release variables before it reaches `Get-Command` or
+/// `cargo`. The orchestrator shape (`cmd.exe` or nothing, then the delivery
+/// binary) is a strict subset, so both call sites share one bound. Every launch
+/// may run instrumented on a busy coverage runner.
 ///
-/// It is not a new guess at runner speed: it adopts the delivery package's
-/// existing per-launch fixture budget for mise and stock PowerShell commands,
-/// held by `DEADLINE` in `support/mise_acceptance.rs` and
-/// `support/previous_updater.rs` and by `TIMEOUT` in `bootstrap_windows.rs`.
-/// The pin test below fails if those diverge from this value.
+/// The value is a package convention, not a measured derivation. The delivery
+/// package already bounds each of its mise and PowerShell fixture launches with
+/// the same 180 s literal (`DEADLINE` in `support/mise_acceptance.rs` and
+/// `support/previous_updater.rs`, `TIMEOUT` in `bootstrap_windows.rs`); none of
+/// those states its own derivation either. This adopts that one number instead
+/// of adding a different guess, and the pin test below keeps them equal so that
+/// changing any of them for a stated reason forces this bound to be revisited.
+/// What the value must satisfy is stated and checked there: this binary's
+/// launches fit inside the coverage shard's inner test deadline.
 ///
 /// Measured (main run 37036793207, job 110937162182): the former flat 15 s
 /// expired at 15013 ms with neither pipe at EOF, the tree `mise.exe`
 /// cpu=328ms, `cmd.exe`, `pwsh.exe` cpu=671ms. Inference: about one CPU second
 /// in fifteen wall seconds is a starved start, not a hang.
 ///
-/// A launch that really stalls still fails here with `bounded_output`'s tree
-/// diagnostics, because one budget sits far inside the coverage shard's inner
-/// test deadline (`coverage::shard_deadline`: the job limit less its evidence
-/// reserve), which the pin test also checks against the workflow's limit. Each
-/// test unwraps its first expiry, so a stall costs one budget per test, not one
-/// per loop iteration.
+/// A launch that really stalls still fails with `bounded_output`'s tree
+/// diagnostics when this budget expires; each test unwraps its first expiry.
 const WRAPPER_LAUNCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// Every wrapper launch this binary can make on Windows: each orchestrator task
+/// once directly and once through `cmd.exe`, plus the published-Windows task
+/// (Unix makes only the direct launches, a subset). The pin test requires
+/// exactly these call sites, so a new launch updates this.
+const WRAPPER_LAUNCHES: u64 = 2 * MISSING_INPUTS.len() as u64 + 1;
+
 /// Every wrapper wait in this file takes the stated budget rather than a flat
-/// literal, that budget is the package's per-launch fixture budget, and it
-/// expires inside every coverage shard's inner test deadline.
+/// literal, that budget stays the package's one launch convention, and this
+/// binary's launches fit inside every coverage shard's inner test deadline.
+///
+/// The deadline check is a sanity bound for this binary alone, not a
+/// guarantee: it charges every launch a full budget in series (the worst case
+/// where each nearly expires yet succeeds; a stall ends its test at the first
+/// expiry instead), but the shard deadline is shared with every other test
+/// binary in the partition, which this file cannot see.
 #[test]
 fn wrapper_waits_take_the_package_launch_budget_inside_the_shard_deadline() {
     let package = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     // Split so this test's own needles are not counted as call sites.
     let call = ["bounded_", "output("].concat();
     let budgeted = format!("{call}&mutchild,{},", "WRAPPER_LAUNCH_BUDGET");
+    let orchestrator = ["orchestrator_", "without_inputs(task,"].concat();
     let source: String = include_str!("powershell_diagnostics.rs")
         .split_whitespace()
         .collect();
-    let calls = source.matches(&call).count();
-    assert!(calls >= 2, "expected both wrapper waits, found {calls}");
+    assert_eq!(
+        source.matches(&call).count(),
+        2,
+        "the wrapper waits changed; update WRAPPER_LAUNCHES"
+    );
     assert_eq!(
         source.matches(&budgeted).count(),
-        calls,
+        2,
         "a wrapper wait no longer takes WRAPPER_LAUNCH_BUDGET"
+    );
+    assert_eq!(
+        source.matches(&orchestrator).count(),
+        2,
+        "the orchestrator launch callers changed; update WRAPPER_LAUNCHES"
     );
 
     for (file, name) in [
@@ -466,7 +490,7 @@ fn wrapper_waits_take_the_package_launch_budget_inside_the_shard_deadline() {
         assert_eq!(
             seconds,
             [WRAPPER_LAUNCH_BUDGET.as_secs()],
-            "{file} {name} no longer matches the package launch budget"
+            "{file} {name} no longer matches the package launch convention"
         );
     }
 
@@ -481,11 +505,13 @@ fn wrapper_waits_take_the_package_launch_budget_inside_the_shard_deadline() {
         );
     }
     assert!(!limits.is_empty(), "no coverage job limit found");
+    let serial = WRAPPER_LAUNCHES * WRAPPER_LAUNCH_BUDGET.as_secs();
     for minutes in limits {
         let window = kuru_delivery::coverage::shard_deadline(0, minutes).unwrap();
         assert!(
-            WRAPPER_LAUNCH_BUDGET.as_secs() < window,
-            "a {minutes}-minute coverage job leaves {window} s, within one launch budget"
+            serial < window,
+            "a {minutes}-minute coverage job leaves {window} s, within this binary's \
+             {WRAPPER_LAUNCHES} serial launch budgets ({serial} s)"
         );
     }
 }
