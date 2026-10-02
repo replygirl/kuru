@@ -665,7 +665,14 @@ has failed closes an engine it started, and only where the open then returns
 that failure, the owner marks the record `"failing": true` with a `"reason"`
 taken from the error's text, cut at a character boundary to stay within the
 record limit; the starter token's spellings, the tag and the store's connection
-secrets are replaced in it. The publisher writes a stage change or the failing
+secrets are replaced in it. An owner whose store opened but which ends before
+its starter attached, because its listener, endpoint publication or serve loop
+failed, marks the record the same way (with the endpoint's connection secret
+replaced too) while it holds verified owner authority, before its store closes.
+It awaits that one write, as retirement already awaits the publisher, then
+closes the store and retires the record; without verified authority, or when
+the write fails, it retires the record before the store closes. Otherwise that
+starter would see only the retirement and lose the reason. The publisher writes a stage change or the failing
 mark at once and coalesces progress-only changes to at most one write every
 250 ms, always writing the latest. The starting client reads only a record
 carrying the value for the token it passed, once per readiness poll after that
@@ -677,8 +684,9 @@ starter's readiness wait, the record grants no authority: election,
 attachment, recovery and retirement never read it, and a failed write never
 fails or delays the open. The owner always replaces it by publishing a complete
 staged record over its name, and retires it (rename, then remove) inside its
-close, after the endpoint is retired and before the store closes, and on every
-error return of its open. Two hooks, read only by
+close, after the endpoint is retired and before the store closes (after it,
+when it marked the record failing as above), and on every error return of its
+open. Two hooks, read only by
 the owner process under `test`/`test-support` (Windows owners receive them by
 explicit forwarding), let tests follow events instead of sleeping:
 `KURU_TEST_MEMORY_ACTIVITY_WRITE_FAILURE=1` makes every record write fail, and
@@ -706,7 +714,13 @@ the test needs exact windows. Inside the crate, `cfg(test)` seams on the
 publisher's `Writes` (a write gate, a write log and a mode that logs without
 I/O, since a paused clock cannot be trusted across `spawn_blocking`) check its
 write spacing, and `store::failed_open_close` pauses one test's own open
-between its failing mark and its engine's close.
+between its failing mark and its engine's close. `ClosePoint::BeforeStoreClose`
+pauses an owner just before its store closes, after its record's mark or
+retirement, through its serve knobs or, for a failed endpoint publication,
+`OwnerHooks::close_pause`; `ServeKnobs::accept_fault` makes the serve loop's
+accept fail. The command-line `Sandbox` passes each command a private
+`KURU_TEST_MEMORY_OWNER_DIAGNOSTIC` file and adds the stderr of any owner those
+commands elected to its failure messages.
 
 With `KURU_OPEN_MARKERS=1` (exactly `1`; unset or any other value changes
 nothing) the command line writes open-time marker lines to standard error for

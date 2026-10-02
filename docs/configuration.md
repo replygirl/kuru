@@ -710,9 +710,10 @@ since its last progress:
 - `memory service exited before readiness` at once when the service exited,
   with its exit status.
 - `memory service ended its open before readiness` at once when the service
-  ended its open without serving the command.
+  ended its open without serving the command and without recording why.
 - `memory service open failed before readiness` at once when the service
-  reported that its open failed, followed by the reason it recorded.
+  reported that its open, or its startup after opening the database, failed,
+  followed by the reason it recorded.
 
 Waiting to become the project's only starter, a command that starts while the
 previous memory service is still shutting down, and an inspection command
