@@ -52,4 +52,6 @@ Measured (macOS arm64, head `1d26e184`, runs sequential):
 - Gated second run, free space sampled every 30 s (minimum 7.7 GiB): exit 0; lib 647 passed, 0 failed, 6 ignored (892.86 s); integration 10/5/12/1 passed; task 932.18 s. Ok in both the ungated and this run: `the_record_has_the_specified_fields_and_names` (31 names), `the_stream_is_create_only_private_and_removed`, `a_gated_owner_writes_one_complete_record`, `an_ungated_owner_writes_no_record`, `owner_timeline_clause_text_is_stable`, `readiness_deadline_names_the_owner_event_it_was_held_at`, `gated_opens_of_sealed_aged_stores_count_the_planned_rows`.
 - `format:check` 0, `docs:check` 0, `lint` 0, `lint:windows` 0, `typecheck` 0, `//packages/kuru-delivery:test` 0 (`release_workflow` 35 passed).
 
-Still not run: `//apps/kuru-tui:test` on the rebased head (its pre-rebase pass at `318b3226` is recorded above; the rebase brought in #166 memory changes it exercises, so that pass is not evidence for this head), any Linux or Windows leg, the PR's first-attempt CI (5.1, 5.2 remain deferred).
+- `//apps/kuru-tui:test` with `KURU_OPEN_TIMELINE=1` exported at `6de27eac` (tree of `1d26e184` plus this ledger): exit 0, 275 passed, 0 failed, task 417.47 s. Its ungated run was not repeated on the rebased head.
+
+Still not run: any Linux or Windows leg, the PR's first-attempt CI (5.1, 5.2 remain deferred).
