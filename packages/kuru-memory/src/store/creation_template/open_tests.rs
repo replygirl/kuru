@@ -343,6 +343,13 @@ async fn warm_fixture_cache(
 /// template with two engine starts instead of building it. The warm-up's
 /// build is the template root's only engine start, a second warm-up and the
 /// open leave its receipt valid, and the store records this build's key.
+///
+/// The start counts alone do not prove the open copied the warm-up's
+/// template rather than building one: had the warm-up left no template and
+/// the open built it, the template root would still show one build start.
+/// That pin is carried by the receipt: `snapshot` fails unless the warm-up
+/// itself published this build's template, and `verify_used` fails if the
+/// open then built, republished, quarantined or re-keyed anything there.
 #[tokio::test]
 async fn fixture_cache_warm_up_lets_a_fresh_open_copy_with_two_starts() -> Result<()> {
     let fixture = fixture()?;

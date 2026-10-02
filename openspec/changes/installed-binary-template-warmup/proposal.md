@@ -49,7 +49,7 @@ binary warms the shared test cache for ordinary unit tests.
 Test-only. Touches `packages/kuru-memory` (test-support additions, two new
 unit tests), `packages/kuru-delivery` (test-support harness only), and
 `apps/kuru-tui` (test target: new stderr assertions, new measurement
-`println!`). No product, spec, CLI, config or workflow surface changes. No
+`eprintln!`). No product, spec, CLI, config or workflow surface changes. No
 change to `startup_timeout_secs` or any deadline. Expected to eliminate the
 native-mise-fixture member of this flake family on Windows coverage
 partitions (the installed binary's own first-launch path on a cold user

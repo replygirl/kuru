@@ -667,6 +667,10 @@ impl Installation {
                 )
             })?;
         let launch = started.elapsed().as_millis();
+        // Best-effort diagnostics: the marker lines appear only if the pinned
+        // mise forwards `MARKERS_ENV` to the installed binary, which was seen
+        // on macOS but not observed on Windows, and a passing coverage run
+        // captures this output. No assertion depends on them.
         let markers: Vec<&str> = stderr
             .lines()
             .filter(|line| line.starts_with(MARKER_PREFIX))
