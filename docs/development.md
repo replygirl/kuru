@@ -718,9 +718,23 @@ between its failing mark and its engine's close. `ClosePoint::BeforeStoreClose`
 pauses an owner just before its store closes, after its record's mark or
 retirement, through its serve knobs or, for a failed endpoint publication,
 `OwnerHooks::close_pause`; `ServeKnobs::accept_fault` makes the serve loop's
-accept fail. The command-line `Sandbox` passes each command a private
-`KURU_TEST_MEMORY_OWNER_DIAGNOSTIC` file and adds the stderr of any owner those
-commands elected to its failure messages.
+accept fail. The application tests' shared `ServiceCleanup` fixture creates a
+private `KURU_TEST_MEMORY_OWNER_DIAGNOSTIC` file in its root, and the
+command-line children of the `cli`, `lease`, `preferences`, `terminal`,
+`trust`, `unix_shell_turn` and `windows_terminal` binaries and of `server`'s
+Unix leg receive it. When the fixture drops, it writes any stderr those owners
+left to the test's captured output, which the harness shows only for a failing
+test, whether it panicked or returned its error; `ServiceCleanup::release`
+attaches the same text to a failed outcome. Both read the file after cleanup
+has awaited the owners it can find. With the `test-support` feature an owner
+whose open fails writes `memory service owner open failed: <error>` to its
+stderr before it retires its activity record, so the file already holds the
+reason when the starter sees the record gone; the process's own final error
+report follows only after its owner lock is released. A starter run with
+`KURU_TEST_MEMORY_STARTUP_STAGES=1` sends its owner's stderr to a private file
+and, when its start fails, appends that file (at most 1 MiB) to the owner
+diagnostic. Owners that the test process elects itself, through an in-process
+open, are not covered: the test runner's own environment is never changed.
 
 With `KURU_OPEN_MARKERS=1` (exactly `1`; unset or any other value changes
 nothing) the command line writes open-time marker lines to standard error for
