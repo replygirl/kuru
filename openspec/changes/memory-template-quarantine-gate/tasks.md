@@ -152,11 +152,12 @@
       `service.rs` fixtures ~3086/~3253). `child_creation` must not wait in
       any of them — verify by running the full `kuru-memory` test task and
       seeing no test reach its deadline.
-      Observed: the full-task run recorded under 5.1 finished every lib
-      test (596 passed, 0 failed, 850 s wall, `RUST_TEST_THREADS=2`), and
-      the log contains no "deadline exceeded", no panic and no test that
-      ran to a timeout; each real-store open nested a `child_creation`
-      under its fixture's outer `spawning()` guard without waiting.
+      Observed: no test reached its deadline in any of the three full-task
+      runs recorded under 5.1 (`RUST_TEST_THREADS=2`). Their logs show no
+      "deadline exceeded" and no hang, and the only panic is the
+      template-fingerprint assertion discussed in 5.1. Every real-store
+      open nested a `child_creation` under its fixture's outer `spawning()`
+      guard without waiting.
 
 ## 4. Audit every child-creation site and extend the scan
 
@@ -223,41 +224,51 @@
       task, `RUST_TEST_THREADS=2`) and record each binary's summary line.
       This run cannot reproduce the cross-test race on demand; it shows no
       regression and no deadlock, not that the race is absent.
-      Observed (macOS host, this worktree, task exit 0), in binary order:
-      - unittests `src/lib.rs`: ok, 596 passed, 0 failed, 6 ignored, 850.18 s
-      - unittests `src/main.rs`: ok, 0 tests
-      - unittests `tests/fixtures/parent.rs`: ok, 0 tests
-      - `tests/bundle_build.rs`: ok, 10 passed, 0.06 s
-      - `tests/memory.rs`: ok, 5 passed, 3.55 s
-      - `tests/server_lifecycle.rs`: ok, 12 passed, 28.96 s
-      - `tests/supervisor_snapshot.rs`: ok, 1 passed, 2.58 s
-      - `tests/windows_lifecycle.rs`: ok, 0 tests on this host
-      Note: a second full run of this package, started by another session
-      on the same machine shortly before this one, reported
-      `test_support::template::tests::concurrent_processes_create_one_template`
-      FAILED at the `["Created", "Reused"]` assertion (`template.rs:1032`;
-      595 passed, 1 failed). Only its filtered summary lines were
-      captured, not the assertion's diagnostics. The test passed in this
-      run and in five further isolated runs (`cargo test … --lib
-      concurrent_processes_create_one_template`, 5/5). Inferred, not
-      measured: this session's `mise run //packages/kuru-memory:test`
-      rebuilt the lib test binary at the same `target/debug/deps` path
-      while the other run was executing it. The template fingerprint
-      includes a compiled-in digest of `SOURCES`, which lists `server.rs`,
-      and this change edits `server.rs`, so the rebuilt binary carries a
-      different digest. That test's child re-executes `current_exe()`:
-      the running parent kept its old digest (memoised per process) while
-      the child, now the new binary, computed the new one, giving two
-      "Created" outcomes. The prepared supervisor snapshot, also a
-      fingerprint input, may have been replaced the same way. This is the
-      concurrent-Cargo hazard AGENTS.md names, triggered by two runs in
-      one target directory; it is not a defect in the gate. Not re-run
-      concurrently to confirm.
-      The 596-test run compiled before two later edits: the rustfmt wraps
-      and the `#[cfg(unix)]` on `Exclusive::gate` recorded under 5.2. Both
-      are behaviour-neutral on Unix (whitespace; an attribute on a field
-      that is always present there); `spawn_gate` (8/8), lint, Windows
-      lint, typecheck and format were re-run on the final bytes.
+      Observed (macOS host, this worktree). Two sessions ran the full task
+      in this worktree at overlapping times (an implementer instance and a
+      duplicate of it), so there are three runs:
+      - Run A (implementer, started ~02:37, task exit 101): unittests
+        `src/lib.rs` FAILED, 595 passed, 1 failed, 6 ignored, 900.60 s.
+        The failure was
+        `test_support::template::tests::concurrent_processes_create_one_template`
+        at `template.rs:1032`:
+        `left: ["Created", "Created"]`, `right: ["Created", "Reused"]`,
+        child test ok, child stderr empty. The other binaries were ok:
+        bundle_build 10, memory 5, server_lifecycle 12,
+        supervisor_snapshot 1, and main/parent/windows_lifecycle 0 tests.
+      - Run B (duplicate instance, overlapping run A): unittests
+        `src/lib.rs` ok, 596 passed, 0 failed, 6 ignored, 850.18 s. Other
+        binaries ok: bundle_build 10 (0.06 s), memory 5 (3.55 s),
+        server_lifecycle 12 (28.96 s), supervisor_snapshot 1 (2.58 s).
+      - Run C (implementer, started ~02:59 on the final bytes, after the
+        rustfmt wraps and the `#[cfg(unix)]` field fix, task exit 0):
+        unittests `src/lib.rs` ok, 596 passed, 0 failed, 6 ignored,
+        774.67 s. Other binaries ok: bundle_build 10, memory 5,
+        server_lifecycle 12 (23.88 s), supervisor_snapshot 1, and
+        main/parent/windows_lifecycle 0 tests.
+      `test_support::template::tests` also passed 3/3 when run in
+      isolation (run by the implementer), and
+      `concurrent_processes_create_one_template` passed 5/5 when run alone
+      (run by the duplicate). That shows the failure is intermittent; it
+      does not establish a cause.
+      Run A's failure, from the code: the gate cannot produce two
+      `Created` outcomes. `Created` needs `NotFound` under the
+      cross-process exclusive key flock, and the gate is in-process and
+      only delays (full argument in
+      `tmp/roadmap/store-creation-design/diag-quarantine-structure.md`,
+      "Separate finding"). Two inferences remain, both unverified. (1) The
+      duplicate's build replaced the lib test binary or the prepared
+      supervisor snapshot during run A, so the child (`current_exe()`) and
+      the parent computed different template fingerprints. This holds only
+      if a fingerprint input changed between the two builds. The compiled
+      `SOURCES` (`store.rs`, `store/migrations.rs`, `store/usage_ledger.rs`,
+      `server.rs`, `test_support/template.rs`) did not change in that
+      window (only `spawn_gate.rs` did), so it would need the supervisor
+      snapshot hash to differ. (2) A pre-existing intermittent defect in
+      the template's cross-process exclusion. Left unchanged here and
+      reported for separate routing.
+      Run C ran on the final source bytes. `spawn_gate` (8/8), lint, Windows
+      lint, typecheck and format were also re-run on them.
 - [x] 5.2 Run `mise run format:check`, `//packages/kuru-memory:lint`,
       `//packages/kuru-memory:lint:windows`, and
       `//packages/kuru-memory:typecheck`, confirm each passes, and name any
