@@ -165,7 +165,10 @@ description = "Open-time measurement of a release kuru executable from outside t
 # KURU_OPEN_TIME_BUDGET_NEW_PROJECT_MS and
 # KURU_OPEN_TIME_BUDGET_COLD_EXISTING_MS (budgets for the median open to
 # ready). Counts are checked first, the medians only once every count holds;
-# any violation exits non-zero after the records and summary are written.
+# any violation exits non-zero after the records and summary are written. A
+# median budget miss with every count held measures one more full series
+# (records in retry/records.jsonl), which decides; a count violation or
+# failed open in either series fails without another.
 # The gate applies to the main series only (files and retirement wait on);
 # without the gate variables the task is report only and only an
 # infrastructure failure exits non-zero. ci.yml's open-time job sets them;

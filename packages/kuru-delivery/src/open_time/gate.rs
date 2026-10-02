@@ -13,6 +13,12 @@
 //!
 //! A pure function of the records, so it is tested on recorded runs without a
 //! process.
+//!
+//! Runner noise can move a median; it cannot change an engine start count.
+//! So a first series that holds every structural check but misses a median
+//! budget is measured once more, in full, and the gate fails only if that
+//! second series misses too ([`Decision`]). A structural violation in either
+//! series fails at once, and there is never a third series.
 
 use std::{collections::BTreeMap, fmt::Write as _};
 
@@ -332,6 +338,16 @@ impl Verdict {
         self.violations.is_empty()
     }
 
+    /// Every structural check held and only a median budget was missed: the
+    /// one failure a second series may overturn.
+    pub fn missed_only_a_median(&self) -> bool {
+        !self.violations.is_empty()
+            && self
+                .violations
+                .iter()
+                .all(|violation| matches!(violation, Violation::Median { .. }))
+    }
+
     /// One line per violation.
     pub fn describe(&self, gate: &Gate) -> String {
         self.violations
@@ -339,6 +355,112 @@ impl Verdict {
             .map(|violation| violation.describe(gate))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+}
+
+/// The gate's decision over at most two evaluated series of the main series.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// The first series passed every check.
+    Passed,
+    /// The first series failed a run, readiness or engine start check; no
+    /// second series is measured.
+    Failed,
+    /// The first series held every structural check but missed a median
+    /// budget: measure one more full series and decide on it.
+    Remeasure,
+    /// The first series missed a median budget and the second passed every
+    /// check.
+    PassedOnSecond,
+    /// The first series missed a median budget and the second failed a check
+    /// of any kind.
+    FailedOnSecond,
+}
+
+impl Decision {
+    /// Decide from the first series' verdict and, once measured, the
+    /// second's. A second verdict is read only when the first missed a median
+    /// budget and nothing else; otherwise the first series decides and a
+    /// second verdict is ignored.
+    pub fn decide(first: &Verdict, second: Option<&Verdict>) -> Self {
+        if first.passed() {
+            return Self::Passed;
+        }
+        if !first.missed_only_a_median() {
+            return Self::Failed;
+        }
+        match second {
+            None => Self::Remeasure,
+            Some(second) if second.passed() => Self::PassedOnSecond,
+            Some(_) => Self::FailedOnSecond,
+        }
+    }
+
+    pub fn passed(self) -> bool {
+        matches!(self, Self::Passed | Self::PassedOnSecond)
+    }
+
+    /// The series that decided: 1 or 2; `None` while a second is owed.
+    pub fn series(self) -> Option<usize> {
+        match self {
+            Self::Passed | Self::Failed => Some(1),
+            Self::PassedOnSecond | Self::FailedOnSecond => Some(2),
+            Self::Remeasure => None,
+        }
+    }
+
+    /// The summary line stating the result and which series decided it.
+    pub fn render(self) -> String {
+        let line = match self {
+            Self::Passed => "passed, decided by the first series: every check held.",
+            Self::Failed => {
+                "failed, decided by the first series: a run, readiness or engine start \
+                 check failed, so no second series was measured (only a median budget miss \
+                 is measured again)."
+            }
+            Self::Remeasure => {
+                "a second series decides: the first series held every run, readiness and \
+                 engine start check but missed a median budget, so one more full series was \
+                 measured, and the gate fails only if that series misses too."
+            }
+            Self::PassedOnSecond => {
+                "passed, decided by the second series: the first series missed a median \
+                 budget, and the second series passed every check."
+            }
+            Self::FailedOnSecond => {
+                "failed, decided by the second series: the first series missed a median \
+                 budget, and the second series failed too."
+            }
+        };
+        format!("\n**Open-time gate decision: {line}**\n")
+    }
+}
+
+/// The gate's result over the series it measured.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Judgement {
+    pub first: Verdict,
+    /// Present only when the first series missed only a median budget.
+    pub second: Option<Verdict>,
+    pub decision: Decision,
+}
+
+impl Judgement {
+    pub fn passed(&self) -> bool {
+        self.decision.passed()
+    }
+
+    /// The violations behind the decision, labelled by series when a second
+    /// series was measured.
+    pub fn describe(&self, gate: &Gate) -> String {
+        match &self.second {
+            None => self.first.describe(gate),
+            Some(second) => format!(
+                "second series (decides):\n{}\nfirst series:\n{}",
+                second.describe(gate),
+                self.first.describe(gate)
+            ),
+        }
     }
 }
 
@@ -453,9 +575,15 @@ pub fn evaluate(runs: &[Run], gate: &Gate) -> Verdict {
 
 /// The gate's section of the summary.
 pub fn render(verdict: &Verdict, gate: &Gate) -> String {
+    render_titled(verdict, gate, "Open-time gate")
+}
+
+/// The gate's section of the summary under its own title, such as
+/// "Open-time gate, first series".
+pub fn render_titled(verdict: &Verdict, gate: &Gate, title: &str) -> String {
     let mut text = String::new();
     let result = if verdict.passed() { "passed" } else { "failed" };
-    let _ = writeln!(text, "\n## Open-time gate: {result}\n");
+    let _ = writeln!(text, "\n## {title}: {result}\n");
     let _ = writeln!(
         text,
         "Checked in order: every case has runs, every run opened, and each run's engine \

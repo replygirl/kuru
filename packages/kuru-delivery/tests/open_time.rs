@@ -450,6 +450,12 @@ async fn the_gate_passes_and_fails_the_command_after_writing_every_record() {
     let summary = fs::read_to_string(root.path().join("output/summary.md")).unwrap();
     assert!(summary.contains("(gate)"), "{summary}");
     assert!(summary.contains("## Open-time gate: passed"), "{summary}");
+    assert!(
+        summary.contains("Open-time gate decision: passed, decided by the first series"),
+        "{summary}"
+    );
+    // A pass measures no second series.
+    assert!(!root.path().join("output/retry").exists());
 
     let root = tempfile::tempdir().unwrap();
     let failed = command(root.path(), &fixture_gate("3")).await;
@@ -465,6 +471,96 @@ async fn the_gate_passes_and_fails_the_command_after_writing_every_record() {
     let summary = fs::read_to_string(root.path().join("output/summary.md")).unwrap();
     assert!(summary.contains("## Open-time gate: failed"), "{summary}");
     assert!(summary.contains("Medians not checked"), "{summary}");
+    // A count violation fails at once: no second series.
+    assert!(!root.path().join("output/retry").exists());
+    assert!(!summary.contains("second series (gate)"), "{summary}");
+    assert!(
+        summary.contains("Open-time gate decision: failed, decided by the first series"),
+        "{summary}"
+    );
+}
+
+fn records_in(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// Matching counts with a 0 ms budget: the first series misses only a median
+/// budget, so one more full series is measured beside it, misses too and
+/// decides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_median_miss_measures_one_more_series_which_decides() {
+    let root = tempfile::tempdir().unwrap();
+    let mut gate = fixture_gate("0");
+    for (name, value) in &mut gate {
+        if name.starts_with("KURU_OPEN_TIME_BUDGET_") {
+            *value = "0";
+        }
+    }
+    let failed = command(root.path(), &gate).await;
+    let (stdout, stderr) = (text(&failed.stdout), text(&failed.stderr));
+    assert!(!failed.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("Recorded 8 runs in 2 series"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("open-time gate failed, decided by the second series"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("second series (decides):"), "{stderr}");
+    assert!(stderr.contains("over the 0 ms budget"), "{stderr}");
+
+    // Each series' records in its own file, every case once per series.
+    let output = root.path().join("output");
+    for path in [
+        output.join("records.jsonl"),
+        output.join("retry/records.jsonl"),
+    ] {
+        let records = records_in(&path);
+        let cases: Vec<&str> = records
+            .iter()
+            .map(|record| record["case"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            cases,
+            [
+                "first-launch",
+                "cold-existing",
+                "warm-reopen",
+                "new-project"
+            ],
+            "{}",
+            path.display()
+        );
+    }
+
+    // Both series and the decision in the one summary, in order.
+    let summary = fs::read_to_string(output.join("summary.md")).unwrap();
+    let order = [
+        "## Kuru open time: fixture, first series (gate)",
+        "## Open-time gate, first series: failed",
+        "Open-time gate decision: a second series decides",
+        "## Kuru open time: fixture, second series (gate)",
+        "## Open-time gate, second series: failed",
+        "Open-time gate decision: failed, decided by the second series",
+    ];
+    let mut from = 0;
+    for heading in order {
+        let at = summary[from..]
+            .find(heading)
+            .unwrap_or_else(|| panic!("{heading} missing after byte {from}:\n{summary}"));
+        from += at + heading.len();
+    }
+    assert!(!summary.contains("## Open-time gate: "), "{summary}");
+    // The scratch roots are removed after a completed measurement.
+    assert_eq!(
+        fs::read_dir(root.path().join("scratch")).unwrap().count(),
+        0
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

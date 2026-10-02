@@ -105,7 +105,9 @@ enum Command {
     /// Report only unless every gate variable is set; then exact engine
     /// starts per case and the new-project and cold-existing median budgets
     /// are checked, and a violation exits non-zero after the records are
-    /// written.
+    /// written. A median budget miss alone measures one more full series
+    /// (records in `<output>/retry/`), which decides; a count violation in
+    /// either series fails at once.
     OpenTime {
         #[arg(long, env = "KURU_OPEN_TIME_BINARY")]
         binary: PathBuf,
@@ -513,17 +515,21 @@ async fn main() -> Result<()> {
             let report = open_time::run(&options).await?;
             println!("{}", report.summary);
             println!(
-                "Recorded {} runs ({} failed to open, {} failed after opening).",
-                report.records, report.failed_opens, report.failed_after_open
+                "Recorded {} runs in {} series ({} failed to open, {} failed after opening).",
+                report.records, report.series, report.failed_opens, report.failed_after_open
             );
             match (&options.gate, &report.gate) {
-                (Some(gate), Some(verdict)) => {
+                (Some(gate), Some(judgement)) => {
+                    let decided = match judgement.decision.series() {
+                        Some(2) => "the second series",
+                        _ => "the first series",
+                    };
                     ensure!(
-                        verdict.passed(),
-                        "open-time gate failed:\n{}",
-                        verdict.describe(gate)
+                        judgement.passed(),
+                        "open-time gate failed, decided by {decided}:\n{}",
+                        judgement.describe(gate)
                     );
-                    println!("Open-time gate passed.");
+                    println!("Open-time gate passed. Decided by {decided}.");
                 }
                 (Some(_), None) => bail!("the open-time gate was not evaluated"),
                 (None, _) => println!("Report only: no gate variable is set."),

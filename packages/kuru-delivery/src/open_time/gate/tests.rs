@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use super::{Gate, Median, Run, Settings, Violation, evaluate, render};
+use super::{Gate, Median, Run, Settings, Violation, evaluate, render, render_titled};
 use crate::open_time::{
     Case,
     report::{Counts, OwnerPath, stats},
@@ -509,4 +509,199 @@ fn the_gate_is_configured_completely_or_not_at_all() {
         settings.gate().unwrap().unwrap().warm_reopen_starts,
         BTreeMap::from([(OwnerPath::NoOwnerObserved, 0)])
     );
+}
+
+/// Runner noise moves medians, not engine start counts, so only a first
+/// series that misses nothing but a median budget is measured again, once.
+mod decision {
+    use super::*;
+    use crate::open_time::gate::{Decision, Judgement, Verdict};
+
+    /// A series' verdict under the CI gate.
+    fn verdict(runs: &[Run]) -> Verdict {
+        evaluate(runs, &ci_gate())
+    }
+
+    fn passing() -> Verdict {
+        verdict(&recorded(RUN_A))
+    }
+
+    /// New-project runs 200 ms slower: every structural check holds, one
+    /// median budget is missed.
+    fn median_miss(text: &str) -> Verdict {
+        let mut runs = recorded(text);
+        for run in runs.iter_mut().filter(|run| run.case == Case::NewProject) {
+            run.ready_ms = run.ready_ms.map(|ready| ready + 200.0);
+        }
+        let verdict = verdict(&runs);
+        assert!(verdict.missed_only_a_median(), "{verdict:?}");
+        verdict
+    }
+
+    /// One new-project run starts the pre-template 4 engines, and every
+    /// new-project run is far over its budget too.
+    fn count_violation(text: &str) -> Verdict {
+        let mut runs = recorded(text);
+        run_mut(&mut runs, Case::NewProject, 3).engine_starts = 4;
+        for run in runs.iter_mut().filter(|run| run.case == Case::NewProject) {
+            run.ready_ms = Some(5_000.0);
+        }
+        let verdict = verdict(&runs);
+        assert!(!verdict.passed() && !verdict.missed_only_a_median());
+        verdict
+    }
+
+    fn failed_open(text: &str) -> Verdict {
+        let mut runs = recorded(text);
+        run_mut(&mut runs, Case::ColdExisting, 2).ready_ms = None;
+        let verdict = verdict(&runs);
+        assert!(!verdict.passed() && !verdict.missed_only_a_median());
+        verdict
+    }
+
+    #[test]
+    fn a_passing_first_series_decides_and_requests_no_second() {
+        let decision = Decision::decide(&passing(), None);
+        assert_eq!(decision, Decision::Passed);
+        assert!(decision.passed());
+        assert_eq!(decision.series(), Some(1));
+        // A second verdict cannot change a decided first series.
+        let second = median_miss(RUN_B);
+        assert_eq!(
+            Decision::decide(&passing(), Some(&second)),
+            Decision::Passed
+        );
+        assert!(
+            decision
+                .render()
+                .contains("passed, decided by the first series")
+        );
+    }
+
+    #[test]
+    fn a_count_violation_or_failed_open_in_the_first_series_fails_without_a_second() {
+        for first in [count_violation(RUN_A), failed_open(RUN_A)] {
+            let decision = Decision::decide(&first, None);
+            assert_eq!(decision, Decision::Failed, "{first:?}");
+            assert!(!decision.passed());
+            assert_eq!(decision.series(), Some(1));
+            // Even a passing second series is never consulted.
+            assert_eq!(Decision::decide(&first, Some(&passing())), Decision::Failed);
+            assert!(
+                decision
+                    .render()
+                    .contains("failed, decided by the first series"),
+                "{}",
+                decision.render()
+            );
+        }
+        // Both medians over budget is still only a median miss.
+        let mut runs = recorded(RUN_A);
+        for run in runs
+            .iter_mut()
+            .filter(|run| matches!(run.case, Case::NewProject | Case::ColdExisting))
+        {
+            run.ready_ms = run.ready_ms.map(|ready| ready + 400.0);
+        }
+        assert_eq!(Decision::decide(&verdict(&runs), None), Decision::Remeasure);
+    }
+
+    #[test]
+    fn a_median_miss_requests_a_second_series_which_passes_the_gate() {
+        let first = median_miss(RUN_A);
+        let decision = Decision::decide(&first, None);
+        assert_eq!(decision, Decision::Remeasure);
+        assert!(!decision.passed());
+        assert_eq!(decision.series(), None);
+        assert!(
+            decision
+                .render()
+                .contains("a second series decides: the first series held every run")
+        );
+
+        let second = passing();
+        let decision = Decision::decide(&first, Some(&second));
+        assert_eq!(decision, Decision::PassedOnSecond);
+        assert!(decision.passed());
+        assert_eq!(decision.series(), Some(2));
+        assert!(
+            decision
+                .render()
+                .contains("passed, decided by the second series")
+        );
+    }
+
+    #[test]
+    fn a_second_median_miss_fails_the_gate() {
+        let first = median_miss(RUN_A);
+        let decision = Decision::decide(&first, Some(&median_miss(RUN_B)));
+        assert_eq!(decision, Decision::FailedOnSecond);
+        assert!(!decision.passed());
+        assert_eq!(decision.series(), Some(2));
+        assert!(
+            decision
+                .render()
+                .contains("failed, decided by the second series")
+        );
+    }
+
+    #[test]
+    fn a_count_violation_or_failed_open_in_the_second_series_fails_the_gate() {
+        let first = median_miss(RUN_A);
+        for second in [count_violation(RUN_B), failed_open(RUN_B)] {
+            let decision = Decision::decide(&first, Some(&second));
+            assert_eq!(decision, Decision::FailedOnSecond, "{second:?}");
+            assert!(!decision.passed());
+        }
+    }
+
+    #[test]
+    fn a_failed_judgement_names_the_deciding_series_and_both_series_violations() {
+        let first = median_miss(RUN_A);
+        let second = count_violation(RUN_B);
+        let judgement = Judgement {
+            decision: Decision::decide(&first, Some(&second)),
+            first,
+            second: Some(second),
+        };
+        assert!(!judgement.passed());
+        let text = judgement.describe(&ci_gate());
+        let (second, first) = text
+            .split_once("\nfirst series:\n")
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            second.starts_with("second series (decides):\n")
+                && second.contains("new-project: 4 engine starts, expected 2, in iteration 3"),
+            "{text}"
+        );
+        // Run A's new-project median 729.75 ms, plus 200.
+        assert!(
+            first.contains("new-project: median open to ready 929.8 ms is over the 890 ms budget"),
+            "{text}"
+        );
+
+        let judgement = Judgement {
+            decision: Decision::decide(&failed_open(RUN_A), None),
+            first: failed_open(RUN_A),
+            second: None,
+        };
+        assert_eq!(
+            judgement.describe(&ci_gate()),
+            "cold-existing: no readiness signal (a failed open), in iteration 2"
+        );
+    }
+
+    #[test]
+    fn a_series_section_carries_its_own_title() {
+        let text = render_titled(
+            &median_miss(RUN_A),
+            &ci_gate(),
+            "Open-time gate, first series",
+        );
+        assert!(
+            text.contains("## Open-time gate, first series: failed"),
+            "{text}"
+        );
+        assert!(!text.contains("## Open-time gate: "), "{text}");
+    }
 }

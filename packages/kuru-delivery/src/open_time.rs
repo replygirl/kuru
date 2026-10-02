@@ -27,7 +27,9 @@
 //! gate, the completed main series is also checked against exact engine
 //! starts per case and the `new-project` and `cold-existing` median budgets
 //! ([`gate`]); the verdict is appended to the summary and returned, and the
-//! command exits non-zero on a violation after every record is written.
+//! command exits non-zero on a violation after every record is written. A
+//! first series that misses only a median budget is followed by one more
+//! full series, which decides ([`gate::Decision`]).
 //!
 //! Two modes serve local comparisons and are never gated: with file
 //! observation off (the control) the observer lists processes only, and with
@@ -63,6 +65,8 @@ use report::{Counts, OwnerPath, Stages};
 pub const SCHEMA: &str = "kuru.open-time.v3";
 const RECORDS: &str = "records.jsonl";
 const SUMMARY: &str = "summary.md";
+/// Holds the gate's second series' `records.jsonl`, beside the first's.
+const RETRY: &str = "retry";
 /// The owner idles 30 s after its last client (kuru-memory
 /// `SERVICE_IDLE_TIMEOUT`), then closes its engine and supervisor.
 const RETIRE_BOUND: Duration = Duration::from_secs(120);
@@ -291,7 +295,10 @@ impl Record {
 /// What a completed series produced.
 #[derive(Debug)]
 pub struct Report {
+    /// Runs recorded across every series measured.
     pub records: usize,
+    /// Series measured: 1, or 2 when the gate measured a second.
+    pub series: usize,
     /// Runs without a readiness signal (a `ready` marker or `Memory: ready.`).
     pub failed_opens: usize,
     /// Runs that opened and then failed.
@@ -299,8 +306,8 @@ pub struct Report {
     /// The ramp series' single wait for every owner to retire.
     pub final_retire_wait_ms: Option<f64>,
     pub summary: String,
-    /// The gate's verdict over the completed series, when gated.
-    pub gate: Option<gate::Verdict>,
+    /// The gate's judgement over the completed series, when gated.
+    pub gate: Option<gate::Judgement>,
 }
 
 /// One iteration's private directories.
@@ -533,6 +540,8 @@ struct Series<'a> {
     previous_exit: Option<Instant>,
     records: Vec<Record>,
     sink: fs::File,
+    /// The ramp series' single wait for every owner to retire.
+    final_retire_wait_ms: Option<f64>,
 }
 
 impl Series<'_> {
@@ -641,6 +650,44 @@ impl Series<'_> {
         Ok(())
     }
 
+    /// Every iteration, then the ramp's single final retirement wait.
+    /// Completed runs stay in `records` whatever stops the series.
+    async fn all(&mut self, binary: &Path) -> Result<()> {
+        let mut kept = Vec::new();
+        for iteration in 1..=self.options.iterations {
+            let directory = self.root.join(format!("iteration-{iteration:02}"));
+            let scratch = Scratch::create(directory.clone(), binary)?;
+            self.iteration(&scratch, iteration).await?;
+            if self.options.retire_wait {
+                // Every process under this directory has retired; remove its
+                // engine cache and store before the next iteration.
+                fs::remove_dir_all(&directory)
+                    .with_context(|| format!("remove {}", directory.display()))?;
+            } else {
+                kept.push(directory);
+            }
+        }
+        // The ramp series waits once, after its last run, for every owner it
+        // started; only then can the iteration directories be removed.
+        if kept.is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        // Each wait also covers every process under the root, so the first
+        // one outlasts the rest.
+        for directory in &kept {
+            let services = directory.join("data").join("memory").join("services");
+            observe::wait_retired(&mut self.processes, &services, RETIRE_BOUND, RETIRE_POLL)
+                .await?;
+        }
+        self.final_retire_wait_ms = Some(millis(started.elapsed()));
+        for directory in &kept {
+            fs::remove_dir_all(directory)
+                .with_context(|| format!("remove {}", directory.display()))?;
+        }
+        Ok(())
+    }
+
     fn keep(&mut self, record: Record) -> Result<()> {
         serde_json::to_writer(&mut self.sink, &record)?;
         self.sink.write_all(b"\n")?;
@@ -699,8 +746,96 @@ async fn version(binary: &Path, scratch: &Path, bound: Duration) -> Result<Strin
         .to_owned())
 }
 
+/// A fresh private scratch root under `parent`, and its plain path.
+fn scratch_root(parent: &Path) -> Result<(tempfile::TempDir, PathBuf)> {
+    let scratch = tempfile::Builder::new()
+        .prefix("kuru-open-time-")
+        .tempdir_in(parent)
+        .context("create the private scratch root")?;
+    let root = plain(scratch.path())?;
+    Ok((scratch, root))
+}
+
+/// What one series left: every completed run, and what stopped it.
+struct Measured {
+    records: Vec<Record>,
+    final_retire_wait_ms: Option<f64>,
+    /// An infrastructure failure that stopped the series part way.
+    failure: Option<anyhow::Error>,
+}
+
+impl Measured {
+    fn stopped(error: anyhow::Error) -> Self {
+        Self {
+            records: Vec::new(),
+            final_retire_wait_ms: None,
+            failure: Some(error),
+        }
+    }
+
+    fn summary(&self, label: &str, gated: bool) -> String {
+        let mut summary = report::summary_of(&self.records, label, gated);
+        if let Some(wait) = self.final_retire_wait_ms {
+            summary.push_str(&format!(
+                "\nFinal wait for every owner of the ramp to retire: {wait:.0} ms.\n"
+            ));
+        }
+        summary
+    }
+
+    fn runs(&self) -> Vec<gate::Run> {
+        self.records.iter().map(gate::Run::from).collect()
+    }
+}
+
+/// Measure one full series in the scratch root `root`, writing each record
+/// to `records` as its run finishes.
+async fn measure(
+    options: &Options,
+    binary: &Path,
+    identity: &Binary,
+    root: &Path,
+    records: &Path,
+) -> Measured {
+    let sink = match fs::File::create(records) {
+        Ok(sink) => sink,
+        Err(error) => {
+            return Measured::stopped(
+                anyhow::Error::new(error).context(format!("create {}", records.display())),
+            );
+        }
+    };
+    let mut series = Series {
+        options,
+        root: root.to_owned(),
+        binary: identity.clone(),
+        host: Host {
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            cpus: std::thread::available_parallelism().map_or(1, usize::from),
+        },
+        processes: Processes::new(root),
+        previous_exit: None,
+        records: Vec::new(),
+        sink,
+        final_retire_wait_ms: None,
+    };
+    let failure = series.all(binary).await.err();
+    Measured {
+        records: series.records,
+        final_retire_wait_ms: series.final_retire_wait_ms,
+        failure,
+    }
+}
+
 /// Run the series. Records and the summary are written as runs finish, so an
 /// infrastructure failure part way still leaves every completed run.
+///
+/// Gated, a first series that holds every structural check but misses a
+/// median budget is followed by one more full series, with the same cases
+/// and iterations in a fresh scratch root; its records go to
+/// `<output>/retry/records.jsonl`, and the summary carries both series and
+/// the decision ([`gate::Decision`]).
 pub async fn run(options: &Options) -> Result<Report> {
     ensure!(options.iterations > 0, "at least one iteration is required");
     // The budgets derive from the main series; the control lists no files
@@ -717,98 +852,98 @@ pub async fn run(options: &Options) -> Result<Report> {
         .with_context(|| format!("create {}", options.output.display()))?;
     let parent = options.scratch.clone().unwrap_or_else(std::env::temp_dir);
     fs::create_dir_all(&parent)?;
-    let scratch = tempfile::Builder::new()
-        .prefix("kuru-open-time-")
-        .tempdir_in(&parent)
-        .context("create the private scratch root")?;
-    let root = plain(scratch.path())?;
+    let (scratch, root) = scratch_root(&parent)?;
     let (sha256, bytes) = digest(&binary)?;
     let version = version(&binary, &root, options.run_bound).await?;
-    let sink = fs::File::create(options.output.join(RECORDS))?;
-    let mut series = Series {
-        options,
-        root: root.clone(),
-        binary: Binary {
-            sha256,
-            bytes,
-            version,
-        },
-        host: Host {
-            os: std::env::consts::OS,
-            arch: std::env::consts::ARCH,
-            cpus: std::thread::available_parallelism().map_or(1, usize::from),
-        },
-        processes: Processes::new(&root),
-        previous_exit: None,
-        records: Vec::new(),
-        sink,
+    let identity = Binary {
+        sha256,
+        bytes,
+        version,
     };
-    let mut failure = None;
-    let mut kept = Vec::new();
-    for iteration in 1..=options.iterations {
-        let directory = root.join(format!("iteration-{iteration:02}"));
-        let result = match Scratch::create(directory.clone(), &binary) {
-            Ok(scratch) => series.iteration(&scratch, iteration).await,
-            Err(error) => Err(error),
-        };
-        if let Err(error) = result {
-            failure = Some(error);
-            break;
-        }
-        if options.retire_wait {
-            // Every process under this directory has retired; remove its
-            // engine cache and store before the next iteration.
-            fs::remove_dir_all(&directory)
-                .with_context(|| format!("remove {}", directory.display()))?;
-        } else {
-            kept.push(directory);
-        }
-    }
-    // The ramp series waits once, after its last run, for every owner it
-    // started; only then can the iteration directories be removed.
-    let mut final_retire_wait_ms = None;
-    if failure.is_none() && !kept.is_empty() {
-        let started = Instant::now();
-        // Each wait also covers every process under the root, so the first
-        // one outlasts the rest.
-        for directory in &kept {
-            let services = directory.join("data").join("memory").join("services");
-            if let Err(error) =
-                observe::wait_retired(&mut series.processes, &services, RETIRE_BOUND, RETIRE_POLL)
-                    .await
-            {
-                failure = Some(error);
-                break;
-            }
-        }
-        if failure.is_none() {
-            final_retire_wait_ms = Some(millis(started.elapsed()));
-            for directory in &kept {
-                fs::remove_dir_all(directory)
-                    .with_context(|| format!("remove {}", directory.display()))?;
-            }
-        }
-    }
-    let mut summary = report::summary_of(&series.records, &options.label, options.gate.is_some());
-    if let Some(wait) = final_retire_wait_ms {
-        summary.push_str(&format!(
-            "\nFinal wait for every owner of the ramp to retire: {wait:.0} ms.\n"
-        ));
-    }
+    let gated = options.gate.is_some();
+    let first = measure(
+        options,
+        &binary,
+        &identity,
+        &root,
+        &options.output.join(RECORDS),
+    )
+    .await;
+    let mut scratches = vec![scratch];
+    let mut second = None;
     // A series stopped by an infrastructure failure is not gated: its
     // records are partial, and the failure is the result.
-    let verdict = match (&options.gate, &failure) {
-        (Some(gate), None) => {
-            let runs: Vec<gate::Run> = series.records.iter().map(gate::Run::from).collect();
-            let verdict = gate::evaluate(&runs, gate);
-            summary.push_str(&gate::render(&verdict, gate));
-            Some(verdict)
+    let (summary, judgement) = match (&options.gate, first.failure.is_none()) {
+        (Some(gate), true) => {
+            let verdict = gate::evaluate(&first.runs(), gate);
+            let decision = gate::Decision::decide(&verdict, None);
+            if decision == gate::Decision::Remeasure {
+                let label = format!("{}, first series", options.label);
+                let mut summary = first.summary(&label, gated);
+                summary.push_str(&gate::render_titled(
+                    &verdict,
+                    gate,
+                    "Open-time gate, first series",
+                ));
+                summary.push_str(&decision.render());
+                let directory = options.output.join(RETRY);
+                let prepared = fs::create_dir_all(&directory)
+                    .with_context(|| format!("create {}", directory.display()))
+                    .and_then(|()| scratch_root(&parent));
+                let measured = match prepared {
+                    Ok((scratch, root)) => {
+                        scratches.push(scratch);
+                        let records = directory.join(RECORDS);
+                        measure(options, &binary, &identity, &root, &records).await
+                    }
+                    Err(error) => Measured::stopped(error),
+                };
+                let label = format!("{}, second series", options.label);
+                summary.push('\n');
+                summary.push_str(&measured.summary(&label, gated));
+                let judgement = if measured.failure.is_none() {
+                    let retried = gate::evaluate(&measured.runs(), gate);
+                    let decision = gate::Decision::decide(&verdict, Some(&retried));
+                    summary.push_str(&gate::render_titled(
+                        &retried,
+                        gate,
+                        "Open-time gate, second series",
+                    ));
+                    summary.push_str(&decision.render());
+                    Some(gate::Judgement {
+                        first: verdict,
+                        second: Some(retried),
+                        decision,
+                    })
+                } else {
+                    summary.push_str(
+                        "\n## Open-time gate, second series: not evaluated\n\n\
+                         The second series stopped.\n",
+                    );
+                    None
+                };
+                second = Some(measured);
+                (summary, judgement)
+            } else {
+                let mut summary = first.summary(&options.label, gated);
+                summary.push_str(&gate::render(&verdict, gate));
+                summary.push_str(&decision.render());
+                (
+                    summary,
+                    Some(gate::Judgement {
+                        first: verdict,
+                        second: None,
+                        decision,
+                    }),
+                )
+            }
         }
-        (Some(_), Some(_)) => {
+        (Some(_), false) => {
+            let mut summary = first.summary(&options.label, gated);
             summary.push_str("\n## Open-time gate: not evaluated\n\nThe series stopped.\n");
-            None
+            (summary, None)
         }
-        (None, _) => None,
+        (None, _) => (first.summary(&options.label, gated), None),
     };
     fs::write(options.output.join(SUMMARY), &summary)?;
     if let Some(path) = &options.summary {
@@ -818,32 +953,41 @@ pub async fn run(options: &Options) -> Result<Report> {
             .open(path)?;
         writeln!(file, "{summary}")?;
     }
-    let failed_opens = series
-        .records
-        .iter()
-        .filter(|record| !record.opened())
-        .count();
-    let failed_after_open = series
-        .records
-        .iter()
+    let mut first = first;
+    let failure = first.failure.take().or_else(|| {
+        second
+            .as_mut()
+            .and_then(|second: &mut Measured| second.failure.take())
+    });
+    let measured: Vec<&Measured> = std::iter::once(&first).chain(second.iter()).collect();
+    let all = || measured.iter().flat_map(|series| series.records.iter());
+    let failed_opens = all().filter(|record| !record.opened()).count();
+    let failed_after_open = all()
         .filter(|record| record.opened() && !record.outcome.success)
         .count();
-    let records = series.records.len();
+    let records = all().count();
+    let series = measured.len();
+    let final_retire_wait_ms = first.final_retire_wait_ms;
     if let Some(error) = failure {
-        // Leave the scratch root for inspection when a process is still alive.
-        let kept = scratch.keep();
+        // Leave the stopped series' scratch root for inspection when a
+        // process is still alive; any earlier one is removed.
+        let kept = scratches.pop().map(tempfile::TempDir::keep);
+        drop(scratches);
         bail!(
             "open-time measurement stopped after {records} records: {error:#}; scratch kept at {}",
-            kept.display()
+            kept.map_or_else(String::new, |kept| kept.display().to_string())
         );
     }
-    scratch.close().context("remove the scratch root")?;
+    for scratch in scratches {
+        scratch.close().context("remove the scratch root")?;
+    }
     Ok(Report {
         records,
+        series,
         failed_opens,
         failed_after_open,
         final_retire_wait_ms,
         summary,
-        gate: verdict,
+        gate: judgement,
     })
 }

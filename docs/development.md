@@ -1354,9 +1354,12 @@ exact binary, builds only the delivery tool (which needs no engine bundle
 input) and runs `mise run //packages/kuru-delivery:measure:open-time` once: the
 main series, 10 iterations, with the gate variables set. Measured on three
 runs, the step takes about 3.5 minutes including compilation of the delivery
-tool, added to `ci-gate`'s critical path after `native-tests`. Nothing is
-rebuilt, and the measured executable embeds the engine its installation job
-verified. The control, coarse-period and ramp modes (below) are local-only
+tool, added to `ci-gate`'s critical path after `native-tests`. Only when the
+first series misses a median budget with every other check holding does the
+same command measure a second series
+([the retry rule](#the-gate-and-its-budgets)), adding roughly one more
+series' time (an estimate, not yet observed in CI). Nothing is rebuilt, and
+the measured executable embeds the engine its installation job verified. The control, coarse-period and ramp modes (below) are local-only
 and are not run in CI.
 
 The harness drives the binary from outside. Each iteration uses a fresh private
@@ -1534,8 +1537,11 @@ engine starts, owner path, load and census, followed by the gate's section:
 the expected engine starts, both gated medians with their budgets, and every
 violation. Download the `ci-open-time-ubuntu-latest-attempt-<n>` artifact,
 uploaded after a failed gate too, for `main/records.jsonl`, one
-`kuru.open-time.v3` JSON object per run, and `main/summary.md`. Version 3 added the
-`new-project` case, `stages.ready_signal` and `stages.markers`, and names the
+`kuru.open-time.v3` JSON object per run, and `main/summary.md`. When the gate
+measured a second series, its records are in `main/retry/records.jsonl`, and
+`main/summary.md` (like the job summary) carries the first series, its gate
+section, the second series and its gate section, each titled by series, then
+a line stating which series decided. Version 3 added the `new-project` case, `stages.ready_signal` and `stages.markers`, and names the
 final milestone `ready` for either signal. Records hold no path, credential or
 memory content.
 
@@ -1598,6 +1604,18 @@ expected value or budget, and the iterations that violated it, after every
 record has been written; the command then exits non-zero. `first-launch` and
 `warm-reopen` open times are reported but not gated.
 
+Runner noise can move a median but not an engine start count, so a median
+budget miss alone gets one bounded re-measurement. When the first series
+holds every run, readiness and engine start check but misses a median
+budget, the same command, in the same job, measures one more full main
+series (the same iterations and cases, in a fresh scratch root), reports both
+series, and fails only if the second series also fails a check of any kind.
+A count violation, an unexpected owner path or a failed open is never
+measured again: in the first series it fails at once with no second series,
+and in the second it fails too. There is never a third series, and the job is
+never rerun to get past a miss; a median that keeps missing is fixed only by
+re-deriving the budgets (below).
+
 Each budget follows one rule: the highest median of the case across two
 post-fix derivation runs of the main series, plus three times the largest
 within-run spread (maximum minus minimum) of that case, rounded up to a whole
@@ -1619,7 +1637,8 @@ moves the gated medians), re-derive in the same pull request:
    commit carrying the new startup path, never a rerun of one job (while the
    old budgets fail the job, its uploaded records still carry every
    measurement).
-3. From each run's `main/records.jsonl`, take the median and the spread of
+3. From each run's first series, `main/records.jsonl` (never a second
+   series' `main/retry/records.jsonl`), take the median and the spread of
    `stages.ready_ms` for `new-project` and `cold-existing`, apply the rule above
    to both runs together, and set the two budgets in `ci.yml`, with the run ids
    and arithmetic in the comment beside them.

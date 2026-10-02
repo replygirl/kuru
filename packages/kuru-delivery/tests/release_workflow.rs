@@ -2210,6 +2210,9 @@ fn open_time_is_a_required_gate_on_the_main_series() {
         "36949202478",
         "36952763676",
         "name: ci-release-binary-${{ matrix.os }}\n",
+        "    timeout-minutes: 60\n",
+        "      # Retry rule, median budgets only:",
+        "# third series. A persistent miss is fixed by re-deriving the budgets\n",
     ] {
         assert!(job.contains(required), "open-time lost {required}");
     }
