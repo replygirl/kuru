@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::pool::{MemoryPool, PooledSession};
 use anyhow::{Context, Result, bail, ensure};
 use futures::TryStreamExt;
 use kuru_core::{ContentBlock, MemoryConfig, Message, Mode};
@@ -13,7 +14,7 @@ use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::{Connection, MySqlConnection, MySqlPool, Row};
+use sqlx::{Connection, MySqlConnection, Row};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit};
@@ -52,6 +53,9 @@ mod open_pool_budget_tests;
 #[cfg(test)]
 #[path = "store/operational_gc_tests.rs"]
 mod operational_gc_tests;
+#[cfg(test)]
+#[path = "store/pool_session_tests.rs"]
+mod pool_session_tests;
 #[cfg(test)]
 #[path = "store/template_stage_tests.rs"]
 pub(crate) mod template_stage_tests;
@@ -267,7 +271,7 @@ struct Shared {
     write: Arc<Mutex<()>>,
     dream: Arc<Mutex<()>>,
     uncertain: StdMutex<Option<Pending>>,
-    usage_pool: StdMutex<Option<Arc<MySqlPool>>>,
+    usage_pool: StdMutex<Option<Arc<MemoryPool>>>,
     #[cfg(test)]
     candidate_recovery_pause: Option<Arc<CandidateRecoveryPause>>,
     #[cfg(test)]
@@ -329,7 +333,7 @@ fn fail_candidate_cleanup_once(store: &MemoryStore) -> Result<()> {
 
 #[derive(Clone, Debug)]
 struct Pending {
-    pool: Arc<MySqlPool>,
+    pool: Arc<MemoryPool>,
     connection: u64,
     receipt: Receipt,
 }
@@ -365,7 +369,7 @@ enum Receipt {
 #[derive(Clone, Debug)]
 pub struct MemoryStore {
     shared: Arc<Shared>,
-    pool: Arc<MySqlPool>,
+    pool: Arc<MemoryPool>,
     branch: String,
     logical_receipt: Option<LogicalReceipt>,
 }
@@ -1212,7 +1216,7 @@ impl CandidateNames {
 }
 
 async fn candidate_heads(
-    pool: &MySqlPool,
+    pool: &MemoryPool,
     names: &CandidateNames,
 ) -> Result<BTreeMap<String, String>> {
     let rows: Vec<(String, String)> = tokio::time::timeout(
@@ -2837,7 +2841,7 @@ impl MemoryStore {
                 |receipt| receipt.physical_id.clone(),
             );
             let session_id = mutation.session_id().to_owned();
-            let (mut connection, id) = owned_connection(&store.pool).await?;
+            let (mut connection, id) = write_session(&store.pool).await?;
             let mutation = match mutation {
                 SessionLifecycleMutation::Fork {
                     source_session_id,
@@ -2874,8 +2878,10 @@ impl MemoryStore {
                 connection: id,
                 receipt: Receipt::Operation(operation.clone()),
             });
-            let result = tokio::time::timeout(
-                QUERY_TIMEOUT,
+            // One budget bounds the write and its session's return.
+            let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
+            let result = tokio::time::timeout_at(
+                deadline,
                 apply_session_lifecycle(
                     &mut connection,
                     &operation,
@@ -2885,11 +2891,13 @@ impl MemoryStore {
                 ),
             )
             .await;
-            drop(connection);
             if let Ok(Ok(outcome)) = result {
                 *store.shared.uncertain.lock().expect("uncertain lock") = None;
+                connection.settle_receipted(deadline).await;
                 return Ok(outcome);
             }
+            // Not a receipted success: end the session before reconciling.
+            drop(connection);
             if store.resolve_uncertain().await? == Some(true) {
                 return load_session_lifecycle_outcome(&store.pool, &operation, &session_id).await;
             }
@@ -3722,7 +3730,7 @@ impl MemoryStore {
                 || Uuid::new_v4().to_string(),
                 |receipt| receipt.physical_id.clone(),
             );
-            let (mut connection, id) = owned_connection(&store.pool).await?;
+            let (mut connection, id) = write_session(&store.pool).await?;
             *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: store.pool.clone(),
                 connection: id,
@@ -3735,8 +3743,10 @@ impl MemoryStore {
                 .lock()
                 .expect("apply pause lock")
                 .take();
-            let result = tokio::time::timeout(
-                QUERY_TIMEOUT,
+            // One budget bounds the write and its session's return.
+            let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
+            let result = tokio::time::timeout_at(
+                deadline,
                 apply(
                     &mut connection,
                     &operation,
@@ -3748,11 +3758,13 @@ impl MemoryStore {
                 ),
             )
             .await;
-            drop(connection);
             if matches!(result, Ok(Ok(()))) {
                 *store.shared.uncertain.lock().expect("uncertain lock") = None;
+                connection.settle_receipted(deadline).await;
                 return Ok(());
             }
+            // Not a receipted success: end the session before reconciling.
+            drop(connection);
             if store.resolve_uncertain().await? == Some(true) {
                 return Ok(());
             }
@@ -4539,7 +4551,7 @@ async fn validate_session_fork_source(
 
 async fn run_migration_worker(
     server: Server,
-    pool: Arc<MySqlPool>,
+    pool: Arc<MemoryPool>,
     #[cfg(test)] hooks: Option<Arc<migrations::MigrationRunnerHooks>>,
 ) -> Result<(File, Result<()>)> {
     let (result, waiting) = tokio::sync::oneshot::channel();
@@ -4632,7 +4644,7 @@ async fn close_failed_open(server: &Server, error: anyhow::Error) -> anyhow::Err
     with_close_failure(error, closed)
 }
 
-async fn close_migration_worker(server: Server, _pool: Arc<MySqlPool>) -> Result<File> {
+async fn close_migration_worker(server: Server, _pool: Arc<MemoryPool>) -> Result<File> {
     // The caller installed the startup guard before it began any operation.
     // If cancellation happens while pools drain, Owner::drop transfers it to
     // the independent reaper.
@@ -5950,7 +5962,7 @@ fn decode_session_lifecycle_result_ref(
 }
 
 async fn load_session_lifecycle_outcome(
-    pool: &MySqlPool,
+    pool: &MemoryPool,
     operation: &str,
     session_id: &str,
 ) -> Result<SessionLifecycleOutcome> {
@@ -6416,13 +6428,13 @@ fn decode_session_catalog_row(row: &sqlx::mysql::MySqlRow) -> Result<SessionCata
 }
 
 async fn load_public_turn(
-    transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    transaction: &mut MySqlConnection,
     node_id: &str,
 ) -> Result<Option<PublicTurnRecord>> {
     validate_public_node_id("public transcript node", node_id)?;
     let row = sqlx::query("SELECT node_id, origin_session_id, turn_id, record_kind, continuation_of_node_id, predecessor_node_id, settlement, user_entry, speaker_id, terminal_entries, record_format FROM session_public_turns WHERE node_id = ?")
         .bind(node_id)
-        .fetch_optional(&mut **transaction)
+        .fetch_optional(&mut *transaction)
         .await?;
     row.as_ref().map(decode_public_turn_row).transpose()
 }
@@ -7390,7 +7402,7 @@ fn decode_message(role: String, format: &str, content: &str) -> Result<Message> 
     }
 }
 
-async fn owned_connection(pool: &MySqlPool) -> Result<(MySqlConnection, u64)> {
+async fn owned_connection(pool: &MemoryPool) -> Result<(MySqlConnection, u64)> {
     let mut connection = pool.acquire().await?.detach();
     let id = tokio::time::timeout(
         QUERY_TIMEOUT,
@@ -7401,7 +7413,82 @@ async fn owned_connection(pool: &MySqlPool) -> Result<(MySqlConnection, u64)> {
     Ok((connection, id))
 }
 
-async fn await_session_end(pool: &MySqlPool, id: u64, duration: Duration) -> Result<()> {
+/// One receipt-bearing write's SQL session. Dropping it ends the session
+/// (detach, then drop: no `COM_QUIT`), exactly as a detached write connection
+/// always did, so any outcome that is not a receipted success leaves no
+/// session for `resolve_uncertain` to wait on but the one it observes ending.
+struct WriteSession(Option<PooledSession>);
+
+impl WriteSession {
+    /// Return the session to its pool after the write's receipted success.
+    ///
+    /// Only for writers whose apply ends with SQL `COMMIT` (or an explicit
+    /// `ROLLBACK` of an unchanged write) and that set no session variable,
+    /// `USE` no database, check out no Dolt branch and take no named lock:
+    /// `apply`, `apply_session_lifecycle` and the usage ledger's
+    /// `apply_change`. A writer that changes session state must let the
+    /// session drop instead.
+    ///
+    /// `deadline` is the write's own budget, taken before its apply. SQLx's
+    /// release ping is bounded by what remains of it: when it runs out, the
+    /// release future is dropped, SQLx closes the floating connection and
+    /// lowers the pool size, and the session already stopped counting as
+    /// held when the release began. The write is receipted either way, so an
+    /// expired release never turns its success into an error.
+    async fn settle_receipted(mut self, deadline: tokio::time::Instant) {
+        if let Some(session) = self.0.take()
+            && tokio::time::timeout_at(deadline, session.release())
+                .await
+                .is_err()
+        {
+            tracing::warn!(
+                "receipted memory write's session release exceeded the write's budget; \
+                 the connection was closed instead of returned to the pool"
+            );
+        }
+    }
+}
+
+impl Drop for WriteSession {
+    fn drop(&mut self) {
+        if let Some(session) = self.0.take() {
+            drop(session.detach());
+        }
+    }
+}
+
+impl std::ops::Deref for WriteSession {
+    type Target = MySqlConnection;
+
+    fn deref(&self) -> &MySqlConnection {
+        self.0
+            .as_deref()
+            .expect("write session is open until settled")
+    }
+}
+
+impl std::ops::DerefMut for WriteSession {
+    fn deref_mut(&mut self) -> &mut MySqlConnection {
+        self.0
+            .as_deref_mut()
+            .expect("write session is open until settled")
+    }
+}
+
+/// A write session that stays pooled until its outcome is known; see
+/// [`WriteSession`]. `owned_connection` detaches at once instead.
+async fn write_session(pool: &MemoryPool) -> Result<(WriteSession, u64)> {
+    let mut session = WriteSession(Some(pool.acquire().await?));
+    let id = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(&mut *session),
+    )
+    .await
+    .context("memory connection identity deadline exceeded")??;
+    Ok((session, id))
+}
+
+async fn await_session_end(pool: &MemoryPool, id: u64, duration: Duration) -> Result<()> {
     tokio::time::timeout(duration, async {
         loop {
             let active: i64 = sqlx::query_scalar(
@@ -7435,7 +7522,7 @@ async fn await_branch_sessions_end(
         .await
 }
 
-async fn operation_exists(pool: &MySqlPool, operation: &str) -> Result<bool> {
+async fn operation_exists(pool: &MemoryPool, operation: &str) -> Result<bool> {
     let result: Option<String> = tokio::time::timeout(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT id FROM operations WHERE id = ?")
@@ -7462,7 +7549,7 @@ fn validate_logical_query(method: &str, argument_digest: &str) -> Result<()> {
     Ok(())
 }
 
-async fn operation_receipt_matches(pool: &MySqlPool, expected: &LogicalReceipt) -> Result<bool> {
+async fn operation_receipt_matches(pool: &MemoryPool, expected: &LogicalReceipt) -> Result<bool> {
     let row: Option<(i8, Option<String>, Option<String>)> = tokio::time::timeout(
         QUERY_TIMEOUT,
         sqlx::query_as(
@@ -7483,7 +7570,7 @@ async fn operation_receipt_matches(pool: &MySqlPool, expected: &LogicalReceipt) 
         Some(_) => Err(LogicalReceiptConflict.into()),
     }
 }
-async fn revision(pool: &MySqlPool) -> Result<String> {
+async fn revision(pool: &MemoryPool) -> Result<String> {
     Ok(tokio::time::timeout(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')").fetch_one(pool),
@@ -7506,7 +7593,7 @@ pub(crate) const INITIALIZE_COMMIT: &str =
 /// The message [`INITIALIZE_COMMIT`] records, which the template shape
 /// asserts.
 pub(crate) const INITIALIZE_MESSAGE: &str = "Initialize Kuru memory schema 1";
-async fn initialize(pool: &MySqlPool) -> Result<()> {
+async fn initialize(pool: &MemoryPool) -> Result<()> {
     // Initialization is only called in a new, unpublished staging directory.
     for statement in INITIALIZE_STATEMENTS {
         sqlx::query(statement).execute(pool).await?;
@@ -7533,7 +7620,7 @@ async fn validate_schema_v1(connection: &mut MySqlConnection) -> Result<()> {
     }
     Ok(())
 }
-async fn import(pool: &MySqlPool, legacy: &LegacyImport) -> Result<()> {
+async fn import(pool: &MemoryPool, legacy: &LegacyImport) -> Result<()> {
     // The old file contains every project; this may be a new, empty scope.
     // Its snapshot receipt is still retained in the activation record.
     if legacy.messages.is_empty() && legacy.state.is_empty() {
@@ -11281,7 +11368,7 @@ mod tests {
     }
 
     async fn inspection_snapshot(
-        pool: &MySqlPool,
+        pool: &MemoryPool,
     ) -> Result<(String, Vec<(String, String)>, Vec<(String, i64, String)>)> {
         Ok((
             revision(pool).await?,

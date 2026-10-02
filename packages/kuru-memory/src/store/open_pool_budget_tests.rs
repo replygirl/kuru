@@ -117,19 +117,42 @@ async fn retained_open_pools_keep_the_ordinary_acquire_window() -> Result<()> {
     }
 
     // Contend the retained main pool: with every connection held, the next
-    // acquire must end at the ordinary window, not a startup-length one.
+    // acquire must end at the ordinary window, not a startup-length one, and
+    // name a wait for held connections. SQLx's own window is the bound under
+    // test; the test adds no timer.
+    let max = store.pool.options().get_max_connections();
     let mut held = Vec::new();
-    for _ in 0..store.pool.options().get_max_connections() {
+    for _ in 0..max {
         held.push(store.pool.acquire().await?);
     }
-    let contended = tokio::time::timeout(
-        crate::server::ORDINARY_POOL_WINDOW * 2,
-        store.pool.acquire(),
-    )
-    .await;
+    let error = store
+        .pool
+        .acquire()
+        .await
+        .err()
+        .context("a contended retained pool handed out a fifth session")?;
     assert!(
-        matches!(contended, Ok(Err(sqlx::Error::PoolTimedOut))),
-        "contended retained pool did not fail at its ordinary acquire window"
+        pool_timed_out(&error),
+        "contended retained pool lost SQLx's pool timeout: {error:#}"
+    );
+    let diagnostic = crate::pool::pool_acquire_timeout(&error)
+        .with_context(|| format!("contended acquire carried no typed diagnostic: {error:#}"))?;
+    assert_eq!(diagnostic.wait, crate::pool::PoolWait::HeldConnections);
+    assert_eq!(diagnostic.branch, "main");
+    assert_eq!((diagnostic.max, diagnostic.size), (max, max));
+    assert_eq!((diagnostic.idle, diagnostic.checked_out), (0, max));
+    assert_eq!(diagnostic.window, crate::server::ORDINARY_POOL_WINDOW);
+    assert!(diagnostic.waited >= diagnostic.window, "{diagnostic}");
+    assert_eq!(diagnostic.authenticated_during_wait, 0);
+    assert_eq!(diagnostic.phase, None);
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("memory pool acquire on kuru/main timed out")
+            && text.contains("every permit held")
+            && text.contains(&format!(
+                "pool size {max} of {max}, 0 idle, {max} checked out"
+            )),
+        "contended acquire diagnostic is incomplete: {text}"
     );
     drop(held);
     drop(usage);

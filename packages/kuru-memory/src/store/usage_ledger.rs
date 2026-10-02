@@ -333,28 +333,30 @@ impl UsageLedger {
         tokio::spawn(async move {
             let _guard = guard;
             let operation = Uuid::new_v4().to_string();
-            let (mut connection, id) = owned_connection(&store.pool).await?;
+            let (mut connection, id) = write_session(&store.pool).await?;
             *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: store.pool.clone(),
                 connection: id,
                 receipt: Receipt::Operation(operation.clone()),
             });
-            let result = tokio::time::timeout(
-                QUERY_TIMEOUT,
+            // One budget bounds the write and its session's return.
+            let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
+            let result = tokio::time::timeout_at(
+                deadline,
                 apply_change(&mut connection, &operation, change),
             )
             .await;
-            drop(connection);
             match result {
-                Ok(Ok(false)) => {
+                // Committed, or an unchanged settlement rolled back: either
+                // way the session is clean and the outcome receipted.
+                Ok(Ok(_)) => {
                     *store.shared.uncertain.lock().expect("uncertain lock") = None;
-                    Ok(())
-                }
-                Ok(Ok(true)) => {
-                    *store.shared.uncertain.lock().expect("uncertain lock") = None;
+                    connection.settle_receipted(deadline).await;
                     Ok(())
                 }
                 other => {
+                    // Not a receipted success: end the session first.
+                    drop(connection);
                     if store.resolve_uncertain().await? == Some(true) {
                         return Ok(());
                     }
@@ -414,7 +416,7 @@ pub(super) async fn establish(store: &MemoryStore) -> Result<()> {
 
 /// Validate the branch's working set, history and owned state; returns the
 /// number of owned-state rows decoded.
-async fn validate_branch(pool: &MySqlPool) -> Result<u64> {
+async fn validate_branch(pool: &MemoryPool) -> Result<u64> {
     let dirty: i64 = tokio::time::timeout(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status").fetch_one(pool),
@@ -715,7 +717,7 @@ async fn put_state_tx<T: Serialize>(
     Ok(())
 }
 
-async fn read_marker(pool: &MySqlPool, session_id: &str) -> Result<Option<SessionMarker>> {
+async fn read_marker(pool: &MemoryPool, session_id: &str) -> Result<Option<SessionMarker>> {
     let value: Option<String> = tokio::time::timeout(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
@@ -756,7 +758,7 @@ async fn read_marker_tx(
 }
 
 async fn session_has_records_tx(
-    transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    transaction: &mut MySqlConnection,
     session_id: &str,
 ) -> Result<bool> {
     let index = KeyRange::prefix(&session_index_prefix(session_id))?;
@@ -764,12 +766,12 @@ async fn session_has_records_tx(
     Ok(sqlx::query(sql)
         .bind(low)
         .bind(high)
-        .fetch_optional(&mut **transaction)
+        .fetch_optional(&mut *transaction)
         .await?
         .is_some())
 }
 
-async fn read_state(pool: &MySqlPool, key: &str) -> Result<Option<String>> {
+async fn read_state(pool: &MemoryPool, key: &str) -> Result<Option<String>> {
     tokio::time::timeout(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
@@ -829,7 +831,7 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 async fn range_page(
-    pool: &MySqlPool,
+    pool: &MemoryPool,
     range: &KeyRange,
     after: Option<&[u8]>,
 ) -> sqlx::Result<Vec<(Vec<u8>, String)>> {
@@ -843,7 +845,7 @@ async fn range_page(
 }
 
 async fn session_index_page(
-    pool: &MySqlPool,
+    pool: &MemoryPool,
     index: &KeyRange,
     after: Option<&[u8]>,
 ) -> Result<Vec<(Vec<u8>, String)>> {
@@ -854,7 +856,7 @@ async fn session_index_page(
 }
 
 async fn owned_state_page(
-    pool: &MySqlPool,
+    pool: &MemoryPool,
     owned: &KeyRange,
     after: Option<&[u8]>,
 ) -> Result<Vec<(Vec<u8>, String)>> {
@@ -2321,7 +2323,7 @@ mod tests {
     /// Walk `prefix` to exhaustion with the old query. Production bound the
     /// cursor as UTF-8 text; `BINARY ?` casts the argument to the same bytes
     /// either way, and binding bytes lets this walk pass non-UTF-8 keys.
-    async fn old_walk(pool: &MySqlPool, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+    async fn old_walk(pool: &MemoryPool, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
         let mut keys = Vec::new();
         let mut after: Option<Vec<u8>> = None;
         loop {
@@ -2343,7 +2345,7 @@ mod tests {
 
     /// Walk `range` to exhaustion through the production page function.
     async fn range_walk(
-        pool: &MySqlPool,
+        pool: &MemoryPool,
         range: &KeyRange,
         session_index: bool,
     ) -> Result<Vec<Vec<u8>>> {
@@ -2364,7 +2366,7 @@ mod tests {
         }
     }
 
-    async fn put_raw_keys(pool: &MySqlPool, keys: &[Vec<u8>]) -> Result<()> {
+    async fn put_raw_keys(pool: &MemoryPool, keys: &[Vec<u8>]) -> Result<()> {
         let mut transaction = pool.begin().await?;
         for key in keys {
             sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
@@ -2380,7 +2382,7 @@ mod tests {
     /// The old and the range walk of `prefix` both equal the stored keys that
     /// begin with it, in byte order.
     async fn assert_same_walk(
-        pool: &MySqlPool,
+        pool: &MemoryPool,
         stored: &std::collections::BTreeSet<Vec<u8>>,
         prefix: &str,
         session_index: bool,
@@ -2636,7 +2638,7 @@ mod tests {
     /// planner as session variables set by one bound `SET`, in place of each
     /// `?`. A `LIMIT ?` takes its integer literally: Dolt refuses a variable
     /// there.
-    async fn explain_bound(pool: &MySqlPool, sql: &str, args: &[PlanArg<'_>]) -> Result<String> {
+    async fn explain_bound(pool: &MemoryPool, sql: &str, args: &[PlanArg<'_>]) -> Result<String> {
         ensure!(
             sql.matches('?').count() == args.len(),
             "argument count does not match {sql}"

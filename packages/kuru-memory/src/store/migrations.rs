@@ -8,11 +8,12 @@ use super::{
     SESSION_CATALOG_RECORD_FORMAT, SessionCatalogRecord, SessionLifecycleState, revision,
     validate_schema_v1, validate_session_catalog,
 };
+use crate::pool::{MemoryPool, PooledSession};
 use anyhow::{Context, Result, bail, ensure};
 use kuru_core::Mode;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use sqlx::{Connection, Executor, MySql, MySqlConnection, MySqlPool, Row};
+use sqlx::{Connection, Executor, MySql, MySqlConnection, Row};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
@@ -90,7 +91,7 @@ struct MigrationPause {
     resume: std::sync::Arc<tokio::sync::Semaphore>,
     route_ready: std::sync::Arc<tokio::sync::Semaphore>,
     route_resume: std::sync::Arc<tokio::sync::Semaphore>,
-    route_source: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<MySqlPool>>>>,
+    route_source: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<MemoryPool>>>>,
     metadata: std::sync::Arc<std::sync::Mutex<MigrationMetadata>>,
 }
 
@@ -115,7 +116,7 @@ pub(super) struct MigrationPauseControl {
     resume: std::sync::Arc<tokio::sync::Semaphore>,
     route_ready: std::sync::Arc<tokio::sync::Semaphore>,
     route_resume: std::sync::Arc<tokio::sync::Semaphore>,
-    route_source: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<MySqlPool>>>>,
+    route_source: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<MemoryPool>>>>,
     metadata: std::sync::Arc<std::sync::Mutex<MigrationMetadata>>,
 }
 
@@ -233,7 +234,7 @@ impl MigrationRunnerHooks {
 
 #[cfg(test)]
 impl MigrationPauseControl {
-    pub(super) async fn route_source(&self) -> Result<std::sync::Arc<MySqlPool>> {
+    pub(super) async fn route_source(&self) -> Result<std::sync::Arc<MemoryPool>> {
         self.route_ready
             .acquire()
             .await
@@ -283,10 +284,10 @@ impl MigrationPauseControl {
 }
 
 async fn routed_pool(
-    direct: &MySqlPool,
+    direct: &MemoryPool,
     hooks: &MigrationRunnerHooks,
     boundary: MigrationBoundary,
-) -> Result<Option<MySqlPool>> {
+) -> Result<Option<MemoryPool>> {
     #[cfg(not(test))]
     {
         let _ = (direct, hooks, boundary);
@@ -328,14 +329,15 @@ async fn routed_pool(
                 .context("migration fixture route resume channel closed")?
                 .forget();
         }
-        Ok(Some(
+        Ok(Some(MemoryPool::fixture(
             sqlx::mysql::MySqlPoolOptions::new()
                 .max_connections(1)
                 .acquire_timeout(QUERY_TIMEOUT)
                 .connect_with(options)
                 .await
                 .context("connect migration fixture proxy")?,
-        ))
+            "main",
+        )))
     }
 }
 
@@ -691,7 +693,7 @@ fn hash_field(hash: &mut Sha256, tag: &[u8], value: &[u8]) {
 
 const VERSION_QUERY: &str = "SELECT id, version FROM kuru_schema LIMIT 2";
 
-pub(super) async fn version(pool: &MySqlPool) -> Result<i32> {
+pub(super) async fn version(pool: &MemoryPool) -> Result<i32> {
     version_from(pool).await
 }
 
@@ -717,36 +719,41 @@ async fn version_from<'e>(executor: impl sqlx::Executor<'e, Database = MySql>) -
     Ok(version)
 }
 
-pub(super) async fn validate_supported(pool: &MySqlPool) -> Result<i32> {
+pub(super) async fn validate_supported(pool: &MemoryPool) -> Result<i32> {
     validate_supported_with(REGISTRY, pool).await
 }
 
 /// Validate a historical branch through its own version dispatcher.
 /// This never migrates the branch or applies latest-main validation.
-pub(super) async fn validate_historical(pool: &MySqlPool) -> Result<i32> {
+pub(super) async fn validate_historical(pool: &MemoryPool) -> Result<i32> {
     let version = validate_supported_with(REGISTRY, pool).await?;
     authority_working_set(pool).await?;
     Ok(version)
 }
 
-async fn validate_supported_with(registry: Registry, pool: &MySqlPool) -> Result<i32> {
+async fn validate_supported_with(registry: Registry, pool: &MemoryPool) -> Result<i32> {
     registry.validate()?;
     let mut connection = acquire(pool).await?;
     let found = version_on(&mut connection).await?;
     validate_version_on(registry, &mut connection, found).await?;
+    connection.release().await;
     Ok(found)
 }
 
 /// One pooled connection for a whole validation pass. The schema validator
 /// runs on one session so the same checks can run on a detached connection
 /// whose database was switched to a revision (see `RevisionReader`).
-async fn acquire(pool: &MySqlPool) -> Result<sqlx::pool::PoolConnection<MySql>> {
-    bounded_query(pool.acquire()).await
+async fn acquire(pool: &MemoryPool) -> Result<PooledSession> {
+    tokio::time::timeout(QUERY_TIMEOUT, pool.acquire())
+        .await
+        .context("Dolt migration query deadline exceeded")?
 }
 
-async fn validate_version_with(registry: Registry, pool: &MySqlPool, expected: i32) -> Result<()> {
+async fn validate_version_with(registry: Registry, pool: &MemoryPool, expected: i32) -> Result<()> {
     let mut connection = acquire(pool).await?;
-    validate_version_on(registry, &mut connection, expected).await
+    validate_version_on(registry, &mut connection, expected).await?;
+    connection.release().await;
+    Ok(())
 }
 
 async fn validate_version_on(
@@ -1238,11 +1245,11 @@ async fn validate_operation_receipt_shape(connection: &mut MySqlConnection) -> R
     Ok(())
 }
 
-pub(super) async fn validate_current(pool: &MySqlPool) -> Result<()> {
+pub(super) async fn validate_current(pool: &MemoryPool) -> Result<()> {
     validate_current_with(REGISTRY, pool).await
 }
 
-async fn validate_current_with(registry: Registry, pool: &MySqlPool) -> Result<()> {
+async fn validate_current_with(registry: Registry, pool: &MemoryPool) -> Result<()> {
     let found = validate_supported_with(registry, pool).await?;
     ensure!(
         found == registry.current,
@@ -1253,21 +1260,21 @@ async fn validate_current_with(registry: Registry, pool: &MySqlPool) -> Result<(
     Ok(())
 }
 
-pub(super) async fn validate_active(pool: &MySqlPool) -> Result<()> {
+pub(super) async fn validate_active(pool: &MemoryPool) -> Result<()> {
     validate_active_with(REGISTRY, pool).await
 }
 
 /// [`validate_active`] without classifying retained attempts, for a caller
 /// that classifies them itself: the template shape check does, so a copied
 /// stage's engine validates with this and then runs that check.
-pub(super) async fn validate_active_unclassified(pool: &MySqlPool) -> Result<()> {
+pub(super) async fn validate_active_unclassified(pool: &MemoryPool) -> Result<()> {
     validate_current_with(REGISTRY, pool).await?;
     clean(pool).await
 }
 
 /// Validate a current-schema read-only main without treating unrelated working
 /// data as a migration failure.
-pub(super) async fn validate_inspection(pool: &MySqlPool) -> Result<()> {
+pub(super) async fn validate_inspection(pool: &MemoryPool) -> Result<()> {
     validate_current_with(REGISTRY, pool).await?;
     authority_working_set(pool).await?;
     classify_historical_attempts(REGISTRY, pool, REGISTRY.current).await
@@ -1276,11 +1283,11 @@ pub(super) async fn validate_inspection(pool: &MySqlPool) -> Result<()> {
 /// Validate a stopped staging database exactly at the version published in its
 /// immutable ready marker. A supported older stage remains activatable, but it
 /// cannot contain attempts for work its publishing binary had not completed.
-pub(super) async fn validate_ready(pool: &MySqlPool) -> Result<i32> {
+pub(super) async fn validate_ready(pool: &MemoryPool) -> Result<i32> {
     validate_ready_with(REGISTRY, pool).await
 }
 
-async fn validate_ready_with(registry: Registry, pool: &MySqlPool) -> Result<i32> {
+async fn validate_ready_with(registry: Registry, pool: &MemoryPool) -> Result<i32> {
     let found = validate_supported_with(registry, pool).await?;
     inventory_with(registry, pool).await?;
     clean(pool).await?;
@@ -1295,7 +1302,7 @@ async fn validate_ready_with(registry: Registry, pool: &MySqlPool) -> Result<i32
     Ok(found)
 }
 
-async fn validate_active_with(registry: Registry, pool: &MySqlPool) -> Result<()> {
+async fn validate_active_with(registry: Registry, pool: &MemoryPool) -> Result<()> {
     validate_current_with(registry, pool).await?;
     clean(pool).await?;
     classify_historical_attempts(registry, pool, registry.current).await
@@ -1393,7 +1400,7 @@ fn parse_attempt_in(prefix: &str, name: &str) -> Result<(i32, Uuid)> {
     Ok((version, operation))
 }
 
-async fn clean(pool: &MySqlPool) -> Result<()> {
+async fn clean(pool: &MemoryPool) -> Result<()> {
     let changes: i64 =
         bounded_query(sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status").fetch_one(pool))
             .await?;
@@ -1406,7 +1413,7 @@ async fn clean(pool: &MySqlPool) -> Result<()> {
 
 /// Read-only compatibility may observe ordinary uncommitted data, but schema
 /// and receipt authority must always remain committed and unchanged.
-async fn authority_working_set(pool: &MySqlPool) -> Result<()> {
+async fn authority_working_set(pool: &MemoryPool) -> Result<()> {
     let rows = bounded_query(
         sqlx::query(
             "SELECT table_name, staged, status FROM dolt_status WHERE BINARY table_name = BINARY 'kuru_schema' OR BINARY table_name = BINARY 'kuru_migrations' OR BINARY table_name = BINARY 'kuru_migration_publications' ORDER BY BINARY table_name, staged, BINARY status LIMIT 4",
@@ -1422,7 +1429,7 @@ async fn authority_working_set(pool: &MySqlPool) -> Result<()> {
     Ok(())
 }
 
-async fn retained_failed_shape(pool: &MySqlPool, definition: &Definition) -> Result<bool> {
+async fn retained_failed_shape(pool: &MemoryPool, definition: &Definition) -> Result<bool> {
     retained_failed_shape_in(pool, WorkingSet::Session, definition).await
 }
 
@@ -1457,7 +1464,7 @@ impl WorkingSet<'_> {
     }
 }
 
-async fn working_set_changes(main: &MySqlPool, working_set: WorkingSet<'_>) -> Result<i64> {
+async fn working_set_changes(main: &MemoryPool, working_set: WorkingSet<'_>) -> Result<i64> {
     bounded_query(
         sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1469,7 +1476,7 @@ async fn working_set_changes(main: &MySqlPool, working_set: WorkingSet<'_>) -> R
 }
 
 async fn retained_failed_shape_in(
-    pool: &MySqlPool,
+    pool: &MemoryPool,
     working_set: WorkingSet<'_>,
     definition: &Definition,
 ) -> Result<bool> {
@@ -1498,11 +1505,11 @@ async fn retained_failed_shape_in(
     Ok(true)
 }
 
-async fn inventory_with(registry: Registry, pool: &MySqlPool) -> Result<()> {
+async fn inventory_with(registry: Registry, pool: &MemoryPool) -> Result<()> {
     inventory_in(registry, pool, RESERVED_PREFIX).await
 }
 
-async fn inventory_in(registry: Registry, pool: &MySqlPool, prefix: &str) -> Result<()> {
+async fn inventory_in(registry: Registry, pool: &MemoryPool, prefix: &str) -> Result<()> {
     let names = reserved_names_in(pool, prefix).await?;
     ensure!(
         names.len() <= INVENTORY_LIMIT,
@@ -1515,11 +1522,11 @@ async fn inventory_in(registry: Registry, pool: &MySqlPool, prefix: &str) -> Res
     Ok(())
 }
 
-async fn reserved_names(pool: &MySqlPool) -> Result<Vec<String>> {
+async fn reserved_names(pool: &MemoryPool) -> Result<Vec<String>> {
     reserved_names_in(pool, RESERVED_PREFIX).await
 }
 
-async fn reserved_names_in(pool: &MySqlPool, prefix: &str) -> Result<Vec<String>> {
+async fn reserved_names_in(pool: &MemoryPool, prefix: &str) -> Result<Vec<String>> {
     // Do not use LIKE: underscores in the namespace are wildcards there. The
     // bounded SQL-side prefix comparison keeps arbitrary user refs out of the
     // reserved inventory and caps allocation before parsing.
@@ -1535,7 +1542,7 @@ async fn reserved_names_in(pool: &MySqlPool, prefix: &str) -> Result<Vec<String>
     Ok(names)
 }
 
-async fn close_routed_pool(pool: Option<MySqlPool>) -> Result<()> {
+async fn close_routed_pool(pool: Option<MemoryPool>) -> Result<()> {
     if let Some(pool) = pool {
         tokio::time::timeout(QUERY_TIMEOUT, pool.close())
             .await
@@ -1544,7 +1551,7 @@ async fn close_routed_pool(pool: Option<MySqlPool>) -> Result<()> {
     Ok(())
 }
 
-async fn close_branch_pool(pool: &MySqlPool) -> Result<()> {
+async fn close_branch_pool(pool: &MemoryPool) -> Result<()> {
     tokio::time::timeout(QUERY_TIMEOUT, pool.close())
         .await
         .context("Dolt migration branch pool close deadline exceeded")
@@ -1564,12 +1571,12 @@ fn after_cleanup<T>(result: Result<T>, cleanup: Result<()>) -> Result<T> {
 /// Build each missing schema version on its own exact-base branch.  The caller
 /// retains server and startup-lock ownership until this returns and all pools
 /// have been closed, so an accepted attempt cannot be abandoned by cancellation.
-pub(super) async fn upgrade(server: &Server, main: &MySqlPool) -> Result<()> {
+pub(super) async fn upgrade(server: &Server, main: &MemoryPool) -> Result<()> {
     upgrade_with(REGISTRY, server, main, &MigrationRunnerHooks::none()).await
 }
 
 #[cfg(test)]
-pub(super) async fn upgrade_main_to_v3_fixture(server: &Server, main: &MySqlPool) -> Result<()> {
+pub(super) async fn upgrade_main_to_v3_fixture(server: &Server, main: &MemoryPool) -> Result<()> {
     const RELEASED_V3: Registry = Registry {
         current: 3,
         definitions: &[V2, V3],
@@ -1580,7 +1587,7 @@ pub(super) async fn upgrade_main_to_v3_fixture(server: &Server, main: &MySqlPool
 /// The permanent usage branch is writable independently of main. Give its
 /// staged attempts a separate owned namespace so a main migration attempt can never
 /// be mistaken for an exact-base usage attempt (or vice versa).
-pub(super) async fn upgrade_usage(server: &Server, usage: &MySqlPool) -> Result<()> {
+pub(super) async fn upgrade_usage(server: &Server, usage: &MemoryPool) -> Result<()> {
     upgrade_in(
         USAGE_REGISTRY,
         server,
@@ -1594,13 +1601,13 @@ pub(super) async fn upgrade_usage(server: &Server, usage: &MySqlPool) -> Result<
 #[cfg(test)]
 pub(super) async fn upgrade_usage_with_hooks(
     server: &Server,
-    usage: &MySqlPool,
+    usage: &MemoryPool,
     hooks: &MigrationRunnerHooks,
 ) -> Result<()> {
     upgrade_in(USAGE_REGISTRY, server, usage, hooks, USAGE_RESERVED_PREFIX).await
 }
 
-pub(super) async fn validate_usage(usage: &MySqlPool) -> Result<()> {
+pub(super) async fn validate_usage(usage: &MemoryPool) -> Result<()> {
     let found = validate_supported_with(USAGE_REGISTRY, usage).await?;
     ensure!(
         found == USAGE_REGISTRY.current,
@@ -1622,7 +1629,7 @@ pub(super) async fn validate_usage(usage: &MySqlPool) -> Result<()> {
 #[cfg(test)]
 pub(super) async fn upgrade_with_hooks(
     server: &Server,
-    main: &MySqlPool,
+    main: &MemoryPool,
     hooks: &MigrationRunnerHooks,
 ) -> Result<()> {
     upgrade_with(REGISTRY, server, main, hooks).await
@@ -1631,7 +1638,7 @@ pub(super) async fn upgrade_with_hooks(
 async fn upgrade_with(
     registry: Registry,
     server: &Server,
-    main: &MySqlPool,
+    main: &MemoryPool,
     hooks: &MigrationRunnerHooks,
 ) -> Result<()> {
     upgrade_in(registry, server, main, hooks, RESERVED_PREFIX).await
@@ -1640,7 +1647,7 @@ async fn upgrade_with(
 async fn upgrade_in(
     registry: Registry,
     server: &Server,
-    main: &MySqlPool,
+    main: &MemoryPool,
     hooks: &MigrationRunnerHooks,
     prefix: &str,
 ) -> Result<()> {
@@ -1717,7 +1724,7 @@ async fn upgrade_in(
     }
 }
 
-async fn ensure_usage_branch_at_v4(main: &MySqlPool, base: &str) -> Result<()> {
+async fn ensure_usage_branch_at_v4(main: &MemoryPool, base: &str) -> Result<()> {
     let branches: Vec<String> = bounded_query(
         sqlx::query_scalar("SELECT name FROM dolt_branches WHERE BINARY name = BINARY ? LIMIT 2")
             .bind(super::usage_ledger::BRANCH)
@@ -1745,7 +1752,7 @@ async fn ensure_usage_branch_at_v4(main: &MySqlPool, base: &str) -> Result<()> {
 
 async fn classify_historical_attempts(
     registry: Registry,
-    main: &MySqlPool,
+    main: &MemoryPool,
     current: i32,
 ) -> Result<()> {
     classify_historical_attempts_in(registry, main, current, RESERVED_PREFIX)
@@ -1818,7 +1825,7 @@ struct Classification {
 /// identity row differs from the opener's is still classified by its content.
 async fn classify_historical_attempts_in(
     registry: Registry,
-    main: &MySqlPool,
+    main: &MemoryPool,
     current: i32,
     prefix: &str,
 ) -> Result<Classification> {
@@ -1827,7 +1834,7 @@ async fn classify_historical_attempts_in(
 
 async fn classify_historical_attempts_with(
     registry: Registry,
-    main: &MySqlPool,
+    main: &MemoryPool,
     current: i32,
     prefix: &str,
     records: Records,
@@ -1840,7 +1847,7 @@ async fn classify_historical_attempts_with(
 
 async fn classify_retained_attempts(
     registry: Registry,
-    main: &MySqlPool,
+    main: &MemoryPool,
     revisions: &mut RevisionReader,
     current: i32,
     prefix: &str,
@@ -1957,7 +1964,7 @@ struct ReservedRef {
 
 /// [`reserved_names_in`] with each branch's head and whether its working set
 /// differs from that head.
-async fn reserved_refs_in(pool: &MySqlPool, prefix: &str) -> Result<Vec<ReservedRef>> {
+async fn reserved_refs_in(pool: &MemoryPool, prefix: &str) -> Result<Vec<ReservedRef>> {
     let rows: Vec<(String, String, bool)> = bounded_query(
         sqlx::query_as(
             "SELECT name, hash, dirty FROM dolt_branches WHERE LEFT(BINARY name, ?) = BINARY ? LIMIT 65",
@@ -1995,7 +2002,7 @@ fn records_from(rows: Vec<sqlx::mysql::MySqlRow>) -> Result<Vec<Record>> {
 }
 
 /// Every publication record of the database `pool` serves, by version.
-async fn records_in(pool: &MySqlPool) -> Result<Vec<Record>> {
+async fn records_in(pool: &MemoryPool) -> Result<Vec<Record>> {
     let rows = bounded_query(
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "{RECORDS_QUERY} ORDER BY version LIMIT ?"
@@ -2008,7 +2015,7 @@ async fn records_in(pool: &MySqlPool) -> Result<Vec<Record>> {
 }
 
 /// Every publication record at one commit, by version.
-async fn records_as_of(pool: &MySqlPool, commit: &str) -> Result<Vec<Record>> {
+async fn records_as_of(pool: &MemoryPool, commit: &str) -> Result<Vec<Record>> {
     let rows = bounded_query(
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "{RECORDS_QUERY} AS OF '{}' ORDER BY version LIMIT ?",
@@ -2039,7 +2046,7 @@ fn placeholders(count: usize) -> String {
 /// disagreement fails closed; nothing falls back to full classification.
 async fn verified_records(
     registry: Registry,
-    main: &MySqlPool,
+    main: &MemoryPool,
     current: i32,
     refs: &[ReservedRef],
 ) -> Result<BTreeMap<String, Record>> {
@@ -2223,7 +2230,7 @@ fn commit_hash(value: &str) -> Result<&str> {
     Ok(value)
 }
 
-async fn branch_head(main: &MySqlPool, name: &str) -> Result<String> {
+async fn branch_head(main: &MemoryPool, name: &str) -> Result<String> {
     let heads: Vec<String> = bounded_query(
         sqlx::query_scalar("SELECT hash FROM dolt_branches WHERE BINARY name = BINARY ? LIMIT 2")
             .bind(name)
@@ -2239,7 +2246,7 @@ async fn branch_head(main: &MySqlPool, name: &str) -> Result<String> {
     Ok(head)
 }
 
-async fn version_as_of(main: &MySqlPool, commit: &str) -> Result<i32> {
+async fn version_as_of(main: &MemoryPool, commit: &str) -> Result<i32> {
     bounded_query(
         sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT version FROM kuru_schema AS OF '{}' WHERE id = 1",
@@ -2250,7 +2257,7 @@ async fn version_as_of(main: &MySqlPool, commit: &str) -> Result<i32> {
     .await
 }
 
-async fn receipt_as_of(main: &MySqlPool, commit: &str, version: i32) -> Result<String> {
+async fn receipt_as_of(main: &MemoryPool, commit: &str, version: i32) -> Result<String> {
     bounded_query(
         sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT operation FROM kuru_migrations AS OF '{}' WHERE version = ?",
@@ -2274,7 +2281,7 @@ struct RevisionReader {
 impl RevisionReader {
     async fn validate(
         &mut self,
-        source: &MySqlPool,
+        source: &MemoryPool,
         registry: Registry,
         commit: &str,
         expected: i32,
@@ -2314,7 +2321,7 @@ impl RevisionReader {
 async fn classify_with_branch_pools_in(
     registry: Registry,
     server: &Server,
-    main: &MySqlPool,
+    main: &MemoryPool,
     current: i32,
     prefix: &str,
 ) -> Result<()> {
@@ -2384,7 +2391,7 @@ async fn classify_with_branch_pools_in(
     Ok(())
 }
 
-async fn ancestor(main: &MySqlPool, ancestor: &str) -> Result<bool> {
+async fn ancestor(main: &MemoryPool, ancestor: &str) -> Result<bool> {
     let count: i64 = bounded_query(
         sqlx::query_scalar("SELECT COUNT(*) FROM dolt_log WHERE commit_hash = ?")
             .bind(ancestor)
@@ -2394,7 +2401,7 @@ async fn ancestor(main: &MySqlPool, ancestor: &str) -> Result<bool> {
     Ok(count == 1)
 }
 
-async fn sole_parent(pool: &MySqlPool, commit: &str) -> Result<String> {
+async fn sole_parent(pool: &MemoryPool, commit: &str) -> Result<String> {
     let parents: Vec<String> = bounded_query(
         sqlx::query_scalar(
             "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? ORDER BY parent_index LIMIT 2",
@@ -2427,7 +2434,7 @@ async fn validate_commit_version(
 async fn discover_current_attempt_in(
     registry: Registry,
     server: &Server,
-    main: &MySqlPool,
+    main: &MemoryPool,
     definition: &Definition,
     step: &StepBase<'_>,
     hooks: &MigrationRunnerHooks,
@@ -2563,7 +2570,7 @@ impl AttemptRecord<'_> {
     async fn expected(
         &self,
         registry: Registry,
-        pool: &MySqlPool,
+        pool: &MemoryPool,
         definition: &Definition,
         operation: Uuid,
     ) -> Result<Vec<Record>> {
@@ -2606,7 +2613,7 @@ impl AttemptRecord<'_> {
 
 async fn build_attempt(
     registry: Registry,
-    pool: &MySqlPool,
+    pool: &MemoryPool,
     definition: &Definition,
     operation: Uuid,
     record: &AttemptRecord<'_>,
@@ -2861,7 +2868,7 @@ fn valid_project_scope(scope: &str) -> bool {
 
 async fn validate_attempt(
     registry: Registry,
-    pool: &MySqlPool,
+    pool: &MemoryPool,
     definition: &Definition,
     operation: Uuid,
     record: &AttemptRecord<'_>,
@@ -2899,7 +2906,7 @@ async fn validate_attempt(
 
 async fn publish(
     registry: Registry,
-    main: &MySqlPool,
+    main: &MemoryPool,
     definition: &Definition,
     branch: &str,
     base: &str,
@@ -3310,7 +3317,7 @@ mod tests {
         Ok(())
     }
 
-    pub(super) async fn durable_snapshot(pool: &MySqlPool) -> Result<DurableSnapshot> {
+    pub(super) async fn durable_snapshot(pool: &MemoryPool) -> Result<DurableSnapshot> {
         let ref_rows = bounded_query(
             sqlx::query("SELECT name, hash FROM dolt_branches ORDER BY BINARY name LIMIT 129")
                 .fetch_all(pool),
@@ -3350,7 +3357,7 @@ mod tests {
         })
     }
 
-    pub(super) async fn commit_fixture(pool: &MySqlPool, message: &str) -> Result<()> {
+    pub(super) async fn commit_fixture(pool: &MemoryPool, message: &str) -> Result<()> {
         bounded_query(
             sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
                 .bind(message)
@@ -3364,7 +3371,7 @@ mod tests {
     pub(super) async fn assert_failed_runner_unchanged(
         registry: Registry,
         server: &Server,
-        main: &MySqlPool,
+        main: &MemoryPool,
         before: &DurableSnapshot,
         expected: &str,
     ) -> Result<()> {

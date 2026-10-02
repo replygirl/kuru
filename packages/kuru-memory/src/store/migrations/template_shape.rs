@@ -204,7 +204,7 @@ impl Ref {
 /// for what is a verdict and what is not. It classifies the retained main
 /// attempts itself, so a caller validating the store first uses a validation
 /// that does not classify them again.
-pub(in crate::store) async fn check(main: &MySqlPool, row: Row<'_>) -> Result<()> {
+pub(in crate::store) async fn check(main: &MemoryPool, row: Row<'_>) -> Result<()> {
     let expected = expected(REGISTRY, USAGE_REGISTRY, USAGE_ANCHOR, row.adopted())?;
     let attempts = branches(main, &expected).await?;
     classify_historical_attempts(REGISTRY, main, REGISTRY.current).await?;
@@ -247,7 +247,7 @@ pub(super) struct Attempts {
 /// The exact branch set: `main`, the usage branch and one clean retained
 /// attempt per executed step and namespace. Returns each attempt's
 /// operation, which its published commit's message names.
-async fn branches(main: &MySqlPool, expected: &Expected) -> Result<Attempts> {
+async fn branches(main: &MemoryPool, expected: &Expected) -> Result<Attempts> {
     let rows: Vec<(String, bool)> = bounded_query(
         sqlx::query_as("SELECT name, dirty FROM dolt_branches ORDER BY name LIMIT ?")
             .bind(read_limit(BRANCH_LIMIT)?)
@@ -306,7 +306,7 @@ async fn branches(main: &MySqlPool, expected: &Expected) -> Result<Attempts> {
 /// so a template without one for every retained branch is refused. The
 /// records themselves were verified against main's history by the
 /// classification `check` ran first.
-pub(super) async fn publication_records(main: &MySqlPool, attempts: &Attempts) -> Result<()> {
+pub(super) async fn publication_records(main: &MemoryPool, attempts: &Attempts) -> Result<()> {
     let expected: Vec<(i32, String)> = attempts
         .main
         .iter()

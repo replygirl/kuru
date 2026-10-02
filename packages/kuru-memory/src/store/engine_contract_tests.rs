@@ -137,7 +137,7 @@ struct Ref {
     dirty: bool,
 }
 
-async fn refs(pool: &MySqlPool) -> Result<BTreeMap<String, Ref>> {
+async fn refs(pool: &MemoryPool) -> Result<BTreeMap<String, Ref>> {
     let rows = bounded(
         "read dolt_branches",
         sqlx::query("SELECT name, hash, dirty FROM dolt_branches ORDER BY name LIMIT 200")
@@ -177,7 +177,7 @@ fn attempt(name: &str) -> Result<(i32, String)> {
     ))
 }
 
-async fn port(pool: &MySqlPool) -> Result<u16> {
+async fn port(pool: &MemoryPool) -> Result<u16> {
     let port: i64 = bounded(
         "read engine port",
         sqlx::query_scalar("SELECT CAST(@@port AS SIGNED)").fetch_one(pool),
@@ -241,7 +241,7 @@ async fn cold_open(data_dir: &Path, scope: &str) -> Result<(OpenOptions, MemoryS
     Ok((options, store))
 }
 
-async fn hostname(pool: &MySqlPool) -> Result<String> {
+async fn hostname(pool: &MemoryPool) -> Result<String> {
     bounded(
         "read @@hostname",
         sqlx::query_scalar("SELECT @@hostname").fetch_one(pool),
@@ -419,7 +419,7 @@ async fn serve_data(
     })
 }
 
-async fn close(server: Server, pools: impl IntoIterator<Item = Arc<MySqlPool>>) -> Result<()> {
+async fn close(server: Server, pools: impl IntoIterator<Item = Arc<MemoryPool>>) -> Result<()> {
     for pool in pools {
         pool.close().await;
     }
@@ -494,7 +494,7 @@ async fn adopt_and_restart(
                 let closed = connection.close().await;
                 commits.and_then(|commits| Ok(closed.map(|()| commits)?))
             }
-            Err(error) => Err(error.into()),
+            Err(error) => Err(error),
         };
         main.close().await;
         commits
@@ -520,7 +520,7 @@ async fn adopt_and_restart(
     ))
 }
 
-async fn instance_as_of(pool: &MySqlPool, hash: &str) -> Result<String> {
+async fn instance_as_of(pool: &MemoryPool, hash: &str) -> Result<String> {
     bounded(
         "read the instance row as of a revision",
         sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
@@ -532,7 +532,7 @@ async fn instance_as_of(pool: &MySqlPool, hash: &str) -> Result<String> {
     .await
 }
 
-async fn sole_parent_on(pool: &MySqlPool, hash: &str) -> Result<Vec<String>> {
+async fn sole_parent_on(pool: &MemoryPool, hash: &str) -> Result<Vec<String>> {
     bounded(
         "read commit parents",
         sqlx::query_scalar(
@@ -767,7 +767,7 @@ async fn bootstrap_connection_commits_identity_on_main_and_usage_branch() -> Res
 
 /// Read-only attach to a live store as `kuru_reader`, through the product
 /// server and its identity-checked pool.
-async fn reader(store: &MemoryStore) -> Result<(Server, Arc<MySqlPool>)> {
+async fn reader(store: &MemoryStore) -> Result<(Server, Arc<MemoryPool>)> {
     let directory = store.shared.directory.clone();
     let data_dir = directory
         .parent()
@@ -779,7 +779,7 @@ async fn reader(store: &MemoryStore) -> Result<(Server, Arc<MySqlPool>)> {
     Ok((server, pool))
 }
 
-async fn dirty_through_main(pool: &MySqlPool, branch: &str) -> Result<(bool, Vec<String>)> {
+async fn dirty_through_main(pool: &MemoryPool, branch: &str) -> Result<(bool, Vec<String>)> {
     let dirty: bool = bounded(
         "read dolt_branches.dirty",
         sqlx::query_scalar("SELECT dirty FROM dolt_branches WHERE name = ?")
@@ -799,7 +799,7 @@ async fn dirty_through_main(pool: &MySqlPool, branch: &str) -> Result<(bool, Vec
 }
 
 /// Make `branch` dirty out of band, from a detached root session on main.
-async fn make_dirty(pool: &MySqlPool, branch: &str) -> Result<()> {
+async fn make_dirty(pool: &MemoryPool, branch: &str) -> Result<()> {
     let mut connection = pool.acquire().await?.detach();
     let written = async {
         use_database(&mut connection, &format!("kuru/{branch}")).await?;
@@ -871,7 +871,7 @@ async fn dolt_branches_reports_dirty_for_root_and_reader() -> Result<()> {
     checked
 }
 
-async fn engine_sessions(pool: &MySqlPool) -> Result<Vec<Option<String>>> {
+async fn engine_sessions(pool: &MemoryPool) -> Result<Vec<Option<String>>> {
     bounded(
         "read engine sessions",
         sqlx::query_scalar("SELECT db FROM information_schema.processlist ORDER BY id")
@@ -1332,7 +1332,7 @@ struct Classified {
     names_main: bool,
 }
 
-async fn in_main_log(main: &MySqlPool, hash: &str) -> Result<bool> {
+async fn in_main_log(main: &MemoryPool, hash: &str) -> Result<bool> {
     let count: i64 = bounded(
         "look up main's log",
         sqlx::query_scalar("SELECT COUNT(*) FROM dolt_log WHERE commit_hash = ?")
@@ -1347,7 +1347,7 @@ async fn in_main_log(main: &MySqlPool, hash: &str) -> Result<bool> {
 /// them: through a pool on the branch and a pool at its parent commit.
 async fn classify_with_branch_pools(
     server: &Server,
-    main: &MySqlPool,
+    main: &MemoryPool,
     name: &str,
 ) -> Result<Classified> {
     let (target, _) = attempt(name)?;
@@ -1406,7 +1406,7 @@ async fn classify_with_branch_pools(
 }
 
 /// The same answers through the main pool only.
-async fn classify_through_main(main: &MySqlPool, name: &str) -> Result<Classified> {
+async fn classify_through_main(main: &MemoryPool, name: &str) -> Result<Classified> {
     let (target, _) = attempt(name)?;
     let all = refs(main).await?;
     let reference = all
@@ -1458,7 +1458,7 @@ async fn classify_through_main(main: &MySqlPool, name: &str) -> Result<Classifie
 
 /// A revision's table definitions: `SHOW TABLES` and `SHOW CREATE TABLE`,
 /// either on a pool at the revision (`as_of` empty) or `AS OF` from main.
-async fn schema_text(pool: &MySqlPool, as_of: &str) -> Result<Vec<(String, String)>> {
+async fn schema_text(pool: &MemoryPool, as_of: &str) -> Result<Vec<(String, String)>> {
     let tables: Vec<String> = bounded(
         "list tables",
         sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SHOW TABLES {as_of}"))).fetch_all(pool),
@@ -1493,7 +1493,7 @@ async fn schema_text(pool: &MySqlPool, as_of: &str) -> Result<Vec<(String, Strin
 /// `kuru/<hash>`.
 async fn revision_schema(
     server: &Server,
-    main: &MySqlPool,
+    main: &MemoryPool,
     target: &str,
     hash: &str,
 ) -> Result<(i64, BTreeMap<String, i64>)> {
@@ -1524,7 +1524,10 @@ async fn revision_schema(
 /// A branch's working-set inventory, as `retained_failed_shape` reads it:
 /// through a pool on the branch (`branch` `None`) or, from main, through the
 /// revision-qualified `` `kuru/<branch>`.dolt_status ``.
-async fn status_rows(pool: &MySqlPool, branch: Option<&str>) -> Result<Vec<(String, i64, String)>> {
+async fn status_rows(
+    pool: &MemoryPool,
+    branch: Option<&str>,
+) -> Result<Vec<(String, i64, String)>> {
     let table = match branch {
         Some(branch) => format!("`kuru/{branch}`.dolt_status"),
         None => "dolt_status".to_owned(),
@@ -1550,7 +1553,7 @@ async fn status_rows(pool: &MySqlPool, branch: Option<&str>) -> Result<Vec<(Stri
 
 /// Run `statements` on `branch`'s working set from a detached root session
 /// on main.
-async fn on_branch(pool: &MySqlPool, branch: &str, statements: &[&str]) -> Result<()> {
+async fn on_branch(pool: &MemoryPool, branch: &str, statements: &[&str]) -> Result<()> {
     let mut connection = pool.acquire().await?.detach();
     let written = async {
         use_database(&mut connection, &format!("kuru/{branch}")).await?;
@@ -1572,7 +1575,7 @@ async fn on_branch(pool: &MySqlPool, branch: &str, statements: &[&str]) -> Resul
 /// branch: the head, `kuru_schema AS OF 'HEAD'` and the working-set
 /// inventory through a pool on the branch, against `dolt_branches`,
 /// `AS OF '<head>'` and the revision-qualified `dolt_status` from main.
-async fn dirty_arm_matches(server: &Server, main: &MySqlPool, name: &str) -> Result<()> {
+async fn dirty_arm_matches(server: &Server, main: &MemoryPool, name: &str) -> Result<()> {
     let attempt_pool = server.pool(name).await?;
     let today = async {
         let head = revision(&attempt_pool).await?;
@@ -1614,7 +1617,7 @@ async fn dirty_arm_matches(server: &Server, main: &MySqlPool, name: &str) -> Res
     Ok(())
 }
 
-async fn column_count(pool: &MySqlPool, schema: Option<&str>) -> Result<i64> {
+async fn column_count(pool: &MemoryPool, schema: Option<&str>) -> Result<i64> {
     let query = match schema {
         Some(schema) => sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = ?",

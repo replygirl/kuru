@@ -63,7 +63,7 @@ async fn released_v7(root: &Path, scope: char) -> Result<OpenOptions> {
     Ok(options)
 }
 
-async fn publication_table_exists(pool: &MySqlPool) -> Result<bool> {
+async fn publication_table_exists(pool: &MemoryPool) -> Result<bool> {
     let tables: i64 = bounded_query(
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND BINARY table_name = BINARY 'kuru_migration_publications'",
@@ -75,7 +75,7 @@ async fn publication_table_exists(pool: &MySqlPool) -> Result<bool> {
 }
 
 /// The retained main attempts by target: name and head.
-async fn retained(pool: &MySqlPool) -> Result<BTreeMap<i32, Vec<(String, String)>>> {
+async fn retained(pool: &MemoryPool) -> Result<BTreeMap<i32, Vec<(String, String)>>> {
     let mut retained = BTreeMap::<i32, Vec<(String, String)>>::new();
     for reference in reserved_refs_in(pool, RESERVED_PREFIX).await? {
         let (target, _) = parse_attempt(&reference.name)?;
@@ -88,7 +88,7 @@ async fn retained(pool: &MySqlPool) -> Result<BTreeMap<i32, Vec<(String, String)
 }
 
 /// The sole retained branch for `target`.
-async fn sole_branch(pool: &MySqlPool, target: i32) -> Result<(String, String)> {
+async fn sole_branch(pool: &MemoryPool, target: i32) -> Result<(String, String)> {
     let mut branches = retained(pool).await?.remove(&target).unwrap_or_default();
     ensure!(
         branches.len() == 1,
@@ -100,7 +100,7 @@ async fn sole_branch(pool: &MySqlPool, target: i32) -> Result<(String, String)> 
 
 /// Run `statements` on `branch`'s working set from one detached session of
 /// `pool`, then close it.
-async fn on_branch(pool: &MySqlPool, branch: &str, statements: &[String]) -> Result<()> {
+async fn on_branch(pool: &MemoryPool, branch: &str, statements: &[String]) -> Result<()> {
     let mut connection = acquire(pool).await?.detach();
     let written = async {
         bounded_query(
@@ -120,7 +120,7 @@ async fn on_branch(pool: &MySqlPool, branch: &str, statements: &[String]) -> Res
     after_cleanup(written, bounded_query(connection.close()).await)
 }
 
-async fn branch_call(pool: &MySqlPool, arguments: &[&str]) -> Result<()> {
+async fn branch_call(pool: &MemoryPool, arguments: &[&str]) -> Result<()> {
     let mut query = sqlx::query(sqlx::AssertSqlSafe(format!(
         "CALL DOLT_BRANCH({})",
         placeholders(arguments.len())
@@ -143,7 +143,7 @@ async fn quiesce(store: &MemoryStore, branch: &str) -> Result<()> {
 
 /// A record-aware classification of the current main: its counts, or the
 /// refusal text.
-async fn classify(pool: &MySqlPool) -> std::result::Result<Classification, String> {
+async fn classify(pool: &MemoryPool) -> std::result::Result<Classification, String> {
     classify_historical_attempts_in(REGISTRY, pool, REGISTRY.current, RESERVED_PREFIX)
         .await
         .map_err(|error| format!("{error:#}"))
@@ -151,7 +151,7 @@ async fn classify(pool: &MySqlPool) -> std::result::Result<Classification, Strin
 
 /// The record each published branch carries, from the refs alone: every
 /// retained clean branch, with its head's parent as the base.
-async fn expected_records(pool: &MySqlPool, published: &[Published]) -> Result<Vec<Record>> {
+async fn expected_records(pool: &MemoryPool, published: &[Published]) -> Result<Vec<Record>> {
     let mut records = published
         .iter()
         .map(|published| Record::of(REGISTRY, published))

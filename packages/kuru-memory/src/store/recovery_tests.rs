@@ -1016,7 +1016,7 @@ async fn observe_stopped_stage(
 }
 
 #[cfg(any(unix, windows))]
-async fn checked_working_status(pool: &MySqlPool) -> Result<Vec<(String, i64, String)>> {
+async fn checked_working_status(pool: &MemoryPool) -> Result<Vec<(String, i64, String)>> {
     let rows = tokio::time::timeout(
         QUERY_TIMEOUT,
         sqlx::query(
@@ -1755,7 +1755,7 @@ async fn exact_base_schema_branch(store: &MemoryStore) -> SchemaBranch {
     }
 }
 
-async fn assert_clean_status(pool: &MySqlPool) {
+async fn assert_clean_status(pool: &MemoryPool) {
     let dirty: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status")
         .fetch_one(pool)
         .await
@@ -1805,7 +1805,7 @@ enum ProbeAtHead {
     Error(String),
 }
 
-async fn probe_table_at_head(pool: &MySqlPool) -> ProbeAtHead {
+async fn probe_table_at_head(pool: &MemoryPool) -> ProbeAtHead {
     match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_transaction_probe AS OF 'HEAD'")
         .fetch_one(pool)
         .await
@@ -1997,7 +1997,7 @@ struct PrecommitObservation {
     candidate: CandidateObservation,
 }
 
-async fn working_status(pool: &MySqlPool) -> Vec<(String, i64, String)> {
+async fn working_status(pool: &MemoryPool) -> Vec<(String, i64, String)> {
     sqlx::query("SELECT table_name, staged, status FROM dolt_status ORDER BY table_name")
         .fetch_all(pool)
         .await
@@ -2014,7 +2014,7 @@ async fn working_status(pool: &MySqlPool) -> Vec<(String, i64, String)> {
         .unwrap()
 }
 
-async fn history_at_head(pool: &MySqlPool, namespace: &str) -> Vec<Message> {
+async fn history_at_head(pool: &MemoryPool, namespace: &str) -> Vec<Message> {
     let version: i32 =
         sqlx::query_scalar("SELECT version FROM kuru_schema AS OF 'HEAD' WHERE id = 1")
             .fetch_one(pool)
@@ -2954,7 +2954,7 @@ enum DropKind {
 }
 
 async fn durable_observation(
-    observer: &MySqlPool,
+    observer: &MemoryPool,
     observation: &DurableObservation,
 ) -> Result<bool> {
     match observation {
@@ -2973,7 +2973,7 @@ async fn durable_observation(
 
 impl AckDropProxy {
     async fn start(
-        observer: Arc<MySqlPool>,
+        observer: Arc<MemoryPool>,
         statement: &'static str,
         observation: DurableObservation,
     ) -> Self {
@@ -2993,7 +2993,7 @@ impl AckDropProxy {
     fn from_listener(
         listener: TcpListener,
         port: u16,
-        observer: Arc<MySqlPool>,
+        observer: Arc<MemoryPool>,
         statement: &'static str,
         observation: DurableObservation,
         discarded: Arc<AtomicBool>,
@@ -3048,7 +3048,7 @@ impl AckDropProxy {
             .unwrap();
         MemoryStore {
             shared: store.shared.clone(),
-            pool: Arc::new(pool),
+            pool: Arc::new(MemoryPool::fixture(pool, &store.branch)),
             branch: store.branch.clone(),
             logical_receipt: None,
         }
@@ -3078,7 +3078,7 @@ impl ReservedAckDropProxy {
 
     fn start(
         self,
-        observer: Arc<MySqlPool>,
+        observer: Arc<MemoryPool>,
         statement: &'static str,
         observation: DurableObservation,
     ) -> AckDropProxy {
@@ -3095,7 +3095,7 @@ impl ReservedAckDropProxy {
 
     fn start_absent(
         self,
-        observer: Arc<MySqlPool>,
+        observer: Arc<MemoryPool>,
         observation: DurableObservation,
     ) -> AckDropProxy {
         AckDropProxy::from_listener(
@@ -3111,7 +3111,7 @@ impl ReservedAckDropProxy {
 }
 
 struct Fault {
-    observer: Arc<MySqlPool>,
+    observer: Arc<MemoryPool>,
     statement: &'static str,
     observation: DurableObservation,
     discarded: Arc<AtomicBool>,

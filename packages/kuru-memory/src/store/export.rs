@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use crate::pool::MemoryPool;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{MySqlPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use super::{MemoryStore, QUERY_TIMEOUT, Shared, decode_message, migrations, revision};
@@ -85,7 +86,7 @@ pub struct ExportPage {
 #[derive(Clone, Debug)]
 pub struct ActiveExportSnapshot {
     _shared: Arc<Shared>,
-    pool: Arc<MySqlPool>,
+    pool: Arc<MemoryPool>,
     provenance: ExportProvenance,
     id: Uuid,
 }
@@ -316,7 +317,7 @@ impl ActiveExportSnapshot {
     }
 }
 
-async fn count(pool: &MySqlPool, table: &'static str) -> Result<u64> {
+async fn count(pool: &MemoryPool, table: &'static str) -> Result<u64> {
     let query = match table {
         "messages" => "SELECT COUNT(*) FROM messages",
         "state" => "SELECT COUNT(*) FROM state",
@@ -333,7 +334,7 @@ async fn count(pool: &MySqlPool, table: &'static str) -> Result<u64> {
 }
 
 async fn messages(
-    pool: &MySqlPool,
+    pool: &MemoryPool,
     schema_version: i32,
     after: Option<i64>,
 ) -> Result<Vec<StorageRecord>> {
@@ -408,7 +409,7 @@ async fn messages(
         .collect()
 }
 
-async fn state(pool: &MySqlPool, after: Option<Vec<u8>>) -> Result<Vec<StorageRecord>> {
+async fn state(pool: &MemoryPool, after: Option<Vec<u8>>) -> Result<Vec<StorageRecord>> {
     let rows = match after {
         Some(after) => {
             tokio::time::timeout(
@@ -447,7 +448,7 @@ async fn state(pool: &MySqlPool, after: Option<Vec<u8>>) -> Result<Vec<StorageRe
 }
 
 async fn context_summaries(
-    pool: &MySqlPool,
+    pool: &MemoryPool,
     schema_version: i32,
     after: Option<String>,
 ) -> Result<Vec<StorageRecord>> {
@@ -521,7 +522,7 @@ async fn context_summaries(
 }
 
 async fn context_cursors(
-    pool: &MySqlPool,
+    pool: &MemoryPool,
     after: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>,
 ) -> Result<Vec<StorageRecord>> {
     let rows = match after {
@@ -563,7 +564,7 @@ async fn context_cursors(
         .collect()
 }
 
-async fn session_catalog(pool: &MySqlPool, after: Option<Vec<u8>>) -> Result<Vec<StorageRecord>> {
+async fn session_catalog(pool: &MemoryPool, after: Option<Vec<u8>>) -> Result<Vec<StorageRecord>> {
     let rows = match after {
         Some(after) => sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog WHERE session_id > ? ORDER BY session_id LIMIT ?")
             .bind(after)
@@ -585,7 +586,7 @@ async fn session_catalog(pool: &MySqlPool, after: Option<Vec<u8>>) -> Result<Vec
         .collect()
 }
 
-async fn public_turns(pool: &MySqlPool, after: Option<String>) -> Result<Vec<StorageRecord>> {
+async fn public_turns(pool: &MemoryPool, after: Option<String>) -> Result<Vec<StorageRecord>> {
     let rows = match after {
         Some(after) => sqlx::query("SELECT node_id, origin_session_id, turn_id, record_kind, continuation_of_node_id, predecessor_node_id, settlement, user_entry, speaker_id, terminal_entries, record_format FROM session_public_turns WHERE node_id > ? ORDER BY node_id LIMIT ?")
             .bind(after)

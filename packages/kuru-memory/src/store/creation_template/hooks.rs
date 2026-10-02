@@ -211,7 +211,7 @@ pub(super) fn manifest_written() {
 /// Run `statements` in order on one connection of `main`, so session state
 /// such as `USE` carries from one to the next. A caller that changes the
 /// session's database restores it last: the connection returns to the pool.
-async fn execute(main: &MySqlPool, statements: &[String]) -> Result<()> {
+async fn execute(main: &MemoryPool, statements: &[String]) -> Result<()> {
     if statements.is_empty() {
         return Ok(());
     }
@@ -231,7 +231,7 @@ async fn execute(main: &MySqlPool, statements: &[String]) -> Result<()> {
 
 /// On the live build engine, before the shape check: run the scoped
 /// statements, then wait at the scoped pause.
-pub(in crate::store) async fn before_shape(main: &MySqlPool) -> Result<()> {
+pub(in crate::store) async fn before_shape(main: &MemoryPool) -> Result<()> {
     let Some(hooks) = current() else {
         return Ok(());
     };
@@ -245,7 +245,7 @@ pub(in crate::store) async fn before_shape(main: &MySqlPool) -> Result<()> {
 
 /// On the live build engine, after the shape check passed: run the scoped
 /// statements.
-pub(in crate::store) async fn after_shape(main: &MySqlPool) -> Result<()> {
+pub(in crate::store) async fn after_shape(main: &MemoryPool) -> Result<()> {
     match current() {
         Some(hooks) => execute(main, &hooks.after_shape).await,
         None => Ok(()),

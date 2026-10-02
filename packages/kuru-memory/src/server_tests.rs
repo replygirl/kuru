@@ -719,7 +719,8 @@ async fn selected_port_takeover_retries_actual_dolt_without_touching_holder() ->
         1,
         PoolAttemptOptions::ordinary(),
     )
-    .await?;
+    .await?
+    .0;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kuru_instance")
         .fetch_one(&pool)
         .await?;

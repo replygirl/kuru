@@ -10,12 +10,12 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
-use crate::{engine::Child, files};
+use crate::{engine::Child, files, pool::MemoryPool};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 #[cfg(windows)]
@@ -195,7 +195,7 @@ struct ServerInner {
     identity: Identity,
     endpoint: Endpoint,
     read_only: bool,
-    pools: Mutex<BTreeMap<String, Weak<MySqlPool>>>,
+    pools: Mutex<BTreeMap<String, Weak<MemoryPool>>>,
     pool_admission: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
     /// The deadline that bounded this owned start's readiness and first
     /// authenticated probe. Pools the store opening requests from this server
@@ -205,6 +205,8 @@ struct ServerInner {
     candidate_wait_observer: Mutex<Option<oneshot::Sender<()>>>,
     #[cfg(test)]
     next_pool_probe_delay: StdMutex<Option<(Duration, Arc<AtomicBool>)>>,
+    #[cfg(test)]
+    next_pool_first_release_hold: StdMutex<Option<tokio::sync::oneshot::Sender<ConnectionGate>>>,
     /// Every branch or revision a caller asked [`Server::pool`] for, in order.
     #[cfg(test)]
     pool_requests: StdMutex<Vec<String>>,
@@ -428,7 +430,7 @@ enum Response {
     TemplateRejected(String),
 }
 
-async fn drain_closed_pools(pools: &[Arc<MySqlPool>]) {
+async fn drain_closed_pools(pools: &[Arc<MemoryPool>]) {
     // `Pool::close` marks its pool closed before returning the future. Build
     // all futures first so one slow MySQL QUIT cannot leave a sibling branch
     // pool admitting work while the exact owner is being reaped.
@@ -436,7 +438,7 @@ async fn drain_closed_pools(pools: &[Arc<MySqlPool>]) {
     futures::future::join_all(drains).await;
 }
 
-async fn close_pools_and_owner(pools: &[Arc<MySqlPool>], owner: Option<Owner>) -> Result<()> {
+async fn close_pools_and_owner(pools: &[Arc<MemoryPool>], owner: Option<Owner>) -> Result<()> {
     // Mark every pool closed and first allow ordinary graceful SQL teardown.
     // SQLx can stall while gracefully closing an idle MySQL socket even after
     // the accepted query's server session has ended. Reaping our exact engine
@@ -823,12 +825,15 @@ impl Server {
                         first_acquire_window: remaining,
                         identity_rejection_is_terminal: true,
                         _test_probe_delay: _initial_probe_delay,
+                        #[cfg(test)]
+                        _test_first_release_hold: None,
                     },
                 ),
             )
             .await
             .context("post-readiness memory authentication deadline exceeded")?
-            .context("authenticate post-readiness memory connection")?;
+            .context("authenticate post-readiness memory connection")?
+            .0;
             let verification =
                 verify_identity_until(&probe, &directory, &identity, startup_deadline)
                     .await
@@ -894,6 +899,8 @@ impl Server {
             #[cfg(test)]
             next_pool_probe_delay: StdMutex::new(None),
             #[cfg(test)]
+            next_pool_first_release_hold: StdMutex::new(None),
+            #[cfg(test)]
             pool_requests: StdMutex::new(Vec::new()),
             owner: Mutex::new(owner),
             reap_guard,
@@ -901,7 +908,7 @@ impl Server {
         }))
     }
 
-    pub async fn pool(&self, branch: &str) -> Result<Arc<MySqlPool>> {
+    pub async fn pool(&self, branch: &str) -> Result<Arc<MemoryPool>> {
         #[cfg(test)]
         self.0
             .pool_requests
@@ -918,7 +925,7 @@ impl Server {
             return Ok(pool);
         }
         pools.retain(|_, pool| pool.strong_count() != 0);
-        let pool = connect_pool_with_timeout(
+        let (pool, observation) = connect_pool_with_timeout(
             &self.0.identity,
             &self.0.endpoint,
             &self.0.directory,
@@ -929,6 +936,9 @@ impl Server {
         )
         .await
         .context("authenticate memory branch pool")?;
+        // The first connection is already idle again and the identity queries
+        // release inline through the funnel, so both reuse that one session.
+        let pool = MemoryPool::new(pool, branch, observation);
         verify_identity_until(
             &pool,
             &self.0.directory,
@@ -942,6 +952,18 @@ impl Server {
         Ok(pool)
     }
 
+    /// The connection observation of the live pool for `branch`.
+    #[cfg(test)]
+    pub(crate) async fn pool_observation(&self, branch: &str) -> Option<ConnectionObservation> {
+        self.0
+            .pools
+            .lock()
+            .await
+            .get(branch)
+            .and_then(Weak::upgrade)
+            .map(|pool| pool.observation().clone())
+    }
+
     /// End the opening phase once the store that started this server is
     /// ready. Later pools use exactly the ordinary per-attempt window.
     pub(crate) fn finish_opening(&self) {
@@ -952,7 +974,7 @@ impl Server {
             .expect("opening deadline lock") = None;
     }
 
-    fn opening_deadline(&self) -> Option<Instant> {
+    pub(crate) fn opening_deadline(&self) -> Option<Instant> {
         *self
             .0
             .opening_deadline
@@ -992,7 +1014,29 @@ impl Server {
                 .take(),
             #[cfg(not(test))]
             _test_probe_delay: None,
+            #[cfg(test)]
+            _test_first_release_hold: self
+                .0
+                .next_pool_first_release_hold
+                .lock()
+                .expect("pool first release hold lock")
+                .take(),
         }
+    }
+
+    /// Hold the next pool's first connection release before SQLx's ping,
+    /// until its attempt's deadline; the receiver gets the take-once gate.
+    #[cfg(test)]
+    pub(crate) fn hold_next_pool_first_release(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<ConnectionGate> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        *self
+            .0
+            .next_pool_first_release_hold
+            .lock()
+            .expect("pool first release hold lock") = Some(sender);
+        receiver
     }
 
     /// Delay the next pool's authentication callback after a real Dolt
@@ -1076,7 +1120,7 @@ impl Server {
     pub(crate) async fn retire_branch_sessions<'a>(
         &self,
         admission: &'a BranchAdmission,
-        observer: &MySqlPool,
+        observer: &MemoryPool,
         deadline: Duration,
     ) -> Result<SessionsEnded<'a>> {
         self.retire_pool(&admission.branch).await?;
@@ -1089,7 +1133,7 @@ impl Server {
     /// `kuru/<branch>`. Observation alone; it grants no branch procedure.
     pub(crate) async fn await_branch_sessions_end(
         &self,
-        observer: &MySqlPool,
+        observer: &MemoryPool,
         branch: &str,
         duration: Duration,
     ) -> Result<()> {
@@ -1727,8 +1771,25 @@ fn valid_secret(secret: &str) -> bool {
     secret.len() == 64 && secret.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// One pool's connection progress for its whole life: the latest
+/// authentication phase, the last callback rejection and how many new
+/// connections entered Kuru's identity callback (after their TCP connect and
+/// MySQL authentication). Retained with the pool.
 #[derive(Clone)]
-struct ConnectionObservation(Arc<StdMutex<ConnectionProgress>>);
+pub(crate) struct ConnectionObservation(Arc<ObservationShared>);
+
+struct ObservationShared {
+    progress: StdMutex<ConnectionProgress>,
+    authenticated: AtomicU64,
+    #[cfg(test)]
+    first_release_cut: AtomicBool,
+    #[cfg(test)]
+    abandoned: AtomicU64,
+    #[cfg(test)]
+    gate: StdMutex<Option<Arc<GateShared>>>,
+    #[cfg(test)]
+    release_gate: StdMutex<Option<Arc<GateShared>>>,
+}
 
 struct ConnectionProgress {
     phase: &'static str,
@@ -1737,15 +1798,173 @@ struct ConnectionProgress {
 
 impl ConnectionObservation {
     fn new() -> Self {
-        Self(Arc::new(StdMutex::new(ConnectionProgress {
-            phase: "after_connect not entered",
-            last_failure: None,
-        })))
+        Self(Arc::new(ObservationShared {
+            progress: StdMutex::new(ConnectionProgress {
+                phase: "after_connect not entered",
+                last_failure: None,
+            }),
+            authenticated: AtomicU64::new(0),
+            #[cfg(test)]
+            first_release_cut: AtomicBool::new(false),
+            #[cfg(test)]
+            abandoned: AtomicU64::new(0),
+            #[cfg(test)]
+            gate: StdMutex::new(None),
+            #[cfg(test)]
+            release_gate: StdMutex::new(None),
+        }))
     }
 
     fn phase(&self, phase: &'static str) {
-        if let Ok(mut progress) = self.0.lock() {
+        if let Ok(mut progress) = self.0.progress.lock() {
             progress.phase = phase;
+        }
+    }
+
+    /// An observation for a pool without the identity callback.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Self::new()
+    }
+
+    /// The latest authentication phase any connection of this pool reached.
+    pub(crate) fn latest_phase(&self) -> &'static str {
+        self.0
+            .progress
+            .lock()
+            .map_or("connection observation unavailable", |progress| {
+                progress.phase
+            })
+    }
+
+    /// New connections that entered this pool's authentication callback.
+    pub(crate) fn authenticated(&self) -> u64 {
+        self.0.authenticated.load(Ordering::SeqCst)
+    }
+
+    /// Whether this pool's first connection release was cut at its pool
+    /// attempt's deadline, so that connection was closed and identity
+    /// verification authenticated its own: one more authenticated connection
+    /// that is the bounded close, not churn.
+    #[cfg(test)]
+    pub(crate) fn first_release_cut(&self) -> bool {
+        self.0.first_release_cut.load(Ordering::SeqCst)
+    }
+
+    /// Identity callbacks of this pool whose connection never reached the
+    /// pool: the callback was cancelled with its timed-out acquire (such as
+    /// an opening-phase first acquire that is then retried) or returned an
+    /// error, after which SQLx closes the connection and may connect again.
+    /// Each is one more authenticated connection that is an abandoned
+    /// attempt, not churn of a working session.
+    #[cfg(test)]
+    pub(crate) fn abandoned_authentications(&self) -> u64 {
+        self.0.abandoned.load(Ordering::SeqCst)
+    }
+
+    /// Count a new connection entering Kuru's identity callback, its first
+    /// line: a TCP or MySQL handshake that never finishes is never counted.
+    /// Under an armed test gate, the connection then waits until the gate is
+    /// dropped. The returned attempt counts as abandoned unless the callback
+    /// completes it, including when it is cancelled while held at the gate.
+    async fn authentication_entered(&self) -> CallbackAttempt {
+        self.0.authenticated.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        {
+            let attempt = CallbackAttempt {
+                observation: Some(self.clone()),
+            };
+            let gate = self
+                .0
+                .gate
+                .lock()
+                .expect("authentication gate lock")
+                .clone();
+            if let Some(gate) = gate {
+                self.phase(AUTHENTICATION_GATE_PHASE);
+                gate.hold().await;
+            }
+            attempt
+        }
+        #[cfg(not(test))]
+        CallbackAttempt {}
+    }
+
+    /// A checked-out connection is being returned to this pool. Under an
+    /// armed test release gate, the return waits until the gate is dropped.
+    #[cfg(test)]
+    async fn release_entered(&self) {
+        let gate = {
+            let mut slot = self.0.release_gate.lock().expect("release gate lock");
+            if slot.as_ref().is_some_and(|gate| gate.once) {
+                slot.take()
+            } else {
+                slot.clone()
+            }
+        };
+        if let Some(gate) = gate {
+            gate.hold().await;
+        }
+    }
+
+    /// Hold every later new connection of this pool at the start of its
+    /// authentication until the returned gate is dropped. No time elapses
+    /// inside the gate; tests observe [`ConnectionGate::entered`].
+    #[cfg(test)]
+    pub(crate) fn gate_new_authentications(&self) -> ConnectionGate {
+        let shared = Arc::new(GateShared {
+            entered: tokio::sync::watch::Sender::new(false),
+            released: tokio::sync::watch::Sender::new(false),
+            once: false,
+        });
+        let previous = self
+            .0
+            .gate
+            .lock()
+            .expect("authentication gate lock")
+            .replace(shared.clone());
+        assert!(previous.is_none(), "authentication gate already armed");
+        ConnectionGate {
+            shared,
+            observation: self.clone(),
+            slot: |shared| &shared.gate,
+        }
+    }
+
+    /// Hold every later return of a checked-out connection to this pool,
+    /// before SQLx's release ping, until the returned gate is dropped. A
+    /// held return stays pending, so a test can cancel a release mid-flight
+    /// without guessing how long the ping takes.
+    #[cfg(test)]
+    pub(crate) fn gate_releases(&self) -> ConnectionGate {
+        self.arm_release_gate(false)
+    }
+
+    /// Hold only the next return of a checked-out connection, as
+    /// [`Self::gate_releases`] does; later returns pass.
+    #[cfg(test)]
+    pub(crate) fn gate_next_release(&self) -> ConnectionGate {
+        self.arm_release_gate(true)
+    }
+
+    #[cfg(test)]
+    fn arm_release_gate(&self, once: bool) -> ConnectionGate {
+        let shared = Arc::new(GateShared {
+            entered: tokio::sync::watch::Sender::new(false),
+            released: tokio::sync::watch::Sender::new(false),
+            once,
+        });
+        let previous = self
+            .0
+            .release_gate
+            .lock()
+            .expect("release gate lock")
+            .replace(shared.clone());
+        assert!(previous.is_none(), "release gate already armed");
+        ConnectionGate {
+            shared,
+            observation: self.clone(),
+            slot: |shared| &shared.release_gate,
         }
     }
 
@@ -1753,7 +1972,7 @@ impl ConnectionObservation {
         // SQLx discards callback errors while retrying acquisition. Keep only
         // authored messages or static error classes, never SQL payloads or
         // connection options. A later attempt may be in a different phase.
-        let Ok(mut progress) = self.0.lock() else {
+        let Ok(mut progress) = self.0.progress.lock() else {
             return;
         };
         let cause = match error {
@@ -1774,8 +1993,8 @@ impl ConnectionObservation {
         progress.last_failure = Some((progress.phase, cause));
     }
 
-    fn diagnostic(&self) -> String {
-        let Ok(progress) = self.0.lock() else {
+    pub(crate) fn diagnostic(&self) -> String {
+        let Ok(progress) = self.0.progress.lock() else {
             return "connection observation unavailable".into();
         };
         let mut diagnostic = format!("connection phase: {}", progress.phase);
@@ -1788,11 +2007,101 @@ impl ConnectionObservation {
     }
 
     fn is_pre_callback_connection_reset(&self, error: &sqlx::Error) -> bool {
-        let Ok(progress) = self.0.lock() else {
+        let Ok(progress) = self.0.progress.lock() else {
             return false;
         };
         progress.phase == "after_connect not entered"
             && matches!(error, sqlx::Error::Io(error) if error.kind() == std::io::ErrorKind::ConnectionReset)
+    }
+}
+
+/// One identity callback in flight. Under test, dropping it before
+/// [`Self::accepted`] records the callback as abandoned on its pool's
+/// observation; outside tests it carries nothing.
+struct CallbackAttempt {
+    #[cfg(test)]
+    observation: Option<ConnectionObservation>,
+}
+
+impl CallbackAttempt {
+    /// The callback accepted its connection, which SQLx now hands to the pool.
+    fn accepted(self) {
+        #[cfg(test)]
+        {
+            let mut attempt = self;
+            attempt.observation = None;
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CallbackAttempt {
+    fn drop(&mut self) {
+        if let Some(observation) = self.observation.take() {
+            observation.0.abandoned.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The phase a gated new connection reports while held.
+#[cfg(test)]
+pub(crate) const AUTHENTICATION_GATE_PHASE: &str = "authentication gate entered";
+
+#[cfg(test)]
+struct GateShared {
+    entered: tokio::sync::watch::Sender<bool>,
+    released: tokio::sync::watch::Sender<bool>,
+    /// Hold only the first connection that reaches the gate.
+    once: bool,
+}
+
+#[cfg(test)]
+impl GateShared {
+    /// Report entry, then wait until the gate is dropped.
+    async fn hold(&self) {
+        self.entered.send_replace(true);
+        let mut released = self.released.subscribe();
+        let _ = released.wait_for(|released| *released).await;
+    }
+}
+
+/// A test hold on one pool's new connections (or, from
+/// [`ConnectionObservation::gate_releases`], on its connection returns).
+/// Dropping it releases every held connection and disarms the pool.
+#[cfg(test)]
+pub(crate) struct ConnectionGate {
+    shared: Arc<GateShared>,
+    observation: ConnectionObservation,
+    slot: fn(&ObservationShared) -> &StdMutex<Option<Arc<GateShared>>>,
+}
+
+#[cfg(test)]
+impl ConnectionGate {
+    /// Completes once a new connection of the gated pool has entered
+    /// authentication.
+    pub(crate) async fn entered(&self) {
+        let mut entered = self.shared.entered.subscribe();
+        let _ = entered.wait_for(|entered| *entered).await;
+    }
+
+    pub(crate) fn was_entered(&self) -> bool {
+        *self.shared.entered.borrow()
+    }
+}
+
+#[cfg(test)]
+impl Drop for ConnectionGate {
+    fn drop(&mut self) {
+        // A take-once gate may already have left the slot; never disarm a
+        // different gate armed after it.
+        if let Ok(mut gate) = (self.slot)(&self.observation.0).lock()
+            && gate
+                .as_ref()
+                .is_some_and(|armed| Arc::ptr_eq(armed, &self.shared))
+        {
+            gate.take();
+        }
+        self.shared.released.send_replace(true);
     }
 }
 
@@ -1806,6 +2115,10 @@ struct PoolAttemptOptions {
     /// When set, an authored identity rejection ends acquisition instead.
     identity_rejection_is_terminal: bool,
     _test_probe_delay: Option<(Duration, Arc<AtomicBool>)>,
+    /// Receives a take-once gate that holds the attempt's first connection
+    /// release before SQLx's ping.
+    #[cfg(test)]
+    _test_first_release_hold: Option<tokio::sync::oneshot::Sender<ConnectionGate>>,
 }
 
 impl PoolAttemptOptions {
@@ -1815,6 +2128,8 @@ impl PoolAttemptOptions {
             first_acquire_window: ORDINARY_POOL_WINDOW,
             identity_rejection_is_terminal: false,
             _test_probe_delay: None,
+            #[cfg(test)]
+            _test_first_release_hold: None,
         }
     }
 }
@@ -1867,12 +2182,15 @@ async fn connect_pool_with_timeout(
     read_only: bool,
     max: u32,
     attempt: PoolAttemptOptions,
-) -> Result<MySqlPool> {
+) -> Result<(MySqlPool, ConnectionObservation)> {
     let (result, observation) = connect_pool_attempt(
         identity, endpoint, directory, branch, read_only, max, attempt,
     )
     .await?;
-    result.map_err(|error| connection_error(error, &observation))
+    match result {
+        Ok(pool) => Ok((pool, observation)),
+        Err(error) => Err(connection_error(error, &observation)),
+    }
 }
 
 fn connection_error(error: sqlx::Error, observation: &ConnectionObservation) -> anyhow::Error {
@@ -1936,6 +2254,7 @@ async fn connect_pool_attempt(
             #[cfg(test)]
             let stalled_until = stalled_until.clone();
             Box::pin(async move {
+                let attempt = observation.authentication_entered().await;
                 #[cfg(test)]
                 if let Some((delay, entered)) = test_probe_delay {
                     observation.phase("initial authentication callback entered");
@@ -1970,14 +2289,28 @@ async fn connect_pool_attempt(
                     Ok(())
                 }
                 .await;
-                if let Err(error) = &result {
-                    observation.rejected(error);
-                    rejection.record(error);
+                match &result {
+                    Ok(()) => attempt.accepted(),
+                    Err(error) => {
+                        observation.rejected(error);
+                        rejection.record(error);
+                    }
                 }
                 result
             })
+        });
+    #[cfg(test)]
+    let pool = {
+        let observation = observation.clone();
+        pool.after_release(move |_, _| {
+            let observation = observation.clone();
+            Box::pin(async move {
+                observation.release_entered().await;
+                Ok(true)
+            })
         })
-        .connect_lazy_with(options);
+    };
+    let pool = pool.connect_lazy_with(options);
     // Equivalent to `connect_with` (one acquire, then release) when the first
     // window equals the lifetime timeout. A longer opening window retries
     // timed-out acquires without changing any later acquire on this pool.
@@ -1998,14 +2331,43 @@ async fn connect_pool_attempt(
             Err(_) => break Err(sqlx::Error::PoolTimedOut),
         }
     };
-    let result = acquired.map(|connection| {
-        drop(connection);
-        pool
-    });
+    let result = match acquired {
+        Ok(mut connection) => {
+            // Return the first connection inline so the next statement on
+            // this pool reuses it instead of racing SQLx's spawned release.
+            // The attempt's own deadline bounds the release ping: when it
+            // runs out the future is dropped, SQLx closes the connection, and
+            // the identity verification opens one under its own deadline.
+            #[cfg(test)]
+            if let Some(hold) = attempt._test_first_release_hold {
+                let _ = hold.send(observation.gate_next_release());
+            }
+            if timeout_at(first_deadline, connection.return_to_pool())
+                .await
+                .is_err()
+            {
+                #[cfg(test)]
+                observation
+                    .0
+                    .first_release_cut
+                    .store(true, Ordering::SeqCst);
+                tracing::warn!(
+                    branch,
+                    "memory pool's first connection release exceeded the attempt's deadline; \
+                     the connection was closed instead of returned to the pool"
+                );
+            }
+            Ok(pool)
+        }
+        Err(error) => Err(error),
+    };
     Ok((result, observation))
 }
 
-async fn verify_identity(pool: &MySqlPool, directory: &Path, identity: &Identity) -> Result<()> {
+async fn verify_identity<'p, P>(pool: P, directory: &Path, identity: &Identity) -> Result<()>
+where
+    P: sqlx::Executor<'p, Database = sqlx::MySql> + Copy,
+{
     verify_identity_until(
         pool,
         directory,
@@ -2015,12 +2377,15 @@ async fn verify_identity(pool: &MySqlPool, directory: &Path, identity: &Identity
     .await
 }
 
-async fn verify_identity_until(
-    pool: &MySqlPool,
+async fn verify_identity_until<'p, P>(
+    pool: P,
     directory: &Path,
     identity: &Identity,
     deadline: Instant,
-) -> Result<()> {
+) -> Result<()>
+where
+    P: sqlx::Executor<'p, Database = sqlx::MySql> + Copy,
+{
     timeout_at(deadline, async {
         let datadir: String = sqlx::query_scalar("SELECT @@datadir")
             .fetch_one(pool)

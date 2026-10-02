@@ -103,7 +103,7 @@ async fn refs<'e>(
 }
 
 /// The sole parent of `commit`.
-async fn parent(pool: &MySqlPool, commit: &str) -> Result<String> {
+async fn parent(pool: &MemoryPool, commit: &str) -> Result<String> {
     let parents: Vec<String> = bounded(
         "read commit parents",
         sqlx::query_scalar(
@@ -198,8 +198,9 @@ async fn variant(template: &Template, data_dir: &Path, statements: &[&str]) -> R
     let server = start(data_dir, &store, TEMPLATE_SCOPE, false).await?;
     let changed = async {
         let main = server.pool("main").await?;
-        let mut connection = bounded("acquire the variant session", main.acquire())
-            .await?
+        let mut connection = tokio::time::timeout(QUERY_TIMEOUT, main.acquire())
+            .await
+            .context("acquire the variant session: deadline exceeded")??
             .detach();
         let changed = async {
             for statement in statements {
@@ -338,7 +339,7 @@ async fn open(data_dir: &Path, scope: &str) -> Result<MemoryStore> {
     crate::test_support::spawn_gated_open(options).await
 }
 
-async fn port(pool: &MySqlPool) -> Result<u16> {
+async fn port(pool: &MemoryPool) -> Result<u16> {
     let port: i64 = bounded(
         "read engine port",
         sqlx::query_scalar("SELECT CAST(@@port AS SIGNED)").fetch_one(pool),
@@ -372,7 +373,7 @@ async fn refused(port: u16, user: &str, password: &str) -> Result<bool> {
 }
 
 /// The instance row of a ref, read from `main`'s pool by qualified name.
-async fn row_on(pool: &MySqlPool, database: &str) -> Result<(String, String)> {
+async fn row_on(pool: &MemoryPool, database: &str) -> Result<(String, String)> {
     bounded(
         "read an identity row",
         sqlx::query_as(sqlx::AssertSqlSafe(format!(

@@ -135,7 +135,7 @@ impl ValidationProbe {
             .push((directory.to_owned(), identity));
     }
 
-    async fn before_cold_stage_validation(&self, stage: &Path, pool: &MySqlPool) -> Result<()> {
+    async fn before_cold_stage_validation(&self, stage: &Path, pool: &MemoryPool) -> Result<()> {
         self.validating(stage);
         if self.dirty_cold_stage {
             tokio::time::timeout(
@@ -154,7 +154,7 @@ impl ValidationProbe {
 /// cold staged build and the store template build.
 async fn build_schema(
     server: &Server,
-    pool: &MySqlPool,
+    pool: &MemoryPool,
     legacy: Option<&LegacyImport>,
     #[cfg(test)] hooks: Option<&migrations::MigrationRunnerHooks>,
 ) -> std::result::Result<(), (Phase, anyhow::Error)> {
@@ -205,7 +205,7 @@ where
         startup: File,
         start: Start,
         progress: &mut ProgressReporter,
-    ) -> Result<(Server, Arc<MySqlPool>)> {
+    ) -> Result<(Server, Arc<MemoryPool>)> {
         progress.report(MemoryOpenStage::OpeningDatabase);
         let server =
             Server::open_with_guard((self.make_options)(self.stage.to_owned(), false), startup)
@@ -388,7 +388,7 @@ impl StageSession {
     /// Run the session, close and reap its engine, and return the startup
     /// lock. A failure before `ready.json` preserves the unready stage while
     /// the lock is still held.
-    async fn finish(mut self, server: Server, pool: Arc<MySqlPool>) -> Result<File> {
+    async fn finish(mut self, server: Server, pool: Arc<MemoryPool>) -> Result<File> {
         let activated = self.activate(&server, &pool).await;
         match (activated, close_migration_worker(server, pool).await) {
             (Ok(()), Ok(returned_lock)) => Ok(returned_lock),
@@ -418,7 +418,7 @@ impl StageSession {
     async fn activate(
         &mut self,
         server: &Server,
-        pool: &MySqlPool,
+        pool: &MemoryPool,
     ) -> std::result::Result<(), (Phase, anyhow::Error)> {
         match self.kind {
             Session::Cold => {
@@ -466,7 +466,7 @@ impl StageSession {
 
     /// Read the initial revision and publish `ready.json` between the marker
     /// boundaries.
-    async fn mark(&mut self, pool: &MySqlPool) -> Result<()> {
+    async fn mark(&mut self, pool: &MemoryPool) -> Result<()> {
         let initial_revision = revision(pool).await?;
         let activation = Activation {
             format: 1,
