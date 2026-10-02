@@ -1782,6 +1782,8 @@ struct ObservationShared {
     progress: StdMutex<ConnectionProgress>,
     authenticated: AtomicU64,
     #[cfg(test)]
+    first_release_cut: AtomicBool,
+    #[cfg(test)]
     gate: StdMutex<Option<Arc<GateShared>>>,
     #[cfg(test)]
     release_gate: StdMutex<Option<Arc<GateShared>>>,
@@ -1800,6 +1802,8 @@ impl ConnectionObservation {
                 last_failure: None,
             }),
             authenticated: AtomicU64::new(0),
+            #[cfg(test)]
+            first_release_cut: AtomicBool::new(false),
             #[cfg(test)]
             gate: StdMutex::new(None),
             #[cfg(test)]
@@ -1832,6 +1836,15 @@ impl ConnectionObservation {
     /// New connections that entered this pool's authentication callback.
     pub(crate) fn authenticated(&self) -> u64 {
         self.0.authenticated.load(Ordering::SeqCst)
+    }
+
+    /// Whether this pool's first connection release was cut at its pool
+    /// attempt's deadline, so that connection was closed and identity
+    /// verification authenticated its own: one more authenticated connection
+    /// that is the bounded close, not churn.
+    #[cfg(test)]
+    pub(crate) fn first_release_cut(&self) -> bool {
+        self.0.first_release_cut.load(Ordering::SeqCst)
     }
 
     /// Count a new connection entering Kuru's identity callback, its first
@@ -2280,6 +2293,11 @@ async fn connect_pool_attempt(
                 .await
                 .is_err()
             {
+                #[cfg(test)]
+                observation
+                    .0
+                    .first_release_cut
+                    .store(true, Ordering::SeqCst);
                 tracing::warn!(
                     branch,
                     "memory pool's first connection release exceeded the attempt's deadline; \

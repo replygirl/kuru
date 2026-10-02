@@ -24,6 +24,21 @@ async fn observation(store: &MemoryStore, branch: &str) -> Result<ConnectionObse
         .with_context(|| format!("no live pool retained for {branch}"))
 }
 
+/// A fresh pool whose sequential open work reused one session authenticated
+/// exactly one connection, plus verification's own when the pool attempt's
+/// deadline cut the first connection's release (the bounded close the
+/// product allows, never churn).
+fn ensure_one_working_session(observed: &ConnectionObservation, work: &str) -> Result<()> {
+    let authenticated = observed.authenticated();
+    let cut = observed.first_release_cut();
+    ensure!(
+        authenticated == 1 + u64::from(cut),
+        "{work} authenticated {authenticated} connections (first release cut: {cut}), \
+         not one working session"
+    );
+    Ok(())
+}
+
 /// Run one step of sequential work; fail as soon as any new connection of the
 /// gated pool enters authentication instead of reusing the pooled session.
 async fn reusing<T>(
@@ -41,16 +56,15 @@ async fn reusing<T>(
 }
 
 /// The open sequence runs its statements one after another on each pool, so
-/// each pool authenticates exactly one connection.
+/// each pool authenticates exactly one working connection.
 #[tokio::test]
 async fn fresh_open_authenticates_one_session_per_pool() -> Result<()> {
     let store = MemoryStore::temporary().await?;
     for branch in ["main", usage_ledger::BRANCH] {
-        let authenticated = observation(&store, branch).await?.authenticated();
-        ensure!(
-            authenticated == 1,
-            "the open sequence authenticated {authenticated} connections on {branch}, not one"
-        );
+        ensure_one_working_session(
+            &observation(&store, branch).await?,
+            &format!("the open sequence on {branch}"),
+        )?;
     }
     store.close().await?;
     Ok(())
@@ -74,12 +88,8 @@ async fn sequential_statements_authenticate_one_session() -> Result<()> {
     let pool = store.shared.server.pool(branch).await?;
     let observed = observation(&store, branch).await?;
     // Load-bearing before the gate: creation and its two identity queries
-    // must have used one session.
-    ensure!(
-        observed.authenticated() == 1,
-        "creating and verifying the pool authenticated {} connections, not one",
-        observed.authenticated()
-    );
+    // must have used one working session.
+    ensure_one_working_session(&observed, "creating and verifying the pool")?;
     let gate = observed.gate_new_authentications();
     let one: i64 = reusing(&gate, "fetch_one", async {
         Ok(sqlx::query_scalar("SELECT 1")
@@ -132,7 +142,7 @@ async fn sequential_statements_authenticate_one_session() -> Result<()> {
     .await?;
     ensure!(after == 8);
     ensure!(!gate.was_entered());
-    ensure!(observed.authenticated() == 1);
+    ensure_one_working_session(&observed, "the pool's sequential statements")?;
     drop(gate);
     drop(pool);
     store.close().await?;
@@ -690,10 +700,15 @@ async fn first_connection_release_is_bounded_by_its_attempt_deadline() -> Result
         "the first connection's release did not reach the pool's return"
     );
     ensure!(
+        pool.observation().first_release_cut(),
+        "the held first release was not recorded as cut at the attempt's deadline"
+    );
+    ensure!(
         pool.authenticated() == 2,
         "{} connections authenticated; the closed first connection and verification's own were expected",
         pool.authenticated()
     );
+    ensure_one_working_session(pool.observation(), "the pool with its first release cut")?;
     ensure!(
         (pool.size(), pool.num_idle()) == (1, 1),
         "the pool holds {} connections, {} idle, after the first was closed",
