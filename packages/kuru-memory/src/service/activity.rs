@@ -301,17 +301,18 @@ pub(crate) enum Observation {
     Absent,
     /// Something is there that cannot be presented this poll: another
     /// owner's record, an undecodable or oversized one, a record replaced or
-    /// retired between its read and the check that its name still holds it,
-    /// or any other failure. It decides nothing.
+    /// retired after its open and before the check that its name still holds
+    /// the handle opened, or any other failure. It decides nothing.
     Unusable,
     /// The record tagged with this starter's tag.
     Record(Activity),
 }
 
 /// One bounded read of the record tagged `tag`. Only a missing name is
-/// [`Observation::Absent`]; a failed verification after the read is
-/// [`Observation::Unusable`] even when the name has since gone, so a
-/// retirement is first seen as absent at the next read.
+/// [`Observation::Absent`]; a failed check of the opened handle, whether
+/// inside the open or after the read, is [`Observation::Unusable`] even when
+/// the name has since gone, so a retirement is first seen as absent at the
+/// next read.
 pub(crate) fn observe(data_dir: &Path, scope: &str, tag: &str) -> Observation {
     observe_then(data_dir, scope, tag, || {})
 }
@@ -324,14 +325,7 @@ fn observe_then(data_dir: &Path, scope: &str, tag: &str, between: impl FnOnce())
     };
     let (parent, file) = match crate::files::read(&path, Privacy::OwnerOnly) {
         Ok(opened) => opened,
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            return Observation::Absent;
-        }
-        Err(_) => return Observation::Unusable,
+        Err(error) => return unopened(&error),
     };
     let Ok(bytes) = crate::files::read_held_then(&parent, &path, file, RECORD_LIMIT, between)
     else {
@@ -340,6 +334,15 @@ fn observe_then(data_dir: &Path, scope: &str, tag: &str, between: impl FnOnce())
     match decode(&bytes) {
         Ok((found, activity)) if found == tag => Observation::Record(activity),
         _ => Observation::Unusable,
+    }
+}
+
+/// What a failed open of the record's name observed.
+fn unopened(error: &anyhow::Error) -> Observation {
+    if crate::files::is_missing_name(error) {
+        Observation::Absent
+    } else {
+        Observation::Unusable
     }
 }
 
@@ -1601,6 +1604,48 @@ mod tests {
         // An undecodable record of any tag.
         crate::files::write(&directory.join(RECORD), b"{")?;
         ensure!(observe(&data, &scope, &tag) == Observation::Unusable);
+        Ok(())
+    }
+
+    // A record replaced over its name after the reader opened it, and before
+    // the open checked the handle it holds, is not a missing name: the
+    // platform reports that handle as unlinked, which is not the lookup's own
+    // miss. Its next read decides. The error is the platform's real one for a
+    // held handle whose name a staged publication replaced.
+    #[test]
+    fn a_record_replaced_under_its_open_is_not_absent() -> Result<()> {
+        let (_root, data, scope) = record_fixture()?;
+        let tag = activity_tag(&Uuid::new_v4());
+        let directory = directory(&data, &scope)?;
+        let path = directory.join(RECORD);
+        // The lookup's own miss, of the directory and then of the name.
+        for _ in 0..2 {
+            let missing = crate::files::read(&path, Privacy::OwnerOnly)
+                .err()
+                .context("a missing record was opened")?;
+            ensure!(unopened(&missing) == Observation::Absent, "{missing:#}");
+            write_record(&directory, &tag, &staged(&[PreparingDatabase]))?;
+            retire_record(&directory, &tag)?;
+        }
+        write_record(&directory, &tag, &staged(&[PreparingDatabase]))?;
+        let (_parent, held) = crate::files::read(&path, Privacy::OwnerOnly)?;
+        write_record(
+            &directory,
+            &tag,
+            &staged(&[PreparingDatabase, OpeningDatabase]),
+        )?;
+        // The open's own check of the handle, which runs first here and
+        // returns before any change to it.
+        let replaced = anyhow::Error::from(
+            kuru_platform::fs::seal_private(&held, false)
+                .err()
+                .context("a handle whose name was replaced passed its check")?,
+        );
+        ensure!(unopened(&replaced) == Observation::Unusable, "{replaced:#}");
+        ensure!(
+            observe(&data, &scope, &tag)
+                == Observation::Record(staged(&[PreparingDatabase, OpeningDatabase]))
+        );
         Ok(())
     }
 

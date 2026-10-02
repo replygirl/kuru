@@ -79,6 +79,17 @@ pub(crate) fn name(path: &Path) -> Result<&OsStr> {
     path.file_name().context("memory file needs a literal name")
 }
 
+/// Whether `error` says the name, or a directory on its path, was not there
+/// when it was looked up: the operating system's own not-found code from a
+/// native open. A checked open also reports `NotFound`, carrying no OS code,
+/// for a handle it holds whose name was unlinked or replaced after the open;
+/// the name was there, so that is not a missing name.
+pub(crate) fn is_missing_name(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        error.kind() == std::io::ErrorKind::NotFound && error.raw_os_error().is_some()
+    })
+}
+
 pub(crate) fn read(path: &Path, privacy: Privacy) -> Result<(Directory, File)> {
     let parent = parent(path, privacy, NameRetention::Movable)?;
     let file = parent.read(name(path)?)?;
