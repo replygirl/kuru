@@ -1,0 +1,108 @@
+# Design
+
+## Context
+
+Source: `tmp/roadmap/unit7-usage-scan-design-2026-10-01.md` (design sections 1, 2.B, 2.D, 4, 5, 6 and the lead decisions) and `tmp/roadmap/unit7-b-reanchor-2026-10-01.md` (code anchors at origin/main `d17dfe40`). Labels: measured means observed by running, code means read from source, inferred means unchecked reasoning.
+
+- `establish` (`store/usage_ledger.rs`) runs once per writable open under the write guard and walks every owned row twice (scan 1 before `upgrade_usage`, scan 2 after `validate_usage`), then publishes `shared.usage_pool`.
+- The walk is linear since `usage-scan-index-range`: measured on Ubuntu CI run 36915490039, 45.8 ms at 4,000 rows and 169.9 ms at 20,000 rows, a slope of 7.76 microseconds per row and a flat part of about 14.8 ms (derived arithmetic).
+- Validity is row-local; the ledger never deletes (no `DELETE FROM state` exists); all writes go through `apply_change`'s seven `put_state_tx` sites (code).
+- Dolt 2.3.5 facts (measured, design section 7): `DOLT_HASHOF_TABLE('state')` costs 0.3 ms flat, sees the transaction's own writes, ignores other tables, is history-independent and stable across GC; an empty `DOLT_COMMIT --allow-empty` with a message works; `dolt_log LIMIT 1` returns HEAD.
+
+## Goals / Non-Goals
+
+**Goals:**
+- A recorded reopen decodes 0 owned rows; the first open after an upgrade or after a foreign change decodes each once.
+- Validate-before-activation by construction, with the induction below.
+- Missing, foreign or mismatched records never refuse an open by themselves.
+
+**Non-Goals:**
+- Incremental validation by `DOLT_DIFF`, flat-check reductions (6b R2/R3), any change to the 30 s deadline, any retry, any read-only open change, any schema or DDL change.
+
+## Decisions
+
+### D1. The induction (design 2.B.2)
+
+Base: S0, the table hash at open, is valid because either the open's full scan validated it or the head record proves an earlier scan or earlier writes did. Step: a write changes only rows it puts, each passed `validate_owned_row` before its `INSERT`; it deletes nothing; validity is row-local, so every owned row in S1 passes the validator. The trailer `V S1` is written in the same commit that creates S1, so no committed state carries an unearned record. A head trailer `V S` with `S` equal to the live hash therefore proves the scan's predicate holds for that content.
+
+Three invariants, stated in the module docs and each tested:
+1. **Row-locality.** A cross-row check added to the scan requires bumping the validator stem and redoing this argument; so does any change to the row validator's inputs.
+2. **Same function.** Writes call `validate_owned_row` (from `put_state_tx`, after encoding and the 64 KiB cap, before the statement), not a lookalike.
+3. **No other writer of owned rows.** Migration publication (state untouched), template adoption (`kuru_instance` only), and foreign or manual commits carry no valid trailer and fall to the scan.
+
+Rejected: trusting the trailer alone (a copied or amended trailer is caught only by the hash comparison); a commit-hash key (self-referential); a row, table, `operations` row, tag or file as carrier (self-referential, schema-version blast radius for every older binary, immutable-receipt meaning, or not atomic with the commit). Design section 2.B.1 holds the full comparison.
+
+### D2. Record carrier and format
+
+Trailer in the ledger's own commit message, same `DOLT_COMMIT` as the writes: `usage ledger v1 [<op>]`, blank line, `Kuru-Usage-State: <validator id> <hash>`. The record commit uses subject `usage ledger validation v1`. The hash is read after the last put and before `DOLT_COMMIT` (measured: sees the transaction's own writes; independent of the `operations` insert). Reader: `DOLT_HASHOF('HEAD')`, then `SELECT commit_hash, message FROM dolt_log LIMIT 1` requiring `commit_hash == HEAD` (never the `dolt_log()` table function, which ignores `-n`, measured); message at most 512 bytes, exactly one trailer line, validator ASCII at most 128 bytes, hash exactly 32 characters of `[0-9a-v]`. Bound(S) when validator equals `VALIDATOR` and hash equals the live hash; every other outcome is Missing.
+
+`VALIDATOR = concat!("kuru.usage.state.v1+", env!("CARGO_PKG_VERSION"))` (`kuru.usage.state.v1+0.9.0` today, code). The release version makes each release boundary cost one linear scan. A golden corpus beside the constant (one accepted row per class; refused near-misses: unknown field, wrong key, unknown class, non-UTF-8 key, zero sequence, bad format, over-long id) is a tripwire for development builds sharing a version string; a flipped verdict requires updating the corpus and bumping the `v1` stem together.
+
+### D3. Write precondition
+
+In `apply_change`, before any read or write in the transaction, read `DOLT_HASHOF_TABLE('state')` and require it equal `shared.usage_validated`. On inequality: roll back, clear the in-memory hash, return a typed error "usage ledger state changed outside its writer since validation; reopen to revalidate". Later writes see no hash and refuse the same way until a reopen. The in-memory hash is set only after `COMMIT` returns. Writes that change nothing roll back and leave it unchanged. Rejected: proceeding as today (an unvalidated foreign row could be built on); re-validating in place (a change under the exclusive lease is an anomaly, so fail closed per "reconcile before further mutation").
+
+### D4. Open sequence with D
+
+Under the guard, after `dolt_status` is clean and the existing flat checks pass: bound check; Bound gives S0 with no rows decoded, otherwise the full scan with the range query using `validate_owned_row`, S0 read under the same clean state, and its count noted. Then `upgrade_usage`, `validate_usage`, and D: re-read the hash S1; if S1 equals S0 no walk, else the full walk. The flat checks of the old scan 2 (`dolt_status`, `validate_historical`, the old-receipt check) stay after the upgrade (about 15 ms measured as the flat part), so only the owned walk is dropped. Then record, then `usage_validated = S1`, then publish the pool.
+
+Record rule: write when HEAD's trailer is not `VALIDATOR S1` and at least one owned row exists. On the full path the count is the scan's own; on the Bound path (a migration commit now sits on HEAD) a plain `SELECT 1 FROM state WHERE key >= ? AND key < ? LIMIT 1` probe (no `FOR UPDATE`, no transaction needed). An empty ledger writes nothing, which keeps the template and reopen tests that pin the usage head and "one commit on the usage branch" true.
+
+Timeline: `establish` still stamps `usage-scan-1` and `usage-scan-2` exactly once each (the job's parser requires it) and calls `usage_rows(0)` on the Bound path and the real count on the full path. The record commit is stamped after `usage-scan-1` so it stays out of the asserted interval. Decided as built: a D-forced rescan's rows are not added to `counts.usage_rows` (it counts only the pre-upgrade scan, `scanned.unwrap_or(0)`) and no `Counts` field was added, so format 1 and the parser stay unchanged. The rescan is visible to tests as `UsageOpen.rescanned` (test-only), and the unit suite's `rescanned: None` assertions pin that no usage migration changes `state` today, so the D path does not walk.
+
+### D5. Uncertain outcomes
+
+The anchor in `store.rs` is `resolve_uncertain`, called by usage writes, main writes, candidate operations and `reconcile()`; a usage Pending is otherwise indistinguishable from a main `Receipt::Operation`. Decision: a separate `Receipt::UsageOperation(String)` arm with the same reconciliation as `Operation`, plus the usage-write re-derivation, and `Receipt::UsageValidation { base_head, state_hash }` for the record commit: HEAD equals `base_head` means not committed; HEAD's message parses to `VALIDATOR state_hash` with sole parent `base_head` means committed; anything else (HEAD still at `base_head`, or a head that diverged from both) is not proven and settles as not committed, never as an error. That is safe because reconciliation first waits for the original SQL session to end, so the empty record commit can no longer land, its outcome changes no row and nothing replays it; a missing record only means the next open scans and records again (Missing never refuses). This departs from the roadmap design's 2.B.4 ("anything else: the existing ambiguity error"), which would have left a Pending that blocks every later writer until a reopen. After either arm settles, `resolve_uncertain` re-derives `usage_validated` (`rederive_validated` in `usage_ledger.rs`) by a three-way rule, so a settled write never turns the ledger read-only and the re-derivation happens for every caller:
+- the branch is clean and HEAD's trailer is Bound against the live hash: set the live hash;
+- the branch is clean and the live hash equals the in-memory validated hash: keep it, since unchanged content is content this open already validated;
+- anything else (a dirty branch, or a live hash that is neither recorded nor the validated one): clear it, so later writes refuse until a reopen.
+
+The second arm departs from the roadmap design's 2.B.4 and from the lead's stated rule for the re-derivation ("Bound sets it, else clear it"); it is brought to the lead with this change. Reason: a write that never committed (its `DOLT_COMMIT` request lost) settles as not committed and leaves HEAD where it was. When that HEAD carries no record, as on an empty ledger (HEAD is the adoption commit, D4's record rule writes nothing) or under a migration or foreign commit, the two-way rule would read Missing, clear the hash, and refuse every later write with `UsageLedgerStateChanged` until a reopen, although `state` is byte-for-byte the content the open validated. Keeping the hash only on exact equality admits nothing new: the write precondition (D3) compares the same live hash before every write. Pinned by `absent_usage_write_keeps_the_validated_state_and_retries` (`recovery_tests.rs`, the real lost-request proxy on an empty, unrecorded ledger) and `uncertain_uncommitted_receipt_keeps_the_ledger_writable` (`usage_ledger.rs`); mutation check observed 2026-10-01, macOS arm64: with the keep arm disabled (`check.bound || (unchanged && false)`) both fail (`recovery_tests.rs:1776`, `usage_ledger.rs:2056`), and restored both pass. Rejected: `Arc::ptr_eq` on the usage pool (unset during `establish`); re-deriving only in `UsageLedger::change` (misses `reconcile()` and other callers).
+
+The record commit registers its Pending before its transaction begins, so every failure of that transaction, definite or uncertain, is resolved inline under the same guard through `resolve_uncertain`, and either settled outcome keeps the open (recorded or unrecorded), since the scan already validated the content (Missing never refuses). No log line is written for it; the next open's scan and record are the observable consequence of an unrecorded head. A resolution that itself fails (the original SQL session does not end within its deadline, or a query fails) still returns that error and refuses the open: that is the existing reconcile-before-mutation rule, not ambiguous evidence. A detected change of HEAD or `state` before the record commit also refuses the open ("state changed while it was being validated").
+
+### D6. What an older binary can do with a ledger written by the new one
+
+It can do everything it could before. Read from the older code (`0.9.0`, design anchor section 7), then checked by running an origin/main `0e562595` release build, which writes no record, against a ledger written by this change (verification 3.3; no `0.9.0` release binary was run):
+- The trailer is a message line in commits whose subjects are unchanged for ledger writes; the validation commit is empty. No DDL, no schema version change, no new table, no receipt format.
+- Nothing in older code parses a usage commit message outside the template shape check (`migrations/template_shape.rs`), which runs only on template builds and copies before any ledger write, so it never sees a ledger-written branch.
+- Older migration classification reads `dolt_log` and `dolt_commit_ancestors` by commit hash only and concerns attempt heads, so a validation commit on top of a migration head changes no result.
+- Its writable open runs its own full scan on every open and its writes ignore HEAD's message, so it validates and writes exactly as before. Its commits carry no trailer, so a newer binary pays one scan and re-records afterward. This is sound in both directions.
+Verification 3.3 records that run: the older build opened, scanned every row (record-carrying commits included) and wrote, and this binary's next open scanned once and recorded.
+
+## Risks / Trade-offs
+
+- [Validator change within one version string that the corpus does not cover] → the corpus tripwire, and the rule that any change to `validate_owned_row` or the kuru-core validators it calls bumps the stem.
+- [Deliberate forger with database write access writes a matching trailer] → not defended, and the present scan does not defend against that adversary either (it passes well-formed false rows).
+- [Dolt serialization change on an engine bump changes table hashes] → the open reads Missing, scans once per project and re-records; note it in the Dolt-bump checklist in `docs/development.md`.
+- [Hash collision of a 160-bit hash] → negligible (inferred).
+- [A write that finds `state` changed now refuses where it used to proceed] → typed error, reopen revalidates; covered by the foreign-change test.
+- [First open after an upgrade pays one full scan] → measured linear since the archived range-paging change; verification 4.1 measures it end to end at 20k conversations.
+- [CI calibration] → see D7.
+
+### D7. CI calibration arithmetic
+
+Inputs (measured): the scan-1 medians `T(4000) / T(20000)` of the four Ubuntu runs of the `usage-scan-scaling` job with its provisional bounds, after A's primary-key paging, when every open scanned: run 36915490039 45.8 / 169.9 ms, run 36912181861 (#164) 64.3 / 235.8 ms, run 36919301194 (main) 51.9 / 177.3 ms, run 36922862997 (#165) 56.7 / 212.4 ms. Each pair was read from the job's printed rows; the rest is arithmetic on them.
+- Linear rate: two points per run give slopes of 7.76, 10.72, 7.84 and 9.73 microseconds per row over flat parts of 14.8, 21.4, 20.6 and 17.8 ms. The worst run is 10.7 microseconds per row over 21.4 ms, which predicts 21.4 + 20,000 x 0.0107 = 236 ms at 20,000 rows, the worst measured T(20000).
+- K = 6 (was 8). The unfloored ratios are 3.71, 3.67, 3.42 and 3.75, below the ideal-linear 5.0 because of the flat part. K = 6 is 1.6 x the worst 3.75. A quadratic scan scales the variable part by 25, so the worst run predicts 21.4 + 25 x (64.3 - 21.4) = 1,094 ms, a ratio of 17, nearly 3 x K.
+- Floor 100 ms (kept). Every Ubuntu T(4000) is below it, so the ratio check binds in practice at T(20000) at most 6 x 100 ms = 600 ms, 2.5 x the worst 236 ms.
+- Ceiling 1,000 ms (was 3,000 ms) = 4.2 x the worst 236 ms, below the quadratic prediction of 1,094 ms and 30 x under the 30 s open deadline. It binds only when T(4000) exceeds 1,000 / 6 = 167 ms, about 2.6 x the slowest measured T(4000) of 64.3 ms.
+- Bound series: `counts.usage_rows == 0` on every recorded reopen is asserted (the `bound-rows` check). Its `usage-pool` to `usage-scan-1` timing is printed and deliberately not bounded: no Ubuntu measurement of a recorded reopen existed when the bounds were set, a bound without one could fail the PR's only run (no CI job is rerun), and the 0-row check is the deterministic guarantee. The 50 ms bound proposed in the roadmap design (3.4 x the 14.8 ms flat part) becomes one more `Check` in `evaluate` once an Ubuntu run has printed the value (inferred to hold: macOS measured 11.1 to 11.4 ms; Ubuntu flat parts 15 to 21 ms).
+
+The code carries the same numbers in `CALIBRATED` and the one-line `DERIVATION` (`test_support/usage_scan.rs`), which the report prints; `docs/development.md` states the derivation and how to recalibrate. This PR's run restates the arithmetic with its own observed numbers in verification 4.3.
+
+### D8. Driver forcing
+
+The driver never forced the full path (code, re-anchor 3): after this change the aged fixture is Bound. Before each full sample the driver opens the store directly in its own process (`aged_store::claim`, owner lock held, offline `MemoryStore::open` with the engine's supervisor and cache) and calls `commit_unrecorded_usage_head` (test support only), an empty `DOLT_COMMIT` on the usage branch with no trailer, then closes and releases the lock; the next owner open finds no record, scans every row and records, and the owner open after it is the recorded reopen. Samples split into a full series (asserted by `rows`, the ratio and the ceiling) and a bound series (asserted by `bound-rows`: 0 rows decoded; its timing is printed, not bounded, see D7). The `rows` check and `gated_opens_of_sealed_aged_stores_count_the_planned_rows` are adapted to expect planned rows on forced-full samples and 0 on bound ones.
+
+## Open Questions
+
+- None open. Closed during implementation: a D-forced rescan gets no `Counts` field and its rows are not counted in `counts.usage_rows` (D4). Brought to the lead: the re-derivation's keep arm (D5), a departure from roadmap 2.B.4's "Bound, else clear".
+
+## Operational surface
+
+The only deploy-topology change is the existing `usage-scan-scaling` job in `.github/workflows/ci.yml`: it stays on `ubuntu-latest`, `needs: bundle-inputs`, 45-minute timeout, ages its fixture in-job on every run with no Actions cache (since #165), and stays in `ci-gate`'s `needs`. No new secret, no bind address, no container, no connection-limit change. The Dolt binary is the pinned 2.3.5 bundled engine (`support/dolt-assets.json`); the job is Ubuntu only and the trailer and hash behaviour is unverified on Windows locally (native CI runs the ordinary suite). The fixture is aged by the binary under test, so its writes carry the record and an unforced open is already bound; the driver's forcing step (D8) makes the measured full path independent of that. The fixture seal's key does not cover the validator or the write path, which no longer matters now that the fixture is never cached.
+
+## Integration contract
+
+The external contract is Dolt 2.3.5 SQL: `DOLT_HASHOF_TABLE('state')`, `DOLT_HASHOF('HEAD')`, `dolt_log` (first row, checked equal to HEAD), `DOLT_COMMIT('--allow-empty', ...)` and `dolt_commit_ancestors` for the record arm's parent check. Their behaviour is pinned by the measured probes in design section 7 of the roadmap design (flat cost, sees own writes, history-independent, GC-stable) and by tests that run against real Dolt; an engine bump can change table-hash values or plan text, which reads as Missing and costs one rescan. Nothing here changes a schema, id type or version: the usage branch keeps `USAGE_REGISTRY` `[V2, V3, V4]`, the state table, and `USAGE_CURRENT_VERSION` 4, and the receipt format is unchanged. The commit-message trailer is the only new on-disk artifact, and its format is specified in the `Usage validation record convention` requirement.

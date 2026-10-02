@@ -1370,6 +1370,16 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Usage-scan driver forcing step; see
+    /// `store::MemoryStore::commit_unrecorded_usage_head`. Direct opens only.
+    #[cfg(all(unix, feature = "test-support"))]
+    pub(crate) async fn commit_unrecorded_usage_head(&self) -> Result<()> {
+        let Backend::Local(store) = &self.backend else {
+            bail!("forcing an unrecorded usage head needs a direct (owner) open")
+        };
+        store.commit_unrecorded_usage_head().await
+    }
+
     pub fn ensure_project_scope(&self, scope: &str) -> Result<()> {
         match &self.backend {
             Backend::Local(store) => store.ensure_project_scope(scope),

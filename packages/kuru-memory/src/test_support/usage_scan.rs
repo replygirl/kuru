@@ -13,9 +13,18 @@
 //!   root. CI ages the fixture in-job on every run and never caches it: even
 //!   after `DOLT_GC` the two stores exceed the shared Actions cache budget.
 //! - `measure-usage-scan` (`measure:usage-scan`, which alone sets the gate):
-//!   per size, one warm-up and then `--samples` cold owner opens, each a real
-//!   spawned owner whose timeline gives the first usage scan's duration
-//!   (`usage-pool` to `usage-scan-1`) and its row count.
+//!   per size, one warm-up cycle and then `--samples` cycles. A cycle forces
+//!   the full validation, then measures one cold full open and one cold bound
+//!   open, each a real spawned owner whose timeline gives the first usage
+//!   scan's duration (`usage-pool` to `usage-scan-1`) and its row count.
+//!
+//! The fixture is aged by this binary, so every write carries the usage
+//! validation record and an unforced open of it is bound: it decodes no rows.
+//! Before each full open the driver therefore adds one empty commit without a
+//! record to the usage branch (`MemoryStore::commit_unrecorded_usage_head`,
+//! the head a binary that does not write records would leave). That open finds
+//! no record, scans every row and records; the next open, the bound one,
+//! decodes none.
 //!
 //! Layout under the fixture root, whose canonical path is part of the key
 //! because the owner binds its scope to the project's canonical path:
@@ -23,9 +32,8 @@
 //! directories), `age-<n>.json` (the `age-store` report lines),
 //! `create-<n>.log` and `fixture.json` (the seal).
 //!
-//! The bounds are provisional: the validation-record change replaces them
-//! with calibrated bounds and their derivation, and adds the assertion that
-//! a recorded reopen decodes no usage rows.
+//! The bounds are calibrated from the measured post-paging linear rate; their
+//! derivation is [`DERIVATION`] and `docs/development.md`.
 
 use super::aged_store::{Counts, Plan, REPORT_FORMAT, REPORT_FORMAT_VERSION};
 use crate::OpenOptions;
@@ -104,14 +112,27 @@ pub struct Bounds {
     pub ceiling_ns: u64,
 }
 
-/// Provisional, until the validation-record change calibrates them: linear
-/// growth predicts a ratio of about 5 between 4,000 and 20,000 rows and
-/// quadratic growth about 25.
-pub const PROVISIONAL: Bounds = Bounds {
-    ratio: 8.0,
+/// The calibrated bounds: K = 6 over a 100 ms floor and a 1 s ceiling at the
+/// largest size. [`DERIVATION`] is their arithmetic.
+pub const CALIBRATED: Bounds = Bounds {
+    ratio: 6.0,
     floor_ns: 100_000_000,
-    ceiling_ns: 3_000_000_000,
+    ceiling_ns: 1_000_000_000,
 };
+
+/// The label the report prints for [`CALIBRATED`].
+pub const CALIBRATED_LABEL: &str = "calibrated";
+
+/// The derivation of [`CALIBRATED`], one line, from the four Ubuntu runs of
+/// this check's earlier provisional bounds (every open then scanned, after
+/// the primary-key paging): first scans of 4,000 and 20,000 rows took 45.8 and
+/// 169.9, 64.3 and 235.8, 51.9 and 177.3, and 56.7 and 212.4 ms, a linear cost
+/// of 7.8 to 10.7 us per row over 15 to 21 ms flat and an unfloored ratio of at
+/// most 3.75. K = 6 is 1.6 times 3.75 and about a third of the 17 a quadratic
+/// scan predicts (21 ms + 25 x 43 ms over 64 ms); every T(4000) is under the
+/// 100 ms floor, so the ratio check binds at T(20000) <= 600 ms, 2.5 times the
+/// worst 236 ms; the ceiling is 1000 ms, 4.2 times it.
+pub const DERIVATION: &str = "derivation: 4 Ubuntu runs, worst linear fit 10.7 us/row + 21 ms flat, T(4000) 46-64 ms, T(20000) 170-236 ms, unfloored ratio at most 3.75 (ideal linear 5, quadratic about 17); K=6 is 1.6x the 3.75, and with T(4000) under the 100 ms floor the ratio check binds at T(20000) <= 600 ms, 2.5x the worst 236 ms; ceiling 1000 ms is 4.2x the worst 236 ms";
 
 // --- Fixture key ---------------------------------------------------------------
 
@@ -371,13 +392,16 @@ pub fn median(values: &[u64]) -> Result<u64> {
 
 // --- Evaluation ------------------------------------------------------------------
 
-/// Every sample of one size: warm-ups are checked for rows but not timed.
+/// Every open of one size. The full series are opens that had to validate
+/// every row (warm-ups are checked for rows but not timed); the bound series
+/// are the opens that followed, which find the record and decode no row.
 #[derive(Clone, Debug)]
 pub struct SizeSamples {
     pub conversations: u64,
     pub expected_rows: u64,
     pub warmups: Vec<Sample>,
     pub samples: Vec<Sample>,
+    pub bound: Vec<Sample>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -389,6 +413,11 @@ pub struct SizeSummary {
     pub scan2_median_ns: u64,
     pub usage_block_median_ns: u64,
     pub open_median_ns: u64,
+    /// The bound series' first scan interval (the flat checks and the record
+    /// read; no row is decoded), reported and not bounded.
+    pub bound_scan1_ns: Vec<u64>,
+    pub bound_scan1_median_ns: u64,
+    pub bound_open_median_ns: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -425,6 +454,7 @@ pub fn evaluate(sizes: &[SizeSamples], bounds: Bounds, label: &'static str) -> R
     );
     let mut summaries = Vec::new();
     let mut mismatches = Vec::new();
+    let mut recorded = Vec::new();
     for size in sizes {
         let pick = |field: fn(&Sample) -> u64| size.samples.iter().map(field).collect::<Vec<_>>();
         let scan1 = pick(|sample| sample.scan1_ns);
@@ -436,12 +466,35 @@ pub fn evaluate(sizes: &[SizeSamples], bounds: Bounds, label: &'static str) -> R
             scan2_median_ns: median(&pick(|sample| sample.scan2_ns))?,
             usage_block_median_ns: median(&pick(|sample| sample.usage_block_ns))?,
             open_median_ns: median(&pick(|sample| sample.open_ns))?,
+            bound_scan1_median_ns: median(
+                &size
+                    .bound
+                    .iter()
+                    .map(|sample| sample.scan1_ns)
+                    .collect::<Vec<_>>(),
+            )?,
+            bound_scan1_ns: size.bound.iter().map(|sample| sample.scan1_ns).collect(),
+            bound_open_median_ns: median(
+                &size
+                    .bound
+                    .iter()
+                    .map(|sample| sample.open_ns)
+                    .collect::<Vec<_>>(),
+            )?,
         });
         for (index, sample) in size.warmups.iter().chain(&size.samples).enumerate() {
             if sample.usage_rows != size.expected_rows {
                 mismatches.push(format!(
                     "{} conversations open {index} decoded {} rows, expected {}",
                     size.conversations, sample.usage_rows, size.expected_rows
+                ));
+            }
+        }
+        for (index, sample) in size.bound.iter().enumerate() {
+            if sample.usage_rows != 0 {
+                recorded.push(format!(
+                    "{} conversations recorded reopen {index} decoded {} rows, expected 0",
+                    size.conversations, sample.usage_rows
                 ));
             }
         }
@@ -456,7 +509,10 @@ pub fn evaluate(sizes: &[SizeSamples], bounds: Bounds, label: &'static str) -> R
         detail: if mismatches.is_empty() {
             "every open decoded its size's expected usage rows".into()
         } else {
-            format!("usage scan row count differs: {}", mismatches.join("; "))
+            format!(
+                "usage scan row count differs (a forced full open must decode every owned row): {}",
+                mismatches.join("; ")
+            )
         },
     }];
     let pass = ratio <= bounds.ratio;
@@ -496,8 +552,20 @@ pub fn evaluate(sizes: &[SizeSamples], bounds: Bounds, label: &'static str) -> R
             ms(bounds.ceiling_ns),
         ),
     });
-    // After the validation-record change: a recorded reopen decodes 0 usage
-    // rows. Not asserted here, because every writable open scans until then.
+    // The deterministic half of the validation record: the open that follows
+    // a full open finds its record and decodes no usage row at either size.
+    checks.push(Check {
+        name: "bound-rows",
+        pass: recorded.is_empty(),
+        detail: if recorded.is_empty() {
+            "every recorded reopen decoded 0 usage rows".into()
+        } else {
+            format!(
+                "a recorded reopen decoded usage rows (the validation record did not bind it): {}",
+                recorded.join("; ")
+            )
+        },
+    });
     let pass = checks.iter().all(|check| check.pass);
     Ok(Verdict {
         bounds: label,
@@ -520,7 +588,7 @@ pub fn render_lines(verdict: &Verdict) -> String {
     let mut text = String::new();
     let _ = writeln!(
         text,
-        "usage-scan check: {} bounds (K={}, floor={:.0} ms, ceiling={:.0} ms at the largest size); calibrated bounds and their derivation land with the validation-record change",
+        "usage-scan check: {} bounds (K={}, floor={:.0} ms, ceiling={:.0} ms at the largest size); {DERIVATION}",
         verdict.bounds.to_uppercase(),
         verdict.ratio_bound,
         ms(verdict.floor_ns),
@@ -528,7 +596,7 @@ pub fn render_lines(verdict: &Verdict) -> String {
     );
     let _ = writeln!(
         text,
-        "size   rows   scan1 median ms [samples]   scan2 ms  usage block ms  open ms"
+        "full opens (every owned row decoded):\nsize   rows   scan1 median ms [samples]   scan2 ms  usage block ms  open ms"
     );
     for size in &verdict.sizes {
         let samples = size
@@ -548,19 +616,34 @@ pub fn render_lines(verdict: &Verdict) -> String {
             ms(size.open_median_ns)
         );
     }
+    let _ = writeln!(
+        text,
+        "recorded reopens (no row decoded; timings reported, not bounded):\nsize   scan1 median ms [samples]   open ms"
+    );
+    for size in &verdict.sizes {
+        let samples = size
+            .bound_scan1_ns
+            .iter()
+            .map(|ns| format!("{:.1}", ms(*ns)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = writeln!(
+            text,
+            "{:<6} {:.1} [{samples}]   {:.1}",
+            size.conversations,
+            ms(size.bound_scan1_median_ns),
+            ms(size.bound_open_median_ns)
+        );
+    }
     for check in &verdict.checks {
         let _ = writeln!(
             text,
-            "{:<8} {}  {}",
+            "{:<10} {}  {}",
             check.name,
             verdict_word(check.pass),
             check.detail
         );
     }
-    let _ = writeln!(
-        text,
-        "not yet asserted: 0 rows decoded on a recorded reopen (lands with the validation-record change)"
-    );
     let _ = write!(text, "verdict  {}", verdict_word(verdict.pass));
     text
 }
@@ -576,7 +659,7 @@ pub fn render_summary(verdict: &Verdict) -> String {
     );
     let _ = writeln!(
         text,
-        "Bounds are **{}**: ratio K = {}, floor {:.0} ms, ceiling {:.0} ms at the largest size. Calibrated bounds and their derivation land with the validation-record change, with the check that a recorded reopen decodes 0 usage rows.\n",
+        "Bounds are **{}**: ratio K = {}, floor {:.0} ms, ceiling {:.0} ms at the largest size, and 0 usage rows decoded by every recorded reopen. {DERIVATION}\n",
         verdict.bounds,
         verdict.ratio_bound,
         ms(verdict.floor_ns),
@@ -603,6 +686,25 @@ pub fn render_summary(verdict: &Verdict) -> String {
             ms(size.scan2_median_ns),
             ms(size.usage_block_median_ns),
             ms(size.open_median_ns)
+        );
+    }
+    let _ = writeln!(
+        text,
+        "\nRecorded reopens decode no row; their timings are reported, not bounded.\n\n| conversations | bound scan 1 median ms | bound scan 1 samples ms | bound open median ms |\n|---|---|---|---|"
+    );
+    for size in &verdict.sizes {
+        let samples = size
+            .bound_scan1_ns
+            .iter()
+            .map(|ns| format!("{:.1}", ms(*ns)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            text,
+            "| {} | {:.1} | {samples} | {:.1} |",
+            size.conversations,
+            ms(size.bound_scan1_median_ns),
+            ms(size.bound_open_median_ns)
         );
     }
     let _ = writeln!(text, "\n| check | result | detail |\n|---|---|---|");
@@ -895,11 +997,37 @@ async fn measured_open(
     Ok((sample, bytes))
 }
 
-/// Per size, `warmups` and then `samples` gated owner opens of the sealed
-/// fixture. Each timeline is copied into `evidence` beside its owner log, and
-/// one record per open is appended to `evidence/records.jsonl`. The owner
-/// timeline gate must reach the spawned owners: the measuring task sets it in
-/// the environment they inherit.
+/// Add the empty commit that leaves the usage head without a validation
+/// record, so that the next open validates every owned row. The store is
+/// opened in this process (offline, with the engine's supervisor and cache)
+/// under the project owner lock, after any previous owner has released it.
+async fn force_full_validation(layout: &Layout, n: u64, engine: &Engine) -> Result<()> {
+    let claim = super::aged_store::claim(&layout.data(n)).await?;
+    let mut options = OpenOptions::new(claim.data_dir.clone(), claim.scope.clone());
+    options.config.offline = true;
+    options.config.cache_dir = engine.cache_dir.clone();
+    options.supervisor = Some(engine.supervisor.clone());
+    let forced = async {
+        let memory = crate::MemoryStore::open(options).await?;
+        let forced = memory.commit_unrecorded_usage_head().await;
+        let closed = memory.close().await;
+        forced?;
+        closed
+    }
+    .await;
+    let released = claim.lock.release();
+    forced?;
+    released
+}
+
+/// Per size, `warmups` warm-up cycles and then `samples` measured cycles.
+/// Each cycle forces the full validation, then runs one gated owner open
+/// that must decode every owned row and one more that finds the record it
+/// left and decodes none (the warm-up cycles stop after the full open). Each
+/// timeline is copied into `evidence` beside its owner log, and one record
+/// per open is appended to `evidence/records.jsonl`. The owner timeline gate
+/// must reach the spawned owners: the measuring task sets it in the
+/// environment they inherit.
 pub async fn measure(
     layout: &Layout,
     spec: &Spec,
@@ -933,45 +1061,71 @@ pub async fn measure(
             expected_rows: spec.expected_rows(n),
             warmups: Vec::new(),
             samples: Vec::new(),
+            bound: Vec::new(),
         };
-        for index in 0..warmups + samples {
-            let log = evidence.join(format!("owner-{n}-{index}.log"));
-            let (sample, bytes) =
-                measured_open(&options, &project, &engine.executable, &log).await?;
-            let timeline_path = evidence.join(format!("timeline-{n}-{index}.json"));
-            std::fs::write(&timeline_path, &bytes)?;
-            let warmup = index < warmups;
-            writeln!(
-                records,
-                "{}",
-                json!({
-                    "conversations": n,
-                    "open": index,
-                    "warmup": warmup,
-                    "sample": sample,
-                })
-            )?;
-            eprintln!(
-                "measure-usage-scan: {n} conversations open {index}{}: scan1 {:.1} ms, rows {}, open {:.1} ms",
-                if warmup { " (warm-up)" } else { "" },
-                ms(sample.scan1_ns),
-                sample.usage_rows,
-                ms(sample.open_ns)
-            );
-            opened.push(Opened {
-                sample: sample.clone(),
-                timeline: bytes,
-                timeline_path,
-            });
-            if warmup {
-                measured.warmups.push(sample);
-            } else {
-                measured.samples.push(sample);
+        let mut index = 0;
+        for cycle in 0..warmups + samples {
+            let warmup = cycle < warmups;
+            force_full_validation(layout, n, engine).await?;
+            for series in [Series::Full, Series::Bound] {
+                if warmup && series == Series::Bound {
+                    continue;
+                }
+                let log = evidence.join(format!("owner-{n}-{index}.log"));
+                let (sample, bytes) =
+                    measured_open(&options, &project, &engine.executable, &log).await?;
+                let timeline_path = evidence.join(format!("timeline-{n}-{index}.json"));
+                std::fs::write(&timeline_path, &bytes)?;
+                writeln!(
+                    records,
+                    "{}",
+                    json!({
+                        "conversations": n,
+                        "open": index,
+                        "series": series.name(),
+                        "warmup": warmup,
+                        "sample": sample,
+                    })
+                )?;
+                eprintln!(
+                    "measure-usage-scan: {n} conversations open {index} ({}{}): scan1 {:.1} ms, rows {}, open {:.1} ms",
+                    series.name(),
+                    if warmup { ", warm-up" } else { "" },
+                    ms(sample.scan1_ns),
+                    sample.usage_rows,
+                    ms(sample.open_ns)
+                );
+                opened.push(Opened {
+                    sample: sample.clone(),
+                    timeline: bytes,
+                    timeline_path,
+                });
+                match (series, warmup) {
+                    (Series::Bound, _) => measured.bound.push(sample),
+                    (Series::Full, true) => measured.warmups.push(sample),
+                    (Series::Full, false) => measured.samples.push(sample),
+                }
+                index += 1;
             }
         }
         sizes.push(measured);
     }
     Ok((sizes, opened))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Series {
+    Full,
+    Bound,
+}
+
+impl Series {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Bound => "bound",
+        }
+    }
 }
 
 // --- Command lines -------------------------------------------------------------
@@ -1183,7 +1337,7 @@ pub async fn measure_main(args: impl IntoIterator<Item = OsString>) -> Result<()
         &arguments.evidence,
     )
     .await?;
-    let verdict = evaluate(&sizes, PROVISIONAL, "provisional")?;
+    let verdict = evaluate(&sizes, CALIBRATED, CALIBRATED_LABEL)?;
     println!("{}", render_lines(&verdict));
     std::fs::write(
         arguments.evidence.join("verdict.json"),

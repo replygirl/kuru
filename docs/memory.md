@@ -89,6 +89,66 @@ store, so closing or purging that store also covers its ledger. Dream promotion,
 abandonment and undo do not remove observed usage; `/cost` reads session usage
 separately from conversation and note history.
 
+## Usage ledger validation record
+
+Before a writable open lets any usage through, every ledger-owned row on the
+permanent usage branch must decode and be internally consistent. Reading every
+row on every open would make start-up grow with the ledger, so the branch
+records its own validation in its history and a later open relies on that
+record instead of reading the rows again. The record is a durable convention,
+not an implementation detail: other tools and later releases may meet it.
+
+**Format.** One trailer line in a commit message on the usage branch:
+
+```text
+Kuru-Usage-State: <validator id> <state hash>
+```
+
+- The validator id is ASCII of at most 128 bytes and names the check that ran,
+  by its version stem and the Kuru release (`kuru.usage.state.v1+<release>`).
+- The state hash is exactly 32 characters of `[0-9a-v]`: the engine's content
+  hash of the branch's `state` table, which depends only on the table's rows.
+- Every ledger write commits the record for the content that write produced, in
+  the same commit as the write (a subject such as `usage ledger v1 [<operation>]`,
+  a blank line and the trailer). When an open validates a non-empty ledger whose
+  head has no record for its content, it adds one empty commit, `usage ledger
+  validation v1`, carrying it. A ledger with no usage row gets no such commit,
+  so a new project's usage branch still holds only its adoption commit until the
+  first write.
+
+**Reading.** An open accepts a record only from the branch head's own message,
+of at most 512 bytes, with exactly one trailer line, naming exactly this
+release's validator and a hash equal to the live table's. It then decodes no
+usage row. Every other message is the same as no record: a different release's
+validator, a hash that no longer matches, a duplicated, malformed or oversize
+line, or a commit made by a tool that does not write records.
+
+**A missing, foreign or mismatched record means a re-check, never a refusal.**
+The open then decodes every ledger-owned row, in key order and in bounded
+pages, refuses only if a row is invalid, and records the result. The first open
+after a Kuru upgrade (or downgrade) re-checks every usage row once, because the
+validator id includes the release; the open after it decodes none. The cost of
+that one re-check grows linearly with the ledger; see the
+[usage scan scaling check](development.md#usage-scan-scaling-check) for the
+measured rate and its bounds.
+
+**While the store is open.** Every write validates the rows it writes with the
+same function the full check uses, before it commits, and refuses if the
+`state` table no longer has the content the open validated. That is the error
+`usage ledger state changed outside its writer since validation; reopen to
+revalidate`: nothing was written, and later writes refuse until a reopen
+validates the ledger again. A write whose reply was lost is reconciled before
+anything else changes the ledger, and a committed one keeps the ledger
+writable.
+
+**Compatibility.** The record adds no table, schema or schema version, so a
+Kuru release that does not know it opens, validates and writes the ledger as
+before: the trailer is only a line in a commit message. A write by such a
+release leaves no record, and the next open by a release that knows it
+re-checks the ledger once and records it. The check is row-local, so a check
+that compares rows with one another must bump the validator id's version stem,
+and no code but the ledger's own write path may write ledger-owned rows.
+
 ## Runtime and offline use
 
 Every Kuru executable includes the pinned native Dolt archive and its license
