@@ -1948,8 +1948,11 @@ pub(crate) async fn quarantine_after_adoption(
 }
 
 /// Test support: record a quarantine under the shared test root against the
-/// fixture whose creation caused it.
+/// fixture whose creation caused it. Under `cfg(test)` every outcome is also
+/// recorded by root (`hooks::quarantines`).
 fn account(root: &Path, stage: &Path, moved: &Quarantine) {
+    #[cfg(test)]
+    hooks::quarantined(root, moved);
     #[cfg(any(test, feature = "test-support"))]
     if matches!(moved, Quarantine::Moved(_)) && is_shared_root(root) {
         crate::test_support::engine_ledger::template_event(

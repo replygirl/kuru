@@ -651,11 +651,17 @@ impl Server {
             for (name, value) in crate::test_support::lifecycle_trace::forwarded() {
                 command.env(name, value);
             }
+            // Test builds hold the spawn gate across child creation; see
+            // `crate::spawn_gate`.
+            #[cfg(test)]
+            let creation = crate::spawn_gate::child_creation().await;
             let child = command
                 .spawn()
                 .context("start memory lifetime supervisor")?;
             // The test gate guards this process's child creation, not the
             // supervisor's later startup or the delayed authentication probe.
+            #[cfg(test)]
+            drop(creation);
             drop(_test_spawn_guard);
             let mut owner = Owner {
                 child: Some(child),

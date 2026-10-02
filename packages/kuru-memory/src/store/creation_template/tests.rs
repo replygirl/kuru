@@ -175,6 +175,54 @@ pub(super) fn rejected(root: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// The reason [`quarantine`] records when its non-waiting exclusive try
+/// finds the key lock busy: the designed best-effort skip.
+pub(super) const KEY_LOCK_BUSY: &str = "the store template key lock is busy";
+
+/// Check the one quarantine attempt reached under the private template root
+/// `root` against that root's contents. Returns the quarantined directory's
+/// name, or `None` for the designed skip.
+///
+/// A verdict reached under the shared key lock quarantines through a
+/// non-waiting exclusive try after that lock is released. A test that holds
+/// only a shared spawn-gate guard across its open (`spawn_gated_open`) does
+/// not exclude a sibling test's child creation, and that child can hold a
+/// duplicate of the just-released shared lock until its exec (see
+/// `crate::spawn_gate`). The try then finds the lock busy and the quarantine
+/// is skipped by design. That skip is accepted when the judged template is
+/// still published and nothing was quarantined. Every other outcome fails:
+/// no attempt or more than one, another skip reason, or a move of anything
+/// but the judged template.
+pub(super) fn quarantined_or_busy(root: &Path, judged: FileIdentity) -> Result<Option<String>> {
+    let attempts = super::hooks::quarantines(root);
+    let [attempt] = attempts.as_slice() else {
+        bail!("not exactly one quarantine attempt: {attempts:?}");
+    };
+    let quarantined = rejected(root)?;
+    match attempt {
+        Quarantine::Moved(_) => {
+            let [moved] = quarantined.as_slice() else {
+                bail!("not exactly one quarantined template: {quarantined:?}");
+            };
+            ensure!(
+                published(root).is_none()
+                    && files::directory(&root.join(moved))?.identity() == judged,
+                "the judged template was not the one quarantined"
+            );
+            Ok(Some(moved.clone()))
+        }
+        Quarantine::Skipped(reason) if reason == KEY_LOCK_BUSY => {
+            ensure!(
+                published(root) == Some(judged) && quarantined.is_empty(),
+                "a quarantine skipped on a busy key lock changed the template root: \
+                 {quarantined:?}"
+            );
+            Ok(None)
+        }
+        Quarantine::Skipped(reason) => bail!("the quarantine was skipped: {reason}"),
+    }
+}
+
 /// The manifest of the template directory `template`.
 pub(super) fn read_manifest(template: &Path) -> Result<Manifest> {
     Ok(serde_json::from_slice(&files::read_bytes(
@@ -1267,7 +1315,8 @@ async fn quarantine_is_bound_to_the_judged_template() -> Result<()> {
 /// is kept; the next verdict, with the lock free, quarantines it. A sibling
 /// test's spawn holding a duplicate of the just-released shared lock has this
 /// effect, so tests that expect a quarantine hold the lock gate
-/// ([`create_unspawned`]).
+/// ([`create_unspawned`]), or, through an ordinary open that holds only a
+/// shared guard, accept this recorded skip ([`quarantined_or_busy`]).
 #[tokio::test]
 async fn a_busy_key_lock_skips_the_quarantine_and_keeps_the_older_one() -> Result<()> {
     let fixture = fixture()?;
@@ -1335,6 +1384,16 @@ async fn a_busy_key_lock_skips_the_quarantine_and_keeps_the_older_one() -> Resul
         quarantined,
         "the older quarantine changed"
     );
+    // The skip is recorded with the reason the open-path tests accept
+    // (`quarantined_or_busy`).
+    let attempts = super::hooks::quarantines(&root);
+    ensure!(
+        matches!(
+            attempts.as_slice(),
+            [Quarantine::Moved(_), Quarantine::Skipped(reason)] if reason == KEY_LOCK_BUSY
+        ),
+        "the busy key lock was not recorded as the designed skip: {attempts:?}"
+    );
     // The lock is free again: this verdict quarantines the judged template
     // and removes the older quarantined directory.
     let error = create_unspawned(&root, &stage(&fixture, "third")?)
@@ -1348,6 +1407,61 @@ async fn a_busy_key_lock_skips_the_quarantine_and_keeps_the_older_one() -> Resul
     };
     ensure!(only != first, "the older quarantine was kept");
     assert_eq!(files::directory(&root.join(only))?.identity(), judged);
+    fixture.release(Ok(()))
+}
+
+/// [`quarantined_or_busy`] accepts the recorded busy-lock skip with the
+/// judged template still published, and refuses a root with no attempt and
+/// a skip whose root no longer holds the judged template.
+#[tokio::test]
+async fn quarantined_or_busy_accepts_only_the_designed_skip() -> Result<()> {
+    let fixture = fixture()?;
+    let root = fixture.path().join("templates");
+    let judged = clone_shared(&root).await?;
+    let mut manifest = read_manifest(&root.join(key()))?;
+    manifest.key = "f".repeat(64);
+    write_manifest(&root.join(key()), &manifest)?;
+    ensure!(
+        quarantined_or_busy(&root, judged).is_err(),
+        "a root with no quarantine attempt was accepted"
+    );
+    let holder: Arc<StdMutex<Option<File>>> = Arc::default();
+    let hooks = Hooks {
+        before_quarantine: Some(Arc::new({
+            let (root, holder) = (root.clone(), holder.clone());
+            move || {
+                let lock = open_root(&root)
+                    .and_then(|root| Ok(root.lock_file(OsStr::new(&lock_name(key())))?))
+                    .expect("open the key lock");
+                lock.try_lock_shared().expect("hold the key lock shared");
+                *holder.lock().expect("the lock holder") = Some(lock);
+            }
+        })),
+        ..Hooks::default()
+    };
+    let error = tokio::time::timeout(
+        PROMPT,
+        HOOKS.scope(hooks, create_unspawned(&root, &stage(&fixture, "copy")?)),
+    )
+    .await
+    .context("a busy key lock was waited for instead of skipping the quarantine")?
+    .expect_err("a template with another key was accepted");
+    ensure!(error.is_verdict(), "{error}");
+    let held = holder
+        .lock()
+        .expect("the lock holder")
+        .take()
+        .context("the key lock was never held")?;
+    release(held).await;
+    ensure!(
+        quarantined_or_busy(&root, judged)?.is_none(),
+        "the designed skip was not reported as one"
+    );
+    let other = clone_shared(&fixture.path().join("other")).await?;
+    ensure!(
+        quarantined_or_busy(&root, other).is_err(),
+        "a skip was accepted for a template that is not the published one"
+    );
     fixture.release(Ok(()))
 }
 
