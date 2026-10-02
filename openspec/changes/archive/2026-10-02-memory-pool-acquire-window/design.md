@@ -59,7 +59,7 @@ notes); this artifact records the decisions it implements.
   write's end), reconciliation after an apply that ends without its receipt
   (the fence's existing path), and the multi-write candidate operations
   (promotion, abandonment, cleanup), whose writes each take one budget.
-  Every service write therefore completes inside the client's 35 s
+  Each receipt-bearing service write therefore completes inside the client's 35 s
   `OPERATION_TIMEOUT` (`QUERY_TIMEOUT` + `REPLY_MARGIN`, `service/rpc.rs:38`,
   :699-702) by construction. `Pending` is still set after the acquire and
   identity statement and before apply. Rejected: separate budgets, which let a

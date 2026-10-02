@@ -698,7 +698,7 @@ const COMPLETED_RECEIPT_WINDOW: usize = 4096;
 
 /// What the operation budget allows beyond one memory statement budget
 /// (`QUERY_TIMEOUT`): the time an outcome handler keeps for writing its
-/// reply. A service write fits the same arithmetic by construction: one write
+/// reply. Each receipt-bearing service write fits the same arithmetic by construction: one write
 /// budget, taken as soon as the write holds the store's write lock and before
 /// its first pool acquisition, bounds the reads before its pending record,
 /// the acquisition, its identity statement, any validation before the write,

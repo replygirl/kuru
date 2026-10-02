@@ -1597,14 +1597,15 @@ statement or operation it serves, never by a shorter window of its own:
   the write and the session's return, and for a candidate creation the new
   branch's pool creation. A contended acquisition therefore uses write time:
   a write that then runs out after its pending record is an uncertain write,
-  reconciled by the existing fence. A service write ends within
-  `QUERY_TIMEOUT`, so its reply fits the client's `OPERATION_TIMEOUT` (35 s,
+  reconciled by the existing fence. Each receipt-bearing service write ends
+  within `QUERY_TIMEOUT`, so its reply fits the client's `OPERATION_TIMEOUT` (35 s,
   `QUERY_TIMEOUT` plus `REPLY_MARGIN` in `service/rpc.rs`) by construction.
   Three things are not one write's work and keep their own bounds: the wait
   for the write lock (the previous write's end); reconciliation after a
   write that ends without its receipt, which stays on the fence's existing
   path; and candidate promotion, abandonment and cleanup, which run several
-  writes, each under its own write budget.
+  writes, each under its own write budget, so such a call is several write
+  budgets.
   An acquisition that fails returns before any statement and before the
   pending record, so it never makes a write uncertain.
 - **Creation budget.** A pool created after memory is open (a candidate's or
