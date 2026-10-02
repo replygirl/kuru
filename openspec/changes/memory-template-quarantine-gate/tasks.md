@@ -214,8 +214,9 @@
       `git diff 0e562595 -- packages/kuru-memory/src/store/creation_template/`
       is empty, `git log origin/main..HEAD -- …/creation_template/` lists no
       commit, and the working tree has no diff there. The quarantine tests
-      are untouched by this change. The branch needs a rebase onto main
-      before merge; after it, re-run `every_child_creation_takes_the_gate`
+      are untouched by this change. Rebased onto `origin/main` (new tip
+      `b9453c5b`); `cargo test -p kuru-memory --lib spawn_gate` re-run after
+      the rebase: 8 passed, including `every_child_creation_takes_the_gate`
       against main's new `server.rs`/`engine.rs` lines.
 
 ## 5. Local verification
