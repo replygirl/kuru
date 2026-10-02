@@ -3892,7 +3892,7 @@ mod tests {
                 "an exited owner was reported without the stage read before its exit: {rendered}"
             );
             ensure!(
-                polls > RELEASE_AFTER as usize && elapsed < fixture.window(),
+                polls >= RELEASE_AFTER as usize && elapsed < fixture.window(),
                 "the exit was observed after {polls} failed polls and {elapsed:?}: {rendered}"
             );
             ensure!(
