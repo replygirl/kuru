@@ -378,6 +378,27 @@
       `tmp/roadmap/store-creation-design/diag-quarantine-structure.md` and
       reported for separate routing. This change's "impossible" claim
       covers the quarantine verdict only.
+      Amended after an independent round-2 review: the residual also
+      covers two tests already using `quarantined_or_busy`, through a
+      different try. `shape_verdict_on_the_copy_fails_the_open_and_quarantines_the_template`
+      (`open_tests.rs:965-976`) and
+      `adoption_verdict_quarantines_and_leaves_the_stage_in_place`
+      (`open_tests.rs:1417`) build their flawed template with
+      `tests::ensure` (`tests.rs:54-57`), which takes only the shared
+      spawn-gate guard and drops the private root's exclusive key lock on
+      return (`ensure_in`, `creation_template.rs:1592-1600`; released by
+      dropping the `File`, not by `unlock()`). The subsequent `open`
+      reaches `create_in`'s first non-waiting shared try
+      (`creation_template.rs:1791`), whose `Ok(None)` is also
+      `Unavailable(Busy)` and sends the open cold
+      (`creation_worker.rs:165`). [inferred] A sibling child creation that
+      straddles the drop and that try — admitted, because this test holds
+      only a shared guard — would make the cold open succeed; the test
+      then fails with "a copy of a flawed template was activated", before
+      `quarantined_or_busy` is reached at all. This is the same mechanism
+      and class as the paragraph above, not a regression; both tests are
+      added to the roadmap diagnosis record's residual list for the same
+      separate routing.
 - [x] 6.4 Verify the review round — record each check.
       Observed (macOS host, this worktree): `format:check`,
       `//packages/kuru-memory:lint`, `//packages/kuru-memory:lint:windows`
@@ -394,3 +415,26 @@
       its deadline. This run shows no regression or deadlock; it cannot
       force the cross-test race, so the skip branch is covered by the two
       deterministic tests in 6.1.
+- [x] 6.5 Independent review round 2 on head `0851eab8`, and the CI legs
+      5.2 named as not run (coverage gate, Linux/Windows native legs).
+      Observed: an independent reviewer (a subagent that did not write the
+      change) read the full diff, the touched files and the diagnosis
+      record, and returned verdict ACCEPT with no must-fix. Both round-1
+      must-fixes were re-verified independently (cospec archived as a pure
+      rename; the three open-path assertions reach `quarantined_or_busy`
+      correctly). Should-fix 1 (the 6.3 residual was incomplete) is
+      resolved above; should-fix 2 (`quarantined_or_busy`'s third arm
+      untested) and the visibility nit are code changes, out of scope for
+      a record-only amendment after archiving. Should-fix 4 (PR body
+      wording) is not part of the cospec record.
+      CI evidence (run `36989424837`, head `0851eab8139039574917ae42a72262f5ae19c38d`,
+      `gh pr checks 171 --repo replygirl/kuru`): every job passed except
+      the two Windows arm64 `dolt-windows-arm64` reproducibility legs,
+      which report `skipping` (unrelated cache-key gating, not a failure).
+      This closes what 5.2 named as not run: `native-tests (ubuntu-latest,
+      windows-latest, windows-11-arm, macos-latest) / Require native
+      coverage and installation checks` all pass; the coverage-merge jobs
+      for macOS, Ubuntu and Windows all pass. A green run does not by
+      itself prove the cross-test race is closed — it cannot be forced
+      from a test — so this does not change the 6.3/6.4 analysis, only
+      records that the previously-pending legs finished green.
