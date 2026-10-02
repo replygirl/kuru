@@ -37,6 +37,18 @@ impl StepTimings {
         }
     }
 
+    /// How many steps have been marked; a fixture wait reads a change as
+    /// progress. A disabled recorder always reports zero.
+    pub(crate) fn completed(&self) -> usize {
+        self.0.as_ref().map_or(0, |recorded| {
+            recorded
+                .steps
+                .lock()
+                .map(|steps| steps.len())
+                .unwrap_or_default()
+        })
+    }
+
     /// One line per completed step, in completion order, and the time now.
     pub(crate) fn render(&self) -> String {
         let Some(recorded) = &self.0 else {

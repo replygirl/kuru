@@ -94,6 +94,9 @@ mod accounting_tests;
 mod step_timings;
 
 #[cfg(test)]
+mod progress_wait;
+
+#[cfg(test)]
 mod public_test_support;
 
 #[cfg(test)]

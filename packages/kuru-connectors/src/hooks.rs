@@ -449,6 +449,14 @@ impl HookHost {
         self.workers.state.borrow().active
     }
 
+    /// The bound [`HookHost::quiesce`] waits before reporting unconfirmed
+    /// cleanup. A fixture that awaits an operation enclosing `quiesce` derives
+    /// its own bound from this value instead of restating it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn quiesce_bound(&self) -> Duration {
+        QUIESCE
+    }
+
     fn suppressed_observations(&self, event: HookEvent) -> Vec<HookObservation> {
         (0..self.hooks.event(event).len())
             .map(|index| observation(event, index, HookOutcomeKind::Suppressed))
