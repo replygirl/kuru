@@ -94,7 +94,7 @@ Stage names SHALL be the record's stage names; no path, tag or token SHALL appea
 - **THEN** the starter fails at the poll that finds the record gone with `memory service ended its open before readiness`, naming the last stage seen, without waiting for the window
 
 #### Scenario: Failing owner fails at once with its reason
-- **WHEN** the owner marks its record failing with a reason before closing its engine
+- **WHEN** the owner marks its open failing with a reason before closing its engine, and its record carries that mark
 - **THEN** the starter fails at the poll that reads that record with `memory service open failed before readiness`, naming the reason and the last stage seen, without waiting for the engine reap or the window
 
 #### Scenario: Silent owner is abandoned one window after spawn
