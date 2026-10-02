@@ -584,6 +584,14 @@ jobs:
       # cold-existing medians 399.3 and 387.0 ms, spreads 61.7 and 23.5 ms:
       # 399.3 + 3 x 61.7 = 584.4, so 585.
       KURU_OPEN_TIME_BUDGET_COLD_EXISTING_MS: "585"
+      # Retry rule, median budgets only: when the first series holds every
+      # run, readiness and engine start check but misses a median budget,
+      # the same command measures one more full main series (same n and
+      # cases, fresh scratch) and fails only if that series misses too.
+      # Runner noise moves medians, not counts: a count violation or a
+      # failed open in either series fails at once, and there is never a
+      # third series. A persistent miss is fixed by re-deriving the budgets
+      # (docs/development.md#open-time-gate), never by rerunning the job.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -612,6 +620,10 @@ jobs:
           path: ${{ runner.temp }}/kuru-release
       # The main series only: 10 iterations. Measured on three runs at
       # about 3.5 minutes total, including the delivery tool's compile time.
+      # A median budget miss adds one more series of the same size (an
+      # estimate of about 3 more minutes, not yet observed in CI), well
+      # inside the job's 60-minute timeout. The second series' records are
+      # uploaded under main/retry/.
       - name: Measure and gate open time
         shell: bash
         env:
