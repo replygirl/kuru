@@ -1119,3 +1119,7 @@ A memory pool acquisition that reaches its bound SHALL fail with a bounded, secr
 #### Scenario: Wait with no new connection
 - **WHEN** a pool with spare capacity times out while no connection started authenticating during the wait
 - **THEN** the acquisition names an idle-check-or-release wait and reports no connection phase
+
+#### Scenario: Cancelled release
+- **WHEN** a session's release is cancelled after the pool has taken its connection, and a later acquisition reaches its bound
+- **THEN** the cancelled session is not counted as checked out, and the wait class reflects only the sessions Kuru work still holds

@@ -12,6 +12,7 @@
 - [x] 2.2 Release a new pool's first connection inline and verify its identity on one session, and verify the sequential-statement and fresh-open tests pass
 - [x] 2.3 Add `PoolAcquireTimedOut` with its three wait classes, the anyhow context and the `Executor` carrier, and verify the contended, stalled-authentication and classifier tests pass
 - [x] 2.4 Log every timed-out acquisition with the typed fields from the pool funnel, so the service owner's log names the wait without changing the wire fault, and verify the warning is emitted where the diagnostic is built
+- [x] 2.5 Stop counting a pooled session as checked out once its release takes the connection, before awaiting SQLx's return, and verify a release cancelled at a test-only release gate leaves the count and the next timeout's wait class correct
 
 ## 3. Receipted write sessions
 
