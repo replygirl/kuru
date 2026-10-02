@@ -45,6 +45,7 @@ fn options(root: &Path, binary: PathBuf) -> ServerOptions {
         } else {
             None
         },
+        ticks: None,
     }
 }
 

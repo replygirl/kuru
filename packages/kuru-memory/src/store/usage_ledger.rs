@@ -480,11 +480,11 @@ pub(super) async fn establish(store: &MemoryStore) -> Result<()> {
         .context("usage ledger branch creation deadline exceeded")??;
     }
     let pool = store.shared.server.pool(BRANCH).await?;
-    open_timeline::stamp(Event::UsagePool);
+    store.shared.server.open_milestone(Event::UsagePool);
     // Pre-upgrade validation: an invalid ledger is never migrated.
     validate_branch_state(pool.as_ref()).await?;
     let before = bound_check(pool.as_ref()).await?;
-    open_timeline::stamp(Event::UsageBound);
+    store.shared.server.open_milestone(Event::UsageBound);
     let scanned = if before.bound {
         None
     } else {
@@ -492,11 +492,11 @@ pub(super) async fn establish(store: &MemoryStore) -> Result<()> {
     };
     // 0 on a recorded reopen: the rows decoded between usage-bound and here.
     open_timeline::usage_rows(scanned.unwrap_or(0));
-    open_timeline::stamp(Event::UsageScan1);
+    store.shared.server.open_milestone(Event::UsageScan1);
     migrations::upgrade_usage(&store.shared.server, pool.as_ref()).await?;
-    open_timeline::stamp(Event::UsageUpgrade);
+    store.shared.server.open_milestone(Event::UsageUpgrade);
     migrations::validate_usage(pool.as_ref()).await?;
-    open_timeline::stamp(Event::UsageValidate);
+    store.shared.server.open_milestone(Event::UsageValidate);
     // D: the old second scan's flat checks stay; its owned walk runs only
     // when the upgrade changed `state` (no usage migration does today).
     validate_branch_state(pool.as_ref()).await?;
@@ -506,7 +506,7 @@ pub(super) async fn establish(store: &MemoryStore) -> Result<()> {
     } else {
         Some(validate_owned_rows(pool.as_ref(), &after.state_hash).await?)
     };
-    open_timeline::stamp(Event::UsageScan2);
+    store.shared.server.open_milestone(Event::UsageScan2);
     let recorded = if after.bound {
         false
     } else {
@@ -519,7 +519,7 @@ pub(super) async fn establish(store: &MemoryStore) -> Result<()> {
         }
         owned
     };
-    open_timeline::stamp(Event::UsageRecord);
+    store.shared.server.open_milestone(Event::UsageRecord);
     #[cfg(test)]
     {
         *store.shared.usage_open.lock().expect("usage open lock") = Some(UsageOpen {

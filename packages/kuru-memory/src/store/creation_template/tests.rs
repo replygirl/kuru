@@ -33,6 +33,7 @@ pub(super) async fn engine() -> Result<Engine> {
         binary: crate::test_support::warm_runtime_cache().await?,
         supervisor: test_supervisor()?,
         timeout: startup(),
+        ticks: None,
     })
 }
 
@@ -42,6 +43,7 @@ fn no_engine() -> Engine {
         binary: PathBuf::from("/nonexistent/dolt"),
         supervisor: PathBuf::from("/nonexistent/supervisor"),
         timeout: startup(),
+        ticks: None,
     }
 }
 
@@ -1650,6 +1652,7 @@ async fn non_table_objects_fail_the_template_shape() -> Result<()> {
         read_only: false,
         retained: None,
         lifecycle_root,
+        ticks: None,
     };
     let server = {
         let _gate = crate::spawn_gate::spawning().await;

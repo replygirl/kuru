@@ -1700,6 +1700,9 @@ async fn upgrade_in(
             .await;
             let target = after_cleanup(inspected, close_branch_pool(&attempt).await)?;
             publish(registry, main, definition, &branch, &base, &target, hooks).await?;
+            // One completed migration step: each iteration publishes the
+            // next higher version, so this is bounded by the registry.
+            server.advance_open();
             continue;
         }
         let attempt = server.pool(&branch).await?;
@@ -1721,6 +1724,7 @@ async fn upgrade_in(
         .await;
         let target = after_cleanup(built, close_branch_pool(&attempt).await)?;
         publish(registry, main, definition, &branch, &base, &target, hooks).await?;
+        server.advance_open();
     }
 }
 

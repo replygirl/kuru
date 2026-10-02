@@ -651,13 +651,47 @@ reaching it.
 
 While it opens, the owner publishes the open stages it has begun as a small
 private record beside its endpoint (`activity.json`, in `service/activity.rs`).
-The record carries a SHA-256 value derived from the starter token, never the
-token, and the starting client forwards only a record carrying the value for
-the token it passed, between its readiness polls. The record grants no
-authority: election, attachment, recovery and retirement never read it, and a
-failed write never fails or delays the open. The owner retires it (rename,
-then remove) inside its close, after the endpoint is retired and before the
-store closes, and on both error returns of its open. Two hooks, read only by
+The record is format 2 only (`deny_unknown_fields`, at most 4 KiB) and carries a
+SHA-256 value derived from the starter token, never the token. Beside the stages
+it carries `progress`, a count that belongs to one open
+(`MemoryStore::open_observed` creates it; the open's `ProgressReporter` and
+`ServerOptions` carry it). The count advances only at a distinct one-shot point or a completed bounded unit of
+work: every stage report, every open-timeline milestone stamped inside the open
+(stamp and advance are paired at the site), every 8 MiB copied by extraction or
+hashed by warm-cache verification, and every completed migration step. A new
+site follows the same rule: never advance on a timer, inside a sleep, in a
+retry iteration or while waiting for a lock. Immediately before an open that
+has failed closes an engine it started, and only where the open then returns
+that failure, the owner marks the record `"failing": true` with a `"reason"`
+taken from the error's text, cut at a character boundary to stay within the
+record limit; the starter token's spellings, the tag and the store's connection
+secrets are replaced in it. An owner whose store opened but which ends before
+its starter attached, because its listener, endpoint publication or serve loop
+failed, marks the record the same way (with the endpoint's connection secret
+replaced too) while it holds verified owner authority, before its store closes.
+It awaits that one write, as retirement already awaits the publisher, then
+closes the store and retires the record; without verified authority, or when
+the write fails, it retires the record before the store closes. Otherwise that
+starter would see only the retirement and lose the reason. The publisher writes a stage change or the failing
+mark at once and coalesces progress-only changes to at most one write every
+250 ms, always writing the latest. The starting client reads only a record
+carrying the value for the token it passed, once per readiness poll after that
+poll's attach attempt and owner-exit check (`OwnerWatch`). A change of its
+stages, count or failing mark restarts the `memory.startup_timeout_secs`
+window; a record it read that is gone, or one marked failing, ends the wait at
+once (see [configuration](configuration.md)). Gone means that the lookup of the
+record's name, or of its directory, found nothing (`files::is_missing_name`). A
+record replaced over its name after the client opened it fails the platform's
+handle check as unlinked, with no OS error code (Unix), or as delete-pending
+(Windows); either way it is not a missing name, that read decides nothing and
+the next poll's lookup does. Beyond extending or ending its own
+starter's readiness wait, the record grants no authority: election,
+attachment, recovery and retirement never read it, and a failed write never
+fails or delays the open. The owner always replaces it by publishing a complete
+staged record over its name, and retires it (rename, then remove) inside its
+close, after the endpoint is retired and before the store closes (after it,
+when it marked the record failing as above), and on every error return of its
+open. Two hooks, read only by
 the owner process under `test`/`test-support` (Windows owners receive them by
 explicit forwarding), let tests follow events instead of sleeping:
 `KURU_TEST_MEMORY_ACTIVITY_WRITE_FAILURE=1` makes every record write fail, and
@@ -669,6 +703,43 @@ OPEN_HOLD_DIR_ENV}`), and remove a hold once the sentence for that stage is
 visible. `test_support::hold_owner_lock` takes a project's owner lock, so a
 child that elects an owner finds it busy and shows the waiting sentence until
 `HeldOwnerLock::release`.
+
+The progress-bounded readiness wait is tested against a real child process on
+Linux, macOS and Windows through a stand-in owner. With the `test-support`
+feature, `KURU_TEST_MEMORY_SERVICE_STAND_IN=<file>` (`SERVICE_STAND_IN_ENV`)
+makes `service_entry` skip everything else: the owner takes no lock, opens
+nothing and writes nothing, and exits with the decimal status `<file>` holds
+once it holds one, polling every 10 ms of real time in its own process under a
+120 s bound so an unreleased stand-in leaves no process behind. Tests pass it
+only through the task-local owner environment
+(`activity::with_owner_environment`), which both platforms' spawns apply, and
+spawn the prepared `test-support` snapshot; the test then writes and retires
+the owner's record itself from the starter's poll hook, on a paused clock where
+the test needs exact windows. Inside the crate, `cfg(test)` seams on the
+publisher's `Writes` (a write gate, a write log and a mode that logs without
+I/O, since a paused clock cannot be trusted across `spawn_blocking`) check its
+write spacing, and `store::failed_open_close` pauses one test's own open
+between its failing mark and its engine's close. `ClosePoint::BeforeStoreClose`
+pauses an owner just before its store closes, after its record's mark or
+retirement, through its serve knobs or, for a failed endpoint publication,
+`OwnerHooks::close_pause`; `ServeKnobs::accept_fault` makes the serve loop's
+accept fail. The application tests' shared `ServiceCleanup` fixture creates a
+private `KURU_TEST_MEMORY_OWNER_DIAGNOSTIC` file in its root, and the
+command-line children of the `cli`, `lease`, `preferences`, `terminal`,
+`trust`, `unix_shell_turn` and `windows_terminal` binaries and of `server`'s
+Unix leg receive it. When the fixture drops, it writes any stderr those owners
+left to the test's captured output, which the harness shows only for a failing
+test, whether it panicked or returned its error; `ServiceCleanup::release`
+attaches the same text to a failed outcome. Both read the file after cleanup
+has awaited the owners it can find. With the `test-support` feature an owner
+whose open fails writes `memory service owner open failed: <error>` to its
+stderr before it retires its activity record, so the file already holds the
+reason when the starter sees the record gone; the process's own final error
+report follows only after its owner lock is released. A starter run with
+`KURU_TEST_MEMORY_STARTUP_STAGES=1` sends its owner's stderr to a private file
+and, when its start fails, appends that file (at most 1 MiB) to the owner
+diagnostic. Owners that the test process elects itself, through an in-process
+open, are not covered: the test runner's own environment is never changed.
 
 With `KURU_OPEN_MARKERS=1` (exactly `1`; unset or any other value changes
 nothing) the command line writes open-time marker lines to standard error for

@@ -185,6 +185,10 @@ pub struct ServerOptions {
     /// Windows requires one stable external namespace for all names of this
     /// physical store. Unix preserves its existing in-directory lease layout.
     pub lifecycle_root: Option<PathBuf>,
+    /// The progress counter of the open this engine start belongs to, if it
+    /// counts. The start advances it at its milestones and marks it failing
+    /// before it reaps an engine whose failure fails that open.
+    pub ticks: Option<crate::progress::OpenTicks>,
 }
 
 #[derive(Clone)]
@@ -213,6 +217,8 @@ struct ServerInner {
     owner: Mutex<Option<Owner>>,
     reap_guard: Arc<StdMutex<Option<File>>>,
     closed: AtomicBool,
+    /// The progress counter of the open that started this server, if any.
+    ticks: Option<crate::progress::OpenTicks>,
 }
 
 /// One branch's pool admission fence: while it lives, [`Server::pool`] cannot
@@ -608,6 +614,7 @@ impl Server {
                     None,
                     reap_guard,
                     None,
+                    options.ticks,
                 ));
             }
         } else {
@@ -789,16 +796,20 @@ impl Server {
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                return Err(startup_failure(&mut owner, error).await);
+                return Err(startup_failure(&mut owner, error, options.ticks.as_ref()).await);
             }
         };
         let (endpoint, owned) = match response {
             Response::Ready { endpoint, owned } => {
-                crate::open_timeline::stamp(crate::open_timeline::Event::SupervisorReady);
+                crate::progress::milestone(
+                    options.ticks.as_ref(),
+                    crate::open_timeline::Event::SupervisorReady,
+                );
                 if !owned && !options.read_only {
                     return Err(startup_failure(
                         &mut owner,
                         anyhow!("writable memory requires an owned supervisor lifetime"),
+                        options.ticks.as_ref(),
                     )
                     .await);
                 }
@@ -808,6 +819,7 @@ impl Server {
                 return Err(startup_failure(
                     &mut owner,
                     anyhow!("memory server startup failed: {message}"),
+                    options.ticks.as_ref(),
                 )
                 .await);
             }
@@ -818,6 +830,7 @@ impl Server {
                         "memory server startup rejected the store template: {message}"
                     ))
                     .into(),
+                    options.ticks.as_ref(),
                 )
                 .await);
             }
@@ -874,11 +887,14 @@ impl Server {
         .await;
         let identity = match verified {
             Ok(identity) => {
-                crate::open_timeline::stamp(crate::open_timeline::Event::ProbeVerified);
+                crate::progress::milestone(
+                    options.ticks.as_ref(),
+                    crate::open_timeline::Event::ProbeVerified,
+                );
                 identity
             }
             Err(error) => {
-                return Err(startup_failure(&mut owner, error).await);
+                return Err(startup_failure(&mut owner, error, options.ticks.as_ref()).await);
             }
         };
         let owner = if owned {
@@ -895,9 +911,14 @@ impl Server {
             owner,
             reap_guard,
             Some(startup_deadline),
+            options.ticks,
         ))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one constructor for the owned and borrowed starts"
+    )]
     fn new(
         directory: PathBuf,
         identity: Identity,
@@ -906,6 +927,7 @@ impl Server {
         owner: Option<Owner>,
         reap_guard: Arc<StdMutex<Option<File>>>,
         opening_deadline: Option<Instant>,
+        ticks: Option<crate::progress::OpenTicks>,
     ) -> Self {
         Self(Arc::new(ServerInner {
             directory,
@@ -926,7 +948,36 @@ impl Server {
             owner: Mutex::new(owner),
             reap_guard,
             closed: AtomicBool::new(false),
+            ticks,
         }))
+    }
+
+    /// Advance the count of the open that started this server: one
+    /// completed bounded unit of that open's work, such as a migration step.
+    pub(crate) fn advance_open(&self) {
+        if let Some(ticks) = &self.0.ticks {
+            ticks.advance();
+        }
+    }
+
+    /// Stamp `event` and advance the count of the open that started this
+    /// server.
+    pub(crate) fn open_milestone(&self, event: crate::open_timeline::Event) {
+        crate::progress::milestone(self.0.ticks.as_ref(), event);
+    }
+
+    /// Mark the open that started this server failing with `error`. Call
+    /// only immediately before closing this server for a failure that the
+    /// open then returns.
+    pub(crate) fn mark_open_failing(&self, error: &anyhow::Error) {
+        if let Some(ticks) = &self.0.ticks {
+            ticks.mark_failing_with(self.failure_reason(error));
+        }
+    }
+
+    /// `error`'s own text with this server's identity secrets replaced.
+    pub(crate) fn failure_reason(&self, error: &anyhow::Error) -> String {
+        redact_identity(format!("{error:#}"), &self.0.identity)
     }
 
     pub async fn pool(&self, branch: &str) -> Result<Arc<MemoryPool>> {
@@ -1375,7 +1426,27 @@ fn readiness_deadline_part(
         .then_some(ReadinessPart::Accept)
 }
 
-async fn startup_failure(owner: &mut Owner, error: anyhow::Error) -> anyhow::Error {
+/// `text` without either connection secret of `identity`.
+fn redact_identity(text: String, identity: &Identity) -> String {
+    [&identity.password, &identity.reader_password]
+        .into_iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(text, |text, secret| {
+            text.replace(secret.as_str(), "[redacted]")
+        })
+}
+
+/// Reap a failed engine start. Every caller returns the error from the
+/// start, and every start that carries an open's counter fails that open with
+/// it, so the open is marked failing first, before the reap begins.
+async fn startup_failure(
+    owner: &mut Owner,
+    error: anyhow::Error,
+    ticks: Option<&crate::progress::OpenTicks>,
+) -> anyhow::Error {
+    if let Some(ticks) = ticks {
+        ticks.mark_failing(&error);
+    }
     match finish_owner(owner).await {
         Ok(()) => error,
         Err(cleanup) => error.context(format!("memory startup cleanup also failed: {cleanup:#}")),

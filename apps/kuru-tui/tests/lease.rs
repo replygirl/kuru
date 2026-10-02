@@ -33,13 +33,24 @@ fn command() -> Command {
     command
 }
 
+/// A command whose elected owner writes its stderr to `fixture`'s diagnostic
+/// file, which a failing test shows.
+fn observed(fixture: &memory::ServiceCleanup) -> Command {
+    let mut command = command();
+    command.env(
+        kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+        fixture.owner_diagnostic_path(),
+    );
+    command
+}
+
 #[test]
 fn writer_lease_rejects_a_second_process_and_releases_on_close() {
     let root = kuru_memory::test_support::tempdir().unwrap();
     let project = root.path().join("project");
     let data = root.path().join("data");
     std::fs::create_dir_all(&project).unwrap();
-    let _root = memory::ServiceCleanup::new(root, &data);
+    let fixture = memory::ServiceCleanup::new(root, &data);
     let directory = Directory::ensure_private(&data.join("locks")).unwrap();
     let project = project.canonicalize().unwrap();
     let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
@@ -53,14 +64,14 @@ fn writer_lease_rejects_a_second_process_and_releases_on_close() {
     lease.try_lock().unwrap();
     let mut args = arguments(&project, &data);
     args.extend(["run".into(), "hello".into(), "--json".into()]);
-    let blocked = command().args(&args).output().unwrap();
+    let blocked = observed(&fixture).args(&args).output().unwrap();
     assert!(!blocked.status.success());
     assert!(String::from_utf8_lossy(&blocked.stderr).contains("active Kuru writer"));
     // Even a read command needs the writer lease before importing a legacy file.
     // An invalid marker proves the lease error precedes any attempt to parse it.
     let legacy = data.join("memory.sqlite3");
     std::fs::write(&legacy, b"legacy bytes must remain untouched").unwrap();
-    let blocked_migration = command()
+    let blocked_migration = observed(&fixture)
         .args(arguments(&project, &data))
         .arg("sessions")
         .output()
@@ -74,7 +85,7 @@ fn writer_lease_rejects_a_second_process_and_releases_on_close() {
     assert_eq!(std::fs::read_dir(&data).unwrap().count(), 2);
     std::fs::remove_file(legacy).unwrap();
     drop(lease);
-    let resumed = command().args(&args).output().unwrap();
+    let resumed = observed(&fixture).args(&args).output().unwrap();
     assert!(
         resumed.status.success(),
         "{}",
@@ -90,10 +101,14 @@ fn listing_sessions_does_not_create_new_sessions() {
     let project = root.path().join("project");
     let data = root.path().join("data");
     std::fs::create_dir_all(&project).unwrap();
-    let _root = memory::ServiceCleanup::new(root, &data);
+    let fixture = memory::ServiceCleanup::new(root, &data);
     let args = arguments(&project, &data);
     for _ in 0..2 {
-        let output = command().args(&args).arg("sessions").output().unwrap();
+        let output = observed(&fixture)
+            .args(&args)
+            .arg("sessions")
+            .output()
+            .unwrap();
         assert!(
             output.status.success(),
             "{}",
@@ -104,14 +119,22 @@ fn listing_sessions_does_not_create_new_sessions() {
             serde_json::json!([])
         );
     }
-    let run = command()
+    let run = observed(&fixture)
         .args(&args)
         .args(["run", "a saved session"])
         .output()
         .unwrap();
     assert!(run.status.success());
-    let first = command().args(&args).arg("sessions").output().unwrap();
-    let second = command().args(&args).arg("sessions").output().unwrap();
+    let first = observed(&fixture)
+        .args(&args)
+        .arg("sessions")
+        .output()
+        .unwrap();
+    let second = observed(&fixture)
+        .args(&args)
+        .arg("sessions")
+        .output()
+        .unwrap();
     assert!(first.status.success() && second.status.success());
     let sessions: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(sessions.as_array().unwrap().len(), 1);

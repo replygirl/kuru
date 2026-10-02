@@ -757,6 +757,7 @@ async fn opening_retry_after_a_timed_out_callback_is_one_working_session() -> Re
             read_only: false,
             retained: None,
             lifecycle_root: cfg!(windows).then(|| root.path().join("leases")),
+            ticks: None,
         })
         .await?
     };

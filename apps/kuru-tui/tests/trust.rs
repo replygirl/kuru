@@ -92,7 +92,12 @@ impl Sandbox {
             .arg(project)
             .arg("--data-dir")
             .arg(&self.data)
-            .env("XDG_CONFIG_HOME", self.root.path().join("config"));
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+            // A failing test shows the stderr of every owner this elects.
+            .env(
+                kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+                self.root.owner_diagnostic_path(),
+            );
         command
     }
 
@@ -1595,6 +1600,10 @@ fn terminal_command(sandbox: &Sandbox) -> ProcessCommand {
         .arg("--data-dir")
         .arg(&sandbox.data)
         .env("XDG_CONFIG_HOME", sandbox.root.path().join("config"))
+        .env(
+            kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+            sandbox.root.owner_diagnostic_path(),
+        )
         .env("TERM", "xterm-256color");
     command
 }

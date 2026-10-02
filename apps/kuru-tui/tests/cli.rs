@@ -96,7 +96,12 @@ impl Sandbox {
             .arg("--data-dir")
             .arg(&self.data)
             .args(["--provider", provider, "--no-dream"])
-            .env("XDG_CONFIG_HOME", self.root.path().join("config"));
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+            // A failing test shows the stderr of every owner this elects.
+            .env(
+                kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+                self.root.owner_diagnostic_path(),
+            );
         command
     }
     fn run(&self, args: &[&str]) -> Output {
@@ -533,6 +538,10 @@ async fn bounded_linux_cli_child(
         .arg(&env.data)
         .args(["--provider", "demo", "--no-dream"])
         .env("XDG_CONFIG_HOME", env.root.path().join("config"))
+        .env(
+            kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+            env.root.owner_diagnostic_path(),
+        )
         .env("KURU_TEST_MCP_CA_PEM", ca_path)
         .env("KURU_TEST_STATIC_HEADER", "Bearer synthetic-static-proof")
         .arg("--trust-workspace-once")
@@ -960,6 +969,47 @@ fn service_cleanup_release_attaches_its_failure_to_the_fixture_outcome() {
     memory::ServiceCleanup::new(root, &data)
         .release(Ok(()))
         .unwrap();
+}
+
+/// An owner's stderr reaches a failed fixture's outcome, and is absent from a
+/// fixture whose owners wrote nothing.
+#[test]
+fn service_cleanup_attaches_owner_stderr_to_a_failed_outcome() {
+    use std::io::Write as _;
+
+    let root = kuru_memory::test_support::tempdir().unwrap();
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let cleanup = memory::ServiceCleanup::new(root, &data);
+    // The hook appends to the existing file; this stands in for an owner.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(cleanup.owner_diagnostic_path())
+        .unwrap()
+        .write_all(b"Error: synthetic owner failure\n")
+        .unwrap();
+    let rendered = format!(
+        "{:#}",
+        cleanup
+            .release::<()>(Err(anyhow::anyhow!("original fixture failure")))
+            .unwrap_err()
+    );
+    assert!(rendered.contains("original fixture failure"), "{rendered}");
+    assert!(
+        rendered.contains("owner stderr") && rendered.contains("synthetic owner failure"),
+        "{rendered}"
+    );
+
+    let root = kuru_memory::test_support::tempdir().unwrap();
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let rendered = format!(
+        "{:#}",
+        memory::ServiceCleanup::new(root, &data)
+            .release::<()>(Err(anyhow::anyhow!("original fixture failure")))
+            .unwrap_err()
+    );
+    assert_eq!(rendered, "original fixture failure");
 }
 
 /// The lines a command wrote on standard error before the first-run notice,
@@ -1550,9 +1600,13 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
     assert!(
         !env.run(&["--resume", "missing", "run", "no"])
             .status
-            .success()
+            .success(),
+        "a missing session resumed"
     );
-    assert!(!env.run(&["undo-dream"]).status.success());
+    assert!(
+        !env.run(&["undo-dream"]).status.success(),
+        "undo-dream succeeded with no dream"
+    );
     assert!(env.success(&["run", "plain answer"]).contains("demo"));
 }
 

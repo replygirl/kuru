@@ -27,6 +27,7 @@ async fn prepared_snapshot_runs_real_supervisor_after_cargo_alias_disappears_and
         read_only: false,
         retained: None,
         lifecycle_root: cfg!(windows).then(|| root.path().join("lifecycles")),
+        ticks: None,
     };
     let server = Server::open(options.clone()).await?;
     let pool = server.pool("main").await?;

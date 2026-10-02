@@ -435,6 +435,7 @@ async fn open_rejects_invalid_options_before_executable_lookup() -> Result<()> {
         read_only: false,
         retained: None,
         lifecycle_root: None,
+        ticks: None,
     };
     let mut invalid = options();
     invalid.timeout = Duration::ZERO;
@@ -585,6 +586,7 @@ async fn closing_an_attached_handle_does_not_establish_quiescence() -> Result<()
         read_only: false,
         retained: None,
         lifecycle_root: None,
+        ticks: None,
     };
     let (owner, attached) = {
         // Held across both owned-supervisor spawns; see `crate::spawn_gate`.
@@ -855,6 +857,29 @@ async fn parent_close_during_selected_port_takeover_never_retries() -> Result<()
     Ok(())
 }
 
+// A failure reason recorded for a starter never carries either connection
+// secret of the store's identity.
+#[test]
+fn a_failure_reason_never_carries_a_connection_secret() {
+    let identity = Identity {
+        version: 1,
+        instance: Uuid::new_v4().to_string(),
+        project_scope: "project/redaction".into(),
+        password: secret(),
+        reader_password: secret(),
+        initialized: true,
+        template: None,
+    };
+    let text = format!(
+        "pool refused {} and {} twice: {}",
+        identity.password, identity.reader_password, identity.password
+    );
+    assert_eq!(
+        redact_identity(text, &identity),
+        "pool refused [redacted] and [redacted] twice: [redacted]"
+    );
+}
+
 /// A supervisor that takes its startup request and never answers reaches the
 /// one readiness deadline in its Ready-frame step: the outer cause is
 /// unchanged, the step is named, and the supervisor was reaped before the
@@ -877,6 +902,7 @@ async fn supervisor_readiness_deadline_names_its_part() -> Result<()> {
         read_only: false,
         retained: None,
         lifecycle_root: None,
+        ticks: None,
     };
     // Holds the spawn gate across the supervisor spawn only.
     let error = Server::open_with_initial_probe_delay(

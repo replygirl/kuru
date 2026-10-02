@@ -249,6 +249,7 @@ async fn open_reader(store: &MemoryStore) -> Result<(Server, Arc<MemoryPool>)> {
             read_only: true,
             retained: None,
             lifecycle_root: cfg!(windows).then(|| data_dir.join("memory/lifecycles")),
+            ticks: None,
         })
         .await?
     };

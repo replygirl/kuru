@@ -1,0 +1,40 @@
+# Proposal
+
+## Why
+
+A client that starts its project's memory service waits for that owner within one flat `memory.startup_timeout_secs` measured from the command's start, and abandons it then even while the owner is visibly working. On slow Windows runners every catalogued A1 readiness failure (`tmp/roadmap/windows-families-plan-2026-10-02-readiness.md`, rows R4, R7 and R18) ended at about 30 s with the owner alive, holding its lock and still opening its database, so the command failed while the service was making progress. The maintainer's ruling of 2026-10-02 is that no wait may abandon progressing work: the elected starter keeps waiting while its own owner advances, and gives up only after `startup_timeout_secs` with no progress, or at once when the owner has exited, has recorded that its open is failing, or has retired its record before readiness.
+
+**This reverses an earlier decision, by the maintainer's ruling.** Decision i (`tmp/roadmap/startup-and-flakes-knowledge-transfer-2026-09-29.md` §9 row i, 2026-09-29) withdrew the stage-bounded wait and fixed "no change to the meaning or value of `startup_timeout_secs`"; unit 2's revised design pinned "no change to the meaning of `startup_timeout_secs`" (`tmp/roadmap/unit2-open-activity-feedback-design-2026-09-29-revised.md:1033`), and the timeline design restated "Decision i stands" (`tmp/roadmap/readiness-owner-timeline-design-2026-10-02.md:10`). The 2026-10-02 ruling supersedes all three: the value and documented range of `startup_timeout_secs` (1-300 s) are unchanged, and its meaning for a starter's readiness wait becomes "no progress for this long". The approved design is `tmp/roadmap/progress-readiness-wait-design-2026-10-02.md`, with the lead's decisions D1-D5 recorded in `design.md`.
+
+## What Changes
+
+- **Owner progress count.** Each tokened owner's open activity record (format 2 only) carries, beside its stages, a per-open progress count that advances only when the open reaches a distinct one-shot code point or completes a bounded unit of work: every open stage report, every open milestone already stamped inside the open, every 8 MiB of embedded-engine extraction or warm-cache hashing, and every migration step completed. It never advances on a timer, inside a sleep, in a retry iteration or while waiting for a lock. The count is per open, not process-global.
+- **Failing flag and reason.** Immediately before an open that has failed closes its started engine (every `close_failed_open` call, after an audit that each such `Err` always propagates), the owner records `"failing": true` and a bounded failure reason in the same record, so the client reports the cause at once instead of waiting through the engine reap (bounded only by about 13 s). Owner stderr is discarded in the product, so the record is the only path by which that reason reaches the user.
+- **Progress-bounded readiness wait.** After spawning its owner, the elected starter reads its own owner's record on every readiness poll, after that poll's attach attempt and exit check. A change of the record's content restarts the `startup_timeout_secs` window, measured on the client's own clock; the first window starts at spawn. The wait fails with a typed error: `memory service readiness deadline exceeded` after a window with no change, naming the last stage seen and the time since the last progress; `memory service exited before readiness` at once on owner exit, with the exit status and last stage seen; `memory service ended its open before readiness` at once when a record it has read is retired before attachment; and `memory service open failed before readiness` at once when the record says the open is failing, with the reason. No overall cap and no retry. Each engine start remains bounded by the owner's own deadline, so a single engine start longer than `startup_timeout_secs` still fails.
+- **Waits that stay flat.** Election, the wait for a previous owner to close and a read-only inspection's wait for a booting owner each remain bounded by one `startup_timeout_secs` from the command's start. A second starter during a slow owner start therefore fails with the election deadline while the first keeps waiting and attaches (lead decision D1 (a); the progress-aware election wait is a follow-on).
+- **Test-support stand-in owner.** Under the `test-support` feature, `service_entry` gains a stand-in mode selected by `KURU_TEST_MEMORY_SERVICE_STAND_IN`, which takes no lock, writes nothing and exits with the status its release file names, so the four readiness tests run natively on Linux, macOS and Windows.
+- **Docs.** `docs/configuration.md` and `apps/kuru-docs/reference/configuration.md` state the new meaning, the user-facing definition of progress, what each error reports, and that each engine start is still bounded by this value; `docs/release.md` gains both mixed-version directions of the record format; `docs/development.md` documents the progress field, the progress-point rule and the stand-in mode.
+
+Unchanged, and carried verbatim in the living spec: "Attachment-bound idle cleanup", whose retirement order (endpoint, then record, then store close) becomes load-bearing for the client's retirement signal; `configuration-schema` "Invalid numeric bound is rejected" (1-300 stays); and the gated "Owner open timeline". Also unchanged: owner election and lock semantics, PID-free authority, the client never killing its owner, reap ordering, the uncertain-write fence, the poll cadence, the existing leading error texts, `KURU_OPEN_MARKERS` and the five progress sentences. A sign-of-life indicator for long waits is a recorded follow-on.
+
+## Capabilities
+
+### New Capabilities
+
+### Modified Capabilities
+- `project-memory-owner`: "One project owner controls the live engine" (the start lock is held through the progress-bounded wait; election, previous-owner and inspection waits stay flat; "Two cold starters" qualified and "Second starter during a slow owner start" added), "Tagged open activity record" (progress count, failing flag and reason; the record may extend and end only its own starter's readiness wait), and a new "Readiness wait bounded by owner progress".
+
+## Impact
+
+- `packages/kuru-memory`: `src/service.rs` (readiness loop, `ReadinessFailure`, the test-support stand-in mode in `service_entry`), `src/service/activity.rs` (format 2, progress and failing fields, observation classes, publisher spacing), `src/progress.rs` (per-open progress ticks on the reporter), `src/server.rs` (ticks on `ServerOptions`), `src/store.rs` and `src/store/usage_ledger.rs` (milestone pairing, migration-step ticks, the failing flag at `close_failed_open`), `src/provision.rs` (extraction and verification byte ticks).
+- Record format 1 is no longer accepted; the owner is always the client's own executable, so a mismatch arises only when that binary is replaced in place between a client's start and its spawn. Both directions degrade to today's flat wait and are documented in `docs/release.md`. Not breaking for users or configuration.
+- The start lock may be held longer than one window, while the owner keeps progressing. Test harness bounds sized for about one window now surface a slow-but-advancing owner as a harness timeout, which is real slowness to report.
+- The failure reason lands in this unit together with the failing flag: every flagged site already holds the error it is about to return (`packages/kuru-memory/src/store.rs:4717`, `close_failed_open`). If the reason proves larger than the flag, the flag lands here and the reason becomes the very next change; the PR body says which.
+- No new dependency, argument, protocol frame, migration or workflow. The 90% coverage gate is unchanged.
+
+## Surfaces
+
+- [x] interactive — a user-visible/interactive surface (UI, TUI, CLI UX)
+- [ ] deploy — deploy/runtime/CI-execution topology (infra, Dockerfile, workflow runtime, secrets, bind address)
+- [ ] integration — a third-party/external contract (SDK, OAuth, schema/id-type reconciliation)
+- [ ] agent-behavior — prompts, tools, model routing, or agent output shape

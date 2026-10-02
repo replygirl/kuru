@@ -151,6 +151,11 @@ impl Sandbox {
             .arg(&self.data)
             .args(["--provider", provider, "--no-dream"])
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+            // A failing test shows the stderr of every owner this elects.
+            .env(
+                kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+                self.root.owner_diagnostic_path(),
+            )
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             .env_remove("NO_COLOR")

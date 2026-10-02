@@ -79,6 +79,17 @@ pub(crate) fn name(path: &Path) -> Result<&OsStr> {
     path.file_name().context("memory file needs a literal name")
 }
 
+/// Whether `error` says the name, or a directory on its path, was not there
+/// when it was looked up: the operating system's own not-found code from a
+/// native open. A checked open also reports `NotFound`, carrying no OS code,
+/// for a handle it holds whose name was unlinked or replaced after the open;
+/// the name was there, so that is not a missing name.
+pub(crate) fn is_missing_name(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        error.kind() == std::io::ErrorKind::NotFound && error.raw_os_error().is_some()
+    })
+}
+
 pub(crate) fn read(path: &Path, privacy: Privacy) -> Result<(Directory, File)> {
     let parent = parent(path, privacy, NameRetention::Movable)?;
     let file = parent.read(name(path)?)?;
@@ -92,7 +103,20 @@ pub(crate) fn read_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
 /// [`read_bytes`] with a hook between reading the held handle and verifying
 /// that its name still identifies it, where a concurrent retirement can land.
 pub(crate) fn read_bytes_then(path: &Path, limit: u64, between: impl FnOnce()) -> Result<Vec<u8>> {
-    let (parent, mut file) = read(path, Privacy::OwnerOnly)?;
+    let (parent, file) = read(path, Privacy::OwnerOnly)?;
+    read_held_then(&parent, path, file, limit, between)
+}
+
+/// Read at most `limit` bytes from `file`, already opened at `path` in
+/// `parent`, then verify that the name still identifies it. `between` runs
+/// after the read and before that verification.
+pub(crate) fn read_held_then(
+    parent: &Directory,
+    path: &Path,
+    mut file: File,
+    limit: u64,
+    between: impl FnOnce(),
+) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     (&mut file).take(limit + 1).read_to_end(&mut bytes)?;
     ensure!(

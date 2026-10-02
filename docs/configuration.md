@@ -689,12 +689,39 @@ directories that share a `cache_dir` share it. With `dolt_binary` set, new
 projects are built without the template. Corrupt existing caches fail without
 automatic repair. If activating a verified engine fails, the error reports the retained private
 staging directory for inspection; Kuru does not automatically retry that move.
-The startup timeout is 1–300 seconds. If a newly started memory service is not
-ready in time, the error `memory service readiness deadline exceeded` also
-reports how that wait was split: election, owner probe, spawn and readiness
-polling in milliseconds, the number of readiness polls, and what the last poll
-found. A command that starts while the previous memory service is still shutting
-down waits for it within the same timeout. A service whose starting command never
+The startup timeout is 1–300 seconds (default 30). When a command starts its
+project's memory service, the timeout means "no progress for this long", not a
+limit on the whole start: the command keeps waiting while the service it started
+makes progress, and gives up only after this many seconds without any. The
+first period starts when the service is started, and there is no overall cap. A
+service makes progress when its open begins a new stage or completes a bounded
+step of work: a stage of the open, an engine start or check it reaches, each
+8 MiB of extracting or verifying the bundled engine, or one completed migration
+step. Time alone, waiting for a lock and retrying never count. Each engine start
+inside the service is still limited to this many seconds, so a single engine
+start that takes longer still fails. The wait ends with one of four errors, each
+naming the last stage the service reported, its progress count and the time
+since its last progress:
+
+- `memory service readiness deadline exceeded` after the timeout passed with no
+  progress; it also reports how the wait was split: election, owner probe, spawn
+  and readiness polling in milliseconds, the number of readiness polls, and what
+  the last poll found.
+- `memory service exited before readiness` at once when the service exited,
+  with its exit status.
+- `memory service ended its open before readiness` at once when the service
+  ended its open without serving the command and without recording why.
+- `memory service open failed before readiness` at once when the service
+  reported that its open, or its startup after opening the database, failed,
+  followed by the reason it recorded.
+
+Waiting to become the project's only starter, a command that starts while the
+previous memory service is still shutting down, and an inspection command
+waiting for a starting service each stay limited to this timeout from the
+command's start, whatever progress is made. So when two commands start the same
+cold project together and its service takes longer than the timeout, the
+command that started it keeps waiting and attaches, and the other fails with
+`memory service election deadline exceeded`. A service whose starting command never
 attaches exits by itself once this timeout has passed since its endpoint was
 published, when no client is attached. See [memory storage](memory.md) for
 migration, revision inspection and backups, or

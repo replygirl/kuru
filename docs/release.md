@@ -365,6 +365,18 @@ gets no new "protocol is incompatible" refusal.
 - An updated client that spawns a pre-token executable (a downgrade under a
   running client) passes the tenth service argument, which the old owner rejects;
   the client reports that the memory service exited before readiness.
+- The owner's open activity record is format 2 only, carrying its progress
+  count and, on a failing open, the failing mark and reason; neither version
+  reads the other's format. A client from before the progress-bounded readiness
+  wait that spawns an updated owner rejects its format 2 record, shows only the
+  open stages it observes itself and keeps its flat wait of one
+  `startup_timeout_secs` from its start. An updated client that spawns an
+  executable from before that change (a downgrade under a running client)
+  rejects its format 1 record, so it never sees progress and gives up one
+  `startup_timeout_secs` after spawn with `memory service readiness deadline
+  exceeded`. It still reports an owner exit at once, but it cannot observe that
+  owner's retirement or a failing open, so those end only at the owner's exit
+  or the timeout.
 
 ## Notes model and configuration
 
