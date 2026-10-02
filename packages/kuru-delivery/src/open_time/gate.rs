@@ -292,7 +292,7 @@ impl Violation {
                     .map(|(iteration, ready)| format!("iteration {iteration} {ready:.1} ms"))
                     .collect();
                 format!(
-                    "{}: median open to ready {median_ms:.0} ms is over the {budget_ms} ms \
+                    "{}: median open to ready {median_ms:.1} ms is over the {budget_ms} ms \
                      budget; runs over the budget: {}",
                     case.label(),
                     runs.join(", ")
@@ -479,7 +479,7 @@ pub fn render(verdict: &Verdict, gate: &Gate) -> String {
             for median in medians {
                 let _ = writeln!(
                     text,
-                    "| {} | {} | {:.0} | {:.0} | {:.0} | {} | {} |",
+                    "| {} | {} | {:.1} | {:.0} | {:.0} | {} | {} |",
                     median.case.label(),
                     median.n,
                     median.median_ms,
