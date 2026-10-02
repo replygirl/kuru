@@ -71,7 +71,7 @@ fn is_tag(text: &str) -> bool {
 /// The record's name for a stage an owner may publish. Ready, the
 /// retained-install notices and the client's own service start are never
 /// published. Exhaustive, so a new stage must be placed here to compile.
-fn stage_name(stage: MemoryOpenStage) -> Option<&'static str> {
+pub(super) fn stage_name(stage: MemoryOpenStage) -> Option<&'static str> {
     Some(match stage {
         MemoryOpenStage::WaitingForProjectOwnership => "WaitingForProjectOwnership",
         MemoryOpenStage::WaitingForRuntimeCache => "WaitingForRuntimeCache",
@@ -155,6 +155,38 @@ fn write_record(directory: &Path, tag: &str, stages: &[MemoryOpenStage]) -> Resu
     let bytes = encode(tag, stages)?;
     crate::files::ensure_private_directory(directory)?;
     crate::files::write(&directory.join(RECORD), &bytes)
+}
+
+/// Test-only: publish a format-2 record for `tag` as its owner would, with
+/// `stages` and the progress count `progress`, through the same private
+/// staged write.
+#[cfg(test)]
+pub(super) fn write_progress_record(
+    data_dir: &Path,
+    scope: &str,
+    tag: &str,
+    stages: &[MemoryOpenStage],
+    progress: u64,
+) -> Result<()> {
+    let stages: Vec<&str> = stages
+        .iter()
+        .map(|stage| stage_name(*stage).context("open stage is not published"))
+        .collect::<Result<_>>()?;
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "format": 2,
+        "tag": tag,
+        "stages": stages,
+        "progress": progress,
+    }))?;
+    let directory = directory(data_dir, scope)?;
+    crate::files::ensure_private_directory(&directory)?;
+    crate::files::write(&directory.join(RECORD), &bytes)
+}
+
+/// Test-only: retire the record tagged `tag` exactly as its owner does.
+#[cfg(test)]
+pub(super) fn retire_tagged_record(data_dir: &Path, scope: &str, tag: &str) -> Result<()> {
+    retire_record(&directory(data_dir, scope)?, tag)
 }
 
 fn read_stages(data_dir: &Path, scope: &str, tag: &str) -> Result<Vec<MemoryOpenStage>> {

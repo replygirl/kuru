@@ -138,6 +138,10 @@ fn fixture_startup_observations(
 /// Internal process entry used by both the ordinary executable and native
 /// fixtures. Paths arrive as native OS arguments so non-UTF-8 names survive.
 pub async fn service_entry(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(release) = std::env::var_os(SERVICE_STAND_IN_ENV).filter(|path| !path.is_empty()) {
+        return stand_in_owner(&PathBuf::from(release)).await;
+    }
     crate::open_timeline::install_from_env();
     let (project, options) = parse_service_arguments(arguments)?;
     ServiceOwner::open(options, &project).await?.serve().await
@@ -205,6 +209,42 @@ fn parse_service_arguments(
 
 fn optional_path(argument: OsString) -> Option<PathBuf> {
     (argument != OsStr::new("-")).then(|| PathBuf::from(argument))
+}
+
+/// Test-support stand-in owner: names a release file. An owner process
+/// started with it takes no lock, opens nothing and writes nothing; it stays
+/// alive until the file holds a decimal exit status, then exits with that
+/// status. A test passes it only through the task-local owner environment,
+/// so its readiness tests drive the starter against a real child process on
+/// every platform while publishing the owner's record itself.
+#[cfg(feature = "test-support")]
+pub const SERVICE_STAND_IN_ENV: &str = "KURU_TEST_MEMORY_SERVICE_STAND_IN";
+
+/// The stand-in owner's whole life. It polls in its own fixture process,
+/// as `client_fixture_entry` does, every 10 ms of real time under a 120 s
+/// bound, so a test that never releases it leaves no process behind. A
+/// missing or not yet complete file is not a release.
+#[cfg(feature = "test-support")]
+async fn stand_in_owner(release: &Path) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match std::fs::read_to_string(release) {
+            Ok(text) => {
+                if let Ok(status) = text.trim().parse::<i32>() {
+                    std::process::exit(status);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("read memory service stand-in release");
+            }
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "memory service stand-in was not released"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -489,6 +529,7 @@ impl ServiceAttachment {
 /// observes itself. It is built only after the child was just seen running.
 /// The owner may report open stages through the activity record; see
 /// `service/activity.rs`.
+#[derive(Debug)]
 struct ReadinessSplit {
     started: tokio::time::Instant,
     elected: tokio::time::Instant,
@@ -521,6 +562,123 @@ impl std::fmt::Display for ReadinessSplit {
         )
     }
 }
+
+/// Why the elected starter's wait for the owner it spawned ended without
+/// readiness. Each variant carries the owner progress the starter observed:
+/// the last published stage it read, the number of record changes it saw
+/// and the time since the last one (since spawn when none was seen). The
+/// leading texts are distinct and none is a prefix of another; the
+/// `owner progress:` clause follows the leading text and precedes any test
+/// observations and the client phase split.
+#[derive(Debug)]
+enum ReadinessFailure {
+    /// No progress for one window.
+    Stalled {
+        last_stage: Option<MemoryOpenStage>,
+        seen: u64,
+        since: Duration,
+        window: Duration,
+        observations: Option<String>,
+        split: ReadinessSplit,
+    },
+    /// The owner process exited before readiness.
+    OwnerExited {
+        status: std::process::ExitStatus,
+        last_stage: Option<MemoryOpenStage>,
+        seen: u64,
+        since: Duration,
+    },
+    /// A record this starter had read left its name before attachment: the
+    /// owner ended its open without serving this starter.
+    #[expect(
+        dead_code,
+        reason = "red stub: constructed once the readiness loop reads its owner's record every poll"
+    )]
+    OwnerRetired {
+        last_stage: Option<MemoryOpenStage>,
+        seen: u64,
+        since: Duration,
+    },
+    /// The owner marked its record failing, with the reason it recorded.
+    #[expect(
+        dead_code,
+        reason = "red stub: constructed once the owner records its failing open"
+    )]
+    OwnerFailed {
+        reason: String,
+        last_stage: Option<MemoryOpenStage>,
+        seen: u64,
+        since: Duration,
+    },
+}
+
+impl std::fmt::Display for ReadinessFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let progress = |formatter: &mut std::fmt::Formatter<'_>,
+                        last_stage: &Option<MemoryOpenStage>,
+                        seen: u64,
+                        since: Duration| {
+            write!(
+                formatter,
+                "owner progress: last={} advances={seen} since-progress={}ms",
+                last_stage.and_then(activity::stage_name).unwrap_or("none"),
+                since.as_millis(),
+            )
+        };
+        match self {
+            Self::Stalled {
+                last_stage,
+                seen,
+                since,
+                window,
+                observations,
+                split,
+            } => {
+                formatter.write_str("memory service readiness deadline exceeded; ")?;
+                progress(formatter, last_stage, *seen, *since)?;
+                write!(formatter, " window={}ms; ", window.as_millis())?;
+                if let Some(observations) = observations {
+                    write!(formatter, "{observations}; ")?;
+                }
+                write!(formatter, "{split}")
+            }
+            Self::OwnerExited {
+                status,
+                last_stage,
+                seen,
+                since,
+            } => {
+                write!(
+                    formatter,
+                    "memory service exited before readiness: {status}; "
+                )?;
+                progress(formatter, last_stage, *seen, *since)
+            }
+            Self::OwnerRetired {
+                last_stage,
+                seen,
+                since,
+            } => {
+                formatter.write_str("memory service ended its open before readiness; ")?;
+                progress(formatter, last_stage, *seen, *since)
+            }
+            Self::OwnerFailed {
+                reason,
+                last_stage,
+                seen,
+                since,
+            } => {
+                write!(
+                    formatter,
+                    "memory service open failed before readiness: {reason}; "
+                )?;
+                progress(formatter, last_stage, *seen, *since)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReadinessFailure {}
 
 /// Attach to a valid owner, or elect and start one while retaining a distinct
 /// short start lock. Endpoint readiness is the authenticated private handshake;
@@ -686,7 +844,13 @@ async fn attach_or_spawn_elected(
             }
         };
         if let Some(status) = child.try_wait()? {
-            bail!("memory service exited before readiness: {status}");
+            return Err(ReadinessFailure::OwnerExited {
+                status,
+                last_stage: None,
+                seen: 0,
+                since: spawned.elapsed(),
+            }
+            .into());
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -701,11 +865,20 @@ async fn attach_or_spawn_elected(
                 last_attach,
             };
             #[cfg(feature = "test-support")]
-            if let Some(diagnostic) = &mut startup_diagnostic {
-                let observations = fixture_startup_observations(options, diagnostic);
-                bail!("memory service readiness deadline exceeded; {observations}; {split}");
+            let observations = startup_diagnostic
+                .as_mut()
+                .map(|diagnostic| fixture_startup_observations(options, diagnostic));
+            #[cfg(not(feature = "test-support"))]
+            let observations = None;
+            return Err(ReadinessFailure::Stalled {
+                last_stage: None,
+                seen: 0,
+                since: now.saturating_duration_since(spawned),
+                window: Duration::from_secs(options.config.startup_timeout_secs),
+                observations,
+                split,
             }
-            bail!("memory service readiness deadline exceeded; {split}");
+            .into());
         }
         // After the deadline check and never after an attach, so the read can
         // neither move the deadline nor count as a poll.
@@ -3369,6 +3542,440 @@ mod tests {
         endpoint.retire(&data, &owner)?;
         owner.release()?;
         Ok(())
+    }
+
+    /// R1-R4: the elected starter's readiness wait against a real child
+    /// owner, the test-support stand-in, on every platform. The stand-in
+    /// takes no lock and publishes nothing; each test publishes the owner's
+    /// tagged record itself from the per-poll hook, under the starter token
+    /// it gave the starter, and no test body sleeps.
+    #[cfg(feature = "test-support")]
+    mod progress_wait {
+        use super::*;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        type Missed = Rc<RefCell<Vec<(u32, tokio::time::Instant)>>>;
+
+        struct StandInOwner {
+            root: crate::test_support::TempDir,
+            project: PathBuf,
+            data: PathBuf,
+            scope: String,
+            options: crate::store::OpenOptions,
+            executable: PathBuf,
+            release: PathBuf,
+            tag: String,
+        }
+
+        impl StandInOwner {
+            fn new(startup_timeout_secs: u64) -> Result<Self> {
+                let root = crate::test_support::tempdir()?;
+                let (project, scope, data, mut options) = owner_fixture(root.path())?;
+                options.config.startup_timeout_secs = startup_timeout_secs;
+                let token = uuid::Uuid::new_v4();
+                options.starter_token = Some(token);
+                Ok(Self {
+                    release: root.path().join("release"),
+                    executable: crate::store::test_supervisor()?,
+                    tag: activity::activity_tag(&token),
+                    root,
+                    project,
+                    data,
+                    scope,
+                    options,
+                })
+            }
+
+            /// Release the stand-in with `status`, staged and then renamed
+            /// onto the release name so it never reads a partial file.
+            fn release(&self, status: i32) -> Result<()> {
+                let staged = self.root.path().join("release.staged");
+                std::fs::write(&staged, status.to_string())?;
+                std::fs::rename(&staged, &self.release)?;
+                Ok(())
+            }
+
+            fn window(&self) -> Duration {
+                Duration::from_secs(self.options.config.startup_timeout_secs)
+            }
+
+            /// Run the starter with the stand-in as its owner and `hook`
+            /// after each failed poll, recording every failed poll's instant.
+            /// The stand-in is released with status 0 whatever the outcome,
+            /// before any result is examined, so no failing test leaves it.
+            async fn start(
+                &self,
+                missed: &Missed,
+                mut hook: impl FnMut(u32) + 'static,
+                bound: Duration,
+            ) -> Result<Result<ServiceAttachment>> {
+                let recorded = Rc::clone(missed);
+                let hook = move |polls: u32| {
+                    recorded
+                        .borrow_mut()
+                        .push((polls, tokio::time::Instant::now()));
+                    hook(polls);
+                };
+                let environment = vec![(
+                    OsString::from(SERVICE_STAND_IN_ENV),
+                    self.release.clone().into_os_string(),
+                )];
+                let outcome = tokio::time::timeout(
+                    bound,
+                    activity::with_owner_environment(
+                        environment,
+                        readiness_poll_hook::MISSED.scope(
+                            RefCell::new(Box::new(hook)),
+                            attach_or_start(&self.options, &self.project, &self.executable),
+                        ),
+                    ),
+                )
+                .await;
+                let released = self.release(0);
+                let outcome = outcome.context("stand-in owner fixture exceeded its outer deadline");
+                released?;
+                outcome
+            }
+        }
+
+        /// The failed polls in order, each exactly one poll interval after
+        /// the previous, so every index below is derived, not assumed.
+        fn derived_polls(missed: &Missed) -> Result<Vec<(u32, tokio::time::Instant)>> {
+            let missed = missed.borrow().clone();
+            let polls: Vec<u32> = missed.iter().map(|(polls, _)| *polls).collect();
+            ensure!(
+                polls.iter().copied().eq(1..=polls.len() as u32),
+                "failed polls are not numbered consecutively from 1: {polls:?}"
+            );
+            let gaps: Vec<Duration> = missed
+                .windows(2)
+                .map(|pair| pair[1].1.duration_since(pair[0].1))
+                .collect();
+            ensure!(
+                gaps.iter().all(|gap| *gap == READINESS_POLL_INTERVAL),
+                "readiness polls were not {READINESS_POLL_INTERVAL:?} apart: {gaps:?}"
+            );
+            Ok(missed)
+        }
+
+        fn readiness_failure(error: &anyhow::Error) -> Result<&ReadinessFailure> {
+            error
+                .downcast_ref::<ReadinessFailure>()
+                .with_context(|| format!("the readiness failure is not typed: {error:#}"))
+        }
+
+        /// R1: an owner whose record changes at least once in every window is
+        /// waited for past the flat bound and attached when it publishes.
+        /// The hook advances the record at polls 99, 198 and 297, each read
+        /// at the next poll, 990 ms after the previous progress, and after
+        /// poll 300 publishes a real listener and endpoint on the resumed
+        /// clock, as the cadence test does.
+        #[tokio::test(start_paused = true)]
+        async fn an_advancing_owner_is_waited_for_beyond_one_window() -> Result<()> {
+            const ADVANCES: [u32; 3] = [99, 198, 297];
+            const PUBLISH_AFTER: u32 = 300;
+            type Served = tokio::task::JoinHandle<Result<Option<String>>>;
+            type Published = (ServiceLock, EndpointRecord, Served);
+            // The hook takes a real owner lock while this test's spawned
+            // owner exists; see `crate::spawn_gate`.
+            let _exclusive = crate::spawn_gate::locking_async().await;
+            let fixture = StandInOwner::new(1)?;
+            let mut endpoint_authority = authority();
+            endpoint_authority.project_path = project_path_bytes(&fixture.project);
+            endpoint_authority.project_scope = fixture.scope.clone();
+
+            let missed = Missed::default();
+            let published: Rc<RefCell<Option<Published>>> = Rc::default();
+            let hook = {
+                let published = Rc::clone(&published);
+                let (data, scope, tag) = (
+                    fixture.data.clone(),
+                    fixture.scope.clone(),
+                    fixture.tag.clone(),
+                );
+                let authority = endpoint_authority.clone();
+                move |polls: u32| {
+                    if let Some(advance) = ADVANCES.iter().position(|at| *at == polls) {
+                        activity::write_progress_record(
+                            &data,
+                            &scope,
+                            &tag,
+                            &[MemoryOpenStage::OpeningDatabase],
+                            advance as u64 + 1,
+                        )
+                        .expect("publish the owner's progress");
+                    }
+                    if polls != PUBLISH_AFTER {
+                        return;
+                    }
+                    tokio::time::resume();
+                    let owner = ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)
+                        .expect("owner lock probe")
+                        .expect("the stand-in owner holds no owner lock");
+                    let (mut listener, address) =
+                        ServiceListener::bind(&data, &scope).expect("bind fixture listener");
+                    let endpoint = EndpointRecord {
+                        authority: authority.clone(),
+                        address,
+                    };
+                    endpoint
+                        .publish(&data, &owner)
+                        .expect("publish fixture endpoint");
+                    let authority = authority.clone();
+                    let served = tokio::spawn(async move {
+                        let mut stream = listener.accept(HANDSHAKE_TIMEOUT).await?;
+                        accept_handshake_presenting(&mut stream, &authority)
+                            .await?
+                            .map_err(|reason| anyhow::anyhow!(reason.diagnostic()))
+                    });
+                    *published.borrow_mut() = Some((owner, endpoint, served));
+                }
+            };
+            let outcome = fixture
+                .start(&missed, hook, Duration::from_secs(60))
+                .await?;
+            let returned = tokio::time::Instant::now();
+            let missed = derived_polls(&missed)?;
+            let attached = match outcome {
+                Ok(attached) => attached,
+                Err(error) => bail!(
+                    "an owner advancing at least once per window was abandoned after {} failed polls: {error:#}",
+                    missed.len()
+                ),
+            };
+            let (owner, endpoint, served) = published
+                .borrow_mut()
+                .take()
+                .context("the hook never published an endpoint")?;
+            let presented = served.await??;
+            ensure!(
+                missed.len() == PUBLISH_AFTER as usize,
+                "the endpoint published after poll {PUBLISH_AFTER} was not attached on the next poll: {} failed polls",
+                missed.len()
+            );
+            let first = missed.first().context("no failed poll was recorded")?.1;
+            ensure!(
+                returned.duration_since(first) >= fixture.window() * 3,
+                "the wait ended {:?} after spawn, inside three windows",
+                returned.duration_since(first)
+            );
+            ensure!(
+                attached.generation() == endpoint_authority.service_generation
+                    && presented.is_some(),
+                "the starter attached to another generation or without its token"
+            );
+            drop(attached);
+            endpoint.retire(&fixture.data, &owner)?;
+            owner.release()?;
+            Ok(())
+        }
+
+        /// R2: an owner whose record last changed at poll 51 (written by
+        /// the hook of poll 50) is abandoned one window later, at poll 151,
+        /// naming the stage it last published.
+        #[tokio::test(start_paused = true)]
+        async fn a_stalled_owner_is_abandoned_naming_its_stage() -> Result<()> {
+            const WRITE_AFTER: u32 = 50;
+            let fixture = StandInOwner::new(1)?;
+            let missed = Missed::default();
+            let hook = {
+                let (data, scope, tag) = (
+                    fixture.data.clone(),
+                    fixture.scope.clone(),
+                    fixture.tag.clone(),
+                );
+                move |polls: u32| {
+                    if polls == WRITE_AFTER {
+                        activity::write_progress_record(
+                            &data,
+                            &scope,
+                            &tag,
+                            &[MemoryOpenStage::ExtractingEmbeddedRuntime],
+                            1,
+                        )
+                        .expect("publish the owner's progress");
+                    }
+                }
+            };
+            let outcome = {
+                // Held across the owner spawn; see `crate::spawn_gate`.
+                let _gate = crate::spawn_gate::spawning().await;
+                fixture
+                    .start(&missed, hook, Duration::from_secs(60))
+                    .await?
+            };
+            let missed = derived_polls(&missed)?;
+            let error = outcome
+                .err()
+                .context("a stalled owner was reported ready")?;
+            let rendered = format!("{error:#}");
+            let ReadinessFailure::Stalled {
+                last_stage, since, ..
+            } = readiness_failure(&error)?
+            else {
+                bail!("a stalled owner was not reported as a stall: {rendered}");
+            };
+            ensure!(
+                *last_stage == Some(MemoryOpenStage::ExtractingEmbeddedRuntime),
+                "a stalled owner was abandoned without the stage it last published: {rendered}"
+            );
+            ensure!(
+                missed.len() == 150 && *since == fixture.window(),
+                "a stalled owner was abandoned after {} failed polls and {since:?} without progress, not one window after its progress at poll 51: {rendered}",
+                missed.len()
+            );
+            ensure!(
+                rendered.starts_with("memory service readiness deadline exceeded; "),
+                "the stall lost its leading text: {rendered}"
+            );
+            Ok(())
+        }
+
+        /// R3: an owner that exits after its record named a stage fails the
+        /// wait at the poll that observes the exit, with its status and that
+        /// stage. Real clock and a 300 s window: the stand-in's exit, which
+        /// the hook releases at poll 6 after poll 6 read the record written
+        /// at poll 5, races only that window, so the outcome is
+        /// deterministic by budget without any sleep. A stand-in that never
+        /// exited would end as a stall naming the stage, not a hang.
+        #[tokio::test]
+        async fn an_exited_owner_fails_at_once_with_its_stage() -> Result<()> {
+            const WRITE_AFTER: u32 = 5;
+            const RELEASE_AFTER: u32 = 6;
+            let fixture = Rc::new(StandInOwner::new(300)?);
+            let missed = Missed::default();
+            let hook = {
+                let fixture = Rc::clone(&fixture);
+                move |polls: u32| {
+                    if polls == WRITE_AFTER {
+                        activity::write_progress_record(
+                            &fixture.data,
+                            &fixture.scope,
+                            &fixture.tag,
+                            &[MemoryOpenStage::CreatingDatabase],
+                            1,
+                        )
+                        .expect("publish the owner's progress");
+                    }
+                    if polls == RELEASE_AFTER {
+                        fixture.release(3).expect("release the stand-in owner");
+                    }
+                }
+            };
+            let started = tokio::time::Instant::now();
+            let outcome = {
+                // Held across the owner spawn; see `crate::spawn_gate`.
+                let _gate = crate::spawn_gate::spawning().await;
+                fixture
+                    .start(&missed, hook, Duration::from_secs(330))
+                    .await?
+            };
+            let elapsed = started.elapsed();
+            let polls = missed.borrow().len();
+            let error = outcome
+                .err()
+                .context("an exited owner was reported ready")?;
+            let rendered = format!("{error:#}");
+            let ReadinessFailure::OwnerExited {
+                status, last_stage, ..
+            } = readiness_failure(&error)?
+            else {
+                bail!("an exited owner was not reported as exited: {rendered}");
+            };
+            ensure!(
+                status.code() == Some(3),
+                "the exited owner's status was not reported: {rendered}"
+            );
+            ensure!(
+                *last_stage == Some(MemoryOpenStage::CreatingDatabase),
+                "an exited owner was reported without the stage read before its exit: {rendered}"
+            );
+            ensure!(
+                polls > RELEASE_AFTER as usize && elapsed < fixture.window(),
+                "the exit was observed after {polls} failed polls and {elapsed:?}: {rendered}"
+            );
+            ensure!(
+                rendered.starts_with("memory service exited before readiness: "),
+                "the exit lost its leading text: {rendered}"
+            );
+            Ok(())
+        }
+
+        /// R4: a record the starter has read and that its owner then retires
+        /// ends the wait at the next poll, while the owner stays alive. The
+        /// hook writes the record at poll 5, read at poll 6, and retires it
+        /// with the owner's own retirement at poll 7, so poll 8 fails.
+        #[tokio::test(start_paused = true)]
+        async fn a_retired_record_fails_at_once() -> Result<()> {
+            const WRITE_AFTER: u32 = 5;
+            const RETIRE_AFTER: u32 = 7;
+            let fixture = StandInOwner::new(1)?;
+            let missed = Missed::default();
+            let retired: Rc<RefCell<Option<Result<()>>>> = Rc::default();
+            let hook = {
+                let retired = Rc::clone(&retired);
+                let (data, scope, tag) = (
+                    fixture.data.clone(),
+                    fixture.scope.clone(),
+                    fixture.tag.clone(),
+                );
+                move |polls: u32| {
+                    if polls == WRITE_AFTER {
+                        activity::write_progress_record(
+                            &data,
+                            &scope,
+                            &tag,
+                            &[MemoryOpenStage::CreatingDatabase],
+                            1,
+                        )
+                        .expect("publish the owner's progress");
+                    }
+                    if polls == RETIRE_AFTER {
+                        *retired.borrow_mut() =
+                            Some(activity::retire_tagged_record(&data, &scope, &tag));
+                    }
+                }
+            };
+            let outcome = {
+                // Held across the owner spawn; see `crate::spawn_gate`.
+                let _gate = crate::spawn_gate::spawning().await;
+                fixture
+                    .start(&missed, hook, Duration::from_secs(60))
+                    .await?
+            };
+            let missed = derived_polls(&missed)?;
+            let error = outcome
+                .err()
+                .context("an owner whose record was retired was reported ready")?;
+            let rendered = format!("{error:#}");
+            let ReadinessFailure::OwnerRetired { last_stage, .. } = readiness_failure(&error)?
+            else {
+                bail!(
+                    "a retired record did not end the wait at once; it ended after {} failed polls: {rendered}",
+                    missed.len()
+                );
+            };
+            ensure!(
+                *last_stage == Some(MemoryOpenStage::CreatingDatabase),
+                "the retirement was reported without the stage read before it: {rendered}"
+            );
+            ensure!(
+                missed.len() == RETIRE_AFTER as usize,
+                "the retirement at poll {RETIRE_AFTER} was observed after {} failed polls: {rendered}",
+                missed.len()
+            );
+            retired
+                .borrow_mut()
+                .take()
+                .context("the hook never retired the record")?
+                .context("the owner's retirement of its record failed")?;
+            ensure!(
+                rendered.starts_with("memory service ended its open before readiness; "),
+                "the retirement lost its leading text: {rendered}"
+            );
+            Ok(())
+        }
     }
 
     #[tokio::test]
