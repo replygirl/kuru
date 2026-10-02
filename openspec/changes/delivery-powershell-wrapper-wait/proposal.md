@@ -33,8 +33,12 @@ candidate.
   helper that pins its shape (what it is derived from) and fails if a flat,
   undocumented literal is reintroduced in its place.
 - No change to `kuru_delivery::command::bounded_output` or
-  `output_with_limit_and_timeout`, to what either of the two existing tests
-  asserts about the wrapper's diagnostic text, or to any Unix-side code.
+  `output_with_limit_and_timeout` (the "no Unix-side change" non-goal is
+  about `command.rs`'s `bounded_unix` implementation specifically), or to
+  what either of the two existing `#[cfg(windows)]` tests asserts about the
+  wrapper's diagnostic text. The line-427 call site itself does compile and
+  run on Unix (it is shared by a non-`cfg(windows)` test), so its bound is
+  still in scope for this change, per goal (1) naming both call sites.
 
 ## Impact
 
@@ -46,6 +50,12 @@ candidate.
   read of the file (searched for `bounded_output`, `powershell_diagnostics`,
   `wrapper`, `coverage partition`, `published-windows`) found no such
   description, so no docs change is expected.
-- `#[cfg(windows)]` tests cannot run on this darwin worktree; evidence for
-  the fix is collected from the next native Windows coverage run, not
-  reproduced locally.
+- The line-427 call site (`orchestrator_without_inputs`, used by the
+  non-`cfg(windows)` `coverage_orchestrator_refuses_missing_inputs_before_any_effect`
+  as well as a `#[cfg(windows)]` sibling) and the new derivation unit test
+  on it compile and run on this darwin worktree — their observed pass is
+  local evidence. Only the two `#[cfg(windows)]` tests
+  (`cmd_mise_launches_published_windows_task_wrapper_before_cargo` and
+  `cmd_launches_the_exact_coverage_tasks_and_reaches_input_validation`) are
+  Windows-only; their evidence is collected from the next native Windows
+  coverage run, not reproduced locally.

@@ -20,11 +20,16 @@
       (line 495) with the new bound. Verify by reading the diff.
 - [ ] 1.3 Replace the `Duration::from_secs(30)` argument to `bounded_output`
       in `orchestrator_without_inputs` (line 427, used by both
-      `coverage_orchestrator_refuses_missing_inputs_before_any_effect` and
+      `coverage_orchestrator_refuses_missing_inputs_before_any_effect`, a
+      plain `#[tokio::test]` with no `cfg(windows)` that also compiles and
+      runs on Unix, and the `#[cfg(windows)]`
       `cmd_launches_the_exact_coverage_tasks_and_reaches_input_validation`)
       with the same bound, unless its own call shape needs a separately
       derived value — if so, derive it the same way and say why it differs.
-      Verify by reading the diff.
+      This is the one call site the "no Unix-side change" non-goal does not
+      cover: that non-goal is about `command.rs`'s `bounded_unix`
+      implementation, not about leaving line 427 untouched, since goal (1)
+      names both call sites explicitly. Verify by reading the diff.
 - [ ] 1.4 Confirm neither existing test's assertions on the wrapper's
       diagnostic text (`"Published Windows verification requires"`, the
       `MISSING_INPUTS` diagnostics, the absence of
@@ -36,14 +41,18 @@
 
 ## 2. Pin the derived-bound shape with a deterministic test
 
-- [ ] 2.1 Add a `#[cfg(windows)]` test (unit test on the constant/helper if
-      arithmetic is involved, or an integration test with a stalled child
-      proving `bounded_output` still reports its tree diagnostics on
-      expiry under the derived bound) that fails if a flat, unexplained
-      literal replaces the derivation. Verify: unrunnable on this darwin
-      worktree — name it explicitly as not run here, with the reason
-      (`#[cfg(windows)]`), and collect its result from the next native
-      Windows CI run instead of asserting a local pass.
+- [ ] 2.1 Add a unit test on the constant/helper itself (not gated to
+      `cfg(windows)`, since the value it computes is also used by the
+      Unix-compiled call site at 1.3) that fails if the derivation's inputs
+      or arithmetic silently regress to an unexplained flat literal. This
+      test is runnable and must actually be run on this darwin worktree
+      (`mise run //packages/kuru-delivery:test`, tooling feature) as local
+      evidence. Optionally also add a `#[cfg(windows)]` integration test
+      with a stalled child proving `bounded_output` still reports its tree
+      diagnostics on expiry under the derived bound; that one is Windows-only
+      and cannot run here. Verify: the unit test's pass/fail is observed
+      locally; the optional Windows integration test, if added, is named as
+      not run here with the reason.
 
 ## 3. Evidence and docs
 
@@ -59,8 +68,12 @@
       these two bounds before writing anything there. Verify: either one
       sentence is added where such a description exists, or the change
       records that none exists and no docs edit was made.
-- [ ] 3.3 Collect the next native Windows coverage run's result for both
-      `cmd_mise_launches_published_windows_task_wrapper_before_cargo` and the
-      two tests sharing line 427's call site as acceptance evidence. Name
-      this task as unrun here (darwin worktree, `#[cfg(windows)]`) and the
-      reason, rather than manufacturing a pass.
+- [ ] 3.3 Run `coverage_orchestrator_refuses_missing_inputs_before_any_effect`
+      (line 427's call site, no `cfg(windows)`) and the new 2.1 unit test
+      locally on this darwin worktree and record the observed pass as
+      evidence. Collect the next native Windows coverage run's result for
+      the two `#[cfg(windows)]` tests —
+      `cmd_mise_launches_published_windows_task_wrapper_before_cargo` and
+      `cmd_launches_the_exact_coverage_tasks_and_reaches_input_validation` —
+      separately, naming them explicitly as unrun here (darwin worktree,
+      `#[cfg(windows)]`) rather than manufacturing a pass for them.
