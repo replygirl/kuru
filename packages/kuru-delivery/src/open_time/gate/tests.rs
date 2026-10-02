@@ -228,26 +228,81 @@ fn a_new_project_median_over_budget_fails_and_names_the_runs_over_it() {
     assert!(text.contains("| 585 | within |"), "{text}");
 }
 
+/// A budget equal to a whole-ms median passes; one ms less fails, listing
+/// only the runs strictly over it.
+fn assert_budget_boundary(runs: &[Run], case: Case, median_ms: u64) {
+    let budget = |gate: &mut Gate, budget_ms: u64| match case {
+        Case::NewProject => gate.new_project_budget_ms = budget_ms,
+        Case::ColdExisting => gate.cold_existing_budget_ms = budget_ms,
+        other => panic!("{other:?} has no budget"),
+    };
+    let mut gate = ci_gate();
+    budget(&mut gate, median_ms);
+    let verdict = evaluate(runs, &gate);
+    assert_eq!(verdict.violations, [], "{verdict:?}");
+    let medians = verdict.medians.as_deref().expect("medians are checked");
+    let row = median_of(medians, case);
+    assert_eq!(row.median_ms, median_ms as f64, "{row:?}");
+    assert_eq!(row.budget_ms, median_ms);
+    let text = render(&verdict, &gate);
+    let row = format!("| {} | 10 | {median_ms} |", case.label());
+    let line = text
+        .lines()
+        .find(|line| line.starts_with(&row))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        line.ends_with(&format!("| {median_ms} | within |")),
+        "{line}"
+    );
+
+    budget(&mut gate, median_ms - 1);
+    let verdict = evaluate(runs, &gate);
+    let [
+        Violation::Median {
+            case: violated,
+            median_ms: observed,
+            budget_ms,
+            over,
+        },
+    ] = verdict.violations.as_slice()
+    else {
+        panic!("{verdict:?}");
+    };
+    assert_eq!(
+        (*violated, *observed, *budget_ms),
+        (case, median_ms as f64, median_ms - 1)
+    );
+    let mut expected: Vec<(usize, f64)> = runs
+        .iter()
+        .filter(|run| run.case == case)
+        .filter_map(|run| Some((run.iteration, run.ready_ms?)))
+        .filter(|(_, ready)| *ready > (median_ms - 1) as f64)
+        .collect();
+    expected.sort_by_key(|(iteration, _)| *iteration);
+    assert_eq!(over, &expected);
+    // The runs at the old budget, now one ms over the new one, are listed.
+    assert!(
+        over.iter().any(|(_, ready)| *ready == median_ms as f64),
+        "{over:?}"
+    );
+}
+
 #[test]
 fn a_median_at_the_budget_passes_and_one_ms_under_it_fails() {
-    // Run B's new-project median is 731.9 ms.
+    // Run B's recorded cold-existing samples 5 and 6 (in order) are both
+    // 387.0 ms (iterations 2, 6 and 10 are 387.0), so the median is exactly
+    // 387 ms; eight runs (386.5 ms and up) are over 386.
     let runs = recorded(RUN_B);
-    let mut gate = ci_gate();
-    gate.new_project_budget_ms = 732;
-    assert!(evaluate(&runs, &gate).passed());
-    gate.new_project_budget_ms = 731;
-    let verdict = evaluate(&runs, &gate);
-    assert!(
-        matches!(
-            verdict.violations.as_slice(),
-            [Violation::Median {
-                case: Case::NewProject,
-                budget_ms: 731,
-                ..
-            }]
-        ),
-        "{verdict:?}"
-    );
+    assert_budget_boundary(&runs, Case::ColdExisting, 387);
+
+    // Run B's new-project samples 5 and 6 are iterations 1 (731.4 ms) and
+    // 10 (732.4 ms); both at 732.0 keep the order and make the median
+    // exactly 732 ms.
+    let mut runs = recorded(RUN_B);
+    for iteration in [1, 10] {
+        run_mut(&mut runs, Case::NewProject, iteration).ready_ms = Some(732.0);
+    }
+    assert_budget_boundary(&runs, Case::NewProject, 732);
 }
 
 #[test]

@@ -194,7 +194,7 @@ to partition and stays in the Windows installation job.
 Windows primitives retain a separate native coverage job for early feedback. The
 required `ci-gate` accepts only success from every branch of this graph,
 including the `open-time` gate that follows `native-tests`; see
-[open-time report](#open-time-report).
+[open-time gate](#open-time-gate).
 
 Windows on Arm (`windows-11-arm`) runs the same partitioned workspace suites as
 x64, uninstrumented, as separately named behavioral evidence: `Behavior
@@ -1172,7 +1172,7 @@ example `kuru-memory`, and runs through
 the merge requires every receipt's scope to equal. An optional `KURU_COVERAGE_SEED` names a
 dependency seed directory to import (below); leave it unset locally.
 
-## Open-time report
+## Open-time gate
 
 `ci.yml`'s `Open-time gate (ubuntu-latest)` job measures how long the release
 `kuru` takes to open project memory, as a user would see it, on ubuntu-latest
