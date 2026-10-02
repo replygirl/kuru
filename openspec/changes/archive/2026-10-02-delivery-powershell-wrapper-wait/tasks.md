@@ -123,7 +123,25 @@ and the new pin test
       `cmd_launches_the_exact_coverage_tasks_and_reaches_input_validation`
       are `#[cfg(windows)]` and this worktree is macOS; their native evidence
       is recorded in 3.4.
-- [ ] 3.4 Record the native Windows evidence for the two `#[cfg(windows)]`
+- [x] 3.4 Record the native Windows evidence for the two `#[cfg(windows)]`
       tests from the windows-latest coverage partitions of the PR head that
       carries the final code, and verify by the `test ... ok` lines in the
-      fetched job logs, not by the job's green check.
+      fetched job logs, not by the job's green check. Observed (CI run
+      37043921127, head 4f79aadd, the last commit changing code; each job log
+      fetched individually): partition 1, job 110961561344, binary started
+      18:04:59.568Z, `wrapper_waits_take_the_package_launch_budget_inside_the_shard_deadline
+      ... ok` at 18:04:59.644Z and
+      `cmd_mise_launches_published_windows_task_wrapper_before_cargo ... ok`
+      at 18:05:04.437Z, so that launch completed within 4.9 s of the binary
+      starting; partition 3, job 110961561263,
+      `cmd_launches_the_exact_coverage_tasks_and_reaches_input_validation
+      ... ok` 0.23 s after its binary started; partition 2, job
+      110961561159, `coverage_orchestrator_refuses_missing_inputs_before_any_effect
+      ... ok`. All eight windows-latest coverage partitions concluded
+      success (jobs 110961561159, 110961561178, 110961561212, 110961561263,
+      110961561272, 110961561327, 110961561344, 110961561387). The earlier
+      run 37042689778 (head a2a862ba) was cancelled by the push before its
+      Windows partitions finished, so it supplies no evidence. Inference: the
+      archive commit that follows changes only `openspec/`, so this evidence
+      applies to the code it ships; one passing run is not evidence about
+      the starved-start tail the budget exists for.
