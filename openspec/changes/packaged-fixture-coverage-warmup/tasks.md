@@ -38,23 +38,33 @@
       the warm-up (fold in the existing `, instrumented` suffix rather than
       keeping both); verify by reading one printed line from each of a local
       uninstrumented run and a run with `LLVM_PROFILE_FILE` set.
-- [ ] 1.6 Confirm the failure path is unchanged: a warm-up error or an
-      assertion failure after it still surfaces through the same `Err` ->
-      `root.keep()` -> `panic!` in
-      `packaged_install_and_update_preserve_complete_offline_memory`, naming
-      the warm-up's own error context first; verify by reading the panic
-      message shape, not by forcing a real failure in CI.
+- [ ] 1.6 Confirm the failure path is unchanged in mechanism: a warm-up error
+      or an assertion failure after it still surfaces through the same
+      `Err` -> `root.keep()` -> `panic!` in
+      `packaged_install_and_update_preserve_complete_offline_memory`, with
+      the warm-up's own `.context(...)` as the innermost (first-attached)
+      context. Note the two call sites (lines ~1666, ~1728) each wrap
+      `conversation` in their own outer `.context("verify the direct/updated
+      installation's cold offline memory")`, so `{error:#}` prints that outer
+      text first; reword those two call-site contexts to be mode-aware (drop
+      "cold" or branch the wording) so the printed chain never claims "cold"
+      during a warm-mode failure. Verify by reading the panic message shape,
+      not by forcing a real failure in CI.
 
 ## 2. Docs
 
-- [ ] 2.1 `docs/development.md`: add one sentence next to the paragraph
-      documenting #168's native-mise-fixture warm-up (and the paragraph
-      stating `embedded_runtime` "stays cold") saying the packaged fixture
-      warms the same way under coverage only and stays cold, unconditionally,
-      in the Installation job on every OS; verify the existing "stays cold"
-      and printed-line-format sentences remain true as written (still
-      describing the uninstrumented/install-job case) and `mise run
-      docs:check` passes.
+- [ ] 2.1 `docs/development.md`: next to the paragraph documenting #168's
+      native-mise-fixture warm-up, and the paragraph stating `embedded_runtime`
+      "stays cold" and quoting its printed line
+      (`embedded_runtime first launch (cold cache, …): <ms> ms [<label>]`):
+      update the quoted line to the new `cold`/`warm (coverage)` wording,
+      change "stays cold" to state the packaged fixture stays cold
+      unconditionally only in the Installation job on every OS, and add one
+      sentence that under coverage it warms its cache the same way the native
+      mise fixture does before its first launch. `docs:check` does not catch
+      a quoted-string mismatch, so re-read the edited paragraph against
+      task 1.5's actual output string before committing; then run `mise run
+      docs:check`.
 
 ## 3. Local verification
 

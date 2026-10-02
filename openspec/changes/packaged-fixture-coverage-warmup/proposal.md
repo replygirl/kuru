@@ -49,7 +49,9 @@ separate, already-landing readiness-window change.
 Test-only. Touches `apps/kuru-tui/tests/embedded_runtime.rs` and
 `docs/development.md`. No product code, no CLI/config/workflow surface, and
 no change to `startup_timeout_secs`, any deadline, retry behavior, or the
-native `windows_mise` fixture #168 already warmed. Expected to turn the
-windows-latest coverage partitions green for this test without a rerun; the
-Installation job on every OS remains the cold proof that an installed
-artifact unpacks its engine and builds its store template in one launch.
+native `windows_mise` fixture #168 already warmed. Inference, unmeasured
+until this change's own PR CI: this should turn the windows-latest coverage
+partitions green for this test without a rerun, since #168's analogous
+warm-up on `windows_mise` did so for that fixture. The Installation job on
+every OS remains the cold proof that an installed artifact unpacks its
+engine and builds its store template in one launch.
