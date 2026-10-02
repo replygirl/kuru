@@ -1,8 +1,9 @@
 # Verification
 
 Local evidence: macOS 27.0 arm64 (this worktree, branch
-`fix/bootstrap-post-reap-group-query`, 2026-10-02). CI evidence is not yet
-available and is not claimed.
+`fix/bootstrap-post-reap-group-query`, 2026-10-02). Linux evidence (section 6)
+comes from an aarch64 container and from the PR's first CI run 37016484794,
+each labelled where it is cited.
 
 ## 1. A reaped group recycled by another user is not a cleanup failure [critical]
 
@@ -33,4 +34,11 @@ available and is not claimed.
 - [x] 5.3 @integration (agent) `mise run //packages/kuru-connectors:test` (297 passed, exit 0) and `mise run //packages/kuru-runtime:test` (220 passed, exit 0, after the `(pid, ppid)` shell check) -> observed: pass
 - [x] 5.4 @integration (agent) `mise run format:check`, `mise run lint`, `mise run lint:windows`, `mise run typecheck`, `mise run lint:tooling` -> observed: each exit 0; hk pre-commit format, tooling and conventional steps passed on each commit
 - [x] 5.6 @integration (agent) re-run after the new-leader rule: `mise run //packages/kuru-platform:test`, `//packages/kuru-delivery:test` (lib 195 passed), `//packages/kuru-connectors:test` (297 passed), `//packages/kuru-runtime:test -- cancelled_shell_turn` (1 passed), `format:check`, `lint`, `lint:windows`, `typecheck`, `lint:tooling` -> observed: each exit 0
-- [~] 5.5 @runtime (agent) CI macOS coverage partition on the PR -> defer: no PR or CI run exists for this branch yet; it must pass before merge
+- [x] 5.7 @integration (agent) after the Linux fixture correction (6.1): `mise run //packages/kuru-platform:test` (lib 32 passed), `mise run format:check`, `mise run lint`, `mise run lint:windows`, `mise run typecheck` -> observed: each exit 0 on macOS
+- [~] 5.5 @runtime (agent) CI native coverage partitions on the PR -> defer: the first run 37016484794 passed on macOS and Windows and failed on ubuntu-latest partition 4 (6.1); a rerun after the fixture correction must pass before merge
+
+## 6. Linux evidence
+
+- [x] 6.1 @regression (agent) first CI run 37016484794, ubuntu-latest coverage partition 4 (job 110868884745): `unix::tests::permission_listing_lists_once_within_the_cleanup_budget` failed at unix.rs:897 with `left: Recycled, right: PermissionDenied`; macOS and Windows legs passed. Mechanism, measured: the fixture's "member of ours" was hardcoded as uid 501, while `PermissionListing` classifies against the process's real `own_uids()`. Uid 501 is the local macOS user, so the row read as ours; under any other uid it is a foreign row whose `pid` equals the group, so the new-leader rule correctly yields `Recycled`. Reproduced in `docker run --rm -v <worktree>:/w:ro -w /w -v kuru-linux-target:/target -v kuru-linux-cargo:/usr/local/cargo/registry -e CARGO_TARGET_DIR=/target -e RUSTUP_TOOLCHAIN=1.98.1 rust:1.98.1` (OrbStack, aarch64) with the lib test binary run as root and via `setpriv --reuid=1001 --regid=1001 --clear-groups`: both failed identically at unix.rs:897 (`Recycled` vs `PermissionDenied`). That the runner's uid is 1001 is inferred; any uid other than 501 reproduces it. The same test's near-deadline fixture had the mirror defect (uid 0 is ours when run as root). Both fixtures are now built from `own_uids()` (ours: the real and effective IDs; foreign: the first uid not among them); product classification is unchanged
+- [x] 6.2 @unit (agent) after the correction, the same container lib binary with `--skip secret::tests::native_store_reopens` -> observed: `31 passed; 0 failed`, exit 0 as root and as uid 1001, including all `unix::tests::permission_listing_*`, `owned_listing_uses_the_real_listing_for_its_own_group` (real Linux `ps`) and the `unix::snapshot::tests` parsers. The skipped test needs the gnome-keyring D-Bus session that CI provisions (native-tests.yml:298) and fails in the bare container independently of this change
+- [x] 6.3 @integration (agent) real foreign-group listing on Linux, from CI run 37016484794 (measured there, not in the container): `foreign_group_is_classified_as_recycled_without_error` ok (job 110868884801), `post_reap_query_accepts_a_group_recycled_by_another_user` ok (job 110868884834), `live_group_of_ours_is_classified_as_a_survivor_with_its_listing` ok (job 110868884760). In the container, `unix_process_group` passed (2/2) as uid 1001 and `unix_snapshot` passed 8/9; `foreign_group_is_classified_as_recycled_without_error` panicked in fixture selection because a single-process container has no other-user group with `pid > 1`, an environment limit rather than a classification result. The new-leader rule itself remains inferred from POSIX `fork()`; no recycled group was produced on demand

@@ -874,10 +874,15 @@ mod tests {
         let calls = Arc::default();
         let budgets = Arc::default();
         let deadline = Instant::now() + Duration::from_secs(60);
+        // The listing classifies against this process's real IDs, so the
+        // fixtures are built from them rather than from a host's usual uid.
+        let own = own_uids();
+        let [ruid, euid] = own;
+        let foreign = (0..).find(|uid| !own.contains(uid)).unwrap();
         let mut listing = PermissionListing::with_lister(
             40,
             deadline,
-            counting_lister(&calls, &budgets, vec![member(40, 501, 501, "Z")]),
+            counting_lister(&calls, &budgets, vec![member(40, euid, ruid, "Z")]),
         );
         assert!(!listing.listed());
         assert!(format!("{listing:?}").contains("listed: false"));
@@ -916,7 +921,7 @@ mod tests {
         let mut near = PermissionListing::with_lister(
             40,
             Instant::now() + Duration::from_millis(300),
-            counting_lister(&calls, &budgets, vec![member(40, 0, 0, "Ss")]),
+            counting_lister(&calls, &budgets, vec![member(40, foreign, foreign, "Ss")]),
         );
         assert_eq!(
             near.resolve_blocking(GroupPresence::PermissionDenied),
