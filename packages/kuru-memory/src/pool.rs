@@ -9,16 +9,27 @@
 //! [`MemoryPool`] instead returns its connection inline, before the
 //! statement's future completes.
 //!
-//! An acquisition SQLx times out is reported as a typed
-//! [`PoolAcquireTimedOut`] naming what it waited for. There is no `Deref` to
-//! the SQLx pool, so nothing acquires around this funnel.
+//! An acquisition that reaches its bound is reported as a typed
+//! [`PoolAcquireTimedOut`] naming what it waited for and which bound ended
+//! the wait. There is no `Deref` to the SQLx pool, so nothing acquires around
+//! this funnel.
+//!
+//! A memory statement or operation budget runs its work in a budget scope,
+//! [`within`] or [`within_until`], instead of `tokio::time::timeout`. The
+//! funnel registers its in-flight acquisition with the enclosing scope, so a
+//! budget that expires while the acquisition waits is reported as that
+//! acquisition's [`PoolAcquireTimedOut`] (bound: the statement budget), and one
+//! that expires during execution as a [`BudgetElapsed`] with no acquisition
+//! diagnostic.
 
 use std::{
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     ops::{Deref, DerefMut},
     sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -31,9 +42,227 @@ use sqlx::{
     pool::{PoolConnection, PoolOptions},
 };
 use sqlx_core::transaction::TransactionManager;
-use tokio::time::Instant;
+use tokio::time::{Instant, sleep_until};
 
 use crate::server::ConnectionObservation;
+
+/// A pending acquisition this long leaves one diagnostics record, and one
+/// that completes later leaves another. It only logs: it never decides an
+/// acquisition's outcome.
+pub const SLOW_ACQUIRE_THRESHOLD: Duration = Duration::from_secs(2);
+
+tokio::task_local! {
+    static BUDGET_SCOPE: BudgetScope;
+}
+
+/// The innermost budget scope of the current task: the earliest deadline of
+/// it and every enclosing scope, that deadline's budget, and the in-flight
+/// acquisition slot every nested scope shares.
+#[derive(Clone)]
+struct BudgetScope {
+    deadline: Instant,
+    budget: Duration,
+    slot: Arc<InFlightSlot>,
+}
+
+/// The acquisition a budget scope's work is waiting on, if any. Each
+/// registration carries its own token, so a concurrent acquisition in the
+/// same scope never clears another's entry.
+#[derive(Default)]
+struct InFlightSlot {
+    next: AtomicU64,
+    current: StdMutex<Option<(u64, InFlightAcquire)>>,
+}
+
+struct InFlightAcquire {
+    pool: MemoryPool,
+    started: Instant,
+    authenticated_before: u64,
+    budget: Duration,
+    remaining: Duration,
+}
+
+impl InFlightSlot {
+    /// The scope's expiry, built while its work (and so any pending
+    /// acquisition's registration) is still alive.
+    fn elapsed(&self, budget: Duration) -> BudgetElapsed {
+        let acquire = self
+            .current
+            .lock()
+            .ok()
+            .and_then(|current| {
+                current.as_ref().map(|(_, acquire)| {
+                    acquire.pool.diagnose(
+                        acquire.started,
+                        acquire.authenticated_before,
+                        AcquireBound::StatementBudget,
+                        acquire.budget,
+                        acquire.remaining,
+                    )
+                })
+            })
+            .inspect(PoolAcquireTimedOut::report)
+            .map(Box::new);
+        BudgetElapsed { budget, acquire }
+    }
+}
+
+/// Run memory statement or operation work under `budget`, as
+/// `tokio::time::timeout` does, in a budget scope the pool funnel reads: an
+/// acquisition inside it is bounded by what remains of the earliest enclosing
+/// budget, and an expiry during that acquisition is reported as its typed
+/// [`PoolAcquireTimedOut`].
+pub async fn within<F: Future>(budget: Duration, work: F) -> Result<F::Output, BudgetElapsed> {
+    scoped(
+        Instant::now() + budget,
+        budget,
+        work,
+        std::future::pending(),
+    )
+    .await
+}
+
+/// [`within`] for work whose budget is a deadline, as
+/// `tokio::time::timeout_at` does.
+pub async fn within_until<F: Future>(
+    deadline: Instant,
+    work: F,
+) -> Result<F::Output, BudgetElapsed> {
+    let budget = deadline.saturating_duration_since(Instant::now());
+    scoped(deadline, budget, work, std::future::pending()).await
+}
+
+/// [`within`] whose scope also ends, through the same expiry path, as soon as
+/// `expire` completes: an event standing in for the deadline, never a bound.
+#[cfg(test)]
+pub(crate) async fn within_or<F: Future>(
+    budget: Duration,
+    work: F,
+    expire: impl Future<Output = ()>,
+) -> Result<F::Output, BudgetElapsed> {
+    scoped(Instant::now() + budget, budget, work, expire).await
+}
+
+async fn scoped<F: Future>(
+    deadline: Instant,
+    budget: Duration,
+    work: F,
+    expire: impl Future<Output = ()>,
+) -> Result<F::Output, BudgetElapsed> {
+    let scope = match BUDGET_SCOPE.try_with(BudgetScope::clone) {
+        Ok(enclosing) if enclosing.deadline <= deadline => enclosing,
+        Ok(enclosing) => BudgetScope {
+            deadline,
+            budget,
+            slot: enclosing.slot,
+        },
+        Err(_) => BudgetScope {
+            deadline,
+            budget,
+            slot: Arc::default(),
+        },
+    };
+    let slot = scope.slot.clone();
+    let (deadline, budget) = (scope.deadline, scope.budget);
+    // The work is polled first, as `tokio::time::timeout` polls its future
+    // before its delay.
+    let expired = async {
+        tokio::select! {
+            biased;
+            () = sleep_until(deadline) => {}
+            () = expire => {}
+        }
+        slot.elapsed(budget)
+    };
+    tokio::select! {
+        biased;
+        output = BUDGET_SCOPE.scope(scope, work) => Ok(output),
+        elapsed = expired => Err(elapsed),
+    }
+}
+
+/// A memory statement or operation budget that elapsed. When it elapsed
+/// while an acquisition was waiting, its source is that acquisition's
+/// [`PoolAcquireTimedOut`]; otherwise it elapsed during execution and is no
+/// acquisition timeout.
+#[derive(Debug)]
+pub struct BudgetElapsed {
+    pub budget: Duration,
+    pub acquire: Option<Box<PoolAcquireTimedOut>>,
+}
+
+impl fmt::Display for BudgetElapsed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "memory statement budget of {:.3} s elapsed",
+            self.budget.as_secs_f64()
+        )?;
+        if self.acquire.is_some() {
+            write!(formatter, " while acquiring a pool session")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for BudgetElapsed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.acquire
+            .as_ref()
+            .map(|acquire| acquire.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// One acquisition counted as pending on its pool and, inside a budget scope,
+/// registered in that scope's slot. Dropping it (on completion or
+/// cancellation, including while queued) clears both.
+struct PendingAcquire {
+    observation: ConnectionObservation,
+    registration: Option<(Arc<InFlightSlot>, u64)>,
+}
+
+impl PendingAcquire {
+    fn register(
+        pool: &MemoryPool,
+        scope: Option<&BudgetScope>,
+        started: Instant,
+        authenticated_before: u64,
+    ) -> Self {
+        pool.observation.acquire_started();
+        let registration = scope.map(|scope| {
+            let token = scope.slot.next.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut current) = scope.slot.current.lock() {
+                *current = Some((
+                    token,
+                    InFlightAcquire {
+                        pool: pool.clone(),
+                        started,
+                        authenticated_before,
+                        budget: scope.budget,
+                        remaining: scope.deadline.saturating_duration_since(started),
+                    },
+                ));
+            }
+            (scope.slot.clone(), token)
+        });
+        Self {
+            observation: pool.observation.clone(),
+            registration,
+        }
+    }
+}
+
+impl Drop for PendingAcquire {
+    fn drop(&mut self) {
+        if let Some((slot, token)) = self.registration.take()
+            && let Ok(mut current) = slot.current.lock()
+            && current.as_ref().is_some_and(|(owner, _)| *owner == token)
+        {
+            current.take();
+        }
+        self.observation.acquire_ended();
+    }
+}
 
 /// A memory branch pool. Cloning shares the same SQLx pool and observation.
 #[derive(Clone)]
@@ -72,14 +301,16 @@ impl MemoryPool {
         Self::new(pool, branch, ConnectionObservation::detached())
     }
 
-    /// Acquire one session. A timed-out acquisition carries a
-    /// [`PoolAcquireTimedOut`] as context over SQLx's `PoolTimedOut`.
+    /// Acquire one session. An acquisition that reaches the pool ceiling
+    /// carries a [`PoolAcquireTimedOut`] as context over SQLx's
+    /// `PoolTimedOut`; one ended by its budget scope is that scope's
+    /// [`BudgetElapsed`].
     pub async fn acquire(&self) -> Result<PooledSession> {
         self.acquire_session()
             .await
             .map_err(|failure| match failure {
                 AcquireFailure::TimedOut(diagnostic) => {
-                    anyhow::Error::from(sqlx::Error::PoolTimedOut).context(diagnostic)
+                    anyhow::Error::from(sqlx::Error::PoolTimedOut).context(*diagnostic)
                 }
                 AcquireFailure::Sqlx(error) => error.into(),
             })
@@ -140,11 +371,39 @@ impl MemoryPool {
         self.checked_out.load(Ordering::SeqCst)
     }
 
+    /// Acquisitions of this pool still waiting.
+    #[cfg(test)]
+    pub(crate) fn pending_acquires(&self) -> u64 {
+        self.observation.pending_acquires()
+    }
+
     async fn acquire_session(&self) -> std::result::Result<PooledSession, AcquireFailure> {
         let started = Instant::now();
         let authenticated_before = self.observation.authenticated();
-        match self.pool.acquire().await {
+        let scope = BUDGET_SCOPE.try_with(BudgetScope::clone).ok();
+        let _pending =
+            PendingAcquire::register(self, scope.as_ref(), started, authenticated_before);
+        let acquiring = self.pool.acquire();
+        tokio::pin!(acquiring);
+        let mut slow = false;
+        let acquired = tokio::select! {
+            biased;
+            acquired = &mut acquiring => acquired,
+            () = sleep_until(started + SLOW_ACQUIRE_THRESHOLD) => {
+                slow = true;
+                self.still_waiting(started, authenticated_before, scope.as_ref());
+                acquiring.await
+            }
+        };
+        match acquired {
             Ok(connection) => {
+                if slow {
+                    tracing::warn!(
+                        branch = %self.branch,
+                        waited_ms = millis(started.elapsed()),
+                        "memory pool acquire completed slowly"
+                    );
+                }
                 self.checked_out.fetch_add(1, Ordering::SeqCst);
                 Ok(PooledSession {
                     connection: Some(connection),
@@ -152,41 +411,95 @@ impl MemoryPool {
                 })
             }
             Err(sqlx::Error::PoolTimedOut) => {
-                let authenticated_total = self.observation.authenticated();
-                let authenticated_during_wait =
-                    authenticated_total.saturating_sub(authenticated_before);
-                let max = self.pool.options().get_max_connections();
-                let checked_out = self.checked_out.load(Ordering::SeqCst);
-                let diagnostic = PoolAcquireTimedOut {
-                    branch: self.branch.to_string(),
-                    wait: PoolWait::classify(max, checked_out, authenticated_during_wait),
-                    max,
-                    size: self.pool.size(),
-                    idle: self.pool.num_idle(),
-                    checked_out,
-                    waited: started.elapsed(),
-                    window: self.pool.options().get_acquire_timeout(),
-                    authenticated_total,
-                    authenticated_during_wait,
-                    phase: (authenticated_during_wait > 0).then(|| self.observation.latest_phase()),
-                };
-                tracing::warn!(
-                    branch = %diagnostic.branch,
-                    wait = diagnostic.wait.label(),
-                    max = diagnostic.max,
-                    size = diagnostic.size,
-                    idle = diagnostic.idle,
-                    checked_out = diagnostic.checked_out,
-                    waited_ms = u64::try_from(diagnostic.waited.as_millis()).unwrap_or(u64::MAX),
-                    authenticated_total = diagnostic.authenticated_total,
-                    authenticated_during_wait = diagnostic.authenticated_during_wait,
-                    phase = diagnostic.phase.unwrap_or("none"),
-                    "memory pool acquire timed out"
+                let ceiling = self.pool.options().get_acquire_timeout();
+                let diagnostic = self.diagnose(
+                    started,
+                    authenticated_before,
+                    AcquireBound::PoolCeiling,
+                    ceiling,
+                    ceiling,
                 );
-                Err(AcquireFailure::TimedOut(diagnostic))
+                diagnostic.report();
+                Err(AcquireFailure::TimedOut(Box::new(diagnostic)))
             }
             Err(error) => Err(AcquireFailure::Sqlx(error)),
         }
+    }
+
+    /// What one acquisition, started at `started`, is waiting for now.
+    fn diagnose(
+        &self,
+        started: Instant,
+        authenticated_before: u64,
+        bound: AcquireBound,
+        budget: Duration,
+        window: Duration,
+    ) -> PoolAcquireTimedOut {
+        let authenticated_total = self.observation.authenticated();
+        let authenticated_during_wait = authenticated_total.saturating_sub(authenticated_before);
+        let max = self.pool.options().get_max_connections();
+        let checked_out = self.checked_out.load(Ordering::SeqCst);
+        PoolAcquireTimedOut {
+            branch: self.branch.to_string(),
+            wait: PoolWait::classify(max, checked_out, authenticated_during_wait),
+            bound,
+            budget,
+            max,
+            size: self.pool.size(),
+            idle: self.pool.num_idle(),
+            checked_out,
+            waited: started.elapsed(),
+            window,
+            authenticated_total,
+            authenticated_during_wait,
+            phase: (authenticated_during_wait > 0).then(|| self.observation.latest_phase()),
+        }
+    }
+
+    /// The slow-acquire record of an acquisition still pending at the
+    /// threshold: what it waits for so far and how much of its bound remains.
+    fn still_waiting(
+        &self,
+        started: Instant,
+        authenticated_before: u64,
+        scope: Option<&BudgetScope>,
+    ) {
+        let (bound, budget, window, remaining) = match scope {
+            Some(scope) => (
+                AcquireBound::StatementBudget,
+                scope.budget,
+                scope.deadline.saturating_duration_since(started),
+                scope.deadline.saturating_duration_since(Instant::now()),
+            ),
+            None => {
+                let ceiling = self.pool.options().get_acquire_timeout();
+                (
+                    AcquireBound::PoolCeiling,
+                    ceiling,
+                    ceiling,
+                    ceiling.saturating_sub(started.elapsed()),
+                )
+            }
+        };
+        let waiting = self.diagnose(started, authenticated_before, bound, budget, window);
+        tracing::warn!(
+            branch = %waiting.branch,
+            wait = waiting.wait.label(),
+            bound = waiting.bound.label(),
+            budget_ms = millis(waiting.budget),
+            remaining_ms = millis(remaining),
+            max = waiting.max,
+            size = waiting.size,
+            idle = waiting.idle,
+            checked_out = waiting.checked_out,
+            pending = self.observation.pending_acquires(),
+            waited_ms = millis(waiting.waited),
+            authenticated_total = waiting.authenticated_total,
+            authenticated_during_wait = waiting.authenticated_during_wait,
+            phase = waiting.phase.unwrap_or("none"),
+            "memory pool acquire still waiting"
+        );
+        self.observation.slow_acquire_recorded();
     }
 
     /// The `Executor` form: a timeout travels as `sqlx::Error::Io` of kind
@@ -197,7 +510,7 @@ impl MemoryPool {
             .await
             .map_err(|failure| match failure {
                 AcquireFailure::TimedOut(diagnostic) => {
-                    sqlx::Error::Io(io::Error::other(diagnostic))
+                    sqlx::Error::Io(io::Error::other(*diagnostic))
                 }
                 AcquireFailure::Sqlx(error) => error,
             })
@@ -205,7 +518,7 @@ impl MemoryPool {
 }
 
 enum AcquireFailure {
-    TimedOut(PoolAcquireTimedOut),
+    TimedOut(Box<PoolAcquireTimedOut>),
     Sqlx(sqlx::Error),
 }
 
@@ -427,17 +740,42 @@ impl PoolWait {
     }
 }
 
+/// Which timer ended a timed-out acquisition. When the two deadlines fall on
+/// one timer tick, it is whichever fired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcquireBound {
+    /// The budget scope of the statement or operation the acquisition served.
+    StatementBudget,
+    /// The pool's own lifetime acquire timeout, with no earlier budget scope.
+    PoolCeiling,
+}
+
+impl AcquireBound {
+    fn label(self) -> &'static str {
+        match self {
+            Self::StatementBudget => "statement budget",
+            Self::PoolCeiling => "pool ceiling",
+        }
+    }
+}
+
 /// A bounded, secret-free report of a timed-out pool acquisition: no SQL
 /// text, credentials, endpoints or paths.
 #[derive(Clone, Debug)]
 pub struct PoolAcquireTimedOut {
     pub branch: String,
     pub wait: PoolWait,
+    /// The bound that ended the wait.
+    pub bound: AcquireBound,
+    /// The statement or operation budget, or the pool ceiling.
+    pub budget: Duration,
     pub max: u32,
     pub size: u32,
     pub idle: usize,
     pub checked_out: u32,
     pub waited: Duration,
+    /// The acquisition's own share of its bound: what was left of the budget
+    /// when it began, or the whole pool ceiling.
     pub window: Duration,
     pub authenticated_total: u64,
     pub authenticated_during_wait: u64,
@@ -446,16 +784,53 @@ pub struct PoolAcquireTimedOut {
     pub phase: Option<&'static str>,
 }
 
+impl PoolAcquireTimedOut {
+    fn report(&self) {
+        tracing::warn!(
+            branch = %self.branch,
+            wait = self.wait.label(),
+            bound = self.bound.label(),
+            budget_ms = millis(self.budget),
+            window_ms = millis(self.window),
+            max = self.max,
+            size = self.size,
+            idle = self.idle,
+            checked_out = self.checked_out,
+            waited_ms = millis(self.waited),
+            authenticated_total = self.authenticated_total,
+            authenticated_during_wait = self.authenticated_during_wait,
+            phase = self.phase.unwrap_or("none"),
+            "memory pool acquire timed out"
+        );
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 impl fmt::Display for PoolAcquireTimedOut {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "memory pool acquire on kuru/{} timed out after {:.3} s (window {:.3} s) waiting {}",
+            "memory pool acquire on kuru/{} timed out after {:.3} s ",
             self.branch,
             self.waited.as_secs_f64(),
-            self.window.as_secs_f64(),
-            self.wait.describe(),
         )?;
+        match self.bound {
+            AcquireBound::StatementBudget => write!(
+                formatter,
+                "(statement budget {:.3} s, {:.3} s left when the acquire began)",
+                self.budget.as_secs_f64(),
+                self.window.as_secs_f64(),
+            )?,
+            AcquireBound::PoolCeiling => write!(
+                formatter,
+                "(pool ceiling {:.3} s)",
+                self.window.as_secs_f64()
+            )?,
+        }
+        write!(formatter, " waiting {}", self.wait.describe())?;
         if let Some(phase) = self.phase {
             write!(formatter, " (connection phase: {phase})")?;
         }
@@ -475,7 +850,8 @@ impl fmt::Display for PoolAcquireTimedOut {
 impl std::error::Error for PoolAcquireTimedOut {}
 
 /// The typed pool timeout anywhere in `error`'s chain: anyhow context from
-/// [`MemoryPool::acquire`], or the `Executor` carrier.
+/// [`MemoryPool::acquire`], the `Executor` carrier, or the source of a
+/// [`BudgetElapsed`] that ended an acquisition.
 pub fn pool_acquire_timeout(error: &anyhow::Error) -> Option<&PoolAcquireTimedOut> {
     // anyhow finds a context value at any depth only through its own
     // downcast; `chain()` yields the context wrappers instead.
@@ -502,6 +878,8 @@ mod tests {
         PoolAcquireTimedOut {
             branch: "main".into(),
             wait,
+            bound: AcquireBound::PoolCeiling,
+            budget: Duration::from_secs(2),
             max: 4,
             size: 3,
             idle: 0,
@@ -534,7 +912,7 @@ mod tests {
         );
         assert!(!idle.contains("connection phase"), "{idle}");
         assert!(
-            idle.contains("timed out after 2.004 s (window 2.000 s)"),
+            idle.contains("timed out after 2.004 s (pool ceiling 2.000 s) waiting with no new"),
             "{idle}"
         );
         assert!(
@@ -587,5 +965,88 @@ mod tests {
             Some(sqlx::Error::PoolTimedOut)
         )));
         assert!(pool_acquire_timeout(&anyhow::Error::from(sqlx::Error::PoolTimedOut)).is_none());
+    }
+
+    /// A budget that ended an acquisition names the statement budget and the
+    /// acquisition's share, and is found through `BudgetElapsed`'s source; a
+    /// budget that elapsed during execution carries no acquisition diagnostic.
+    #[test]
+    fn budget_elapsed_carries_only_an_acquisition_it_ended() {
+        let mut acquire = diagnostic(PoolWait::HeldConnections, None);
+        acquire.bound = AcquireBound::StatementBudget;
+        acquire.budget = Duration::from_millis(500);
+        acquire.window = Duration::from_millis(400);
+        acquire.waited = Duration::from_millis(401);
+        let text = acquire.to_string();
+        assert!(
+            text.contains(
+                "memory pool acquire on kuru/main timed out after 0.401 s (statement budget 0.500 s, 0.400 s left when the acquire began) waiting for a connection held by Kuru work"
+            ),
+            "{text}"
+        );
+        let ended = Err::<(), _>(BudgetElapsed {
+            budget: Duration::from_millis(500),
+            acquire: Some(Box::new(acquire)),
+        });
+        let error = anyhow::Context::context(ended, "memory read deadline exceeded")
+            .expect_err("elapsed budget");
+        assert_eq!(
+            pool_acquire_timeout(&error).map(|found| found.bound),
+            Some(AcquireBound::StatementBudget)
+        );
+        assert!(
+            format!("{error:#}").contains(
+                "memory read deadline exceeded: memory statement budget of 0.500 s elapsed while acquiring a pool session: memory pool acquire on kuru/main timed out"
+            ),
+            "{error:#}"
+        );
+        assert!(!error.chain().any(|cause| matches!(
+            cause.downcast_ref::<sqlx::Error>(),
+            Some(sqlx::Error::PoolTimedOut)
+        )));
+        let execution = anyhow::Error::from(BudgetElapsed {
+            budget: Duration::from_secs(30),
+            acquire: None,
+        });
+        assert!(pool_acquire_timeout(&execution).is_none());
+        assert_eq!(
+            execution.to_string(),
+            "memory statement budget of 30.000 s elapsed"
+        );
+    }
+
+    /// A nested scope ends at the earliest enclosing deadline and reports
+    /// that deadline's budget; with no acquisition pending, its expiry
+    /// carries no acquisition diagnostic. The inner scope ends on an event,
+    /// so no time passes.
+    #[tokio::test]
+    async fn budget_scopes_nest_to_the_earliest_deadline() {
+        let outer = Duration::from_secs(30);
+        let inner = within(
+            outer,
+            within_or(
+                outer * 120,
+                std::future::pending::<()>(),
+                std::future::ready(()),
+            ),
+        )
+        .await
+        .expect("the enclosing scope has not elapsed")
+        .expect_err("the event ends the inner scope");
+        assert_eq!(inner.budget, outer);
+        assert!(inner.acquire.is_none());
+        let shorter = within(
+            outer,
+            within_or(
+                outer / 60,
+                std::future::pending::<()>(),
+                std::future::ready(()),
+            ),
+        )
+        .await
+        .expect("the enclosing scope has not elapsed")
+        .expect_err("the event ends the inner scope");
+        assert_eq!(shorter.budget, outer / 60);
+        assert_eq!(within(outer, async { 7 }).await.ok(), Some(7));
     }
 }

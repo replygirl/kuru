@@ -207,6 +207,8 @@ struct ServerInner {
     next_pool_probe_delay: StdMutex<Option<(Duration, Arc<AtomicBool>)>>,
     #[cfg(test)]
     next_pool_first_release_hold: StdMutex<Option<tokio::sync::oneshot::Sender<ConnectionGate>>>,
+    #[cfg(test)]
+    next_pool_authentication_gate: StdMutex<Option<tokio::sync::oneshot::Sender<ConnectionGate>>>,
     /// Every branch or revision a caller asked [`Server::pool`] for, in order.
     #[cfg(test)]
     pool_requests: StdMutex<Vec<String>>,
@@ -848,6 +850,8 @@ impl Server {
                         _test_probe_delay: _initial_probe_delay,
                         #[cfg(test)]
                         _test_first_release_hold: None,
+                        #[cfg(test)]
+                        _test_authentication_gate: None,
                     },
                 ),
             )
@@ -921,6 +925,8 @@ impl Server {
             next_pool_probe_delay: StdMutex::new(None),
             #[cfg(test)]
             next_pool_first_release_hold: StdMutex::new(None),
+            #[cfg(test)]
+            next_pool_authentication_gate: StdMutex::new(None),
             #[cfg(test)]
             pool_requests: StdMutex::new(Vec::new()),
             owner: Mutex::new(owner),
@@ -1042,6 +1048,13 @@ impl Server {
                 .lock()
                 .expect("pool first release hold lock")
                 .take(),
+            #[cfg(test)]
+            _test_authentication_gate: self
+                .0
+                .next_pool_authentication_gate
+                .lock()
+                .expect("pool authentication gate lock")
+                .take(),
         }
     }
 
@@ -1057,6 +1070,22 @@ impl Server {
             .next_pool_first_release_hold
             .lock()
             .expect("pool first release hold lock") = Some(sender);
+        receiver
+    }
+
+    /// Hold every new connection of the next pool at the start of its
+    /// authentication until the gate the receiver gets is dropped. The next
+    /// pool attempt takes this seam once; no time elapses inside the gate.
+    #[cfg(test)]
+    pub(crate) fn gate_next_pool_authentication(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<ConnectionGate> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        *self
+            .0
+            .next_pool_authentication_gate
+            .lock()
+            .expect("pool authentication gate lock") = Some(sender);
         receiver
     }
 
@@ -1876,6 +1905,10 @@ pub(crate) struct ConnectionObservation(Arc<ObservationShared>);
 struct ObservationShared {
     progress: StdMutex<ConnectionProgress>,
     authenticated: AtomicU64,
+    /// Acquisitions through the pool funnel still waiting.
+    pending_acquires: tokio::sync::watch::Sender<u64>,
+    #[cfg(test)]
+    slow_acquire_records: tokio::sync::watch::Sender<u64>,
     #[cfg(test)]
     first_release_cut: AtomicBool,
     #[cfg(test)]
@@ -1899,6 +1932,9 @@ impl ConnectionObservation {
                 last_failure: None,
             }),
             authenticated: AtomicU64::new(0),
+            pending_acquires: tokio::sync::watch::Sender::new(0),
+            #[cfg(test)]
+            slow_acquire_records: tokio::sync::watch::Sender::new(0),
             #[cfg(test)]
             first_release_cut: AtomicBool::new(false),
             #[cfg(test)]
@@ -1935,6 +1971,46 @@ impl ConnectionObservation {
     /// New connections that entered this pool's authentication callback.
     pub(crate) fn authenticated(&self) -> u64 {
         self.0.authenticated.load(Ordering::SeqCst)
+    }
+
+    /// An acquisition through the pool funnel began waiting.
+    pub(crate) fn acquire_started(&self) {
+        self.0.pending_acquires.send_modify(|pending| *pending += 1);
+    }
+
+    /// An acquisition through the pool funnel completed, failed or was
+    /// cancelled.
+    pub(crate) fn acquire_ended(&self) {
+        self.0
+            .pending_acquires
+            .send_modify(|pending| *pending = pending.saturating_sub(1));
+    }
+
+    /// Acquisitions through the pool funnel still waiting.
+    pub(crate) fn pending_acquires(&self) -> u64 {
+        *self.0.pending_acquires.borrow()
+    }
+
+    /// One pending acquisition left its slow-acquire record.
+    pub(crate) fn slow_acquire_recorded(&self) {
+        #[cfg(test)]
+        self.0
+            .slow_acquire_records
+            .send_modify(|records| *records += 1);
+    }
+
+    /// Slow-acquire records ("still waiting") this pool's acquisitions left.
+    #[cfg(test)]
+    pub(crate) fn slow_acquire_records(&self) -> u64 {
+        *self.0.slow_acquire_records.borrow()
+    }
+
+    /// Completes once this pool's acquisitions have left at least `records`
+    /// slow-acquire records.
+    #[cfg(test)]
+    pub(crate) async fn slow_acquire_records_reach(&self, records: u64) {
+        let mut receiver = self.0.slow_acquire_records.subscribe();
+        let _ = receiver.wait_for(|count| *count >= records).await;
     }
 
     /// Whether this pool's first connection release was cut at its pool
@@ -2214,6 +2290,10 @@ struct PoolAttemptOptions {
     /// release before SQLx's ping.
     #[cfg(test)]
     _test_first_release_hold: Option<tokio::sync::oneshot::Sender<ConnectionGate>>,
+    /// Receives a gate that holds the attempt's new connections at the start
+    /// of their authentication.
+    #[cfg(test)]
+    _test_authentication_gate: Option<tokio::sync::oneshot::Sender<ConnectionGate>>,
 }
 
 impl PoolAttemptOptions {
@@ -2225,6 +2305,8 @@ impl PoolAttemptOptions {
             _test_probe_delay: None,
             #[cfg(test)]
             _test_first_release_hold: None,
+            #[cfg(test)]
+            _test_authentication_gate: None,
         }
     }
 }
@@ -2326,6 +2408,10 @@ async fn connect_pool_attempt(
     let project_scope = identity.project_scope.clone();
     let expected_directory = directory.join("data");
     let observation = ConnectionObservation::new();
+    #[cfg(test)]
+    if let Some(gate) = attempt._test_authentication_gate {
+        let _ = gate.send(observation.gate_new_authentications());
+    }
     let callback_observation = observation.clone();
     let rejection = IdentityRejection::default();
     let callback_rejection = rejection.clone();
