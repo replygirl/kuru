@@ -11,13 +11,22 @@
 //! owner-private file named for its service generation. The record carries
 //! only static event names, offsets, one wall-clock anchor, the service
 //! generation, the package version and counts: never a path, scope, SQL,
-//! identity, credential or content. Recording and writing never fail or
-//! delay the open, serve or close. Windows owners are spawned with an
-//! explicit environment that does not carry the variable, so the timeline is
-//! inert there and no support is claimed.
+//! identity, credential or content. Recording and writing never fail,
+//! cancel or reorder the open, serve or close.
+//!
+//! A gated owner started with a starter token also streams each stamp, as
+//! it is taken, to a create-only owner-private file named from that token's
+//! activity tag: one unsynced line of at most 62 bytes per stamp, carrying
+//! only the event name, its offset and its wall-clock time. The owner removes
+//! that file under owner authority right after endpoint publication, before
+//! it serves, or when its open fails; it never appends to or removes a file
+//! it did not create. A gated starter reads only its own owner's stream,
+//! once, at its readiness deadline. A Windows starter forwards the gate to
+//! its owner only when it is exactly `1`.
 
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
+    fs::File,
     io::Write as _,
     path::Path,
     sync::{Mutex, OnceLock, PoisonError},
@@ -25,16 +34,25 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use kuru_platform::fs::{NameRetention, Privacy};
+use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde::Serialize;
 
-/// The variable that gates the timeline in the owner process.
+/// The variable that gates the timeline in the owner process, and the
+/// deadline read in a starter.
 pub(crate) const ENV: &str = "KURU_OPEN_TIMELINE";
 const CAPACITY: usize = 64;
-const MAX_BYTES: usize = 8 * 1024;
+/// The bound of the close-time record and of a starter's stream read.
+pub(crate) const MAX_BYTES: usize = 8 * 1024;
+/// The longest stream line: the longest event name and two `u64::MAX`
+/// integers, three separators included.
+#[cfg(test)]
+const MAX_LINE_BYTES: usize = 62;
 const FORMAT: &str = "kuru.open-timeline";
 const FORMAT_VERSION: u32 = 1;
 const FILE_PREFIX: &str = "open-timeline-";
+/// Deliberately not [`FILE_PREFIX`]: nothing that lists close-time records
+/// ever sees a stream.
+const STREAM_PREFIX: &str = "open-stream-";
 
 static INSTALLED: OnceLock<Timeline> = OnceLock::new();
 
@@ -43,12 +61,25 @@ static INSTALLED: OnceLock<Timeline> = OnceLock::new();
 pub(crate) enum Event {
     OwnerMain,
     OwnerLock,
+    StartupLock,
+    ExtractStart,
+    ExtractEnd,
     CacheVerifyStart,
     CacheVerifyEnd,
+    CreateStart,
+    SupervisorSpawned,
+    /// Stamped only by a Windows supervisor start.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    ChannelAccepted,
     SupervisorReady,
     ProbeVerified,
+    TemplateCopied,
+    ColdCreated,
+    Activated,
     MainPool,
     VersionRead,
+    MigrateStart,
+    MigrateEnd,
     ValidateActive,
     CandidateRecovery,
     UsagePool,
@@ -65,15 +96,26 @@ pub(crate) enum Event {
 
 impl Event {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 20] = [
+    pub(crate) const ALL: [Self; 31] = [
         Self::OwnerMain,
         Self::OwnerLock,
+        Self::StartupLock,
+        Self::ExtractStart,
+        Self::ExtractEnd,
         Self::CacheVerifyStart,
         Self::CacheVerifyEnd,
+        Self::CreateStart,
+        Self::SupervisorSpawned,
+        Self::ChannelAccepted,
         Self::SupervisorReady,
         Self::ProbeVerified,
+        Self::TemplateCopied,
+        Self::ColdCreated,
+        Self::Activated,
         Self::MainPool,
         Self::VersionRead,
+        Self::MigrateStart,
+        Self::MigrateEnd,
         Self::ValidateActive,
         Self::CandidateRecovery,
         Self::UsagePool,
@@ -92,12 +134,23 @@ impl Event {
         match self {
             Self::OwnerMain => "owner-main",
             Self::OwnerLock => "owner-lock",
+            Self::StartupLock => "startup-lock",
+            Self::ExtractStart => "extract-start",
+            Self::ExtractEnd => "extract-end",
             Self::CacheVerifyStart => "cache-verify-start",
             Self::CacheVerifyEnd => "cache-verify-end",
+            Self::CreateStart => "create-start",
+            Self::SupervisorSpawned => "supervisor-spawned",
+            Self::ChannelAccepted => "channel-accepted",
             Self::SupervisorReady => "supervisor-ready",
             Self::ProbeVerified => "probe-verified",
+            Self::TemplateCopied => "template-copied",
+            Self::ColdCreated => "cold-created",
+            Self::Activated => "activated",
             Self::MainPool => "main-pool",
             Self::VersionRead => "version-read",
+            Self::MigrateStart => "migrate-start",
+            Self::MigrateEnd => "migrate-end",
             Self::ValidateActive => "validate-active",
             Self::CandidateRecovery => "candidate-recovery",
             Self::UsagePool => "usage-pool",
@@ -127,11 +180,53 @@ pub(crate) fn install_from_env() {
     }
 }
 
+/// True when this process's own environment holds the gate exactly; a
+/// starter reads its owner's stream, and a Windows starter forwards the gate,
+/// only then. A test scopes its own value instead, never the runner's
+/// environment.
+pub(crate) fn gate_set() -> bool {
+    #[cfg(test)]
+    if let Ok(gated) = GATE_OVERRIDE.try_with(|gated| *gated) {
+        return gated;
+    }
+    enabled(std::env::var_os(ENV).as_deref())
+}
+
 /// Stamp `event` when this process installed a timeline; otherwise nothing.
 pub(crate) fn stamp(event: Event) {
     if let Some(timeline) = INSTALLED.get() {
         timeline.stamp(event);
+        // After the stamp released its log, so a held owner's other tasks
+        // can still stamp.
+        #[cfg(all(unix, any(test, feature = "test-support")))]
+        hold::at(event);
     }
+}
+
+/// Start streaming this process's timeline into `directory`, when it
+/// installed one; otherwise nothing. See [`Timeline::stream_to`].
+pub(crate) fn stream_to(directory: &Path, tag: &str) {
+    if let Some(timeline) = INSTALLED.get() {
+        timeline.stream_to(directory, tag);
+    }
+}
+
+/// Remove this process's stream, when it has one. See
+/// [`Timeline::end_stream`].
+pub(crate) fn end_stream() {
+    if let Some(timeline) = INSTALLED.get() {
+        timeline.end_stream();
+    }
+}
+
+/// The stream file name for one starter token's activity tag.
+pub(crate) fn stream_name(tag: &str) -> String {
+    format!("{STREAM_PREFIX}{tag}")
+}
+
+/// One stream line: the event name, its offset and its wall-clock time.
+fn stream_line(event: Event, ns: u64, unix_ns: u64) -> String {
+    format!("{} {ns} {unix_ns}\n", event.name())
 }
 
 /// Record the first usage-ledger scan's row count (name and number only).
@@ -178,6 +273,27 @@ struct Log {
     dropped: u32,
     late: u32,
     sealed: bool,
+    stream: Option<Stream>,
+}
+
+/// The owner's own stream file, held with its checked directory so that
+/// only this file is ever removed from its name.
+struct Stream {
+    directory: Directory,
+    name: OsString,
+    file: File,
+    /// A failed write stops further writes; the file is still removed.
+    failed: bool,
+}
+
+impl Stream {
+    fn append(&mut self, event: Event, ns: u64, anchor_unix_ns: u64) {
+        if self.failed {
+            return;
+        }
+        let line = stream_line(event, ns, anchor_unix_ns.saturating_add(ns));
+        self.failed = self.file.write_all(line.as_bytes()).is_err();
+    }
 }
 
 impl Timeline {
@@ -207,6 +323,7 @@ impl Timeline {
                 dropped: 0,
                 late: 0,
                 sealed: false,
+                stream: None,
             }),
         }
     }
@@ -223,11 +340,73 @@ impl Timeline {
         }
         if log.entries.len() < log.limit {
             log.entries.push((event, ns));
+            let anchor_unix_ns = self.anchor_unix_ns;
+            if let Some(stream) = &mut log.stream {
+                stream.append(event, ns, anchor_unix_ns);
+            }
         } else {
             log.dropped = log.dropped.saturating_add(1);
         }
         if event == Event::EndpointPublished {
             log.sealed = true;
+        }
+    }
+
+    /// Create this owner's stream as `open-stream-<tag>` in the owner-private
+    /// `directory` and write every entry logged so far; each later logged
+    /// stamp appends its line. Create-only: a name already taken, by a
+    /// predecessor with the same tag or anything else, leaves streaming off
+    /// and that object untouched. Unsynced, and best effort: no failure here
+    /// changes the open. Call once, while holding owner authority.
+    pub(crate) fn stream_to(&self, directory: &Path, tag: &str) {
+        let _ = self.try_stream_to(directory, tag);
+    }
+
+    fn try_stream_to(&self, directory: &Path, tag: &str) -> Result<()> {
+        ensure!(
+            !tag.is_empty() && tag.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "open timeline stream tag is not hex"
+        );
+        // Held across creation, so no stamp falls between the flush of the
+        // logged entries and the stream's attachment.
+        let mut log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
+        ensure!(log.stream.is_none(), "open timeline already streams");
+        crate::files::ensure_private_directory(directory)?;
+        let directory =
+            crate::files::open_directory(directory, Privacy::OwnerOnly, NameRetention::Movable)?;
+        let name = OsString::from(stream_name(tag));
+        let file = directory.create_new(&name)?;
+        let mut stream = Stream {
+            directory,
+            name,
+            file,
+            failed: false,
+        };
+        for &(event, ns) in &log.entries {
+            stream.append(event, ns, self.anchor_unix_ns);
+        }
+        log.stream = Some(stream);
+        Ok(())
+    }
+
+    /// Stop streaming and remove the stream file this owner created. A
+    /// removal a concurrent reader leaves uncertain on Windows is not
+    /// retried; nothing here fails or waits.
+    pub(crate) fn end_stream(&self) {
+        let stream = self
+            .log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stream
+            .take();
+        if let Some(Stream {
+            directory,
+            name,
+            file,
+            ..
+        }) = stream
+        {
+            let _ = directory.remove_file(&name, file);
         }
     }
 
@@ -315,6 +494,102 @@ pub(crate) fn write(timeline: &Timeline, directory: &Path, generation: &str) -> 
     let mut file = parent.create_new(OsStr::new(&file_name(generation)))?;
     file.write_all(&bytes)?;
     Ok(())
+}
+
+/// Test-support owner event hold (Unix): when a gated owner stamps `E`
+/// and the directory named by [`hold::DIR_ENV`] holds a fifo pair
+/// `E.entered` and `E.release`, it writes one byte to `E.entered`, then
+/// blocks the stamping thread until it reads one byte from `E.release`.
+/// Each event holds at most once per process. Without the pair, or without
+/// a reader on `E.entered`, nothing waits. Only the stamps of an installed
+/// timeline reach it, after the stamp released the log.
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub(crate) mod hold {
+    use super::Event;
+    use anyhow::{Context as _, Result, bail};
+    use nix::{
+        errno::Errno,
+        fcntl::OFlag,
+        poll::{PollFd, PollFlags, PollTimeout},
+        sys::stat::Mode,
+    };
+    use std::{
+        os::{fd::AsFd as _, unix::fs::FileTypeExt as _},
+        path::{Path, PathBuf},
+        sync::{
+            OnceLock,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    /// Names the hold directory in the owner's environment.
+    pub(crate) const DIR_ENV: &str = "KURU_TEST_MEMORY_TIMELINE_HOLD_DIR";
+    /// The configuration maximum of `memory.startup_timeout_secs`. It only
+    /// keeps a broken test from holding an owner forever; no assertion
+    /// depends on it.
+    const LIMIT: Duration = Duration::from_secs(300);
+
+    static DIRECTORY: OnceLock<Option<PathBuf>> = OnceLock::new();
+    static HELD: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn at(event: Event) {
+        let Some(directory) =
+            DIRECTORY.get_or_init(|| std::env::var_os(DIR_ENV).map(PathBuf::from))
+        else {
+            return;
+        };
+        let bit = 1_u64 << (event as u32);
+        if HELD.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+            return;
+        }
+        // Reported and passed, as a failed activity hold is.
+        if let Err(error) = wait(directory, event) {
+            eprintln!("open timeline hold on {} failed: {error:#}", event.name());
+        }
+    }
+
+    fn wait(directory: &Path, event: Event) -> Result<()> {
+        let name = event.name();
+        let entered = match nix::fcntl::open(
+            &directory.join(format!("{name}.entered")),
+            OFlag::O_WRONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(entered) => std::fs::File::from(entered),
+            // No pair, or nobody reading: no hold.
+            Err(Errno::ENOENT | Errno::ENXIO) => return Ok(()),
+            Err(error) => return Err(error).context("open the entered fifo"),
+        };
+        if !entered.metadata()?.file_type().is_fifo() {
+            bail!("{name}.entered is not a fifo");
+        }
+        nix::unistd::write(&entered, b"e").context("signal the hold")?;
+        drop(entered);
+        let release = nix::fcntl::open(
+            &directory.join(format!("{name}.release")),
+            OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .context("open the release fifo")?;
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX);
+            let mut fds = [PollFd::new(release.as_fd(), PollFlags::POLLIN)];
+            match nix::poll::poll(&mut fds, timeout) {
+                Ok(0) => bail!("not released within {LIMIT:?}"),
+                Ok(_) => break,
+                Err(Errno::EINTR) => {}
+                Err(error) => return Err(error).context("poll the release fifo"),
+            }
+        }
+        let mut byte = [0_u8; 1];
+        match nix::unistd::read(&release, &mut byte).context("read the release byte")? {
+            1 => Ok(()),
+            _ => bail!("the holding test went away"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -483,12 +758,23 @@ mod tests {
             [
                 "owner-main",
                 "owner-lock",
+                "startup-lock",
+                "extract-start",
+                "extract-end",
                 "cache-verify-start",
                 "cache-verify-end",
+                "create-start",
+                "supervisor-spawned",
+                "channel-accepted",
                 "supervisor-ready",
                 "probe-verified",
+                "template-copied",
+                "cold-created",
+                "activated",
                 "main-pool",
                 "version-read",
+                "migrate-start",
+                "migrate-end",
                 "validate-active",
                 "candidate-recovery",
                 "usage-pool",
@@ -590,6 +876,147 @@ mod tests {
             );
         }
         assert!(!is_timeline_name(OsStr::new("endpoint.json")));
+    }
+
+    /// The stream's lines, each split into its three fields.
+    fn stream_lines(path: &Path) -> Vec<(String, u64, u64)> {
+        std::fs::read_to_string(path)
+            .expect("a readable stream")
+            .lines()
+            .map(|line| {
+                let fields = line.split(' ').collect::<Vec<_>>();
+                assert_eq!(fields.len(), 3, "{line:?}");
+                (
+                    fields[0].to_owned(),
+                    fields[1].parse().expect("an offset"),
+                    fields[2].parse().expect("a wall-clock time"),
+                )
+            })
+            .collect()
+    }
+
+    fn new_tag() -> String {
+        crate::service::activity::activity_tag(&uuid::Uuid::new_v4())
+    }
+
+    // T1.
+    #[test]
+    fn the_stream_mirrors_the_log_line_by_line() {
+        let root = tempfile::tempdir().unwrap();
+        let services = root.path().join("services");
+        let tag = new_tag();
+        let timeline = Timeline::new();
+        // Logged before the stream attaches: flushed when it does.
+        timeline.stamp(Event::OwnerMain);
+        timeline.stamp(Event::OwnerLock);
+        timeline.stream_to(&services, &tag);
+        let path = services.join(stream_name(&tag));
+        assert_eq!(stream_lines(&path).len(), 2);
+        for event in [
+            Event::StartupLock,
+            Event::CreateStart,
+            Event::SupervisorSpawned,
+            Event::EndpointPublished,
+        ] {
+            timeline.stamp(event);
+        }
+        // Sealed: counted late, never streamed.
+        timeline.stamp(Event::SupervisorReady);
+        let (entries, _, dropped, late, _) = snapshot(&timeline);
+        assert_eq!((dropped, late), (0, 1));
+        let lines = stream_lines(&path);
+        assert_eq!(
+            lines,
+            entries
+                .iter()
+                .map(|&(event, ns)| (event.name().to_owned(), ns, timeline.anchor_unix_ns + ns))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            entries
+                .iter()
+                .map(|&(event, ns)| stream_line(event, ns, timeline.anchor_unix_ns + ns))
+                .collect::<String>()
+                .into_bytes()
+        );
+
+        // A full log streams nothing more.
+        let tag = new_tag();
+        let full = Timeline::with_capacity(2);
+        full.stream_to(&services, &tag);
+        for _ in 0..5 {
+            full.stamp(Event::MainPool);
+        }
+        assert_eq!(stream_lines(&services.join(stream_name(&tag))).len(), 2);
+        assert_eq!(snapshot(&full).2, 3);
+
+        // The longest line, and a full log of them, stay within the bounds.
+        let longest = Event::ALL
+            .iter()
+            .map(|&event| stream_line(event, u64::MAX, u64::MAX).len())
+            .max()
+            .unwrap();
+        assert!(longest <= MAX_LINE_BYTES, "{longest} bytes");
+        assert!(CAPACITY * longest <= MAX_BYTES);
+    }
+
+    // T2.
+    #[test]
+    fn the_stream_is_create_only_private_and_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let services = root.path().join("services");
+        crate::files::ensure_private_directory(&services).unwrap();
+        let token = uuid::Uuid::new_v4();
+        let tag = crate::service::activity::activity_tag(&token);
+        let path = services.join(stream_name(&tag));
+        assert!(!path.to_string_lossy().contains(&token.to_string()));
+        assert!(!is_timeline_name(path.file_name().unwrap()));
+
+        // A taken name: no stream, stamps still logged, and the occupying
+        // file is never appended to or removed.
+        let occupied = b"owner-main 0 1\n".as_slice();
+        std::fs::write(&path, occupied).unwrap();
+        let refused = Timeline::new();
+        refused.stamp(Event::OwnerMain);
+        refused.stream_to(&services, &tag);
+        refused.stamp(Event::OwnerLock);
+        refused.end_stream();
+        assert_eq!(snapshot(&refused).0.len(), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), occupied);
+        std::fs::remove_file(&path).unwrap();
+
+        // A name that is not a tag never becomes a path.
+        let timeline = Timeline::new();
+        timeline.stamp(Event::OwnerMain);
+        for bad in ["", "../escape", "ab/cd", "not hex"] {
+            timeline.stream_to(&services, bad);
+        }
+        assert_eq!(std::fs::read_dir(&services).unwrap().count(), 0);
+
+        timeline.stream_to(&services, &tag);
+        timeline.stamp(Event::OwnerLock);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        for line in text.lines() {
+            let fields = line.split(' ').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 3, "{line:?}");
+            assert!(Event::ALL.iter().any(|event| event.name() == fields[0]));
+            assert!(fields[1..].iter().all(|field| field.parse::<u64>().is_ok()));
+        }
+        assert!(!text.contains(&tag) && !text.contains(&token.to_string()));
+        timeline.end_stream();
+        assert!(!path.exists(), "end_stream left the stream");
+        // Ended: later stamps write nothing and recreate nothing.
+        timeline.stamp(Event::StartupLock);
+        timeline.end_stream();
+        assert_eq!(std::fs::read_dir(&services).unwrap().count(), 0);
+        assert_eq!(snapshot(&timeline).0.len(), 3);
     }
 
     #[test]

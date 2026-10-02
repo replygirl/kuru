@@ -143,3 +143,54 @@ async fn opening_pool_identity_rejection_is_terminal() -> Result<()> {
     server.close().await?;
     Ok(())
 }
+
+/// A Windows accept that fails with its own timeout at or after the shared
+/// readiness deadline is the accept part of that deadline; before it, or
+/// with another kind, it stays an ordinary accept failure.
+#[test]
+fn an_accept_timeout_at_the_deadline_is_the_accept_part() {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let timed_out = std::io::Error::new(std::io::ErrorKind::TimedOut, "accept timed out");
+    for now in [deadline, deadline + Duration::from_millis(1)] {
+        assert_eq!(
+            readiness_deadline_part(&timed_out, now, deadline),
+            Some(ReadinessPart::Accept)
+        );
+    }
+    let early = deadline - Duration::from_millis(1);
+    assert_eq!(readiness_deadline_part(&timed_out, early, deadline), None);
+    for kind in [
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::Other,
+    ] {
+        let error = std::io::Error::new(kind, "accept failed");
+        assert_eq!(readiness_deadline_part(&error, deadline, deadline), None);
+    }
+    // Printed in the deadline's shape, under its unchanged outer cause.
+    let error = readiness_deadline(timed_out.into(), ReadinessPart::Accept, deadline);
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.starts_with(
+            "memory supervisor readiness deadline exceeded: the supervisor's private channel accept had not completed "
+        ),
+        "{rendered}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "memory supervisor readiness deadline exceeded"
+    );
+    for (part, text) in [
+        (
+            ReadinessPart::Accept,
+            "the supervisor's private channel accept",
+        ),
+        (ReadinessPart::Write, "the startup request write"),
+        (ReadinessPart::Read, "the supervisor's Ready frame"),
+    ] {
+        assert_eq!(part.to_string(), text);
+        let step = ReadinessStep::new(ReadinessPart::Accept);
+        step.set(part);
+        assert_eq!(step.get(), part);
+    }
+}

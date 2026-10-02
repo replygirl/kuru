@@ -522,17 +522,117 @@ impl std::fmt::Display for ReadinessSplit {
     }
 }
 
-/// Red-test stub for the gated starter's owner timeline clause; the
-/// implementation replaces it in the next commit.
-#[cfg(test)]
+/// The owner timeline clause a gated starter adds at its readiness deadline:
+/// one bounded read of its own owner's stream (named from the activity tag
+/// of the token it passed), with no wait and no retry, every error mapped to
+/// text. `None` when this starter is ungated: then nothing is read.
+///
+/// `owner-exec` is the owner's anchor less `spawn_called`, the instant
+/// taken just before the spawn call, and `since-last` is `now` less the last
+/// line's wall-clock time: wall-clock differences across two processes, so
+/// a clock step skews them. An owner anchored before `spawn_called` is a
+/// predecessor's file with the same tag, reported only as `stale`. Lines
+/// are `<name> <offset-ns> <unix-ns>`; a trailing partial line is still
+/// being written and ignored, and a malformed complete line is counted,
+/// never named. The clause never carries a path, token, scope or tag.
 fn owner_timeline_clause(
-    _data_dir: &Path,
-    _scope: &str,
-    _tag: &str,
-    _spawn_called: std::time::SystemTime,
-    _now: std::time::SystemTime,
+    data_dir: &Path,
+    scope: &str,
+    tag: &str,
+    spawn_called: std::time::SystemTime,
+    now: std::time::SystemTime,
 ) -> Option<String> {
-    Some(String::new())
+    if !open_timeline::gate_set() {
+        return None;
+    }
+    let read = EndpointRecord::directory(data_dir, scope).and_then(|directory| {
+        crate::files::read_bytes(
+            &directory.join(open_timeline::stream_name(tag)),
+            open_timeline::MAX_BYTES as u64,
+        )
+    });
+    let bytes = match read {
+        Ok(bytes) => bytes,
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+            }) =>
+        {
+            return Some("owner timeline: absent".into());
+        }
+        Err(_) => return Some("owner timeline: unreadable".into()),
+    };
+    Some(owner_timeline_text(&bytes, spawn_called, now))
+}
+
+fn owner_timeline_text(
+    bytes: &[u8],
+    spawn_called: std::time::SystemTime,
+    now: std::time::SystemTime,
+) -> String {
+    const MS: u64 = 1_000_000;
+    fn unix_ns(time: std::time::SystemTime) -> u64 {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+            })
+    }
+    fn number(field: &str) -> Option<u64> {
+        field
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| field.parse().ok())
+            .flatten()
+    }
+    fn line(bytes: &[u8]) -> Option<(&str, u64, u64)> {
+        let mut fields = std::str::from_utf8(bytes).ok()?.split(' ');
+        let (name, offset, unix) = (fields.next()?, fields.next()?, fields.next()?);
+        let named = (1..=32).contains(&name.len())
+            && name
+                .bytes()
+                .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'));
+        (named && fields.next().is_none()).then_some(())?;
+        Some((name, number(offset)?, number(unix)?))
+    }
+    let mut events = Vec::new();
+    let mut skipped = 0_usize;
+    // Everything after the last newline is a line still being written.
+    if let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') {
+        for raw in bytes[..end].split(|byte| *byte == b'\n') {
+            match line(raw) {
+                Some(event) => events.push(event),
+                None => skipped += 1,
+            }
+        }
+    }
+    let skipped = if skipped == 0 {
+        String::new()
+    } else {
+        format!("; skipped={skipped}")
+    };
+    let (Some(&(_, first_offset, first_unix)), Some(&(last, last_offset, last_unix))) =
+        (events.first(), events.last())
+    else {
+        return format!("owner timeline: empty{skipped}");
+    };
+    let anchor = first_unix.saturating_sub(first_offset);
+    let spawned = unix_ns(spawn_called);
+    if anchor < spawned {
+        return "owner timeline: stale".into();
+    }
+    let listed = events
+        .iter()
+        .map(|(name, offset, _)| format!("{name}={}", offset / MS))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "owner timeline: owner-exec={}ms; {listed} (ms); last={last} +{}ms; since-last={}ms{skipped}",
+        (anchor - spawned) / MS,
+        last_offset / MS,
+        unix_ns(now).saturating_sub(last_unix) / MS,
+    )
 }
 
 /// Attach to a valid owner, or elect and start one while retaining a distinct
@@ -660,6 +760,10 @@ async fn attach_or_spawn_elected(
         .is_observed()
         .then(|| activity::activity_tag(&starter_token));
     let mut forwarded = 0;
+    // Only a gated starter reads its owner's stream at the deadline. Taken
+    // before the spawn call: a Windows spawn awaits, and its owner may stamp
+    // before the call returns, which would read as stale.
+    let spawn_called = open_timeline::gate_set().then(std::time::SystemTime::now);
     let mut child = ServiceProcess::new(
         spawn_service(
             options,
@@ -714,11 +818,28 @@ async fn attach_or_spawn_elected(
                 last_attach,
             };
             #[cfg(feature = "test-support")]
-            if let Some(diagnostic) = &mut startup_diagnostic {
-                let observations = fixture_startup_observations(options, diagnostic);
-                bail!("memory service readiness deadline exceeded; {observations}; {split}");
+            let observations = startup_diagnostic
+                .as_mut()
+                .map(|diagnostic| fixture_startup_observations(options, diagnostic));
+            let owner_timeline = spawn_called
+                .and_then(|spawn_called| {
+                    owner_timeline_clause(
+                        &options.data_dir,
+                        &options.project_scope,
+                        &activity::activity_tag(&starter_token),
+                        spawn_called,
+                        std::time::SystemTime::now(),
+                    )
+                })
+                .map(|clause| format!("{clause}; "))
+                .unwrap_or_default();
+            #[cfg(feature = "test-support")]
+            if let Some(observations) = observations {
+                bail!(
+                    "memory service readiness deadline exceeded; {observations}; {owner_timeline}{split}"
+                );
             }
-            bail!("memory service readiness deadline exceeded; {split}");
+            bail!("memory service readiness deadline exceeded; {owner_timeline}{split}");
         }
         // After the deadline check and never after an attach, so the read can
         // neither move the deadline nor count as a poll.
@@ -1047,40 +1168,71 @@ async fn spawn_service(
     command.console = Console::PrivateHidden;
     command.stderr = stderr.map_or(Stdio::Null, |file| Stdio::Handle(file.into()));
     let system = kuru_platform::windows::process::system_directory()?;
-    let windows = system
-        .parent()
-        .context("Windows system directory has no parent")?;
-    command.environment = vec![
-        ("SystemRoot".into(), windows.as_os_str().into()),
-        ("WINDIR".into(), windows.as_os_str().into()),
-        ("PATH".into(), system.into_os_string()),
-    ];
-    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
-        command
-            .environment
-            .push(("LLVM_PROFILE_FILE".into(), profile));
-    }
+    #[cfg_attr(
+        not(any(test, feature = "test-support")),
+        expect(unused_mut, reason = "only test support adds layers")
+    )]
+    let mut layers: Vec<Vec<(OsString, OsString)>> = Vec::new();
     #[cfg(feature = "test-support")]
     if fixture_startup_stages_enabled() {
-        command
-            .environment
-            .push((STARTUP_STAGE_DIAGNOSTIC_ENV.into(), OsString::from("1")));
+        layers.push(vec![(
+            STARTUP_STAGE_DIAGNOSTIC_ENV.into(),
+            OsString::from("1"),
+        )]);
     }
     #[cfg(any(test, feature = "test-support"))]
-    command.environment.extend(activity::forwarded_test_hooks());
+    layers.push(activity::forwarded_test_hooks());
     // Test-support measurement only: forward the inert-by-default trace.
     #[cfg(any(test, feature = "test-support"))]
-    command
-        .environment
-        .extend(crate::test_support::lifecycle_trace::forwarded());
+    layers.push(crate::test_support::lifecycle_trace::forwarded());
     #[cfg(test)]
-    command
-        .environment
-        .extend(activity::owner_test_environment());
+    layers.push(activity::owner_test_environment());
+    command.environment = owner_environment(
+        system,
+        std::env::var_os("LLVM_PROFILE_FILE"),
+        open_timeline::gate_set(),
+        layers,
+    )
+    .context("compose the memory service environment")?;
     command
         .spawn()
         .await
         .context("start independent or outer-contained project memory service")
+}
+
+/// The Windows owner's explicit environment: the system variables, the
+/// coverage destination when set, and the timeline gate only when this
+/// starter's own gate is exactly `1`. Each later layer overrides the result
+/// so far through `merge_environment`, one layer at a time, so a key that
+/// arrives from two layers (a test's `KURU_OPEN_TIMELINE=0`, or a hook set
+/// both in the runner and a test's own scope) replaces its case-equivalent
+/// entry instead of becoming a duplicate the spawn would refuse.
+#[cfg(windows)]
+fn owner_environment(
+    system: PathBuf,
+    profile: Option<OsString>,
+    gate: bool,
+    layers: Vec<Vec<(OsString, OsString)>>,
+) -> io::Result<Vec<(OsString, OsString)>> {
+    let windows = system
+        .parent()
+        .ok_or_else(|| io::Error::other("Windows system directory has no parent"))?
+        .as_os_str()
+        .to_owned();
+    let mut base = vec![
+        ("SystemRoot".into(), windows.clone()),
+        ("WINDIR".into(), windows),
+        ("PATH".into(), system.into_os_string()),
+    ];
+    if let Some(profile) = profile {
+        base.push(("LLVM_PROFILE_FILE".into(), profile));
+    }
+    if gate {
+        base.push((open_timeline::ENV.into(), OsString::from("1")));
+    }
+    layers
+        .into_iter()
+        .try_fold(base, kuru_platform::windows::process::merge_environment)
 }
 
 #[cfg(unix)]
@@ -1430,10 +1582,22 @@ impl ServiceOwner {
         )?
         .context("project already has a memory service owner; wait for its validated endpoint")?;
         lock.verify()?;
+        // A gated owner's stream, named from its starter's token, exists
+        // only while this owner lock is held: it is removed before serving
+        // and on every failed open below, never in close.
+        if open_timeline::installed().is_some()
+            && let Some(token) = &options.starter_token
+            && let Ok(directory) =
+                EndpointRecord::directory(&options.data_dir, &options.project_scope)
+        {
+            open_timeline::stream_to(&directory, &activity::activity_tag(token));
+        }
         open_timeline::stamp(open_timeline::Event::OwnerLock);
         // On failure the store open retires its own record before returning,
         // while this owner lock is still held.
-        let (store, activity) = activity::open_owner_store(options.clone(), hooks).await?;
+        let (store, activity) = activity::open_owner_store(options.clone(), hooks)
+            .await
+            .inspect_err(|_| open_timeline::end_stream())?;
         let prepared = async {
             let (listener, address) =
                 ServiceListener::bind(&options.data_dir, &options.project_scope)?;
@@ -1443,12 +1607,15 @@ impl ServiceOwner {
                     .await?;
             record.publish(&options.data_dir, &lock)?;
             open_timeline::stamp(open_timeline::Event::EndpointPublished);
+            // Before serving and before this open returns.
+            open_timeline::end_stream();
             Ok::<_, anyhow::Error>((listener, record))
         }
         .await;
         let (listener, record) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
+                open_timeline::end_stream();
                 // A failed listener or publication must still reap Dolt while
                 // this process retains its service-owner authority.
                 if let Some(publisher) = activity {
@@ -3136,6 +3303,81 @@ mod tests {
         Ok(())
     }
 
+    /// The Windows owner's explicit environment carries the timeline gate
+    /// only when the starter's own gate is set, which only exactly `1` is;
+    /// a test's layer overrides it in place, and no key is ever duplicated.
+    #[cfg(windows)]
+    #[test]
+    fn the_owner_environment_forwards_only_an_exact_gate() -> Result<()> {
+        use kuru_platform::windows::process::environment_key_eq;
+        let system = PathBuf::from(r"C:\Windows\System32");
+        let gate = |environment: &[(OsString, OsString)]| {
+            environment
+                .iter()
+                .filter(|(key, _)| environment_key_eq(key, OsStr::new(open_timeline::ENV)))
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+        };
+        let unique = |environment: &[(OsString, OsString)]| {
+            environment.iter().enumerate().all(|(index, (key, _))| {
+                environment[index + 1..]
+                    .iter()
+                    .all(|(other, _)| !environment_key_eq(key, other))
+            })
+        };
+        for (gated, expected) in [(true, vec![OsString::from("1")]), (false, Vec::new())] {
+            let environment = owner_environment(
+                system.clone(),
+                Some(OsString::from("profile-%p.profraw")),
+                open_timeline::with_gate_sync(gated, open_timeline::gate_set),
+                Vec::new(),
+            )?;
+            assert_eq!(gate(&environment), expected, "gated={gated}");
+            assert!(unique(&environment));
+            for key in ["SystemRoot", "WINDIR", "PATH", "LLVM_PROFILE_FILE"] {
+                assert!(
+                    environment
+                        .iter()
+                        .any(|(name, _)| environment_key_eq(name, OsStr::new(key))),
+                    "{key} missing"
+                );
+            }
+        }
+        // A test's own `0`, in any case, replaces a forwarded `1`; its `1`
+        // never duplicates it; the same hook from two layers stays single.
+        let hook = (
+            OsString::from("KURU_TEST_MEMORY_OPEN_HOLD_DIR"),
+            OsString::from(r"C:\holds"),
+        );
+        for (layer, expected) in [
+            (
+                vec![(OsString::from(open_timeline::ENV), OsString::from("0"))],
+                "0",
+            ),
+            (
+                vec![(OsString::from("kuru_open_timeline"), OsString::from("0"))],
+                "0",
+            ),
+            (
+                vec![(OsString::from(open_timeline::ENV), OsString::from("1"))],
+                "1",
+            ),
+        ] {
+            let environment = owner_environment(
+                system.clone(),
+                None,
+                true,
+                vec![vec![hook.clone()], layer, vec![hook.clone()]],
+            )?;
+            assert_eq!(gate(&environment), [OsString::from(expected)]);
+            assert!(unique(&environment));
+        }
+        // Duplicates within one layer are still refused, as the spawn would.
+        let duplicated = vec![vec![hook.clone(), hook]];
+        assert!(owner_environment(system, None, false, duplicated).is_err());
+        Ok(())
+    }
+
     /// The failure of a launched owner that stays alive without publishing
     /// an endpoint until the lowered startup bound expires in the readiness
     /// loop, with its parsed client phase split.
@@ -3503,10 +3745,6 @@ mod tests {
         Ok(())
     }
 
-    /// The test-support owner event hold's directory variable.
-    #[cfg(unix)]
-    const TIMELINE_HOLD_DIR_ENV: &str = "KURU_TEST_MEMORY_TIMELINE_HOLD_DIR";
-
     /// One owner event hold: `<event>.entered` and `<event>.release` fifos in
     /// the hold directory, each opened here read-write and non-blocking, so
     /// the owner's non-blocking opens find a peer and neither end reports a
@@ -3621,7 +3859,7 @@ mod tests {
         let environment = vec![
             (OsString::from(open_timeline::ENV), OsString::from("1")),
             (
-                OsString::from(TIMELINE_HOLD_DIR_ENV),
+                OsString::from(open_timeline::hold::DIR_ENV),
                 holds.clone().into_os_string(),
             ),
         ];

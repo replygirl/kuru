@@ -147,6 +147,7 @@ async fn provision_with_extractor_observed(
     // the stage before the lock is released (see `StageLease`).
     let lease = StageLease::new(PrivateTemp::new(".install-", Some(&versions))?, lock, asset);
     progress.report(MemoryOpenStage::ExtractingEmbeddedRuntime);
+    crate::open_timeline::stamp(crate::open_timeline::Event::ExtractStart);
     let candidate = lease.path().join("runtime");
     let candidate_path = candidate.clone();
     let (lease, extraction) = tokio::task::spawn_blocking(move || {
@@ -157,6 +158,7 @@ async fn provision_with_extractor_observed(
         (lease, result)
     })
     .await?;
+    crate::open_timeline::stamp(crate::open_timeline::Event::ExtractEnd);
     if let Err(error) = extraction {
         return Err(lease.discard_after(error));
     }

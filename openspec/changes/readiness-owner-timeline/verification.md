@@ -22,7 +22,7 @@ Authored 2026-10-02 before implementation; rows are ticked as evidence lands, wi
 
 ## 4. The supervisor deadline names its part
 
-- [ ] 4.1 @integration (agent) T5 Unix `supervisor_readiness_deadline_names_its_part` (a supervisor that never answers, paused clock) -> outer cause exact, inner names the Ready frame, child reaped
+- [ ] 4.1 @integration (agent) T5 Unix `supervisor_readiness_deadline_names_its_part` (a supervisor that never answers, real clock at the 1 ms timeout plus the 2 s transport allowance; see design D8a) -> outer cause exact, inner names the Ready frame, child reaped (no cleanup-failure context)
 - [ ] 4.2 @unit (agent) T5 pure `an_accept_timeout_at_the_deadline_is_the_accept_part` on every OS -> `TimedOut` at or after the deadline is the accept part; before it, or another kind, is not
 - [ ] 4.3 @regression (agent) T7 extended `startup_log_capture_is_opt_in_exact_and_bounded` -> a split supervisor error still gets the fixture log
 

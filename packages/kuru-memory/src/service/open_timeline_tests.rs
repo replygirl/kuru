@@ -8,6 +8,32 @@ use crate::test_support::{
     await_managed_quiescence, fixture_deadline, observed, warm_runtime_cache,
 };
 
+/// The owner environment that pins an owner ungated, whatever the runner's
+/// own environment holds: only exactly `1` enables the timeline.
+#[cfg(all(unix, feature = "test-support"))]
+fn ungated() -> Vec<(OsString, OsString)> {
+    vec![(OsString::from(open_timeline::ENV), OsString::from("0"))]
+}
+
+/// The stream file names in `services`, sorted; none when it is absent.
+#[cfg(all(unix, feature = "test-support"))]
+fn stream_names(services: &Path) -> Result<Vec<String>> {
+    let entries = match std::fs::read_dir(services) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if name.starts_with("open-stream-") {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 /// The timeline file names in `services`, sorted; none when it is absent.
 fn timeline_names(services: &Path) -> Result<Vec<String>> {
     let entries = match std::fs::read_dir(services) {
@@ -218,13 +244,17 @@ async fn a_gated_owner_writes_one_complete_record() -> Result<()> {
             &options,
             &project,
             &root.path().join("first.log"),
-            Vec::new(),
+            ungated(),
         )
         .await?;
         ensure!(timeline_names(&services)?.is_empty());
+        ensure!(stream_names(&services)?.is_empty());
         let gate = vec![(OsString::from("KURU_OPEN_TIMELINE"), OsString::from("1"))];
         let record =
             run_child_owner(&options, &project, &root.path().join("second.log"), gate).await?;
+        // Its stream was removed before it served.
+        let streams = stream_names(&services)?;
+        ensure!(streams.is_empty(), "{streams:?}");
         let authority = &record.authority;
         let names = timeline_names(&services)?;
         ensure!(
@@ -253,8 +283,27 @@ async fn a_gated_owner_writes_one_complete_record() -> Result<()> {
             .iter()
             .map(|entry| entry["event"].as_str().unwrap_or_default())
             .collect::<Vec<_>>();
-        let canonical = Event::ALL.map(Event::name);
-        ensure!(names == canonical, "{names:?}");
+        // An existing-store Unix open: one engine start, and no extraction,
+        // creation, migration or Windows channel accept.
+        let expected = Event::ALL
+            .into_iter()
+            .filter(|event| {
+                !matches!(
+                    event,
+                    Event::ExtractStart
+                        | Event::ExtractEnd
+                        | Event::CreateStart
+                        | Event::ChannelAccepted
+                        | Event::TemplateCopied
+                        | Event::ColdCreated
+                        | Event::Activated
+                        | Event::MigrateStart
+                        | Event::MigrateEnd
+                )
+            })
+            .map(Event::name)
+            .collect::<Vec<_>>();
+        ensure!(names == expected, "{names:?}");
         let offsets = events
             .iter()
             .map(|entry| entry["ns"].as_u64().context("an offset is not an integer"))
@@ -298,9 +347,11 @@ async fn an_ungated_owner_writes_no_record() -> Result<()> {
         let services = EndpointRecord::directory(&data, &scope)?;
         for run in ["first", "second"] {
             let log = root.path().join(format!("{run}.log"));
-            run_child_owner(&options, &project, &log, Vec::new()).await?;
+            run_child_owner(&options, &project, &log, ungated()).await?;
             let names = timeline_names(&services)?;
             ensure!(names.is_empty(), "{run} ungated owner wrote {names:?}");
+            let names = stream_names(&services)?;
+            ensure!(names.is_empty(), "{run} ungated owner streamed {names:?}");
         }
         await_managed_quiescence(&options).await
     })
