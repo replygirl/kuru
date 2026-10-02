@@ -956,7 +956,7 @@ impl Server {
     /// open then returns.
     pub(crate) fn mark_open_failing(&self, error: &anyhow::Error) {
         if let Some(ticks) = &self.0.ticks {
-            ticks.mark_failing(error);
+            ticks.mark_failing_with(redact_identity(format!("{error:#}"), &self.0.identity));
         }
     }
 
@@ -1330,6 +1330,16 @@ async fn finish_owner(owner: &mut Owner) -> Result<()> {
         let _ = observer.send(());
     }
     Ok(())
+}
+
+/// `text` without either connection secret of `identity`.
+fn redact_identity(text: String, identity: &Identity) -> String {
+    [&identity.password, &identity.reader_password]
+        .into_iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(text, |text, secret| {
+            text.replace(secret.as_str(), "[redacted]")
+        })
 }
 
 /// Reap a failed engine start. Every caller returns the error from the

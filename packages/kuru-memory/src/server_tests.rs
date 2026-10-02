@@ -856,3 +856,26 @@ async fn parent_close_during_selected_port_takeover_never_retries() -> Result<()
     assert!(!directory.join("endpoint.json").exists());
     Ok(())
 }
+
+// A failure reason recorded for a starter never carries either connection
+// secret of the store's identity.
+#[test]
+fn a_failure_reason_never_carries_a_connection_secret() {
+    let identity = Identity {
+        version: 1,
+        instance: Uuid::new_v4().to_string(),
+        project_scope: "project/redaction".into(),
+        password: secret(),
+        reader_password: secret(),
+        initialized: true,
+        template: None,
+    };
+    let text = format!(
+        "pool refused {} and {} twice: {}",
+        identity.password, identity.reader_password, identity.password
+    );
+    assert_eq!(
+        redact_identity(text, &identity),
+        "pool refused [redacted] and [redacted] twice: [redacted]"
+    );
+}

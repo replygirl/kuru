@@ -158,7 +158,12 @@ impl OpenTicks {
     /// closes the engine it started and returns that error. The first mark
     /// stands: a later failure in the same close is not the cause.
     pub(crate) fn mark_failing(&self, error: &anyhow::Error) {
-        let reason: Arc<str> = Arc::from(format!("{error:#}"));
+        self.mark_failing_with(format!("{error:#}"));
+    }
+
+    /// `mark_failing` with an already formatted reason.
+    pub(crate) fn mark_failing_with(&self, reason: String) {
+        let reason: Arc<str> = Arc::from(reason);
         self.0.send_if_modified(|advance| {
             if advance.failure.is_some() {
                 return false;
