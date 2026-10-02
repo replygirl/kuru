@@ -192,7 +192,7 @@ async fn iteration(store: &MemoryStore, variant: Variant, index: usize) -> Resul
     let target = candidate.view().revision().await?;
     transition_candidate(store, &names.open, &names.promoting, &target).await?;
     let mut held = if variant == Variant::DeleteTight {
-        Some(owned_connection(&store.pool).await?.0)
+        Some(owned_connection(&store.pool, write_deadline()).await?.0)
     } else {
         None
     };
@@ -211,7 +211,7 @@ async fn iteration(store: &MemoryStore, variant: Variant, index: usize) -> Resul
         }
         Variant::DeleteProduct => {
             candidate_heads(&store.pool, &names).await?;
-            let (mut connection, _) = owned_connection(&store.pool).await?;
+            let (mut connection, _) = owned_connection(&store.pool, write_deadline()).await?;
             let probe = checked_delete(&mut connection, &names.promoting).await;
             drop(connection);
             (probe, Some(linger(store, &names.promoting, zero).await?))

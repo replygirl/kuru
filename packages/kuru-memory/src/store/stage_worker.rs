@@ -151,7 +151,7 @@ impl ValidationProbe {
     async fn before_cold_stage_validation(&self, stage: &Path, pool: &MemoryPool) -> Result<()> {
         self.validating(stage);
         if self.dirty_cold_stage {
-            tokio::time::timeout(
+            crate::pool::within(
                 QUERY_TIMEOUT,
                 sqlx::query("CREATE TABLE uncommitted_fixture (id INT PRIMARY KEY)").execute(pool),
             )
@@ -330,7 +330,7 @@ where
                 .await?;
             #[cfg(test)]
             super::creation_template::hooks::after_shape(&pool).await?;
-            let hostname: String = tokio::time::timeout(
+            let hostname: String = crate::pool::within(
                 QUERY_TIMEOUT,
                 sqlx::query_scalar("SELECT @@hostname").fetch_one(pool.as_ref()),
             )

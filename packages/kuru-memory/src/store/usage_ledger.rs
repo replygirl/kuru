@@ -369,7 +369,14 @@ impl UsageLedger {
     async fn change(&self, change: Change) -> Result<()> {
         self.store.writable()?;
         let guard = self.store.shared.write.clone().lock_owned().await;
-        self.store.resolve_uncertain().await?;
+        // One write budget, taken once this write holds the write lock and
+        // before its first pool acquisition, bounds the reconciliation read
+        // before its pending record, its acquisition, the write and its
+        // session's return.
+        let deadline = write_deadline();
+        crate::pool::within_until(deadline, self.store.resolve_uncertain())
+            .await
+            .context("usage ledger write deadline exceeded")??;
         // Read only after reconciliation, which may have re-derived it.
         let validated = self
             .store
@@ -383,15 +390,13 @@ impl UsageLedger {
         tokio::spawn(async move {
             let _guard = guard;
             let operation = Uuid::new_v4().to_string();
-            let (mut connection, id) = write_session(&store.pool).await?;
+            let (mut connection, id) = write_session(&store.pool, deadline).await?;
             *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: store.pool.clone(),
                 connection: id,
                 receipt: Receipt::UsageOperation(operation.clone()),
             });
-            // One budget bounds the write and its session's return.
-            let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
-            let result = tokio::time::timeout_at(
+            let result = crate::pool::within_until(
                 deadline,
                 apply_change(&mut connection, &operation, &validated, change),
             )
@@ -455,7 +460,7 @@ pub(super) async fn establish(store: &MemoryStore) -> Result<()> {
     store.writable()?;
     let _guard = store.shared.write.lock().await;
     store.resolve_uncertain().await?;
-    let exists: Vec<String> = tokio::time::timeout(
+    let exists: Vec<String> = crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT name FROM dolt_branches WHERE BINARY name = BINARY ? LIMIT 2")
             .bind(BRANCH)
@@ -469,7 +474,7 @@ pub(super) async fn establish(store: &MemoryStore) -> Result<()> {
     );
     if exists.is_empty() {
         let base = revision(&store.pool).await?;
-        tokio::time::timeout(
+        crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query("CALL DOLT_BRANCH(?, ?)")
                 .bind(BRANCH)
@@ -580,7 +585,7 @@ pub(super) async fn live_state_hash(pool: &MemoryPool) -> Result<String> {
 /// The branch's working set, schema history and old receipts: flat checks
 /// that stay on every open.
 async fn validate_branch_state(pool: &MemoryPool) -> Result<()> {
-    let dirty: i64 = tokio::time::timeout(
+    let dirty: i64 = crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status").fetch_one(pool),
     )
@@ -589,7 +594,7 @@ async fn validate_branch_state(pool: &MemoryPool) -> Result<()> {
     ensure!(dirty == 0, "usage ledger branch has uncommitted changes");
     let version = migrations::validate_historical(pool).await?;
     if version <= 3 {
-        let old_receipts: Vec<(String, String)> = tokio::time::timeout(
+        let old_receipts: Vec<(String, String)> = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_as("SELECT id, label FROM operations LIMIT 2").fetch_all(pool),
         )
@@ -633,7 +638,7 @@ async fn validate_owned_rows(pool: &MemoryPool, expected: &str) -> Result<u64> {
 /// Whether any owned row exists: one primary-key range probe.
 async fn any_owned(pool: &MemoryPool) -> Result<bool> {
     let owned = KeyRange::prefix(OWNED_PREFIX)?;
-    Ok(tokio::time::timeout(
+    Ok(crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query(RANGE_ANY)
             .bind(owned.start.as_slice())
@@ -655,7 +660,8 @@ async fn record_validation(
     pool: &Arc<MemoryPool>,
     check: &BoundCheck,
 ) -> Result<()> {
-    let (mut connection, id) = owned_connection(pool).await?;
+    let deadline = write_deadline();
+    let (mut connection, id) = owned_connection(pool, deadline).await?;
     *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
         pool: pool.clone(),
         connection: id,
@@ -664,7 +670,7 @@ async fn record_validation(
             state_hash: check.state_hash.clone(),
         },
     });
-    let result = tokio::time::timeout(QUERY_TIMEOUT, async {
+    let result = crate::pool::within_until(deadline, async {
         let mut transaction = connection.begin().await?;
         let head: String = sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')")
             .fetch_one(&mut *transaction)
@@ -773,7 +779,7 @@ fn state_hash_valid(hash: &str) -> bool {
 async fn state_hash<'e>(
     executor: impl sqlx::Executor<'e, Database = sqlx::MySql>,
 ) -> Result<String> {
-    let hash: String = tokio::time::timeout(
+    let hash: String = crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT DOLT_HASHOF_TABLE('state')").fetch_one(executor),
     )
@@ -803,7 +809,7 @@ async fn bound_check(pool: &MemoryPool) -> Result<BoundCheck> {
     // below is what makes the first row HEAD's message. The message is
     // truncated past the record limit so a foreign message cannot grow the
     // read, and parse_record then refuses it as oversize.
-    let (logged, message): (String, String) = tokio::time::timeout(
+    let (logged, message): (String, String) = crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_as("SELECT commit_hash, LEFT(message, ?) FROM dolt_log LIMIT 1")
             .bind(i64::try_from(RECORD_MESSAGE_MAX + 1).unwrap_or(i64::MAX))
@@ -838,7 +844,7 @@ pub(super) async fn validation_committed(
     if check.head == base_head || !check.bound || check.state_hash != state_hash {
         return Ok(false);
     }
-    let parents: Vec<String> = tokio::time::timeout(
+    let parents: Vec<String> = crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_scalar(
             "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? ORDER BY parent_index LIMIT 2",
@@ -857,7 +863,7 @@ pub(super) async fn validation_committed(
 /// validated, keeps the ledger writable; anything else refuses writes until a
 /// reopen.
 pub(super) async fn rederive_validated(shared: &Shared, pool: &MemoryPool) -> Result<()> {
-    let dirty: i64 = tokio::time::timeout(
+    let dirty: i64 = crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status").fetch_one(pool),
     )
@@ -1155,7 +1161,7 @@ async fn put_state_tx<T: Serialize>(
 }
 
 async fn read_marker(pool: &MemoryPool, session_id: &str) -> Result<Option<SessionMarker>> {
-    let value: Option<String> = tokio::time::timeout(
+    let value: Option<String> = crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
             .bind(session_key(session_id).as_bytes())
@@ -1209,7 +1215,7 @@ async fn session_has_records_tx(
 }
 
 async fn read_state(pool: &MemoryPool, key: &str) -> Result<Option<String>> {
-    tokio::time::timeout(
+    crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
             .bind(key.as_bytes())
@@ -1286,7 +1292,7 @@ async fn session_index_page(
     index: &KeyRange,
     after: Option<&[u8]>,
 ) -> Result<Vec<(Vec<u8>, String)>> {
-    tokio::time::timeout(QUERY_TIMEOUT, range_page(pool, index, after))
+    crate::pool::within(QUERY_TIMEOUT, range_page(pool, index, after))
         .await
         .context("usage ledger session index deadline exceeded")?
         .map_err(Into::into)
@@ -1297,7 +1303,7 @@ async fn owned_state_page(
     owned: &KeyRange,
     after: Option<&[u8]>,
 ) -> Result<Vec<(Vec<u8>, String)>> {
-    tokio::time::timeout(QUERY_TIMEOUT, range_page(pool, owned, after))
+    crate::pool::within(QUERY_TIMEOUT, range_page(pool, owned, after))
         .await
         .context("usage ledger state validation deadline exceeded")?
         .map_err(Into::into)
@@ -2010,7 +2016,7 @@ mod tests {
         let start = start("resumed", "invocation-1");
         let operation = Uuid::new_v4().to_string();
         let before = validated(&store).context("open validated nothing")?;
-        let (mut connection, id) = owned_connection(&ledger.store.pool).await?;
+        let (mut connection, id) = owned_connection(&ledger.store.pool, write_deadline()).await?;
         let produced = apply_change(
             &mut connection,
             &operation,
@@ -2045,7 +2051,7 @@ mod tests {
         let ledger = store.usage_ledger()?;
         let before = validated(&store).context("open validated nothing")?;
         let operation = Uuid::new_v4().to_string();
-        let (mut connection, id) = owned_connection(&ledger.store.pool).await?;
+        let (mut connection, id) = owned_connection(&ledger.store.pool, write_deadline()).await?;
         {
             let mut transaction = connection.begin().await?;
             put_state_tx(
@@ -3446,7 +3452,7 @@ mod tests {
         // A value the scan would refuse (a marker under another session's
         // key) is refused inside the write transaction, before its INSERT.
         let head = revision(pool.as_ref()).await?;
-        let (mut connection, _) = owned_connection(&pool).await?;
+        let (mut connection, _) = owned_connection(&pool, write_deadline()).await?;
         let mut transaction = connection.begin().await?;
         let refused = put_state_tx(
             &mut transaction,
@@ -4025,7 +4031,7 @@ mod tests {
             state_hash: live.clone(),
         };
         let finished = || async {
-            let (_, id) = owned_connection(&pool).await?;
+            let (_, id) = owned_connection(&pool, write_deadline()).await?;
             Ok::<_, anyhow::Error>(id)
         };
 

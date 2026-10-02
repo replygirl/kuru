@@ -1638,21 +1638,101 @@ Every store pool is a `MemoryPool` (`packages/kuru-memory/src/pool.rs`). Each
 statement returns its connection to the pool before its future completes, so
 sequential work reuses one authenticated session. A receipt-bearing write
 returns its session only after a receipted success; any other outcome ends the
-session before the uncertain-write fence reconciles it. The return is bounded
-by what remains of the write's own budget (`QUERY_TIMEOUT`): a return that
-outlasts it is abandoned, SQLx closes the connection, and the receipted write
-still succeeds. A new pool's first connection returns within that pool
-attempt's deadline in the same way. A new connection still runs TCP, MySQL
-authentication and the identity callback inside the pool's ordinary acquire
-window (`ORDINARY_POOL_WINDOW`, 2 s).
+session before the uncertain-write fence reconciles it. A new connection runs
+TCP, MySQL authentication and the identity callback inside the acquisition
+that opens it.
 
-An acquisition that reaches that window fails with a `PoolAcquireTimedOut`
+### Bounds
+
+Once memory is open, an acquisition is bounded by the remaining budget of the
+statement or operation it serves, never by a shorter window of its own:
+
+- **Statement budget.** Memory statement and operation budgets run in a
+  budget scope, `pool::within(budget, work)` or
+  `pool::within_until(deadline, work)`, which behave like
+  `tokio::time::timeout` and `timeout_at`. A nested scope ends at the
+  earliest enclosing deadline. The pool funnel registers its pending
+  acquisition with the enclosing scope, so a budget that runs out while the
+  acquisition waits is reported as that acquisition's timeout.
+- **Pool ceiling.** Every store pool's lifetime SQLx `acquire_timeout` is
+  `QUERY_TIMEOUT` (30 s), the memory statement budget. It decides only an
+  acquisition outside any scope, or one whose scope deadline falls on the same
+  timer tick; nothing is set above the budget it serves.
+- **Write budget.** A receipt-bearing write takes one deadline,
+  `QUERY_TIMEOUT`, before its pool acquisition and spends it on the
+  acquisition, the `CONNECTION_ID()` identity statement, any validation
+  before its pending record (a session fork's source traversal), the write
+  and the session's return, so these end within one `QUERY_TIMEOUT` from
+  before the acquisition. A store mutation, a session catalog write, a
+  candidate creation and a usage ledger change take that deadline as soon as
+  they hold the store's write lock, so it also covers every read before their
+  pending record (reconciling an earlier uncertain write, the schema check, a
+  logical receipt's match and its recorded outcome, a candidate creation's
+  ref and base reads) and, for a candidate creation, the new branch's pool
+  creation. A candidate promotion merge, status transition, deletion and
+  session exclusion, and the usage ledger's validation record, take their
+  deadline at their acquisition; their earlier reads (promotion's
+  reconciliation, ref, revision and working-set reads, session retirement,
+  the validation record's bound check) keep their own statement budgets. A
+  contended acquisition therefore uses write time: a write that then runs out
+  after its pending record is an uncertain write, reconciled by the existing
+  fence. An acquisition that fails returns before any statement and before
+  the pending record, so it never makes a write uncertain.
+
+  The client waits `OPERATION_TIMEOUT` (35 s, `QUERY_TIMEOUT` plus
+  `REPLY_MARGIN` in `service/rpc.rs`) for a reply. A write's own budget fits
+  that wait, but a service write as a whole is not bounded by it: the wait
+  for the write lock (the previous write's end), the earlier reads of the
+  writers that take their deadline at the acquisition, reconciliation after
+  a write that ends without its receipt (the fence's own path), and candidate
+  promotion, abandonment and cleanup, which run session retirement, pool
+  retirement and several writes, each under its own write budget, all add to
+  it. Past the client's wait, the outcome query (see
+  [memory service protocol](#memory-service-protocol)) and the uncertain-write
+  fence recover the write's outcome.
+- **Creation budget.** A pool created after memory is open (a candidate's or
+  other branch's pool) runs its first acquisition, its first connection's
+  return and identity verification under one `QUERY_TIMEOUT` budget, nested
+  in any enclosing scope. If that budget runs out, creation fails with
+  `memory branch pool creation budget elapsed` and no pool is retained;
+  nothing is retried. `Server::pool` holds the server's pool map while it
+  creates a pool, so a stalled creation delays other `Server::pool` calls for
+  up to that budget.
+- **Read transactions.** `MemoryPool::begin` runs its acquisition and `BEGIN`
+  under one `QUERY_TIMEOUT` scope; each statement in the transaction keeps its
+  own budget.
+- **Opening.** While memory is opening, a pool's first acquisition keeps the
+  bound derived from the startup budget (`startup_timeout_secs`), never less
+  than `OPENING_POOL_FLOOR` (2 s), with its first-connection release cut and
+  retry. With the 30 s ceiling, that retry is reachable only when
+  `startup_timeout_secs` exceeds 30. The attach probe and its identity check
+  keep their 2 s.
+
+Use `pool::within`/`within_until` for memory statement and operation
+budgets in `packages/kuru-memory`, not `tokio::time::timeout`, so an expiry
+during an acquisition is typed. A tokio timeout still cancels the work at its
+deadline, but the funnel cannot see it, so its expiry carries no cause. These
+stay tokio timeouts: service IPC frame timeouts, the outcome probe
+(`PROBE_BUDGET`, 2 s, positive evidence only) and the four guarded outcome
+reads in `service/rpc.rs` (their expiry is answered as still uncertain without
+its cause), the `DREAM_LEASE_WAIT` lease waits in `facade.rs`, pool closes
+(`CLOSE_GRACE` and the migration pool closes) and process or supervisor
+timeouts. A scope is task-local: work moved into `tokio::spawn`, or a stream
+polled after its scope ended, falls back to the pool ceiling.
+
+### Diagnostics
+
+An acquisition that reaches its bound fails with a `PoolAcquireTimedOut`
 diagnostic instead of SQLx's bare `pool timed out while waiting for an open
-connection`, for example:
+connection`. It names the bound that ended the wait, that budget and what was
+left of it when the acquisition began, for example:
 
 ```text
-memory pool acquire on kuru/main timed out after 2.004 s (window 2.000 s) waiting for a new connection in Kuru's identity callback (connection phase: data directory query); pool size 1 of 4, 0 idle, 1 checked out; 3 connections authenticated since the pool opened, 1 during this wait
+memory pool acquire on kuru/main timed out after 0.501 s (statement budget 0.500 s, 0.500 s left when the acquire began) waiting for a connection held by Kuru work (every permit held); pool size 4 of 4, 0 idle, 4 checked out; 4 connections authenticated since the pool opened, 0 during this wait
 ```
+
+With the pool ceiling as the bound the parenthesis reads
+`(pool ceiling 30.000 s)`.
 
 The connection counts are of connections that entered Kuru's identity
 callback, which runs after TCP and MySQL authentication have finished. A
@@ -1674,13 +1754,49 @@ investigate:
   first point at which it observes a new connection. No phase is printed,
   because the pool's latest phase would be stale.
 
-The diagnostic contains no SQL text, credentials, endpoints or paths. Through
-the pool's own `acquire` it is context over SQLx's `PoolTimedOut`; through a
-statement it is a `sqlx::Error::Io` of kind `Other`, so it reads
-`error communicating with database: memory pool acquire ...`. Use
-`kuru_memory::pool::pool_acquire_timeout` to find it in an error chain. The
-pool also logs each timeout as a `memory pool acquire timed out` warning with
-the same fields.
+The diagnostic contains no SQL text, credentials, endpoints or paths. Where it
+appears in an error chain:
+
+- **Statement budget.** A `pool::BudgetElapsed` (`memory statement budget of
+  0.500 s elapsed while acquiring a pool session`) whose source is the
+  diagnostic. SQLx did not time out, so its `PoolTimedOut` is not in the
+  chain.
+- **Pool ceiling, through the pool's own `acquire`.** Context over SQLx's
+  `PoolTimedOut`.
+- **Pool ceiling, through a statement.** A `sqlx::Error::Io` of kind `Other`,
+  which reads `error communicating with database: memory pool acquire ...`.
+- **Budget elapsed during execution.** A `BudgetElapsed` with no source
+  (`memory statement budget of 30.000 s elapsed`). It is not an acquisition
+  timeout, and `pool_acquire_timeout` returns `None` for it.
+
+Use `kuru_memory::pool::pool_acquire_timeout` to find the diagnostic in an
+error chain. Callers keep their own context strings, such as `memory read
+deadline exceeded`.
+
+The pool logs each timeout as a `memory pool acquire timed out` warning with
+the same fields. An acquisition still pending after
+`SLOW_ACQUIRE_THRESHOLD` (2 s) logs one `memory pool acquire still waiting`
+warning with the same fields plus the remaining budget and the number of
+pending acquisitions, and one that then succeeds logs `memory pool acquire
+completed slowly` with its wait. The threshold only logs; it never ends an
+acquisition. A post-open pool creation acquires on the raw SQLx pool before a
+`MemoryPool` exists, so it leaves no slow record; it fails with its connection
+phase or as its creation budget's `BudgetElapsed`.
+
+### Identity rejection and failed connects
+
+An authored identity rejection (data directory or project/instance mismatch)
+ends the acquisition at once with its cause, never as a timeout, in pool
+creation and on a retained pool. It is sticky: every later acquisition on that
+pool fails with the same cause, including one that would have reused an idle
+session, until the store is reopened. The same endpoint cannot answer
+differently, and a new pool still authenticates every new connection.
+
+SQLx retries other connection failures inside one acquisition until its
+bound, with backoff capped at a fifth of the time left: a refused TCP connect
+(for example, an engine that is gone) or a non-identity callback error. With
+a 30 s bound, such a terminal fault is reported as the acquisition's timeout
+at its bound rather than after 2 s.
 
 ## Memory service protocol
 

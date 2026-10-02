@@ -1229,7 +1229,9 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
 async fn live_original_session_blocks_receipt_reconciliation_even_after_commit() {
     let store = MemoryStore::temporary().await.unwrap();
     let operation = Uuid::new_v4().to_string();
-    let (mut connection, id) = owned_connection(&store.pool).await.unwrap();
+    let (mut connection, id) = owned_connection(&store.pool, write_deadline())
+        .await
+        .unwrap();
     apply(
         &mut connection,
         &operation,
@@ -1277,7 +1279,9 @@ async fn dropped_uncommitted_session_resolves_absent_receipt_only_after_teardown
     let store = MemoryStore::temporary().await.unwrap();
     let revision = store.revision().await.unwrap();
     let operation = Uuid::new_v4().to_string();
-    let (mut connection, id) = owned_connection(&store.pool).await.unwrap();
+    let (mut connection, id) = owned_connection(&store.pool, write_deadline())
+        .await
+        .unwrap();
     sqlx::query("START TRANSACTION")
         .execute(&mut connection)
         .await
@@ -1314,7 +1318,9 @@ async fn dropped_uncommitted_session_resolves_absent_receipt_only_after_teardown
 #[tokio::test]
 async fn in_flight_disconnect_waits_for_real_query_and_session_teardown() -> Result<()> {
     let store = MemoryStore::temporary().await.unwrap();
-    let (mut connection, id) = owned_connection(&store.pool).await.unwrap();
+    let (mut connection, id) = owned_connection(&store.pool, write_deadline())
+        .await
+        .unwrap();
     let running = tokio::spawn(async move {
         let _ = sqlx::query("SELECT SLEEP(5)")
             .execute(&mut connection)
@@ -1556,7 +1562,9 @@ async fn promotion_receipt_keeps_base_target_and_refuses_divergent_history() {
     let candidate = store.begin_candidate("receipt barrier").await.unwrap();
     candidate.view().put("candidate", &json!(1)).await.unwrap();
     let target = candidate.view().revision().await.unwrap();
-    let (connection, id) = owned_connection(&store.pool).await.unwrap();
+    let (connection, id) = owned_connection(&store.pool, write_deadline())
+        .await
+        .unwrap();
     *store.shared.uncertain.lock().unwrap() = Some(Pending {
         pool: store.pool.clone(),
         connection: id,
@@ -2205,7 +2213,9 @@ async fn manual_dolt_commit_atomically_publishes_ddl_version_and_receipt() {
     let source_history = history_at_head(store.pool.as_ref(), SCHEMA_BOUNDARY_NAMESPACE).await;
     let candidate = preserved_candidate(&store).await;
     let receipt = Uuid::new_v4().to_string();
-    let (mut connection, id) = owned_connection(&store.pool).await.unwrap();
+    let (mut connection, id) = owned_connection(&store.pool, write_deadline())
+        .await
+        .unwrap();
     staged_schema_transaction(&mut connection, &receipt, true)
         .await
         .unwrap();
@@ -2228,7 +2238,9 @@ async fn dropping_precommit_ddl_session_retains_dirty_working_ddl_outside_head()
     let source_history = history_at_head(store.pool.as_ref(), SCHEMA_BOUNDARY_NAMESPACE).await;
     let candidate = preserved_candidate(&store).await;
     let receipt = Uuid::new_v4().to_string();
-    let (mut connection, id) = owned_connection(&store.pool).await.unwrap();
+    let (mut connection, id) = owned_connection(&store.pool, write_deadline())
+        .await
+        .unwrap();
     staged_schema_transaction(&mut connection, &receipt, false)
         .await
         .unwrap();
@@ -2441,7 +2453,9 @@ async fn lost_manual_dolt_commit_reply_reconciles_one_clean_schema_commit() {
     )
     .await;
     let affected = proxy.view(&store).await;
-    let (mut connection, id) = owned_connection(&affected.pool).await.unwrap();
+    let (mut connection, id) = owned_connection(&affected.pool, write_deadline())
+        .await
+        .unwrap();
     let error = staged_schema_transaction(&mut connection, &receipt, true)
         .await
         .unwrap_err();
@@ -3098,7 +3112,9 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
     let failed = exact_base_schema_branch(&store).await;
     assert_eq!(failed.base, base);
     let failed_receipt = Uuid::new_v4().to_string();
-    let (mut failed_connection, failed_id) = owned_connection(&failed.view.pool).await.unwrap();
+    let (mut failed_connection, failed_id) = owned_connection(&failed.view.pool, write_deadline())
+        .await
+        .unwrap();
     staged_schema_transaction(&mut failed_connection, &failed_receipt, false)
         .await
         .unwrap();
@@ -3126,7 +3142,9 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
     let fresh = exact_base_schema_branch(&store).await;
     assert_eq!(fresh.base, base);
     let receipt = Uuid::new_v4().to_string();
-    let (mut fresh_connection, fresh_id) = owned_connection(&fresh.view.pool).await.unwrap();
+    let (mut fresh_connection, fresh_id) = owned_connection(&fresh.view.pool, write_deadline())
+        .await
+        .unwrap();
     staged_schema_transaction(&mut fresh_connection, &receipt, true)
         .await
         .unwrap();
@@ -3160,7 +3178,9 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
     )
     .await;
     let affected = proxy.view(&store).await;
-    let (mut merge_connection, merge_id) = owned_connection(&affected.pool).await.unwrap();
+    let (mut merge_connection, merge_id) = owned_connection(&affected.pool, write_deadline())
+        .await
+        .unwrap();
     *affected.shared.uncertain.lock().unwrap() = Some(Pending {
         pool: affected.pool.clone(),
         connection: merge_id,

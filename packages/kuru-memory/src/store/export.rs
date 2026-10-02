@@ -327,7 +327,7 @@ async fn count(pool: &MemoryPool, table: &'static str) -> Result<u64> {
         "session_public_turns" => "SELECT COUNT(*) FROM session_public_turns",
         _ => unreachable!("export registry is fixed"),
     };
-    let count: i64 = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query_scalar(query).fetch_one(pool))
+    let count: i64 = crate::pool::within(QUERY_TIMEOUT, sqlx::query_scalar(query).fetch_one(pool))
         .await
         .context("export count deadline exceeded")??;
     u64::try_from(count).context("export count is negative")
@@ -349,7 +349,7 @@ async fn messages(
             } else {
                 "SELECT sequence, namespace, role, content FROM messages WHERE sequence > ? ORDER BY sequence LIMIT ?"
             };
-            tokio::time::timeout(
+            crate::pool::within(
                 QUERY_TIMEOUT,
                 sqlx::query(query)
                 .bind(after)
@@ -366,7 +366,7 @@ async fn messages(
             } else {
                 "SELECT sequence, namespace, role, content FROM messages ORDER BY sequence LIMIT ?"
             };
-            tokio::time::timeout(
+            crate::pool::within(
                 QUERY_TIMEOUT,
                 sqlx::query(query)
                 .bind(PAGE_SIZE)
@@ -412,7 +412,7 @@ async fn messages(
 async fn state(pool: &MemoryPool, after: Option<Vec<u8>>) -> Result<Vec<StorageRecord>> {
     let rows = match after {
         Some(after) => {
-            tokio::time::timeout(
+            crate::pool::within(
                 QUERY_TIMEOUT,
                 sqlx::query(
                     "SELECT `key`, value FROM state WHERE `key` > ? ORDER BY `key` LIMIT ?",
@@ -424,7 +424,7 @@ async fn state(pool: &MemoryPool, after: Option<Vec<u8>>) -> Result<Vec<StorageR
             .await
         }
         None => {
-            tokio::time::timeout(
+            crate::pool::within(
                 QUERY_TIMEOUT,
                 sqlx::query("SELECT `key`, value FROM state ORDER BY `key` LIMIT ?")
                     .bind(PAGE_SIZE)
@@ -468,7 +468,7 @@ async fn context_summaries(
             .bind(PAGE_SIZE)
             .fetch_all(pool),
     };
-    let rows = tokio::time::timeout(QUERY_TIMEOUT, rows)
+    let rows = crate::pool::within(QUERY_TIMEOUT, rows)
         .await
         .context("export context summary page deadline exceeded")??;
     rows.into_iter()
@@ -540,7 +540,7 @@ async fn context_cursors(
                 .fetch_all(pool)
         }
     };
-    let rows = tokio::time::timeout(QUERY_TIMEOUT, rows)
+    let rows = crate::pool::within(QUERY_TIMEOUT, rows)
         .await
         .context("export context cursor page deadline exceeded")??;
     rows.into_iter()
@@ -574,7 +574,7 @@ async fn session_catalog(pool: &MemoryPool, after: Option<Vec<u8>>) -> Result<Ve
             .bind(PAGE_SIZE)
             .fetch_all(pool),
     };
-    tokio::time::timeout(QUERY_TIMEOUT, rows)
+    crate::pool::within(QUERY_TIMEOUT, rows)
         .await
         .context("export session catalog page deadline exceeded")??
         .into_iter()
@@ -596,7 +596,7 @@ async fn public_turns(pool: &MemoryPool, after: Option<String>) -> Result<Vec<St
             .bind(PAGE_SIZE)
             .fetch_all(pool),
     };
-    tokio::time::timeout(QUERY_TIMEOUT, rows)
+    crate::pool::within(QUERY_TIMEOUT, rows)
         .await
         .context("export public turn page deadline exceeded")??
         .into_iter()

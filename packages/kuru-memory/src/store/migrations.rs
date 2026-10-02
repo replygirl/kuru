@@ -341,10 +341,18 @@ async fn routed_pool(
     }
 }
 
+/// A migration command connection's budget: its acquisition and identity
+/// statement share one `QUERY_TIMEOUT`. Each migration statement keeps its
+/// own [`bounded_query`] budget, so a fixture pause between them is not
+/// charged to the connection.
+fn connection_deadline() -> tokio::time::Instant {
+    super::write_deadline()
+}
+
 async fn bounded_query<T>(
     query: impl std::future::Future<Output = std::result::Result<T, sqlx::Error>>,
 ) -> Result<T> {
-    tokio::time::timeout(QUERY_TIMEOUT, query)
+    crate::pool::within(QUERY_TIMEOUT, query)
         .await
         .context("Dolt migration query deadline exceeded")?
         .map_err(Into::into)
@@ -744,7 +752,7 @@ async fn validate_supported_with(registry: Registry, pool: &MemoryPool) -> Resul
 /// runs on one session so the same checks can run on a detached connection
 /// whose database was switched to a revision (see `RevisionReader`).
 async fn acquire(pool: &MemoryPool) -> Result<PooledSession> {
-    tokio::time::timeout(QUERY_TIMEOUT, pool.acquire())
+    crate::pool::within(QUERY_TIMEOUT, pool.acquire())
         .await
         .context("Dolt migration query deadline exceeded")?
 }
@@ -2510,7 +2518,8 @@ async fn discover_current_attempt_in(
     hooks.describe(MigrationBoundary::BeforeBranch, &branch, None);
     let routed = routed_pool(main, hooks, MigrationBoundary::BeforeBranch).await?;
     let command_pool = routed.as_ref().unwrap_or(main);
-    let (mut connection, connection_id) = super::owned_connection(command_pool).await?;
+    let (mut connection, connection_id) =
+        super::owned_connection(command_pool, connection_deadline()).await?;
     let created = async {
         hooks.reach(MigrationBoundary::BeforeBranch).await?;
         bounded_query(
@@ -2641,7 +2650,7 @@ async fn build_attempt(
     };
     let routed = routed_pool(pool, hooks, MigrationBoundary::BeforeCommit).await?;
     let command_pool = routed.as_ref().unwrap_or(pool);
-    let (mut connection, id) = super::owned_connection(command_pool).await?;
+    let (mut connection, id) = super::owned_connection(command_pool, connection_deadline()).await?;
     let result = async {
         for statement in definition.sql {
             bounded_query(sqlx::query(*statement).execute(&mut connection)).await?;
@@ -2926,7 +2935,7 @@ async fn publish(
     hooks.describe(MigrationBoundary::BeforePublish, branch, Some(target));
     let routed = routed_pool(main, hooks, MigrationBoundary::BeforePublish).await?;
     let command_pool = routed.as_ref().unwrap_or(main);
-    let (mut connection, id) = super::owned_connection(command_pool).await?;
+    let (mut connection, id) = super::owned_connection(command_pool, connection_deadline()).await?;
     let result = async {
         hooks.reach(MigrationBoundary::BeforePublish).await?;
         bounded_query(

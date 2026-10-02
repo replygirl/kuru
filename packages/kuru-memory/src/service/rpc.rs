@@ -696,15 +696,29 @@ impl AttachmentState {
 
 const COMPLETED_RECEIPT_WINDOW: usize = 4096;
 
-/// What the operation budget already allows beyond one guarded SQL read: the
-/// time an outcome handler keeps for writing its reply.
+/// What the operation budget allows beyond one memory statement budget
+/// (`QUERY_TIMEOUT`): the time an outcome handler keeps for writing its
+/// reply. A receipt-bearing write's own work fits the same arithmetic: one
+/// write budget, taken before its pool acquisition, bounds the acquisition,
+/// its identity statement, any validation before its pending record, the
+/// write and its session's return within `QUERY_TIMEOUT`, leaving this margin
+/// of the client's `OPERATION_TIMEOUT`. A store mutation, session catalog
+/// write, candidate creation and usage ledger change take it once they hold
+/// the write lock, so it also covers their reads before the pending record.
+/// The write-lock wait, the earlier reads of writers that take their budget
+/// at the acquisition (candidate promotion, transition, deletion, exclusion),
+/// reconciliation after a write that ends without its receipt and multi-write
+/// candidate operations are outside it, so a service write as a whole is not
+/// bounded by `OPERATION_TIMEOUT`; past it, the outcome query and the
+/// uncertain-write fence recover the outcome.
 const REPLY_MARGIN: std::time::Duration =
     OPERATION_TIMEOUT.saturating_sub(crate::store::QUERY_TIMEOUT);
 /// An outcome handler answers within this budget from its entry, so its reply
 /// fits the client's `OPERATION_TIMEOUT` from sending the request.
 const HANDLER_BUDGET: std::time::Duration = OPERATION_TIMEOUT.saturating_sub(REPLY_MARGIN);
-/// One lock-free probe: a pool acquire and one point read.
-const PROBE_BUDGET: std::time::Duration = crate::server::ORDINARY_POOL_WINDOW;
+/// One lock-free probe: a pool acquire and one point read. Positive evidence
+/// only: a probe that does not finish within it answers nothing.
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 const _: () =
     assert!(HANDLER_BUDGET.as_nanos() > REPLY_MARGIN.as_nanos() + PROBE_BUDGET.as_nanos());
 

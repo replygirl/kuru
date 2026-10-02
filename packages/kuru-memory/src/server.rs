@@ -47,14 +47,17 @@ use tokio::sync::oneshot;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Notify, OwnedMutexGuard},
+    sync::{Mutex, OwnedMutexGuard},
     time::{Instant, sleep, timeout, timeout_at},
 };
 use uuid::Uuid;
 
-/// Ordinary per-attempt window for authenticating a pool and for its identity
-/// query once memory is open. An opening server never uses less than this.
-pub(crate) const ORDINARY_POOL_WINDOW: Duration = Duration::from_secs(2);
+/// The floor of an opening server's pool attempt window and identity query,
+/// and the attach probe's window. Once memory is open, pool creation and
+/// every acquisition are bounded by the budget of the work they serve
+/// instead, with a pool ceiling of `QUERY_TIMEOUT`; the pool's 2 s
+/// slow-acquire record (`pool::SLOW_ACQUIRE_THRESHOLD`) only logs.
+pub(crate) const OPENING_POOL_FLOOR: Duration = Duration::from_secs(2);
 const DATA_DIRECTORY_MISMATCH: &str = "memory server data directory mismatch";
 const IDENTITY_MISMATCH: &str = "memory SQL project/instance identity mismatch";
 const RECORD_LIMIT: usize = 64 * 1024;
@@ -211,6 +214,8 @@ struct ServerInner {
     next_pool_probe_delay: StdMutex<Option<(Duration, Arc<AtomicBool>)>>,
     #[cfg(test)]
     next_pool_first_release_hold: StdMutex<Option<tokio::sync::oneshot::Sender<ConnectionGate>>>,
+    #[cfg(test)]
+    next_pool_authentication_gate: StdMutex<Option<tokio::sync::oneshot::Sender<ConnectionGate>>>,
     /// Every branch or revision a caller asked [`Server::pool`] for, in order.
     #[cfg(test)]
     pool_requests: StdMutex<Vec<String>>,
@@ -856,11 +861,13 @@ impl Server {
                     PoolAttemptOptions {
                         // One transient attempt, closed after verification.
                         acquire_timeout: remaining,
-                        first_acquire_window: remaining,
+                        first_acquire_window: Some(remaining),
                         identity_rejection_is_terminal: true,
                         _test_probe_delay: _initial_probe_delay,
                         #[cfg(test)]
                         _test_first_release_hold: None,
+                        #[cfg(test)]
+                        _test_authentication_gate: None,
                     },
                 ),
             )
@@ -944,6 +951,8 @@ impl Server {
             #[cfg(test)]
             next_pool_first_release_hold: StdMutex::new(None),
             #[cfg(test)]
+            next_pool_authentication_gate: StdMutex::new(None),
+            #[cfg(test)]
             pool_requests: StdMutex::new(Vec::new()),
             owner: Mutex::new(owner),
             reap_guard,
@@ -997,6 +1006,49 @@ impl Server {
             return Ok(pool);
         }
         pools.retain(|_, pool| pool.strong_count() != 0);
+        // Read once: the opening phase can end while this pool is created.
+        let pool = if let Some(window) = self.pool_attempt_window() {
+            // While opening, the attempt continues the startup deadline and
+            // verification takes its own window, never less than the floor.
+            let pool = self.create_pool(branch, Some(window)).await?;
+            verify_identity_until(
+                &pool,
+                &self.0.directory,
+                &self.0.identity,
+                Instant::now() + self.pool_attempt_window().unwrap_or(OPENING_POOL_FLOOR),
+            )
+            .await
+            .context("verify memory branch pool identity")?;
+            pool
+        } else {
+            // Once open, the first acquire, the first release and identity
+            // verification share one creation budget, nested in any
+            // enclosing budget scope. Its expiry fails the creation and
+            // retains no pool; nothing is retried.
+            let deadline = Instant::now() + crate::store::QUERY_TIMEOUT;
+            crate::pool::within_until(deadline, async {
+                let pool = self.create_pool(branch, None).await?;
+                verify_identity_until(&pool, &self.0.directory, &self.0.identity, deadline)
+                    .await
+                    .context("verify memory branch pool identity")?;
+                Ok::<_, anyhow::Error>(pool)
+            })
+            .await
+            .context("memory branch pool creation budget elapsed")??
+        };
+        let pool = Arc::new(pool);
+        pools.insert(branch.to_owned(), Arc::downgrade(&pool));
+        Ok(pool)
+    }
+
+    /// Authenticate a new pool for `branch` with its first connection idle
+    /// again. The identity queries that follow release inline through the
+    /// funnel, so they reuse that one session.
+    async fn create_pool(
+        &self,
+        branch: &str,
+        first_acquire_window: Option<Duration>,
+    ) -> Result<MemoryPool> {
         let (pool, observation) = connect_pool_with_timeout(
             &self.0.identity,
             &self.0.endpoint,
@@ -1004,24 +1056,11 @@ impl Server {
             branch,
             self.0.read_only,
             4,
-            self.pool_attempt(),
+            self.pool_attempt(first_acquire_window),
         )
         .await
         .context("authenticate memory branch pool")?;
-        // The first connection is already idle again and the identity queries
-        // release inline through the funnel, so both reuse that one session.
-        let pool = MemoryPool::new(pool, branch, observation);
-        verify_identity_until(
-            &pool,
-            &self.0.directory,
-            &self.0.identity,
-            Instant::now() + self.pool_attempt_window(),
-        )
-        .await
-        .context("verify memory branch pool identity")?;
-        let pool = Arc::new(pool);
-        pools.insert(branch.to_owned(), Arc::downgrade(&pool));
-        Ok(pool)
+        Ok(MemoryPool::new(pool, branch, observation))
     }
 
     /// The connection observation of the live pool for `branch`.
@@ -1037,7 +1076,7 @@ impl Server {
     }
 
     /// End the opening phase once the store that started this server is
-    /// ready. Later pools use exactly the ordinary per-attempt window.
+    /// ready. Later pools are created under one creation budget.
     pub(crate) fn finish_opening(&self) {
         *self
             .0
@@ -1055,28 +1094,29 @@ impl Server {
     }
 
     /// While opening, the remaining startup deadline that bounded this
-    /// server's own probe, never less than the ordinary window: a slow but
+    /// server's own probe, never less than the opening floor: a slow but
     /// healthy start must not leave the next open-sequence pool with less
-    /// than an ordinary attempt. Once open, exactly the ordinary window.
-    fn pool_attempt_window(&self) -> Duration {
-        self.opening_deadline()
-            .map_or(ORDINARY_POOL_WINDOW, |deadline| {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .max(ORDINARY_POOL_WINDOW)
-            })
+    /// than the floor. Once open, `None`: the creation budget bounds the
+    /// attempt.
+    fn pool_attempt_window(&self) -> Option<Duration> {
+        self.opening_deadline().map(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(OPENING_POOL_FLOOR)
+        })
     }
 
-    fn pool_attempt(&self) -> PoolAttemptOptions {
-        let opening = self.opening_deadline().is_some();
+    fn pool_attempt(&self, first_acquire_window: Option<Duration>) -> PoolAttemptOptions {
         PoolAttemptOptions {
             // SQLx keeps this for every later acquire on the pool, so a pool
-            // created while opening must still be ordinary once memory is open.
-            acquire_timeout: ORDINARY_POOL_WINDOW,
-            first_acquire_window: self.pool_attempt_window(),
-            // A longer opening window must not wait out an identity
-            // rejection; the same endpoint cannot answer differently.
-            identity_rejection_is_terminal: opening,
+            // created while opening serves its later work with the same
+            // ceiling: the statement budget. An acquisition inside a budget
+            // scope is bounded by what remains of that budget.
+            acquire_timeout: crate::store::QUERY_TIMEOUT,
+            first_acquire_window,
+            // No window may wait out an identity rejection; the same
+            // endpoint cannot answer differently.
+            identity_rejection_is_terminal: true,
             #[cfg(test)]
             _test_probe_delay: self
                 .0
@@ -1093,6 +1133,13 @@ impl Server {
                 .lock()
                 .expect("pool first release hold lock")
                 .take(),
+            #[cfg(test)]
+            _test_authentication_gate: self
+                .0
+                .next_pool_authentication_gate
+                .lock()
+                .expect("pool authentication gate lock")
+                .take(),
         }
     }
 
@@ -1108,6 +1155,22 @@ impl Server {
             .next_pool_first_release_hold
             .lock()
             .expect("pool first release hold lock") = Some(sender);
+        receiver
+    }
+
+    /// Hold every new connection of the next pool at the start of its
+    /// authentication until the gate the receiver gets is dropped. The next
+    /// pool attempt takes this seam once; no time elapses inside the gate.
+    #[cfg(test)]
+    pub(crate) fn gate_next_pool_authentication(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<ConnectionGate> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        *self
+            .0
+            .next_pool_authentication_gate
+            .lock()
+            .expect("pool authentication gate lock") = Some(sender);
         receiver
     }
 
@@ -1210,7 +1273,7 @@ impl Server {
         duration: Duration,
     ) -> Result<()> {
         let database = format!("kuru/{branch}");
-        timeout(duration, async {
+        crate::pool::within(duration, async {
             loop {
                 let active: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM information_schema.processlist WHERE BINARY DB = BINARY ?",
@@ -1947,6 +2010,19 @@ pub(crate) struct ConnectionObservation(Arc<ObservationShared>);
 struct ObservationShared {
     progress: StdMutex<ConnectionProgress>,
     authenticated: AtomicU64,
+    /// Acquisitions through the pool funnel still waiting.
+    pending_acquires: tokio::sync::watch::Sender<u64>,
+    /// The first authored identity rejection any callback of this pool
+    /// returned. It is sticky for the pool's life: the same endpoint cannot
+    /// answer differently.
+    identity_rejection: tokio::sync::watch::Sender<Option<&'static str>>,
+    #[cfg(test)]
+    slow_acquire_records: tokio::sync::watch::Sender<u64>,
+    /// Each slow-acquire record's window (what its statement budget had left
+    /// when the acquisition began), or `None` when the pool ceiling bounded
+    /// it, in record order.
+    #[cfg(test)]
+    slow_acquire_windows: StdMutex<Vec<Option<Duration>>>,
     #[cfg(test)]
     first_release_cut: AtomicBool,
     #[cfg(test)]
@@ -1970,6 +2046,12 @@ impl ConnectionObservation {
                 last_failure: None,
             }),
             authenticated: AtomicU64::new(0),
+            pending_acquires: tokio::sync::watch::Sender::new(0),
+            identity_rejection: tokio::sync::watch::Sender::new(None),
+            #[cfg(test)]
+            slow_acquire_records: tokio::sync::watch::Sender::new(0),
+            #[cfg(test)]
+            slow_acquire_windows: StdMutex::new(Vec::new()),
             #[cfg(test)]
             first_release_cut: AtomicBool::new(false),
             #[cfg(test)]
@@ -2006,6 +2088,73 @@ impl ConnectionObservation {
     /// New connections that entered this pool's authentication callback.
     pub(crate) fn authenticated(&self) -> u64 {
         self.0.authenticated.load(Ordering::SeqCst)
+    }
+
+    /// An acquisition through the pool funnel began waiting.
+    pub(crate) fn acquire_started(&self) {
+        self.0.pending_acquires.send_modify(|pending| *pending += 1);
+    }
+
+    /// An acquisition through the pool funnel completed, failed or was
+    /// cancelled.
+    pub(crate) fn acquire_ended(&self) {
+        self.0
+            .pending_acquires
+            .send_modify(|pending| *pending = pending.saturating_sub(1));
+    }
+
+    /// Acquisitions through the pool funnel still waiting.
+    pub(crate) fn pending_acquires(&self) -> u64 {
+        *self.0.pending_acquires.borrow()
+    }
+
+    /// Completes once at least `pending` acquisitions through the pool funnel
+    /// are waiting.
+    #[cfg(test)]
+    pub(crate) async fn pending_acquires_reach(&self, pending: u64) {
+        let mut receiver = self.0.pending_acquires.subscribe();
+        let _ = receiver.wait_for(|count| *count >= pending).await;
+    }
+
+    /// One pending acquisition left its slow-acquire record.
+    pub(crate) fn slow_acquire_recorded(&self) {
+        #[cfg(test)]
+        self.0
+            .slow_acquire_records
+            .send_modify(|records| *records += 1);
+    }
+
+    /// Keep the window of the slow-acquire record about to be counted
+    /// (`None` for the pool ceiling).
+    #[cfg(test)]
+    pub(crate) fn slow_acquire_window(&self, window: Option<Duration>) {
+        if let Ok(mut windows) = self.0.slow_acquire_windows.lock() {
+            windows.push(window);
+        }
+    }
+
+    /// The windows of this pool's slow-acquire records, in order.
+    #[cfg(test)]
+    pub(crate) fn slow_acquire_windows(&self) -> Vec<Option<Duration>> {
+        self.0
+            .slow_acquire_windows
+            .lock()
+            .map(|windows| windows.clone())
+            .unwrap_or_default()
+    }
+
+    /// Slow-acquire records ("still waiting") this pool's acquisitions left.
+    #[cfg(test)]
+    pub(crate) fn slow_acquire_records(&self) -> u64 {
+        *self.0.slow_acquire_records.borrow()
+    }
+
+    /// Completes once this pool's acquisitions have left at least `records`
+    /// slow-acquire records.
+    #[cfg(test)]
+    pub(crate) async fn slow_acquire_records_reach(&self, records: u64) {
+        let mut receiver = self.0.slow_acquire_records.subscribe();
+        let _ = receiver.wait_for(|count| *count >= records).await;
     }
 
     /// Whether this pool's first connection release was cut at its pool
@@ -2134,7 +2283,35 @@ impl ConnectionObservation {
         }
     }
 
+    /// The authored identity rejection this pool's callbacks returned first,
+    /// once one has: every later acquisition on the pool fails with it.
+    pub(crate) fn identity_rejection(&self) -> Option<sqlx::Error> {
+        self.0
+            .identity_rejection
+            .borrow()
+            .map(|cause| sqlx::Error::Protocol(cause.into()))
+    }
+
+    /// Completes with the pool's authored identity rejection once any of its
+    /// callbacks has returned one, at once if one already has.
+    pub(crate) async fn identity_rejected(&self) -> sqlx::Error {
+        let mut rejection = self.0.identity_rejection.subscribe();
+        let cause = match rejection.wait_for(Option::is_some).await {
+            Ok(cause) => (*cause).unwrap_or(IDENTITY_MISMATCH),
+            // The sender lives as long as this observation.
+            Err(_) => IDENTITY_MISMATCH,
+        };
+        sqlx::Error::Protocol(cause.into())
+    }
+
     fn rejected(&self, error: &sqlx::Error) {
+        if let Some(cause) = identity_rejection(error) {
+            self.0.identity_rejection.send_if_modified(|first| {
+                let unset = first.is_none();
+                first.get_or_insert(cause);
+                unset
+            });
+        }
         // SQLx discards callback errors while retrying acquisition. Keep only
         // authored messages or static error classes, never SQL payloads or
         // connection options. A later attempt may be in a different phase.
@@ -2274,9 +2451,14 @@ impl Drop for ConnectionGate {
 struct PoolAttemptOptions {
     /// SQLx's per-acquire timeout for the whole lifetime of the pool.
     acquire_timeout: Duration,
-    /// Bound on the pool's first acquisition, at least `acquire_timeout`.
-    /// Acquires that time out are retried until it ends.
-    first_acquire_window: Duration,
+    /// Bound on the pool's first acquisition and its first release. An
+    /// acquire that SQLx times out before it ends is retried, which happens
+    /// only when it is longer than `acquire_timeout` (an opening startup
+    /// budget above `QUERY_TIMEOUT`). `None` for a pool created once memory
+    /// is open: the creation's budget scope, whose deadline is taken before
+    /// the first acquire and so fires no later than `acquire_timeout`,
+    /// bounds both, and nothing is retried.
+    first_acquire_window: Option<Duration>,
     /// SQLx retries every `after_connect` error until `acquire_timeout`.
     /// When set, an authored identity rejection ends acquisition instead.
     identity_rejection_is_terminal: bool,
@@ -2285,17 +2467,23 @@ struct PoolAttemptOptions {
     /// release before SQLx's ping.
     #[cfg(test)]
     _test_first_release_hold: Option<tokio::sync::oneshot::Sender<ConnectionGate>>,
+    /// Receives a gate that holds the attempt's new connections at the start
+    /// of their authentication.
+    #[cfg(test)]
+    _test_authentication_gate: Option<tokio::sync::oneshot::Sender<ConnectionGate>>,
 }
 
 impl PoolAttemptOptions {
     fn ordinary() -> Self {
         Self {
-            acquire_timeout: ORDINARY_POOL_WINDOW,
-            first_acquire_window: ORDINARY_POOL_WINDOW,
+            acquire_timeout: OPENING_POOL_FLOOR,
+            first_acquire_window: Some(OPENING_POOL_FLOOR),
             identity_rejection_is_terminal: false,
             _test_probe_delay: None,
             #[cfg(test)]
             _test_first_release_hold: None,
+            #[cfg(test)]
+            _test_authentication_gate: None,
         }
     }
 }
@@ -2309,34 +2497,6 @@ fn identity_rejection(error: &sqlx::Error) -> Option<&'static str> {
         }
         sqlx::Error::Protocol(message) if message == IDENTITY_MISMATCH => Some(IDENTITY_MISMATCH),
         _ => None,
-    }
-}
-
-/// The first identity rejection seen by one pool attempt's callbacks.
-#[derive(Clone, Default)]
-struct IdentityRejection(Arc<(StdMutex<Option<&'static str>>, Notify)>);
-
-impl IdentityRejection {
-    fn record(&self, error: &sqlx::Error) {
-        let Some(cause) = identity_rejection(error) else {
-            return;
-        };
-        if let Ok(mut first) = self.0.0.lock() {
-            first.get_or_insert(cause);
-        }
-        self.0.1.notify_one();
-    }
-
-    async fn rejected(&self) -> sqlx::Error {
-        self.0.1.notified().await;
-        let cause = self
-            .0
-            .0
-            .lock()
-            .ok()
-            .and_then(|first| *first)
-            .unwrap_or(IDENTITY_MISMATCH);
-        sqlx::Error::Protocol(cause.into())
     }
 }
 
@@ -2397,9 +2557,11 @@ async fn connect_pool_attempt(
     let project_scope = identity.project_scope.clone();
     let expected_directory = directory.join("data");
     let observation = ConnectionObservation::new();
+    #[cfg(test)]
+    if let Some(gate) = attempt._test_authentication_gate {
+        let _ = gate.send(observation.gate_new_authentications());
+    }
     let callback_observation = observation.clone();
-    let rejection = IdentityRejection::default();
-    let callback_rejection = rejection.clone();
     // Every callback of this attempt stalls until one instant, fixed by the
     // first: a server that becomes responsive then, not a per-retry delay.
     #[cfg(test)]
@@ -2414,7 +2576,6 @@ async fn connect_pool_attempt(
             let project_scope = project_scope.clone();
             let expected_directory = expected_directory.clone();
             let observation = callback_observation.clone();
-            let rejection = callback_rejection.clone();
             #[cfg(test)]
             let test_probe_delay = attempt._test_probe_delay.clone();
             #[cfg(test)]
@@ -2457,10 +2618,7 @@ async fn connect_pool_attempt(
                 .await;
                 match &result {
                     Ok(()) => attempt.accepted(),
-                    Err(error) => {
-                        observation.rejected(error);
-                        rejection.record(error);
-                    }
+                    Err(error) => observation.rejected(error),
                 }
                 result
             })
@@ -2480,19 +2638,36 @@ async fn connect_pool_attempt(
     // Equivalent to `connect_with` (one acquire, then release) when the first
     // window equals the lifetime timeout. A longer opening window retries
     // timed-out acquires without changing any later acquire on this pool.
-    let first_deadline = Instant::now() + attempt.first_acquire_window;
+    // Without a first window the caller's budget scope bounds the acquire,
+    // and SQLx's lifetime timeout, never earlier than that scope, ends it
+    // without a retry.
+    let first_deadline = attempt
+        .first_acquire_window
+        .map(|window| Instant::now() + window);
     let acquired = loop {
-        let acquiring = timeout_at(first_deadline, pool.acquire());
+        // Boxed: SQLx's acquire, which establishes the lazy connection, is
+        // about eighty nested future layers, and this attempt already sits
+        // deep inside store and server opens (the select below adds more).
+        // Inline, it pushes every opener's layout past the compiler's query
+        // depth limit; one allocation per attempt keeps it bounded.
+        let acquiring = Box::pin(async {
+            match first_deadline {
+                Some(deadline) => timeout_at(deadline, pool.acquire()).await,
+                None => Ok(pool.acquire().await),
+            }
+        });
         let acquired = if attempt.identity_rejection_is_terminal {
             tokio::select! {
+                biased;
+                error = observation.identity_rejected() => Ok(Err(error)),
                 acquired = acquiring => acquired,
-                error = rejection.rejected() => Ok(Err(error)),
             }
         } else {
             acquiring.await
         };
         match acquired {
-            Ok(Err(sqlx::Error::PoolTimedOut)) if Instant::now() < first_deadline => {}
+            Ok(Err(sqlx::Error::PoolTimedOut))
+                if first_deadline.is_some_and(|deadline| Instant::now() < deadline) => {}
             Ok(acquired) => break acquired,
             Err(_) => break Err(sqlx::Error::PoolTimedOut),
         }
@@ -2501,17 +2676,24 @@ async fn connect_pool_attempt(
         Ok(mut connection) => {
             // Return the first connection inline so the next statement on
             // this pool reuses it instead of racing SQLx's spawned release.
-            // The attempt's own deadline bounds the release ping: when it
-            // runs out the future is dropped, SQLx closes the connection, and
-            // the identity verification opens one under its own deadline.
+            // While opening, the attempt's own deadline bounds the release
+            // ping: when it runs out the future is dropped, SQLx closes the
+            // connection, and the identity verification opens one under its
+            // own deadline. Once open, the creation's budget scope bounds it
+            // and its expiry fails the creation with this pool dropped.
             #[cfg(test)]
             if let Some(hold) = attempt._test_first_release_hold {
                 let _ = hold.send(observation.gate_next_release());
             }
-            if timeout_at(first_deadline, connection.return_to_pool())
-                .await
-                .is_err()
-            {
+            let returning = connection.return_to_pool();
+            let returned = match first_deadline {
+                Some(deadline) => timeout_at(deadline, returning).await.is_ok(),
+                None => {
+                    returning.await;
+                    true
+                }
+            };
+            if !returned {
                 #[cfg(test)]
                 observation
                     .0
@@ -2538,7 +2720,7 @@ where
         pool,
         directory,
         identity,
-        Instant::now() + ORDINARY_POOL_WINDOW,
+        Instant::now() + OPENING_POOL_FLOOR,
     )
     .await
 }
@@ -2552,7 +2734,7 @@ async fn verify_identity_until<'p, P>(
 where
     P: sqlx::Executor<'p, Database = sqlx::MySql> + Copy,
 {
-    timeout_at(deadline, async {
+    crate::pool::within_until(deadline, async {
         let datadir: String = sqlx::query_scalar("SELECT @@datadir")
             .fetch_one(pool)
             .await?;

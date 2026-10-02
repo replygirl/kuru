@@ -1,7 +1,7 @@
 //! Pooled SQL sessions are reused, not re-authenticated, by sequential work.
 //!
 //! Every new connection runs TCP, MySQL authentication and the identity
-//! callback inside the pool's ordinary acquire window. These tests count those
+//! callback inside its acquisition's budget. These tests count those
 //! authentications and hold any new one at an authentication gate, so a
 //! regression fails at the moment a new connection starts authenticating,
 //! never after a timer. A release gate likewise holds a connection's return
@@ -312,10 +312,28 @@ async fn candidate_view_writes_reuse_candidate_pool_sessions() -> Result<()> {
     Ok(())
 }
 
+/// The statement-budget expiry of an acquisition that `gate` holds in
+/// authentication. The scope ends as soon as a new connection has entered the
+/// gate, an event standing in for the budget's deadline, so reaching the gate
+/// before any budget is not a runner-speed assumption.
+async fn budget_ended_in_authentication<T>(
+    gate: &ConnectionGate,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<anyhow::Error> {
+    match crate::pool::within_or(QUERY_TIMEOUT, work, gate.entered()).await {
+        Err(elapsed) => {
+            ensure!(elapsed.budget == QUERY_TIMEOUT, "{elapsed}");
+            Ok(anyhow::Error::from(elapsed))
+        }
+        Ok(Ok(_)) => bail!("a stalled authentication handed out a session"),
+        Ok(Err(error)) => bail!("a stalled acquisition failed before its budget ended: {error:#}"),
+    }
+}
+
 /// With spare capacity and the only session held, a new connection that
-/// stalls in authentication fails the acquisition naming that wait, both
-/// through the funnel's own acquire and through a statement. SQLx's own
-/// window is the bound under test; the gate involves no time.
+/// stalls in authentication ends the acquisition at its statement budget,
+/// naming that wait, both through the funnel's own acquire and through a
+/// statement. The gates involve no time.
 #[tokio::test]
 async fn stalled_authentication_names_the_new_connection_phase() -> Result<()> {
     let store = MemoryStore::temporary().await?;
@@ -324,15 +342,7 @@ async fn stalled_authentication_names_the_new_connection_phase() -> Result<()> {
     let gate = pool.observation().gate_new_authentications();
     let authenticated = pool.authenticated();
 
-    let error = pool
-        .acquire()
-        .await
-        .err()
-        .context("a stalled authentication handed out a session")?;
-    ensure!(
-        gate.was_entered(),
-        "the acquisition did not open a connection"
-    );
+    let error = budget_ended_in_authentication(&gate, pool.acquire()).await?;
     let diagnostic = crate::pool::pool_acquire_timeout(&error)
         .with_context(|| format!("stalled acquire carried no typed diagnostic: {error:#}"))?;
     ensure!(
@@ -343,6 +353,11 @@ async fn stalled_authentication_names_the_new_connection_phase() -> Result<()> {
         diagnostic.phase == Some(crate::server::AUTHENTICATION_GATE_PHASE),
         "{diagnostic}"
     );
+    ensure!(
+        diagnostic.bound == crate::pool::AcquireBound::StatementBudget,
+        "{diagnostic}"
+    );
+    ensure!(diagnostic.budget == QUERY_TIMEOUT, "{diagnostic}");
     ensure!(diagnostic.authenticated_during_wait == 1, "{diagnostic}");
     ensure!(
         diagnostic.authenticated_total == authenticated + 1,
@@ -353,8 +368,6 @@ async fn stalled_authentication_names_the_new_connection_phase() -> Result<()> {
         "{diagnostic}"
     );
     ensure!(diagnostic.size < diagnostic.max, "{diagnostic}");
-    ensure!(diagnostic.window == crate::server::ORDINARY_POOL_WINDOW);
-    ensure!(diagnostic.waited >= diagnostic.window, "{diagnostic}");
     let text = format!("{error:#}");
     ensure!(
         text.contains(
@@ -362,23 +375,33 @@ async fn stalled_authentication_names_the_new_connection_phase() -> Result<()> {
         ),
         "{text}"
     );
+    // The ended acquisition dropped its held callback; a fresh gate gives the
+    // statement its own entry event.
+    drop(gate);
 
     // A statement through the `Executor` reports the same wait in its chain.
-    let error = anyhow::Error::from(
-        sqlx::query_scalar::<_, i64>("SELECT 1")
+    let gate = pool.observation().gate_new_authentications();
+    let error = budget_ended_in_authentication(&gate, async {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT 1")
             .fetch_one(pool.as_ref())
-            .await
-            .err()
-            .context("a stalled authentication ran a statement")?,
-    )
+            .await?)
+    })
+    .await?
     .context("memory read failed");
     let diagnostic = crate::pool::pool_acquire_timeout(&error)
         .with_context(|| format!("statement carried no typed diagnostic: {error:#}"))?;
-    ensure!(diagnostic.wait == crate::pool::PoolWait::NewConnection);
+    ensure!(
+        diagnostic.wait == crate::pool::PoolWait::NewConnection,
+        "{diagnostic}"
+    );
     ensure!(diagnostic.authenticated_during_wait == 1, "{diagnostic}");
     ensure!(
         format!("{error:#}").contains("memory pool acquire on kuru/main timed out"),
         "{error:#}"
+    );
+    ensure!(
+        pool.pending_acquires() == 0,
+        "an ended acquisition is still counted as pending"
     );
 
     drop(gate);
@@ -394,7 +417,8 @@ async fn stalled_authentication_names_the_new_connection_phase() -> Result<()> {
 /// acquire still names the wait it actually had. With every other permit
 /// held, an inflated count would report held connections. The release gate
 /// holds the return before its ping, so the cancellation point involves no
-/// time.
+/// time, and the acquisition's budget ends once its new connection has
+/// entered the authentication gate.
 #[tokio::test]
 async fn cancelled_release_is_not_counted_as_a_held_connection() -> Result<()> {
     let store = MemoryStore::temporary().await?;
@@ -426,15 +450,7 @@ async fn cancelled_release_is_not_counted_as_a_held_connection() -> Result<()> {
     );
 
     let gate = pool.observation().gate_new_authentications();
-    let error = pool
-        .acquire()
-        .await
-        .err()
-        .context("a stalled authentication handed out a session")?;
-    ensure!(
-        gate.was_entered(),
-        "the acquisition did not open a connection"
-    );
+    let error = budget_ended_in_authentication(&gate, pool.acquire()).await?;
     let diagnostic = crate::pool::pool_acquire_timeout(&error)
         .with_context(|| format!("stalled acquire carried no typed diagnostic: {error:#}"))?;
     ensure!(
@@ -442,10 +458,17 @@ async fn cancelled_release_is_not_counted_as_a_held_connection() -> Result<()> {
         "{diagnostic}"
     );
     ensure!(
+        diagnostic.bound == crate::pool::AcquireBound::StatementBudget,
+        "{diagnostic}"
+    );
+    ensure!(
         (diagnostic.checked_out, diagnostic.idle) == (holding, 0),
         "{diagnostic}"
     );
-    ensure!(diagnostic.size < diagnostic.max, "{diagnostic}");
+    // The budget's diagnostic is taken while the acquisition is still alive,
+    // so the pool's size counts its new connection in authentication: the
+    // permit the cancelled release freed, not a held one.
+    ensure!(diagnostic.size == holding + 1, "{diagnostic}");
 
     drop(gate);
     for session in held {
@@ -583,7 +606,7 @@ async fn rejected_write_closes_its_session() -> Result<()> {
 async fn receipted_release_past_its_deadline_closes_the_connection() -> Result<()> {
     let store = MemoryStore::temporary().await?;
     let pool = store.pool.clone();
-    let (session, id) = write_session(&pool).await?;
+    let (session, id) = write_session(&pool, write_deadline()).await?;
     let (size, checked_out) = (pool.size(), pool.checked_out());
     ensure!(checked_out >= 1, "the write session is not counted as held");
     let gate = pool.observation().gate_releases();
@@ -674,16 +697,8 @@ async fn receipted_write_succeeds_when_its_release_outlasts_its_budget() -> Resu
     Ok(())
 }
 
-/// A new branch pool's first connection release is bounded by the attempt's
-/// own deadline. The take-once gate holds that release indefinitely, so only
-/// the deadline ends it: the connection is closed and identity verification
-/// authenticates its own. The outer timeout only turns an unbounded
-/// regression into a failure.
-#[tokio::test]
-async fn first_connection_release_is_bounded_by_its_attempt_deadline() -> Result<()> {
-    let store = MemoryStore::temporary().await?;
-    let branch = "first_release_probe";
-    tokio::time::timeout(
+async fn create_probe_branch(store: &MemoryStore, branch: &str) -> Result<()> {
+    crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query("CALL DOLT_BRANCH(?)")
             .bind(branch)
@@ -691,52 +706,84 @@ async fn first_connection_release_is_bounded_by_its_attempt_deadline() -> Result
     )
     .await
     .context("probe branch creation deadline exceeded")??;
-    let mut hold = store.shared.server.hold_next_pool_first_release();
-    let pool = tokio::time::timeout(QUERY_TIMEOUT, store.shared.server.pool(branch))
-        .await
-        .context("a held first release kept the branch pool from opening")??;
-    let gate = hold
-        .try_recv()
-        .context("the pool attempt did not arm the first release hold")?;
+    Ok(())
+}
+
+/// Once memory is open, a new branch pool's first acquire, first release and
+/// identity verification share one creation budget. The take-once gate holds
+/// the first release, and the creation's scope ends once that release has
+/// reached the pool's return, an event standing in for the budget's
+/// deadline, so no new connection's handshake has to beat a budget. The
+/// creation fails with its budget elapsed and retains no pool; nothing is
+/// retried, and a later creation opens one working session.
+#[tokio::test]
+async fn first_connection_release_held_past_the_creation_budget_ends_creation_at_its_budget()
+-> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let server = &store.shared.server;
+    let branch = "first_release_probe";
+    create_probe_branch(&store, branch).await?;
+    let hold = server.hold_next_pool_first_release();
+    // The gate stays held until the scope has ended, so only the scope can
+    // end the held release.
+    let kept = std::sync::Mutex::new(None::<ConnectionGate>);
+    let expire = async {
+        // A creation that fails before its first release drops the sender;
+        // then only its own outcome ends the scope.
+        let Ok(gate) = hold.await else {
+            return std::future::pending().await;
+        };
+        gate.entered().await;
+        *kept.lock().expect("kept gate lock") = Some(gate);
+    };
+    let outcome = crate::pool::within_or(QUERY_TIMEOUT, server.pool(branch), expire).await;
+    let gate = kept.lock().expect("kept gate lock").take();
+    let elapsed = match outcome {
+        Err(elapsed) => elapsed,
+        Ok(Ok(_)) => bail!("the branch pool opened while its first release was held"),
+        Ok(Err(error)) => bail!("creation failed before its first release was held: {error:#}"),
+    };
+    let gate = gate.context("the creation budget ended without the first release held")?;
+    ensure!(elapsed.budget == QUERY_TIMEOUT, "{elapsed}");
     ensure!(
-        gate.was_entered(),
-        "the first connection's release did not reach the pool's return"
+        elapsed.acquire.is_none(),
+        "the creation's own acquisition is not a funnel acquisition: {elapsed}"
     );
     ensure!(
-        pool.observation().first_release_cut(),
-        "the held first release was not recorded as cut at the attempt's deadline"
+        server.pool_observation(branch).await.is_none(),
+        "a creation that ran out of budget retained a pool"
     );
+    drop(gate);
+
+    let pool = server.pool(branch).await?;
+    let observed = pool.observation();
     ensure!(
-        pool.authenticated() == 2,
-        "{} connections authenticated; the closed first connection and verification's own were expected",
-        pool.authenticated()
+        !observed.first_release_cut(),
+        "a creation within its budget recorded a cut first release"
     );
+    ensure_one_working_session(observed, "the pool created after an expired creation")?;
     ensure!(
-        pool.observation().abandoned_authentications() == 0,
-        "the cut first connection was recorded as an abandoned callback"
+        observed.abandoned_authentications() == 0,
+        "the pool created after an expired creation abandoned a callback"
     );
-    ensure_one_working_session(pool.observation(), "the pool with its first release cut")?;
     ensure!(
         (pool.size(), pool.num_idle()) == (1, 1),
-        "the pool holds {} connections, {} idle, after the first was closed",
+        "the pool holds {} connections, {} idle",
         pool.size(),
         pool.num_idle()
     );
-    drop(gate);
     drop(pool);
     store.close().await?;
     Ok(())
 }
 
-/// An opening-phase pool retries a first acquire whose identity callback
-/// outlasts SQLx's ordinary window, inside the remaining startup deadline.
-/// The cancelled callback is recorded as abandoned, and the pool still holds
-/// one working session. The stall is fixed at one instant past the ordinary
-/// window from the first callback, so that first callback is always cut by
-/// its window; how many retries a slow runner needs before that instant is
-/// not asserted, only that each is recorded.
+/// An opening-phase first acquire whose identity callback outlasts the
+/// opening floor, inside the remaining startup deadline, opens the pool on
+/// its first attempt: the pool ceiling is the statement budget, so nothing
+/// cuts the callback and no connection is abandoned. The stall is fixed at
+/// one instant past the floor from the first callback.
 #[tokio::test]
-async fn opening_retry_after_a_timed_out_callback_is_one_working_session() -> Result<()> {
+async fn opening_first_acquire_outlasting_the_floor_is_one_working_session() -> Result<()> {
     let root = crate::test_support::tempdir()?;
     let config = kuru_core::MemoryConfig {
         offline: true,
@@ -750,8 +797,8 @@ async fn opening_retry_after_a_timed_out_callback_is_one_working_session() -> Re
         let _gate = crate::spawn_gate::spawning().await;
         crate::server::Server::open(crate::server::ServerOptions {
             binary,
-            directory: root.path().join("opening-retry"),
-            project_scope: "project/opening-retry".into(),
+            directory: root.path().join("opening-first-acquire"),
+            project_scope: "project/opening-first-acquire".into(),
             supervisor: test_supervisor()?,
             timeout: Duration::from_secs(config.startup_timeout_secs),
             read_only: false,
@@ -770,28 +817,32 @@ async fn opening_retry_after_a_timed_out_callback_is_one_working_session() -> Re
         );
         let entered = Arc::new(AtomicBool::new(false));
         server.delay_next_pool_authentication(
-            crate::server::ORDINARY_POOL_WINDOW * 3 / 2,
+            crate::server::OPENING_POOL_FLOOR * 3 / 2,
             entered.clone(),
         );
         let pool = server
             .pool("main")
             .await
-            .context("the opening pool did not retry its timed-out first acquire")?;
+            .context("the opening pool did not open past the floor")?;
         ensure!(
             entered.load(Ordering::SeqCst),
             "the first authentication callback was not delayed"
         );
         let observed = pool.observation();
-        ensure_one_working_session(observed, "the opening pool after a timed-out first acquire")?;
         ensure!(
-            observed.abandoned_authentications() >= 1,
-            "the timed-out first callback was not recorded as abandoned \
-             ({} connections authenticated)",
+            observed.abandoned_authentications() == 0,
+            "the first callback was cut and abandoned ({} connections authenticated)",
             observed.authenticated()
         );
         ensure!(
+            observed.authenticated() == 1,
+            "{} connections authenticated; the first attempt's one was expected",
+            observed.authenticated()
+        );
+        ensure_one_working_session(observed, "the opening pool past the floor")?;
+        ensure!(
             (pool.size(), pool.num_idle()) == (1, 1),
-            "the pool holds {} connections, {} idle, after its retried first acquire",
+            "the pool holds {} connections, {} idle, after its first acquire",
             pool.size(),
             pool.num_idle()
         );
@@ -800,4 +851,255 @@ async fn opening_retry_after_a_timed_out_callback_is_one_working_session() -> Re
     .await;
     server.close().await?;
     outcome
+}
+
+/// A budget that elapses after its acquisition returned is no acquisition
+/// timeout: the scope ends on an event once the session is in hand, so no
+/// budget has to outlast the acquisition. The dropped session leaves the pool
+/// usable for the next statement.
+#[tokio::test]
+async fn budget_elapsed_in_execution_is_not_an_acquire_timeout() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let pool = store.pool.clone();
+    let acquired = tokio::sync::Notify::new();
+    let outcome = crate::pool::within_or(
+        QUERY_TIMEOUT,
+        async {
+            let _session = pool.acquire().await?;
+            acquired.notify_one();
+            std::future::pending::<Result<()>>().await
+        },
+        acquired.notified(),
+    )
+    .await;
+    let elapsed = match outcome {
+        Err(elapsed) => elapsed,
+        Ok(outcome) => bail!(
+            "the work ended before its budget: {:?}",
+            outcome.map_err(|error| format!("{error:#}"))
+        ),
+    };
+    ensure!(
+        elapsed.acquire.is_none(),
+        "an execution expiry carried an acquisition diagnostic: {elapsed}"
+    );
+    let error = anyhow::Error::from(elapsed).context("memory read deadline exceeded");
+    ensure!(
+        crate::pool::pool_acquire_timeout(&error).is_none(),
+        "an execution expiry was reported as an acquisition timeout: {error:#}"
+    );
+    ensure!(
+        format!("{error:#}")
+            == "memory read deadline exceeded: memory statement budget of 30.000 s elapsed",
+        "{error:#}"
+    );
+    ensure!(
+        pool.pending_acquires() == 0,
+        "a completed acquisition is still counted as pending"
+    );
+    let one: i64 = crate::pool::within(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar("SELECT 1").fetch_one(pool.as_ref()),
+    )
+    .await??;
+    ensure!(one == 1, "the next statement read {one}");
+    drop(pool);
+    store.close().await?;
+    Ok(())
+}
+
+/// The uncertain-write fence: a write's acquisition precedes its pending
+/// record, so an acquisition that fails leaves no uncertain write. A plain
+/// store has no logical receipt and nothing pending, so the first acquisition
+/// `put` makes is its write session's. Every permit is held; once that
+/// acquisition is queued, the pool is marked closed (`MemoryPool::close`, a
+/// synchronous mark; not `MemoryStore::close`, which waits for the write
+/// guard the queued worker holds), which wakes it with SQLx's `PoolClosed`.
+#[tokio::test]
+async fn acquire_failure_before_a_write_is_never_uncertain() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let pool = store.pool.clone();
+    let max = pool.options().get_max_connections();
+    let mut held = Vec::new();
+    for _ in 0..max {
+        held.push(pool.acquire().await?);
+    }
+    let writer = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .put("pool.session.fenced", &serde_json::json!(1))
+                .await
+        }
+    });
+    tokio::pin!(writer);
+    tokio::select! {
+        biased;
+        outcome = &mut writer => bail!(
+            "the write ended before its acquisition queued: {:?}",
+            outcome.map(|result| result.map_err(|error| format!("{error:#}")))
+        ),
+        () = pool.observation().pending_acquires_reach(1) => {}
+    }
+    let closing = pool.close();
+    let error = match writer.await.context("write worker panicked")? {
+        Ok(()) => bail!("a write on a closed pool succeeded"),
+        Err(error) => error,
+    };
+    ensure!(
+        error.chain().any(|cause| matches!(
+            cause.downcast_ref::<sqlx::Error>(),
+            Some(sqlx::Error::PoolClosed)
+        )),
+        "the write's failure is not its acquisition's PoolClosed: {error:#}"
+    );
+    ensure!(
+        store
+            .shared
+            .uncertain
+            .lock()
+            .expect("uncertain lock")
+            .is_none(),
+        "a write whose acquisition failed left an uncertain record: {error:#}"
+    );
+    ensure!(
+        pool.pending_acquires() == 0,
+        "the failed acquisition is still counted as pending"
+    );
+    drop(held);
+    closing.await;
+    drop(pool);
+    store.close().await?;
+    Ok(())
+}
+
+const IDENTITY_MISMATCH: &str = "memory SQL project/instance identity mismatch";
+
+/// An authored identity rejection, not a timeout of any kind.
+fn ensure_identity_rejection(error: &anyhow::Error, what: &str) -> Result<()> {
+    ensure!(
+        format!("{error:#}").contains(IDENTITY_MISMATCH),
+        "{what} did not name the identity mismatch: {error:#}"
+    );
+    ensure!(
+        crate::pool::pool_acquire_timeout(error).is_none(),
+        "{what} was reported as an acquisition timeout: {error:#}"
+    );
+    ensure!(
+        !error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<sqlx::Error>(),
+                Some(sqlx::Error::PoolTimedOut)
+            ) || cause.is::<crate::pool::BudgetElapsed>()
+        }),
+        "{what} waited out a bound instead of ending at the rejection: {error:#}"
+    );
+    Ok(())
+}
+
+/// Once memory is open, an authored identity rejection ends an acquisition at
+/// once with its cause, and every later acquisition on that pool fails with it
+/// without authenticating again; a pool creation that meets one fails with it
+/// and retains nothing. With a sticky rejection no timer can decide, so the
+/// test orders nothing against one. The branch's identity is changed through
+/// a detached session of its own pool, the same per-branch working-set
+/// visibility the main-pool identity test relies on.
+#[tokio::test]
+async fn post_open_identity_rejection_ends_the_acquire_at_once() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let server = &store.shared.server;
+    let branch = "identity_rejection_probe";
+    create_probe_branch(&store, branch).await?;
+    let pool = server.pool(branch).await?;
+    let mut connection = pool.acquire().await?.detach();
+    let project_scope: String =
+        sqlx::query_scalar("SELECT project_scope FROM kuru_instance WHERE singleton = 1")
+            .fetch_one(&mut connection)
+            .await?;
+    sqlx::query("UPDATE kuru_instance SET project_scope = 'foreign-sql-project'")
+        .execute(&mut connection)
+        .await?;
+    let outcome = async {
+        let before = pool.authenticated();
+        let error = pool
+            .acquire()
+            .await
+            .err()
+            .context("a pool whose identity changed handed out a session")?;
+        ensure_identity_rejection(&error, "the retained pool's acquisition")?;
+        let rejected = pool.authenticated();
+        ensure!(
+            rejected > before,
+            "the rejected acquisition authenticated no new connection"
+        );
+        let error = pool
+            .acquire()
+            .await
+            .err()
+            .context("a rejected pool handed out a session")?;
+        ensure_identity_rejection(&error, "the second acquisition")?;
+        let error = anyhow::Error::from(
+            sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(pool.as_ref())
+                .await
+                .err()
+                .context("a rejected pool ran a statement")?,
+        );
+        ensure_identity_rejection(&error, "a statement on the rejected pool")?;
+        ensure!(
+            pool.authenticated() == rejected,
+            "a later acquisition authenticated a connection instead of failing with the \
+             pool's rejection"
+        );
+        ensure!(
+            pool.pending_acquires() == 0,
+            "a rejected acquisition is still counted as pending"
+        );
+
+        // With the retained pool gone, a creation meets the same rejection.
+        ensure!(
+            server.pool_observation(branch).await.is_some(),
+            "the branch pool was not retained before its creation half"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    drop(pool);
+    let outcome = match outcome {
+        Ok(()) => {
+            async {
+                ensure!(
+                    server.pool_observation(branch).await.is_none(),
+                    "the dropped branch pool is still retained"
+                );
+                let error = server
+                    .pool(branch)
+                    .await
+                    .err()
+                    .context("a pool creation that met an identity rejection succeeded")?;
+                ensure_identity_rejection(&error, "the pool creation")?;
+                ensure!(
+                    server.pool_observation(branch).await.is_none(),
+                    "a rejected creation retained a pool"
+                );
+                Ok(())
+            }
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    sqlx::query("UPDATE kuru_instance SET project_scope = ?")
+        .bind(&project_scope)
+        .execute(&mut connection)
+        .await?;
+    sqlx::Connection::close(connection).await?;
+    outcome?;
+    let pool = server
+        .pool(branch)
+        .await
+        .context("pool creation after restoring the identity")?;
+    ensure_one_working_session(pool.observation(), "the pool after the restored identity")?;
+    drop(pool);
+    store.close().await?;
+    Ok(())
 }
