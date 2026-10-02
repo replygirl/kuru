@@ -1012,6 +1012,10 @@ async fn spawn_service(
     for (name, value) in activity::owner_test_environment() {
         command.env(name, value);
     }
+    // Test builds hold the spawn gate across child creation; see
+    // `crate::spawn_gate`.
+    #[cfg(test)]
+    let _creation = crate::spawn_gate::child_creation().await;
     command.spawn().context("start project memory service")
 }
 

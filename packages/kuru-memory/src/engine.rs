@@ -37,6 +37,10 @@ pub(crate) async fn spawn(
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // Test builds hold the spawn gate across child creation; see
+        // `crate::spawn_gate`.
+        #[cfg(test)]
+        let _creation = crate::spawn_gate::child_creation().await;
         Ok(Child {
             inner: command.spawn().context("start verified Dolt engine")?,
         })

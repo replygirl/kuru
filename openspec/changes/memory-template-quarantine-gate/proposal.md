@@ -56,45 +56,69 @@ codebase already has.
 
 ## What Changes
 
-- Under `cfg(test)`, `server.rs`'s default open path
-  (`Server::open_inner` → `open_inner_with_probe_delay`) takes
-  `spawn_gate::spawning()` exactly across `command.spawn()`, the same
-  guard `open_with_initial_probe_delay` already takes, threaded through the
-  existing `_test_spawn_guard` parameter instead of always passing `None`.
-  This is shape (b) from the prior revision's two candidates, not shape
-  (a) (wrapping the whole open in a shared guard): (b) holds the guard only
-  across the actual spawn, so `locking_async()` holders (the quarantine
-  write-guard tests) queue behind at most one in-flight spawn, not an
-  entire open's readiness wait — matching the constraint that every guard
-  spans only child creation and spawning tests keep running concurrently
-  with one another.
-- A full audit of every child-process creation site reachable from the
-  `kuru-memory` test binary (`engine.rs::spawn`, `service.rs`'s supervisor
-  and project-service launches, `provision.rs`'s probe spawns,
-  `test_support/template.rs`'s stage/template builders, and the sites
-  `spawn_gate.rs`'s own module doc already names as gated), recording each
-  site's treatment — already-gated, newly gated by this change, or
-  correctly left ungated with the reason (no `cfg(test)` reachability, or
-  already excluded by taking the lock-gate's exclusive guard instead).
-- `spawn_gate.rs`'s existing scan (`no_spawn_guard_encloses_a_test_cache_warm_up`)
-  extended so a newly introduced spawn site with no guard in scope is
-  caught by a test, not just by manual audit.
-- No change to the quarantine tests themselves beyond what #155 already
-  made (`create_unspawned`, the busy-lock test naming the designed skip);
-  this change's assertions are unchanged.
+- Under `cfg(test)`, every child creation on a product code path that the
+  `kuru-memory` test binary drives holds a spawn-gate guard exactly across
+  the spawn. The paths are: the lifetime-supervisor launch in
+  `server.rs::open_inner_with_probe_delay`, the Dolt engine in
+  `engine.rs::spawn` (which covers the in-process supervisor and
+  `provision::verify_version`), and the project memory service in
+  `service.rs::spawn_service`.
+- **Deviation from the brief, with the reason:** the brief's literal remedy,
+  `crate::spawn_gate::spawning().await` inside the open path, deadlocks.
+  `spawn_gate.rs`'s own `excluding_spawns` doc says the gate is fair, so a
+  nested shared acquisition waits behind a queued writer forever. Many
+  fixtures already hold `spawning()` across whole opens:
+  `test_support::spawn_gated_open` has 76 call sites, and about 100 more
+  facade/service/served-owner/activity tests do the same. `excluding_spawns`
+  restarts and two service fixtures (`service.rs` ~3086, ~3253) spawn while
+  holding the *exclusive* guard. The product paths therefore take a new
+  `spawn_gate::child_creation()` (Unix only):
+  - It waits only while a lock taker *holds* the exclusive guard, never
+    behind one that is only queued, so nesting under any fair shared guard
+    cannot deadlock.
+  - It counts creations in flight. `locking()`/`locking_async()` return
+    only after that count drains, so a creation already in flight when a lock
+    taker arrives is still excluded.
+  - It does not wait when the current test (thread or tokio task) is the one
+    holding the exclusive guard. A libtest test owns its thread and its
+    runtime.
+  - `spawning()`, `spawning_blocking()`, `excluding_spawns()` and the tokio
+    `RwLock` are unchanged: shared for spawns, exclusive for lock takers.
+    `locking()`/`locking_async()` return a thin wrapper around the write
+    guard that clears the holder mark on drop or downgrade.
+- A full audit of every child-process construction compiled into the crate,
+  recorded in tasks.md section 4 and in the PR body, gives each site's
+  treatment.
+- A new scan test, `spawn_gate::tests::every_child_creation_takes_the_gate`,
+  fails when a function constructs a child process (`Command::new(`,
+  `NativeSpawnSpec::new(`, `isolated_command(`) without any spawn-gate token
+  in its body. Windows-only functions and files and the one builder
+  (`provision::isolated_command`) are exempt by name. A permanent synthetic
+  negative test (`the_child_creation_scan_reports_an_ungated_construction`)
+  proves that the scan reports an ungated construction. The scan already
+  found one site: the macOS-only `/bin/hostname` helper in
+  `store/engine_contract_tests.rs`, now gated across creation only.
+- No change to the quarantine tests: `creation_template/tests.rs` and
+  `open_tests.rs` are byte-unchanged.
 
 ## Impact
 
-- Test-only: the new guard acquisition compiles only under `cfg(test)`
-  (`spawn_gate` is already a strict no-op outside `cfg(test)`, including on
-  Windows). No product quarantine semantics change: no retry on
-  `WouldBlock`, no blocking lock, no deadline change, no change to the
-  gate's `RwLock` semantics (shared for spawns, exclusive for lock takers).
-- Files: `packages/kuru-memory/src/server.rs` (`cfg(test)` guard threading
-  on the default open path), `packages/kuru-memory/src/spawn_gate.rs`
-  (scan extension), and any other site the audit finds ungated and
-  reachable; `openspec/changes/memory-template-quarantine-gate/` for this
-  record.
-- Makes the failure family impossible in-process rather than rarer: every
-  spawn in the test binary now either takes the shared guard or is proven
-  unreachable while a write-guard holder runs.
+- Test-only: every new acquisition compiles only under `cfg(test)`, and
+  `spawn_gate` is a `cfg(test)` module. Product quarantine semantics are
+  unchanged: no retry on `WouldBlock`, no blocking lock, no deadline change.
+  Windows behaviour is unchanged: `child_creation` and its bookkeeping exist
+  only on Unix, and no Windows arm was edited.
+- Files:
+  - `packages/kuru-memory/src/spawn_gate.rs`: the gate, its tests and the
+    scan.
+  - `packages/kuru-memory/src/{server.rs,engine.rs,service.rs}`: one
+    `#[cfg(test)]` acquisition per spawn.
+  - `packages/kuru-memory/src/store/engine_contract_tests.rs`: the hostname
+    helper.
+  - `openspec/changes/memory-template-quarantine-gate/`: this record.
+- Makes the failure family impossible in-process rather than rarer, for any
+  test that holds the exclusive guard across its release-to-try window. With
+  that guard held, no child creation in the binary can be in flight.
+  Residual [inferred]: a test that reaches a quarantine verdict while holding
+  only a *shared* guard is still not excluded from sibling spawns. That was
+  already true before this change, and the failing test is not such a test.

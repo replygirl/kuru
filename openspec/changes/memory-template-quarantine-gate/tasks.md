@@ -95,81 +95,184 @@
       other thread to race the exclusive-lock try inside this test's
       write guard.
 
-## 3. Gate the chokepoint: default open path takes the spawn guard under cfg(test)
+## 3. Gate every product-path child creation under cfg(test), nesting-safely
 
-- [ ] 3.1 Thread a real `#[cfg(test)]` `spawn_gate::spawning()` guard
-      through `server.rs::open_inner`/`Server::open_with_guard` into
-      `open_inner_with_probe_delay`'s existing `_test_spawn_guard`
-      parameter, instead of the hardcoded `None` at
-      `open_inner`'s call site, on both the unix (~line 629-657) and
-      windows (~line 697-730) arms — lint runs for the Windows target as
-      well as the host. Non-test builds keep passing `None` (the parameter
-      is already typed `Option<...>`, so this is additive, not a signature
-      change visible outside `cfg(test)`). Drop the guard at the same
-      point the existing `drop(_test_spawn_guard)` calls do, immediately
-      after `command.spawn()`/`.spawn().await` returns — verify by reading
-      the diff and confirming no non-`cfg(test)` line changed.
-- [ ] 3.2 Confirm this does not introduce a deadlock against
-      `spawn_gate.rs`'s own `WARM`-list scan: a caller that already holds
-      `spawning()` (or `locking_async()`) must not call `temporary()`/
-      `temporary_cold()`/`open_temporary` itself, since tokio's
-      write-preferring `RwLock` would then block a nested shared acquire
-      behind a queued writer — verify by re-running the existing scan
-      (`no_spawn_guard_encloses_a_test_cache_warm_up` or its successor from
-      4.2) and by grepping call sites of `temporary()`/`temporary_cold()`
-      for an enclosing `locking_async()`/`spawning()` scope.
-- [ ] 3.3 Record the throughput effect: a `locking_async()` write-guard
-      holder now queues behind at most one in-flight `spawning()` spawn
-      (shared-to-exclusive contention is bounded by `RUST_TEST_THREADS`),
-      not an entire open's readiness wait, since the guard is held only
-      across `command.spawn()` — verify by reading the guard's drop point
-      relative to the readiness-wait `timeout_at` call, which must remain
-      outside the guarded span.
+- [x] 3.1 Add `spawn_gate::child_creation()` (Unix, `cfg(test)`): it waits
+      only while a lock taker holds the exclusive guard, never behind a
+      queued one; it counts creations in flight and makes
+      `locking()`/`locking_async()` wait for the count to drain; and it does
+      not wait when the current test (thread or tokio task) holds the
+      exclusive guard. Leave `spawning`/`spawning_blocking`/
+      `excluding_spawns` and the tokio `RwLock` unchanged — verify with new
+      unit tests: a nested creation under a shared guard with a queued
+      writer completes; a lock taker waits for an in-flight creation; a
+      creation by another test waits while the taker holds, and the taker's
+      own does not.
+      Observed: `spawn_gate.rs` adds `child_creation()` (`#[cfg(unix)]`)
+      over a `creation::Creations` counter plus a holder mark; `locking()`/
+      `locking_async()` now return an `Exclusive` wrapper that drains the
+      counter before returning and clears the mark on drop/downgrade. The
+      tokio `RwLock` and `spawning`/`spawning_blocking`/`excluding_spawns`
+      bodies are unchanged. Clause-to-test map, all passing in
+      `cargo test -p kuru-memory --lib spawn_gate` (8 passed, 0 failed):
+      nested creation under a shared guard with a queued writer →
+      `a_child_creation_inside_a_shared_guard_never_waits_behind_a_queued_writer`;
+      lock taker waits for an in-flight creation →
+      `an_in_flight_spawn_excludes_lock_acquisition_until_it_finishes`;
+      another test's creation waits while the taker holds, and the taker's
+      own creation does not → both asserted inside
+      `a_lock_taker_excludes_child_creations_of_other_tests` (the holder
+      runs on a spawned thread with its own runtime and its own
+      `creations.enter()` completes before it signals `acquired`, which the
+      test awaits under a 5 s deadline; the main test thread then shows its
+      creation blocked for 200 ms and released only after the holder drops);
+      the restart path →
+      `a_restart_returns_its_shared_guard_without_waiting_behind_a_queued_writer`;
+      panic safety → `a_panicking_holder_releases_the_gate`.
+- [x] 3.2 Take `child_creation()` exactly across `command.spawn()` in
+      `server.rs::open_inner_with_probe_delay` (Unix arm; dropped at the
+      existing `drop(_test_spawn_guard)` point), `engine.rs::spawn` (Unix
+      arm) and `service.rs::spawn_service` (Unix fn), each under
+      `#[cfg(test)]` — verify by reading the diff: no non-`cfg(test)` line
+      and no Windows arm changed.
+      Observed: `git diff -U0 -- src/server.rs src/engine.rs src/service.rs`
+      is 14 added lines and 0 removed: three `#[cfg(test)] let … =
+      crate::spawn_gate::child_creation().await;` acquisitions (plus one
+      `#[cfg(test)] drop(creation);` in `server.rs` at the existing guard
+      release point) and their two-line comments. Every executable added
+      line sits under `#[cfg(test)]`; all three sites are in the
+      `#[cfg(unix)]` arm or a `#[cfg(unix)]` fn. The Windows arms
+      (`server.rs` `NativeSpawnSpec` branch, `service.rs:1031`
+      `spawn_service`, `service.rs:3733` `windows_starter_fixture`) have no
+      diff lines.
+- [x] 3.3 Confirm no deadlock: the literal `spawning().await` would nest
+      under the outer shared guards (`spawn_gated_open`, 76 call sites, and
+      about 100 facade/service/served-owner/activity fixtures) and under
+      exclusive holders that spawn (`excluding_spawns` restarts,
+      `service.rs` fixtures ~3086/~3253). `child_creation` must not wait in
+      any of them — verify by running the full `kuru-memory` test task and
+      seeing no test reach its deadline.
+      Observed: the full-task run recorded under 5.1 finished every lib
+      test (596 passed, 0 failed, 850 s wall, `RUST_TEST_THREADS=2`), and
+      the log contains no "deadline exceeded", no panic and no test that
+      ran to a timeout; each real-store open nested a `child_creation`
+      under its fixture's outer `spawning()` guard without waiting.
 
-## 4. Audit every other spawn site and extend the scan
+## 4. Audit every child-creation site and extend the scan
 
-- [ ] 4.1 List every `.spawn()`/`NativeSpawnSpec::spawn()` call in
-      `packages/kuru-memory/src` outside `#[cfg(test)]` test modules
-      (`grep -rn "\.spawn(" packages/kuru-memory/src`) and classify each:
-      `engine.rs::spawn` (the Dolt engine process — called by the
-      supervisor process itself, not reachable from the test binary's own
-      process, and also called directly by `server_tests.rs` fixtures,
-      which `spawn_gate.rs`'s doc already names as gated at the call
-      site), `service.rs`'s supervisor/project-service launches,
-      `provision.rs`'s probe spawns, `server/windows_fixture.rs`,
-      `test_support/template.rs`'s stage/template builders. Record, per
-      site: reachable from the `kuru-memory` test binary's own process
-      or not; if reachable, gated by an enclosing `spawning()`/
-      `spawning_blocking()` or by 3.1's new default-path guard, or left
-      ungated with the specific reason (e.g. runs inside the supervisor's
-      own process, which is not the test binary racing its own flock
-      duplicates). This list becomes the PR body's per-site audit table.
-- [ ] 4.2 Extend `spawn_gate.rs`'s existing scan
-      (`no_spawn_guard_encloses_a_test_cache_warm_up` or a sibling test)
-      so a spawn site newly added to the test binary with no guard in
-      scope fails a test, not just a manual grep — verify with a
-      deliberate negative fixture (a throwaway ungated `.spawn()` added
-      temporarily to confirm the extended scan catches it, then removed
-      before the final diff).
-- [ ] 4.3 Confirm no quarantine assertion in
-      `packages/kuru-memory/src/store/creation_template/tests.rs` or
-      `open_tests.rs` needs to change: 3.1's fix closes the gap at the
-      chokepoint, so #155's existing `create_unspawned`/write-guard
-      pattern in those two files remains correct and sufficient — verify
-      by re-reading both files' quarantine assertions against the sweep
-      already on record in this change's prior revision (git history) and
-      confirming none both (a) asserts a quarantine outcome and (b) is
-      reachable through an exclusive guard it does not already hold.
+- [x] 4.1 List every child-process construction in `packages/kuru-memory/src`
+      and record its treatment (also the PR body's audit table) — verify
+      by grep of `Command::new(`, `NativeSpawnSpec::new(`,
+      `isolated_command(`, `engine::spawn(` and by reading each site.
+      Observed (grep over `src`, excluding `spawn_gate.rs`'s own fixtures;
+      line numbers at this revision; "fn" is the innermost enclosing
+      function):
+      | site | fn | treatment |
+      |---|---|---|
+      | `engine.rs:32` (`isolated_command(`) | `spawn`, unix arm | newly gated: `child_creation` |
+      | `engine.rs:51` (`NativeSpawnSpec::new(`) | `spawn`, windows arm | Windows-only arm, unchanged; the scan passes it because the shared fn body holds `child_creation` |
+      | `server.rs:631` (`Command::new(`) | `open_inner_with_probe_delay`, unix arm | newly gated: `child_creation`, dropped at the existing `_test_spawn_guard` release |
+      | `server.rs:706` (`NativeSpawnSpec::new(`) | `open_inner_with_probe_delay`, windows arm | Windows-only arm, unchanged |
+      | `server.rs:2308` (`engine::spawn(`) | `supervise_with_port_hook` | call, not a construction; gated inside `engine::spawn` |
+      | `service.rs:999` (`Command::new(`) | `spawn_service`, `#[cfg(unix)]` | newly gated: `child_creation` |
+      | `service.rs:1031` (`NativeSpawnSpec::new(`) | `spawn_service`, `#[cfg(windows)]` | Windows-only fn, unchanged |
+      | `service.rs:2900`, `:2935` (`/bin/sh`) | `starter_wait_surfaces_the_exited_child_stderr` | already gated: `spawning()` |
+      | `service.rs:3733` (`NativeSpawnSpec::new(`) | `windows_starter_fixture`, `#[cfg(windows)]` | Windows-only fn |
+      | `service.rs:6898` (`Command::new(`) | `separate_cold_starters_share_one_owner_and_preserve_both_writes` | already gated: `spawning()` |
+      | `server_tests.rs:65`, `:135` (`/bin/sh`) | two reap-guard tests | already gated: `spawning_blocking()` |
+      | `server_tests.rs:220` (`engine::spawn(`) | `cleanup_observation_error_keeps_actual_lifecycle_lease_until_child_exit` | call; gated inside `engine::spawn`, outer `spawning()`/`locking_async` |
+      | `provision.rs:1557` (`Command::new(`) | `isolated_command` | the builder: constructs but never spawns; scan-exempt by name |
+      | `provision.rs:1579` (`engine::spawn(`) | `verify_version_with_timeout` | call; gated inside `engine::spawn` |
+      | `server/windows_fixture.rs:14`, `:76` | `unconfigured`, `partial_readiness` | Windows-only file |
+      | `test_support/windows.rs:176` (`engine::spawn(`) | `forced_engine_cleanup` | Windows-only file; call |
+      | `test_support/template.rs:846` (`Command::new(`) | `spawn_child`, `#[cfg(unix)]` | already gated: `spawning()` |
+      | `test_support/template.rs:893` (`NativeSpawnSpec::new(`) | `spawn_child`, `#[cfg(windows)]` | Windows-only fn |
+      | `store/engine_contract_tests.rs:283` (`/bin/hostname`) | `os_hostname`, `cfg(all(unix, not(linux)))` | **found by the scan, newly gated**: `child_creation` across creation only (`spawn()` then `wait_with_output()` outside the guard) |
+      | `store/creation_template/tests.rs:1923`, `:1969` | `spawn_child` unix/windows | already gated: `spawning()` |
+      | `store/recovery_tests.rs:96`, `:142` | `spawn_process_loss_creator` unix/windows | already gated: `spawning()` |
+- [x] 4.2 Add `every_child_creation_takes_the_gate`: each construction's
+      innermost enclosing function must contain a spawn-gate token
+      (`spawning`, `child_creation`, `locking`, `excluding_spawns`), except
+      Windows-only functions/files and the builder
+      `provision::isolated_command` — verify with a permanent synthetic
+      negative test (`the_child_creation_scan_reports_an_ungated_construction`)
+      in place of the earlier throwaway fixture, plus the real-tree run.
+      Observed: both tests pass in the `spawn_gate` lib run above. The
+      real-tree scan asserts it saw more than 15 constructions and zero
+      ungated. Before the hostname helper was gated, the same scan reported
+      `store/engine_contract_tests.rs` `os_hostname` as ungated, which is
+      the find recorded in 4.1.
+- [x] 4.3 Confirm no quarantine assertion changes — verify with
+      `git diff origin/main -- packages/kuru-memory/src/store/creation_template/`
+      showing no change.
+      Observed: the literal command is no longer empty, because
+      `origin/main` advanced four commits past this branch's base
+      (`0e562595`): main's new commits edit `creation_template/hooks.rs`
+      (6 lines) and add 171 lines to `creation_template/open_tests.rs`.
+      What this change itself does:
+      `git diff 0e562595 -- packages/kuru-memory/src/store/creation_template/`
+      is empty, `git log origin/main..HEAD -- …/creation_template/` lists no
+      commit, and the working tree has no diff there. The quarantine tests
+      are untouched by this change. The branch needs a rebase onto main
+      before merge; after it, re-run `every_child_creation_takes_the_gate`
+      against main's new `server.rs`/`engine.rs` lines.
 
 ## 5. Local verification
 
-- [ ] 5.1 Run `mise run //packages/kuru-memory:test -- store::creation_template::`
-      and the full `//packages/kuru-memory:test` locally and record the
-      pass count (this cannot reproduce the cross-binary race on demand,
-      per #155's own prior finding; it confirms no regression, not the
-      race's absence) — verify by reading the test binary's own summary
-      line.
-- [ ] 5.2 Run `mise run format:check`, `//packages/kuru-memory:lint`,
+- [x] 5.1 Run `mise run //packages/kuru-memory:test` (the full package
+      task, `RUST_TEST_THREADS=2`) and record each binary's summary line.
+      This run cannot reproduce the cross-test race on demand; it shows no
+      regression and no deadlock, not that the race is absent.
+      Observed (macOS host, this worktree, task exit 0), in binary order:
+      - unittests `src/lib.rs`: ok, 596 passed, 0 failed, 6 ignored, 850.18 s
+      - unittests `src/main.rs`: ok, 0 tests
+      - unittests `tests/fixtures/parent.rs`: ok, 0 tests
+      - `tests/bundle_build.rs`: ok, 10 passed, 0.06 s
+      - `tests/memory.rs`: ok, 5 passed, 3.55 s
+      - `tests/server_lifecycle.rs`: ok, 12 passed, 28.96 s
+      - `tests/supervisor_snapshot.rs`: ok, 1 passed, 2.58 s
+      - `tests/windows_lifecycle.rs`: ok, 0 tests on this host
+      Note: a second full run of this package, started by another session
+      on the same machine shortly before this one, reported
+      `test_support::template::tests::concurrent_processes_create_one_template`
+      FAILED at the `["Created", "Reused"]` assertion (`template.rs:1032`;
+      595 passed, 1 failed). Only its filtered summary lines were
+      captured, not the assertion's diagnostics. The test passed in this
+      run and in five further isolated runs (`cargo test … --lib
+      concurrent_processes_create_one_template`, 5/5). Inferred, not
+      measured: this session's `mise run //packages/kuru-memory:test`
+      rebuilt the lib test binary at the same `target/debug/deps` path
+      while the other run was executing it. The template fingerprint
+      includes a compiled-in digest of `SOURCES`, which lists `server.rs`,
+      and this change edits `server.rs`, so the rebuilt binary carries a
+      different digest. That test's child re-executes `current_exe()`:
+      the running parent kept its old digest (memoised per process) while
+      the child, now the new binary, computed the new one, giving two
+      "Created" outcomes. The prepared supervisor snapshot, also a
+      fingerprint input, may have been replaced the same way. This is the
+      concurrent-Cargo hazard AGENTS.md names, triggered by two runs in
+      one target directory; it is not a defect in the gate. Not re-run
+      concurrently to confirm.
+      The 596-test run compiled before two later edits: the rustfmt wraps
+      and the `#[cfg(unix)]` on `Exclusive::gate` recorded under 5.2. Both
+      are behaviour-neutral on Unix (whitespace; an attribute on a field
+      that is always present there); `spawn_gate` (8/8), lint, Windows
+      lint, typecheck and format were re-run on the final bytes.
+- [x] 5.2 Run `mise run format:check`, `//packages/kuru-memory:lint`,
       `//packages/kuru-memory:lint:windows`, and
-      `//packages/kuru-memory:typecheck` and confirm each passes — verify
-      by reading each command's exit code. Name any check not run and why.
+      `//packages/kuru-memory:typecheck`, confirm each passes, and name any
+      check that was not run.
+      Observed: `format:check` first failed on two rustfmt wraps in
+      `spawn_gate.rs`'s new tests; fixed with `format:fix`, then exit 0.
+      `lint:windows` first failed: `field gate is never read` on
+      `spawn_gate::Exclusive` for the Windows target, because the field is
+      only read inside `#[cfg(unix)]` release calls; the field and its
+      initialiser are now `#[cfg(unix)]` too, matching the module's
+      Windows no-op shape. After that: `//packages/kuru-memory:lint` exit
+      0, `//packages/kuru-memory:lint:windows` exit 0,
+      `//packages/kuru-memory:typecheck` exit 0, `format:check` exit 0;
+      `cargo test -p kuru-memory --lib spawn_gate` re-run after the field
+      change: 8 passed. Not run: `coverage` (CI-enforced, not a hook),
+      the Linux and Windows native test legs (CI), and
+      `mise run cospec -- apply` in this session (its status before the
+      session resumed is unknown here).

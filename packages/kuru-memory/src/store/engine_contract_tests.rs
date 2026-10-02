@@ -277,15 +277,20 @@ async fn os_hostname() -> Result<String> {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 async fn os_hostname() -> Result<String> {
-    let output = tokio::time::timeout(
-        QUERY_TIMEOUT,
+    let child = {
+        // Held across child creation only; see `crate::spawn_gate`.
+        let _creation = crate::spawn_gate::child_creation().await;
         tokio::process::Command::new("/bin/hostname")
             .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .context("/bin/hostname: deadline exceeded")??;
+            .spawn()
+            .context("start /bin/hostname")?
+    };
+    let output = tokio::time::timeout(QUERY_TIMEOUT, child.wait_with_output())
+        .await
+        .context("/bin/hostname: deadline exceeded")??;
     ensure!(output.status.success(), "/bin/hostname failed: {output:?}");
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
