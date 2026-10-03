@@ -142,14 +142,21 @@ pub async fn read_asset(base: &str, name: &str, limit: usize) -> Result<Vec<u8>>
     }
 }
 
-/// The production client for release assets. There is deliberately no total
-/// timeout: connection setup and every read are bounded, and the caller's byte
-/// limit bounds how many reads a transfer can take.
+/// The timeout shape shared by every release download client. There is
+/// deliberately no total timeout: connection setup and every read are bounded,
+/// and the caller's byte limit bounds how many reads a transfer can take.
+/// Production passes [`CONNECT_TIMEOUT`] and [`READ_IDLE_TIMEOUT`]; tests pass
+/// small bounds and reach a local HTTP fixture by leaving out `https_only`.
+pub(crate) fn bounded_builder(connect: Duration, idle: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .read_timeout(idle)
+}
+
+/// The production client for release assets.
 fn release_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    Ok(bounded_builder(CONNECT_TIMEOUT, READ_IDLE_TIMEOUT)
         .https_only(true)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_IDLE_TIMEOUT)
         .build()?)
 }
 

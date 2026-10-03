@@ -655,13 +655,11 @@ mod download_timeouts {
     const OLD_TOTAL: Duration = Duration::from_millis(400);
     const BOUND: Duration = Duration::from_secs(5);
 
-    /// The production shape with small values, without `https_only` so the
-    /// local HTTP fixture is reachable.
+    /// The production builder with small bounds, without `https_only` so the
+    /// local HTTP fixture is reachable, and without a system proxy.
     fn idle_client(idle: Duration) -> reqwest::Client {
-        reqwest::Client::builder()
+        bounded_builder(Duration::from_secs(1), idle)
             .no_proxy()
-            .connect_timeout(Duration::from_secs(1))
-            .read_timeout(idle)
             .build()
             .unwrap()
     }
@@ -689,7 +687,9 @@ mod download_timeouts {
 
     #[tokio::test]
     async fn the_old_flat_total_cuts_off_the_same_slow_transfer() {
-        // The defect: a whole-request timeout fails a healthy slow link.
+        // The defect's shape, in a client this test builds: a whole-request
+        // timeout fails a healthy slow link. The production builder is covered
+        // by the idle-bound tests above and below, not by this one.
         let server = PacedServer::start(Pace::Trickle {
             chunks: CHUNKS,
             gap: GAP,

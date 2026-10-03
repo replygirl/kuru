@@ -31,11 +31,15 @@ failed, so the user sees only "update failed". This is fixed-wait audit unit U2
   `tooling` feature, while `archive` is compiled into the shipped `kuru`
   binary without it, so `archive` cannot import from `bundle`. There is still
   one definition. `bundle/build.rs` keeps its literals (out of scope).
-- Each site's builder is factored: `archive::release_client()` and
-  `published::published_client()` build the production clients
-  (`https_only`, both bounds; published keeps `no_proxy`,
+- The timeout shape lives in one builder: `archive::bounded_builder(connect,
+  idle)` sets the connect and read-idle bounds and nothing else, and
+  `published::published_builder(connect, idle)` extends it with `no_proxy`,
   `redirect(Policy::limited(5))` and the `kuru-published-release-client` user
-  agent). `archive::download(client, url, limit)` and
+  agent. `archive::release_client()` and `published::published_client()` call
+  those builders with `CONNECT_TIMEOUT` and `READ_IDLE_TIMEOUT` and add only
+  `https_only`. Tests build their clients from the same builders with small
+  bounds and without `https_only`, so reverting the production timeout shape
+  fails the idle-bound tests. `archive::download(client, url, limit)` and
   `published::send(request)` + `bounded_body` take the client (or a request
   built from it) by injection, and `PublicGitHub::with_client` lets tests
   construct the reader with their own client. Production never builds a client
@@ -55,7 +59,7 @@ failed, so the user sees only "update failed". This is fixed-wait audit unit U2
 
 ## Impact
 
-- `packages/kuru-delivery/src/archive.rs`: constants, `release_client`,
+- `packages/kuru-delivery/src/archive.rs`: constants, `bounded_builder`, `release_client`,
   `download`, phase contexts; test-only `archive/paced_http.rs` fixture
   module (shared with `published.rs` tests) and new tests in `archive/tests.rs`.
 - `packages/kuru-delivery/src/published.rs`: `published_client`,

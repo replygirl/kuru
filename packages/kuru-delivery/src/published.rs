@@ -3,7 +3,7 @@
 use crate::{archive, release};
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::{
-    Client, RequestBuilder, Response, Url,
+    Client, ClientBuilder, RequestBuilder, Response, Url,
     header::{AUTHORIZATION, HeaderValue, LINK},
     redirect::Policy,
 };
@@ -11,6 +11,7 @@ use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
+    time::Duration,
 };
 
 pub(crate) const REPOSITORY: &str = "replygirl/kuru";
@@ -196,18 +197,23 @@ impl PublicGitHub {
     }
 }
 
-/// The production client for published release reads. There is deliberately
-/// no total timeout: connection setup and every read are bounded, and each
-/// caller's byte limit bounds how many reads a response can take.
-fn published_client() -> Result<Client> {
-    Ok(Client::builder()
-        .https_only(true)
+/// The published release client's settings on the shared release download
+/// timeout shape (no total timeout; each caller's byte limit bounds how many
+/// reads a response can take). Tests pass small bounds and omit `https_only`.
+fn published_builder(connect: Duration, idle: Duration) -> ClientBuilder {
+    archive::bounded_builder(connect, idle)
         .no_proxy()
         .redirect(Policy::limited(5))
-        .connect_timeout(archive::CONNECT_TIMEOUT)
-        .read_timeout(archive::READ_IDLE_TIMEOUT)
         .user_agent("kuru-published-release-client")
-        .build()?)
+}
+
+/// The production client for published release reads.
+fn published_client() -> Result<Client> {
+    Ok(
+        published_builder(archive::CONNECT_TIMEOUT, archive::READ_IDLE_TIMEOUT)
+            .https_only(true)
+            .build()?,
+    )
 }
 
 /// Send one published release request, naming that phase if it fails. An
@@ -1412,7 +1418,6 @@ mod tests {
     mod download_timeouts {
         use super::*;
         use crate::archive::paced_http::{Pace, PacedServer};
-        use std::time::Duration;
 
         const IDLE: Duration = Duration::from_millis(500);
         const GAP: Duration = Duration::from_millis(50);
@@ -1420,16 +1425,11 @@ mod tests {
         const OLD_TOTAL: Duration = Duration::from_millis(400);
         const BOUND: Duration = Duration::from_secs(5);
 
-        /// The production shape with small values, without `https_only` so
+        /// The production builder with small bounds, without `https_only` so
         /// the local HTTP fixture is reachable.
         fn github(idle: Duration) -> PublicGitHub {
             PublicGitHub::with_client(
-                Client::builder()
-                    .no_proxy()
-                    .redirect(Policy::limited(5))
-                    .connect_timeout(Duration::from_secs(1))
-                    .read_timeout(idle)
-                    .user_agent("kuru-published-release-client")
+                published_builder(Duration::from_secs(1), idle)
                     .build()
                     .unwrap(),
                 None,
