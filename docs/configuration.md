@@ -499,6 +499,12 @@ Other tool calls from the same pre-discovery provider response also settle
 without effects. An approved read or search can return its reviewed result.
 An unsafe approval record still permits an explicit once choice, while
 persistent approval requires revoking or repairing that record first.
+When the operating system refuses or fails to read the record or its data
+directory, for example after a permission change, status names that error
+instead of reporting invalid state. Approving again would repeat the same
+read, so restore the owner's access to the record or data directory and retry.
+A record that becomes unreadable while a nested review is pending fails that
+publication with the read error.
 
 The activation sets are command-specific:
 

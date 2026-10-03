@@ -1882,10 +1882,13 @@ pub(crate) fn manifest_text(
     );
     if let Some(state) = state {
         let label = match state {
-            ApprovalState::Absent => "not approved",
-            ApprovalState::Matching => "approved",
-            ApprovalState::Stale => "approval does not match the current manifest",
-            ApprovalState::Invalid => "approval state is invalid or unsafe",
+            ApprovalState::Absent => "not approved".to_owned(),
+            ApprovalState::Matching => "approved".to_owned(),
+            ApprovalState::Stale => "approval does not match the current manifest".to_owned(),
+            ApprovalState::Invalid => "approval state is invalid or unsafe".to_owned(),
+            ApprovalState::Unreadable(failure) => format!(
+                "approval record could not be read ({failure}); fix the permissions of the approval record or the Kuru data directory, then retry"
+            ),
         };
         text.push_str(&format!("\nStatus: {label}"));
     }
