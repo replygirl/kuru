@@ -20,3 +20,10 @@
 - [x] 4.1 Require the neutral prefix `managed owner retirement did not complete within 10 seconds`, no `idle managed owner`, and `no endpoint record present` in the three elapsed-bound tests, and verify they fail with the old text
 - [x] 4.2 Change `retire_idle_service`'s expiry prefix and the opening reading's endpoint clause, refresh the `docs/development.md` sentence that quotes them, and verify the three tests pass three times
 - [x] 4.3 Relabel the occurrence's "published" reading as inferred (Drop panic discards the test's outcome; option A not excluded) and record the undelivered close-phase stamps in the proposal
+
+## 5. Decision (b): wait on the owner lock release under the close budget
+
+- [x] 5.1 Add `a_retirement_behind_a_close_held_past_ten_seconds_completes_within_its_close_budget` (owner held at `ClosePoint::AfterReap` past the former 10 s, released within the close budget) and make the three elapsed-bound tests require the close budget's expiry (budget, time since the first closing reading, owner state); verify all four fail on 20e6189d's flat 10 s
+- [x] 5.2 Stamp the first closing reply on `MaintenanceTrace` (test-support only) and replace the flat 10 s in `retire_idle_service`: ask under the retained 10 s with the active-client refusal loop, then wait on `await_owner_release` on its own thread and runtime under `close_budget()` from the first closing reading, then take the permit under the same backstop; verify the four tests pass three times and the full kuru-memory suite passes
+- [x] 5.3 Confirm `ServiceCleanup::retire` (PTY and ConPTY) and mise acceptance `retire_blocking` are bounded by the retirement's own backstop, document it on both, update `docs/development.md`, and record option (c) as a separate PR
+- [x] 5.4 Run the terminal test three times and the static checks, and record the results in verification.md

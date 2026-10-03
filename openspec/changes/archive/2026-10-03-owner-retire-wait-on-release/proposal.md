@@ -57,7 +57,7 @@ reported, not made.
 - A test-support-only `service::activity::inspect` reads the open-activity
   record under its name whatever its tag, for that diagnostic only. It decides
   nothing; the record still grants no authority.
-- The flat 10 s is unchanged. The missing outer backstop is documented on
+- (Superseded by the Decision below.) The flat 10 s is unchanged. The missing outer backstop is documented on
   `retire_idle_service`, with the candidate shapes recorded for the lead in the
   handoff notes. No product close, election, lock or record behaviour changes;
   no retry, sleep or bound is added.
@@ -75,6 +75,51 @@ change cannot adopt without them: `close_budget()` (32 s), counted from a
 close-start stamp the owner records, around an event wait on the owner's lock
 release.
 
+## Decision: the bound (option b, amended 2026-10-03)
+
+The lead decided option (b) after the BLOCKED report above, and this change
+now also lands it (amended in place; no new change):
+
+- `retire_idle_service` asks through the maintenance acquisition as before,
+  keeping the active-client refusal loop (retry with a 20 ms backoff while
+  the owner refuses with attached clients). That asking phase keeps the former
+  10 s as its bound, named `ANSWERING_OWNER_BOUND`: it is retained, not
+  derived, and now covers only an owner that has not shown it is closing (a
+  client still attached, the start lock held, or no reply yet).
+- At the first retirement reply that shows the owner closing (no live
+  endpoint or a connection the owner closed unanswered, as the lead named, and
+  also an accepted retirement request, which is the same close and would
+  otherwise still be policed by the 10 s), it drops the acquisition and waits
+  on the owner lock's release event (`await_owner_release`, no deadline by
+  design) under one backstop: `server::close_budget()` (`CLOSE_GRACE` 8 s +
+  `KILL_GRACE` 3 s + `SUPERVISOR_REAP_ALLOWANCE` 13 s + `CLOSE_GRACE` 8 s =
+  32 s, the product's own derived close budget) counted from that first
+  reading, a lower bound of the close's age. The reading is stamped on the
+  existing `MaintenanceTrace` (test-support only field and signal); product
+  messages and behaviour are unchanged.
+- The lock wait cannot be cancelled, so it runs on its own thread with its own
+  current-thread runtime, as the terminal tests' `await_owner_exit` does; the
+  async side waits on a oneshot under `timeout_at(backstop)`. At the backstop
+  the retirement fails and the blocked thread ends with the process (or once
+  the owner lets go). No retry and no sleep are in the release path.
+- After the release, the maintenance permit is taken and dropped once more
+  under the same backstop, so the completion proof is unchanged.
+- The backstop's expiry names the budget, the time since the first closing
+  reading and which reading it was, the owner's state from #197's readings
+  (published / still opening at stage X / failed open closing / closing with
+  records retired / unreadable), the trace and the refusal count.
+- Because the bound lives inside `retire_idle_service`, every caller is
+  bounded without an outer backstop: `ServiceCleanup::retire` (the PTY and
+  ConPTY terminal tests) and mise acceptance `retire_blocking` keep their
+  thread-and-join shape, whose join now ends by that backstop, and the
+  runtime callers (`dream.rs`, `accounting_tests.rs`) are unchanged.
+
+Not in this change: option (c), deriving the product maintenance permit's
+own election deadline (`startup_timeout_secs`, 30 s by default, shorter than
+the 32 s close budget) from `close_budget()`. It changes product maintenance
+behaviour and is a separate PR. Close-phase stamps (see "Not delivered") are
+still not added.
+
 ## Capabilities
 
 ### New Capabilities
@@ -87,7 +132,13 @@ unchanged.
 ## Impact
 
 - `packages/kuru-memory/src/test_support.rs`: `retire_idle_service` expiry text,
-  new `owner_state`, the existing elapsed-bound test's assertion.
+  new `owner_state`, the existing elapsed-bound test's assertion; (decision b)
+  the event wait on the owner lock release under `close_budget()`.
+- `packages/kuru-memory/src/service.rs`: (decision b) the trace's test-support
+  first-closing-reading stamp and signal.
+- `apps/kuru-tui/tests/support/memory.rs`,
+  `packages/kuru-delivery/tests/support/mise_acceptance.rs`: (decision b) doc
+  comments only; their joins are bounded by the retirement's backstop.
 - `packages/kuru-memory/src/service/activity.rs`: test-support `inspect` and
   `describe_stage`; two regression tests.
 - Docs: `docs/development.md` (fixture retirement).
