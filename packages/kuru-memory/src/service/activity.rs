@@ -665,11 +665,10 @@ impl Feed {
         drop(self.sender);
         Publisher {
             task: Some(self.task),
+            last: None,
             target: self.target,
             #[cfg(test)]
             written: self.written,
-            #[cfg(test)]
-            published: self.stages.len(),
         }
     }
 }
@@ -774,17 +773,30 @@ async fn publish(
 /// The finished publisher of one owner's record, kept until the owner retires
 /// that record within its own close or failed open.
 pub(crate) struct Publisher {
-    /// The publisher's task until it is joined, by a failing mark or by
-    /// retirement.
+    /// The publisher's task until it is joined: before its owner's endpoint
+    /// retires, by a failing mark or by retirement, whichever comes first.
     task: Option<tokio::task::JoinHandle<Activity>>,
+    /// The last activity the joined task saw, whether or not its write
+    /// succeeded; `None` before the join or when the task did not return.
+    last: Option<Activity>,
     target: Target,
     #[cfg(test)]
     written: watch::Receiver<usize>,
-    #[cfg(test)]
-    published: usize,
 }
 
 impl Publisher {
+    /// Await the publisher's last write. Its task ends once its open has
+    /// ended and the latest activity was written, or a write after the open
+    /// failed; it never rewrites or waits for spacing after its open, so this
+    /// waits only for the write in flight and the open's last activity.
+    /// Afterwards the record changes only by a failing mark or retirement.
+    /// Idempotent.
+    pub(crate) async fn finish_writes(&mut self) {
+        if let Some(task) = self.task.take() {
+            self.last = task.await.ok();
+        }
+    }
+
     /// Mark the record failing with `reason`, for an owner whose store opened
     /// but which ends before its starter attached. Joins the publisher, then
     /// writes its last activity once more with the failing mark and `reason`,
@@ -794,10 +806,8 @@ impl Publisher {
     /// verified owner authority, since the write replaces whatever record
     /// holds the name.
     pub(crate) async fn mark_failing(&mut self, reason: &str) -> bool {
-        let Some(task) = self.task.take() else {
-            return false;
-        };
-        let Ok(last) = task.await else {
+        self.finish_writes().await;
+        let Some(last) = self.last.clone() else {
             return false;
         };
         let Target {
@@ -818,22 +828,10 @@ impl Publisher {
 impl Publisher {
     /// Join the publisher's task and return the last activity it saw.
     pub(crate) async fn join(mut self) -> Result<Activity> {
-        Ok(self
-            .task
-            .take()
-            .context("the publisher was already joined")?
-            .await?)
-    }
-
-    /// Wait until the publisher wrote every stage its open handed it.
-    pub(crate) async fn settled(&self) -> Result<()> {
-        let published = self.published;
-        self.written
-            .clone()
-            .wait_for(|written| *written >= published)
-            .await
-            .map(|_| ())
-            .context("the publisher stopped before writing every stage")
+        match self.task.take() {
+            Some(task) => Ok(task.await?),
+            None => self.last.context("the joined publisher did not return"),
+        }
     }
 
     /// Wait until the publisher's task has returned, so the record holds
@@ -995,18 +993,16 @@ pub(crate) async fn open_owner_store(
 /// leaving a record with any other tag in place. Call only while holding the
 /// owner lock, after the publisher's open has ended. Best effort: no failure
 /// here can fail a close or change an open's outcome.
-pub(crate) async fn retire(publisher: Publisher, data_dir: &Path, scope: &str) {
+pub(crate) async fn retire(mut publisher: Publisher, data_dir: &Path, scope: &str) {
+    // The task ends with its open. Joining it first means no late write can
+    // recreate the record after its retirement; an owner's close joined it
+    // before its endpoint retired, and a failing mark joined it and awaited
+    // its own write.
+    publisher.finish_writes().await;
     let Publisher {
-        task,
         target: Target { tag, .. },
         ..
     } = publisher;
-    // The task ends with its open. Joining it first means no late write can
-    // recreate the record after its retirement; a failing mark has already
-    // joined it and awaited its own write.
-    if let Some(task) = task {
-        let _ = task.await;
-    }
     let Ok(directory) = directory(data_dir, scope) else {
         return;
     };
@@ -1154,6 +1150,14 @@ mod tests {
         let root = tempfile::tempdir()?;
         let data = root.path().join("private");
         Ok((root, data, format!("project/{}", "a".repeat(64))))
+    }
+
+    /// Whether the record's name holds an object, or why that could not be
+    /// determined: a failed lookup is never read as an absent record.
+    fn record_named(data: &Path, scope: &str) -> Result<bool> {
+        let path = directory(data, scope)?.join(RECORD);
+        path.try_exists()
+            .with_context(|| format!("look up the activity record {}", path.display()))
     }
 
     fn received(progress: &mut MemoryOpenProgress) -> Vec<MemoryOpenStage> {
@@ -1746,9 +1750,12 @@ mod tests {
         ensure!(read_stages(&data, &scope, &foreign)? == [PreparingDatabase]);
         write_record(&directory, &own, &staged(&[PreparingDatabase]))?;
         retire_record(&directory, &own)?;
-        ensure!(!directory.join(RECORD).exists(), "the own record remained");
         ensure!(
-            !directory.join(RETIRED_RECORD).exists(),
+            !directory.join(RECORD).try_exists()?,
+            "the own record remained"
+        );
+        ensure!(
+            !directory.join(RETIRED_RECORD).try_exists()?,
             "the staged record remained"
         );
         Ok(())
@@ -1772,7 +1779,7 @@ mod tests {
         // Removal of the staged record may wait for these readers.
         retire_record(&directory, &tag)?;
         ensure!(
-            read_stages(&data, &scope, &tag).is_err(),
+            observe(&data, &scope, &tag) == Observation::Absent,
             "the name kept the record"
         );
         write_record(&directory, &tag, &staged(&[CreatingDatabase]))?;
@@ -1819,7 +1826,7 @@ mod tests {
         .await
         .context("the publisher did not write within ten seconds")??;
         retire(feed.finish(), &data, &scope).await;
-        ensure!(!directory(&data, &scope)?.join(RECORD).exists());
+        ensure!(!record_named(&data, &scope)?);
         Ok(())
     }
 
@@ -1844,7 +1851,7 @@ mod tests {
             let (store, publisher) = open_owner_store(options, hooks).await?;
             let publisher = publisher.context("a tokened owner started no publisher")?;
             ensure!(
-                !directory(&data, &scope)?.join(RECORD).exists(),
+                !record_named(&data, &scope)?,
                 "a write passed the closed gate"
             );
             gate.close();
@@ -1869,7 +1876,7 @@ mod tests {
                 owner.activity.is_none(),
                 "an untokened owner started a publisher"
             );
-            ensure!(!directory(&data, &scope)?.join(RECORD).exists());
+            ensure!(!record_named(&data, &scope)?);
             owner.close().await
         })
         .await
@@ -1888,13 +1895,17 @@ mod tests {
             let tag = activity_tag(&token);
             let _gate = crate::spawn_gate::spawning().await;
             let owner = ServiceOwner::open(options.clone(), &project).await?;
+            // The publisher's last write follows its open: only its end, not
+            // its stages, leaves the record settled for an exact read.
             owner
                 .activity
                 .as_ref()
                 .context("a tokened owner kept no publisher")?
-                .settled()
-                .await?;
-            ensure!(!read_stages(&data, &scope, &tag)?.is_empty());
+                .ended()
+                .await;
+            let published = read_activity(&data, &scope, &tag)
+                .context("read the opened owner's settled record")?;
+            ensure!(!published.stages.is_empty(), "{published:?}");
             let pause =
                 ClosePause::at_each(&[ClosePoint::AfterEndpointRetire, ClosePoint::AfterReap]);
             let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
@@ -1903,14 +1914,16 @@ mod tests {
             drop(attach_raw(&data, &scope, None).await?);
             pause.entered.notified().await;
             ensure!(EndpointRecord::read(&data, &scope)?.is_none());
+            let retiring = read_activity(&data, &scope, &tag)
+                .context("the record was unreadable after the endpoint retired")?;
             ensure!(
-                read_stages(&data, &scope, &tag).is_ok(),
-                "the record was retired before the endpoint"
+                retiring == published,
+                "the record changed after the endpoint retired: {retiring:?}"
             );
             pause.release.notify_one();
             pause.entered.notified().await;
             ensure!(
-                !directory(&data, &scope)?.join(RECORD).exists(),
+                !record_named(&data, &scope)?,
                 "the record outlived the store close"
             );
             ensure!(
@@ -1924,6 +1937,90 @@ mod tests {
         })
         .await
         .with_context(|| format!("record retirement fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    // The publisher's last write follows its open on its own task. A close
+    // awaits it before retiring the endpoint, so a starter whose attach
+    // fails then reads a settled record and never a late replacement. Here
+    // every write waits at a gate until the listener has dropped: the close
+    // must not retire the endpoint while that write is pending.
+    #[tokio::test]
+    async fn the_publishers_last_write_lands_before_the_endpoint_retires() -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, mut options) = owner_fixture(root.path())?;
+            let token = Uuid::new_v4();
+            options.starter_token = Some(token);
+            let tag = activity_tag(&token);
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let hooks = OwnerHooks {
+                writes: Writes {
+                    gate: Some(Arc::clone(&gate)),
+                    ..Writes::default()
+                },
+                ..OwnerHooks::default()
+            };
+            let _spawning = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open_with_activity(options.clone(), &project, hooks).await?;
+            let written = owner
+                .activity
+                .as_ref()
+                .context("a tokened owner kept no publisher")?
+                .written
+                .clone();
+            ensure!(
+                !record_named(&data, &scope)?,
+                "a write passed the closed gate"
+            );
+            let pause = ClosePause::at_each(&[
+                ClosePoint::AfterListenerDrop,
+                ClosePoint::AfterEndpointRetire,
+                ClosePoint::AfterReap,
+            ]);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(Arc::clone(&pause));
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &scope, None).await?);
+            pause.entered.notified().await;
+            ensure!(
+                written.has_changed().is_ok() && !record_named(&data, &scope)?,
+                "the gated publisher ended before the close began"
+            );
+            // Released before the gate opens: a close that retires its
+            // endpoint without awaiting the publisher reaches the next pause
+            // in this same scheduler pass, before the gated write can run.
+            pause.release.notify_one();
+            gate.add_permits(1);
+            pause.entered.notified().await;
+            let ended = written.has_changed().is_err();
+            let endpoint = EndpointRecord::read(&data, &scope).map(|record| record.is_none());
+            let retiring = read_activity(&data, &scope, &tag);
+            pause.release.notify_one();
+            pause.entered.notified().await;
+            let reaped = record_named(&data, &scope);
+            pause.release.notify_one();
+            served.await??;
+            ensure!(
+                ended,
+                "the endpoint retired while the publisher was writing"
+            );
+            ensure!(endpoint?, "the endpoint was not retired");
+            let retiring =
+                retiring.context("the record was unreadable after the endpoint retired")?;
+            ensure!(
+                !retiring.stages.is_empty() && retiring.progress > 0 && retiring.failure.is_none(),
+                "the record lacked its open's last activity: {retiring:?}"
+            );
+            ensure!(!reaped?, "the record outlived the store close");
+            ensure!(owner_lock_free(&options)?);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("last-write ordering fixture exceeded its {deadline:?} deadline")
+        })?
     }
 
     // An open that fails after starting its engine marks its record failing,
@@ -1990,7 +2087,7 @@ mod tests {
                 "{error:#}"
             );
             ensure!(
-                !directory(&data, &scope)?.join(RECORD).exists(),
+                !record_named(&data, &scope)?,
                 "the failed open left its record"
             );
             Ok::<(), anyhow::Error>(())
@@ -2075,7 +2172,7 @@ mod tests {
             .err()
             .context("the fixture owner opened despite its fault")?;
         ensure!(
-            !directory(&data, &scope)?.join(RECORD).exists(),
+            !record_named(&data, &scope)?,
             "a failed open left its record"
         );
         Ok(error)
@@ -2170,7 +2267,7 @@ mod tests {
                 "the owner lock was free before the store closed"
             );
             ensure!(
-                !directory(&data, &scope)?.join(RECORD).exists(),
+                !record_named(&data, &scope)?,
                 "the record outlived the owner's ending"
             );
             ensure!(owner_lock_free(&options)?);
@@ -2284,7 +2381,7 @@ mod tests {
                 "the owner lock was free before the store closed"
             );
             ensure!(
-                !directory(&data, &scope)?.join(RECORD).exists(),
+                !record_named(&data, &scope)?,
                 "the record outlived the owner's ending"
             );
             ensure!(owner_lock_free(&options)?);
@@ -2335,7 +2432,7 @@ mod tests {
             let retiring = observe(&data, &scope, &tag);
             pause.release.notify_one();
             pause.entered.notified().await;
-            let reaped = directory(&data, &scope).map(|directory| directory.join(RECORD).exists());
+            let reaped = record_named(&data, &scope);
             let lock_free = owner_lock_free(&options);
             pause.release.notify_one();
             served.await??;
@@ -2635,7 +2732,7 @@ mod tests {
             })
             .await?;
             ensure!(seen == [StartingMemoryService, Ready], "{seen:?}");
-            ensure!(!directory(&data, &scope)?.join(RECORD).exists());
+            ensure!(!record_named(&data, &scope)?);
             memory.close().await?;
             await_managed_quiescence(&options).await
         })

@@ -2146,7 +2146,8 @@ impl ServiceOwner {
     }
 
     /// Close only after accepted requests and client attachments have
-    /// drained: stop accepting, retire the endpoint, close the store (its
+    /// drained: stop accepting, await the activity publisher's last write,
+    /// retire the endpoint, close the store (its
     /// write drain and the Dolt reap, which ends the lifecycle lease), and
     /// only then release owner authority. A crash instead leaves a stale
     /// record which a successor reconciles only after obtaining owner and
@@ -2173,7 +2174,7 @@ impl ServiceOwner {
             listener,
             record,
             data_dir,
-            activity,
+            mut activity,
             ..
         } = self;
         #[cfg(test)]
@@ -2181,6 +2182,14 @@ impl ServiceOwner {
         drop(listener);
         #[cfg(test)]
         ClosePause::reached(pause, ClosePoint::AfterListenerDrop).await;
+        // The publisher's last write follows its open on its own task, and
+        // nothing before here waited for it. Awaiting it now, as retirement
+        // already would, means that once the endpoint is gone the record
+        // changes only by its failing mark or its retirement: a starter whose
+        // attach then fails reads a settled record, never a late replacement.
+        if let Some(publisher) = activity.as_mut() {
+            publisher.finish_writes().await;
+        }
         let retired = record.retire(&data_dir, &lock);
         #[cfg(test)]
         ClosePause::reached(pause, ClosePoint::AfterEndpointRetire).await;

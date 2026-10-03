@@ -713,7 +713,10 @@ fails or delays the open. The owner always replaces it by publishing a complete
 staged record over its name, and retires it (rename, then remove) inside its
 close, after the endpoint is retired and before the store closes (after it,
 when it marked the record failing as above), and on every error return of its
-open. Two hooks, read only by
+open. The publisher's last write follows the open on its own task, so the
+close awaits it after the listener drops and before the endpoint is retired:
+from then on the record changes only by its failing mark or its retirement,
+and a starter whose attach fails never reads a late replacement. Two hooks, read only by
 the owner process under `test`/`test-support` (Windows owners receive them by
 explicit forwarding), let tests follow events instead of sleeping:
 `KURU_TEST_MEMORY_ACTIVITY_WRITE_FAILURE=1` makes every record write fail, and
