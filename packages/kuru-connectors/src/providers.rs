@@ -31,7 +31,9 @@ mod sse;
 mod subscription_tests;
 
 const SUBSCRIPTION_BASE: &str = "https://chatgpt.com/backend-api/codex";
-const COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
+/// Total budget of one completion operation, across retries, rotation and the
+/// whole response stream (docs/protocols.md).
+pub const COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
 // This describes the audited catalog wire contract, not Kuru's identity.
 const CATALOG_COMPATIBILITY: &str = "0.154.0";
 
@@ -1231,7 +1233,7 @@ impl ResponsesProvider {
         let response = self.send(builder, operation, budget).await?;
         let response = sse::response(
             response,
-            crate::IO_TIMEOUT,
+            crate::STREAM_IDLE_TIMEOUT,
             operation,
             self.is_subscription(),
             sink,

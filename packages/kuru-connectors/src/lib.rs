@@ -54,9 +54,9 @@ pub use permissions::{
     PermissionOutcome, PermissionService, PersistentGrant,
 };
 pub use providers::{
-    ContextPrefixEstimate, DemoProvider, Provider, ProviderEvent, ProviderFailureKind,
-    ProviderReasoningSummary, ProviderSink, ResponsesProvider, TextDeltaSource, collect_completion,
-    largest_fitting_context_prefix, provider,
+    COMPLETION_TIMEOUT, ContextPrefixEstimate, DemoProvider, Provider, ProviderEvent,
+    ProviderFailureKind, ProviderReasoningSummary, ProviderSink, ResponsesProvider,
+    TextDeltaSource, collect_completion, largest_fitting_context_prefix, provider,
 };
 pub use redaction::{
     ProjectionError, json as project_json, text as project_text, truncate_tool_output,
@@ -72,3 +72,17 @@ pub use tools::{
 /// Maximum protocol message/body size; limits also apply to chunked responses.
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Longest silence a streamed completion may hold between wire chunks before
+/// the stream fails; any chunk, including a frame Kuru does not forward,
+/// restarts it.
+///
+/// Derivation: the Responses streaming-events reference documents no
+/// keepalive, heartbeat or inter-event bound for HTTP SSE (developers.openai.com
+/// `api/reference/resources/responses/streaming-events`, read 2026-10-03), and
+/// the background-mode guide states reasoning models "can take several minutes"
+/// on complex problems, so silent reasoning between events is expected. The
+/// vendor's own Responses client documents a 300000 ms default SSE idle timeout
+/// (Codex configuration reference, `model_providers.<id>.stream_idle_timeout_ms`,
+/// read 2026-10-03). Kuru adopts that client default as its product silence
+/// budget; it is not a server guarantee. The total remains [`COMPLETION_TIMEOUT`].
+pub const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
