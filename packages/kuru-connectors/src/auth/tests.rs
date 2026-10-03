@@ -1362,11 +1362,15 @@ async fn stalled_issuer(head: Option<&'static str>) -> (String, tokio::task::Joi
     (issuer, task)
 }
 
-fn short_timeout_manager(temp: &tempfile::TempDir, issuer: &str) -> AuthManager {
+fn short_timeout_manager(
+    temp: &tempfile::TempDir,
+    issuer: &str,
+    http_timeout: Duration,
+) -> AuthManager {
     let project = temp.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
     let mut manager = AuthManager::test_issuer(temp.path().join("data"), project, issuer).unwrap();
-    Arc::get_mut(&mut manager.inner).unwrap().http_timeout = Duration::from_millis(300);
+    Arc::get_mut(&mut manager.inner).unwrap().http_timeout = http_timeout;
     manager
 }
 
@@ -1424,7 +1428,7 @@ async fn auth_transport_failures_distinguish_refused_from_stalled_without_echo()
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let closed = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    let manager = short_timeout_manager(&refused, &closed);
+    let manager = short_timeout_manager(&refused, &closed, Duration::from_millis(300));
     let post_refused = post(&manager).await.unwrap_err();
     let exchange_refused = token_exchange(&manager).await.unwrap_err();
     assert_eq!(
@@ -1440,7 +1444,7 @@ async fn auth_transport_failures_distinguish_refused_from_stalled_without_echo()
 
     let stalled = tempfile::tempdir().unwrap();
     let (issuer, task) = stalled_issuer(None).await;
-    let manager = short_timeout_manager(&stalled, &issuer);
+    let manager = short_timeout_manager(&stalled, &issuer, Duration::from_millis(300));
     let post_stalled = post(&manager).await.unwrap_err();
     let exchange_stalled = token_exchange(&manager).await.unwrap_err();
     task.abort();
@@ -1463,7 +1467,9 @@ async fn auth_response_body_stall_is_reported_as_a_read_timeout_without_echo() {
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{\"response-body-sentinel\":",
     ))
     .await;
-    let manager = short_timeout_manager(&temp, &issuer);
+    // The fixture must answer the head inside the budget before the body
+    // stalls, so this test uses the suite's 2 s precedent, not 300 ms.
+    let manager = short_timeout_manager(&temp, &issuer, Duration::from_secs(2));
     let response = post(&manager).await.unwrap();
     let error = tokio::time::timeout(BOUND, super::http::json_response(response))
         .await
