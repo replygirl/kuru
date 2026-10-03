@@ -19,6 +19,18 @@ provider recovered. Found by the fixed-wait audit of 2026-10-02, §3B rank 5
   failed listing leaves the cell empty, so the next metadata lookup lists
   again; the first successful listing is cached exactly as before (an empty
   `Ok` listing is still cached and is not a failure).
+- Retry cadence: a failed listing records a retry instant
+  `MODEL_CATALOG_RETRY_AFTER` (30 s) ahead, beside the cache. Until then every
+  lookup uses the fallback without calling `models()`, including lookups that
+  were queued on the cell behind the failed attempt. tokio's `OnceCell`
+  releases its permit on an initializer error and the next waiter runs the
+  initializer itself; without the gate, actor asks fanned out with `join_all`
+  would each run a slowly failing listing in turn, the N-th waiting up to N
+  times the connector's 60 s `IO_TIMEOUT` before its completion started, on
+  every turn. With the gate a provider that stays down costs at most one
+  listing attempt (bounded by that 60 s HTTP timeout) per 30 s window, and
+  concurrent lookups wait at most for that one attempt, as they did when the
+  failure was cached.
 - The failure is not propagated. The failing call proceeds with an empty
   catalog, so the existing not-found fallback yields the embedded snapshot or
   the assumed context window and completions keep working.
@@ -54,10 +66,12 @@ session.
 ## Impact
 
 - `packages/kuru-runtime/src/engine.rs`: `Harness` gains
-  `model_catalog_warned: AtomicBool`; `selected_model_metadata` uses
-  `get_or_try_init` and warns once; a new `model_catalog_tests` test module
-  with a fake provider whose `models()` fails twice then succeeds, and the
-  process-wide warning recorder.
+  `model_catalog_warned: AtomicBool` and
+  `model_catalog_retry_at: Mutex<Option<Instant>>`; `selected_model_metadata`
+  uses `get_or_try_init`, skips listing inside the retry window and warns
+  once; a new `model_catalog_tests` test module with a fake provider whose
+  `models()` fails a set number of times (optionally after a delay) then
+  succeeds, and the process-wide warning recorder.
 - No public API, configuration, protocol, dependency or Cargo.lock change. No
   user documentation describes catalog-failure behavior; docs/usage.md's
   diagnostics description (no remote error text in the ring) stays true.
