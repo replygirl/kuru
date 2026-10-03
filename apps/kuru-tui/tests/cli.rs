@@ -1529,6 +1529,57 @@ fn imported_project_instructions_require_exact_workspace_review_before_demo_disp
     assert!(String::from_utf8_lossy(&stale.stderr).contains("workspace authority"));
 }
 
+/// An approval record the operating system refuses to read is named as a read
+/// failure with a permissions remedy, not as invalid state to approve again.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_approval_record_reports_its_read_error_and_remedy() {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert!(
+        !nix::unistd::geteuid().is_root(),
+        "this check needs an unprivileged runner; uid 0 reads a mode 000 file"
+    );
+    let env = Sandbox::new();
+    std::fs::write(env.project.join("AGENTS.md"), "REVIEWED\n").unwrap();
+    env.success(&["trust", "approve", "--yes"]);
+    let records = std::fs::read_dir(env.data.join("trust/workspaces"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    let [record] = records.as_slice() else {
+        panic!("expected one approval record, found {records:?}");
+    };
+    std::fs::set_permissions(record, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let status = env.run(&["trust", "status"]);
+    let denied = env.run(&["run", "hello"]);
+    std::fs::set_permissions(record, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let expected = std::io::Error::from_raw_os_error(nix::errno::Errno::EACCES as i32).to_string();
+    let status = String::from_utf8_lossy(&status.stdout).into_owned();
+    assert!(
+        status.contains("Status: approval record could not be read"),
+        "{status}"
+    );
+    assert!(status.contains(&expected), "{status}");
+    assert!(status.contains("permissions"), "{status}");
+    assert!(!status.contains("invalid or unsafe"), "{status}");
+    assert!(!denied.status.success());
+    let stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(stderr.contains(&expected), "{stderr}");
+    assert!(
+        !env.data.join("memory").exists(),
+        "an unreadable approval must stop the command before memory effects"
+    );
+    assert!(
+        env.success(&["trust", "status"])
+            .contains("Status: approved")
+    );
+}
+
 #[test]
 fn oversized_instruction_is_reported_before_usable_project_dispatch() {
     let env = Sandbox::new();

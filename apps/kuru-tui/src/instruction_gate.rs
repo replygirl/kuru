@@ -3,7 +3,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use kuru_connectors::{
     InstructionActivation, InstructionGate, InstructionGateOutcome, InstructionReviewAnswer,
@@ -227,8 +227,12 @@ impl InstructionActivation for ProposedActivation {
         self.snapshot.revalidate_selected_skill_sources()?;
         if let Some(reviewed) = &self.reviewed {
             let store = ApprovalStore::new(&self.data, &self.root);
+            // A read failure is not evidence of a change: report it as itself.
+            let current = store
+                .generation_is_current(reviewed)
+                .context("workspace approval record could not be read")?;
             ensure!(
-                store.generation_is_current(reviewed).unwrap_or(false),
+                current,
                 "workspace approval changed during review; review current authority again"
             );
         }
@@ -834,6 +838,94 @@ mod tests {
                 .0,
             ApprovalState::Absent,
             "changed bytes no longer match the stored nested entry and require a new review"
+        );
+    }
+
+    /// A record that becomes unreadable after review is reported as a read
+    /// failure, not as a changed approval, and publishes nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_record_at_publication_reports_its_read_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(
+            !nix::unistd::geteuid().is_root(),
+            "this check needs an unprivileged runner; uid 0 reads a mode 000 file"
+        );
+        let project = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = data.path().join("state");
+        std::fs::create_dir(project.path().join("src")).unwrap();
+        std::fs::write(project.path().join("src/AGENTS.md"), "nested instruction").unwrap();
+        let root = Arc::new(
+            Directory::open(
+                project.path(),
+                kuru_platform::fs::Privacy::Inherited,
+                kuru_platform::fs::NameRetention::Pinned,
+            )
+            .unwrap(),
+        );
+        let base =
+            ConfigSnapshot::parse(None, project.path(), None, InvocationOverrides::default())
+                .unwrap();
+        ApprovalStore::new(&state, &root)
+            .approve_command(base.manifest())
+            .unwrap();
+        let gate = Arc::new(NestedInstructionGate::new(
+            root.clone(),
+            state.clone(),
+            base.clone(),
+            false,
+        ));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<InstructionReviewRequest>(1);
+        let pending = tokio::spawn(async move {
+            gate.review(
+                &[ProjectRelativeTarget::parse("src").unwrap()],
+                Some(&InstructionReviewSender::new(sender)),
+            )
+            .await
+        });
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("unreadable review request deadline")
+            .unwrap();
+        assert!(request.persistent_allowed, "{}", request.display);
+        request.reply.send(InstructionReviewAnswer::Once).unwrap();
+        let InstructionGateOutcome::Proposed(proposed) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+                .await
+                .expect("unreadable review reply deadline")
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("once answer did not produce a deferred activation");
+        };
+        let records = std::fs::read_dir(state.join("trust/workspaces"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect::<Vec<_>>();
+        let [record] = records.as_slice() else {
+            panic!("expected one approval record, found {records:?}");
+        };
+        std::fs::set_permissions(record, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let error = proposed.publish().await.unwrap_err();
+        std::fs::set_permissions(record, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let chain = format!("{error:#}");
+        let denied = std::io::Error::from_raw_os_error(nix::errno::Errno::EACCES as i32);
+        assert!(
+            chain.contains("workspace approval record could not be read"),
+            "{chain}"
+        );
+        assert!(chain.contains(&denied.to_string()), "{chain}");
+        assert!(!chain.contains("changed during review"), "{chain}");
+        assert_eq!(
+            ApprovalStore::new(&state, &root).inspect(base.manifest()),
+            ApprovalState::Matching,
+            "a failed publication leaves the base approval unchanged"
         );
     }
 

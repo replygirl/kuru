@@ -5,6 +5,7 @@
 
 use std::{
     ffi::{OsStr, OsString},
+    fmt,
     fs::File,
     io::{ErrorKind, Read, Write},
     path::Path,
@@ -32,7 +33,51 @@ pub(crate) enum ApprovalState {
     Absent,
     Matching,
     Stale,
+    /// The record or its storage has a shape or content the checked store rejects.
     Invalid,
+    /// The operating system refused or failed a read of the record or its storage.
+    Unreadable(ReadFailure),
+}
+
+/// An operating-system error code from reading approval state. It displays
+/// only the platform's standard message for that code: never a path or bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReadFailure(i32);
+
+impl ReadFailure {
+    /// Only a genuine OS error is a read failure. The checked filesystem
+    /// synthesizes its structural rejections without an OS code, and object
+    /// shapes the OS itself refuses (a symlink under no-follow, a directory or
+    /// file in the other's place) remain structural invalidity.
+    fn of(error: &anyhow::Error) -> Option<Self> {
+        let error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())?;
+        let code = error.raw_os_error()?;
+        if matches!(
+            error.kind(),
+            ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::IsADirectory
+        ) {
+            return None;
+        }
+        #[cfg(unix)]
+        if code == nix::errno::Errno::ELOOP as i32 {
+            return None;
+        }
+        Some(Self(code))
+    }
+}
+
+impl fmt::Display for ReadFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        std::io::Error::from_raw_os_error(self.0).fmt(formatter)
+    }
+}
+
+/// Classify a failed record read without approving: an OS read failure is
+/// reported as such, and everything else stays structurally invalid.
+fn failed_read_state(error: &anyhow::Error) -> ApprovalState {
+    ReadFailure::of(error).map_or(ApprovalState::Invalid, ApprovalState::Unreadable)
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -228,7 +273,8 @@ impl<'a> ApprovalStore<'a> {
                 ApprovalState::Matching
             }
             Ok(Some(checked)) if checked.record.structurally_valid() => ApprovalState::Stale,
-            Ok(Some(_)) | Err(_) => ApprovalState::Invalid,
+            Ok(Some(_)) => ApprovalState::Invalid,
+            Err(error) => failed_read_state(&error),
         }
     }
 
@@ -276,7 +322,8 @@ impl<'a> ApprovalStore<'a> {
                     Some(generation),
                 )
             }
-            Ok(Some(_)) | Err(_) => (ApprovalState::Invalid, None),
+            Ok(Some(_)) => (ApprovalState::Invalid, None),
+            Err(error) => (failed_read_state(&error), None),
         }
     }
 
@@ -1168,6 +1215,75 @@ mod tests {
         let path = store.open_store().unwrap().unwrap().path().to_path_buf();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(store.inspect(&manifest), ApprovalState::Invalid);
+    }
+
+    /// An operating-system read failure is reported as such, never relabelled
+    /// as structural invalidity, and still never approves anything.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_record_names_its_os_error_and_never_matches() {
+        let _gate = crate::spawn_gate::locking();
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(
+            !nix::unistd::geteuid().is_root(),
+            "this check needs an unprivileged runner; uid 0 reads a mode 000 file"
+        );
+        let fixture = Fixture::new("allow_shell = true\n");
+        let manifest = fixture.manifest();
+        let store = ApprovalStore::new(&fixture.data, &fixture.workspace);
+        store.approve_command(&manifest).unwrap();
+        let record = store
+            .open_store()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join(record_name(&fixture.workspace));
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = ReadFailure(nix::errno::Errno::EACCES as i32);
+        assert_eq!(store.inspect(&manifest), ApprovalState::Unreadable(denied));
+        // The OS's standard text for the code alone: no path or record bytes.
+        assert_eq!(
+            denied.to_string(),
+            std::io::Error::from_raw_os_error(nix::errno::Errno::EACCES as i32).to_string()
+        );
+        assert!(!denied.to_string().contains('/'), "{denied}");
+        let nested = store.inspect_nested(&manifest, &manifest, &[[1; 32]]);
+        assert_eq!(nested.0, ApprovalState::Unreadable(denied));
+        assert!(
+            nested.1.is_none(),
+            "an unread record yields no review generation"
+        );
+        assert!(store.approve_command(&manifest).is_err());
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(store.inspect(&manifest), ApprovalState::Matching);
+    }
+
+    /// A directory in the record's place is a shape the checked filesystem
+    /// rejects itself; it never approves on any platform.
+    #[test]
+    fn a_directory_in_the_records_place_never_matches() {
+        let _gate = crate::spawn_gate::locking();
+        let fixture = Fixture::new("allow_shell = true\n");
+        let manifest = fixture.manifest();
+        let store = ApprovalStore::new(&fixture.data, &fixture.workspace);
+        store.approve_command(&manifest).unwrap();
+        let directory = store.open_store().unwrap().unwrap();
+        let name = record_name(&fixture.workspace);
+        let operations = movable_record_directory(&directory).unwrap();
+        let current = operations.read(&name).unwrap();
+        operations.remove_file(&name, current).unwrap();
+        std::fs::create_dir(directory.path().join(&name)).unwrap();
+        let state = store.inspect(&manifest);
+        assert!(
+            !matches!(state, ApprovalState::Matching | ApprovalState::Absent),
+            "{state:?}"
+        );
+        // Unix opens the directory and the checked filesystem rejects its shape
+        // with a synthesized error; Windows refuses the open itself.
+        #[cfg(unix)]
+        assert_eq!(state, ApprovalState::Invalid);
+        assert!(store.approve_command(&manifest).is_err());
     }
 
     #[test]
