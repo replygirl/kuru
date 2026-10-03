@@ -11,7 +11,6 @@ kuru_base=${KURU_RELEASE_BASE:-}
 kuru_directory=${KURU_INSTALL_DIR:-}
 kuru_stage=''
 kuru_producer=''
-kuru_consumer=''
 kuru_archive_limit=$((128 * 1024 * 1024))
 kuru_manifest_limit=$((64 * 1024))
 kuru_support_limit=$((4 * 1024 * 1024))
@@ -26,13 +25,11 @@ fail() {
 cleanup() {
   kuru_status=$?
   trap - EXIT INT TERM HUP
-  # These are disposable direct children, never a pipeline's hidden processes.
-  for kuru_pid in "$kuru_producer" "$kuru_consumer"; do
-    if [[ -n $kuru_pid ]]; then
-      kill -KILL "$kuru_pid" 2>/dev/null || true
-      wait "$kuru_pid" 2>/dev/null || true
-    fi
-  done
+  # A disposable direct child, never a pipeline's hidden process.
+  if [[ -n $kuru_producer ]]; then
+    kill -KILL "$kuru_producer" 2>/dev/null || true
+    wait "$kuru_producer" 2>/dev/null || true
+  fi
   if [[ -n $kuru_stage ]]; then
     rm -rf -- "$kuru_stage"
   fi
@@ -136,7 +133,7 @@ if [[ -z $kuru_directory ]]; then
   kuru_directory="$HOME/.local/bin"
 fi
 [[ $kuru_directory != *$'\n'* && $kuru_directory != *$'\r'* ]] || fail 'install directory must not contain line breaks'
-for kuru_tool in mkdir mktemp mkfifo head wc cat gzip tar chmod mv rm tr cmp sort cp; do
+for kuru_tool in mkdir mktemp wc cat gzip tar chmod mv rm tr cmp sort cp; do
   command -v "$kuru_tool" >/dev/null || fail "$kuru_tool is required"
 done
 if command -v sha256sum >/dev/null; then
@@ -156,30 +153,35 @@ check_destination() {
 check_destination
 kuru_stage=$(mktemp -d "$kuru_directory/.kuru-install.XXXXXX")
 
-# Retain both process identities so signals and size limits stop the producer,
-# including one that keeps its stream open after head has reached the cap.
+# The kernel's file-size limit bounds the producer itself, so no second process
+# or stream is needed: a write past the cap stops the producer with SIGXFSZ,
+# including one that would otherwise keep its output open after the cap. A
+# FIFO to a capped reader is not used because macOS sometimes never delivered
+# end of file to that reader after the producer exited. The producer is the
+# only child and is retained so signals stop it through cleanup.
 bounded() {
   local kuru_limit=$1 kuru_output=$2 kuru_description=$3
   shift 3
-  local kuru_pipe="$kuru_stage/stream" kuru_head_status kuru_source_status kuru_bytes
-  mkfifo "$kuru_pipe"
-  # Arm the reader first. On macOS, an immediately failing writer can otherwise
-  # close during the FIFO open handoff and leave a later reader waiting forever.
-  head -c "$((kuru_limit + 1))" < "$kuru_pipe" > "$kuru_output" &
-  kuru_consumer=$!
-  "$@" > "$kuru_pipe" &
+  local kuru_source_status kuru_bytes
+  # ulimit -f counts 1024-byte blocks outside POSIX mode; every cap is whole.
+  (( kuru_limit > 0 && kuru_limit % 1024 == 0 )) || fail "$kuru_description has an invalid size limit"
+  # A producer stopped at the cap must not leave a core dump behind. Setting
+  # the cap fails only above an inherited hard limit, which then bounds the
+  # producer more tightly and becomes its limit.
+  { set +o posix; ulimit -c 0; ulimit -f "$((kuru_limit / 1024))" 2>/dev/null || ulimit -S -f hard; exec "$@"; } > "$kuru_output" &
   kuru_producer=$!
-  if wait "$kuru_consumer"; then kuru_head_status=0; else kuru_head_status=$?; fi
-  kuru_consumer=''
-  (( kuru_head_status == 0 )) || fail "$kuru_description reader failed ($kuru_head_status)"
-  kuru_bytes=$(wc -c < "$kuru_output")
-  if (( kuru_bytes > kuru_limit )); then
-    fail "$kuru_description exceeds size limit"
-  fi
-  if wait "$kuru_producer"; then kuru_source_status=0; else kuru_source_status=$?; fi
+  if wait "$kuru_producer" 2>/dev/null; then kuru_source_status=0; else kuru_source_status=$?; fi
   kuru_producer=''
-  rm -- "$kuru_pipe"
-  (( kuru_head_status == 0 && kuru_source_status == 0 )) || fail "$kuru_description failed (producer $kuru_source_status, reader $kuru_head_status)"
+  # 128 + SIGXFSZ (25 on macOS and Linux): a write reached past the cap. This
+  # also covers a sparse output whose seek past the cap left it nearly empty.
+  (( kuru_source_status != 153 )) || fail "$kuru_description exceeds size limit"
+  if (( kuru_source_status != 0 )); then
+    # An inherited ignored SIGXFSZ, which this shell cannot reset, turns the
+    # write past the cap into a write error that leaves a cap-sized output.
+    kuru_bytes=$(wc -c < "$kuru_output")
+    (( kuru_bytes < kuru_limit )) || fail "$kuru_description exceeds size limit"
+    fail "$kuru_description failed (producer $kuru_source_status)"
+  fi
 }
 
 fetch() {

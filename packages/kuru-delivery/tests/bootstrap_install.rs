@@ -153,8 +153,24 @@ impl Fixture {
 
     fn command_from(&self, script: &str) -> Command {
         let mut command = Command::new("/bin/bash");
+        command.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script));
+        self.configure(command)
+    }
+
+    /// Runs `prelude` in a parent shell that then executes the bootstrap, so
+    /// the bootstrap inherits what the prelude sets, such as an ignored signal.
+    fn wrapped(&self, prelude: &str) -> Command {
+        let mut command = Command::new("/bin/bash");
         command
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
+            .arg("-c")
+            .arg(format!("{prelude}\nexec /bin/bash \"$0\" \"$@\""))
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("support/install.sh"))
+            .args(["--version", self.version, "--target", self.target]);
+        self.configure(command)
+    }
+
+    fn configure(&self, mut command: Command) -> Command {
+        command
             .current_dir(self.root.path())
             .env_clear()
             .env("PATH", &self.tools)
@@ -432,6 +448,8 @@ case ${FIXTURE_TRANSPORT:-ok} in
   fail-after-data)
     cat "$asset"
     exit 22 ;;
+  record-core-limit)
+    ulimit -H -c >> "$FIXTURE_ROOT/producer-core-limits" ;;
 esac
 exec cat "$asset"
 "#;
@@ -573,6 +591,42 @@ async fn explicit_github_and_custom_mirror_versions_use_literal_release_director
         assert_eq!(requests.lines().count(), 3);
         assert!(requests.lines().next().unwrap().ends_with("/SHA256SUMS"));
     }
+}
+
+/// Bounded reads must not depend on a FIFO handoff between two children.
+///
+/// The bootstrap once streamed each bounded call through a FIFO to a capped
+/// reader. On macOS that reader sometimes never saw end of file after its
+/// producer exited, so the run hung; a stream the producer could not open hung
+/// it every time. That kernel race cannot be forced from user space, but this
+/// hostile `mkfifo`, whose FIFOs cannot be opened for writing, drives the
+/// never-paired case deterministically: the FIFO protocol waits for the
+/// fixture's bound, while the file-size-limited producer never creates a FIFO.
+#[tokio::test]
+async fn bounded_reads_install_through_the_mirror_without_a_fifo_handoff() {
+    let fixture = Fixture::new(TARGETS[0], "0.2.0");
+    fs::remove_file(fixture.tools.join("mkfifo")).unwrap();
+    executable(
+        &fixture.tools.join("mkfifo"),
+        format!(
+            "#!/bin/bash\n: > \"$FIXTURE_ROOT/mkfifo-called\"\n'{}' \"$@\" && '{}' 0400 \"$1\"\n",
+            system_tool("mkfifo").display(),
+            system_tool("chmod").display(),
+        )
+        .as_bytes(),
+    );
+    let mut command = fixture.explicit();
+    command
+        .env_remove("KURU_RELEASE_BASE")
+        .args(["--release-base", "https://fixture.invalid/releases/0.2.0/"]);
+    success(&fixture.run(command).await);
+    fixture.installed(&fixture.destination);
+    assert!(
+        !fixture.path("mkfifo-called").exists(),
+        "bounded reads still create a FIFO"
+    );
+    let requests = fs::read_to_string(fixture.path("requests")).unwrap();
+    assert_eq!(requests.lines().count(), 3);
 }
 
 #[tokio::test]
@@ -1054,7 +1108,7 @@ async fn checksum_missing_corrupt_ambiguous_and_malformed_inputs_preserve_the_in
         "{trace}"
     );
     assert!(trace.contains("kuru_producer="), "{trace}");
-    assert!(trace.contains("kuru_consumer="), "{trace}");
+    assert!(trace.contains("ulimit -f"), "{trace}");
     assert!(trace.contains(" wait "), "{trace}");
     fixture.unchanged();
 }
@@ -1198,6 +1252,59 @@ async fn manifest_and_archive_downloads_are_bounded_including_a_producer_that_st
     assert!(
         survivors.is_empty(),
         "oversized producer survived cleanup: {survivors:?}"
+    );
+}
+
+/// The size-limit message must not depend on the caller's signal disposition.
+/// An ancestor that ignores SIGXFSZ, which a non-interactive shell cannot
+/// reset, turns the write past the cap into EFBIG: the producer exits 1 with a
+/// cap-sized output instead of being stopped with status 153.
+#[tokio::test]
+async fn size_limit_failures_are_reported_when_the_caller_ignores_sigxfsz() {
+    let fixture = Fixture::new(TARGETS[0], "0.2.0");
+    let manifest = fixture.release.join("SHA256SUMS");
+    let original = fs::read(&manifest).unwrap();
+    File::options()
+        .write(true)
+        .open(&manifest)
+        .unwrap()
+        .set_len(64 * 1024 + 1)
+        .unwrap();
+    failure(
+        &fixture.run(fixture.wrapped("trap '' XFSZ")).await,
+        "local release asset exceeds size limit",
+    );
+    fixture.unchanged();
+    fs::write(&manifest, original).unwrap();
+    File::options()
+        .write(true)
+        .open(fixture.archive())
+        .unwrap()
+        .set_len(LIMIT + 1)
+        .unwrap();
+    failure(
+        &fixture.run(fixture.wrapped("trap '' XFSZ")).await,
+        "local release asset exceeds size limit",
+    );
+    fixture.unchanged();
+}
+
+/// A producer stopped at its cap must not leave a core dump in the installer's
+/// working directory, whatever core-dump limit the installer inherits.
+#[tokio::test]
+async fn bounded_producers_cannot_write_core_dumps() {
+    let fixture = Fixture::new(TARGETS[0], "0.2.0");
+    let mut command = fixture.explicit();
+    command
+        .env_remove("KURU_RELEASE_BASE")
+        .env("FIXTURE_TRANSPORT", "record-core-limit");
+    success(&fixture.run(command).await);
+    fixture.installed(&fixture.destination);
+    let limits = fs::read_to_string(fixture.path("producer-core-limits")).unwrap();
+    assert_eq!(
+        limits.lines().collect::<Vec<_>>(),
+        ["0"; 3],
+        "bounded producers kept a core-dump hard limit"
     );
 }
 

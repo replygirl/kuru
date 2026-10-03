@@ -202,8 +202,11 @@ bash /tmp/kuru-install.sh --version VERSION --release-base /path/to/release-file
 `KURU_RELEASE_BASE` sets the same option; the CLI takes precedence. Custom bases
 require `--version` and are used directly, without appending another version
 directory. Remote sources and redirects must use HTTPS. Downloads and extraction
-are bounded, and checksums are verified before extraction. Checksums detect
-corruption; trust comes from the release source you choose.
+run under a per-step file-size limit (a lower inherited `ulimit -f` hard limit
+still applies), and checksums are verified before extraction. Checksums detect
+corruption; trust comes from the release source you choose. Each step's limit
+also covers its error output, so send the installer's output to a terminal, a
+pipe or a new file rather than appending it to a log already over 64 KiB.
 
 ## Shell completions and manual page
 

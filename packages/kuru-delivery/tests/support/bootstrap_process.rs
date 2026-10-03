@@ -328,7 +328,11 @@ fn stage_observations(parent: &Path) -> String {
             "names",
             "types",
             "kuru",
-            "stream",
+            "README.md",
+            "support.tar.gz",
+            "support.tar",
+            "support-names",
+            "support-types",
         ] {
             let value = match fs::symlink_metadata(entry.path().join(name)) {
                 Ok(metadata) => format!("type={:?},bytes={}", metadata.file_type(), metadata.len()),
