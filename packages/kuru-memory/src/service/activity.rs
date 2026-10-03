@@ -1947,12 +1947,71 @@ mod tests {
         .with_context(|| format!("record retirement fixture exceeded its {deadline:?} deadline"))?
     }
 
-    /// A fixture's retirement bound that elapses behind a served owner held
-    /// in its close, after its Dolt reap and before its lock release, names
-    /// a closing owner past both record retirements. Releasing the pause is
-    /// the event that ends the close; the retirement then completes.
-    /// Paused time elapses the fixture's own bound; the owner's reap is done
-    /// before time is paused and nothing live waits on a clock.
+    /// A served owner held in its close, after its Dolt reap and before its
+    /// lock release, past the fixture's former flat 10 s bound and within its
+    /// own close budget: the retirement waits on the lock release and
+    /// completes once the test releases the pause (the event that ends the
+    /// close). Paused time carries the test past 10 s; it resumes before the
+    /// release, so the close budget's backstop never elapses and nothing
+    /// waits on a wall clock.
+    #[tokio::test]
+    async fn a_retirement_behind_a_close_held_past_ten_seconds_completes_within_its_close_budget()
+    -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, _scope, data, mut options) = owner_fixture(root.path())?;
+            options.starter_token = Some(Uuid::new_v4());
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            owner
+                .activity
+                .as_ref()
+                .context("a tokened owner kept no publisher")?
+                .settled()
+                .await?;
+            let pause = ClosePause::at(ClosePoint::AfterReap);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &options.project_scope, None).await?);
+            pause.entered.notified().await;
+            tokio::time::pause();
+            let mut retiring = Box::pin(crate::test_support::retire_idle_service(&options));
+            let held = Duration::from_secs(10) + Duration::from_secs(1);
+            let ended_early = tokio::select! {
+                biased;
+                retired = retiring.as_mut() => Some(retired),
+                () = tokio::time::sleep(held) => None,
+            };
+            tokio::time::resume();
+            pause.release.notify_one();
+            served.await??;
+            if let Some(retired) = ended_early {
+                bail!(
+                    "the retirement ended within {held:?} while the close was held: {:?}",
+                    retired.map_err(|error| format!("{error:#}"))
+                );
+            }
+            retiring
+                .await
+                .context("the retirement did not complete once the held close was released")?;
+            ensure!(owner_lock_free(&options)?);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("released close fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    /// A served owner held in its close, after its Dolt reap and before its
+    /// lock release, past its own close budget: the fixture's wait on the
+    /// lock release fails at that budget, counted from the first retirement
+    /// request that found no live endpoint, and names a closing owner past
+    /// both record retirements and the time since that reading. Releasing
+    /// the pause then ends the close. Paused time elapses the budget; the
+    /// owner's reap is done before time is paused and nothing live waits on
+    /// a clock.
     #[tokio::test]
     async fn an_elapsed_retirement_behind_a_held_close_names_a_closing_owner() -> Result<()> {
         warm_runtime_cache().await?;
@@ -1976,23 +2035,26 @@ mod tests {
             drop(attach_raw(&data, &options.project_scope, None).await?);
             pause.entered.notified().await;
             tokio::time::pause();
-            let elapsed = crate::test_support::retire_idle_service(&options).await;
+            let (elapsed, waiter) =
+                crate::test_support::retire_idle_service_keeping_waiter(&options).await;
             tokio::time::resume();
             pause.release.notify_one();
             served.await??;
+            crate::test_support::join_release_waiter(waiter)?;
             let text = format!(
                 "{:#}",
                 elapsed
                     .err()
                     .context("retirement completed while the owner held its lock")?
             );
+            crate::test_support::ensure_close_budget_expiry(
+                &text,
+                "no live endpoint",
+                "owner closing; last phase = endpoint and activity records retired",
+            )?;
             ensure!(
-                text.contains("managed owner retirement did not complete within 10 seconds")
-                    && !text.contains("idle managed owner")
-                    && text.contains(
-                        "owner closing; last phase = endpoint and activity records retired"
-                    ),
-                "the elapsed bound did not name a closing owner: {text}"
+                !text.contains("idle managed owner"),
+                "the elapsed bound named an idle owner: {text}"
             );
             ensure!(owner_lock_free(&options)?);
             crate::test_support::retire_idle_service(&options).await
@@ -2003,9 +2065,10 @@ mod tests {
 
     /// A fixture's retirement bound that elapses behind an owner held in its
     /// open before it published an endpoint names an opening owner and its
-    /// last stage, not an idle owner that did not retire. Paused time elapses
-    /// the fixture's own bound while the open waits at its hold; time resumes
-    /// before the hold is released and the owner opens and closes.
+    /// last stage, not an idle owner that did not retire. Its first request
+    /// finds no live endpoint, so the bound is the close budget from that
+    /// reading. Paused time elapses it while the open waits at its hold; time
+    /// resumes before the hold is released and the owner opens and closes.
     #[tokio::test]
     async fn an_elapsed_retirement_behind_an_unpublished_owner_names_its_open_stage() -> Result<()>
     {
@@ -2040,11 +2103,13 @@ mod tests {
                 EndpointRecord::read(&data, &scope).map(|record| record.is_some()),
             );
             tokio::time::pause();
-            let elapsed = crate::test_support::retire_idle_service(&options).await;
+            let (elapsed, waiter) =
+                crate::test_support::retire_idle_service_keeping_waiter(&options).await;
             tokio::time::resume();
             barrier.release.notify_one();
             let owner = opening.await?;
             owner.close().await?;
+            crate::test_support::join_release_waiter(waiter)?;
             ensure!(!held.0?, "the held open did not hold its owner lock");
             ensure!(!held.1?, "the held open had published an endpoint");
             let text = format!(
@@ -2053,13 +2118,14 @@ mod tests {
                     .err()
                     .context("retirement completed while the owner held its lock")?
             );
+            crate::test_support::ensure_close_budget_expiry(
+                &text,
+                "no live endpoint",
+                "owner still opening; last stage = PreparingDatabase; no endpoint record present",
+            )?;
             ensure!(
-                text.contains("managed owner retirement did not complete within 10 seconds")
-                    && !text.contains("idle managed owner")
-                    && text.contains(
-                        "owner still opening; last stage = PreparingDatabase; no endpoint record present"
-                    ),
-                "the elapsed bound did not name the opening owner's stage: {text}"
+                !text.contains("idle managed owner"),
+                "the elapsed bound named an idle owner: {text}"
             );
             ensure!(owner_lock_free(&options)?);
             Ok::<(), anyhow::Error>(())

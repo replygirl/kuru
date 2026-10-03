@@ -834,6 +834,52 @@ pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
     Ok(())
 }
 
+/// [`retire_idle_service`], also returning the owner-release waiter its
+/// close-budget backstop abandoned, so a test can join that waiter once it
+/// has let the owner go, before its root is removed.
+#[cfg(test)]
+pub(crate) async fn retire_idle_service_keeping_waiter(
+    options: &OpenOptions,
+) -> (Result<()>, Option<std::thread::JoinHandle<()>>) {
+    (retire_idle_service(options).await, None)
+}
+
+/// Join a waiter [`retire_idle_service_keeping_waiter`] abandoned, once the
+/// owner it waited behind has released its lock.
+#[cfg(test)]
+pub(crate) fn join_release_waiter(waiter: Option<std::thread::JoinHandle<()>>) -> Result<()> {
+    if let Some(waiter) = waiter {
+        waiter
+            .join()
+            .map_err(|_| anyhow::anyhow!("the abandoned owner-release waiter panicked"))?;
+    }
+    Ok(())
+}
+
+/// Check that `text` is the expiry of the wait on a closing owner's lock
+/// release: it names the owner's close budget, the time since the first
+/// retirement request found the owner closing (at least that budget), that
+/// first `reading` and the owner `state`, and not the former flat bound.
+#[cfg(test)]
+pub(crate) fn ensure_close_budget_expiry(text: &str, reading: &str, state: &str) -> Result<()> {
+    let budget = crate::server::close_budget();
+    let prefix =
+        format!("managed owner did not release its lock within its close budget of {budget:?}; ");
+    let since = format!("ms since the first retirement request found it closing ({reading})");
+    let elapsed = text
+        .split_once(&prefix)
+        .and_then(|(_, rest)| rest.split_once(&since))
+        .and_then(|(milliseconds, _)| milliseconds.parse::<u128>().ok());
+    ensure!(
+        elapsed.is_some_and(|milliseconds| milliseconds >= budget.as_millis())
+            && text.contains(state)
+            && !text.contains("within 10 seconds"),
+        "the release wait's expiry did not name the close budget, the time since the first \
+         closing reading ({reading}) and the owner state ({state}): {text}"
+    );
+    Ok(())
+}
+
 /// What a managed owner's own records say about it now, for a fixture whose
 /// bound has elapsed while that owner held its lock. Reads only, takes no
 /// lock and cannot fail the caller: an unreadable record is named instead.
@@ -1657,11 +1703,13 @@ mod tests {
     }
 
     /// An owner lock held with no endpoint published, as by an owner still
-    /// reaping Dolt after retiring its record: the fixture's bound elapses
-    /// and its error names the step it was cancelled in, what the
-    /// retirement requests met and, from the absent records, a closing
-    /// owner, not only that the deadline elapsed. Paused
-    /// time advances the fixture's own waits; nothing here waits on a clock.
+    /// reaping Dolt after retiring its record: the first retirement request
+    /// finds no live endpoint, so the fixture waits on the lock's release
+    /// under the owner's close budget from that reading. When the budget
+    /// elapses, its error names the budget, the time since that reading, what
+    /// the retirement requests met and, from the absent records, a closing
+    /// owner. Paused time advances the fixture's own waits; nothing here
+    /// waits on a clock.
     #[tokio::test(start_paused = true)]
     async fn an_elapsed_retirement_bound_names_the_step_it_was_cancelled_in() -> Result<()> {
         let root = tempdir()?;
@@ -1675,22 +1723,24 @@ mod tests {
             crate::service::ServiceLockKind::Owner,
         )?
         .context("a fresh fixture's owner lock was busy")?;
-        let error = retire_idle_service(&options)
-            .await
-            .expect_err("retirement completed while the owner lock was held");
+        let (retired, waiter) = retire_idle_service_keeping_waiter(&options).await;
+        owner.release()?;
+        join_release_waiter(waiter)?;
+        let error = retired.expect_err("retirement completed while the owner lock was held");
         let text = format!("{error:#}");
+        ensure_close_budget_expiry(
+            &text,
+            "no live endpoint",
+            "owner closing; last phase = endpoint and activity records retired",
+        )?;
         ensure!(
-            text.contains("managed owner retirement did not complete within 10 seconds")
-                && !text.contains("idle managed owner")
-                && text
-                    .contains("owner closing; last phase = endpoint and activity records retired")
+            !text.contains("idle managed owner")
                 && text.contains("maintenance waiting for the owner lock for ")
                 && text.contains("busy replies=0")
                 && text.contains("active-client refusals=0")
                 && !text.contains("requests without a live endpoint=0;"),
             "the elapsed bound did not name its step: {text}"
         );
-        owner.release()?;
         root.release(Ok(()))
     }
 
