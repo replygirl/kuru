@@ -843,7 +843,7 @@ pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
 /// then the activity record, then closes its store (pool drain, Dolt reap)
 /// and only then releases its lock; an open that failed before its starter
 /// attached marks the record failing first and retires it after the store
-/// close. So, with no endpoint published:
+/// close. So, with no endpoint record present:
 ///
 /// - an activity record not marked failing is an owner still opening, never
 ///   published; a served owner's close passes the same reading only between
@@ -1680,7 +1680,8 @@ mod tests {
             .expect_err("retirement completed while the owner lock was held");
         let text = format!("{error:#}");
         ensure!(
-            text.contains("idle managed owner did not retire within 10 seconds")
+            text.contains("managed owner retirement did not complete within 10 seconds")
+                && !text.contains("idle managed owner")
                 && text
                     .contains("owner closing; last phase = endpoint and activity records retired")
                 && text.contains("maintenance waiting for the owner lock for ")

@@ -1987,7 +1987,8 @@ mod tests {
                     .context("retirement completed while the owner held its lock")?
             );
             ensure!(
-                text.contains("idle managed owner did not retire within 10 seconds")
+                text.contains("managed owner retirement did not complete within 10 seconds")
+                    && !text.contains("idle managed owner")
                     && text.contains(
                         "owner closing; last phase = endpoint and activity records retired"
                     ),
@@ -2053,9 +2054,10 @@ mod tests {
                     .context("retirement completed while the owner held its lock")?
             );
             ensure!(
-                text.contains("idle managed owner did not retire within 10 seconds")
+                text.contains("managed owner retirement did not complete within 10 seconds")
+                    && !text.contains("idle managed owner")
                     && text.contains(
-                        "owner still opening; last stage = PreparingDatabase; no endpoint published"
+                        "owner still opening; last stage = PreparingDatabase; no endpoint record present"
                     ),
                 "the elapsed bound did not name the opening owner's stage: {text}"
             );
