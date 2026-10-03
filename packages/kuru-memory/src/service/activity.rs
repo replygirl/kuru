@@ -288,6 +288,27 @@ pub(crate) fn read_activity(data_dir: &Path, scope: &str, tag: &str) -> Result<A
     Ok(activity)
 }
 
+/// Test-support diagnostics only: the activity of whatever owner's record is
+/// under the name now, whatever its tag, or `None` when the name is missing.
+/// It decides nothing: a fixture whose own bound has already elapsed names
+/// the owner it was waiting behind with it, and nothing else reads it.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn inspect(data_dir: &Path, scope: &str) -> Result<Option<Activity>> {
+    let path = directory(data_dir, scope)?.join(RECORD);
+    let bytes = match crate::files::read_bytes(&path, RECORD_LIMIT) {
+        Ok(bytes) => bytes,
+        Err(error) if crate::files::is_missing_name(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    decode(&bytes).map(|(_, activity)| Some(activity))
+}
+
+/// The record's name for `stage`, or its debug name for one never published.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn describe_stage(stage: MemoryOpenStage) -> String {
+    stage_name(stage).map_or_else(|| format!("{stage:?}"), str::to_owned)
+}
+
 #[cfg(test)]
 fn read_stages(data_dir: &Path, scope: &str, tag: &str) -> Result<Vec<MemoryOpenStage>> {
     read_activity(data_dir, scope, tag).map(|activity| activity.stages)
@@ -1924,6 +1945,125 @@ mod tests {
         })
         .await
         .with_context(|| format!("record retirement fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    /// A fixture's retirement bound that elapses behind a served owner held
+    /// in its close, after its Dolt reap and before its lock release, names
+    /// a closing owner past both record retirements. Releasing the pause is
+    /// the event that ends the close; the retirement then completes.
+    /// Paused time elapses the fixture's own bound; the owner's reap is done
+    /// before time is paused and nothing live waits on a clock.
+    #[tokio::test]
+    async fn an_elapsed_retirement_behind_a_held_close_names_a_closing_owner() -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, _scope, data, mut options) = owner_fixture(root.path())?;
+            options.starter_token = Some(Uuid::new_v4());
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            owner
+                .activity
+                .as_ref()
+                .context("a tokened owner kept no publisher")?
+                .settled()
+                .await?;
+            let pause = ClosePause::at(ClosePoint::AfterReap);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &options.project_scope, None).await?);
+            pause.entered.notified().await;
+            tokio::time::pause();
+            let elapsed = crate::test_support::retire_idle_service(&options).await;
+            tokio::time::resume();
+            pause.release.notify_one();
+            served.await??;
+            let text = format!(
+                "{:#}",
+                elapsed
+                    .err()
+                    .context("retirement completed while the owner held its lock")?
+            );
+            ensure!(
+                text.contains("idle managed owner did not retire within 10 seconds")
+                    && text.contains(
+                        "owner closing; last phase = endpoint and activity records retired"
+                    ),
+                "the elapsed bound did not name a closing owner: {text}"
+            );
+            ensure!(owner_lock_free(&options)?);
+            crate::test_support::retire_idle_service(&options).await
+        })
+        .await
+        .with_context(|| format!("held close fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    /// A fixture's retirement bound that elapses behind an owner held in its
+    /// open before it published an endpoint names an opening owner and its
+    /// last stage, not an idle owner that did not retire. Paused time elapses
+    /// the fixture's own bound while the open waits at its hold; time resumes
+    /// before the hold is released and the owner opens and closes.
+    #[tokio::test]
+    async fn an_elapsed_retirement_behind_an_unpublished_owner_names_its_open_stage() -> Result<()>
+    {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, mut options) = owner_fixture(root.path())?;
+            options.starter_token = Some(Uuid::new_v4());
+            let barrier = Arc::new(OpenHold::default());
+            let hooks = OwnerHooks {
+                hold: Some((PreparingDatabase, Arc::clone(&barrier))),
+                ..OwnerHooks::default()
+            };
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut opening = Box::pin({
+                let options = options.clone();
+                async move { ServiceOwner::open_with_activity(options, &project, hooks).await }
+            });
+            tokio::select! {
+                biased;
+                () = barrier.entered.notified() => {}
+                opened = opening.as_mut() => bail!(
+                    "the open ended before holding at PreparingDatabase: {:?}",
+                    opened.map(|_| ())
+                ),
+            }
+            // Read at the hold and checked after the release, so a failed
+            // check never leaves the owner holding its open.
+            let held = (
+                owner_lock_free(&options),
+                EndpointRecord::read(&data, &scope).map(|record| record.is_some()),
+            );
+            tokio::time::pause();
+            let elapsed = crate::test_support::retire_idle_service(&options).await;
+            tokio::time::resume();
+            barrier.release.notify_one();
+            let owner = opening.await?;
+            owner.close().await?;
+            ensure!(!held.0?, "the held open did not hold its owner lock");
+            ensure!(!held.1?, "the held open had published an endpoint");
+            let text = format!(
+                "{:#}",
+                elapsed
+                    .err()
+                    .context("retirement completed while the owner held its lock")?
+            );
+            ensure!(
+                text.contains("idle managed owner did not retire within 10 seconds")
+                    && text.contains(
+                        "owner still opening; last stage = PreparingDatabase; no endpoint published"
+                    ),
+                "the elapsed bound did not name the opening owner's stage: {text}"
+            );
+            ensure!(owner_lock_free(&options)?);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("unpublished owner fixture exceeded its {deadline:?} deadline"))?
     }
 
     // An open that fails after starting its engine marks its record failing,

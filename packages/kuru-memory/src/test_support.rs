@@ -797,7 +797,13 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
 ///
 /// When its bound elapses, the error names the step the acquisition was
 /// cancelled in, so a slow owner close, a still-attached client and a stalled
-/// request are distinguishable from the failure text alone.
+/// request are distinguishable from the failure text alone, and the state of
+/// the owner it waited behind, read at expiry by [`owner_state`].
+///
+/// The 10 s bound is a fixture guess no product budget derives. It stays
+/// until a caller has an outer backstop: `ServiceCleanup` and the mise
+/// acceptance fixture join their cleanup threads without one, so waiting on
+/// the owner's lock release instead could hang a test until its job times out.
 pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
     let trace = crate::service::MaintenanceTrace::default();
     let mut refusals: u32 = 0;
@@ -820,11 +826,60 @@ pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
     .await
     .with_context(|| {
         format!(
-            "idle managed owner did not retire within 10 seconds; {trace}; active-client refusals={refusals}"
+            "idle managed owner did not retire within 10 seconds; {}; {trace}; active-client refusals={refusals}",
+            owner_state(options)
         )
     })??;
     drop(permit);
     Ok(())
+}
+
+/// What a managed owner's own records say about it now, for a fixture whose
+/// bound has elapsed while that owner held its lock. Reads only, takes no
+/// lock and cannot fail the caller: an unreadable record is named instead.
+///
+/// The owner publishes its open-activity record as its open begins stages,
+/// publishes its endpoint once open, and in its close retires the endpoint,
+/// then the activity record, then closes its store (pool drain, Dolt reap)
+/// and only then releases its lock; an open that failed before its starter
+/// attached marks the record failing first and retires it after the store
+/// close. So, with no endpoint published:
+///
+/// - an activity record not marked failing is an owner still opening, never
+///   published; a served owner's close passes the same reading only between
+///   its two record retirements, one rename and removal;
+/// - a failing record is a failed open closing its store;
+/// - no record is a close past both retirements (an owner started without a
+///   starter token publishes no record, so it reads so while opening too).
+///
+/// No close step is stamped, so the time since the close began is unknown;
+/// the trace's lock wait, every request finding no live endpoint, bounds it
+/// from below.
+pub(crate) fn owner_state(options: &OpenOptions) -> String {
+    match crate::service::EndpointRecord::read(&options.data_dir, &options.project_scope) {
+        Ok(Some(_)) => return "owner published; its endpoint record is still present".to_owned(),
+        Ok(None) => {}
+        Err(error) => return format!("owner state unreadable: endpoint record: {error:#}"),
+    }
+    match crate::service::activity::inspect(&options.data_dir, &options.project_scope) {
+        Ok(Some(activity)) => match activity.failure {
+            Some(reason) => format!(
+                "owner open failed before its starter attached; closing its store; reason = {reason}"
+            ),
+            None => {
+                let stage = activity.stages.last().copied();
+                let stage = stage.map(crate::service::activity::describe_stage);
+                format!(
+                    "owner still opening; last stage = {}; no endpoint published",
+                    stage.as_deref().unwrap_or("none")
+                )
+            }
+        },
+        Ok(None) => "owner closing; last phase = endpoint and activity records retired \
+             (store close, Dolt reap or owner-lock release outstanding)"
+            .to_owned(),
+        Err(error) => format!("owner state unreadable: open-activity record: {error:#}"),
+    }
 }
 
 /// Wait, without polling, until the managed owner for `options` has released
@@ -1603,8 +1658,9 @@ mod tests {
 
     /// An owner lock held with no endpoint published, as by an owner still
     /// reaping Dolt after retiring its record: the fixture's bound elapses
-    /// and its error names the step it was cancelled in and what the
-    /// retirement requests met, not only that the deadline elapsed. Paused
+    /// and its error names the step it was cancelled in, what the
+    /// retirement requests met and, from the absent records, a closing
+    /// owner, not only that the deadline elapsed. Paused
     /// time advances the fixture's own waits; nothing here waits on a clock.
     #[tokio::test(start_paused = true)]
     async fn an_elapsed_retirement_bound_names_the_step_it_was_cancelled_in() -> Result<()> {
@@ -1625,6 +1681,8 @@ mod tests {
         let text = format!("{error:#}");
         ensure!(
             text.contains("idle managed owner did not retire within 10 seconds")
+                && text
+                    .contains("owner closing; last phase = endpoint and activity records retired")
                 && text.contains("maintenance waiting for the owner lock for ")
                 && text.contains("busy replies=0")
                 && text.contains("active-client refusals=0")

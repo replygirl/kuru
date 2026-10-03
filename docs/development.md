@@ -533,6 +533,22 @@ and written only on evidence this process observed itself:
   enumerate stores by a hand-written name pattern. A fixture that already has
   an outcome releases through `ServiceCleanup::release(outcome)`, which
   attaches a cleanup failure or the guard's verdict to that outcome.
+  Its retirement step, `test_support::retire_idle_service`, is bounded by a
+  flat 10 s that no product budget derives. When that bound elapses, its error
+  names the fixture's own step and the state of the owner it waited behind,
+  read at expiry from that owner's records without taking a lock: `owner
+  published` (endpoint record present), `owner still opening; last stage = X`
+  (an open-activity record and no endpoint: it never published), `owner open
+  failed ...; reason = ...` (a failing record), or `owner closing; last phase =
+  endpoint and activity records retired` (its store close, Dolt reap or lock
+  release outstanding). A served owner reads as opening only between its two
+  record retirements, and an owner without a starter token publishes no
+  record. No close step is stamped, so the time since the close began is not
+  known; the trace's lock wait bounds it from below. The bound is not yet an
+  event wait on the owner's lock release (`await_owner_release`) because
+  `ServiceCleanup` and the mise acceptance fixture join their cleanup threads
+  with no outer backstop, so such a wait could hang a test until its job's
+  timeout.
 - `test_support::await_store_quiescence(&directory, lifecycle_root)` does the
   same for one store whose engine ran in another process, such as a spawned
   `kuru` executable.
