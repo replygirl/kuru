@@ -1030,7 +1030,10 @@ async fn run_shard<H: Host>(
         plan.executables.len()
     );
 
-    let (profile_count, profile_bytes) = profile_totals(&target)?;
+    // Every export below re-merges the target's raw profiles, and the
+    // receipt digests them; all of them must describe this one set.
+    let profiles = profile_set(&target)?;
+    let (profile_count, profile_bytes) = profiles.totals();
     let exports = match &llvm_cov {
         Some(llvm_cov) => {
             ensure!(
@@ -1047,7 +1050,8 @@ async fn run_shard<H: Host>(
                 &root,
                 root_text,
                 &env,
-                &state,
+                &target,
+                &profiles,
                 &partition,
                 &mut phases,
             )
@@ -1095,6 +1099,9 @@ async fn run_shard<H: Host>(
     })
     .await
     .context("coverage partition receipt failed")?;
+    if llvm_cov.is_some() {
+        profiles.require_unchanged(&target, "after its receipt was written")?;
+    }
 
     // Export after the receipt, so it can never affect evidence. A failed
     // export leaves no seed, so the workflow saves nothing under this key and
@@ -1175,7 +1182,11 @@ async fn export_lcov<H: Host>(
 
 /// Export every instantiation's mapped and covered lines and require them to
 /// reproduce this partition's own cargo-llvm-cov summary exactly, per file
-/// and in total, before any evidence names them.
+/// and in total, before any evidence names them. Each report re-merges the
+/// target's raw profiles, so the profiles must still be `profiles` once the
+/// last report is written: otherwise the export and the summary describe
+/// different profiles and no port of llvm-cov could reproduce one from the
+/// other.
 #[allow(clippy::too_many_arguments)]
 async fn export_lines<H: Host>(
     host: &mut H,
@@ -1183,11 +1194,13 @@ async fn export_lines<H: Host>(
     root: &Path,
     root_text: &str,
     env: &[(OsString, OsString)],
-    state: &Path,
+    target: &Path,
+    profiles: &ProfileSet,
     partition: &PartitionScheme,
     phases: &mut Phases,
 ) -> Result<PathBuf> {
     let started = unix_now()?;
+    let state = target.join(STATE);
     let full = state.join("coverage.raw.json");
     report(host, llvm_cov, root, env, &["--json"], &full)
         .await
@@ -1203,6 +1216,7 @@ async fn export_lines<H: Host>(
     )
     .await
     .context("partition coverage summary failed")?;
+    profiles.require_unchanged(target, "while its coverage was exported")?;
     let export = lines::LlvmExport::read(&full)?.partition_line_export(root_text)?;
     let reported = lines::LlvmExport::read(&summary)?.summary_figures(root_text)?;
     let derived = export.figures()?;
@@ -1224,18 +1238,72 @@ async fn export_lines<H: Host>(
     Ok(path)
 }
 
-/// Count and size of the raw profiles in the target root.
-fn profile_totals(target: &Path) -> Result<(usize, u64)> {
-    let mut count = 0;
-    let mut bytes = 0_u64;
+/// The raw profiles in the target root by name, each with its size and
+/// modification time: an instrumented process that exits writes a new
+/// profile, or merges into an existing `%m` pool file in place.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ProfileSet(BTreeMap<String, (u64, Option<std::time::SystemTime>)>);
+
+/// Profiles a changed-profile diagnostic names.
+const PROFILE_CHANGE_REPORT_LIMIT: usize = 10;
+
+fn profile_set(target: &Path) -> Result<ProfileSet> {
+    let mut profiles = BTreeMap::new();
     for entry in fs::read_dir(target)? {
         let entry = entry?;
-        if entry.path().extension() == Some(OsStr::new("profraw")) {
-            count += 1;
-            bytes = bytes.saturating_add(fs::symlink_metadata(entry.path())?.len());
+        let path = entry.path();
+        if path.extension() == Some(OsStr::new("profraw")) {
+            let metadata = fs::symlink_metadata(&path)?;
+            let name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .with_context(|| format!("profile {} lacks a UTF-8 name", path.display()))?
+                .to_owned();
+            profiles.insert(name, (metadata.len(), metadata.modified().ok()));
         }
     }
-    Ok((count, bytes))
+    Ok(ProfileSet(profiles))
+}
+
+impl ProfileSet {
+    /// Count and total size.
+    fn totals(&self) -> (usize, u64) {
+        let bytes = self
+            .0
+            .values()
+            .fold(0_u64, |total, (bytes, _)| total.saturating_add(*bytes));
+        (self.0.len(), bytes)
+    }
+
+    /// Require the target's profiles to be exactly this set still, naming
+    /// every new, changed and removed profile otherwise.
+    fn require_unchanged(&self, target: &Path, when: &str) -> Result<()> {
+        let now = profile_set(target)?;
+        if &now == self {
+            return Ok(());
+        }
+        let mut changes = Vec::new();
+        for (name, stamp) in &now.0 {
+            match self.0.get(name) {
+                None => changes.push(format!("new {name}")),
+                Some(before) if before != stamp => changes.push(format!("changed {name}")),
+                Some(_) => {}
+            }
+        }
+        for name in self.0.keys() {
+            if !now.0.contains_key(name) {
+                changes.push(format!("removed {name}"));
+            }
+        }
+        let shown = changes.len().min(PROFILE_CHANGE_REPORT_LIMIT);
+        bail!(
+            "coverage partition raw profiles changed {when} ({} profiles; first {shown}: {}); an \
+             instrumented process outlived the partition's tests, so its exports and receipt \
+             would not describe one profile set",
+            changes.len(),
+            changes[..shown].join(", ")
+        )
+    }
 }
 
 fn run_merge(common: &Common, inputs: &MergeInputs) -> Result<()> {
@@ -1568,6 +1636,9 @@ mod tests {
         /// Added to the covered lines the fake summary reports, so the line
         /// export no longer reproduces it.
         summary_offset: u64,
+        /// The call during which a test-started instrumented process exits
+        /// late and writes `kuru-late-1.profraw` into the target root.
+        late_profile: Option<Call>,
         /// Whether the seeded dependency was already in the target at build.
         seeded_at_build: Option<bool>,
     }
@@ -1606,8 +1677,17 @@ mod tests {
                 receipts: Vec::new(),
                 write_export: true,
                 summary_offset: 0,
+                late_profile: None,
                 seeded_at_build: None,
             }
+        }
+
+        /// Write the late profile if `call` is the one it lands during.
+        fn late(&self, call: Call, profiles: &Path) -> Result<()> {
+            if self.late_profile == Some(call) {
+                fs::write(profiles.join("kuru-late-1.profraw"), b"late owner exit")?;
+            }
+            Ok(())
         }
 
         fn call(&mut self, call: Call) -> Result<()> {
@@ -1953,6 +2033,8 @@ mod tests {
                         }
                         _ => panic!("unexpected export {}", invocation.describe()),
                     };
+                    let call = *self.calls.last().unwrap();
+                    self.late(call, &target)?;
                     if self.write_export {
                         fs::write(output, text)?;
                     }
@@ -1980,6 +2062,7 @@ mod tests {
         async fn receipt(&mut self, options: &ReceiptOptions<'_>) -> Result<()> {
             self.call(Call::Receipt)?;
             assert!(!options.profiles.join("kuru-0-0.profraw").exists());
+            self.late(Call::Receipt, options.profiles)?;
             self.receipts.push((
                 options.mode,
                 options.partition.clone(),
@@ -2600,6 +2683,74 @@ mod tests {
         drift.fake.packages.pop();
         let error = drift.run(INSTRUMENTED).await.unwrap_err().to_string();
         assert!(error.contains("differ from WORKSPACE_PACKAGES"), "{error}");
+    }
+
+    /// CI run 37147327774 (macOS partition 3 of 4): a memory stand-in owner
+    /// that its test left polling exited 120 s later, between the partition's
+    /// `--json` and `--json --summary-only` reports. Both re-merge the raw
+    /// profiles, so the summary counted lines the export never saw and the
+    /// self-check blamed the port. A profile that changes during the exports
+    /// or the receipt now fails the partition by name, and only before then
+    /// can the self-check run.
+    #[tokio::test]
+    async fn a_profile_written_during_export_or_receipt_fails_the_partition_by_name() {
+        for (call, summary_offset, when) in [
+            // The CI shape: the summary sees one more covered line.
+            (Call::LineExport, 1, "while its coverage was exported"),
+            // No figure differs, but the exports still describe two sets.
+            (Call::Export, 0, "while its coverage was exported"),
+            (Call::Summary, 0, "while its coverage was exported"),
+            (Call::Receipt, 0, "after its receipt was written"),
+        ] {
+            let mut scenario = Scenario::new(INSTRUMENTED);
+            scenario.fake.late_profile = Some(call);
+            scenario.fake.summary_offset = summary_offset;
+            let error = format!("{:#}", scenario.run(INSTRUMENTED).await.unwrap_err());
+            assert!(
+                error.contains(&format!("raw profiles changed {when}"))
+                    && error.contains("first 1: new kuru-late-1.profraw")
+                    && !error.contains("does not reproduce"),
+                "{call:?}: {error}"
+            );
+            assert!(
+                scenario.failure().contains("kuru-late-1.profraw"),
+                "{call:?}"
+            );
+            if call != Call::Receipt {
+                assert!(!scenario.job("evidence").exists(), "{call:?}");
+                assert!(!scenario.fake.calls.contains(&Call::Receipt), "{call:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn profile_sets_name_new_changed_and_removed_profiles() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path();
+        for name in ["a.profraw", "b.profraw", "c.profraw"] {
+            fs::write(target.join(name), b"one").unwrap();
+        }
+        fs::write(target.join("other.json"), b"ignored").unwrap();
+        let before = profile_set(target).unwrap();
+        assert_eq!(before.totals(), (3, 9));
+        before.require_unchanged(target, "now").unwrap();
+        fs::write(target.join("other.json"), b"still ignored").unwrap();
+        before.require_unchanged(target, "now").unwrap();
+        // A `%m` pool file merged in place keeps its name.
+        fs::write(target.join("b.profraw"), b"one and two").unwrap();
+        fs::remove_file(target.join("c.profraw")).unwrap();
+        fs::write(target.join("d.profraw"), b"late").unwrap();
+        let error = before
+            .require_unchanged(target, "during the test")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "raw profiles changed during the test (3 profiles; first 3: changed b.profraw, \
+                 new d.profraw, removed c.profraw)"
+            ),
+            "{error}"
+        );
     }
 
     #[tokio::test]

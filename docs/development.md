@@ -102,7 +102,13 @@ cargo-llvm-cov's `--json --summary-only` report over the same profiles and
 requires the export to reproduce it exactly, per file and in total; a mismatch
 fails the partition, names the first mismatching files and keeps the summary in
 its diagnostics. The receipt carries the export's digest and self-checked
-totals.
+totals. Every cargo-llvm-cov report re-merges the target's raw profiles, so the
+partition records them (name, size and modification time) once its tests end
+and requires the same set after its last report, before the self-check, and
+again after its receipt. A profile that appears, changes or disappears in
+between means an instrumented process outlived the partition's tests; the
+partition fails naming those profiles instead of blaming the port. A test must
+therefore not leave an instrumented child running after it returns.
 
 The merge refuses a receipt without that digest or an export that differs from
 it or from its totals. It requires every partition to report the same files,
@@ -735,9 +741,14 @@ The progress-bounded readiness wait is tested against a real child process on
 Linux, macOS and Windows through a stand-in owner. With the `test-support`
 feature, `KURU_TEST_MEMORY_SERVICE_STAND_IN=<file>` (`SERVICE_STAND_IN_ENV`)
 makes `service_entry` skip everything else: the owner takes no lock, opens
-nothing and writes nothing, and exits with the decimal status `<file>` holds
-once it holds one, polling every 10 ms of real time in its own process under a
-120 s bound so an unreleased stand-in leaves no process behind. Tests pass it
+nothing and writes nothing, and once `<file>` holds a decimal status it removes
+the file and exits with that status, polling every 10 ms of real time in its
+own process. The fixture's start releases the stand-in whatever the outcome
+and, once it was spawned, waits in real time until the release file is gone,
+so the stand-in never outlives its test. A paused-clock test can otherwise end
+and remove the fixture directory before the stand-in's first poll; that
+stand-in then ran to its 120 s backstop and, in a coverage partition, wrote its
+profile while the partition was exporting. Tests pass it
 only through the task-local owner environment
 (`activity::with_owner_environment`), which both platforms' spawns apply, and
 spawn the prepared `test-support` snapshot; the test then writes and retires
