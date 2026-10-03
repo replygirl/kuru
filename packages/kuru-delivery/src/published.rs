@@ -3,7 +3,7 @@
 use crate::{archive, release};
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::{
-    Client, RequestBuilder, Response, Url,
+    Client, ClientBuilder, RequestBuilder, Response, Url,
     header::{AUTHORIZATION, HeaderValue, LINK},
     redirect::Policy,
 };
@@ -90,16 +90,14 @@ impl PublicGitHub {
                 Ok::<_, anyhow::Error>(value)
             })
             .transpose()?;
-        Ok(Self {
-            client: Client::builder()
-                .https_only(true)
-                .no_proxy()
-                .redirect(Policy::limited(5))
-                .timeout(Duration::from_secs(60))
-                .user_agent("kuru-published-release-client")
-                .build()?,
+        Ok(Self::with_client(published_client()?, authorization))
+    }
+
+    fn with_client(client: Client, authorization: Option<HeaderValue>) -> Self {
+        Self {
+            client,
             authorization,
-        })
+        }
     }
 
     fn request(&self, url: &str) -> Result<RequestBuilder> {
@@ -131,7 +129,7 @@ impl PublicGitHub {
     }
 
     pub(crate) async fn get(&self, url: &str, limit: usize) -> Result<Vec<u8>> {
-        let response = self.request(url)?.send().await?.error_for_status()?;
+        let response = send(self.request(url)?).await?;
         bounded_body(response, limit).await
     }
 
@@ -140,11 +138,7 @@ impl PublicGitHub {
     /// the fixed listing path; a server-supplied `Link` URL is never requested,
     /// it only decides whether the next page exists.
     async fn release_page(&self, number: usize) -> Result<(Vec<PublishedRelease>, bool)> {
-        let response = self
-            .checked_request(listing_page_url(number)?)
-            .send()
-            .await?
-            .error_for_status()?;
+        let response = send(self.checked_request(listing_page_url(number)?)).await?;
         let link = response
             .headers()
             .get(LINK)
@@ -203,6 +197,35 @@ impl PublicGitHub {
     }
 }
 
+/// The published release client's settings on the shared release download
+/// timeout shape (no total timeout; each caller's byte limit bounds how many
+/// reads a response can take). Tests pass small bounds and omit `https_only`.
+fn published_builder(connect: Duration, idle: Duration) -> ClientBuilder {
+    archive::bounded_builder(connect, idle)
+        .no_proxy()
+        .redirect(Policy::limited(5))
+        .user_agent("kuru-published-release-client")
+}
+
+/// The production client for published release reads.
+fn published_client() -> Result<Client> {
+    Ok(
+        published_builder(archive::CONNECT_TIMEOUT, archive::READ_IDLE_TIMEOUT)
+            .https_only(true)
+            .build()?,
+    )
+}
+
+/// Send one published release request, naming that phase if it fails. An
+/// unsuccessful status keeps its own message.
+async fn send(request: RequestBuilder) -> Result<Response> {
+    Ok(request
+        .send()
+        .await
+        .context("send published release request")?
+        .error_for_status()?)
+}
+
 /// The fixed URL of one release-listing page.
 fn listing_page_url(number: usize) -> Result<Url> {
     let mut url = Url::parse(&format!(
@@ -221,7 +244,11 @@ async fn bounded_body(mut response: Response, limit: usize) -> Result<Vec<u8>> {
         "published response exceeds size limit"
     );
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("read published release response body")?
+    {
         ensure!(
             bytes.len().saturating_add(chunk.len()) <= limit,
             "published response exceeds size limit"
@@ -1386,5 +1413,90 @@ mod tests {
             assert!(authenticated.request(url).is_err(), "{url}");
         }
         assert!(PublicGitHub::new(Some("bad\ntoken")).is_err());
+    }
+
+    mod download_timeouts {
+        use super::*;
+        use crate::archive::paced_http::{Pace, PacedServer};
+
+        const IDLE: Duration = Duration::from_millis(500);
+        const GAP: Duration = Duration::from_millis(50);
+        const CHUNKS: usize = 30;
+        const OLD_TOTAL: Duration = Duration::from_millis(400);
+        const BOUND: Duration = Duration::from_secs(5);
+
+        /// The production builder with small bounds, without `https_only` so
+        /// the local HTTP fixture is reachable.
+        fn github(idle: Duration) -> PublicGitHub {
+            PublicGitHub::with_client(
+                published_builder(Duration::from_secs(1), idle)
+                    .build()
+                    .unwrap(),
+                None,
+            )
+        }
+
+        /// The same send and body phases as [`PublicGitHub::get`], through
+        /// the scheme-agnostic request builder.
+        async fn fetch(github: &PublicGitHub, url: Url) -> Result<Vec<u8>> {
+            tokio::time::timeout(BOUND, async {
+                bounded_body(send(github.checked_request(url)).await?, METADATA_LIMIT).await
+            })
+            .await
+            .expect("published read must end within its idle bound")
+        }
+
+        #[tokio::test]
+        async fn slow_response_past_the_old_total_succeeds_within_the_idle_bound() {
+            let server = PacedServer::start(Pace::Trickle {
+                chunks: CHUNKS,
+                gap: GAP,
+            })
+            .await;
+            let started = std::time::Instant::now();
+            let bytes = fetch(&github(IDLE), server.url.clone()).await.unwrap();
+            assert_eq!(bytes, PacedServer::body(CHUNKS));
+            assert!(started.elapsed() > OLD_TOTAL, "{:?}", started.elapsed());
+        }
+
+        #[tokio::test]
+        async fn a_body_stalled_past_idle_fails_naming_the_read_phase() {
+            let server = PacedServer::start(Pace::StallBody).await;
+            let error = fetch(&github(Duration::from_millis(200)), server.url.clone())
+                .await
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("read published release response body"),
+                "{message}"
+            );
+            assert!(
+                !message.contains("send published release request"),
+                "{message}"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unanswered_connection_fails_naming_the_send_phase() {
+            let server = PacedServer::never_accepting().await;
+            let error = fetch(&github(Duration::from_millis(200)), server.url.clone())
+                .await
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("send published release request"),
+                "{message}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refused_connection_fails_naming_the_send_phase() {
+            let url = PacedServer::refused().await;
+            let error = fetch(&github(IDLE), url).await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("send published release request"),
+                "{error:#}"
+            );
+        }
     }
 }

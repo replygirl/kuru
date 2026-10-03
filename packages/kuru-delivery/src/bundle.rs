@@ -1,6 +1,7 @@
 //! Verified, hash-addressed build inputs. This helper never executes an archive
 //! or depends on the runtime that will eventually consume its bytes.
 
+use crate::archive::{CONNECT_TIMEOUT, READ_IDLE_TIMEOUT};
 use crate::lease::HeldLock;
 use anyhow::{Context, Result, bail, ensure};
 use kuru_platform::fs::{
@@ -24,8 +25,6 @@ const MAX_EXPANDED: u64 = 128 * 1024 * 1024;
 const LOCK_NAME: &str = ".prepare.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(180);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(15)];
 
 #[path = "bundle/build.rs"]

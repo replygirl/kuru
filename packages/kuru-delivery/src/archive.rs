@@ -19,11 +19,16 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use url::Url;
 
 pub use crate::targets::TARGETS;
 pub const MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
 pub const SHELL_SUPPORT_MARKER: &str = "<!-- kuru-shell-support-format: 1 -->";
 pub const MAX_README_BYTES: usize = 64 * 1024;
+/// Release and bundle downloads bound connection setup and each idle read
+/// instead of the whole transfer, so a healthy slow link is not cut off.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn shell_support_marker(readme: &[u8]) -> Result<bool> {
     ensure!(
@@ -107,7 +112,7 @@ pub async fn read_asset(base: &str, name: &str, limit: usize) -> Result<Vec<u8>>
         || base.starts_with("\\\\")
         || (base.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
             && base.as_bytes().get(1) == Some(&b':'));
-    if let Some(mut base) = url::Url::parse(base).ok().filter(|_| !native_path) {
+    if let Some(mut base) = Url::parse(base).ok().filter(|_| !native_path) {
         ensure!(
             base.scheme() == "https"
                 && base.host_str().is_some()
@@ -123,24 +128,7 @@ pub async fn read_asset(base: &str, name: &str, limit: usize) -> Result<Vec<u8>>
             .map_err(|()| anyhow::anyhow!("invalid release base"))?
             .pop_if_empty()
             .push(name);
-        let client = reqwest::Client::builder()
-            .https_only(true)
-            .timeout(Duration::from_secs(60))
-            .build()?;
-        let mut response = client.get(base).send().await?.error_for_status()?;
-        ensure!(
-            response.content_length().is_none_or(|n| n <= limit as u64),
-            "release asset exceeds size limit"
-        );
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            ensure!(
-                bytes.len().saturating_add(chunk.len()) <= limit,
-                "release asset exceeds size limit"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
+        download(&release_client()?, base, limit).await
     } else {
         let directory = Directory::open(
             &absolute(Path::new(base))?,
@@ -152,6 +140,48 @@ pub async fn read_asset(base: &str, name: &str, limit: usize) -> Result<Vec<u8>>
         directory.verify(OsStr::new(name), &input)?;
         Ok(bytes)
     }
+}
+
+/// The timeout shape shared by every release download client. There is
+/// deliberately no total timeout: connection setup and every read are bounded,
+/// and the caller's byte limit bounds how many reads a transfer can take.
+/// Production passes [`CONNECT_TIMEOUT`] and [`READ_IDLE_TIMEOUT`]; tests pass
+/// small bounds and reach a local HTTP fixture by leaving out `https_only`.
+pub(crate) fn bounded_builder(connect: Duration, idle: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .read_timeout(idle)
+}
+
+/// The production client for release assets.
+fn release_client() -> Result<reqwest::Client> {
+    Ok(bounded_builder(CONNECT_TIMEOUT, READ_IDLE_TIMEOUT)
+        .https_only(true)
+        .build()?)
+}
+
+/// Fetch one release asset over HTTP with an already-checked URL, naming the
+/// request or body phase that failed.
+async fn download(client: &reqwest::Client, url: Url, limit: usize) -> Result<Vec<u8>> {
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .context("send release asset request")?
+        .error_for_status()?;
+    ensure!(
+        response.content_length().is_none_or(|n| n <= limit as u64),
+        "release asset exceeds size limit"
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("read release asset body")? {
+        ensure!(
+            bytes.len().saturating_add(chunk.len()) <= limit,
+            "release asset exceeds size limit"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn absolute(path: &Path) -> Result<PathBuf> {
@@ -626,6 +656,9 @@ fn package_with_docs(
     staging.finish()?;
     Ok(archive)
 }
+
+#[cfg(test)]
+pub(crate) mod paced_http;
 
 #[cfg(test)]
 mod tests;

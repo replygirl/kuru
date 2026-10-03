@@ -642,3 +642,105 @@ fn packaging_does_not_follow_archive_or_checksum_output_symlinks() {
         assert_eq!(fs::read_dir(&fixture.releases).unwrap().count(), 1);
     }
 }
+
+mod download_timeouts {
+    use super::super::paced_http::{Pace, PacedServer};
+    use super::*;
+
+    const IDLE: Duration = Duration::from_millis(500);
+    const GAP: Duration = Duration::from_millis(50);
+    // 30 chunks every 50 ms take about 1.5 s: longer than the flat total the
+    // old client shape is given below, with each gap a tenth of the idle bound.
+    const CHUNKS: usize = 30;
+    const OLD_TOTAL: Duration = Duration::from_millis(400);
+    const BOUND: Duration = Duration::from_secs(5);
+
+    /// The production builder with small bounds, without `https_only` so the
+    /// local HTTP fixture is reachable, and without a system proxy.
+    fn idle_client(idle: Duration) -> reqwest::Client {
+        bounded_builder(Duration::from_secs(1), idle)
+            .no_proxy()
+            .build()
+            .unwrap()
+    }
+
+    async fn bounded_download(client: &reqwest::Client, url: Url) -> Result<Vec<u8>> {
+        tokio::time::timeout(BOUND, download(client, url, MAX_ARCHIVE_BYTES))
+            .await
+            .expect("download must end within its idle bound")
+    }
+
+    #[tokio::test]
+    async fn slow_transfer_past_the_old_total_succeeds_within_the_idle_bound() {
+        let server = PacedServer::start(Pace::Trickle {
+            chunks: CHUNKS,
+            gap: GAP,
+        })
+        .await;
+        let started = std::time::Instant::now();
+        let bytes = bounded_download(&idle_client(IDLE), server.url.clone())
+            .await
+            .unwrap();
+        assert_eq!(bytes, PacedServer::body(CHUNKS));
+        assert!(started.elapsed() > OLD_TOTAL, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn the_old_flat_total_cuts_off_the_same_slow_transfer() {
+        // The defect's shape, in a client this test builds: a whole-request
+        // timeout fails a healthy slow link. The production builder is covered
+        // by the idle-bound tests above and below, not by this one.
+        let server = PacedServer::start(Pace::Trickle {
+            chunks: CHUNKS,
+            gap: GAP,
+        })
+        .await;
+        let flat = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(OLD_TOTAL)
+            .build()
+            .unwrap();
+        let error = bounded_download(&flat, server.url.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("read release asset body"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_stalled_past_idle_fails_naming_the_read_phase() {
+        let server = PacedServer::start(Pace::StallBody).await;
+        let error = bounded_download(&idle_client(Duration::from_millis(200)), server.url.clone())
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("read release asset body"), "{message}");
+        assert!(!message.contains("send release asset request"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_connection_fails_naming_the_send_phase() {
+        let server = PacedServer::never_accepting().await;
+        let error = bounded_download(&idle_client(Duration::from_millis(200)), server.url.clone())
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("send release asset request"), "{message}");
+        assert!(!message.contains("read release asset body"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_fails_naming_the_send_phase() {
+        let url = PacedServer::refused().await;
+        let error = bounded_download(&idle_client(IDLE), url).await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("send release asset request"), "{message}");
+    }
+
+    #[test]
+    fn the_release_client_builds_with_the_shared_bounds() {
+        release_client().unwrap();
+    }
+}
