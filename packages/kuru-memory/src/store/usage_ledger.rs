@@ -255,6 +255,7 @@ impl UsageLedger {
             if page.is_empty() {
                 break;
             }
+            let mut indexes = Vec::with_capacity(page.len());
             for (key, value) in &page {
                 let key = String::from_utf8(key.clone())
                     .context("usage session index key is not UTF-8")?;
@@ -264,10 +265,19 @@ impl UsageLedger {
                         && index.session_id == session_id,
                     "usage session index key does not match its record"
                 );
-                let record = read_state(self.store.pool.as_ref(), &index.record_key)
-                    .await?
+                indexes.push(index);
+            }
+            // One keyed read for the page's records, folded in index order.
+            let keys: Vec<&str> = indexes
+                .iter()
+                .map(|index| index.record_key.as_str())
+                .collect();
+            let records = read_states(self.store.pool.as_ref(), &keys).await?;
+            for index in &indexes {
+                let record = records
+                    .get(index.record_key.as_bytes())
                     .context("usage session index references a missing invocation")?;
-                let record = decode_record(&record)?;
+                let record = decode_record(record)?;
                 ensure!(
                     record.start.session_id == session_id
                         && record.start.invocation_id == index.invocation_id
@@ -1243,6 +1253,34 @@ async fn read_state(pool: &MemoryPool, key: &str) -> Result<Option<String>> {
     .await
     .context("usage ledger state read deadline exceeded")?
     .map_err(Into::into)
+}
+
+/// The values of one index page's `keys` (at most [`PAGE_SIZE`]) in one keyed
+/// statement, by key; a key without a row is absent from the map.
+async fn read_states(pool: &MemoryPool, keys: &[&str]) -> Result<BTreeMap<Vec<u8>, String>> {
+    if keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    #[cfg(test)]
+    count_read();
+    let sql = keyed_read_sql(keys.len());
+    let mut query = sqlx::query_as::<_, (Vec<u8>, String)>(sqlx::AssertSqlSafe(sql));
+    for key in keys {
+        query = query.bind(key.as_bytes());
+    }
+    let rows = crate::pool::within(QUERY_TIMEOUT, query.fetch_all(pool))
+        .await
+        .context("usage ledger session records deadline exceeded")??;
+    Ok(rows.into_iter().collect())
+}
+
+/// The keyed read of `count` keys: one bound placeholder per key, so the key
+/// bytes never reach the statement text.
+fn keyed_read_sql(count: usize) -> String {
+    format!(
+        "SELECT `key`, value FROM state WHERE `key` IN ({})",
+        vec!["?"; count].join(", ")
+    )
 }
 
 /// The half-open byte range `[start, end)` that holds exactly the keys
@@ -3476,6 +3514,23 @@ mod tests {
         )
         .await?;
         ensure_range_plan("session record probe", &plan, low, true, high)?;
+        // A page's keyed record read is a primary-key lookup, not a scan.
+        let keys: Vec<Vec<u8>> = (0..3)
+            .map(|n| record_key(&format!("plan-invocation-{n}")).into_bytes())
+            .collect();
+        let args: Vec<PlanArg<'_>> = keys.iter().map(|key| PlanArg::Bytes(key)).collect();
+        let plan = explain_bound(pool.as_ref(), &keyed_read_sql(keys.len()), &args).await?;
+        ensure!(
+            plan_nodes(&plan).any(|node| node == "IndexedTableAccess(state)")
+                && plan.contains("index: [state.key]")
+                && keys.iter().all(|key| {
+                    let key = plan_bytes(key);
+                    plan.contains(&format!("{{[{key}, {key}]}}"))
+                })
+                && !plan_nodes(&plan).any(|node| node == "Table"),
+            "session record keyed read: expected one primary-key point lookup per bound key on \
+             the pinned Dolt. Plan:\n{plan}"
+        );
 
         // Negative control: the old queries, bound as production bound them,
         // sort or read the whole table.
