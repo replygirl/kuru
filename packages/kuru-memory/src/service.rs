@@ -2634,11 +2634,13 @@ async fn request_idle_retirement(options: &crate::store::OpenOptions) -> Result<
         // An owner retiring on its own closes a connection it will never
         // accept; wait for its owner lock as for a missing endpoint.
         Err(error) if is_peer_closed(&error) => return Ok(RetirementReply::PeerClosed),
-        Err(error) => return Err(error),
+        // Each failing write carries its own context, so a log names the
+        // hello or the request. `is_peer_closed` walks the chain.
+        Err(error) => return Err(error).context("memory service maintenance handshake"),
     }
     let result = attachment.call(ServiceCall::RetireIfIdle).await;
     attachment.close();
-    match result? {
+    match result.context("memory service idle-retirement request")? {
         ServiceValue::Retirement { accepted: true } => Ok(RetirementReply::Accepted),
         ServiceValue::Retirement { accepted: false } => Ok(RetirementReply::Busy),
         _ => bail!("memory service returned the wrong maintenance response"),
