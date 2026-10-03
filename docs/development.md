@@ -535,8 +535,12 @@ and written only on evidence this process observed itself:
   attaches a cleanup failure or the guard's verdict to that outcome.
   Its retirement step, `test_support::retire_idle_service`, asks the owner to
   retire through the maintenance acquisition, retrying while attached clients
-  make it refuse, for at most 10 s (a retained fixture bound for an owner that
-  has not shown it is closing; no product budget derives it). Once a request
+  make it refuse, until one deadline carried across those retries:
+  `memory.startup_timeout_secs` (30 s by default) from its first request, the
+  same deadline each maintenance attempt enforces on its start-lock wait,
+  owner response and owner-lock wait. It covers an owner that has not shown it
+  is closing (a client still attached, the start lock held, or no reply yet);
+  no fixture-only bound applies. Once a request
   finds the owner closing (no live endpoint, a connection the owner closed
   unanswered, or an accepted retirement), it stops asking and waits for the
   owner lock's release, an event (`await_owner_release`), under one backstop:
@@ -551,9 +555,11 @@ and written only on evidence this process observed itself:
   backstop. The close budget's expiry
   (`managed owner did not release its lock within its close budget of 32s;
   <N>ms since the first retirement request found it closing (<reading>);
-  <owner state>; <trace>`) and the 10 s expiry (`managed owner retirement did
-  not complete within 10 seconds, and no request found the owner closing;
-  <owner state>; <trace>`) both name the state of the owner they waited
+  <owner state>; <trace>`) and the asking deadline's expiry (`managed owner
+  retirement did not complete within memory.startup_timeout_secs (30s; <N>ms
+  since the first request), and no request found the owner closing; <owner
+  state>; <trace>; active-client refusals=<R>`, also for an attempt failing at
+  that deadline) both name the state of the owner they waited
   behind, read at expiry from that owner's records without taking a lock:
   `owner published` (endpoint record present), `owner still opening; last
   stage = X; no endpoint record present` (an open-activity record

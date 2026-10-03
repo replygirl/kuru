@@ -53,7 +53,9 @@ reported, not made.
   present`; `owner open failed before its
   starter attached; closing its store; reason = ...`; `owner closing; last phase
   = endpoint and activity records retired (store close, Dolt reap or owner-lock
-  release outstanding)`; or `owner state unreadable: ...`.
+  release outstanding)`; or `owner state unreadable: ...`. (The 10 s prefix
+  is superseded by the Decision below: the close budget's and the startup
+  deadline's expiries carry these owner-state readings instead.)
 - A test-support-only `service::activity::inspect` reads the open-activity
   record under its name whatever its tag, for that diagnostic only. It decides
   nothing; the record still grants no authority.
@@ -82,14 +84,24 @@ now also lands it (amended in place; no new change):
 
 - `retire_idle_service` asks through the maintenance acquisition as before,
   keeping the active-client refusal loop (retry with a 20 ms backoff while
-  the owner refuses with attached clients). That asking phase keeps the former
-  10 s as its bound, named `ANSWERING_OWNER_BOUND`: it is retained, not
-  derived, and now covers only an owner that has not shown it is closing (a
-  client still attached, the start lock held, or no reply yet).
+  the owner refuses with attached clients). That asking phase has no
+  fixture-only bound: it is bounded by one deadline carried across the
+  refusal retries, `memory.startup_timeout_secs` (30 s by default) from its
+  first request, the deadline each `acquire_maintenance_permit_traced`
+  attempt already enforces on its start-lock wait, owner response and
+  owner-lock wait (an attempt also ends Busy after 10 replies; only the
+  fixture's refusal retry was otherwise unbounded). It covers only an owner
+  that has not shown it is closing (a client still attached, the start lock
+  held, or no reply yet). Its expiry, and an attempt failing at that same
+  deadline, names the deadline, the time since the first request, the owner
+  state, the trace and the refusal count; product behaviour is unchanged. An
+  interim fix commit (818294f3) kept the former flat 10 s for this phase as
+  `ANSWERING_OWNER_BOUND`; review rejected that self-approved retention, since
+  the lead's decision replaced the flat 10 s, and 055d2818 removed it.
 - At the first retirement reply that shows the owner closing (no live
   endpoint or a connection the owner closed unanswered, as the lead named, and
   also an accepted retirement request, which is the same close and would
-  otherwise still be policed by the 10 s), it drops the acquisition and waits
+  otherwise still be policed by the asking deadline), it drops the acquisition and waits
   on the owner lock's release event (`await_owner_release`, no deadline by
   design) under one backstop: `server::close_budget()` (`CLOSE_GRACE` 8 s +
   `KILL_GRACE` 3 s + `SUPERVISOR_REAP_ALLOWANCE` 13 s + `CLOSE_GRACE` 8 s =
