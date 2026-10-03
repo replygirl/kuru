@@ -2078,13 +2078,13 @@ mod tests {
             let (project, _scope, data, mut options) = owner_fixture(root.path())?;
             options.starter_token = Some(Uuid::new_v4());
             let _gate = crate::spawn_gate::spawning().await;
-            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let mut owner = ServiceOwner::open(options.clone(), &project).await?;
             owner
                 .activity
-                .as_ref()
+                .as_mut()
                 .context("a tokened owner kept no publisher")?
-                .settled()
-                .await?;
+                .finish_writes()
+                .await;
             let pause = ClosePause::at(ClosePoint::AfterReap);
             let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
             knobs.close_pause = Some(pause.clone());
@@ -2135,13 +2135,13 @@ mod tests {
             let (project, _scope, data, mut options) = owner_fixture(root.path())?;
             options.starter_token = Some(Uuid::new_v4());
             let _gate = crate::spawn_gate::spawning().await;
-            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let mut owner = ServiceOwner::open(options.clone(), &project).await?;
             owner
                 .activity
-                .as_ref()
+                .as_mut()
                 .context("a tokened owner kept no publisher")?
-                .settled()
-                .await?;
+                .finish_writes()
+                .await;
             let pause = ClosePause::at(ClosePoint::AfterReap);
             let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
             knobs.close_pause = Some(pause.clone());
@@ -2198,13 +2198,13 @@ mod tests {
             let (project, _scope, data, mut options) = owner_fixture(root.path())?;
             options.starter_token = Some(Uuid::new_v4());
             let _gate = crate::spawn_gate::spawning().await;
-            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let mut owner = ServiceOwner::open(options.clone(), &project).await?;
             owner
                 .activity
-                .as_ref()
+                .as_mut()
                 .context("a tokened owner kept no publisher")?
-                .settled()
-                .await?;
+                .finish_writes()
+                .await;
             let (knobs, _events) = observed(Admission::AnyAttachment, None);
             let served = tokio::spawn(owner.serve_with(knobs));
             let client = attach_raw(&data, &options.project_scope, None).await?;
