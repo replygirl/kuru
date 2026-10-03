@@ -540,9 +540,15 @@ and written only on evidence this process observed itself:
   same deadline each maintenance attempt enforces on its start-lock wait,
   owner response and owner-lock wait. It covers an owner that has not shown it
   is closing (a client still attached, the start lock held, or no reply yet);
-  no fixture-only bound applies. Once a request
-  finds the owner closing (no live endpoint, a connection the owner closed
-  unanswered, or an accepted retirement), it stops asking and waits for the
+  no fixture-only bound applies. A request that finds no live endpoint while
+  the owner's records show it still opening (an open-activity record not
+  marked failing, and no endpoint record) is not a closing reading: an
+  opening owner has not published yet, and once it publishes it must still
+  be asked, so the fixture keeps asking under that deadline, the bound on the
+  open itself. Once a request
+  finds the owner closing (no live endpoint with the owner not opening, a
+  connection the owner closed unanswered, or an accepted retirement), it
+  stops asking and waits for the
   owner lock's release, an event (`await_owner_release`), under one backstop:
   the owner's own close budget, `server::close_budget()` (the first pool
   drain, the Windows lifetime close, the supervisor reap allowance and the
@@ -567,7 +573,10 @@ and written only on evidence this process observed itself:
   reason = ...` (a failing record), or `owner closing; last phase = endpoint
   and activity records retired` (its store close, Dolt reap or lock release
   outstanding). A served owner reads as opening only between its two record
-  retirements, and an owner without a starter token publishes no record. No
+  retirements (a close stalled exactly there is asked until the startup
+  deadline and reported as opening), and an owner without a starter token, or
+  whose best-effort record write failed, publishes no record, so its open
+  reads as a close (only in-process test owners are untokened). No
   close step is stamped, so which close step is slow is not known. The
   product's own maintenance election deadline (`startup_timeout_secs`, 30 s by
   default) is shorter than that close budget; aligning it is separate work.

@@ -288,10 +288,12 @@ pub(crate) fn read_activity(data_dir: &Path, scope: &str, tag: &str) -> Result<A
     Ok(activity)
 }
 
-/// Test-support diagnostics only: the activity of whatever owner's record is
-/// under the name now, whatever its tag, or `None` when the name is missing.
-/// It decides nothing: a fixture whose own bound has already elapsed names
-/// the owner it was waiting behind with it, and nothing else reads it.
+/// Test support only: the activity of whatever owner's record is under the
+/// name now, whatever its tag, or `None` when the name is missing. It grants
+/// nothing and no product path reads it: a fixture whose own bound has
+/// already elapsed names the owner it was waiting behind with it, and a
+/// fixture retirement reads it only to keep asking an owner still opening
+/// rather than take its missing endpoint for a close.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn inspect(data_dir: &Path, scope: &str) -> Result<Option<Activity>> {
     let path = directory(data_dir, scope)?.join(RECORD);

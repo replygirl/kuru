@@ -800,9 +800,13 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
 /// retries: `memory.startup_timeout_secs` from the first attempt, the deadline
 /// that attempt itself enforces on its start-lock wait, owner response and
 /// owner-lock wait. That covers an owner that has not shown it is closing (a
-/// client still attached, the start lock held, or no reply yet). Once a
-/// request finds the owner closing (no live endpoint, a connection the
-/// owner closed unanswered, or an accepted retirement), it stops asking and
+/// client still attached, the start lock held, or no reply yet), including
+/// one still opening: a request that finds no live endpoint while the
+/// owner's records show its open in progress is not a closing reading, since
+/// that owner will publish and must then be asked, so the deadline also bounds
+/// the open itself. Once a request finds the owner closing (no live endpoint
+/// with the owner not opening, a connection the owner closed unanswered, or
+/// an accepted retirement), it stops asking and
 /// waits for the owner lock's release, an event, under one backstop: the
 /// owner's own close budget (`server::close_budget`) counted from that first
 /// reading, a lower bound of the close's age. The lock wait cannot be
@@ -810,9 +814,18 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
 /// fails and that thread, still blocked, ends with the process or once the
 /// owner lets go. Callers therefore need no outer backstop of their own.
 ///
+/// The opening reading comes from the owner's best-effort records (see
+/// [`owner_state`]), so two cases are read imperfectly. A served owner whose
+/// close stalls between its endpoint and activity record retirements reads
+/// as opening: it is asked until the asking deadline, which then names it
+/// still opening. An owner with no record, because it was started without a
+/// starter token (only in-process test owners) or its record write failed,
+/// reads as closing while it opens; if it then publishes and stays idle,
+/// nothing asks it again and the close budget fails.
+///
 /// When either deadline elapses, or an attempt fails, the error names the
-/// step the acquisition was in, so a slow owner close, a still-attached client and a stalled request
-/// are distinguishable from the failure text alone, and the state of the
+/// step the acquisition was in, so a slow owner close, a still-attached
+/// client and a stalled request are distinguishable from the failure text alone, and the state of the
 /// owner it waited behind, read at expiry by [`owner_state`]; the close
 /// budget's expiry also names the first closing reading and the time since.
 pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
@@ -828,9 +841,36 @@ pub(crate) async fn retire_idle_service_keeping_waiter(
     retire_idle_service_traced(options, &retirement_trace(options)).await
 }
 
-/// The trace a fixture retirement for `options` records its requests in.
-pub(crate) fn retirement_trace(_options: &OpenOptions) -> crate::service::MaintenanceTrace {
-    crate::service::MaintenanceTrace::default()
+/// The trace a fixture retirement for `options` records its requests in. A
+/// request that finds no live endpoint is a closing reading only when
+/// [`owner_opening`] does not read the owner as still opening.
+pub(crate) fn retirement_trace(options: &OpenOptions) -> crate::service::MaintenanceTrace {
+    let data_dir = options.data_dir.clone();
+    let scope = options.project_scope.clone();
+    crate::service::MaintenanceTrace::reading_opening(move || owner_opening(&data_dir, &scope))
+}
+
+/// Whether a managed owner's records show it still opening: no endpoint
+/// record and an open-activity record not marked failing (see
+/// [`owner_state`]). Only a positive reading of a closing owner is not
+/// opening: no endpoint record, and an activity record that is absent or
+/// marked failing. An unreadable record or a present endpoint record reads
+/// as opening, so the fixture keeps asking: misreading a close costs only
+/// the asking deadline, while misreading an open would stop asking an owner
+/// that is about to publish.
+fn owner_opening(data_dir: &std::path::Path, scope: &str) -> bool {
+    let closing = matches!(
+        crate::service::EndpointRecord::read(data_dir, scope),
+        Ok(None)
+    ) && matches!(
+        crate::service::activity::inspect(data_dir, scope),
+        Ok(None
+            | Some(crate::service::activity::Activity {
+                failure: Some(_),
+                ..
+            }))
+    );
+    !closing
 }
 
 /// [`retire_idle_service_keeping_waiter`], recording its requests in a

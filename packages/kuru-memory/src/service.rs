@@ -2430,6 +2430,11 @@ pub(crate) struct MaintenanceTrace {
     /// Wakes every waiter on the trace's replies after each recorded reply.
     #[cfg(any(test, feature = "test-support"))]
     replied: tokio::sync::Notify,
+    /// Reads the owner's records at a reply that found no live endpoint and
+    /// says whether the owner is still opening. An opening owner has not
+    /// published yet, so that reply is not a closing reading.
+    #[cfg(any(test, feature = "test-support"))]
+    opening: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// The first retirement reply that showed the owner closing, and when it
@@ -2458,6 +2463,10 @@ struct MaintenanceStep {
     peer_closed: u32,
     /// Retirement requests the owner refused because clients were attached.
     busy: u32,
+    /// Requests without a live endpoint while the owner's records showed it
+    /// still opening.
+    #[cfg(any(test, feature = "test-support"))]
+    opening: u32,
     /// The first reply that showed the owner closing.
     #[cfg(any(test, feature = "test-support"))]
     closing: Option<ClosingReading>,
@@ -2495,7 +2504,21 @@ impl MaintenanceTrace {
         step.since = Some(tokio::time::Instant::now());
     }
 
+    /// A trace whose replies without a live endpoint are closing readings
+    /// only while `opening` says the owner is not still opening.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn reading_opening(opening: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            opening: Some(Box::new(opening)),
+            ..Self::default()
+        }
+    }
+
     fn record(&self, reply: RetirementReply) {
+        // Read before the step lock: the classifier reads the owner's records.
+        #[cfg(any(test, feature = "test-support"))]
+        let opening = reply == RetirementReply::NoEndpoint
+            && self.opening.as_ref().is_some_and(|opening| opening());
         let mut step = self
             .step
             .lock()
@@ -2508,8 +2531,12 @@ impl MaintenanceTrace {
         }
         #[cfg(any(test, feature = "test-support"))]
         {
+            if opening {
+                step.opening = step.opening.saturating_add(1);
+            }
             if step.closing.is_none() {
                 let reply = match reply {
+                    RetirementReply::NoEndpoint if opening => None,
                     RetirementReply::NoEndpoint => Some("no live endpoint"),
                     RetirementReply::PeerClosed => {
                         Some("the owner closed the connection unanswered")
@@ -2592,7 +2619,16 @@ impl std::fmt::Display for MaintenanceTrace {
             step.unanswered,
             step.peer_closed,
             step.busy
-        )
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self.opening.is_some() {
+            write!(
+                formatter,
+                "; requests without a live endpoint while the owner was opening={}",
+                step.opening
+            )?;
+        }
+        Ok(())
     }
 }
 
