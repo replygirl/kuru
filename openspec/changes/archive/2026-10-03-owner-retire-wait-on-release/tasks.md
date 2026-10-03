@@ -14,3 +14,9 @@
 
 - [x] 3.1 Describe the expiry diagnostic and the missing backstop in `docs/development.md` and verify `mise run docs:check`
 - [x] 3.2 Run the kuru-memory suite, the terminal test three times and the static checks, and record the results in verification.md
+
+## 4. Review corrections
+
+- [x] 4.1 Require the neutral prefix `managed owner retirement did not complete within 10 seconds`, no `idle managed owner`, and `no endpoint record present` in the three elapsed-bound tests, and verify they fail with the old text
+- [x] 4.2 Change `retire_idle_service`'s expiry prefix and the opening reading's endpoint clause, refresh the `docs/development.md` sentence that quotes them, and verify the three tests pass three times
+- [x] 4.3 Relabel the occurrence's "published" reading as inferred (Drop panic discards the test's outcome; option A not excluded) and record the undelivered close-phase stamps in the proposal
