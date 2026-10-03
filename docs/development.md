@@ -616,6 +616,14 @@ another holder exists. The tests
 `an_inherited_duplicate_of_the_shared_key_lock_does_not_send_the_opener_cold`
 hold such a duplicate deliberately.
 
+The project service's start and owner locks follow the same rule:
+`ServiceLock::release` and the lock's drop both unlock explicitly before the
+handle closes. A `ServiceOwner::open` that fails releases its owner lock after
+its store has closed and reaped Dolt, and before the open returns, so a starter
+can elect a successor on that lock at once. The test
+`a_failed_open_releases_its_owner_lock_despite_a_duplicate_descriptor` holds a
+duplicate of the failing owner's lock across its open.
+
 An owner ends itself when its last attachment releases, so a fixture that
 needs a running owner chooses its lifetime policy. `ServeKnobs`
 (`service.rs`) carries the admission rule, the first-attachment deadline, the

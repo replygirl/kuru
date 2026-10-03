@@ -517,6 +517,11 @@ pub(crate) struct OwnerHooks {
     /// store opened, at that ending's [`super::ClosePoint`]s.
     #[cfg(test)]
     pub(crate) close_pause: Option<Arc<super::ClosePause>>,
+    /// Receives a duplicate of the owner lock's handle as soon as the lock
+    /// is held: the same open description a sibling's child holds between
+    /// fork and exec.
+    #[cfg(test)]
+    pub(crate) duplicate_owner_lock: Option<Arc<std::sync::Mutex<Option<std::fs::File>>>>,
 }
 
 impl OwnerHooks {
@@ -543,6 +548,8 @@ impl OwnerHooks {
                 hold: None,
                 #[cfg(test)]
                 close_pause: None,
+                #[cfg(test)]
+                duplicate_owner_lock: None,
             }
         }
         #[cfg(not(any(test, feature = "test-support")))]
@@ -2172,6 +2179,50 @@ mod tests {
         .await
         .with_context(|| {
             format!("failed publication mark fixture exceeded its {deadline:?} deadline")
+        })?
+    }
+
+    // An owner whose open fails has released its owner lock when the open
+    // returns, although another descriptor of the lock's open description
+    // still lives, as a sibling's child holds one between fork and exec.
+    #[tokio::test]
+    async fn a_failed_open_releases_its_owner_lock_despite_a_duplicate_descriptor() -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, mut options) = owner_fixture(root.path())?;
+            options.starter_token = Some(Uuid::new_v4());
+            // A directory where the endpoint record would be published.
+            let services = crate::files::ensure_private_directory(&directory(&data, &scope)?)?;
+            std::fs::create_dir(services.path().join("endpoint.json"))?;
+            let slot = Arc::new(std::sync::Mutex::new(None));
+            let hooks = OwnerHooks {
+                duplicate_owner_lock: Some(Arc::clone(&slot)),
+                ..OwnerHooks::default()
+            };
+            let _gate = crate::spawn_gate::spawning().await;
+            let opened = ServiceOwner::open_with_activity(options.clone(), &project, hooks).await;
+            if let Ok(owner) = opened {
+                owner.close().await?;
+                bail!("the owner opened despite its occupied endpoint name");
+            }
+            let duplicate = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .context("the open did not duplicate its owner lock")?;
+            let free = owner_lock_free(&options);
+            drop(duplicate);
+            ensure!(
+                free?,
+                "a failed open left its owner lock held by a duplicate descriptor"
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("failed open duplicate fixture exceeded its {deadline:?} deadline")
         })?
     }
 
