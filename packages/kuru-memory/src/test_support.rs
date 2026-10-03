@@ -797,9 +797,10 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
 ///
 /// It asks through the maintenance acquisition, retrying while the owner
 /// refuses with attached clients, until one deadline carried across those
-/// retries: `memory.startup_timeout_secs` from the first attempt, the deadline
-/// that attempt itself enforces on its start-lock wait, owner response and
-/// owner-lock wait. That covers an owner that has not shown it is closing (a
+/// retries: `memory.startup_timeout_secs` from the first attempt, no longer
+/// than the deadline that attempt itself enforces on its start-lock wait,
+/// owner response and owner-lock wait (the longer of that timeout and the
+/// owner's close budget). That covers an owner that has not shown it is closing (a
 /// client still attached, the start lock held, or no reply yet), including
 /// one still opening: a request that finds no live endpoint while the
 /// owner's records show its open in progress is not a closing reading, since
@@ -911,8 +912,9 @@ pub(crate) async fn retire_idle_service_traced(
         }
     })
     .await;
-    // An attempt's own deadline equals this one, so an attempt failing at it
-    // is the same expiry as the timeout's and is reported alike.
+    // An attempt's own deadline is never shorter than this one, so an attempt
+    // failing at or after it is the same expiry as the timeout's and is
+    // reported alike.
     let expired = |error: Error| {
         error.context(format!(
             "managed owner retirement did not complete within memory.startup_timeout_secs \
