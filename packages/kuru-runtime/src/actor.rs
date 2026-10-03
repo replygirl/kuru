@@ -6,10 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use kuru_connectors::{
-    Provider, ProviderEvent, ProviderReasoningSummary, ProviderSink, collect_completion,
-    largest_fitting_context_prefix,
+    COMPLETION_TIMEOUT, Provider, ProviderEvent, ProviderReasoningSummary, ProviderSink,
+    STREAM_IDLE_TIMEOUT, collect_completion, largest_fitting_context_prefix,
 };
 use kuru_core::{
     Completion, CompletionRequest, ContentBlock, ContextBudget, ContextCompactionPolicy,
@@ -35,6 +35,114 @@ use crate::{
     engine::{CancellationToken, turn_was_cancelled},
     progress::{ContextSnapshot, ProgressDescriptor, ProgressObserver, RequestContext},
 };
+
+/// Failure-message subject of an ordinary turn's model call.
+pub(crate) const MODEL_CALL: &str = "model call";
+/// Failure-message subject of a context compaction's model call.
+pub(crate) const COMPACTION_CALL: &str = "context compaction model call";
+
+/// Longest a model call may go without a provider event. It is the
+/// connector's stream silence budget, not a second number: on real wire
+/// silence both expire together, since the connector re-arms its read once a
+/// chunk's events are forwarded. This window restarts only on forwarded
+/// events, and it also bounds providers that have no stream idle bound.
+const NO_PROGRESS_WINDOW: Duration = STREAM_IDLE_TIMEOUT;
+
+/// When the provider last made progress, shared between the forwarding sink
+/// and the silence watcher of one model call.
+struct LastProgress(std::sync::Mutex<tokio::time::Instant>);
+
+impl LastProgress {
+    fn now() -> Self {
+        Self(std::sync::Mutex::new(tokio::time::Instant::now()))
+    }
+
+    fn record(&self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = tokio::time::Instant::now();
+    }
+
+    fn silence_deadline(&self) -> tokio::time::Instant {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            + NO_PROGRESS_WINDOW
+    }
+
+    /// Resolves once the provider has been silent for [`NO_PROGRESS_WINDOW`].
+    async fn silence(&self) {
+        loop {
+            let deadline = self.silence_deadline();
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
+    }
+}
+
+/// Forwards every provider event to the actor's observer unchanged and
+/// records the provider's progress.
+struct ProgressWindow<'a> {
+    observer: &'a mut dyn ProviderSink,
+    last_progress: &'a LastProgress,
+}
+
+impl ProviderSink for ProgressWindow<'_> {
+    fn emit<'a>(
+        &'a mut self,
+        event: ProviderEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.last_progress.record();
+            let forwarded = self.observer.emit(event).await;
+            // The window measures provider silence, not the observer's own
+            // accounting work, so it restarts once forwarding returns.
+            self.last_progress.record();
+            forwarded
+        })
+    }
+}
+
+/// Collect one completion while its provider keeps making progress: the call
+/// fails after [`NO_PROGRESS_WINDOW`] without a provider event, and in any
+/// case once the connector's total [`COMPLETION_TIMEOUT`] has elapsed. A
+/// provider that bypasses the connector's HTTP client is held to the same
+/// total here. `call` names the model call in either failure; a provider
+/// failure is returned unchanged.
+pub(crate) async fn bounded_completion(
+    provider: &dyn Provider,
+    request: CompletionRequest,
+    observer: &mut dyn ProviderSink,
+    call: &str,
+) -> Result<Completion> {
+    let last_progress = LastProgress::now();
+    let mut window = ProgressWindow {
+        observer,
+        last_progress: &last_progress,
+    };
+    let progressing = async {
+        tokio::select! {
+            biased;
+            result = collect_completion(provider, request, Some(&mut window)) => result,
+            () = last_progress.silence() => Err(anyhow!(
+                "{call}: no provider progress for {} s",
+                NO_PROGRESS_WINDOW.as_secs()
+            )),
+        }
+    };
+    tokio::time::timeout(COMPLETION_TIMEOUT, progressing)
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow!(
+                "{call} exceeded the {} s completion budget",
+                COMPLETION_TIMEOUT.as_secs()
+            ))
+        })
+}
 
 #[derive(Debug)]
 pub(crate) struct MemoryFailure(pub anyhow::Error);
@@ -539,18 +647,12 @@ impl Actor {
                         }
                         let result = work
                             .cancellation
-                            .wait(async {
-                                tokio::time::timeout(
-                                    Duration::from_secs(180),
-                                    collect_completion(
-                                        provider.as_ref(),
-                                        request,
-                                        Some(&mut observer),
-                                    ),
-                                )
-                                .await
-                                .context("model call exceeded 180 seconds")?
-                            })
+                            .wait(bounded_completion(
+                                provider.as_ref(),
+                                request,
+                                &mut observer,
+                                MODEL_CALL,
+                            ))
                             .await;
                         if let Err(error) = &result
                             && error.downcast_ref::<ContextTooLarge>().is_some()
@@ -1114,14 +1216,12 @@ async fn run_context_compaction(
         .map_err(AccountingFailure)?;
     let completion_result = work
         .cancellation
-        .wait(async {
-            tokio::time::timeout(
-                Duration::from_secs(180),
-                collect_completion(provider, request, Some(&mut observer)),
-            )
-            .await
-            .context("context compaction model call exceeded 180 seconds")?
-        })
+        .wait(bounded_completion(
+            provider,
+            request,
+            &mut observer,
+            COMPACTION_CALL,
+        ))
         .await;
     let cancellation_after_completion = completion_result
         .as_ref()

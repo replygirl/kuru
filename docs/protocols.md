@@ -94,11 +94,20 @@ whose name or call ID was never announced, or whose arguments never settled as
 valid JSON, fails the turn instead of dispatching.
 
 Responses completions have a 600-second total operation budget while model
-catalog requests remain bounded to 60 seconds. SSE keeps at most 2 MiB of its
-retained response; deltas and framing also have finite wire and parser limits.
-A truncated, oversized, or failed stream is an error and is not replayed after
-partial output. A successful terminal settles the request without waiting for
-EOF; conflicting terminal frames already buffered are rejected.
+catalog requests remain bounded to 60 seconds. Within that budget a completion
+may stay silent for at most 300 seconds: the stream fails when no wire chunk
+arrives for that long, and the runtime fails the turn or context compaction
+model call when no provider event reaches it for that long. A completion that
+keeps streaming may therefore run until the 600-second budget ends it. The
+silence budget is a product choice, not a server guarantee: the Responses
+streaming reference documents no keepalive or bound between events, and
+reasoning can precede the next event by minutes, so Kuru adopts the 300-second
+default SSE idle timeout documented for OpenAI's own Responses client. SSE
+keeps at most 2 MiB of its retained response; deltas and framing also have
+finite wire and parser limits. A truncated, oversized, or failed stream is an
+error and is not replayed after partial output. A successful terminal settles
+the request without waiting for EOF; conflicting terminal frames already
+buffered are rejected.
 
 The live preview is separate from semantic events, the turn journal and saved
 conversation. Only the selected speaking request exposes text and visible

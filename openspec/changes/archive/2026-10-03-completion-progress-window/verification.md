@@ -1,0 +1,17 @@
+# Verification
+
+## 1. A streaming completion is bounded by progress and the total budget [critical]
+
+- [x] 1.1 @regression (agent) `mise run //packages/kuru-runtime:test -- completion_window_tests` against the previous flat 180 s body behind the shared helper (`timeout(Duration::from_secs(180), collect_completion(..)).with_context(|| format!("{call} exceeded 180 seconds"))`, working tree on base e4aa9f71), then the fixed body -> Observed 2026-10-03, macOS arm64, paused tokio clock (finished in 0.01 s wall). Red (exit 101, 0 passed, 3 failed): `a_stream_delivering_deltas_past_the_previous_flat_bound_completes` panicked "model call failed while streaming: model call exceeded 180 seconds: deadline has elapsed"; `a_provider_that_falls_silent_fails_one_window_after_its_last_event` failed `left: 180s` vs `right: 400s`; `a_stream_that_never_settles_fails_at_the_total_completion_budget` failed `left: 180s` vs `right: 600s`. Green (exit 0): 3 passed; the 450 s stream completes, silence fails at exactly 100 s + 300 s with "model call: no provider progress for 300 s", and the unsettled stream fails at exactly 600 s with "model call exceeded the 600 s completion budget".
+- [x] 1.2 @unit (agent) the progress adapter forwards every event to the observer unchanged (recorded events equal the emitted sequence) -> Observed 2026-10-03: the green run asserts the recording observer received exactly the emitted deltas and `Completed`, in order, and in the silent case exactly the two deltas.
+- [x] 1.3 @unit (agent) the turn label and the compaction label each fail with their own no-progress and total-budget messages -> Observed 2026-10-03: each green test loops over `MODEL_CALL` and `COMPACTION_CALL` (the constants both sites pass); "context compaction model call: no provider progress for 300 s" and "context compaction model call exceeded the 600 s completion budget" asserted verbatim. A grep for `180 seconds`, `exceeded 180` and `from_secs(180)` over packages, apps and docs before renaming found no test or document asserting the old texts.
+
+## 2. Existing turn, compaction and connector behavior is preserved
+
+- [x] 2.1 @integration (agent) `mise run //packages/kuru-runtime:test` (full package, real Dolt turn and compaction paths through the helper) -> Observed 2026-10-03, macOS arm64: exit 0 in 190 s; lib 223 passed, 0 failed (including the compaction accounting, cancellation and retry suites that now run through `bounded_completion`).
+- [x] 2.2 @integration (agent) `mise run //packages/kuru-connectors:test` (SSE idle, total budget and live HTTP fixtures) -> Observed 2026-10-03, macOS arm64: exit 0 in 76 s; lib 297 passed, 0 failed (including `real_idle_stream_is_bounded_and_dropped`, which passes its own idle duration).
+- [~] 2.3 @manual (agent) a live Responses completion exceeding 180 s on a real account -> defer: live login and provider credentials require the user's participation (AGENTS.md); the bound logic is exercised on the paused clock and the wire path by the connector fixtures.
+
+## 3. Static checks and documentation
+
+- [x] 3.1 @integration (agent) `mise run format:check`, `mise run lint`, `mise run lint:windows`, `mise run typecheck`, `mise run docs:check`, `mise run cospec -- validate --all --strict` -> Observed 2026-10-03, macOS arm64: each exits 0 (format:check after `cargo fmt` of the two packages; lint 95 s; root lint:windows 81 s for x86_64-pc-windows-msvc; typecheck 69 s; docs:check 8 s, "Public docs artifacts, local links and anchors passed"; validate "0 errors, 0 warnings").
