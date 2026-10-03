@@ -341,7 +341,6 @@ impl Drop for Owner {
         // immediately after the last store handle. Keep fixture files until the
         // supervisor has confirmed that Dolt is reaped.
         std::thread::spawn(move || {
-            let _guard = guard;
             observe_supervisor(
                 child,
                 retained,
@@ -353,6 +352,12 @@ impl Drop for Owner {
             // and the ledger records it on the next thread that reads it.
             #[cfg(any(test, feature = "test-support"))]
             reaper.report();
+            // Released after the reap, explicitly: a startup lock or a
+            // template build's key lock must not stay held by a sibling's
+            // child that duplicated it between fork and exec.
+            if let Some(guard) = guard {
+                files::release_lock(guard);
+            }
         });
     }
 }

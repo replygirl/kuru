@@ -19,6 +19,23 @@ use std::{io, thread, time::Instant};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+/// Release an advisory lock that `file` holds, then close `file`. The lock
+/// belongs to the open file description, not to this descriptor: on Unix a
+/// sibling's child between fork and exec holds a duplicate of every
+/// descriptor this process has open, and closing only this one would leave
+/// the lock held until that child execs. The explicit unlock ends the lock
+/// for every duplicate. On Windows it is the documented prompt release. An
+/// unlock error is logged; closing still releases once every duplicate is
+/// closed.
+pub(crate) fn release_lock(file: File) {
+    if let Err(error) = file.unlock() {
+        tracing::warn!(
+            error = %error,
+            "an advisory lock could not be released explicitly; it ends when its handle closes"
+        );
+    }
+}
+
 pub(crate) fn directory(path: &Path) -> Result<Directory> {
     open_directory(path, Privacy::OwnerOnly, NameRetention::Movable)
 }

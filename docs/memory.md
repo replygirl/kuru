@@ -427,8 +427,9 @@ steps. A project is built directly when:
 - it imports legacy SQLite data (the import runs before the schema steps);
 - `memory.dolt_binary` names a development engine, because the template's key
   binds the bundled engine;
-- another process is building the template or moving a damaged one aside at
-  that moment: a new project never waits for another one's build;
+- another Kuru open is building the template or moving a damaged one aside at
+  that moment: a new project never waits for another one's build, and only
+  another Kuru open that is still using the template makes it busy;
 - the template's directory or lock file cannot be opened, locked or verified,
   which is logged as a warning in the memory service log; or
 - a template this open did not build fails a check while it is copied. A

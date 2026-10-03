@@ -97,6 +97,10 @@ pub(crate) struct Hooks {
     /// of the compiled one: a stage the supervisor refuses before adoption,
     /// as a stage copied by another build would be.
     pub(crate) stage_key: Option<String>,
+    /// The first shared key lock taken in scope is duplicated here, as a
+    /// sibling's child between fork and exec duplicates every open
+    /// description: the test holds the duplicate past the opener's release.
+    pub(crate) duplicate_shared: Option<Arc<StdMutex<Option<File>>>>,
 }
 
 /// The file [`Hooks::plant_leak`] writes, relative to the build store's
@@ -131,6 +135,22 @@ pub(in crate::store) fn identity_written(stage: &Path) {
 /// compiled one, when scoped.
 pub(in crate::store) fn stage_key() -> Option<String> {
     current().and_then(|hooks| hooks.stage_key)
+}
+
+/// After a key lock is taken and verified: duplicate the first shared one
+/// into [`Hooks::duplicate_shared`], when scoped.
+pub(super) fn key_lock_taken(mode: Mode, lock: &KeyLock) {
+    let Some(slot) = current().and_then(|hooks| hooks.duplicate_shared) else {
+        return;
+    };
+    let mut slot = slot.lock().expect("duplicate key lock slot");
+    if mode == Mode::Shared && slot.is_none() {
+        *slot = Some(
+            lock.file()
+                .try_clone()
+                .expect("duplicate the shared key lock's open file description"),
+        );
+    }
 }
 
 pub(super) fn lock_fault(step: LockStep) -> Result<()> {
