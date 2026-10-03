@@ -347,7 +347,9 @@ where
         match (built, close_migration_worker(server, pool).await) {
             (Ok(hostname), Ok(guard)) => Ok((guard, hostname)),
             (Err(error), Ok(guard)) => {
-                drop(guard);
+                // The template key's exclusive lock: released explicitly, so
+                // a sibling's child between fork and exec cannot keep it.
+                files::release_lock(guard);
                 Err(error)
             }
             (Ok(_), Err(cleanup)) => Err(cleanup),

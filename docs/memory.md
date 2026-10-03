@@ -428,7 +428,9 @@ steps. A project is built directly when:
 - `memory.dolt_binary` names a development engine, because the template's key
   binds the bundled engine;
 - another process is building the template or moving a damaged one aside at
-  that moment: a new project never waits for another one's build;
+  that moment: a new project never waits for another one's build. Kuru
+  releases the template's lock explicitly as soon as it is done with it, so a
+  program Kuru starts at that moment does not keep the lock held;
 - the template's directory or lock file cannot be opened, locked or verified,
   which is logged as a warning in the memory service log; or
 - a template this open did not build fails a check while it is copied. A

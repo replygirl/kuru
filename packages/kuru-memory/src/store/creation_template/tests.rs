@@ -97,14 +97,14 @@ pub(super) fn key() -> &'static str {
 
 /// The key lock of `root`, taken in `mode` without waiting, under the lock
 /// gate.
-pub(super) async fn hold(root: &Path, mode: Mode) -> Result<File> {
+pub(super) async fn hold(root: &Path, mode: Mode) -> Result<KeyLock> {
     let root = open_root(root)?;
     let _gate = crate::spawn_gate::locking_async().await;
     try_key_lock(&root, key(), mode)?.context("the key lock was busy")
 }
 
 /// Release a held key lock under the lock gate.
-pub(super) async fn release(lock: File) {
+pub(super) async fn release(lock: KeyLock) {
     let _gate = crate::spawn_gate::locking_async().await;
     drop(lock);
 }
@@ -854,6 +854,30 @@ async fn second_creator_goes_cold_at_once_while_a_build_is_in_progress() -> Resu
 
 /// A held key lock never makes a template caller wait: without waiting it
 /// is "no template now", and nothing unpublished is read or created.
+/// A released key lock binds no duplicate of its open file description. A
+/// sibling's child holds such a duplicate between fork and exec; the
+/// exclusive try after a shared inspection, or a quarantine, must not find
+/// the lock busy because of it.
+#[tokio::test]
+async fn a_released_key_lock_is_free_while_a_duplicate_descriptor_remains() -> Result<()> {
+    let fixture = fixture()?;
+    let directory = open_root(&fixture.path().join("templates"))?;
+    let _gate = crate::spawn_gate::locking_async().await;
+    for mode in [Mode::Shared, Mode::Exclusive] {
+        let held = try_key_lock(&directory, key(), mode)?
+            .with_context(|| format!("the {mode:?} key lock was busy"))?;
+        // As a sibling's child holds it between fork and exec.
+        let duplicate = held.file().try_clone()?;
+        drop(held);
+        let upgraded = try_key_lock(&directory, key(), Mode::Exclusive)?.with_context(|| {
+            format!("a released {mode:?} key lock stayed held by a duplicate descriptor")
+        })?;
+        drop(duplicate);
+        drop(upgraded);
+    }
+    fixture.release(Ok(()))
+}
+
 #[tokio::test]
 async fn concurrent_template_lock_acquisition_never_waits() -> Result<()> {
     let fixture = fixture()?;
@@ -1375,7 +1399,7 @@ async fn a_busy_key_lock_skips_the_quarantine_and_keeps_the_older_one() -> Resul
         .expect("the lock holder")
         .take()
         .context("the key lock was never held")?;
-    release(held).await;
+    release(KeyLock::new(held)).await;
     assert_eq!(
         published(&root),
         Some(judged),
@@ -1454,7 +1478,7 @@ async fn quarantined_or_busy_accepts_only_the_designed_skip() -> Result<()> {
         .expect("the lock holder")
         .take()
         .context("the key lock was never held")?;
-    release(held).await;
+    release(KeyLock::new(held)).await;
     ensure!(
         quarantined_or_busy(&root, judged)?.is_none(),
         "the designed skip was not reported as one"

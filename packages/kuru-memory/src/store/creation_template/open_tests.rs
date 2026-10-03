@@ -39,6 +39,20 @@ async fn open(options: OpenOptions) -> Result<MemoryStore> {
     crate::test_support::spawn_gated_open(options).await
 }
 
+/// The error of an open that must fail. An open that succeeded instead is
+/// closed before the test fails, so its engine is reaped and the failure
+/// names the unexpected success rather than an unreaped store.
+async fn open_failure(opened: Result<MemoryStore>, unexpected: &str) -> Result<anyhow::Error> {
+    let store = match opened {
+        Err(error) => return Ok(error),
+        Ok(store) => store,
+    };
+    match store.close().await {
+        Ok(()) => bail!("{unexpected}"),
+        Err(closing) => bail!("{unexpected}; closing that store also failed: {closing:#}"),
+    }
+}
+
 /// Engine starts this process made on store directories first started
 /// beneath `root`.
 fn starts_under(root: &Path) -> Result<u64> {
@@ -968,10 +982,11 @@ async fn shape_verdict_on_the_copy_fails_the_open_and_quarantines_the_template()
         ensure!(matches!(built, Ensured::Built(_)), "{built:?}");
         let flawed = published(&root).context("the flawed template was not published")?;
         let options = options(fixture.path().join("project"), &scope('b'), Some(&root)).await?;
-        let error = open(options.clone())
-            .await
-            .err()
-            .context("a copy of a flawed template was activated")?;
+        let error = open_failure(
+            open(options.clone()).await,
+            "a copy of a flawed template was activated",
+        )
+        .await?;
         let message = format!("{error:#}");
         ensure!(
             TemplateVerdict::find(&error).is_some() && message.contains("unexpected branch"),
@@ -1049,11 +1064,10 @@ async fn engine_failure_on_the_copy_preserves_the_stage_and_keeps_the_template()
             .context("the copy ended before its ready marker")?;
         ensure!(!observed.after_marker);
         drop(release_marker);
-        let error = tokio::time::timeout(bound, opening)
+        let opened = tokio::time::timeout(bound, opening)
             .await
-            .context("the failed open did not return")??
-            .err()
-            .context("the open succeeded without its ready marker")?;
+            .context("the failed open did not return")??;
+        let error = open_failure(opened, "the open succeeded without its ready marker").await?;
         ensure!(
             TemplateVerdict::find(&error).is_none(),
             "an engine-side failure was a verdict: {error:#}"
@@ -1098,11 +1112,11 @@ async fn failed_template_build_fails_the_open_without_a_cold_retry() -> Result<(
             before_shape: vec!["CALL DOLT_BRANCH('extra_branch')".to_owned()],
             ..Hooks::default()
         };
-        let error = HOOKS
-            .scope(hooks, open(options.clone()))
-            .await
-            .err()
-            .context("an open whose template build was refused succeeded")?;
+        let error = open_failure(
+            HOOKS.scope(hooks, open(options.clone())).await,
+            "an open whose template build was refused succeeded",
+        )
+        .await?;
         let message = format!("{error:#}");
         ensure!(
             message.contains("build the memory store template")
@@ -1151,11 +1165,11 @@ async fn failed_copy_after_the_build_fails_the_open_without_a_cold_retry() -> Re
                 read: Some(fault.clone()),
                 ..Hooks::default()
             };
-            let error = HOOKS
-                .scope(hooks, open(options.clone()))
-                .await
-                .err()
-                .with_context(|| format!("{label}: an open whose copy failed succeeded"))?;
+            let error = open_failure(
+                HOOKS.scope(hooks, open(options.clone())).await,
+                &format!("{label}: an open whose copy failed succeeded"),
+            )
+            .await?;
             let message = format!("{error:#}");
             ensure!(
                 fault.fired()
@@ -1229,6 +1243,64 @@ async fn failed_copy_after_the_build_fails_the_open_without_a_cold_retry() -> Re
                  {builds} template builds ran in all"
             );
         }
+        Ok(())
+    }
+    .await;
+    fixture.release(outcome)
+}
+
+/// A sibling's child duplicates every open file description between fork
+/// and exec, including the opener's shared key lock. An opener that finds no
+/// template releases that lock and takes the exclusive one to build; a
+/// duplicate still held at that moment must not make the upgrade busy and
+/// send the new project cold. The duplicate is held here for the whole open,
+/// so the open must build, and its injected copy failure must fail it.
+#[tokio::test]
+async fn an_inherited_duplicate_of_the_shared_key_lock_does_not_send_the_opener_cold() -> Result<()>
+{
+    let fixture = fixture()?;
+    let outcome = async {
+        let root = fixture.path().join("templates");
+        let options = options_for(&fixture, &root, '3').await?;
+        let fault = ReadFault::published(key(), false);
+        let duplicate = Arc::new(StdMutex::new(None));
+        let hooks = Hooks {
+            read: Some(fault.clone()),
+            duplicate_shared: Some(duplicate.clone()),
+            ..Hooks::default()
+        };
+        let opened = HOOKS.scope(hooks, open(options.clone())).await;
+        let held = duplicate.lock().expect("duplicate key lock slot").take();
+        let error = open_failure(
+            opened,
+            "a held duplicate of the released shared key lock sent the opener cold",
+        )
+        .await?;
+        ensure!(
+            held.is_some(),
+            "the opener took no shared key lock to duplicate"
+        );
+        let message = format!("{error:#}");
+        ensure!(
+            fault.fired()
+                && message.contains(
+                    "copy the new project from the memory store template this open built"
+                ),
+            "the open did not fail with the copy from the template it built: {message}"
+        );
+        let starts = starts_under(&options.data_dir)?;
+        let builds = starts_under(&root)?;
+        ensure!(
+            starts == 0 && builds == 1 && published(&root).is_some(),
+            "the open made {starts} starts in its directory and {builds} template builds"
+        );
+        let remnants = interrupted(&options)?;
+        let [remnant] = remnants.as_slice() else {
+            bail!("not exactly one preserved remnant: {remnants:?}");
+        };
+        let lifecycles = cfg!(windows).then(|| options.data_dir.join("memory/lifecycles"));
+        crate::test_support::await_store_quiescence(remnant, lifecycles.as_deref()).await?;
+        drop(held);
         Ok(())
     }
     .await;
@@ -1327,11 +1399,11 @@ async fn failed_stage_start_leaves_the_copy_for_the_next_open_to_preserve() -> R
             stage_key: Some(foreign.to_owned()),
             ..Hooks::default()
         };
-        let error = HOOKS
-            .scope(hooks, open(options.clone()))
-            .await
-            .err()
-            .context("a stage naming another build's key was adopted")?;
+        let error = open_failure(
+            HOOKS.scope(hooks, open(options.clone())).await,
+            "a stage naming another build's key was adopted",
+        )
+        .await?;
         let message = format!("{error:#}");
         ensure!(
             TemplateVerdict::find(&error).is_none()
@@ -1420,10 +1492,11 @@ async fn adoption_verdict_quarantines_and_leaves_the_stage_in_place() -> Result<
         ensure!(matches!(built, Ensured::Built(_)), "{built:?}");
         let flawed = published(&root).context("the flawed template was not published")?;
         let options = options_for(&fixture, &root, '4').await?;
-        let error = open(options.clone())
-            .await
-            .err()
-            .context("a copy with a foreign placeholder row was adopted")?;
+        let error = open_failure(
+            open(options.clone()).await,
+            "a copy with a foreign placeholder row was adopted",
+        )
+        .await?;
         let message = format!("{error:#}");
         ensure!(
             TemplateVerdict::find(&error).is_some()

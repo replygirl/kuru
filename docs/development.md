@@ -605,6 +605,17 @@ fair, so a restart waits for every running spawner to drop its shared guard,
 within the fixture's own deadline, and code under the exclusive guard must not
 take a shared one.
 
+The store template's key lock needs no such gate. Every release of it unlocks
+explicitly before its handle closes (`creation_template::KeyLock` and
+`files::release_lock`), including its release as a template build engine's
+reap guard, so a sibling's child holding a duplicate of a released key-lock
+description holds no lock: a new project's exclusive try after its shared
+inspection, and a quarantine after a verdict, meet a busy lock only when
+another holder exists. The tests
+`a_released_key_lock_is_free_while_a_duplicate_descriptor_remains` and
+`an_inherited_duplicate_of_the_shared_key_lock_does_not_send_the_opener_cold`
+hold such a duplicate deliberately.
+
 An owner ends itself when its last attachment releases, so a fixture that
 needs a running owner chooses its lifetime policy. `ServeKnobs`
 (`service.rs`) carries the admission rule, the first-attachment deadline, the

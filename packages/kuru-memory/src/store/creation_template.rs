@@ -369,11 +369,48 @@ enum Mode {
     Exclusive,
 }
 
+/// A held key lock. Every release, including an early return, an unwinding
+/// copy thread or a cancelled opener, unlocks explicitly before the handle
+/// closes ([`files::release_lock`]): a sibling's child that inherited this
+/// open file description between fork and exec must not keep the lock held,
+/// or the next try (the upgrade after an inspection, or a quarantine) would
+/// meet a busy lock no Kuru holder owns and send a new project cold.
+struct KeyLock(Option<File>);
+
+impl KeyLock {
+    fn new(file: File) -> Self {
+        Self(Some(file))
+    }
+
+    /// The held handle, for a build engine's reap guard, which returns it
+    /// after the reap. The caller then owns the release.
+    fn into_file(mut self) -> File {
+        self.0
+            .take()
+            .expect("a key lock holds its handle until released")
+    }
+
+    fn file(&self) -> &File {
+        self.0
+            .as_ref()
+            .expect("a key lock holds its handle until released")
+    }
+}
+
+impl Drop for KeyLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.0.take() {
+            files::release_lock(file);
+        }
+    }
+}
+
 /// Open the key's permanent lock file and take it in `mode` without waiting.
 /// `None` when another holder excludes it; an open, lock or identity error is
 /// an error, which a product opener treats as "no template" and warm-up as
-/// fatal.
-fn try_key_lock(root: &Directory, key: &str, mode: Mode) -> Result<Option<File>> {
+/// fatal. A lock that fails its identity check is released before the error
+/// returns.
+fn try_key_lock(root: &Directory, key: &str, mode: Mode) -> Result<Option<KeyLock>> {
     let name = lock_name(key);
     let name = OsStr::new(&name);
     #[cfg(test)]
@@ -402,11 +439,14 @@ fn try_key_lock(root: &Directory, key: &str, mode: Mode) -> Result<Option<File>>
             return Err(error).context("lock the store template key");
         }
     }
+    let lock = KeyLock::new(file);
     #[cfg(test)]
     hooks::lock_fault(hooks::LockStep::Verify)?;
-    root.verify(name, &file)
+    root.verify(name, lock.file())
         .context("verify the store template key lock")?;
-    Ok(Some(file))
+    #[cfg(test)]
+    hooks::key_lock_taken(mode, &lock);
+    Ok(Some(lock))
 }
 
 // --- Manifest and structural check ------------------------------------------------
@@ -1105,9 +1145,9 @@ fn remove_build_store(lease: crate::server::LifecycleLease) -> Result<()> {
 async fn build(
     root: &Directory,
     key: &str,
-    lock: File,
+    lock: KeyLock,
     engine: &Engine,
-) -> Result<(File, Judged, BuildReport), (Option<File>, CreationFailure)> {
+) -> Result<(KeyLock, Judged, BuildReport), (Option<KeyLock>, CreationFailure)> {
     let lifecycle_root = match build_lifecycle_root(root) {
         Ok(lifecycle_root) => lifecycle_root,
         Err(error) => return Err((Some(lock), CreationFailure::Io(error))),
@@ -1146,8 +1186,8 @@ async fn build(
         hooks: stage_worker::StageHooks::default(),
     };
     let mut progress = ProgressReporter::silent();
-    let (lock, hostname) = match worker.build_template(lock, &mut progress).await {
-        Ok(built) => built,
+    let (lock, hostname) = match worker.build_template(lock.into_file(), &mut progress).await {
+        Ok((lock, hostname)) => (KeyLock::new(lock), hostname),
         Err(error) => {
             return Err((
                 None,
@@ -1723,8 +1763,8 @@ impl std::error::Error for CreateError {}
 async fn copy_blocking(
     judged: Judged,
     stage: &Directory,
-    lock: File,
-) -> (Option<File>, Result<(), CreationFailure>) {
+    lock: KeyLock,
+) -> (Option<KeyLock>, Result<(), CreationFailure>) {
     let destination = match files::directory(stage.path()) {
         Ok(destination) if destination.identity() == stage.identity() => destination,
         Ok(_) => {
