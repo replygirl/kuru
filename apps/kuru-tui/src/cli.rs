@@ -1619,12 +1619,22 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
     }
 }
 
-/// Combine an operation's result with the cleanup that ran after it.
+/// Combine an operation's result with the cleanup that ran after it. A
+/// single failure is returned unchanged; when both fail, neither cause is
+/// dropped, in the shape `Harness::shutdown` uses (primary first).
 fn finish<T>(primary: Result<T>, cleanup: Result<()>, what: &str) -> Result<T> {
-    let _ = what;
-    let value = primary?;
-    cleanup?;
-    Ok(value)
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(cleanup)) => {
+            let failures = [
+                format!("{primary:#}"),
+                format!("{what} cleanup failed: {cleanup:#}"),
+            ];
+            bail!(failures.join("; "))
+        }
+    }
 }
 
 async fn run_mcp_command(host: &ToolHost, command: &McpCommand) -> Result<()> {
