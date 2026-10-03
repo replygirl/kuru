@@ -789,13 +789,6 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
         .map_err(|error| fixture_startup_error(&fixture_options, error))
 }
 
-/// How long [`retire_idle_service`] asks an owner that has not yet shown it
-/// is closing: an attached client detaching, the start lock coming free or a
-/// request finding the owner closing. Retained from the fixture's former flat
-/// bound, which no product budget derives; once a request finds the owner
-/// closing, the owner's own close budget bounds the wait instead.
-const ANSWERING_OWNER_BOUND: Duration = Duration::from_secs(10);
-
 /// Retire the exact managed owner once fixture clients have released their
 /// transports. The owner retires by itself when its last client detaches, so
 /// this waits behind one that is already closing, or asks a still-running one
@@ -803,8 +796,12 @@ const ANSWERING_OWNER_BOUND: Duration = Duration::from_secs(10);
 /// is dropped before a successor starts.
 ///
 /// It asks through the maintenance acquisition, retrying while the owner
-/// refuses with attached clients, for at most [`ANSWERING_OWNER_BOUND`]. Once
-/// a request finds the owner closing (no live endpoint, a connection the
+/// refuses with attached clients, until one deadline carried across those
+/// retries: `memory.startup_timeout_secs` from the first attempt, the deadline
+/// that attempt itself enforces on its start-lock wait, owner response and
+/// owner-lock wait. That covers an owner that has not shown it is closing (a
+/// client still attached, the start lock held, or no reply yet). Once a
+/// request finds the owner closing (no live endpoint, a connection the
 /// owner closed unanswered, or an accepted retirement), it stops asking and
 /// waits for the owner lock's release, an event, under one backstop: the
 /// owner's own close budget (`server::close_budget`) counted from that first
@@ -813,8 +810,8 @@ const ANSWERING_OWNER_BOUND: Duration = Duration::from_secs(10);
 /// fails and that thread, still blocked, ends with the process or once the
 /// owner lets go. Callers therefore need no outer backstop of their own.
 ///
-/// When either bound elapses, the error names the step the acquisition was
-/// in, so a slow owner close, a still-attached client and a stalled request
+/// When either deadline elapses, or an attempt fails, the error names the
+/// step the acquisition was in, so a slow owner close, a still-attached client and a stalled request
 /// are distinguishable from the failure text alone, and the state of the
 /// owner it waited behind, read at expiry by [`owner_state`]; the close
 /// budget's expiry also names the first closing reading and the time since.
@@ -834,7 +831,10 @@ pub(crate) async fn retire_idle_service_keeping_waiter(
     }
     let trace = crate::service::MaintenanceTrace::default();
     let mut refusals: u32 = 0;
-    let asked = tokio::time::timeout(ANSWERING_OWNER_BOUND, async {
+    let asking = Duration::from_secs(options.config.startup_timeout_secs);
+    let started = tokio::time::Instant::now();
+    let asking_deadline = started + asking;
+    let asked = tokio::time::timeout_at(asking_deadline, async {
         loop {
             let acquired = tokio::select! {
                 biased;
@@ -858,22 +858,35 @@ pub(crate) async fn retire_idle_service_keeping_waiter(
         }
     })
     .await;
+    // An attempt's own deadline equals this one, so an attempt failing at it
+    // is the same expiry as the timeout's and is reported alike.
+    let expired = |error: Error| {
+        error.context(format!(
+            "managed owner retirement did not complete within memory.startup_timeout_secs \
+             ({asking:?}; {}ms since the first request), and no request found the owner \
+             closing; {}; {trace}; active-client refusals={refusals}",
+            started.elapsed().as_millis(),
+            owner_state(options)
+        ))
+    };
     let closing = match asked {
         Ok(Ok(Asked::Permit(permit))) => {
             drop(permit);
             return (Ok(()), None);
         }
         Ok(Ok(Asked::Closing(closing))) => closing,
-        Ok(Err(error)) => return (Err(error), None),
-        Err(elapsed) => {
-            let error = Error::new(elapsed).context(format!(
-                "managed owner retirement did not complete within {} seconds, and no request \
-                 found the owner closing; {}; {trace}; active-client refusals={refusals}",
-                ANSWERING_OWNER_BOUND.as_secs(),
+        Ok(Err(error)) if tokio::time::Instant::now() >= asking_deadline => {
+            return (Err(expired(error)), None);
+        }
+        Ok(Err(error)) => {
+            let error = error.context(format!(
+                "managed owner retirement failed before any request found the owner closing; \
+                 {}; {trace}; active-client refusals={refusals}",
                 owner_state(options)
             ));
             return (Err(error), None);
         }
+        Err(elapsed) => return (Err(expired(Error::new(elapsed))), None),
     };
     let budget = crate::server::close_budget();
     let backstop = closing.since + budget;
@@ -960,7 +973,8 @@ pub(crate) fn join_release_waiter(waiter: Option<std::thread::JoinHandle<()>>) -
 /// Check that `text` is the expiry of the wait on a closing owner's lock
 /// release: it names the owner's close budget, the time since the first
 /// retirement request found the owner closing (at least that budget), that
-/// first `reading` and the owner `state`, and not the former flat bound.
+/// first `reading` and the owner `state`, and not the asking deadline's
+/// expiry.
 #[cfg(test)]
 pub(crate) fn ensure_close_budget_expiry(text: &str, reading: &str, state: &str) -> Result<()> {
     let budget = crate::server::close_budget();
@@ -974,7 +988,7 @@ pub(crate) fn ensure_close_budget_expiry(text: &str, reading: &str, state: &str)
     ensure!(
         elapsed.is_some_and(|milliseconds| milliseconds >= budget.as_millis())
             && text.contains(state)
-            && !text.contains("within 10 seconds"),
+            && !text.contains("no request found the owner closing"),
         "the release wait's expiry did not name the close budget, the time since the first \
          closing reading ({reading}) and the owner state ({state}): {text}"
     );
@@ -1082,8 +1096,9 @@ pub fn hold_owner_lock(options: &OpenOptions) -> Result<HeldOwnerLock> {
 /// The managed service retires as soon as its last client detaches, but it
 /// closes asynchronously, so closing every client does not mean its engine is
 /// already reaped. Call this after every client handle for `options` has
-/// closed (an attached client makes [`retire_idle_service`] fail with "active
-/// clients"). It waits behind the owner's own close, or retires an owner that
+/// closed (an attached client makes [`retire_idle_service`] fail at its
+/// `memory.startup_timeout_secs` asking deadline, naming its active-client
+/// refusals). It waits behind the owner's own close, or retires an owner that
 /// is still running, either of which releases the owner lock only after its
 /// Dolt is reaped, then awaits [`await_store_quiescence`] for the project
 /// store, each of its remaining staging directories and each stage preserved
