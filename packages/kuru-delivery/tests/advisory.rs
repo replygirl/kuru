@@ -3,7 +3,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use kuru_delivery::command;
@@ -11,68 +11,134 @@ use kuru_delivery::command;
 const ORIGIN: &str = "https://github.com/RustSec/advisory-db.git";
 const FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
 
+#[path = "support/fixture_git.rs"]
+mod fixture_git;
+use fixture_git::{FixtureGit, Templates};
+
 async fn git(directory: &Path, arguments: &[&str]) {
-    let mut command = command::rooted(directory, "git");
-    command.args(arguments);
-    let started = Instant::now();
-    let output = command::bounded_output(&mut command, Duration::from_secs(10), 4096)
-        .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "git {arguments:?} in {directory:?} failed after {:?}: {error}",
-                started.elapsed()
-            )
-        });
-    assert!(
-        output.status.success(),
-        "git {arguments:?} in {directory:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    FixtureGit::new().git(directory, arguments).await;
 }
 
 async fn git_with_environment(directory: &Path, arguments: &[&str], environment: &[(&str, &str)]) {
-    let mut command = command::rooted(directory, "git");
-    command.args(arguments).envs(environment.iter().copied());
-    let started = Instant::now();
-    let output = command::bounded_output(&mut command, Duration::from_secs(10), 4096)
-        .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "git {arguments:?} in {directory:?} failed after {:?}: {error}",
-                started.elapsed()
-            )
-        });
-    assert!(
-        output.status.success(),
-        "git {arguments:?} in {directory:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let fixture = FixtureGit::new();
+    fixture
+        .run(
+            fixture.command(directory),
+            directory,
+            arguments,
+            environment,
+        )
+        .await;
 }
 
-async fn advisory_database(root: &Path) -> PathBuf {
+async fn advisory_database_with(fixture: &FixtureGit, root: &Path) -> PathBuf {
     let database = root.join("advisory-db");
     fs::create_dir(&database).unwrap();
-    git(&database, &["init"]).await;
+    fixture.git(&database, &["init"]).await;
     fs::write(database.join("README.md"), b"fixture\n").unwrap();
-    git(&database, &["add", "README.md"]).await;
-    git(
-        &database,
-        &[
-            "-c",
-            "user.name=fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-m",
-            "fixture",
-        ],
-    )
-    .await;
-    git(&database, &["remote", "add", "origin", ORIGIN]).await;
-    git(&database, &["config", "remote.origin.fetch", FETCH_REFSPEC]).await;
-    git(&database, &["checkout", "--detach", "HEAD"]).await;
+    fixture.git(&database, &["add", "README.md"]).await;
+    fixture
+        .git(
+            &database,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )
+        .await;
+    fixture
+        .git(&database, &["remote", "add", "origin", ORIGIN])
+        .await;
+    fixture
+        .git(&database, &["config", "remote.origin.fetch", FETCH_REFSPEC])
+        .await;
+    fixture
+        .git(&database, &["checkout", "--detach", "HEAD"])
+        .await;
+    database
+}
+
+async fn stale_commit(fixture: &FixtureGit, database: &Path) {
+    fixture
+        .run(
+            fixture.command(database),
+            database,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "stale fixture",
+                "--date=2000-01-01T00:00:00Z",
+            ],
+            &[
+                ("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z"),
+                ("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z"),
+            ],
+        )
+        .await;
+}
+
+/// Every advisory fixture repository this binary uses, built by one builder:
+/// a clean detached checkout, and copies of it made attached, stale or given
+/// the wrong origin. Each is `<variant>/advisory-db` under `root`.
+async fn build_fixtures(fixture: &FixtureGit, root: &Path) {
+    fs::create_dir(root.join("clean")).unwrap();
+    let clean = advisory_database_with(fixture, &root.join("clean")).await;
+    for variant in ["attached", "stale", "wrong-origin"] {
+        fs::create_dir(root.join(variant)).unwrap();
+        fixture_git::copy_tree(&clean, &root.join(variant).join("advisory-db"));
+    }
+    fixture
+        .git(
+            &root.join("attached/advisory-db"),
+            &["checkout", "-b", "fixture-attached"],
+        )
+        .await;
+    stale_commit(fixture, &root.join("stale/advisory-db")).await;
+    fixture
+        .git(
+            &root.join("wrong-origin/advisory-db"),
+            &[
+                "config",
+                "remote.origin.url",
+                "https://example.invalid/not-rustsec.git",
+            ],
+        )
+        .await;
+}
+
+/// The fixture repositories, built once per test binary under Cargo's
+/// target tmp directory.
+async fn templates() -> &'static Templates {
+    static TEMPLATES: tokio::sync::OnceCell<Templates> = tokio::sync::OnceCell::const_new();
+    TEMPLATES
+        .get_or_init(|| async {
+            let root = tempfile::Builder::new()
+                .prefix("advisory-templates-")
+                .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+                .unwrap();
+            let fixture = FixtureGit::new();
+            build_fixtures(&fixture, root.path()).await;
+            Templates::seal(root, &fixture)
+        })
+        .await
+}
+
+/// A private copy of the `variant` fixture repository at `root/advisory-db`.
+async fn advisory_database(variant: &str, root: &Path) -> PathBuf {
+    let database = root.join("advisory-db");
+    templates()
+        .await
+        .copy(&format!("{variant}/advisory-db"), &database);
     database
 }
 
@@ -107,7 +173,7 @@ async fn scan_cli(
 #[tokio::test]
 async fn cli_uses_direct_audit_binary_with_root_lockfile_and_offline_flags() {
     let root = tempfile::tempdir().unwrap();
-    let database = advisory_database(root.path()).await;
+    let database = advisory_database("clean", root.path()).await;
     let marker = root.path().join("audit-arguments.json");
     let mut command = command::Command::new(env!("CARGO_BIN_EXE_kuru-delivery"));
     command
@@ -154,51 +220,20 @@ async fn cli_rejects_missing_dirty_attached_stale_and_wrong_origin_databases_bef
     let missing = root.path().join("missing-database");
     let dirty_root = root.path().join("dirty");
     fs::create_dir(&dirty_root).unwrap();
-    let dirty = advisory_database(&dirty_root).await;
+    let dirty = advisory_database("clean", &dirty_root).await;
     fs::write(dirty.join("untracked"), b"dirty\n").unwrap();
 
     let attached_root = root.path().join("attached");
     fs::create_dir(&attached_root).unwrap();
-    let attached = advisory_database(&attached_root).await;
-    git(&attached, &["checkout", "-b", "fixture-attached"]).await;
+    let attached = advisory_database("attached", &attached_root).await;
 
     let stale_root = root.path().join("stale");
     fs::create_dir(&stale_root).unwrap();
-    let stale = advisory_database(&stale_root).await;
-    git_with_environment(
-        &stale,
-        &[
-            "-c",
-            "user.name=fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "stale fixture",
-            "--date=2000-01-01T00:00:00Z",
-        ],
-        &[
-            ("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z"),
-            ("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z"),
-        ],
-    )
-    .await;
+    let stale = advisory_database("stale", &stale_root).await;
 
     let wrong_origin_root = root.path().join("wrong-origin");
     fs::create_dir(&wrong_origin_root).unwrap();
-    let wrong_origin = advisory_database(&wrong_origin_root).await;
-    git(
-        &wrong_origin,
-        &[
-            "config",
-            "remote.origin.url",
-            "https://example.invalid/not-rustsec.git",
-        ],
-    )
-    .await;
+    let wrong_origin = advisory_database("wrong-origin", &wrong_origin_root).await;
 
     for (name, database, expected) in [
         ("missing", missing.as_path(), "advisory database is missing"),
@@ -245,7 +280,7 @@ async fn cli_rejects_changed_advisory_head_and_propagates_scanner_failure() {
     ] {
         let case_root = root.path().join(name);
         fs::create_dir(&case_root).unwrap();
-        let database = advisory_database(&case_root).await;
+        let database = advisory_database("clean", &case_root).await;
         let marker = root.path().join(format!("{name}-capture"));
         let output = scan_cli(&database, &marker, advance_head, fail, None).await;
         assert!(!output.status.success(), "{name} unexpectedly succeeded");
@@ -261,7 +296,7 @@ async fn cli_rejects_changed_advisory_head_and_propagates_scanner_failure() {
 #[tokio::test]
 async fn cli_uses_owned_project_audit_configuration_despite_hostile_cargo_home() {
     let root = tempfile::tempdir().unwrap();
-    let database = advisory_database(root.path()).await;
+    let database = advisory_database("clean", root.path()).await;
     let marker = root.path().join("audit-arguments.json");
     let environment_marker = root.path().join("audit-environment.json");
     let hostile_cargo_home = root.path().join("hostile-cargo-home");
@@ -505,7 +540,13 @@ async fn git_helpers_name_arguments_directory_and_elapsed_time_when_the_launch_f
         (plain, r#"git ["status", "--short"]"#),
         (with_environment, r#"git ["log"]"#),
     ] {
-        for required in [arguments, &format!("in {missing:?} failed after ")] {
+        // The launch failed before Git wrote its Trace2 file; the field says so.
+        for required in [
+            arguments,
+            &format!("in {missing:?} failed after "),
+            "; trace2 tail (",
+            "trace2-0.json): <unavailable: ",
+        ] {
             assert!(text.contains(required), "missing {required}: {text}");
         }
     }
@@ -532,7 +573,192 @@ async fn fixture_head_advance_names_git_arguments_directory_and_elapsed_time_whe
         // The fixture's `Error: Custom {..}` report escapes the quoted path.
         "absent",
         " failed after ",
+        "; trace2 tail (",
     ] {
         assert!(stderr.contains(required), "missing {required}: {stderr}");
     }
+}
+
+#[tokio::test]
+async fn fixture_git_sequence_traces_every_call_and_starts_no_child_process() {
+    // Sealing the binary's one template build already required a Trace2
+    // start and no child_start from every call.
+    let templates = templates().await;
+    // Six calls for the clean checkout, then one per copied variant.
+    assert_eq!(templates.calls(), 9);
+    for variant in ["clean", "attached", "stale", "wrong-origin"] {
+        assert!(
+            templates
+                .path()
+                .join(variant)
+                .join("advisory-db/.git")
+                .is_dir()
+        );
+    }
+}
+
+#[tokio::test]
+async fn fixture_git_reads_only_command_line_and_repository_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    let database = advisory_database("clean", root.path()).await;
+    let listing = FixtureGit::new()
+        .git(&database, &["config", "--list", "--show-origin"])
+        .await
+        .stdout;
+    fixture_git::assert_fixture_origins(&listing);
+    let listing = String::from_utf8(listing).unwrap();
+    for required in [
+        "command line:\tmaintenance.auto=false",
+        "command line:\tcore.fsmonitor=false",
+        "file:.git/config\tremote.origin.url=",
+    ] {
+        assert!(listing.contains(required), "missing {required}: {listing}");
+    }
+}
+
+const HOSTILE_CHILD: &str = "KURU_TEST_HOSTILE_FIXTURE_GIT_CHILD";
+
+/// Write a script that records its own invocation as `markers/<role>`.
+fn marker_script(path: &Path, markers: &Path, role: &str) {
+    let marker = markers.join(role).display().to_string().replace('\\', "/");
+    fs::write(
+        path,
+        format!("#!/bin/sh\necho \"$0 $*\" > '{marker}'\nexit 1\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn markers(root: &Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(root.join("markers"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Runs only in the child process the hostile-environment test starts.
+async fn hostile_child(root: &Path) {
+    let fixture = FixtureGit::new();
+    let fixtures = root.join("fixtures");
+    fs::create_dir(&fixtures).unwrap();
+    build_fixtures(&fixture, &fixtures).await;
+    fixture.assert_no_children();
+    let listing = fixture
+        .git(
+            &fixtures.join("clean/advisory-db"),
+            &["config", "--list", "--show-origin"],
+        )
+        .await
+        .stdout;
+    fixture_git::assert_fixture_origins(&listing);
+    assert_eq!(markers(root), Vec::<String>::new(), "hostile programs ran");
+
+    // Control: Git outside the builder reads the hostile configuration and
+    // runs its hook. Only hooks stay enabled, so no daemon or maintenance
+    // child outlives the control.
+    let control = root.join("control");
+    fs::create_dir(&control).unwrap();
+    for arguments in [
+        &["init"][..],
+        &[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "control",
+        ],
+    ] {
+        let mut command = command::rooted(&control, "git");
+        command
+            .args(["-c", "core.fsmonitor=false", "-c", "maintenance.auto=false"])
+            .args(["-c", "gc.auto=0", "-c", "commit.gpgsign=false"])
+            .args(arguments);
+        command::bounded_output(&mut command, fixture_git::BOUND, 64 * 1024)
+            .await
+            .unwrap();
+    }
+    assert!(
+        markers(root).contains(&"pre-commit".to_owned()),
+        "the hostile configuration did not reach unisolated Git: {:?}",
+        markers(root)
+    );
+}
+
+#[tokio::test]
+async fn fixture_git_ignores_hostile_inherited_configuration_and_programs() {
+    if let Some(root) = std::env::var_os(HOSTILE_CHILD) {
+        hostile_child(Path::new(&root)).await;
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let markers = root.path().join("markers");
+    let hooks = root.path().join("hostile-hooks");
+    let programs = root.path().join("hostile-programs");
+    for directory in [&markers, &hooks, &programs] {
+        fs::create_dir(directory).unwrap();
+    }
+    for hook in ["pre-commit", "post-commit"] {
+        marker_script(&hooks.join(hook), &markers, hook);
+    }
+    for role in ["credential", "gpg", "askpass"] {
+        marker_script(&programs.join(role), &markers, role);
+    }
+    let slash = |path: &Path| path.display().to_string().replace('\\', "/");
+    let config = root.path().join("hostile.gitconfig");
+    fs::write(
+        &config,
+        format!(
+            "[core]\n\thooksPath = {}\n\tfsmonitor = true\n\
+             [credential]\n\thelper = \"!{}\"\n\
+             [maintenance]\n\tauto = true\n\
+             [gc]\n\tauto = 1\n\
+             [commit]\n\tgpgsign = true\n\
+             [tag]\n\tgpgsign = true\n\
+             [gpg]\n\tprogram = {}\n",
+            slash(&hooks),
+            slash(&programs.join("credential")),
+            slash(&programs.join("gpg")),
+        ),
+    )
+    .unwrap();
+    // The hostile environment exists only in the child test process.
+    let mut child = command::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "fixture_git_ignores_hostile_inherited_configuration_and_programs",
+            "--nocapture",
+        ])
+        .env(HOSTILE_CHILD, root.path())
+        .env_remove("GIT_CONFIG_NOSYSTEM")
+        .env("GIT_CONFIG_SYSTEM", &config)
+        .env("GIT_CONFIG_GLOBAL", &config)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", &hooks)
+        .env("GIT_ASKPASS", programs.join("askpass"))
+        .env("SSH_ASKPASS", programs.join("askpass"))
+        .env("GIT_TERMINAL_PROMPT", "1");
+    // The re-executed test binary's bound, as for the foreign-repository
+    // child in support/repository_environment.rs; each fixture Git call
+    // inside it keeps its own 10 s bound and Trace2 tail.
+    let output = command::bounded_output(&mut child, Duration::from_secs(60), 256 * 1024)
+        .await
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("1 passed"), "{text}");
 }

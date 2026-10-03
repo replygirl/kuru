@@ -1,6 +1,10 @@
 //! Native delivery fixture. Invocations are explicit and never part of release artifacts.
 
+use kuru_delivery::command;
 use std::io::{self, Read, Write};
+
+#[path = "../support/fixture_git.rs"]
+mod fixture_git;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -44,34 +48,33 @@ async fn main() -> io::Result<()> {
                 "user.name=fixture",
                 "-c",
                 "user.email=fixture@example.invalid",
-                "-c",
-                "commit.gpgsign=false",
                 "commit",
                 "--allow-empty",
                 "-m",
                 "controlled scanner changed advisory HEAD",
             ];
-            let mut command = kuru_delivery::command::rooted(&database, "git");
+            let git = fixture_git::FixtureGit::new();
+            let mut command = git.command(&database);
+            let trace = git.trace(&mut command);
             command.args(git_arguments);
             let started = std::time::Instant::now();
-            let output = kuru_delivery::command::bounded_output(
-                &mut command,
-                std::time::Duration::from_secs(10),
-                64 * 1024,
-            )
-            .await
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "controlled scanner git {git_arguments:?} in {database:?} failed after {:?}: {error}",
-                    started.elapsed()
-                ))
-            })?;
+            let output = command::bounded_output(&mut command, fixture_git::BOUND, 64 * 1024)
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "controlled scanner git {git_arguments:?} in {database:?} failed after {:?}: {error}; {}",
+                        started.elapsed(),
+                        fixture_git::trace_tail(&trace)
+                    ))
+                })?;
             if !output.status.success() {
                 return Err(io::Error::other(format!(
-                    "controlled scanner could not advance advisory HEAD: git {git_arguments:?} in {database:?}: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                    "controlled scanner could not advance advisory HEAD: git {git_arguments:?} in {database:?}: {}; {}",
+                    String::from_utf8_lossy(&output.stderr),
+                    fixture_git::trace_tail(&trace)
                 )));
             }
+            fixture_git::assert_childless(&trace);
         }
         if std::env::var_os("KURU_AUDIT_FAIL").is_some() {
             io::stderr().write_all(b"controlled scanner failure\n")?;
