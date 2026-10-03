@@ -296,6 +296,42 @@ fn terminal_fixture_process() -> Result<()> {
             input.read_exact(&mut acknowledgment)?;
             crossterm::terminal::disable_raw_mode()?;
         }
+        // A dream's busy frame, then (after the parent's acknowledgment) its
+        // settled frame. The activity entry stays in both, as in the TUI.
+        "dream-settle" => {
+            crossterm::terminal::enable_raw_mode()?;
+            let mut input = std::io::stdin().lock();
+            let mut output = std::io::stdout().lock();
+            let frame = |status: &str, composer: &str, dock: &str| {
+                format!(
+                    "\x1b[2J\x1b[1;1HActivity\x1b[2;1Hdream \u{b7} pool \u{b7} parts are consolidating\
+                     \x1b[4;3H{status}\x1b[5;1H.    .    .    .\x1b[6;3H\u{203a} {composer}\
+                     \x1b[8;3H{dock}\x1b[?25h\x1b[6;5H"
+                )
+            };
+            output.write_all(
+                frame(
+                    "\u{280b} dream \u{b7} pool  \u{b7}  3s",
+                    "Keep your next thought here\u{2026}",
+                    "esc cancel  \u{b7}  alt+enter newline",
+                )
+                .as_bytes(),
+            )?;
+            output.flush()?;
+            let mut acknowledgment = [0];
+            input.read_exact(&mut acknowledgment)?;
+            output.write_all(
+                frame(
+                    "\u{25c6} last \u{2248}10+10/100 tokens \u{b7} pool dream \u{b7} assumed",
+                    "What shall we explore or build?",
+                    "enter send  \u{b7}  alt+enter newline",
+                )
+                .as_bytes(),
+            )?;
+            output.flush()?;
+            input.read_exact(&mut acknowledgment)?;
+            crossterm::terminal::disable_raw_mode()?;
+        }
         "error-unwind" => {
             let report = std::path::PathBuf::from(std::env::var("KURU_TERMINAL_ERROR_REPORT")?);
             let mut session = kuru::ui::TerminalSession::enter(&mut std::io::stdout())?;
@@ -721,6 +757,33 @@ fn terminal_driver_waits_for_complete_frames_before_checking_quiescence() -> Res
             .to_string()
             .contains("unfocused terminal is animating"),
         "{error}"
+    );
+    terminal.send(b"q")?;
+    terminal.wait_exit(EXIT_TIMEOUT)
+}
+
+#[test]
+fn terminal_driver_awaits_dream_completion_not_a_stale_dream_entry() -> Result<()> {
+    let mut terminal = fixture("dream-settle")?;
+    terminal.wait_text(&["dream \u{b7} pool  \u{b7}  3s"], &[])?;
+    // While the dream runs the composer shows the busy placeholder: the wait
+    // expires at its bound and reports the captured screen.
+    let error = terminal
+        .wait_dream_settled(Duration::from_millis(200))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("the dream settles: timed out"), "{error}");
+    assert!(error.contains("dream \u{b7} pool  \u{b7}  3s"), "{error}");
+    assert!(error.contains("Keep your next thought here"), "{error}");
+
+    // The settled frame keeps the activity entry and a `dream` request label
+    // in the idle status row; neither is the running dream.
+    terminal.send(b"n")?;
+    terminal.wait_dream_settled(READY_TIMEOUT)?;
+    let screen = terminal.screen();
+    assert!(
+        screen.contains("dream \u{b7} pool \u{b7} parts are consolidating"),
+        "{screen}"
     );
     terminal.send(b"q")?;
     terminal.wait_exit(EXIT_TIMEOUT)
@@ -2606,7 +2669,10 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
         terminal.close_picker(b"\r")?;
         terminal.command("/mode", Some("Modes"))?;
         terminal.close_picker(b"\x1b[B\r")?;
-        terminal.command("/dream", None)?;
+        // The welcome placeholder returns only when the dream completes; await
+        // that event under the sandbox budget rather than READY_TIMEOUT.
+        terminal.submit("/dream")?;
+        terminal.wait_dream_settled(sandbox.startup_timeout)?;
         terminal.command("/unknown", None)?;
         terminal
             .wait_composer_frame(&["Unknown command; use /help", "enter send"], READY_TIMEOUT)?;
