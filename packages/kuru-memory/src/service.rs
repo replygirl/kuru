@@ -2641,6 +2641,25 @@ impl std::fmt::Display for MaintenanceTrace {
     }
 }
 
+/// How long a maintenance permit acquisition waits for the start and owner
+/// locks: the longer of the owner's own close budget
+/// ([`crate::server::close_budget`]) and `memory.startup_timeout_secs`.
+///
+/// Each lock may be held by an owner or starter that is starting or by one
+/// that is closing. The start lock's holder is a starter, bounded by its
+/// startup, or another maintenance acquisition waiting out an owner's close
+/// (or doing its maintenance, which this deadline bounds as before).
+/// The owner lock's holder is an owner still opening (bounded by its
+/// startup), serving (decided by its busy replies, not by this deadline) or
+/// closing on its own or at a retirement request (bounded by its close
+/// budget). Neither figure alone bounds both, so a maintenance caller that
+/// meets an owner's close does not fail while that close is still within the
+/// budget the owner itself allows, and a configured startup timeout longer
+/// than the close budget still bounds the wait behind a starting owner.
+fn maintenance_deadline(options: &crate::store::OpenOptions) -> Duration {
+    crate::server::close_budget().max(Duration::from_secs(options.config.startup_timeout_secs))
+}
+
 pub(crate) async fn acquire_maintenance_permit(
     options: &crate::store::OpenOptions,
 ) -> Result<MaintenancePermit> {
@@ -2648,6 +2667,9 @@ pub(crate) async fn acquire_maintenance_permit(
 }
 
 /// [`acquire_maintenance_permit`], recording each step in `trace`.
+///
+/// One deadline, counted from the acquisition's start, bounds the start-lock
+/// wait, the owner's reply and the owner-lock wait: [`maintenance_deadline`].
 pub(crate) async fn acquire_maintenance_permit_traced(
     options: &crate::store::OpenOptions,
     trace: &MaintenanceTrace,
@@ -2657,8 +2679,7 @@ pub(crate) async fn acquire_maintenance_permit_traced(
         !options.read_only,
         "memory maintenance requires writable options"
     );
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(options.config.startup_timeout_secs);
+    let deadline = tokio::time::Instant::now() + maintenance_deadline(options);
     trace.wait_for(MaintenancePhase::StartLock);
     let start = loop {
         if let Some(lock) = ServiceLock::try_acquire(
@@ -5283,17 +5304,29 @@ mod tests {
         let data = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "a".repeat(64));
         let mut options = crate::OpenOptions::new(data.path().to_owned(), scope.clone());
+        // Shorter than the owner's close budget, which therefore sets the
+        // maintenance deadline.
         options.config.startup_timeout_secs = 1;
         let owner = ServiceLock::try_acquire(data.path(), &scope, ServiceLockKind::Owner)?
             .context("fixture did not acquire service owner lock")?;
-        let error =
-            tokio::time::timeout(Duration::from_secs(3), crate::MemoryStore::purge(options))
-                .await
-                .context("purge did not respect its owner deadline")?
-                .expect_err("purge must not run while the service owns the store");
+        let bound = maintenance_deadline(&options) + Duration::from_secs(2);
+        // A bare owner lock publishes no endpoint, so every retirement request
+        // is a record read with no socket; paused time elapses the deadline.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(bound, crate::MemoryStore::purge(options))
+            .await
+            .context("purge did not respect its owner deadline")?
+            .expect_err("purge must not run while the service owns the store");
+        let waited = started.elapsed();
+        tokio::time::resume();
         ensure!(
             format!("{error:#}").contains("memory service owner is still active"),
             "purge did not explain the live owner: {error:#}"
+        );
+        ensure!(
+            waited >= crate::server::close_budget(),
+            "purge gave up after {waited:?}, inside the owner's close budget"
         );
         ensure!(
             !data
@@ -9577,8 +9610,11 @@ mod tests {
 
     // A live owner that keeps closing connections while it holds its lock
     // looks, at each reset, like a retiring one. The lock decides: it is never
-    // released, so maintenance fails at its existing deadline and names the
-    // requests that owner closed unanswered.
+    // released, so maintenance fails at its deadline (the owner's close
+    // budget, which a 1 s startup timeout does not shorten) and names the
+    // requests that owner closed unanswered. The closed requests are real
+    // socket replies, so this runs on the real clock for that budget rather
+    // than auto-advancing paused time past an owner's reply.
     #[tokio::test]
     async fn maintenance_names_a_live_owner_that_keeps_closing_connections() -> Result<()> {
         // Held for the whole test: it holds a real owner flock and never
@@ -9607,7 +9643,8 @@ mod tests {
                 }
             }
         };
-        let error = tokio::time::timeout(Duration::from_secs(3), async {
+        let bound = maintenance_deadline(&options) + Duration::from_secs(2);
+        let error = tokio::time::timeout(bound, async {
             tokio::select! {
                 acquired = acquire_maintenance_permit_traced(&options, &trace) => {
                     acquired.map(drop).err().context("maintenance acquired a live owner's lock")

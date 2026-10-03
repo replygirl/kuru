@@ -629,7 +629,11 @@ runtime command exit awaits attachment cleanup, including when the command
 reports an error; its service retires once its last attachment closes.
 Migration, recovery, purge, and other maintenance use explicit quiescence gates
 and hold the lifecycle lock through directory activation, so an active database
-cannot be moved underneath another process.
+cannot be moved underneath another process. Maintenance that meets a service
+still starting or shutting down waits for it, within the longer of
+`memory.startup_timeout_secs` and the service's own shutdown allowance (about 32
+seconds: pool drain, engine stop and reap, and a final drain), and then fails
+naming the still-active service.
 
 Within Kuru, dropping or explicitly closing a managed memory view releases that
 client attachment; it never abandons a candidate or kills the shared owner. If a
