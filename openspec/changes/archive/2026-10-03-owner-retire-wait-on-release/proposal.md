@@ -114,6 +114,30 @@ now also lands it (amended in place; no new change):
   async side waits on a oneshot under `timeout_at(backstop)`. At the backstop
   the retirement fails and the blocked thread ends with the process (or once
   the owner lets go). No retry and no sleep are in the release path.
+- Deviation from the lead's premise (review correction, amended 2026-10-03):
+  "no live endpoint" means the owner is retiring on its own only when the
+  owner is not still opening. An owner still opening gives the same reply,
+  since it has not published; if the fixture then stopped asking, an owner
+  that published and sat idle was never asked again and held its lock until
+  the close budget failed the fixture (review reproduced this at 0a7188b4:
+  32.006 s, `owner published; its endpoint record is still present`, against
+  2.37 s with the former flat-bound body, which kept asking). So the trace
+  reads the owner's records at each no-endpoint reply (the same records
+  #197's `owner_state` reads): with no endpoint record and an open-activity
+  record not marked failing, the owner is opening, the reply is not a
+  closing reading, and the fixture keeps asking under the
+  `memory.startup_timeout_secs` asking deadline, the bound on the open
+  itself. Unreadable records also keep it asking. A connection the owner
+  closed unanswered and an accepted retirement remain closing readings
+  unconditionally (an unpublished owner has no listener). #197's held-open
+  test therefore now expires at the asking deadline, still naming `owner
+  still opening; last stage = PreparingDatabase`, rather than at the close
+  budget. The readings are best effort, so two misreadings remain and are
+  documented: a served owner's close stalled exactly between its endpoint and
+  activity record retirements reads as opening (asked until the asking
+  deadline, reported as opening), and an owner without a record (no starter
+  token, only in-process test owners, or a failed record write) reads as
+  closing while it opens.
 - After the release, the maintenance permit is taken and dropped once more
   under the same backstop, so the completion proof is unchanged.
 - The backstop's expiry names the budget, the time since the first closing
@@ -147,7 +171,8 @@ unchanged.
   new `owner_state`, the existing elapsed-bound test's assertion; (decision b)
   the event wait on the owner lock release under `close_budget()`.
 - `packages/kuru-memory/src/service.rs`: (decision b) the trace's test-support
-  first-closing-reading stamp and signal.
+  first-closing-reading stamp and signal; (review correction) its reply
+  waiter and the opening classifier consulted at a no-endpoint reply.
 - `apps/kuru-tui/tests/support/memory.rs`,
   `packages/kuru-delivery/tests/support/mise_acceptance.rs`: (decision b) doc
   comments only; their joins are bounded by the retirement's backstop.
