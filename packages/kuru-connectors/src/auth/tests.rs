@@ -1334,3 +1334,148 @@ async fn native_auth_fresh_logout_fences_browser_and_device_activation() {
     assert_eq!(device.bytes(), tombstone);
     assert!(!device.manager.status().await.unwrap().authenticated);
 }
+
+/// A loopback issuer that accepts every connection and holds it open. With a
+/// `head`, it answers each request with that response head and a partial body
+/// and then stalls; without one, it never answers at all.
+async fn stalled_issuer(head: Option<&'static str>) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            if let Some(head) = head {
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+            held.push(stream);
+        }
+    });
+    (issuer, task)
+}
+
+fn short_timeout_manager(temp: &tempfile::TempDir, issuer: &str) -> AuthManager {
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let mut manager = AuthManager::test_issuer(temp.path().join("data"), project, issuer).unwrap();
+    Arc::get_mut(&mut manager.inner).unwrap().http_timeout = Duration::from_millis(300);
+    manager
+}
+
+fn assert_redacted(error: &anyhow::Error, issuer: &str) {
+    let port = issuer.rsplit(':').next().unwrap();
+    for rendered in [format!("{error:#}"), format!("{error:?}")] {
+        for leaked in [
+            issuer,
+            "127.0.0.1",
+            port,
+            "oauth/token",
+            "request-body-sentinel",
+            "exchange-code-sentinel",
+            "exchange-verifier-sentinel",
+            "response-body-sentinel",
+        ] {
+            assert!(!rendered.contains(leaked), "{leaked} echoed in {rendered}");
+        }
+    }
+}
+
+const BOUND: Duration = Duration::from_secs(10);
+
+async fn post(manager: &AuthManager) -> Result<reqwest::Response> {
+    tokio::time::timeout(
+        BOUND,
+        super::http::post_json(
+            manager,
+            "/oauth/token",
+            &json!({"secret":"request-body-sentinel"}),
+        ),
+    )
+    .await
+    .expect("authentication post must end within the injected HTTP timeout")
+}
+
+async fn token_exchange(manager: &AuthManager) -> Result<()> {
+    tokio::time::timeout(
+        BOUND,
+        super::http::exchange(
+            manager,
+            "exchange-code-sentinel",
+            "exchange-verifier-sentinel",
+            "http://localhost/callback",
+        ),
+    )
+    .await
+    .expect("token exchange must end within the injected HTTP timeout")
+    .map(|_| ())
+}
+
+#[tokio::test]
+async fn auth_transport_failures_distinguish_refused_from_stalled_without_echo() {
+    let refused = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let manager = short_timeout_manager(&refused, &closed);
+    let post_refused = post(&manager).await.unwrap_err();
+    let exchange_refused = token_exchange(&manager).await.unwrap_err();
+    assert_eq!(
+        post_refused.to_string(),
+        "OpenAI authentication request could not connect"
+    );
+    assert_eq!(
+        exchange_refused.to_string(),
+        "OpenAI token exchange request could not connect"
+    );
+    assert_redacted(&post_refused, &closed);
+    assert_redacted(&exchange_refused, &closed);
+
+    let stalled = tempfile::tempdir().unwrap();
+    let (issuer, task) = stalled_issuer(None).await;
+    let manager = short_timeout_manager(&stalled, &issuer);
+    let post_stalled = post(&manager).await.unwrap_err();
+    let exchange_stalled = token_exchange(&manager).await.unwrap_err();
+    task.abort();
+    assert_eq!(
+        post_stalled.to_string(),
+        "OpenAI authentication request timed out"
+    );
+    assert_eq!(
+        exchange_stalled.to_string(),
+        "OpenAI token exchange request timed out"
+    );
+    assert_redacted(&post_stalled, &issuer);
+    assert_redacted(&exchange_stalled, &issuer);
+}
+
+#[tokio::test]
+async fn auth_response_body_stall_is_reported_as_a_read_timeout_without_echo() {
+    let temp = tempfile::tempdir().unwrap();
+    let (issuer, task) = stalled_issuer(Some(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{\"response-body-sentinel\":",
+    ))
+    .await;
+    let manager = short_timeout_manager(&temp, &issuer);
+    let response = post(&manager).await.unwrap();
+    let error = tokio::time::timeout(BOUND, super::http::json_response(response))
+        .await
+        .expect("authentication body read must end within the injected HTTP timeout")
+        .unwrap_err();
+    let exchange = token_exchange(&manager).await.unwrap_err();
+    task.abort();
+    assert_eq!(error.to_string(), "authentication response read timed out");
+    assert_eq!(
+        exchange.to_string(),
+        "authentication response read timed out"
+    );
+    assert_redacted(&error, &issuer);
+    assert_redacted(&exchange, &issuer);
+}

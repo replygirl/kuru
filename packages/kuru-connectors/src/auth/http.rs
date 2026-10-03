@@ -1,4 +1,5 @@
 use super::{AuthManager, CLIENT_ID, now, random, store::Session, validate_secret};
+use crate::providers::TransportKind;
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::{Client, Request, Response, StatusCode};
@@ -177,7 +178,7 @@ pub(super) async fn json_response(mut response: Response) -> Result<Value> {
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| anyhow::anyhow!("authentication response read failed"))?
+        .map_err(|error| transport("authentication response read", &error))?
     {
         ensure!(
             bytes.len() + chunk.len() <= crate::MAX_BYTES,
@@ -202,7 +203,7 @@ pub(super) async fn post_json(manager: &AuthManager, path: &str, body: &Value) -
         .json(body)
         .send()
         .await
-        .map_err(|_| anyhow::anyhow!("OpenAI authentication request failed"))
+        .map_err(|error| transport("OpenAI authentication request", &error))
 }
 
 pub(super) async fn exchange(
@@ -225,9 +226,21 @@ pub(super) async fn exchange(
         .body(body)
         .send()
         .await
-        .map_err(|_| anyhow::anyhow!("OpenAI token exchange request failed"))?;
+        .map_err(|error| transport("OpenAI token exchange request", &error))?;
     serde_json::from_value(json_response(response).await?)
         .map_err(|_| anyhow::anyhow!("invalid token response fields"))
+}
+
+/// Report an authentication transport failure by its kind alone. The reqwest
+/// error is never formatted or chained: its `Display` can carry the issuer URL,
+/// and request and response bodies hold grant material.
+fn transport(subject: &'static str, error: &reqwest::Error) -> anyhow::Error {
+    let outcome = match TransportKind::classify(error) {
+        TransportKind::Timeout => "timed out",
+        TransportKind::Connect => "could not connect",
+        TransportKind::Other => "failed",
+    };
+    anyhow::anyhow!("{subject} {outcome}")
 }
 
 pub(super) fn pending(status: StatusCode) -> bool {

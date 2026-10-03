@@ -52,7 +52,7 @@ pub(super) async fn response(
             "Responses API response is not an event stream"
         );
     }
-    let mut decoder = Decoder::default();
+    let mut decoder = Decoder::new(operation);
     loop {
         let chunk = tokio::time::timeout(idle, response.chunk())
             .await
@@ -92,8 +92,8 @@ pub(super) struct SettledResponse {
     pub(super) reasoning_summaries: Vec<ProviderReasoningSummary>,
 }
 
-#[derive(Default)]
 struct Decoder {
+    operation: Operation,
     wire_bytes: usize,
     retained_output_bytes: usize,
     line: Vec<u8>,
@@ -116,6 +116,27 @@ struct Decoder {
 }
 
 impl Decoder {
+    fn new(operation: Operation) -> Self {
+        Self {
+            operation,
+            wire_bytes: 0,
+            retained_output_bytes: 0,
+            line: Vec::new(),
+            data: String::new(),
+            after_cr: false,
+            started: false,
+            items: BTreeMap::new(),
+            ids: BTreeSet::new(),
+            observations: Vec::new(),
+            text_fragments: BTreeMap::new(),
+            summary_fragments: BTreeMap::new(),
+            tool_fragments: BTreeMap::new(),
+            tool_done: BTreeMap::new(),
+            tool_calls: BTreeMap::new(),
+            settled: false,
+        }
+    }
+
     fn take_observations(&mut self) -> Vec<ProviderEvent> {
         std::mem::take(&mut self.observations)
     }
@@ -217,7 +238,8 @@ impl Decoder {
 
     fn end_line(&mut self) -> Result<Option<Value>> {
         let line = std::mem::take(&mut self.line);
-        let line = std::str::from_utf8(&line).map_err(|_| diagnostics::stream_protocol())?;
+        let line =
+            std::str::from_utf8(&line).map_err(|_| diagnostics::stream_protocol(self.operation))?;
         let line = if self.started {
             line
         } else {
@@ -229,8 +251,8 @@ impl Decoder {
                 return Ok(None);
             }
             let data = std::mem::take(&mut self.data);
-            let event: Value =
-                serde_json::from_str(&data).map_err(|_| diagnostics::stream_protocol())?;
+            let event: Value = serde_json::from_str(&data)
+                .map_err(|_| diagnostics::stream_protocol(self.operation))?;
             return self.event(event);
         }
         if let Some(value) = line.strip_prefix("data:") {
@@ -393,8 +415,8 @@ impl Decoder {
                     arguments.len() <= MAX_BYTES && name.unwrap_or_default().len() <= MAX_BYTES,
                     "Responses completed function arguments exceed retained output limit"
                 );
-                let _: Value =
-                    serde_json::from_str(arguments).map_err(|_| diagnostics::stream_protocol())?;
+                let _: Value = serde_json::from_str(arguments)
+                    .map_err(|_| diagnostics::stream_protocol(self.operation))?;
                 ensure!(
                     self.tool_done
                         .insert(
@@ -437,7 +459,7 @@ impl Decoder {
                     "duplicate completed output index"
                 );
                 let item_bytes = serde_json::to_vec(item)
-                    .map_err(|_| diagnostics::stream_protocol())?
+                    .map_err(|_| diagnostics::stream_protocol(self.operation))?
                     .len();
                 let separator_bytes = if self.items.is_empty() { 2 } else { 1 };
                 let retained = self
@@ -529,7 +551,7 @@ impl Decoder {
                 self.reconcile_fragments(&response)?;
                 response["status"] = json!("completed");
                 let response_bytes = serde_json::to_vec(&response)
-                    .map_err(|_| diagnostics::stream_protocol())?
+                    .map_err(|_| diagnostics::stream_protocol(self.operation))?
                     .len();
                 ensure!(
                     response_bytes <= MAX_BYTES,
@@ -551,7 +573,7 @@ impl Decoder {
                 self.observations.push(ProviderEvent::Failed {
                     kind: ProviderFailureKind::Failed,
                 });
-                return Err(diagnostics::stream_event(&event));
+                return Err(diagnostics::stream_event(self.operation, &event));
             }
             "response.incomplete" => {
                 if let Some(response) = event.get("response") {
@@ -562,14 +584,14 @@ impl Decoder {
                 self.observations.push(ProviderEvent::Failed {
                     kind: ProviderFailureKind::Incomplete,
                 });
-                return Err(diagnostics::stream_failed());
+                return Err(diagnostics::stream_failed(self.operation));
             }
             "error" => {
                 self.settled = true;
                 self.observations.push(ProviderEvent::Failed {
                     kind: ProviderFailureKind::Error,
                 });
-                return Err(diagnostics::stream_failed());
+                return Err(diagnostics::stream_failed(self.operation));
             }
             _ => {}
         }
@@ -658,8 +680,8 @@ impl Decoder {
             let arguments = item["arguments"]
                 .as_str()
                 .context("completed function call lacks arguments")?;
-            let _: Value =
-                serde_json::from_str(arguments).map_err(|_| diagnostics::stream_protocol())?;
+            let _: Value = serde_json::from_str(arguments)
+                .map_err(|_| diagnostics::stream_protocol(self.operation))?;
         }
         Ok(())
     }
@@ -742,7 +764,7 @@ impl Decoder {
                 "stream function fragment disagrees with final output"
             );
             let _: Value = serde_json::from_str(final_arguments)
-                .map_err(|_| diagnostics::stream_protocol())?;
+                .map_err(|_| diagnostics::stream_protocol(self.operation))?;
         }
         for ((_, item_id), (arguments, name)) in &self.tool_done {
             let Some(item) = final_item(output, item_id) else {
@@ -765,10 +787,10 @@ impl Decoder {
             let final_arguments = item["arguments"]
                 .as_str()
                 .context("completed function arguments lack final arguments")?;
-            let expected: Value =
-                serde_json::from_str(arguments).map_err(|_| diagnostics::stream_protocol())?;
+            let expected: Value = serde_json::from_str(arguments)
+                .map_err(|_| diagnostics::stream_protocol(self.operation))?;
             let actual: Value = serde_json::from_str(final_arguments)
-                .map_err(|_| diagnostics::stream_protocol())?;
+                .map_err(|_| diagnostics::stream_protocol(self.operation))?;
             ensure!(
                 expected == actual,
                 "completed function arguments disagree with final output"
@@ -915,6 +937,11 @@ fn append_fragment<K: Ord>(fragments: &mut BTreeMap<K, String>, key: K, value: &
 mod tests {
     use super::*;
 
+    /// The decoder these fixtures exercise: the ChatGPT subscription route.
+    fn chatgpt_decoder() -> Decoder {
+        Decoder::new(Operation::ChatgptCompletion)
+    }
+
     #[test]
     fn fragments_utf8_crlf_multiline_data_and_completed_items() {
         let bytes = concat!(
@@ -925,7 +952,7 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"usage\":{\"input_tokens\":7,\"output_tokens\":2}}}\n\n"
         ).as_bytes();
         for width in [1, 2, 3, 11, bytes.len()] {
-            let mut decoder = Decoder::default();
+            let mut decoder = chatgpt_decoder();
             let mut result = None;
             for part in bytes.chunks(width) {
                 if let Some(value) = decoder.push(part).unwrap() {
@@ -968,7 +995,7 @@ mod tests {
             .iter()
             .map(|event| format!("data: {event}\n\n"))
             .collect();
-        let result = Decoder::default().push(bytes.as_bytes()).unwrap().unwrap();
+        let result = chatgpt_decoder().push(bytes.as_bytes()).unwrap().unwrap();
         let output = result["output"].as_array().unwrap();
         assert_eq!(output.len(), 2);
         assert_eq!(output[0]["id"], json!(reasoning));
@@ -997,7 +1024,7 @@ mod tests {
         ]);
         let completed =
             json!({"type":"response.completed","response":{"id":"r1","output":reordered}});
-        let result = Decoder::default()
+        let result = chatgpt_decoder()
             .push(format!("{streamed}data: {completed}\n\n").as_bytes())
             .unwrap()
             .unwrap();
@@ -1007,7 +1034,7 @@ mod tests {
         let without_reasoning =
             json!({"type":"response.completed","response":{"id":"r1","output":[message]}});
         assert_eq!(
-            Decoder::default()
+            chatgpt_decoder()
                 .push(format!("{streamed}data: {without_reasoning}\n\n").as_bytes())
                 .unwrap()
                 .unwrap()["output"],
@@ -1018,7 +1045,7 @@ mod tests {
         // ID in the terminal output still fails the turn.
         let without_message =
             json!({"type":"response.completed","response":{"id":"r1","output":[reasoning]}});
-        let error = Decoder::default()
+        let error = chatgpt_decoder()
             .push(format!("{streamed}data: {without_message}\n\n").as_bytes())
             .unwrap_err();
         assert!(
@@ -1030,7 +1057,7 @@ mod tests {
         let rewritten = json!({"type":"response.completed","response":{"id":"r1","output":[
             {"type":"message","id":"msg_1","content":[{"type":"output_text","text":"not ready"}]}
         ]}});
-        let error = Decoder::default()
+        let error = chatgpt_decoder()
             .push(format!("{streamed}data: {rewritten}\n\n").as_bytes())
             .unwrap_err();
         assert!(
@@ -1058,7 +1085,7 @@ mod tests {
             .iter()
             .map(|event| format!("data: {event}\n\n"))
             .collect();
-        let result = Decoder::default().push(bytes.as_bytes()).unwrap().unwrap();
+        let result = chatgpt_decoder().push(bytes.as_bytes()).unwrap().unwrap();
         assert_eq!(result["output"], output);
     }
 
@@ -1096,7 +1123,7 @@ mod tests {
             .iter()
             .map(|event| format!("data: {event}\n\n"))
             .collect();
-        let result = Decoder::default().push(bytes.as_bytes()).unwrap().unwrap();
+        let result = chatgpt_decoder().push(bytes.as_bytes()).unwrap().unwrap();
         let output = result["output"].as_array().unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["id"], json!(call));
@@ -1127,7 +1154,7 @@ mod tests {
             }}),
             json!({"type":"response.output_item.done","output_index":0,"item":item}),
         );
-        let result = Decoder::default().push(early.as_bytes()).unwrap().unwrap();
+        let result = chatgpt_decoder().push(early.as_bytes()).unwrap().unwrap();
         assert_eq!(result["output"][0]["name"], "file_read");
         assert_eq!(result["output"][0]["call_id"], "call_1");
 
@@ -1142,7 +1169,7 @@ mod tests {
                 "id":"fc_1","type":"function_call","arguments":arguments
             }}),
         );
-        let result = Decoder::default().push(late.as_bytes()).unwrap().unwrap();
+        let result = chatgpt_decoder().push(late.as_bytes()).unwrap().unwrap();
         assert_eq!(result["output"][0]["name"], "file_read");
         assert_eq!(result["output"][0]["call_id"], "call_1");
 
@@ -1153,7 +1180,7 @@ mod tests {
                 "id":"fc_1","type":"function_call","call_id":"call_1","arguments":arguments
             }}),
         );
-        let error = Decoder::default().push(unnamed.as_bytes()).unwrap_err();
+        let error = chatgpt_decoder().push(unnamed.as_bytes()).unwrap_err();
         assert!(
             format!("{error:#}").contains("completed function call lacks name"),
             "{error:#}"
@@ -1169,9 +1196,7 @@ mod tests {
                 "id":"fc_1","type":"function_call","name":"shell","call_id":"call_1","arguments":arguments
             }}),
         );
-        let error = Decoder::default()
-            .push(contradicted.as_bytes())
-            .unwrap_err();
+        let error = chatgpt_decoder().push(contradicted.as_bytes()).unwrap_err();
         assert!(format!("{error:#}").contains("disagrees"), "{error:#}");
 
         // And so does one whose arguments never became complete JSON.
@@ -1182,7 +1207,7 @@ mod tests {
                 "arguments":"{\"path\":"
             }}),
         );
-        let error = Decoder::default().push(truncated.as_bytes()).unwrap_err();
+        let error = chatgpt_decoder().push(truncated.as_bytes()).unwrap_err();
         assert_eq!(
             error.to_string(),
             "ChatGPT completion stream contained invalid protocol data"
@@ -1204,14 +1229,14 @@ mod tests {
             .iter()
             .map(|event| format!("data: {event}\n\n"))
             .collect();
-        assert!(Decoder::default().push(bytes.as_bytes()).unwrap().is_some());
+        assert!(chatgpt_decoder().push(bytes.as_bytes()).unwrap().is_some());
 
         let conflict = format!(
             "data: {}\n\ndata: {}\n\n",
             json!({"type":"response.output_text.delta","item_id":"message-1","output_index":1,"content_index":0,"delta":"wrong"}),
             json!({"type":"response.completed","response":{"id":"r1","output":output}}),
         );
-        assert!(Decoder::default().push(conflict.as_bytes()).is_err());
+        assert!(chatgpt_decoder().push(conflict.as_bytes()).is_err());
 
         let hidden_refusal = json!({"type":"response.completed","response":{"id":"r1","output":[
             {"type":"message","id":"message-1","content":[{"type":"output_text","text":"safe","refusal":"hidden"}]}
@@ -1221,7 +1246,7 @@ mod tests {
             json!({"type":"response.refusal.delta","item_id":"message-1","output_index":0,"content_index":0,"delta":"hidden"}),
             hidden_refusal,
         );
-        assert!(Decoder::default().push(conflict.as_bytes()).is_err());
+        assert!(chatgpt_decoder().push(conflict.as_bytes()).is_err());
     }
 
     #[test]
@@ -1240,7 +1265,7 @@ mod tests {
             .iter()
             .map(|event| format!("data: {event}\n\n"))
             .collect();
-        let mut decoder = Decoder::default();
+        let mut decoder = chatgpt_decoder();
         let response = decoder.push(bytes.as_bytes()).unwrap().unwrap();
         assert_eq!(
             decoder.settled_reasoning_summaries(&response).unwrap(),
@@ -1272,20 +1297,20 @@ mod tests {
         let terminal = json!({"type":"response.completed","response":{"id":"r1","output":[{"type":"message","content":[{"type":"output_text","text":"terminal"}]}]}});
         let terminal_only = format!("data: {terminal}\n\n");
         assert!(
-            Decoder::default()
+            chatgpt_decoder()
                 .push(terminal_only.as_bytes())
                 .unwrap()
                 .is_some()
         );
         let duplicate = format!("{terminal_only}data: {terminal}\n\n");
-        assert!(Decoder::default().push(duplicate.as_bytes()).is_err());
+        assert!(chatgpt_decoder().push(duplicate.as_bytes()).is_err());
     }
 
     #[test]
     fn requires_authoritative_output_and_unique_terminal_item_ids() {
         let no_output = json!({"type":"response.completed","response":{"id":"r1"}});
         assert!(
-            Decoder::default()
+            chatgpt_decoder()
                 .push(format!("data: {no_output}\n\n").as_bytes())
                 .is_err()
         );
@@ -1294,7 +1319,7 @@ mod tests {
         // completion, not a missing one.
         let empty_output = json!({"type":"response.completed","response":{"id":"r1","output":[]}});
         assert_eq!(
-            Decoder::default()
+            chatgpt_decoder()
                 .push(format!("data: {empty_output}\n\n").as_bytes())
                 .unwrap()
                 .unwrap()["output"],
@@ -1306,7 +1331,7 @@ mod tests {
             {"type":"reasoning","id":"same","summary":[]}
         ]}});
         assert!(
-            Decoder::default()
+            chatgpt_decoder()
                 .push(format!("data: {duplicates}\n\n").as_bytes())
                 .is_err()
         );
@@ -1322,7 +1347,7 @@ mod tests {
             json!({"type":"response.function_call_arguments.delta","item_id":"message-1","output_index":0,"delta":"{}"}),
             terminal,
         );
-        assert!(Decoder::default().push(data.as_bytes()).is_err());
+        assert!(chatgpt_decoder().push(data.as_bytes()).is_err());
     }
 
     #[test]
@@ -1331,7 +1356,7 @@ mod tests {
         let item = json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"text":"kept"}]}});
         let completed = json!({"type":"response.completed","response":{"id":"r1"}});
         let bytes = format!("{discarded}\ndata: {item}\n\ndata: {completed}\n\n");
-        let mut decoder = Decoder::default();
+        let mut decoder = chatgpt_decoder();
         let mut result = None;
         for chunk in bytes.as_bytes().chunks(997) {
             if let Some(value) = decoder.push(chunk).unwrap() {
@@ -1349,7 +1374,7 @@ mod tests {
             json!({"type":"response.output_item.done","output_index":0,"item":item});
         let completed = json!({"type":"response.completed","response":{"id":"r1","output":[item]}});
         let bytes = format!("data: {completed_item}\n\ndata: {completed}\n\n");
-        let result = Decoder::default().push(bytes.as_bytes()).unwrap().unwrap();
+        let result = chatgpt_decoder().push(bytes.as_bytes()).unwrap().unwrap();
         assert_eq!(result["output"].as_array().unwrap().len(), 1);
         assert!(serde_json::to_vec(&result).unwrap().len() < MAX_BYTES);
     }
@@ -1357,18 +1382,18 @@ mod tests {
     #[test]
     fn rejects_oversized_retained_wire_and_event_budgets() {
         let large_item = json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"text":"x".repeat(MAX_BYTES)}]}});
-        let error = Decoder::default()
+        let error = chatgpt_decoder()
             .push(format!("data: {large_item}\n\n").as_bytes())
             .unwrap_err();
         assert!(error.to_string().contains("retained output"));
 
         let large_final = json!({"type":"response.completed","response":{"id":"r1","output":[{"type":"message","content":[{"text":"x".repeat(MAX_BYTES)}]}]}});
-        let error = Decoder::default()
+        let error = chatgpt_decoder()
             .push(format!("data: {large_final}\n\n").as_bytes())
             .unwrap_err();
         assert!(error.to_string().contains("retained response"));
 
-        let error = Decoder::default()
+        let error = chatgpt_decoder()
             .push(&vec![b'x'; MAX_SSE_WIRE_BYTES + 1])
             .unwrap_err();
         assert!(error.to_string().contains("wire size"));
@@ -1376,7 +1401,7 @@ mod tests {
         let mut large_event = b"data: ".to_vec();
         large_event.extend(vec![b'x'; MAX_SSE_EVENT_BYTES + 1]);
         large_event.extend(b"\n\n");
-        let error = Decoder::default().push(&large_event).unwrap_err();
+        let error = chatgpt_decoder().push(&large_event).unwrap_err();
         assert!(error.to_string().contains("event line"));
     }
 
@@ -1392,11 +1417,11 @@ mod tests {
             json!({"type":"response.incomplete","response":{"error":{"message":"secret-sentinel"}}}).to_string(),
             json!({"type":"error","message":"secret-sentinel"}).to_string(),
         ] {
-            let error = Decoder::default().push(format!("data: {data}\n\n").as_bytes()).unwrap_err();
+            let error = chatgpt_decoder().push(format!("data: {data}\n\n").as_bytes()).unwrap_err();
             assert!(!format!("{error:#}").contains("secret-sentinel"));
         }
         let item = json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"i","encrypted_content":"opaque"}});
-        let mut decoder = Decoder::default();
+        let mut decoder = chatgpt_decoder();
         let event = format!("data: {item}\n\n");
         decoder.push(event.as_bytes()).unwrap();
         assert!(
@@ -1406,16 +1431,16 @@ mod tests {
                 .to_string()
                 .contains("duplicate")
         );
-        assert!(Decoder::default().push(b"data: \xff\n\n").is_err());
+        assert!(chatgpt_decoder().push(b"data: \xff\n\n").is_err());
         assert!(
-            Decoder::default()
+            chatgpt_decoder()
                 .push(&vec![b'x'; MAX_SSE_LINE_BYTES + 1])
                 .unwrap_err()
                 .to_string()
                 .contains("event line")
         );
 
-        let error = Decoder::default()
+        let error = chatgpt_decoder()
             .push(b"data: {\"parser-secret\":\n\n")
             .unwrap_err();
         assert_eq!(
@@ -1424,5 +1449,36 @@ mod tests {
         );
         assert!(!format!("{error:#}").contains("parser-secret"));
         assert!(!format!("{error:?}").contains("parser-secret"));
+    }
+
+    #[test]
+    fn api_key_route_stream_failures_do_not_name_chatgpt() {
+        let protocol = Decoder::new(Operation::ResponsesCompletion)
+            .push(b"data: {\"parser-secret\":\n\n")
+            .unwrap_err();
+        assert_eq!(
+            protocol.to_string(),
+            "Responses completion stream contained invalid protocol data"
+        );
+        for (data, expected) in [
+            (
+                json!({"type":"response.failed","response":{"error":{"code":"insufficient_quota","message":"secret-sentinel"}}}),
+                "Responses completion is blocked by an API quota or billing limit",
+            ),
+            (
+                json!({"type":"response.incomplete","response":{"error":{"message":"secret-sentinel"}}}),
+                "Responses completion stream failed before completion",
+            ),
+            (
+                json!({"type":"error","message":"secret-sentinel"}),
+                "Responses completion stream failed before completion",
+            ),
+        ] {
+            let error = Decoder::new(Operation::ResponsesCompletion)
+                .push(format!("data: {data}\n\n").as_bytes())
+                .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+            assert!(!format!("{error:#}").contains("secret-sentinel"));
+        }
     }
 }
