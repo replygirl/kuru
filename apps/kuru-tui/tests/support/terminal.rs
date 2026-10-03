@@ -109,7 +109,8 @@ pub fn startup_timeout(memory_startup: Duration) -> Duration {
     // activated server before the first frame. Each startup allows two seconds
     // for its supervisor handshake; staged shutdown allows 8s graceful + 3s
     // forced reaping + 2s parent acknowledgment (kuru-memory's finish_owner).
-    // Subsequent frame/input waits retain the shorter READY_TIMEOUT.
+    // Subsequent frame/input waits retain the shorter READY_TIMEOUT; a
+    // submitted dream's settle reuses this budget (`wait_dream_settled`).
     (memory_startup + Duration::from_secs(2)) * 2 + Duration::from_secs(8 + 3 + 2) + READY_TIMEOUT
 }
 
@@ -419,6 +420,17 @@ impl Terminal {
     }
 
     pub fn command(&mut self, text: &str, picker: Option<&str>) -> Result<()> {
+        self.submit(text)?;
+        if let Some(picker) = picker {
+            self.wait_text(&[picker, "Esc back"], &[])
+        } else {
+            self.wait_text(&["What shall we explore or build?", "enter send"], &[])
+        }
+    }
+
+    /// Enters `text` at an idle composer and presses Enter, without waiting
+    /// for the dispatched operation to settle.
+    pub fn submit(&mut self, text: &str) -> Result<()> {
         self.wait_idle()?;
         self.send(text.as_bytes())?;
         // A stale idle frame cannot acknowledge a command: first observe the
@@ -440,12 +452,37 @@ impl Terminal {
                 }))
             },
         )?;
-        self.send(b"\r")?;
-        if let Some(picker) = picker {
-            self.wait_text(&[picker, "Esc back"], &[])
-        } else {
-            self.wait_text(&["What shall we explore or build?", "enter send"], &[])
-        }
+        self.send(b"\r")
+    }
+
+    /// Waits for a dream submitted by `submit` to finish, bounded by the
+    /// caller's stated budget (the sandbox startup budget: a dream is memory
+    /// work on the same store, unlike the frame and input waits that keep
+    /// READY_TIMEOUT). The welcome placeholder and `enter send` return only
+    /// when the operation clears `busy`; the activity panel keeps its
+    /// `dream · …` entry and a later event can replace the busy status label,
+    /// so the status row above the separator must also no longer lead with
+    /// `dream · `. Expiry reports the captured screen.
+    #[allow(dead_code)] // Used by terminal.rs; each integration test compiles this support module alone.
+    pub fn wait_dream_settled(&mut self, timeout: Duration) -> Result<()> {
+        self.wait("the dream settles", timeout, |terminal| {
+            let screen = terminal.screen();
+            let rows = screen.lines().collect::<Vec<_>>();
+            let dreaming = rows
+                .iter()
+                .rposition(|row| row.trim_start().starts_with(".    ."))
+                .and_then(|separator| separator.checked_sub(1))
+                .and_then(|status| rows.get(status))
+                .is_some_and(|row| {
+                    // The busy row is `{spinner} {status}  ·  {seconds}s`.
+                    row.trim_start()
+                        .split_once(' ')
+                        .is_some_and(|(_, label)| label.starts_with("dream · "))
+                });
+            Ok(!dreaming
+                && screen.contains("What shall we explore or build?")
+                && screen.contains("enter send"))
+        })
     }
 
     pub fn close_picker(&mut self, keys: &[u8]) -> Result<()> {
