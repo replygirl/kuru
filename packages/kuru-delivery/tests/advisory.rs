@@ -13,7 +13,7 @@ const FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
 
 #[path = "support/fixture_git.rs"]
 mod fixture_git;
-use fixture_git::FixtureGit;
+use fixture_git::{FixtureGit, Templates};
 
 async fn git(directory: &Path, arguments: &[&str]) {
     FixtureGit::new().git(directory, arguments).await;
@@ -29,10 +29,6 @@ async fn git_with_environment(directory: &Path, arguments: &[&str], environment:
             environment,
         )
         .await;
-}
-
-async fn advisory_database(root: &Path) -> PathBuf {
-    advisory_database_with(&FixtureGit::new(), root).await
 }
 
 async fn advisory_database_with(fixture: &FixtureGit, root: &Path) -> PathBuf {
@@ -92,11 +88,14 @@ async fn stale_commit(fixture: &FixtureGit, database: &Path) {
 }
 
 /// Every advisory fixture repository this binary uses, built by one builder:
-/// a clean detached checkout and its attached, stale and wrong-origin variants.
+/// a clean detached checkout, and copies of it made attached, stale or given
+/// the wrong origin. Each is `<variant>/advisory-db` under `root`.
 async fn build_fixtures(fixture: &FixtureGit, root: &Path) {
-    for variant in ["clean", "attached", "stale", "wrong-origin"] {
+    fs::create_dir(root.join("clean")).unwrap();
+    let clean = advisory_database_with(fixture, &root.join("clean")).await;
+    for variant in ["attached", "stale", "wrong-origin"] {
         fs::create_dir(root.join(variant)).unwrap();
-        advisory_database_with(fixture, &root.join(variant)).await;
+        fixture_git::copy_tree(&clean, &root.join(variant).join("advisory-db"));
     }
     fixture
         .git(
@@ -115,6 +114,32 @@ async fn build_fixtures(fixture: &FixtureGit, root: &Path) {
             ],
         )
         .await;
+}
+
+/// The fixture repositories, built once per test binary under Cargo's
+/// target tmp directory.
+async fn templates() -> &'static Templates {
+    static TEMPLATES: tokio::sync::OnceCell<Templates> = tokio::sync::OnceCell::const_new();
+    TEMPLATES
+        .get_or_init(|| async {
+            let root = tempfile::Builder::new()
+                .prefix("advisory-templates-")
+                .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+                .unwrap();
+            let fixture = FixtureGit::new();
+            build_fixtures(&fixture, root.path()).await;
+            Templates::seal(root, &fixture)
+        })
+        .await
+}
+
+/// A private copy of the `variant` fixture repository at `root/advisory-db`.
+async fn advisory_database(variant: &str, root: &Path) -> PathBuf {
+    let database = root.join("advisory-db");
+    templates()
+        .await
+        .copy(&format!("{variant}/advisory-db"), &database);
+    database
 }
 
 async fn scan_cli(
@@ -148,7 +173,7 @@ async fn scan_cli(
 #[tokio::test]
 async fn cli_uses_direct_audit_binary_with_root_lockfile_and_offline_flags() {
     let root = tempfile::tempdir().unwrap();
-    let database = advisory_database(root.path()).await;
+    let database = advisory_database("clean", root.path()).await;
     let marker = root.path().join("audit-arguments.json");
     let mut command = command::Command::new(env!("CARGO_BIN_EXE_kuru-delivery"));
     command
@@ -195,31 +220,20 @@ async fn cli_rejects_missing_dirty_attached_stale_and_wrong_origin_databases_bef
     let missing = root.path().join("missing-database");
     let dirty_root = root.path().join("dirty");
     fs::create_dir(&dirty_root).unwrap();
-    let dirty = advisory_database(&dirty_root).await;
+    let dirty = advisory_database("clean", &dirty_root).await;
     fs::write(dirty.join("untracked"), b"dirty\n").unwrap();
 
     let attached_root = root.path().join("attached");
     fs::create_dir(&attached_root).unwrap();
-    let attached = advisory_database(&attached_root).await;
-    git(&attached, &["checkout", "-b", "fixture-attached"]).await;
+    let attached = advisory_database("attached", &attached_root).await;
 
     let stale_root = root.path().join("stale");
     fs::create_dir(&stale_root).unwrap();
-    let stale = advisory_database(&stale_root).await;
-    stale_commit(&FixtureGit::new(), &stale).await;
+    let stale = advisory_database("stale", &stale_root).await;
 
     let wrong_origin_root = root.path().join("wrong-origin");
     fs::create_dir(&wrong_origin_root).unwrap();
-    let wrong_origin = advisory_database(&wrong_origin_root).await;
-    git(
-        &wrong_origin,
-        &[
-            "config",
-            "remote.origin.url",
-            "https://example.invalid/not-rustsec.git",
-        ],
-    )
-    .await;
+    let wrong_origin = advisory_database("wrong-origin", &wrong_origin_root).await;
 
     for (name, database, expected) in [
         ("missing", missing.as_path(), "advisory database is missing"),
@@ -266,7 +280,7 @@ async fn cli_rejects_changed_advisory_head_and_propagates_scanner_failure() {
     ] {
         let case_root = root.path().join(name);
         fs::create_dir(&case_root).unwrap();
-        let database = advisory_database(&case_root).await;
+        let database = advisory_database("clean", &case_root).await;
         let marker = root.path().join(format!("{name}-capture"));
         let output = scan_cli(&database, &marker, advance_head, fail, None).await;
         assert!(!output.status.success(), "{name} unexpectedly succeeded");
@@ -282,7 +296,7 @@ async fn cli_rejects_changed_advisory_head_and_propagates_scanner_failure() {
 #[tokio::test]
 async fn cli_uses_owned_project_audit_configuration_despite_hostile_cargo_home() {
     let root = tempfile::tempdir().unwrap();
-    let database = advisory_database(root.path()).await;
+    let database = advisory_database("clean", root.path()).await;
     let marker = root.path().join("audit-arguments.json");
     let environment_marker = root.path().join("audit-environment.json");
     let hostile_cargo_home = root.path().join("hostile-cargo-home");
@@ -567,20 +581,27 @@ async fn fixture_head_advance_names_git_arguments_directory_and_elapsed_time_whe
 
 #[tokio::test]
 async fn fixture_git_sequence_traces_every_call_and_starts_no_child_process() {
-    let root = tempfile::tempdir().unwrap();
-    let fixture = FixtureGit::new();
-    build_fixtures(&fixture, root.path()).await;
-    // Four clean checkouts of six calls each, then three variant mutations.
-    assert_eq!(fixture.calls(), 27);
-    fixture.assert_no_children();
+    // Sealing the binary's one template build already required a Trace2
+    // start and no child_start from every call.
+    let templates = templates().await;
+    // Six calls for the clean checkout, then one per copied variant.
+    assert_eq!(templates.calls(), 9);
+    for variant in ["clean", "attached", "stale", "wrong-origin"] {
+        assert!(
+            templates
+                .path()
+                .join(variant)
+                .join("advisory-db/.git")
+                .is_dir()
+        );
+    }
 }
 
 #[tokio::test]
 async fn fixture_git_reads_only_command_line_and_repository_configuration() {
     let root = tempfile::tempdir().unwrap();
-    let fixture = FixtureGit::new();
-    let database = advisory_database_with(&fixture, root.path()).await;
-    let listing = fixture
+    let database = advisory_database("clean", root.path()).await;
+    let listing = FixtureGit::new()
         .git(&database, &["config", "--list", "--show-origin"])
         .await
         .stdout;

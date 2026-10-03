@@ -520,18 +520,18 @@ pub async fn scan(database: &Path, audit_binary: &Path) -> Result<DatabaseRevisi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture_git::FixtureGit;
+    use crate::fixture_git::{FixtureGit, Templates, copy_tree};
 
-    async fn git(directory: &Path, arguments: &[&str]) {
-        git_with_environment(directory, arguments, &[]).await;
+    async fn git(fixture: &FixtureGit, directory: &Path, arguments: &[&str]) {
+        git_with_environment(fixture, directory, arguments, &[]).await;
     }
 
     async fn git_with_environment(
+        fixture: &FixtureGit,
         directory: &Path,
         arguments: &[&str],
         environment: &[(&str, &str)],
     ) {
-        let fixture = FixtureGit::new();
         let production = GitEnvironment::new().unwrap();
         let mut command = fixture.command(directory);
         // The helper begins with hostile inherited selectors/config injection;
@@ -563,7 +563,7 @@ mod tests {
         let missing = root.path().join("absent");
         let message = failure_message({
             let missing = missing.clone();
-            async move { git(&missing, &["status", "--short"]).await }
+            async move { git(&FixtureGit::new(), &missing, &["status", "--short"]).await }
         })
         .await;
         // The launch failed before Git could write its Trace2 file, and the
@@ -578,7 +578,15 @@ mod tests {
         }
         let message = failure_message({
             let missing = missing.clone();
-            async move { git_with_environment(&missing, &["log"], &[("GIT_PAGER", "cat")]).await }
+            async move {
+                git_with_environment(
+                    &FixtureGit::new(),
+                    &missing,
+                    &["log"],
+                    &[("GIT_PAGER", "cat")],
+                )
+                .await
+            }
         })
         .await;
         for required in [
@@ -591,15 +599,10 @@ mod tests {
         }
     }
 
-    async fn database() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
-        let database = root.path().join("advisory-db");
-        fs::create_dir(&database).unwrap();
-        git(&database, &["init"]).await;
-        fs::write(database.join("README.md"), b"fixture\n").unwrap();
-        git(&database, &["add", "README.md"]).await;
+    async fn commit(fixture: &FixtureGit, directory: &Path, message: &str) {
         git(
-            &database,
+            fixture,
+            directory,
             &[
                 "-c",
                 "user.name=fixture",
@@ -607,14 +610,118 @@ mod tests {
                 "user.email=fixture@example.invalid",
                 "commit",
                 "-m",
-                "fixture",
+                message,
             ],
         )
         .await;
-        git(&database, &["remote", "add", "origin", ORIGIN]).await;
-        git(&database, &["config", "remote.origin.fetch", FETCH_REFSPEC]).await;
-        git(&database, &["checkout", "--detach", "HEAD"]).await;
+    }
+
+    /// Build every repository these tests use, once per test binary:
+    /// - `clean/advisory-db`, an accepted detached checkout;
+    /// - `executable-config/advisory-db`, its copy with a local hooks path;
+    /// - `refresh/{source,database}`, a fresh origin and a stale detached
+    ///   checkout whose origin is the sibling `../source`. It is its own root
+    ///   commit: a fixture fetch would start transport children, and the
+    ///   refresh under test fetches.
+    async fn templates() -> &'static Templates {
+        static TEMPLATES: tokio::sync::OnceCell<Templates> = tokio::sync::OnceCell::const_new();
+        TEMPLATES
+            .get_or_init(|| async {
+                let root = tempfile::Builder::new()
+                    .prefix("kuru-advisory-unit-templates-")
+                    .tempdir()
+                    .unwrap();
+                let fixture = FixtureGit::new();
+                let clean = root.path().join("clean/advisory-db");
+                fs::create_dir_all(&clean).unwrap();
+                git(&fixture, &clean, &["init"]).await;
+                fs::write(clean.join("README.md"), b"fixture\n").unwrap();
+                git(&fixture, &clean, &["add", "README.md"]).await;
+                commit(&fixture, &clean, "fixture").await;
+                git(&fixture, &clean, &["remote", "add", "origin", ORIGIN]).await;
+                git(
+                    &fixture,
+                    &clean,
+                    &["config", "remote.origin.fetch", FETCH_REFSPEC],
+                )
+                .await;
+                git(&fixture, &clean, &["checkout", "--detach", "HEAD"]).await;
+
+                let executable = root.path().join("executable-config");
+                fs::create_dir(&executable).unwrap();
+                copy_tree(&clean, &executable.join("advisory-db"));
+                git(
+                    &fixture,
+                    &executable.join("advisory-db"),
+                    &["config", "core.hooksPath", "fixture-hooks"],
+                )
+                .await;
+
+                let source = root.path().join("refresh/source");
+                let database = root.path().join("refresh/database");
+                fs::create_dir_all(&source).unwrap();
+                fs::create_dir(&database).unwrap();
+                git(&fixture, &source, &["init"]).await;
+                fs::write(source.join("README.md"), b"fresh source\n").unwrap();
+                git(&fixture, &source, &["add", "README.md"]).await;
+                commit(&fixture, &source, "fresh source").await;
+                git(&fixture, &database, &["init"]).await;
+                git(
+                    &fixture,
+                    &database,
+                    &["remote", "add", "origin", REFRESH_ORIGIN],
+                )
+                .await;
+                git(
+                    &fixture,
+                    &database,
+                    &["config", "remote.origin.fetch", FETCH_REFSPEC],
+                )
+                .await;
+                git_with_environment(
+                    &fixture,
+                    &database,
+                    &[
+                        "-c",
+                        "user.name=fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "stale local checkout",
+                        "--date=2000-01-01T00:00:00Z",
+                    ],
+                    &[
+                        ("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z"),
+                        ("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z"),
+                    ],
+                )
+                .await;
+                git(&fixture, &database, &["checkout", "--detach", "HEAD"]).await;
+                Templates::seal(root, &fixture)
+            })
+            .await
+    }
+
+    /// The sibling origin of the refresh template's database.
+    const REFRESH_ORIGIN: &str = "../source";
+
+    async fn database() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        templates()
+            .await
+            .copy("clean/advisory-db", &root.path().join("advisory-db"));
         root
+    }
+
+    #[tokio::test]
+    async fn fixture_templates_are_built_once_without_child_processes() {
+        let templates = templates().await;
+        // Six calls for the clean checkout, one for its executable-config
+        // copy, three for the refresh origin and five for its stale checkout.
+        assert_eq!(templates.calls(), 15);
+        assert!(templates.path().join("clean/advisory-db/.git").is_dir());
     }
 
     #[tokio::test]
@@ -624,7 +731,15 @@ mod tests {
         let revision = inspect(&database).await.unwrap();
         assert_eq!(revision.sha.len(), 40);
 
-        git(&database, &["config", "core.hooksPath", "fixture-hooks"]).await;
+        // The same checkout, given the template's executable local config.
+        fs::copy(
+            templates()
+                .await
+                .path()
+                .join("executable-config/advisory-db/.git/config"),
+            database.join(".git/config"),
+        )
+        .unwrap();
         let error = inspect(&database).await.unwrap_err().to_string();
         assert_eq!(
             error,
@@ -667,54 +782,23 @@ mod tests {
     #[tokio::test]
     async fn refresh_accepts_stale_expected_checkout_before_fetching_a_local_test_origin() {
         let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source");
-        let database = root.path().join("database");
-        fs::create_dir(&source).unwrap();
-        fs::create_dir(&database).unwrap();
-        git(&source, &["init"]).await;
-        fs::write(source.join("README.md"), b"fresh source\n").unwrap();
-        git(&source, &["add", "README.md"]).await;
-        git(
-            &source,
-            &[
-                "-c",
-                "user.name=fixture",
-                "-c",
-                "user.email=fixture@example.invalid",
-                "commit",
-                "-m",
-                "fresh source",
-            ],
-        )
-        .await;
-        let origin = source.to_str().unwrap();
-        // The stale checkout is its own detached root commit: a fixture fetch
-        // would start transport children, and the refresh under test fetches.
-        git(&database, &["init"]).await;
-        git(&database, &["remote", "add", "origin", origin]).await;
-        git(&database, &["config", "remote.origin.fetch", FETCH_REFSPEC]).await;
-        git_with_environment(
+        templates()
+            .await
+            .copy("refresh", &root.path().join("refresh"));
+        let database = root.path().join("refresh/database");
+        let stale = inspect_with(
+            &GitEnvironment::new().unwrap(),
             &database,
-            &[
-                "-c",
-                "user.name=fixture",
-                "-c",
-                "user.email=fixture@example.invalid",
-                "commit",
-                "--allow-empty",
-                "-m",
-                "stale local checkout",
-                "--date=2000-01-01T00:00:00Z",
-            ],
-            &[
-                ("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z"),
-                ("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z"),
-            ],
+            false,
+            REFRESH_ORIGIN,
         )
-        .await;
-        git(&database, &["checkout", "--detach", "HEAD"]).await;
+        .await
+        .unwrap();
+        assert_eq!(stale.committed_at, 946_684_800);
 
-        let refreshed = refresh_with_origin(&database, origin).await.unwrap();
+        let refreshed = refresh_with_origin(&database, REFRESH_ORIGIN)
+            .await
+            .unwrap();
         assert!(refreshed.committed_at > 946_684_800);
     }
 }

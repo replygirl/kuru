@@ -186,6 +186,65 @@ pub fn assert_childless(trace: &Path) {
     );
 }
 
+/// Fixture repositories built once per test binary by one builder, which
+/// each test copies, so a test itself starts no fixture Git process.
+///
+/// A template is held in a static for its binary's lifetime and is never
+/// dropped, so its directory outlives the process.
+pub struct Templates {
+    root: tempfile::TempDir,
+    calls: usize,
+}
+
+impl Templates {
+    /// Seal the repositories `fixture` built under `root`, after checking that
+    /// every call wrote its Trace2 start and none started a child.
+    pub fn seal(root: tempfile::TempDir, fixture: &FixtureGit) -> Self {
+        fixture.assert_no_children();
+        Self {
+            root,
+            calls: fixture.calls(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        self.root.path()
+    }
+
+    /// Fixture Git calls the one build made.
+    pub fn calls(&self) -> usize {
+        self.calls
+    }
+
+    /// Copy the template tree `relative` to the new directory `destination`.
+    pub fn copy(&self, relative: &str, destination: &Path) {
+        copy_tree(&self.root.path().join(relative), destination);
+    }
+}
+
+/// Copy a directory of plain files and directories into a new directory.
+/// Each copy is a separate repository; no `.git` state is shared.
+pub fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir(destination)
+        .unwrap_or_else(|error| panic!("create fixture copy {destination:?}: {error}"));
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        let target = destination.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else if kind.is_file() {
+            fs::copy(entry.path(), &target)
+                .unwrap_or_else(|error| panic!("copy fixture file {:?}: {error}", entry.path()));
+        } else {
+            panic!(
+                "fixture template entry {:?} is not a file or directory",
+                entry.path()
+            );
+        }
+    }
+}
+
 /// The `trace2 tail (<path>): ...` field of a fixture Git failure.
 pub fn trace_tail(trace: &Path) -> String {
     let tail = match fs::read_to_string(trace) {
