@@ -461,7 +461,9 @@ async fn native_conpty_wait_drains_the_line_written_just_before_exit() -> Result
         json!({
             "mode":"app",
             "binary":system.join("cmd.exe"),
-            "args":["/d", "/c", "echo", "DRAIN_ON_EXIT_MARKER"],
+            // `echo` is a cmd.exe builtin, and the platform quotes every
+            // argument, so the command is one argument that `/s` unwraps.
+            "args":["/d", "/s", "/c", "echo DRAIN_ON_EXIT_MARKER"],
             "environment":{"SystemRoot":root},
             "cwd":temporary.path(),
         }),
