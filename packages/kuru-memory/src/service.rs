@@ -2427,9 +2427,9 @@ pub(crate) struct MaintenancePermit {
 #[derive(Default)]
 pub(crate) struct MaintenanceTrace {
     step: std::sync::Mutex<MaintenanceStep>,
-    /// Signalled once, at the first reply showing the owner closing.
+    /// Wakes every waiter on the trace's replies after each recorded reply.
     #[cfg(any(test, feature = "test-support"))]
-    closing: tokio::sync::Notify,
+    replied: tokio::sync::Notify,
 }
 
 /// The first retirement reply that showed the owner closing, and when it
@@ -2507,39 +2507,59 @@ impl MaintenanceTrace {
             RetirementReply::Accepted => {}
         }
         #[cfg(any(test, feature = "test-support"))]
-        if step.closing.is_none() {
-            let reply = match reply {
-                RetirementReply::NoEndpoint => Some("no live endpoint"),
-                RetirementReply::PeerClosed => Some("the owner closed the connection unanswered"),
-                RetirementReply::Accepted => Some("retirement accepted"),
-                RetirementReply::Busy => None,
-            };
-            if let Some(reply) = reply {
-                step.closing = Some(ClosingReading {
+        {
+            if step.closing.is_none() {
+                let reply = match reply {
+                    RetirementReply::NoEndpoint => Some("no live endpoint"),
+                    RetirementReply::PeerClosed => {
+                        Some("the owner closed the connection unanswered")
+                    }
+                    RetirementReply::Accepted => Some("retirement accepted"),
+                    RetirementReply::Busy => None,
+                };
+                step.closing = reply.map(|reply| ClosingReading {
                     since: tokio::time::Instant::now(),
                     reply,
                 });
-                drop(step);
-                self.closing.notify_one();
             }
+            drop(step);
+            self.replied.notify_waiters();
         }
     }
 
-    /// Wait for the first reply showing the owner closing, and return it.
-    /// The first such reply stores its signal, so a waiter that starts after
-    /// it still returns at once.
+    /// Wait for the first reply showing the owner closing, and return it. A
+    /// waiter that starts after that reply returns at once.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn closing(&self) -> ClosingReading {
+        self.until(|step| step.closing).await
+    }
+
+    /// Wait until a retirement request has found no live endpoint. A waiter
+    /// that starts after that reply returns at once.
+    #[cfg(test)]
+    pub(crate) async fn found_no_endpoint(&self) {
+        self.until(|step| (step.unanswered > 0).then_some(())).await;
+    }
+
+    /// Wait until `reading` returns a value from the recorded replies. The
+    /// wake-up is registered before each check, so a reply recorded between
+    /// the check and the wait is not missed.
+    #[cfg(any(test, feature = "test-support"))]
+    async fn until<T>(&self, reading: impl Fn(&MaintenanceStep) -> Option<T>) -> T {
         loop {
-            let reading = self
-                .step
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .closing;
-            if let Some(reading) = reading {
-                return reading;
+            let notified = self.replied.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let found = reading(
+                &self
+                    .step
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            if let Some(found) = found {
+                return found;
             }
-            self.closing.notified().await;
+            notified.await;
         }
     }
 }

@@ -825,11 +825,24 @@ pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
 pub(crate) async fn retire_idle_service_keeping_waiter(
     options: &OpenOptions,
 ) -> (Result<()>, Option<std::thread::JoinHandle<()>>) {
+    retire_idle_service_traced(options, &retirement_trace(options)).await
+}
+
+/// The trace a fixture retirement for `options` records its requests in.
+pub(crate) fn retirement_trace(_options: &OpenOptions) -> crate::service::MaintenanceTrace {
+    crate::service::MaintenanceTrace::default()
+}
+
+/// [`retire_idle_service_keeping_waiter`], recording its requests in a
+/// `trace` from [`retirement_trace`] that the caller can observe.
+pub(crate) async fn retire_idle_service_traced(
+    options: &OpenOptions,
+    trace: &crate::service::MaintenanceTrace,
+) -> (Result<()>, Option<std::thread::JoinHandle<()>>) {
     enum Asked {
         Permit(crate::service::MaintenancePermit),
         Closing(crate::service::ClosingReading),
     }
-    let trace = crate::service::MaintenanceTrace::default();
     let mut refusals: u32 = 0;
     let asking = Duration::from_secs(options.config.startup_timeout_secs);
     let started = tokio::time::Instant::now();
@@ -838,7 +851,7 @@ pub(crate) async fn retire_idle_service_keeping_waiter(
         loop {
             let acquired = tokio::select! {
                 biased;
-                acquired = crate::service::acquire_maintenance_permit_traced(options, &trace) => {
+                acquired = crate::service::acquire_maintenance_permit_traced(options, trace) => {
                     acquired
                 }
                 closing = trace.closing() => break Ok(Asked::Closing(closing)),
@@ -939,7 +952,7 @@ pub(crate) async fn retire_idle_service_keeping_waiter(
     // under the backstop, so no successor elected in between goes unnoticed.
     let permit = tokio::time::timeout_at(
         backstop,
-        crate::service::acquire_maintenance_permit_traced(options, &trace),
+        crate::service::acquire_maintenance_permit_traced(options, trace),
     )
     .await
     .with_context(|| {
@@ -991,6 +1004,36 @@ pub(crate) fn ensure_close_budget_expiry(text: &str, reading: &str, state: &str)
             && !text.contains("no request found the owner closing"),
         "the release wait's expiry did not name the close budget, the time since the first \
          closing reading ({reading}) and the owner state ({state}): {text}"
+    );
+    Ok(())
+}
+
+/// Check that `text` is the expiry of a fixture retirement's asking deadline,
+/// `asking` (`memory.startup_timeout_secs`): it names that deadline, the time
+/// since the first request (at least that deadline), that no request found
+/// the owner closing and the owner `state`, and not the close budget's
+/// expiry.
+#[cfg(test)]
+pub(crate) fn ensure_asking_deadline_expiry(
+    text: &str,
+    asking: Duration,
+    state: &str,
+) -> Result<()> {
+    let prefix = format!(
+        "managed owner retirement did not complete within memory.startup_timeout_secs \
+         ({asking:?}; "
+    );
+    let since = text
+        .split_once(&prefix)
+        .and_then(|(_, rest)| rest.split_once("ms since the first request)"))
+        .and_then(|(milliseconds, _)| milliseconds.parse::<u128>().ok());
+    ensure!(
+        since.is_some_and(|milliseconds| milliseconds >= asking.as_millis())
+            && text.contains("no request found the owner closing")
+            && text.contains(state)
+            && !text.contains("within its close budget"),
+        "the asking deadline's expiry did not name the startup timeout ({asking:?}), the time \
+         since the first request and the owner state ({state}): {text}"
     );
     Ok(())
 }
