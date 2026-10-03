@@ -666,9 +666,14 @@ async fn discovered_local(root: &Directory) -> Result<Option<(PathBuf, String)>>
                 command.env_remove(key);
             }
         }
-        let status = tokio::time::timeout(std::time::Duration::from_secs(5), command.status())
+        // A silent `ls-files` reports progress only by exiting, so no derived
+        // ceiling exists: a large index or slow disk legitimately takes long.
+        // Known hang sources (fsmonitor, hooks, optional locks, Git overlays)
+        // are removed above, and kill_on_drop reaps the child when the user
+        // cancels the command.
+        let status = command
+            .status()
             .await
-            .map_err(|_| anyhow::anyhow!("project-local Git index check timed out"))?
             .map_err(|_| anyhow::anyhow!("project-local Git index check is unavailable"))?;
         match status.code() {
             Some(0) => bail!(
