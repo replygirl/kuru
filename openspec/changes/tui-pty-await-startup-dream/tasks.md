@@ -2,14 +2,35 @@
 
 ## 1. Diagnosis record
 
-- [ ] 1.1 Record in the PR body the placeholder semantics (`view.busy` selects "Keep your next thought here…", otherwise "What shall we explore or build?") and the sibling site list: `apps/kuru-tui/tests/terminal.rs` smoke sites asserting the welcome placeholder under `READY_TIMEOUT` (around the `/mem` tab-completion backspace, the `focus draft` backspace and the paste `\x01\r` clear) and `Terminal::command` in `tests/support/terminal.rs`; verify by grepping for `What shall we explore or build?` and confirming every hit is covered or justified.
+- [x] 1.1 Record the placeholder semantics and the affected-site list in the proposal and the PR body. `view.busy` selects "Keep your next thought here…"; otherwise the composer shows "What shall we explore or build?". Verify with a grep for `What shall we explore or build?` and `/dream` that every hit is covered or justified.
+  - Evidence: job 111067851181 was fetched once. The failure, captured screen and launch arguments are quoted in the proposal. The scoped premise (a startup dream and the 25-backspace site) is contradicted by four facts: `--no-dream`; the `wait_text_with_timeout` message format; the Jungian five-part one-turn state; and the only dream being the smoke's manual `/dream`. The corrected site is `Terminal::command("/dream", None)`'s settle in `smoke`.
+  - Grep hits for `What shall we explore or build?` in `tests/terminal.rs` and `tests/support/terminal.rs`:
+    - The `/mem` backspace, the `focus draft` backspace and the paste clear are not post-dream state (`--no-dream`, no operation in flight). They are unchanged.
+    - `Terminal::command` keeps its settle for non-dream commands.
+    - The new `dream-settle` fixture is test-only.
+    - `grep '/dream'` finds one hit in `terminal.rs` (now covered) and none in `windows_terminal.rs`.
 
 ## 2. Support helper
 
-- [ ] 2.1 Add a helper in `apps/kuru-tui/tests/support/terminal.rs` that waits for the activity line to leave `dream · pool`, bounded by the passed sandbox startup timeout, with the screen in the expiry diagnostic; verify the diagnostic contains the captured screen when it expires.
-- [ ] 2.2 Use it at every affected site in `apps/kuru-tui/tests/terminal.rs` and in `Terminal::command` before the welcome-placeholder assertion; verify no remaining post-dream placeholder assertion relies on a bare `READY_TIMEOUT` and no assertion after settling changed.
+- [x] 2.1 Add a helper in `apps/kuru-tui/tests/support/terminal.rs` that waits for the dream's completion: the welcome placeholder and `enter send` return, and the status row above the separator no longer leads with `dream · `. Bound it by the passed sandbox startup timeout and put the screen in the expiry diagnostic. Verify the diagnostic contains the captured screen when it expires.
+  - Evidence: `Terminal::wait_dream_settled(timeout)` uses `Terminal::wait`, whose expiry embeds `diagnostics()` (the screen). `terminal_driver_awaits_dream_completion_not_a_stale_dream_entry` asserts the expiry error contains `the dream settles: timed out`, the busy status row `dream · pool  ·  3s` and `Keep your next thought here`.
+- [x] 2.2 Use the helper at every affected site, and verify no other post-dream placeholder assertion relies on a bare `READY_TIMEOUT` and no assertion after settling changed.
+  - Evidence: `smoke` now runs `submit("/dream")` and then `wait_dream_settled(sandbox.startup_timeout)`. `Terminal::command` is now `submit` plus its unchanged settle, so every other command site behaves byte-identically. The following `/unknown` and later assertions are unchanged.
 
 ## 3. Evidence
 
-- [ ] 3.1 Add a deterministic test (or record mutation evidence) in which a screen shows `dream · pool` with the busy placeholder; verify the old shape fails and the helper waits then passes.
-- [ ] 3.2 Run `mise run //apps/kuru-tui:test` for the affected PTY tests and record observed results; name unrun checks and reasons.
+- [x] 3.1 Add a deterministic test in which a screen shows `dream · pool` with the busy placeholder, verify the helper waits and then passes, and record mutation evidence that the old shape fails.
+  - Evidence: deterministic test `terminal_driver_awaits_dream_completion_not_a_stale_dream_entry`. Its ack-gated fixture renders the busy dream frame, where a 200 ms helper wait expires with the screen. After the acknowledgment it renders the settled frame, which retains the `dream · pool · …` activity entry and a `pool dream ·` idle status label, and the helper passes.
+  - Mutation evidence (local, not committed). After `submit("/dream")` and the busy placeholder, the child was SIGSTOPped for 12 s.
+    - Old shape (`wait_text` welcome placeholder under `READY_TIMEOUT`): returned after 10.12 s with `screen contains ["What shall we explore or build?", "enter send"], excludes []: timed out after 10s; process 98964 is still running`. The screen showed `Keep your next thought here…` and `esc cancel`, the same composer state as CI. Test FAILED.
+    - New shape (`wait_dream_settled(sandbox.startup_timeout)`): returned Ok after 17.69 s. Test ok.
+- [x] 3.2 Run `mise run //apps/kuru-tui:test` for the affected PTY tests and record observed results; name unrun checks and reasons.
+  - Evidence, local macOS with real PTYs:
+    - `mise run //apps/kuru-tui:test -- --test terminal`: with `--all-targets`, this ran every kuru-tui test target. All results ok and none failed. `tests/terminal.rs`: 44 passed, 0 failed, 1 ignored (fixture entry), including `real_pty_accepts_chat_navigation_commands_and_restores_terminal` and the new test.
+    - `mise run format:rust` passed.
+    - `mise run //apps/kuru-tui:lint` (clippy `-D warnings`) passed.
+    - `mise run //apps/kuru-tui:typecheck` passed.
+  - Not run:
+    - `//apps/kuru-tui:lint:windows`: the changed files are `#![cfg(unix)]` or unix-only test support.
+    - Coverage: CI-enforced, with no application code changed.
+    - Native Linux and Windows jobs: CI only; there is no local host for them.
