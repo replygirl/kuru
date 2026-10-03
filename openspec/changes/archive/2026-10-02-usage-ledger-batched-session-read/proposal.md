@@ -24,7 +24,8 @@ session (fixed-wait audit 2026-10-02, §3D rank 1, unit U5 ledger half).
   session index references a mismatched invocation`) are unchanged.
 - No stored aggregate, no new constants or budgets, no schema or API change.
 - Test-only: a task-scoped statement counter in the pool-level read helpers
-  `session()` uses, and a test that asserts the exact count per call.
+  `session()` uses, a test that asserts the exact count per call, and a plan
+  assertion that the keyed read is one primary-key point lookup per bound key.
 
 ## Benchmarks
 
@@ -39,7 +40,7 @@ debug test build, pinned Dolt, macOS arm64.
 | Build | Formula | Statements per `session()` (N = 300, P = 3) |
 |---|---|---|
 | Before (`origin/main` 7c9581b0) | P + 2 + N | 305 (observed) |
-| After | 2P + 2 | 8 (expected; recorded after the fix) |
+| After (this change) | 2P + 2 | 8 (observed) |
 
 The after cost depends only on the page count: 1 marker read + P index pages +
 1 trailing empty page + P keyed record reads. It is still linear in session
