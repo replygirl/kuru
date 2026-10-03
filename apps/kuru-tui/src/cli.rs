@@ -1041,11 +1041,12 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         let host = permission_host(&data, root.clone(), &config, &snapshot, false)?;
         let catalog = host.catalog().await;
         let cleanup = host.shutdown().await;
-        let catalog = catalog?;
-        report_mcp_statuses(catalog.mcp());
-        println!("{}", serde_json::to_string_pretty(&catalog)?);
-        cleanup?;
-        return Ok(());
+        let printed = catalog.and_then(|catalog| {
+            report_mcp_statuses(catalog.mcp());
+            println!("{}", serde_json::to_string_pretty(&catalog)?);
+            Ok(())
+        });
+        return finish(printed, cleanup, "tool host");
     }
 
     if let Some(Command::Mcp { command }) = &cli.command {
@@ -1053,9 +1054,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         let host = permission_host(&data, root.clone(), &config, &snapshot, false)?;
         let result = run_mcp_command(&host, command).await;
         let cleanup = host.shutdown().await;
-        result?;
-        cleanup?;
-        return Ok(());
+        return finish(result, cleanup, "tool host");
     }
 
     let scope = kuru_runtime::project_scope(&cwd)?;
@@ -1388,9 +1387,8 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 }
                 .await;
                 let cleanup = host.shutdown().await;
-                println!("{}", result?);
-                cleanup?;
-                return Ok(());
+                let printed = result.map(|output| println!("{output}"));
+                return finish(printed, cleanup, "tool host");
             }
             Some(Command::File { command }) => {
                 match command {
@@ -1398,8 +1396,11 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                         let host = permission_host(&data, root.clone(), &config, &snapshot, true)?;
                         let outcome = host.undo_file_checkpoint(id, None).await;
                         let cleanup = host.shutdown().await;
-                        println!("{}", serde_json::to_string_pretty(&outcome?)?);
-                        cleanup?;
+                        let printed = outcome.and_then(|outcome| {
+                            println!("{}", serde_json::to_string_pretty(&outcome)?);
+                            Ok(())
+                        });
+                        finish(printed, cleanup, "tool host")?;
                     }
                     FileCommand::List { .. }
                     | FileCommand::Inspect { .. }
@@ -1538,7 +1539,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                         let _ = writeln!(io::stderr().lock(), "{report}");
                     }
                 }
-                result.map_err(|error| {
+                let result = result.map(drop).map_err(|error| {
                     let mut failures = std::collections::BTreeSet::new();
                     while let Ok(event) = events.try_recv() {
                         if let Event::Error { detail, .. } = event
@@ -1552,15 +1553,18 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                     } else {
                         error.context(format!("provider errors: {}", failures.into_iter().collect::<Vec<_>>().join("; ")))
                     }
-                })?;
-                cleanup?;
+                });
+                finish(result, cleanup, "harness")?;
             }
 
             Some(Command::Dream) => {
                 let result = harness.dream().await;
                 let cleanup = harness.shutdown(false).await;
-                println!("{}", serde_json::to_string_pretty(&result?)?);
-                cleanup?;
+                let printed = result.and_then(|outcome| {
+                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                    Ok(())
+                });
+                finish(printed, cleanup, "harness")?;
             }
             Some(Command::UndoDream | Command::File { .. }) => unreachable!("local control returned before provider construction"),
             Some(Command::Serve { bind, token_env }) => {
@@ -1599,21 +1603,28 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         Some(diagnostics) => diagnostics.finish(),
         None => Ok(()),
     };
-    match (result, cleanup, diagnostic_cleanup) {
-        (Ok(()), Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Ok(()), Err(_)) => {
+    match (
+        finish(result, cleanup, "project memory"),
+        diagnostic_cleanup,
+    ) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(_)) => {
             eprintln!("diagnostic cleanup failed; diagnostics may be incomplete");
             Ok(())
         }
-        (Err(primary), _, Err(_)) => {
-            Err(primary.context("diagnostic cleanup also failed; diagnostics may be incomplete"))
-        }
-        (Err(primary), _, Ok(())) => Err(primary),
-        (Ok(()), Err(error), Err(_)) => {
+        (Err(error), Err(_)) => {
             Err(error.context("diagnostic cleanup also failed; diagnostics may be incomplete"))
         }
-        (Ok(()), Err(error), Ok(())) => Err(error),
+        (Err(error), Ok(())) => Err(error),
     }
+}
+
+/// Combine an operation's result with the cleanup that ran after it.
+fn finish<T>(primary: Result<T>, cleanup: Result<()>, what: &str) -> Result<T> {
+    let _ = what;
+    let value = primary?;
+    cleanup?;
+    Ok(value)
 }
 
 async fn run_mcp_command(host: &ToolHost, command: &McpCommand) -> Result<()> {
@@ -2245,5 +2256,55 @@ mod candidate_command_tests {
             }) if branch == "branch" && base == "base" && head == "head"
         ));
         assert!(Cli::try_parse_from(["kuru", "memory", "candidate-promote", "branch"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cleanup_combination_tests {
+    use super::*;
+
+    #[test]
+    fn success_with_clean_cleanup_returns_the_value() {
+        assert_eq!(finish(Ok(7), Ok(()), "tool host").unwrap(), 7);
+    }
+
+    #[test]
+    fn cleanup_failure_after_success_is_returned_unchanged() {
+        let error = finish(
+            Ok(7),
+            Err(anyhow::anyhow!("child not reaped").context("MCP shutdown")),
+            "tool host",
+        )
+        .unwrap_err();
+        assert_eq!(format!("{error:#}"), "MCP shutdown: child not reaped");
+    }
+
+    #[test]
+    fn primary_failure_with_clean_cleanup_is_returned_unchanged() {
+        let error = finish::<()>(
+            Err(anyhow::anyhow!("tool refused").context("execute")),
+            Ok(()),
+            "tool host",
+        )
+        .unwrap_err();
+        assert_eq!(format!("{error:#}"), "execute: tool refused");
+    }
+
+    #[test]
+    fn both_failures_name_the_primary_then_the_cleanup_cause() {
+        let error = finish::<()>(
+            Err(anyhow::anyhow!("tool refused").context("execute")),
+            Err(anyhow::anyhow!("child not reaped").context("MCP shutdown")),
+            "tool host",
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert_eq!(
+            message,
+            "execute: tool refused; tool host cleanup failed: MCP shutdown: child not reaped"
+        );
+        let primary = message.find("execute: tool refused").unwrap();
+        let cleanup = message.find("child not reaped").unwrap();
+        assert!(primary < cleanup, "primary must precede cleanup: {message}");
     }
 }
