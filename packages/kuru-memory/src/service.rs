@@ -2425,7 +2425,22 @@ pub(crate) struct MaintenancePermit {
 /// may cancel it: that caller can name the step it was cancelled in instead
 /// of reporting only that its deadline elapsed.
 #[derive(Default)]
-pub(crate) struct MaintenanceTrace(std::sync::Mutex<MaintenanceStep>);
+pub(crate) struct MaintenanceTrace {
+    step: std::sync::Mutex<MaintenanceStep>,
+    /// Signalled once, at the first reply showing the owner closing.
+    #[cfg(any(test, feature = "test-support"))]
+    closing: tokio::sync::Notify,
+}
+
+/// The first retirement reply that showed the owner closing, and when it
+/// arrived: no live endpoint, a connection the owner closed unanswered, or
+/// an accepted retirement request.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy)]
+pub(crate) struct ClosingReading {
+    pub(crate) since: tokio::time::Instant,
+    pub(crate) reply: &'static str,
+}
 
 #[derive(Clone, Copy, Default)]
 struct MaintenanceStep {
@@ -2443,6 +2458,9 @@ struct MaintenanceStep {
     peer_closed: u32,
     /// Retirement requests the owner refused because clients were attached.
     busy: u32,
+    /// The first reply that showed the owner closing.
+    #[cfg(any(test, feature = "test-support"))]
+    closing: Option<ClosingReading>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2460,7 +2478,7 @@ impl MaintenanceTrace {
     fn wait_for(&self, phase: MaintenancePhase) {
         let now = tokio::time::Instant::now();
         let mut step = self
-            .0
+            .step
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         step.lock_since = Some(now);
@@ -2470,7 +2488,7 @@ impl MaintenanceTrace {
 
     fn enter(&self, phase: MaintenancePhase) {
         let mut step = self
-            .0
+            .step
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         step.phase = phase;
@@ -2479,7 +2497,7 @@ impl MaintenanceTrace {
 
     fn record(&self, reply: RetirementReply) {
         let mut step = self
-            .0
+            .step
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match reply {
@@ -2488,13 +2506,48 @@ impl MaintenanceTrace {
             RetirementReply::Busy => step.busy = step.busy.saturating_add(1),
             RetirementReply::Accepted => {}
         }
+        #[cfg(any(test, feature = "test-support"))]
+        if step.closing.is_none() {
+            let reply = match reply {
+                RetirementReply::NoEndpoint => Some("no live endpoint"),
+                RetirementReply::PeerClosed => Some("the owner closed the connection unanswered"),
+                RetirementReply::Accepted => Some("retirement accepted"),
+                RetirementReply::Busy => None,
+            };
+            if let Some(reply) = reply {
+                step.closing = Some(ClosingReading {
+                    since: tokio::time::Instant::now(),
+                    reply,
+                });
+                drop(step);
+                self.closing.notify_one();
+            }
+        }
+    }
+
+    /// Wait for the first reply showing the owner closing, and return it.
+    /// The first such reply stores its signal, so a waiter that starts after
+    /// it still returns at once.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn closing(&self) -> ClosingReading {
+        loop {
+            let reading = self
+                .step
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closing;
+            if let Some(reading) = reading {
+                return reading;
+            }
+            self.closing.notified().await;
+        }
     }
 }
 
 impl std::fmt::Display for MaintenanceTrace {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let step = *self
-            .0
+            .step
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let phase = match step.phase {
@@ -9500,7 +9553,7 @@ mod tests {
         .await
         .context("maintenance did not respect its owner deadline")??;
         let step = *trace
-            .0
+            .step
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let message = format!("{error:#}");

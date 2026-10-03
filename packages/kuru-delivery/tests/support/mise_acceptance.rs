@@ -352,6 +352,9 @@ impl MiseMemoryCleanup {
         (self.retain(), retirement)
     }
 
+    /// The join needs no backstop of its own: the retirement bounds its wait
+    /// on a closing owner's lock release by that owner's close budget, on a
+    /// thread of its own that is abandoned at the budget.
     fn retire_blocking(&mut self) -> Result<()> {
         let Some(options) = self.options.take() else {
             return Ok(());

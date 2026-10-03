@@ -789,28 +789,62 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
         .map_err(|error| fixture_startup_error(&fixture_options, error))
 }
 
+/// How long [`retire_idle_service`] asks an owner that has not yet shown it
+/// is closing: an attached client detaching, the start lock coming free or a
+/// request finding the owner closing. Retained from the fixture's former flat
+/// bound, which no product budget derives; once a request finds the owner
+/// closing, the owner's own close budget bounds the wait instead.
+const ANSWERING_OWNER_BOUND: Duration = Duration::from_secs(10);
+
 /// Retire the exact managed owner once fixture clients have released their
 /// transports. The owner retires by itself when its last client detaches, so
 /// this waits behind one that is already closing, or asks a still-running one
 /// (a starter-less or not-yet-reached owner) to retire. The maintenance permit
 /// is dropped before a successor starts.
 ///
-/// When its bound elapses, the error names the step the acquisition was
-/// cancelled in, so a slow owner close, a still-attached client and a stalled
-/// request are distinguishable from the failure text alone, and the state of
-/// the owner it waited behind, read at expiry by [`owner_state`].
+/// It asks through the maintenance acquisition, retrying while the owner
+/// refuses with attached clients, for at most [`ANSWERING_OWNER_BOUND`]. Once
+/// a request finds the owner closing (no live endpoint, a connection the
+/// owner closed unanswered, or an accepted retirement), it stops asking and
+/// waits for the owner lock's release, an event, under one backstop: the
+/// owner's own close budget (`server::close_budget`) counted from that first
+/// reading, a lower bound of the close's age. The lock wait cannot be
+/// cancelled, so it runs on its own thread and runtime; at the backstop this
+/// fails and that thread, still blocked, ends with the process or once the
+/// owner lets go. Callers therefore need no outer backstop of their own.
 ///
-/// The 10 s bound is a fixture guess no product budget derives. It stays
-/// until a caller has an outer backstop: `ServiceCleanup` and the mise
-/// acceptance fixture join their cleanup threads without one, so waiting on
-/// the owner's lock release instead could hang a test until its job times out.
+/// When either bound elapses, the error names the step the acquisition was
+/// in, so a slow owner close, a still-attached client and a stalled request
+/// are distinguishable from the failure text alone, and the state of the
+/// owner it waited behind, read at expiry by [`owner_state`]; the close
+/// budget's expiry also names the first closing reading and the time since.
 pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
+    retire_idle_service_keeping_waiter(options).await.0
+}
+
+/// [`retire_idle_service`], also returning the owner-release waiter its
+/// close-budget backstop abandoned, so a test can join that waiter once it
+/// has let the owner go, before its root is removed.
+pub(crate) async fn retire_idle_service_keeping_waiter(
+    options: &OpenOptions,
+) -> (Result<()>, Option<std::thread::JoinHandle<()>>) {
+    enum Asked {
+        Permit(crate::service::MaintenancePermit),
+        Closing(crate::service::ClosingReading),
+    }
     let trace = crate::service::MaintenanceTrace::default();
     let mut refusals: u32 = 0;
-    let permit = tokio::time::timeout(Duration::from_secs(10), async {
+    let asked = tokio::time::timeout(ANSWERING_OWNER_BOUND, async {
         loop {
-            match crate::service::acquire_maintenance_permit_traced(options, &trace).await {
-                Ok(permit) => break Ok(permit),
+            let acquired = tokio::select! {
+                biased;
+                acquired = crate::service::acquire_maintenance_permit_traced(options, &trace) => {
+                    acquired
+                }
+                closing = trace.closing() => break Ok(Asked::Closing(closing)),
+            };
+            match acquired {
+                Ok(permit) => break Ok(Asked::Permit(permit)),
                 Err(error)
                     if error
                         .to_string()
@@ -823,25 +857,92 @@ pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
             }
         }
     })
+    .await;
+    let closing = match asked {
+        Ok(Ok(Asked::Permit(permit))) => {
+            drop(permit);
+            return (Ok(()), None);
+        }
+        Ok(Ok(Asked::Closing(closing))) => closing,
+        Ok(Err(error)) => return (Err(error), None),
+        Err(elapsed) => {
+            let error = Error::new(elapsed).context(format!(
+                "managed owner retirement did not complete within {} seconds, and no request \
+                 found the owner closing; {}; {trace}; active-client refusals={refusals}",
+                ANSWERING_OWNER_BOUND.as_secs(),
+                owner_state(options)
+            ));
+            return (Err(error), None);
+        }
+    };
+    let budget = crate::server::close_budget();
+    let backstop = closing.since + budget;
+    let (sender, released) = tokio::sync::oneshot::channel();
+    let waiter = std::thread::Builder::new()
+        .name("kuru-fixture-owner-release".into())
+        .spawn({
+            let options = options.clone();
+            move || {
+                let outcome = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("create the owner-release runtime")
+                    .and_then(|runtime| runtime.block_on(await_owner_release(&options)));
+                let _ = sender.send(outcome);
+            }
+        });
+    let waiter = match waiter {
+        Ok(waiter) => waiter,
+        Err(error) => return (Err(error).context("spawn the owner-release waiter"), None),
+    };
+    let released = match tokio::time::timeout_at(backstop, released).await {
+        Ok(released) => released,
+        Err(elapsed) => {
+            let error = Error::new(elapsed).context(format!(
+                "managed owner did not release its lock within its close budget of {budget:?}; \
+                 {}ms since the first retirement request found it closing ({}); {}; {trace}; \
+                 active-client refusals={refusals}",
+                closing.since.elapsed().as_millis(),
+                closing.reply,
+                owner_state(options)
+            ));
+            return (Err(error), Some(waiter));
+        }
+    };
+    // The waiter has sent its outcome, so it is ending.
+    if waiter.join().is_err() {
+        return (
+            Err(anyhow::anyhow!("the owner-release waiter panicked")),
+            None,
+        );
+    }
+    let released = released
+        .context("the owner-release waiter ended without a result")
+        .and_then(|released| released.context("await the managed owner's lock release"));
+    if let Err(error) = released {
+        return (Err(error), None);
+    }
+    // Owner authority is free: take and drop the permit as before, still
+    // under the backstop, so no successor elected in between goes unnoticed.
+    let permit = tokio::time::timeout_at(
+        backstop,
+        crate::service::acquire_maintenance_permit_traced(options, &trace),
+    )
     .await
     .with_context(|| {
         format!(
-            "managed owner retirement did not complete within 10 seconds; {}; {trace}; active-client refusals={refusals}",
+            "the maintenance permit was not acquired within the close budget of {budget:?} \
+             after the managed owner released its lock; {}; {trace}",
             owner_state(options)
         )
-    })??;
-    drop(permit);
-    Ok(())
-}
-
-/// [`retire_idle_service`], also returning the owner-release waiter its
-/// close-budget backstop abandoned, so a test can join that waiter once it
-/// has let the owner go, before its root is removed.
-#[cfg(test)]
-pub(crate) async fn retire_idle_service_keeping_waiter(
-    options: &OpenOptions,
-) -> (Result<()>, Option<std::thread::JoinHandle<()>>) {
-    (retire_idle_service(options).await, None)
+    });
+    match permit {
+        Ok(Ok(permit)) => {
+            drop(permit);
+            (Ok(()), None)
+        }
+        Ok(Err(error)) | Err(error) => (Err(error), None),
+    }
 }
 
 /// Join a waiter [`retire_idle_service_keeping_waiter`] abandoned, once the
