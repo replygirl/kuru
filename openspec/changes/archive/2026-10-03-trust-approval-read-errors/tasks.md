@@ -27,4 +27,4 @@ Work in `tmp/worktrees/fix-trust-approval-read-errors` (branch
 ## 4. Checks and archive
 
 - [x] 4.1 Run `mise run //apps/kuru-tui:test`, `format:check`, `lint`, `lint:windows`, `typecheck`, `docs:check` and `cospec -- validate --all --strict`, and verify each exits 0. Observed 2026-10-03 (macOS arm64): full `//apps/kuru-tui:test` exit 0 in 405.6 s (lib 137, cli 44, terminal 43 with 1 ignored, trust 22, embedded_runtime 7, visual 12 with 1 ignored, unix_shell_turn 5, lease 4, openai_auth 4, preferences 3, update 2 with 1 ignored, directories 1, server 1, ui_runtime 1; 0 failed); `format:check`, `lint`, root `lint:windows` (includes `-p kuru` for x86_64-pc-windows-msvc), `typecheck` and `docs:check` exit 0 with `NODE_OPTIONS` unset; `cospec -- validate --all --strict` exit 0.
-- [ ] 4.2 Run `mise run cospec -- archive trust-approval-read-errors` and verify the archive directory exists and no active record remains.
+- [x] 4.2 Run `mise run cospec -- archive trust-approval-read-errors` and verify the archive directory exists and no active record remains. Observed 2026-10-03: archived by the archive commit on this branch; the directory is checked after the command.
