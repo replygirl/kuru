@@ -533,6 +533,53 @@ and written only on evidence this process observed itself:
   enumerate stores by a hand-written name pattern. A fixture that already has
   an outcome releases through `ServiceCleanup::release(outcome)`, which
   attaches a cleanup failure or the guard's verdict to that outcome.
+  Its retirement step, `test_support::retire_idle_service`, asks the owner to
+  retire through the maintenance acquisition, retrying while attached clients
+  make it refuse, until one deadline carried across those retries:
+  `memory.startup_timeout_secs` (30 s by default) from its first request, the
+  same deadline each maintenance attempt enforces on its start-lock wait,
+  owner response and owner-lock wait. It covers an owner that has not shown it
+  is closing (a client still attached, the start lock held, or no reply yet);
+  no fixture-only bound applies. A request that finds no live endpoint while
+  the owner's records show it still opening (an open-activity record not
+  marked failing, and no endpoint record) is not a closing reading: an
+  opening owner has not published yet, and once it publishes it must still
+  be asked, so the fixture keeps asking under that deadline, the bound on the
+  open itself. Once a request
+  finds the owner closing (no live endpoint with the owner not opening, a
+  connection the owner closed unanswered, or an accepted retirement), it
+  stops asking and waits for the
+  owner lock's release, an event (`await_owner_release`), under one backstop:
+  the owner's own close budget, `server::close_budget()` (the first pool
+  drain, the Windows lifetime close, the supervisor reap allowance and the
+  post-reap drain, 32 s), counted from that first reading, which bounds the
+  close's age from below. The lock wait cannot be cancelled, so it runs on its
+  own thread and runtime, like the terminal tests' `await_owner_exit`; at the
+  backstop the retirement fails and that blocked thread ends with the process,
+  so `ServiceCleanup` (the PTY and ConPTY terminal tests) and the mise
+  acceptance fixture, which join their cleanup threads, need no outer
+  backstop. The close budget's expiry
+  (`managed owner did not release its lock within its close budget of 32s;
+  <N>ms since the first retirement request found it closing (<reading>);
+  <owner state>; <trace>`) and the asking deadline's expiry (`managed owner
+  retirement did not complete within memory.startup_timeout_secs (30s; <N>ms
+  since the first request), and no request found the owner closing; <owner
+  state>; <trace>; active-client refusals=<R>`, also for an attempt failing at
+  that deadline) both name the state of the owner they waited
+  behind, read at expiry from that owner's records without taking a lock:
+  `owner published` (endpoint record present), `owner still opening; last
+  stage = X; no endpoint record present` (an open-activity record
+  and no endpoint record: it has not published), `owner open failed ...;
+  reason = ...` (a failing record), or `owner closing; last phase = endpoint
+  and activity records retired` (its store close, Dolt reap or lock release
+  outstanding). A served owner reads as opening only between its two record
+  retirements (a close stalled exactly there is asked until the startup
+  deadline and reported as opening), and an owner without a starter token, or
+  whose best-effort record write failed, publishes no record, so its open
+  reads as a close (only in-process test owners are untokened). No
+  close step is stamped, so which close step is slow is not known. The
+  product's own maintenance election deadline (`startup_timeout_secs`, 30 s by
+  default) is shorter than that close budget; aligning it is separate work.
 - `test_support::await_store_quiescence(&directory, lifecycle_root)` does the
   same for one store whose engine ran in another process, such as a spawned
   `kuru` executable.

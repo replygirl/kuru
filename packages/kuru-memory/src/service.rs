@@ -2434,7 +2434,27 @@ pub(crate) struct MaintenancePermit {
 /// may cancel it: that caller can name the step it was cancelled in instead
 /// of reporting only that its deadline elapsed.
 #[derive(Default)]
-pub(crate) struct MaintenanceTrace(std::sync::Mutex<MaintenanceStep>);
+pub(crate) struct MaintenanceTrace {
+    step: std::sync::Mutex<MaintenanceStep>,
+    /// Wakes every waiter on the trace's replies after each recorded reply.
+    #[cfg(any(test, feature = "test-support"))]
+    replied: tokio::sync::Notify,
+    /// Reads the owner's records at a reply that found no live endpoint and
+    /// says whether the owner is still opening. An opening owner has not
+    /// published yet, so that reply is not a closing reading.
+    #[cfg(any(test, feature = "test-support"))]
+    opening: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+}
+
+/// The first retirement reply that showed the owner closing, and when it
+/// arrived: no live endpoint, a connection the owner closed unanswered, or
+/// an accepted retirement request.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy)]
+pub(crate) struct ClosingReading {
+    pub(crate) since: tokio::time::Instant,
+    pub(crate) reply: &'static str,
+}
 
 #[derive(Clone, Copy, Default)]
 struct MaintenanceStep {
@@ -2452,6 +2472,13 @@ struct MaintenanceStep {
     peer_closed: u32,
     /// Retirement requests the owner refused because clients were attached.
     busy: u32,
+    /// Requests without a live endpoint while the owner's records showed it
+    /// still opening.
+    #[cfg(any(test, feature = "test-support"))]
+    opening: u32,
+    /// The first reply that showed the owner closing.
+    #[cfg(any(test, feature = "test-support"))]
+    closing: Option<ClosingReading>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2469,7 +2496,7 @@ impl MaintenanceTrace {
     fn wait_for(&self, phase: MaintenancePhase) {
         let now = tokio::time::Instant::now();
         let mut step = self
-            .0
+            .step
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         step.lock_since = Some(now);
@@ -2479,16 +2506,30 @@ impl MaintenanceTrace {
 
     fn enter(&self, phase: MaintenancePhase) {
         let mut step = self
-            .0
+            .step
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         step.phase = phase;
         step.since = Some(tokio::time::Instant::now());
     }
 
+    /// A trace whose replies without a live endpoint are closing readings
+    /// only while `opening` says the owner is not still opening.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn reading_opening(opening: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            opening: Some(Box::new(opening)),
+            ..Self::default()
+        }
+    }
+
     fn record(&self, reply: RetirementReply) {
+        // Read before the step lock: the classifier reads the owner's records.
+        #[cfg(any(test, feature = "test-support"))]
+        let opening = reply == RetirementReply::NoEndpoint
+            && self.opening.as_ref().is_some_and(|opening| opening());
         let mut step = self
-            .0
+            .step
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match reply {
@@ -2497,13 +2538,72 @@ impl MaintenanceTrace {
             RetirementReply::Busy => step.busy = step.busy.saturating_add(1),
             RetirementReply::Accepted => {}
         }
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            if opening {
+                step.opening = step.opening.saturating_add(1);
+            }
+            if step.closing.is_none() {
+                let reply = match reply {
+                    RetirementReply::NoEndpoint if opening => None,
+                    RetirementReply::NoEndpoint => Some("no live endpoint"),
+                    RetirementReply::PeerClosed => {
+                        Some("the owner closed the connection unanswered")
+                    }
+                    RetirementReply::Accepted => Some("retirement accepted"),
+                    RetirementReply::Busy => None,
+                };
+                step.closing = reply.map(|reply| ClosingReading {
+                    since: tokio::time::Instant::now(),
+                    reply,
+                });
+            }
+            drop(step);
+            self.replied.notify_waiters();
+        }
+    }
+
+    /// Wait for the first reply showing the owner closing, and return it. A
+    /// waiter that starts after that reply returns at once.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn closing(&self) -> ClosingReading {
+        self.until(|step| step.closing).await
+    }
+
+    /// Wait until a retirement request has found no live endpoint. A waiter
+    /// that starts after that reply returns at once.
+    #[cfg(test)]
+    pub(crate) async fn found_no_endpoint(&self) {
+        self.until(|step| (step.unanswered > 0).then_some(())).await;
+    }
+
+    /// Wait until `reading` returns a value from the recorded replies. The
+    /// wake-up is registered before each check, so a reply recorded between
+    /// the check and the wait is not missed.
+    #[cfg(any(test, feature = "test-support"))]
+    async fn until<T>(&self, reading: impl Fn(&MaintenanceStep) -> Option<T>) -> T {
+        loop {
+            let notified = self.replied.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let found = reading(
+                &self
+                    .step
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            if let Some(found) = found {
+                return found;
+            }
+            notified.await;
+        }
     }
 }
 
 impl std::fmt::Display for MaintenanceTrace {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let step = *self
-            .0
+            .step
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let phase = match step.phase {
@@ -2528,7 +2628,16 @@ impl std::fmt::Display for MaintenanceTrace {
             step.unanswered,
             step.peer_closed,
             step.busy
-        )
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self.opening.is_some() {
+            write!(
+                formatter,
+                "; requests without a live endpoint while the owner was opening={}",
+                step.opening
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -9509,7 +9618,7 @@ mod tests {
         .await
         .context("maintenance did not respect its owner deadline")??;
         let step = *trace
-            .0
+            .step
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let message = format!("{error:#}");

@@ -142,6 +142,11 @@ impl ServiceCleanup {
     /// Retire every project a managed service may have served beneath each
     /// data root, including one whose store exists only under a staging name
     /// because an owner in another process had not activated it yet.
+    ///
+    /// The join needs no backstop of its own: each retirement bounds its wait
+    /// on a closing owner's lock release by that owner's close budget, on a
+    /// thread of its own that is abandoned at the budget, and each store
+    /// quiescence wait by the supervisor's reap allowance.
     fn retire(&self) -> anyhow::Result<()> {
         let mut projects = Vec::new();
         for data in &self.data {

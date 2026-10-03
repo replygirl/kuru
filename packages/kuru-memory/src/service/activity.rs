@@ -288,6 +288,29 @@ pub(crate) fn read_activity(data_dir: &Path, scope: &str, tag: &str) -> Result<A
     Ok(activity)
 }
 
+/// Test support only: the activity of whatever owner's record is under the
+/// name now, whatever its tag, or `None` when the name is missing. It grants
+/// nothing and no product path reads it: a fixture whose own bound has
+/// already elapsed names the owner it was waiting behind with it, and a
+/// fixture retirement reads it only to keep asking an owner still opening
+/// rather than take its missing endpoint for a close.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn inspect(data_dir: &Path, scope: &str) -> Result<Option<Activity>> {
+    let path = directory(data_dir, scope)?.join(RECORD);
+    let bytes = match crate::files::read_bytes(&path, RECORD_LIMIT) {
+        Ok(bytes) => bytes,
+        Err(error) if crate::files::is_missing_name(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    decode(&bytes).map(|(_, activity)| Some(activity))
+}
+
+/// The record's name for `stage`, or its debug name for one never published.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn describe_stage(stage: MemoryOpenStage) -> String {
+    stage_name(stage).map_or_else(|| format!("{stage:?}"), str::to_owned)
+}
+
 #[cfg(test)]
 fn read_stages(data_dir: &Path, scope: &str, tag: &str) -> Result<Vec<MemoryOpenStage>> {
     read_activity(data_dir, scope, tag).map(|activity| activity.stages)
@@ -1938,7 +1961,6 @@ mod tests {
         .await
         .with_context(|| format!("record retirement fixture exceeded its {deadline:?} deadline"))?
     }
-
     // The publisher's last write follows its open on its own task. A close
     // awaits it before retiring the endpoint, so a starter whose attach
     // fails then reads a settled record and never a late replacement. Here
@@ -2037,6 +2059,318 @@ mod tests {
         .with_context(|| {
             format!("last-write ordering fixture exceeded its {deadline:?} deadline")
         })?
+    }
+
+    /// A served owner held in its close, after its Dolt reap and before its
+    /// lock release, past the fixture's former flat 10 s bound and within its
+    /// own close budget: the retirement waits on the lock release and
+    /// completes once the test releases the pause (the event that ends the
+    /// close). Paused time carries the test past 10 s; it resumes before the
+    /// release, so the close budget's backstop never elapses and nothing
+    /// waits on a wall clock.
+    #[tokio::test]
+    async fn a_retirement_behind_a_close_held_past_ten_seconds_completes_within_its_close_budget()
+    -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, _scope, data, mut options) = owner_fixture(root.path())?;
+            options.starter_token = Some(Uuid::new_v4());
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut owner = ServiceOwner::open(options.clone(), &project).await?;
+            owner
+                .activity
+                .as_mut()
+                .context("a tokened owner kept no publisher")?
+                .finish_writes()
+                .await;
+            let pause = ClosePause::at(ClosePoint::AfterReap);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &options.project_scope, None).await?);
+            pause.entered.notified().await;
+            tokio::time::pause();
+            let mut retiring = Box::pin(crate::test_support::retire_idle_service(&options));
+            let held = Duration::from_secs(10) + Duration::from_secs(1);
+            let ended_early = tokio::select! {
+                biased;
+                retired = retiring.as_mut() => Some(retired),
+                () = tokio::time::sleep(held) => None,
+            };
+            tokio::time::resume();
+            pause.release.notify_one();
+            served.await??;
+            if let Some(retired) = ended_early {
+                bail!(
+                    "the retirement ended within {held:?} while the close was held: {:?}",
+                    retired.map_err(|error| format!("{error:#}"))
+                );
+            }
+            retiring
+                .await
+                .context("the retirement did not complete once the held close was released")?;
+            ensure!(owner_lock_free(&options)?);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("released close fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    /// A served owner held in its close, after its Dolt reap and before its
+    /// lock release, past its own close budget: the fixture's wait on the
+    /// lock release fails at that budget, counted from the first retirement
+    /// request that found no live endpoint, and names a closing owner past
+    /// both record retirements and the time since that reading. Releasing
+    /// the pause then ends the close. Paused time elapses the budget; the
+    /// owner's reap is done before time is paused and nothing live waits on
+    /// a clock.
+    #[tokio::test]
+    async fn an_elapsed_retirement_behind_a_held_close_names_a_closing_owner() -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, _scope, data, mut options) = owner_fixture(root.path())?;
+            options.starter_token = Some(Uuid::new_v4());
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut owner = ServiceOwner::open(options.clone(), &project).await?;
+            owner
+                .activity
+                .as_mut()
+                .context("a tokened owner kept no publisher")?
+                .finish_writes()
+                .await;
+            let pause = ClosePause::at(ClosePoint::AfterReap);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &options.project_scope, None).await?);
+            pause.entered.notified().await;
+            tokio::time::pause();
+            let (elapsed, waiter) =
+                crate::test_support::retire_idle_service_keeping_waiter(&options).await;
+            tokio::time::resume();
+            pause.release.notify_one();
+            served.await??;
+            crate::test_support::join_release_waiter(waiter)?;
+            let text = format!(
+                "{:#}",
+                elapsed
+                    .err()
+                    .context("retirement completed while the owner held its lock")?
+            );
+            crate::test_support::ensure_close_budget_expiry(
+                &text,
+                "no live endpoint",
+                "owner closing; last phase = endpoint and activity records retired",
+            )?;
+            ensure!(
+                !text.contains("idle managed owner"),
+                "the elapsed bound named an idle owner: {text}"
+            );
+            ensure!(owner_lock_free(&options)?);
+            crate::test_support::retire_idle_service(&options).await
+        })
+        .await
+        .with_context(|| format!("held close fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    /// A served owner that keeps refusing retirement because a client stays
+    /// attached never shows it is closing, so the fixture keeps asking until
+    /// one deadline carried across its refusal retries: the retirement's own
+    /// `memory.startup_timeout_secs` from its first request, not a flat
+    /// fixture bound. Its expiry names that deadline, the time since the
+    /// first request, a published owner, its busy replies and the refusals.
+    /// Only the retirement's options carry a 1 s startup timeout (the owner
+    /// keeps the default for its engine start); the refusals are real socket
+    /// replies, so this runs on the real clock, bounded by that configured
+    /// second, rather than auto-advancing paused time past an owner's reply.
+    /// Dropping the client then lets the owner retire by itself.
+    #[tokio::test]
+    async fn an_elapsed_retirement_behind_an_attached_client_names_its_startup_deadline()
+    -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, _scope, data, mut options) = owner_fixture(root.path())?;
+            options.starter_token = Some(Uuid::new_v4());
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut owner = ServiceOwner::open(options.clone(), &project).await?;
+            owner
+                .activity
+                .as_mut()
+                .context("a tokened owner kept no publisher")?
+                .finish_writes()
+                .await;
+            let (knobs, _events) = observed(Admission::AnyAttachment, None);
+            let served = tokio::spawn(owner.serve_with(knobs));
+            let client = attach_raw(&data, &options.project_scope, None).await?;
+            let mut asking = options.clone();
+            asking.config.startup_timeout_secs = 1;
+            let elapsed = crate::test_support::retire_idle_service(&asking).await;
+            drop(client);
+            served.await??;
+            let text = format!(
+                "{:#}",
+                elapsed
+                    .err()
+                    .context("retirement completed while a client was attached")?
+            );
+            crate::test_support::ensure_asking_deadline_expiry(
+                &text,
+                Duration::from_secs(1),
+                "owner published",
+            )?;
+            ensure!(
+                !text.contains("busy replies=0;") && !text.contains("within 10 seconds"),
+                "the asking deadline's expiry did not name its busy replies: {text}"
+            );
+            ensure!(owner_lock_free(&options)?);
+            crate::test_support::retire_idle_service(&options).await
+        })
+        .await
+        .with_context(|| format!("attached client fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    /// A fixture's retirement bound that elapses behind an owner held in its
+    /// open before it published an endpoint names an opening owner and its
+    /// last stage, not an idle owner that did not retire. Its requests find
+    /// no live endpoint while the owner's open-activity record shows it still
+    /// opening, which is not a closing reading, so the fixture keeps asking
+    /// and the bound is its asking deadline, `memory.startup_timeout_secs`
+    /// from the first request. Paused time elapses it while the open waits at
+    /// its hold; time resumes before the hold is released and the owner opens
+    /// and closes.
+    #[tokio::test]
+    async fn an_elapsed_retirement_behind_an_unpublished_owner_names_its_open_stage() -> Result<()>
+    {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, mut options) = owner_fixture(root.path())?;
+            options.starter_token = Some(Uuid::new_v4());
+            let barrier = Arc::new(OpenHold::default());
+            let hooks = OwnerHooks {
+                hold: Some((PreparingDatabase, Arc::clone(&barrier))),
+                ..OwnerHooks::default()
+            };
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut opening = Box::pin({
+                let options = options.clone();
+                async move { ServiceOwner::open_with_activity(options, &project, hooks).await }
+            });
+            tokio::select! {
+                biased;
+                () = barrier.entered.notified() => {}
+                opened = opening.as_mut() => bail!(
+                    "the open ended before holding at PreparingDatabase: {:?}",
+                    opened.map(|_| ())
+                ),
+            }
+            // Read at the hold and checked after the release, so a failed
+            // check never leaves the owner holding its open.
+            let held = (
+                owner_lock_free(&options),
+                EndpointRecord::read(&data, &scope).map(|record| record.is_some()),
+            );
+            tokio::time::pause();
+            let (elapsed, waiter) =
+                crate::test_support::retire_idle_service_keeping_waiter(&options).await;
+            tokio::time::resume();
+            barrier.release.notify_one();
+            let owner = opening.await?;
+            owner.close().await?;
+            crate::test_support::join_release_waiter(waiter)?;
+            ensure!(!held.0?, "the held open did not hold its owner lock");
+            ensure!(!held.1?, "the held open had published an endpoint");
+            let text = format!(
+                "{:#}",
+                elapsed
+                    .err()
+                    .context("retirement completed while the owner held its lock")?
+            );
+            crate::test_support::ensure_asking_deadline_expiry(
+                &text,
+                Duration::from_secs(options.config.startup_timeout_secs),
+                "owner still opening; last stage = PreparingDatabase; no endpoint record present",
+            )?;
+            ensure!(
+                !text.contains("idle managed owner"),
+                "the elapsed bound named an idle owner: {text}"
+            );
+            ensure!(owner_lock_free(&options)?);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("unpublished owner fixture exceeded its {deadline:?} deadline"))?
+    }
+
+    /// An owner still opening when a fixture retirement begins answers its
+    /// first request with no live endpoint, and then publishes and sits idle
+    /// with no client: the fixture must keep asking, so the published owner
+    /// accepts and retires, rather than take that first reply as a close and
+    /// wait for a lock release the idle owner never makes. The open is held
+    /// at PreparingDatabase until the retirement's first request has found
+    /// no live endpoint, the trace's own signal; the owner then opens and
+    /// serves under its default policy. Real clock, bounded by the fixture
+    /// deadline; nothing waits on a wall-clock sleep.
+    #[tokio::test]
+    async fn a_retirement_that_began_while_the_owner_opened_retires_it_once_published() -> Result<()>
+    {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, _scope, _data, mut options) = owner_fixture(root.path())?;
+            options.starter_token = Some(Uuid::new_v4());
+            let barrier = Arc::new(OpenHold::default());
+            let hooks = OwnerHooks {
+                hold: Some((PreparingDatabase, Arc::clone(&barrier))),
+                ..OwnerHooks::default()
+            };
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut opening = Box::pin({
+                let options = options.clone();
+                async move { ServiceOwner::open_with_activity(options, &project, hooks).await }
+            });
+            tokio::select! {
+                biased;
+                () = barrier.entered.notified() => {}
+                opened = opening.as_mut() => bail!(
+                    "the open ended before holding at PreparingDatabase: {:?}",
+                    opened.map(|_| ())
+                ),
+            }
+            let trace = crate::test_support::retirement_trace(&options);
+            let retiring = crate::test_support::retire_idle_service_traced(&options, &trace);
+            let driving = async {
+                trace.found_no_endpoint().await;
+                barrier.release.notify_one();
+                let owner = opening.await?;
+                Ok::<_, anyhow::Error>(tokio::spawn(owner.serve()))
+            };
+            let ((retired, waiter), served) = tokio::join!(retiring, driving);
+            let served = served?;
+            // A failed retirement leaves the published owner idle: retire it
+            // with a fresh request before joining the abandoned waiter.
+            let cleanup = match &retired {
+                Ok(()) => Ok(()),
+                Err(_) => crate::test_support::retire_idle_service(&options).await,
+            };
+            crate::test_support::join_release_waiter(waiter)?;
+            let served = served.await?;
+            retired.context("the retirement did not retire the owner that published during it")?;
+            cleanup?;
+            served.context("the owner's serve failed after accepting retirement")?;
+            ensure!(owner_lock_free(&options)?);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("opening owner fixture exceeded its {deadline:?} deadline"))?
     }
 
     // An open that fails after starting its engine marks its record failing,
