@@ -242,9 +242,12 @@ fn optional_path(argument: OsString) -> Option<PathBuf> {
 pub const SERVICE_STAND_IN_ENV: &str = "KURU_TEST_MEMORY_SERVICE_STAND_IN";
 
 /// The stand-in owner's whole life. It polls in its own fixture process,
-/// as `client_fixture_entry` does, every 10 ms of real time under a 120 s
-/// bound, so a test that never releases it leaves no process behind. A
-/// missing or not yet complete file is not a release.
+/// as `client_fixture_entry` does, every 10 ms of real time. A missing or
+/// not yet complete file is not a release. It consumes a release by
+/// removing the file and then exits at once, so its fixture can wait for
+/// that removal before the test ends: an instrumented stand-in that outlived
+/// its test would write its coverage profile after the partition's tests.
+/// The 120 s bound is only a backstop for a fixture that never releases it.
 #[cfg(feature = "test-support")]
 async fn stand_in_owner(release: &Path) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
@@ -252,6 +255,8 @@ async fn stand_in_owner(release: &Path) -> Result<()> {
         match std::fs::read_to_string(release) {
             Ok(text) => {
                 if let Ok(status) = text.trim().parse::<i32>() {
+                    std::fs::remove_file(release)
+                        .context("consume memory service stand-in release")?;
                     std::process::exit(status);
                 }
             }
@@ -4304,8 +4309,11 @@ mod tests {
     #[cfg(feature = "test-support")]
     mod progress_wait {
         use super::*;
-        use std::cell::RefCell;
+        use std::cell::{Cell, RefCell};
         use std::rc::Rc;
+
+        /// Real-time bound for a spawned stand-in to consume its release.
+        const CONSUME_BOUND: Duration = Duration::from_secs(30);
 
         type Missed = Rc<RefCell<Vec<(u32, tokio::time::Instant)>>>;
 
@@ -4318,6 +4326,8 @@ mod tests {
             executable: PathBuf,
             release: PathBuf,
             tag: String,
+            /// Whether a release has been written; the first one decides.
+            released: Cell<bool>,
         }
 
         impl StandInOwner {
@@ -4331,6 +4341,7 @@ mod tests {
                     release: root.path().join("release"),
                     executable: crate::store::test_supervisor()?,
                     tag: activity::activity_tag(&token),
+                    released: Cell::new(false),
                     root,
                     project,
                     data,
@@ -4340,8 +4351,13 @@ mod tests {
             }
 
             /// Release the stand-in with `status`, staged and then renamed
-            /// onto the release name so it never reads a partial file.
+            /// onto the release name so it never reads a partial file. Only
+            /// the first release is written: a stand-in that consumed it has
+            /// exited, and a second file would never be consumed.
             fn release(&self, status: i32) -> Result<()> {
+                if self.released.replace(true) {
+                    return Ok(());
+                }
                 let staged = self.root.path().join("release.staged");
                 std::fs::write(&staged, status.to_string())?;
                 std::fs::rename(&staged, &self.release)?;
@@ -4352,10 +4368,36 @@ mod tests {
                 Duration::from_secs(self.options.config.startup_timeout_secs)
             }
 
+            /// Wait in real time, which the paused test clock does not
+            /// advance, until the stand-in has removed its release file. It
+            /// removes the file only to exit at once, so a test whose body
+            /// finishes within one of its polls, as these virtual-time tests
+            /// do, never removes the fixture directory first and leaves the
+            /// stand-in polling a vanished release until its 120 s bound.
+            fn consumed(&self) -> Result<()> {
+                let deadline = std::time::Instant::now() + CONSUME_BOUND;
+                loop {
+                    match std::fs::symlink_metadata(&self.release) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                        Err(error) => {
+                            return Err(error).context("inspect the stand-in owner's release");
+                        }
+                        Ok(_) => {}
+                    }
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "the stand-in owner did not consume its release within {CONSUME_BOUND:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+
             /// Run the starter with the stand-in as its owner and `hook`
             /// after each failed poll, recording every failed poll's instant.
             /// The stand-in is released with status 0 whatever the outcome,
-            /// before any result is examined, so no failing test leaves it.
+            /// before any result is examined, so no failing test leaves it;
+            /// once it was spawned, its release is consumed before this
+            /// returns, so it never outlives the test.
             async fn start(
                 &self,
                 missed: &Missed,
@@ -4385,8 +4427,14 @@ mod tests {
                 )
                 .await;
                 let released = self.release(0);
+                // Polls and an attachment follow the spawn; a failure with
+                // neither may precede it, and then nothing consumes the file.
+                let spawned = !missed.borrow().is_empty() || matches!(outcome, Ok(Ok(_)));
                 let outcome = outcome.context("stand-in owner fixture exceeded its outer deadline");
                 released?;
+                if spawned {
+                    self.consumed()?;
+                }
                 outcome
             }
         }
@@ -4727,6 +4775,61 @@ mod tests {
                 "the retirement lost its leading text: {rendered}"
             );
             Ok(())
+        }
+
+        /// A stand-in whose test finishes at once has consumed its release,
+        /// and so is exiting, before its fixture's start returns. These
+        /// tests run in paused virtual time, so the body can end and remove
+        /// the fixture directory before the stand-in's first real 10 ms
+        /// poll; an instrumented stand-in left polling a vanished release
+        /// lived on for its 120 s bound and wrote its coverage profile while
+        /// a coverage partition was exporting.
+        #[tokio::test(start_paused = true)]
+        async fn a_stand_in_has_consumed_its_release_when_its_start_returns() -> Result<()> {
+            let fixture = StandInOwner::new(1)?;
+            let missed = Missed::default();
+            let hook = {
+                let (data, scope, tag) = (
+                    fixture.data.clone(),
+                    fixture.scope.clone(),
+                    fixture.tag.clone(),
+                );
+                move |polls: u32| {
+                    if polls == 1 {
+                        activity::write_failing_record(
+                            &data,
+                            &scope,
+                            &tag,
+                            &[MemoryOpenStage::CreatingDatabase],
+                            1,
+                            "refused",
+                        )
+                        .expect("publish the owner's failing mark");
+                    }
+                }
+            };
+            let outcome = {
+                // Held across the owner spawn; see `crate::spawn_gate`.
+                let _gate = crate::spawn_gate::spawning().await;
+                fixture
+                    .start(&missed, hook, Duration::from_secs(60))
+                    .await?
+            };
+            ensure!(
+                outcome.is_err(),
+                "an owner whose record is marked failing was reported ready"
+            );
+            ensure!(
+                !missed.borrow().is_empty(),
+                "the starter never polled the stand-in"
+            );
+            match std::fs::symlink_metadata(&fixture.release) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error).context("inspect the stand-in owner's release"),
+                Ok(_) => {
+                    bail!("the stand-in's release was still unconsumed when its start returned")
+                }
+            }
         }
 
         /// A record its owner marks failing ends the wait at the poll that
