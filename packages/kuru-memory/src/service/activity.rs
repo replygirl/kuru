@@ -2063,6 +2063,70 @@ mod tests {
         .with_context(|| format!("held close fixture exceeded its {deadline:?} deadline"))?
     }
 
+    /// A served owner that keeps refusing retirement because a client stays
+    /// attached never shows it is closing, so the fixture keeps asking until
+    /// one deadline carried across its refusal retries: the retirement's own
+    /// `memory.startup_timeout_secs` from its first request, not a flat
+    /// fixture bound. Its expiry names that deadline, the time since the
+    /// first request, a published owner, its busy replies and the refusals.
+    /// Only the retirement's options carry a 1 s startup timeout (the owner
+    /// keeps the default for its engine start); the refusals are real socket
+    /// replies, so this runs on the real clock, bounded by that configured
+    /// second, rather than auto-advancing paused time past an owner's reply.
+    /// Dropping the client then lets the owner retire by itself.
+    #[tokio::test]
+    async fn an_elapsed_retirement_behind_an_attached_client_names_its_startup_deadline()
+    -> Result<()> {
+        warm_runtime_cache().await?;
+        let deadline = fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, _scope, data, mut options) = owner_fixture(root.path())?;
+            options.starter_token = Some(Uuid::new_v4());
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            owner
+                .activity
+                .as_ref()
+                .context("a tokened owner kept no publisher")?
+                .settled()
+                .await?;
+            let (knobs, _events) = observed(Admission::AnyAttachment, None);
+            let served = tokio::spawn(owner.serve_with(knobs));
+            let client = attach_raw(&data, &options.project_scope, None).await?;
+            let mut asking = options.clone();
+            asking.config.startup_timeout_secs = 1;
+            let elapsed = crate::test_support::retire_idle_service(&asking).await;
+            drop(client);
+            served.await??;
+            let text = format!(
+                "{:#}",
+                elapsed
+                    .err()
+                    .context("retirement completed while a client was attached")?
+            );
+            let prefix = "managed owner retirement did not complete within \
+                memory.startup_timeout_secs (1s; ";
+            let since = text
+                .split_once(prefix)
+                .and_then(|(_, rest)| rest.split_once("ms since the first request)"))
+                .and_then(|(milliseconds, _)| milliseconds.parse::<u128>().ok());
+            ensure!(
+                since.is_some_and(|milliseconds| milliseconds >= 1000)
+                    && text.contains("no request found the owner closing")
+                    && text.contains("owner published")
+                    && !text.contains("busy replies=0;")
+                    && !text.contains("within 10 seconds"),
+                "the asking deadline's expiry did not name the startup timeout, the time since \
+                 the first request, a published owner and its busy replies: {text}"
+            );
+            ensure!(owner_lock_free(&options)?);
+            crate::test_support::retire_idle_service(&options).await
+        })
+        .await
+        .with_context(|| format!("attached client fixture exceeded its {deadline:?} deadline"))?
+    }
+
     /// A fixture's retirement bound that elapses behind an owner held in its
     /// open before it published an endpoint names an opening owner and its
     /// last stage, not an idle owner that did not retire. Its first request
