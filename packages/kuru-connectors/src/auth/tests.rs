@@ -1428,7 +1428,10 @@ async fn auth_transport_failures_distinguish_refused_from_stalled_without_echo()
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let closed = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    let manager = short_timeout_manager(&refused, &closed, Duration::from_millis(300));
+    // A refusal returns as soon as the reset arrives, but Windows retries a
+    // loopback SYN for about 2 s first. Give the refused case a 5 s budget
+    // (under BOUND) so its connect error cannot lose a race to the timeout.
+    let manager = short_timeout_manager(&refused, &closed, Duration::from_secs(5));
     let post_refused = post(&manager).await.unwrap_err();
     let exchange_refused = token_exchange(&manager).await.unwrap_err();
     assert_eq!(
