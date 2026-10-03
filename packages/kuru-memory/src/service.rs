@@ -9745,6 +9745,68 @@ mod tests {
         Ok(())
     }
 
+    // An owner closing on its own after its last client detached, held after
+    // its Dolt reap and before its lock release for longer than
+    // `startup_timeout_secs` but inside its own close budget
+    // (`server::close_budget`): maintenance that meets that close waits for
+    // the owner lock and is granted once the close ends. The acquisition's
+    // waits are tokio timers and, at `AfterReap`, the endpoint record is
+    // retired, so each request is a record read with no socket and nothing
+    // live holds a timer: paused time carries the wait past the startup
+    // timeout, and time resumes before the pause is released.
+    #[tokio::test]
+    async fn maintenance_behind_a_close_held_past_the_startup_timeout_acquires_within_the_close_budget()
+    -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        tokio::time::timeout(deadline, async {
+            let root = tempfile::tempdir()?;
+            let (project, scope, data, options) = owner_fixture(root.path())?;
+            let held =
+                Duration::from_secs(options.config.startup_timeout_secs) + Duration::from_secs(1);
+            ensure!(
+                held < crate::server::close_budget(),
+                "the held close ({held:?}) is not inside the close budget"
+            );
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let pause = ClosePause::at(ClosePoint::AfterReap);
+            let (mut knobs, _events) = observed(Admission::AnyAttachment, None);
+            knobs.close_pause = Some(pause.clone());
+            let served = tokio::spawn(owner.serve_with(knobs));
+            drop(attach_raw(&data, &scope, None).await?);
+            pause.entered.notified().await;
+            tokio::time::pause();
+            let trace = MaintenanceTrace::default();
+            let mut permit = Box::pin(acquire_maintenance_permit_traced(&options, &trace));
+            let ended_early = tokio::select! {
+                biased;
+                acquired = permit.as_mut() => Some(acquired.map(drop)),
+                () = tokio::time::sleep(held) => None,
+            };
+            tokio::time::resume();
+            pause.release.notify_one();
+            served.await??;
+            if let Some(acquired) = ended_early {
+                bail!(
+                    "maintenance ended within {held:?} while the owner's close was held: {:?}",
+                    acquired.map_err(|error| format!("{error:#}"))
+                );
+            }
+            let permit = permit.await.with_context(|| {
+                format!("maintenance failed once the held close ended; {trace}")
+            })?;
+            drop(permit);
+            ensure!(owner_lock_free(&options)?);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .with_context(|| {
+            format!("held close maintenance fixture exceeded its {deadline:?} deadline")
+        })?
+    }
+
     // Signature 2, client half: an electing client's connect queued on the
     // stopped listener is a peer-closed miss, and that client then elects a
     // successor once the owner lock is released.
