@@ -716,7 +716,9 @@ when it marked the record failing as above), and on every error return of its
 open. The publisher's last write follows the open on its own task, so the
 close awaits it after the listener drops and before the endpoint is retired:
 from then on the record changes only by its failing mark or its retirement,
-and a starter whose attach fails never reads a late replacement. Two hooks, read only by
+and a starter whose attach fails never reads a late replacement. A stalled last
+write keeps the endpoint published with no listener for the stall; clients meet
+a refused connection, which they already treat as a closing owner. Two hooks, read only by
 the owner process under `test`/`test-support` (Windows owners receive them by
 explicit forwarding), let tests follow events instead of sleeping:
 `KURU_TEST_MEMORY_ACTIVITY_WRITE_FAILURE=1` makes every record write fail, and
