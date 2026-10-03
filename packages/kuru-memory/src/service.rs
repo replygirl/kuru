@@ -1827,6 +1827,13 @@ impl ServiceOwner {
         }
         open_timeline::stamp(open_timeline::Event::OwnerLock);
         #[cfg(test)]
+        if let Some(slot) = &hooks.duplicate_owner_lock {
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(lock.file().try_clone()?);
+        }
+        #[cfg(test)]
         let end_pause = hooks.close_pause.clone();
         // On failure the store open retires its own record before returning,
         // while this owner lock is still held.
@@ -1870,12 +1877,21 @@ impl ServiceOwner {
                     end_pause.as_deref(),
                 )
                 .await;
-                if let Err(cleanup) = closed {
-                    return Err(error.context(format!(
+                // Released explicitly after the reap and before this open
+                // returns: a starter elects a successor on this lock.
+                let released = lock.release();
+                let error = match closed {
+                    Err(cleanup) => error.context(format!(
                         "reap Dolt after memory service startup failed: {cleanup:#}"
-                    )));
-                }
-                return Err(error);
+                    )),
+                    Ok(()) => error,
+                };
+                return Err(match released {
+                    Err(release) => error.context(format!(
+                        "release memory service owner authority after startup failed: {release:#}"
+                    )),
+                    Ok(()) => error,
+                });
             }
         };
         Ok(Self {
@@ -2373,20 +2389,36 @@ pub enum ServiceLockKind {
     Owner,
 }
 
+/// A held start or owner lock. Every ending unlocks explicitly before its
+/// handle closes, whether through [`Self::release`] or by drop: on Unix a
+/// sibling's child between fork and exec can hold a duplicate of this lock's
+/// open description, and closing only this descriptor would leave the lock
+/// held for that child's lifetime instead of ending it now.
 pub struct ServiceLock {
     directory: Directory,
     name: OsString,
-    file: File,
+    /// Present until the lock is released; taken only by its release.
+    file: Option<File>,
     kind: ServiceLockKind,
+}
+
+impl Drop for ServiceLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            crate::files::release_lock(file);
+        }
+    }
 }
 
 /// Retains both election and owner authority while an explicit maintenance
 /// operation inspects or moves this project's storage. An active service must
 /// retire before this permit can be acquired; a new starter cannot elect until
-/// the permit is dropped.
+/// the permit is dropped. Fields drop in declaration order, so the owner lock
+/// is released before the start lock, the reverse of their acquisition: a
+/// starter that elects on the freed start lock then finds the owner lock free.
 pub(crate) struct MaintenancePermit {
-    _start: ServiceLock,
     _owner: ServiceLock,
+    _start: ServiceLock,
 }
 
 /// Where a maintenance permit acquisition is, for a caller whose own bound
@@ -2570,8 +2602,8 @@ pub(crate) async fn acquire_maintenance_permit_traced(
     start.verify()?;
     owner.verify()?;
     Ok(MaintenancePermit {
-        _start: start,
         _owner: owner,
+        _start: start,
     })
 }
 
@@ -2677,30 +2709,42 @@ impl ServiceLock {
         let file = directory.lock_file(&name)?;
         match file.try_lock() {
             Ok(()) => {
-                directory.verify(&name, &file)?;
-                Ok(Some(Self {
+                let lock = Self {
                     directory,
                     name,
-                    file,
+                    file: Some(file),
                     kind,
-                }))
+                };
+                lock.verify()?;
+                Ok(Some(lock))
             }
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(error) => Err(error).context("acquire project service lock"),
         }
     }
 
+    fn file(&self) -> &File {
+        self.file
+            .as_ref()
+            .expect("a service lock holds its handle until released")
+    }
+
     pub fn verify(&self) -> Result<()> {
-        self.directory.verify(&self.name, &self.file)?;
+        self.directory.verify(&self.name, self.file())?;
         Ok(())
     }
 
     /// Verify, then unlock explicitly before closing. On Unix a sibling's
     /// child between fork and exec can hold a duplicate of this lock's open
-    /// description; closing only this descriptor would leave it locked.
-    pub fn release(self) -> Result<()> {
+    /// description; closing only this descriptor would leave it locked. A
+    /// failed verification still unlocks this description, through drop.
+    pub fn release(mut self) -> Result<()> {
         self.verify()?;
-        self.file.unlock().context("release project service lock")?;
+        let file = self
+            .file
+            .take()
+            .expect("a service lock holds its handle until released");
+        file.unlock().context("release project service lock")?;
         Ok(())
     }
 
@@ -2720,7 +2764,7 @@ impl ServiceLock {
             let lock = Self {
                 directory,
                 name,
-                file,
+                file: Some(file),
                 kind,
             };
             lock.release()
@@ -9916,7 +9960,7 @@ mod tests {
         let owner = ServiceLock::try_acquire(data.path(), &scope, ServiceLockKind::Owner)?
             .context("fixture did not acquire the owner lock")?;
         // As a sibling's child holds it between fork and exec.
-        let duplicate = owner.file.try_clone()?;
+        let duplicate = owner.file().try_clone()?;
         owner.release()?;
         let reacquired = ServiceLock::try_acquire(data.path(), &scope, ServiceLockKind::Owner)?
             .context("a released lock stayed held by a duplicate descriptor")?;
