@@ -1226,7 +1226,8 @@ async fn try_attach_observed(
 ///
 /// A listener that closes while this connect is still queued in its backlog
 /// resets it: Linux delivers that reset from the connect itself, while Darwin
-/// completes the connect and the handshake then meets the closed peer. Either
+/// completes the connect and the handshake then meets the closed peer, as an
+/// EOF, EPIPE or, when the close races its write, ENOTCONN. Either
 /// way it is the same peer-closed observation the handshake already maps, and
 /// never authority. The owner lock decides: a retiring owner reaps Dolt and
 /// releases it, while a live owner that keeps closing connections keeps it
@@ -3186,6 +3187,15 @@ pub fn project_path_bytes(path: &Path) -> Vec<u8> {
 #[cfg(windows)]
 const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
 
+/// Whether the peer closed this connection: a broken pipe, a reset, an EOF
+/// or a socket no longer connected. A stream whose connect succeeded loses
+/// its connection only to its peer. Darwin reports a peer disconnect that
+/// lands while its write path has the socket unlocked as ENOTCONN, and one
+/// before that write as EPIPE; both are this observation.
+///
+/// Callers classify only connects and handshakes, before any request is
+/// sent, or an owner's own attachment diagnostics. A failed request
+/// exchange keeps its uncertain-write handling; this is never mutation proof.
 pub fn is_peer_closed(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -3199,6 +3209,7 @@ pub fn is_peer_closed(error: &anyhow::Error) -> bool {
                 error.kind(),
                 io::ErrorKind::BrokenPipe
                     | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::NotConnected
                     | io::ErrorKind::UnexpectedEof
             )
         })
@@ -9329,6 +9340,75 @@ mod tests {
             connect_miss(&anyhow::anyhow!("memory service connect deadline exceeded")),
             None
         );
+    }
+
+    /// A client stream whose peer disconnected it while its write was in
+    /// flight, as Darwin reports one: `ENOTCONN`, not `EPIPE`.
+    struct DisconnectedDuringWrite;
+
+    impl AsyncRead for DisconnectedDuringWrite {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for DisconnectedDuringWrite {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    // CI runs 36910091434 and 37087605833 (macOS): a fixture's maintenance
+    // request met an owner retiring on its own, and its hello write failed
+    // "write memory service frame: Socket is not connected (os error 57)".
+    // Darwin's `uipc_send` checks `SS_ISCONNECTED` before `SS_CANTSENDMORE`,
+    // so a peer disconnect landing while `sosend` has the socket unlocked
+    // reads as ENOTCONN rather than the EPIPE an earlier one gives. A socket
+    // whose connect succeeded loses its connection only to the peer, so this
+    // is the same peer-closed miss, for maintenance and an electing client.
+    #[tokio::test]
+    async fn a_handshake_write_disconnected_by_a_retiring_owner_is_a_peer_closed_miss() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            io::Error::from_raw_os_error(57).kind(),
+            io::ErrorKind::NotConnected,
+            "Darwin's ENOTCONN no longer maps to NotConnected"
+        );
+        let error = connect_handshake(&mut DisconnectedDuringWrite, &authority())
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "write memory service frame");
+        assert!(
+            is_peer_closed(&error),
+            "a disconnected handshake write was not a peer-closed miss: {error:#}"
+        );
+        assert!(!is_transport_unavailable(&error));
+        assert_eq!(connect_miss(&error), Some(AttachMiss::PeerClosed));
+        // Maintenance reads the same chain as the CI failure.
+        let error = error.context("connect to memory service for maintenance");
+        assert!(is_peer_closed(&error));
     }
 
     // A live owner that keeps closing connections while it holds its lock
