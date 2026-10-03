@@ -1160,7 +1160,24 @@ async fn put_state_tx<T: Serialize>(
     Ok(())
 }
 
+// Test-only count of the statements the pool-level read helpers issue, scoped
+// to one task so parallel tests that call the same helpers never share it.
+// Each helper counts itself once, before its statement budget starts, and
+// issues exactly one statement.
+#[cfg(test)]
+tokio::task_local! {
+    static READS: std::cell::Cell<usize>;
+}
+
+/// Count one statement against the enclosing [`READS`] scope, if any.
+#[cfg(test)]
+fn count_read() {
+    let _ = READS.try_with(|reads| reads.set(reads.get() + 1));
+}
+
 async fn read_marker(pool: &MemoryPool, session_id: &str) -> Result<Option<SessionMarker>> {
+    #[cfg(test)]
+    count_read();
     let value: Option<String> = crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
@@ -1215,6 +1232,8 @@ async fn session_has_records_tx(
 }
 
 async fn read_state(pool: &MemoryPool, key: &str) -> Result<Option<String>> {
+    #[cfg(test)]
+    count_read();
     crate::pool::within(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
@@ -1292,6 +1311,8 @@ async fn session_index_page(
     index: &KeyRange,
     after: Option<&[u8]>,
 ) -> Result<Vec<(Vec<u8>, String)>> {
+    #[cfg(test)]
+    count_read();
     crate::pool::within(QUERY_TIMEOUT, range_page(pool, index, after))
         .await
         .context("usage ledger session index deadline exceeded")?
@@ -3223,6 +3244,102 @@ mod tests {
         // Another session's records do not refuse a fresh mark.
         ledger.mark_new_session("fresh-session").await?;
         ensure!(ledger.session("fresh-session").await?.historical_complete);
+        drop(ledger);
+        store.close().await
+    }
+
+    /// One `session()` call inside a fresh [`READS`] scope: its fold and the
+    /// number of statements it issued.
+    async fn counted_session(
+        ledger: &UsageLedger,
+        session_id: &str,
+    ) -> Result<(SessionUsage, usize)> {
+        READS
+            .scope(std::cell::Cell::new(0), async {
+                let usage = ledger.session(session_id).await?;
+                Ok((usage, READS.with(std::cell::Cell::get)))
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn session_reads_each_index_page_with_one_keyed_record_read() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let ledger = store.usage_ledger()?;
+        ledger.mark_new_session("counted-session").await?;
+        // Admission's exact rows, written by the same validating statement in
+        // one transaction instead of 300 commits; an orphan index row for a
+        // second session has no record.
+        let invocations = 300;
+        let mut records = Vec::with_capacity(invocations);
+        let pool = ledger.store.pool.clone();
+        let mut connection = pool.acquire().await?;
+        let mut transaction = connection.begin().await?;
+        for n in 0..invocations {
+            let start = start("counted-session", &format!("invocation-{n:03}"));
+            let key = record_key(&start.invocation_id);
+            let index = SessionIndex {
+                format: FORMAT,
+                session_id: start.session_id.clone(),
+                invocation_id: start.invocation_id.clone(),
+                record_key: key.clone(),
+            };
+            let index_key = session_index_key(&start.session_id, &start.invocation_id);
+            let record = initial_record(start);
+            put_state_tx(&mut transaction, &key, &record).await?;
+            put_state_tx(&mut transaction, &index_key, &index).await?;
+            records.push((index_key, record));
+        }
+        put_state_tx(
+            &mut transaction,
+            &session_index_key("orphan-session", "orphan-invocation"),
+            &SessionIndex {
+                format: FORMAT,
+                session_id: "orphan-session".into(),
+                invocation_id: "orphan-invocation".into(),
+                record_key: record_key("orphan-invocation"),
+            },
+        )
+        .await?;
+        transaction.commit().await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'seed counted usage session', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(&mut *connection)
+            .await?;
+        drop(connection);
+        drop(pool);
+
+        let (usage, reads) = counted_session(&ledger, "counted-session").await?;
+        // The fold is the in-memory fold of the same records in index order.
+        records.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+        let marker = SessionMarker {
+            format: FORMAT,
+            session_id: "counted-session".into(),
+            historical_complete: true,
+        };
+        let records: Vec<InvocationUsage> = records.into_iter().map(|(_, record)| record).collect();
+        ensure!(usage == fold_session("counted-session", Some(marker), &records)?);
+        ensure!(usage.invocation_count == invocations as u64);
+        // One marker read, P index pages, the empty page that ends the walk,
+        // and one keyed record read per page: 2P + 2 for any session length.
+        let pages = invocations.div_ceil(PAGE_SIZE as usize);
+        ensure!(
+            reads == 2 * pages + 2,
+            "session() over {invocations} invocations in {pages} index pages issued {reads} reads, expected {}",
+            2 * pages + 2
+        );
+        let missing = format!(
+            "{:#}",
+            ledger
+                .session("orphan-session")
+                .await
+                .err()
+                .context("an index row without its record folded")?
+        );
+        ensure!(
+            missing.contains("usage session index references a missing invocation"),
+            "unexpected error: {missing}"
+        );
         drop(ledger);
         store.close().await
     }
