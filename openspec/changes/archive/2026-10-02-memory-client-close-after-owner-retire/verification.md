@@ -1,0 +1,15 @@
+# Verification
+
+## 1. A handshake that a retiring owner disconnects is a peer-closed miss on Darwin [critical]
+
+- [x] 1.1 @regression (agent) `cargo test -p kuru-memory --lib a_handshake_write_disconnected` before the fix -> failed: "a disconnected handshake write was not a peer-closed miss: write memory service frame: not connected" (local macOS 27.0)
+- [x] 1.2 @regression (agent) the same test after the fix -> passed: `is_peer_closed`, `connect_miss == PeerClosed`, not transport-unavailable, and errno 57 maps to NotConnected on macOS
+- [x] 1.3 @unit (agent) `cargo test -p kuru-memory --lib peer_closed` and the handshake rejection tests -> 3/3 peer-closed tests passed; the rejection tests passed inside the full suite (decoded rejections are still not peer-closed)
+
+## 2. Real fixtures and the package suites stay green
+
+- [x] 2.1 @integration (agent) `mise run //packages/kuru-memory:test` -> passed on the second run (695 passed, 0 failed, 6 ignored, plus the 10/5/12/1 integration targets). The first run had 694 passed and 1 failed: `crashed_owner_retains_accepted_receipt_after_sibling_write` failed with "read private memory service endpoint: file name no longer identifies the held object", an endpoint record replaced between its read and identity verify. That failure is outside the peer-closed classification, and the test then passed 5/5 alone and in the full rerun.
+- [x] 2.2 @integration (agent) `ordinary_context_refuses_a_shared_summary_changed_after_its_window_read` and `manual_compact_reports_its_immutable_checkpoint_after_a_concurrent_advance` x5 each (`--exact`, KURU_TEST_SUPERVISOR_PREPARED=1), plus `mise run //packages/kuru-runtime:test -- accounting_tests` -> 10/10 passed; accounting_tests 29 passed
+- [x] 2.3 @integration (agent) `mise run format:check`, `lint`, `lint:windows`, `typecheck`, `docs:check`, `cospec -- validate --all --strict` -> all exited 0
+- [~] 2.4 @runtime (agent) a macOS CI coverage partition on this branch shows no ENOTCONN quiescence failure -> defer: the race is rare (2 occurrences across many runs), CI reruns are not allowed here, and the PR's own CI is the next observation
+- [x] 2.5 @unit (agent) follow-on: the two writes in `request_idle_retirement` carry distinct contexts ("memory service maintenance handshake", "memory service idle-retirement request") so a CI log names the hello or the request. Every maintenance-error text match was grepped first: `retire_idle_service` and the facade candidate fixture match only the top-level "memory service has active clients" `ensure!` text (never wrapped), the deadline tests match the top-level election and owner-response `ensure!`/`with_context` texts, and the handshake rejection diagnostics are matched by no maintenance test; `is_peer_closed` walks the chain, so classification is unchanged. `mise run //packages/kuru-memory:test -- service::` (narrowed to the service tests, not the full package suite) -> 133 passed, 0 failed; `a_handshake_write_disconnected_by_a_retiring_owner_is_a_peer_closed_miss` -> 1 passed
