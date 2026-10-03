@@ -451,7 +451,7 @@ impl NativeChild {
     /// A read-only, point-in-time description of this child and its owned Job
     /// for failure diagnostics. It neither caches status nor signals or waits.
     ///
-    /// Job members are listed by numeric ID and, best effort, image name and
+    /// Job members are listed by numeric ID and, best effort, full image path and
     /// resource sample through a query-only handle. An ID can be reused
     /// between listing and opening; a reopened process outside this Job is
     /// reported as such rather than named. The IDs are text only and confer
@@ -566,7 +566,7 @@ pub struct JobSnapshot {
 #[derive(Debug)]
 pub struct JobMember {
     pub id: u32,
-    /// Executable file name, without its directory.
+    /// Full Win32 path of the member's executable image.
     pub image: io::Result<OsString>,
     pub sample: io::Result<ProcessSample>,
 }
@@ -756,10 +756,9 @@ fn image_name(process: &OwnedHandle, buffer: &mut [u16]) -> io::Result<OsString>
     {
         return Err(io::Error::last_os_error());
     }
-    let path = PathBuf::from(OsString::from_wide(&buffer[..length as usize]));
-    Ok(path
-        .file_name()
-        .map_or_else(|| path.clone().into_os_string(), OsStr::to_os_string))
+    // The full path: a file name alone cannot tell a launcher such as
+    // `Git\cmd\git.exe` from the executable it starts.
+    Ok(OsString::from_wide(&buffer[..length as usize]))
 }
 
 /// Retain a real handle to this process, rather than inheriting a pseudo-handle.

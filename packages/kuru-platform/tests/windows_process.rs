@@ -456,20 +456,29 @@ async fn diagnostic_snapshot_lists_job_members_without_changing_the_tree() {
         .iter()
         .find(|member| {
             member.id != child.id()
-                && member.image.as_deref().ok()
+                && member
+                    .image
+                    .as_deref()
+                    .ok()
+                    .and_then(|image| Path::new(image).file_name())
                     == Some(OsStr::new("kuru-platform-process-fixture.exe"))
         })
         .unwrap_or_else(|| panic!("no descendant fixture member: {text}"));
     assert!(leaf.sample.is_ok(), "{text}");
+    // The image is the member's full executable path, not only its file name.
+    let image = Path::new(leaf.image.as_deref().unwrap());
+    assert!(image.is_absolute(), "{text}");
+    assert_eq!(
+        fs::canonicalize(image).unwrap(),
+        fs::canonicalize(env!("CARGO_BIN_EXE_kuru-platform-process-fixture")).unwrap(),
+        "{text}"
+    );
     assert!(
         text.contains(&format!("root pid={} ", child.id())),
         "{text}"
     );
     assert!(
-        text.contains(&format!(
-            "pid={} image=kuru-platform-process-fixture.exe",
-            leaf.id
-        )),
+        text.contains(&format!("pid={} image={} cpu=", leaf.id, image.display())),
         "{text}"
     );
     // Observation neither cached nor ended anything.

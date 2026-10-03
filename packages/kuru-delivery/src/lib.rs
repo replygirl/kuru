@@ -10,6 +10,10 @@ pub mod command;
 pub mod coverage;
 #[cfg(feature = "tooling")]
 pub mod docs;
+// Shared with the advisory integration tests and scanner fixture.
+#[cfg(all(test, feature = "tooling"))]
+#[path = "../tests/support/fixture_git.rs"]
+mod fixture_git;
 #[cfg(any(feature = "tooling", windows))]
 mod lease;
 #[cfg(feature = "tooling")]

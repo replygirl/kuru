@@ -3,8 +3,9 @@
 use anyhow::{Context, Result, ensure};
 use kuru_delivery::command::{Command, output};
 use std::{
-    fs::{File, OpenOptions, TryLockError},
+    fs::{self, File, OpenOptions, TryLockError},
     io,
+    path::Path,
     time::Duration,
 };
 use tokio::time::{Instant, sleep_until};
@@ -98,6 +99,30 @@ async fn exited_root_output_survives_descendant_quiescence_failure_and_owned_cle
     Ok(())
 }
 
+/// Every listed Job member names its full image path, and one of them is the
+/// fixture executable itself.
+fn ensure_full_image_paths(diagnostic: &str) -> Result<()> {
+    let fixture = fs::canonicalize(env!("CARGO_BIN_EXE_kuru-delivery-fixture"))?;
+    let mut found = false;
+    for listed in diagnostic.split(" image=").skip(1) {
+        let image = [" cpu=", " sample_error="]
+            .iter()
+            .filter_map(|field| listed.find(field))
+            .min()
+            .map_or(listed, |end| &listed[..end]);
+        ensure!(
+            Path::new(image).is_absolute(),
+            "member image {image:?} is not a full path: {diagnostic}"
+        );
+        found |= fs::canonicalize(image).is_ok_and(|image| image == fixture);
+    }
+    ensure!(
+        found,
+        "no member image is the fixture executable: {diagnostic}"
+    );
+    Ok(())
+}
+
 fn held_tree_command(root: &std::path::Path, mode: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kuru-delivery-fixture"));
     command
@@ -130,14 +155,14 @@ async fn quiescence_failure_lists_the_live_descendant_before_owned_cleanup() -> 
         "state=exited(1)",
         "job active=",
         "members=[pid=",
-        "image=kuru-delivery-fixture.exe cpu=",
+        "\\kuru-delivery-fixture.exe cpu=",
     ] {
         ensure!(
             diagnostic.contains(required),
             "missing {required}: {diagnostic}"
         );
     }
-    Ok(())
+    ensure_full_image_paths(&diagnostic)
 }
 
 #[tokio::test]
@@ -154,7 +179,7 @@ async fn timeout_lists_the_running_root_before_owned_cleanup() -> Result<()> {
         r#"arguments=["command-held-descendant""#,
         "tree before cleanup: root pid=",
         "state=running cpu=",
-        "image=kuru-delivery-fixture.exe cpu=",
+        "\\kuru-delivery-fixture.exe cpu=",
     ] {
         ensure!(
             diagnostic.contains(required),
@@ -165,5 +190,6 @@ async fn timeout_lists_the_running_root_before_owned_cleanup() -> Result<()> {
         !diagnostic.contains("job_error=") && !diagnostic.contains("image_error="),
         "tree observation failed: {diagnostic}"
     );
-    Ok(())
+    // A timed-out fixture names each Job member by its full image path.
+    ensure_full_image_paths(&diagnostic)
 }

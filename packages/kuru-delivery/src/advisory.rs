@@ -520,35 +520,10 @@ pub async fn scan(database: &Path, audit_binary: &Path) -> Result<DatabaseRevisi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use crate::fixture_git::FixtureGit;
 
     async fn git(directory: &Path, arguments: &[&str]) {
-        let environment = GitEnvironment::new().unwrap();
-        let mut command = crate::command::rooted(directory, "git");
-        // The helper begins with hostile inherited selectors/config injection;
-        // the production environment must remove them before invoking Git.
-        command
-            .env("GIT_DIR", "foreign-directory")
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-            .env("GIT_CONFIG_VALUE_0", "foreign-hooks");
-        environment.configure_git(&mut command);
-        command.args(arguments);
-        let started = Instant::now();
-        let output =
-            crate::command::bounded_output(&mut command, Duration::from_secs(10), OUTPUT_LIMIT)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "git {arguments:?} in {directory:?} failed after {:?}: {error}",
-                        started.elapsed()
-                    )
-                });
-        assert!(
-            output.status.success(),
-            "git {arguments:?} in {directory:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        git_with_environment(directory, arguments, &[]).await;
     }
 
     async fn git_with_environment(
@@ -556,25 +531,20 @@ mod tests {
         arguments: &[&str],
         environment: &[(&str, &str)],
     ) {
-        let environment_settings = GitEnvironment::new().unwrap();
-        let mut command = crate::command::rooted(directory, "git");
-        environment_settings.configure_git(&mut command);
-        command.args(arguments).envs(environment.iter().copied());
-        let started = Instant::now();
-        let output =
-            crate::command::bounded_output(&mut command, Duration::from_secs(10), OUTPUT_LIMIT)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "git {arguments:?} in {directory:?} failed after {:?}: {error}",
-                        started.elapsed()
-                    )
-                });
-        assert!(
-            output.status.success(),
-            "git {arguments:?} in {directory:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let fixture = FixtureGit::new();
+        let production = GitEnvironment::new().unwrap();
+        let mut command = fixture.command(directory);
+        // The helper begins with hostile inherited selectors/config injection;
+        // the production environment must remove them before invoking Git.
+        command
+            .env("GIT_DIR", "foreign-directory")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", "foreign-hooks");
+        production.configure_git(&mut command);
+        fixture
+            .run(command, directory, arguments, environment)
+            .await;
     }
 
     // A missing working directory fails the launch at once, so the helpers'
@@ -596,9 +566,13 @@ mod tests {
             async move { git(&missing, &["status", "--short"]).await }
         })
         .await;
+        // The launch failed before Git could write its Trace2 file, and the
+        // message says so in the trace tail field.
         for required in [
             r#"git ["status", "--short"]"#,
             &format!("in {missing:?} failed after "),
+            "; trace2 tail (",
+            "trace2-0.json): <unavailable: ",
         ] {
             assert!(message.contains(required), "missing {required}: {message}");
         }
@@ -607,7 +581,12 @@ mod tests {
             async move { git_with_environment(&missing, &["log"], &[("GIT_PAGER", "cat")]).await }
         })
         .await;
-        for required in [r#"git ["log"]"#, &format!("in {missing:?} failed after ")] {
+        for required in [
+            r#"git ["log"]"#,
+            &format!("in {missing:?} failed after "),
+            "; trace2 tail (",
+            "trace2-0.json): <unavailable: ",
+        ] {
             assert!(message.contains(required), "missing {required}: {message}");
         }
     }
@@ -702,8 +681,6 @@ mod tests {
                 "user.name=fixture",
                 "-c",
                 "user.email=fixture@example.invalid",
-                "-c",
-                "commit.gpgsign=false",
                 "commit",
                 "-m",
                 "fresh source",
@@ -711,11 +688,11 @@ mod tests {
         )
         .await;
         let origin = source.to_str().unwrap();
+        // The stale checkout is its own detached root commit: a fixture fetch
+        // would start transport children, and the refresh under test fetches.
         git(&database, &["init"]).await;
         git(&database, &["remote", "add", "origin", origin]).await;
         git(&database, &["config", "remote.origin.fetch", FETCH_REFSPEC]).await;
-        git(&database, &["fetch", "--no-tags", "origin", "HEAD"]).await;
-        git(&database, &["checkout", "--detach", "FETCH_HEAD"]).await;
         git_with_environment(
             &database,
             &[
@@ -723,8 +700,6 @@ mod tests {
                 "user.name=fixture",
                 "-c",
                 "user.email=fixture@example.invalid",
-                "-c",
-                "commit.gpgsign=false",
                 "commit",
                 "--allow-empty",
                 "-m",
@@ -737,6 +712,7 @@ mod tests {
             ],
         )
         .await;
+        git(&database, &["checkout", "--detach", "HEAD"]).await;
 
         let refreshed = refresh_with_origin(&database, origin).await.unwrap();
         assert!(refreshed.committed_at > 946_684_800);
