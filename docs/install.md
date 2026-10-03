@@ -204,7 +204,9 @@ require `--version` and are used directly, without appending another version
 directory. Remote sources and redirects must use HTTPS. Downloads and extraction
 run under a per-step file-size limit (a lower inherited `ulimit -f` hard limit
 still applies), and checksums are verified before extraction. Checksums detect
-corruption; trust comes from the release source you choose.
+corruption; trust comes from the release source you choose. Each step's limit
+also covers its error output, so send the installer's output to a terminal, a
+pipe or a new file rather than appending it to a log already over 64 KiB.
 
 ## Shell completions and manual page
 
