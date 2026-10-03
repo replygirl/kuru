@@ -561,8 +561,8 @@ fn incident_exec_auto_install_workflow_is_rejected() {
     );
     repo.replace(
         ".github/workflows/native-tests.yml",
-        "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      - name: Install coverage components",
-        "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n          MISE_EXEC_AUTO_INSTALL: \"true\"\n      - name: Install coverage components",
+        "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n      # Provisioning, not hiding:",
+        "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n          MISE_EXEC_AUTO_INSTALL: \"true\"\n      # Provisioning, not hiding:",
     );
     repo.replace(
         ".github/workflows/ci.yml",

@@ -101,6 +101,13 @@ async fn main() -> io::Result<()> {
             }
             io::stdout().write_all(&bytes)?;
         }
+        // A started root that never finishes and keeps both pipes open, so a
+        // bounded caller reaches its timeout arm on every OS.
+        Some("never-finish") => {
+            io::stdout().write_all(b"R")?;
+            io::stdout().flush()?;
+            std::future::pending::<()>().await;
+        }
         Some("mark") => {
             let path = arguments
                 .next()

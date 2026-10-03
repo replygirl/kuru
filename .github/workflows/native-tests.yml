@@ -120,6 +120,14 @@ jobs:
           install_args: ${{ inputs.os == 'windows-11-arm' && 'rust github:aligned-team/cospec' || 'rust aqua:taiki-e/cargo-llvm-cov github:aligned-team/cospec' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
+      # Provisioning, not hiding: the job's first execution of the freshly
+      # installed cospec executable happens here, bounded by the job limit and
+      # timed in the log, so the delivery contract test's 30 s bound for each
+      # call measures a warm executable. A stall on the warm executable still
+      # fails that call with its label and diagnostics.
+      - name: Execute the installed cospec once
+        shell: bash
+        run: time cospec --version
       - name: Install coverage components
         if: env.KURU_NATIVE_MODE == 'instrumented'
         run: rustup component add llvm-tools-preview --toolchain 1.98.1
