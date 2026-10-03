@@ -1728,7 +1728,7 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
     let marker = project.path().join("second-hook-started");
     let survived = project.path().join("hook-descendant-survived");
     let script = format!(
-        "request=$(cat); case \"$request\" in *dream-hook-call-1*) printf '%s' '{{\"decision\":\"annotate\",\"annotation\":\"candidate only\"}}';; *) printf started > '{}'; (sleep 1; printf survived > '{}') & sleep 30;; esac",
+        "request=$(cat); case \"$request\" in *dream-hook-call-1*) printf '%s' '{{\"decision\":\"annotate\",\"annotation\":\"candidate only\"}}';; *) (printf '%s' $$ > '{0}.tmp'; mv '{0}.tmp' '{0}'; sleep 30; printf survived > '{1}') & sleep 30;; esac",
         marker.display(),
         survived.display()
     );
@@ -1779,10 +1779,22 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
             .iter()
             .any(|message| message.role == "kuru-hook")
     );
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    // The second hook's backgrounded subshell published the owned group id
+    // (`$$`, the root's pid, which leads its group) once it was running, and
+    // it outlives every bound here, so only the reap can have emptied the
+    // group. Signal zero and a listing only; observation never terminates
+    // anything, and an unclassifiable number is not `none_of_ours`.
+    let group: u32 = std::fs::read_to_string(&marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let reaped = kuru_platform::unix::observe_group_after_reap(group);
     assert!(
-        !survived.exists(),
-        "hook descendant survived dream cancellation"
+        reaped.none_of_ours(),
+        "hook descendant survived dream cancellation: {reaped}; \
+         descendant outlived its 30 s sleep: {}",
+        survived.exists()
     );
     harness.shutdown(false).await.unwrap();
 }
