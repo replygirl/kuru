@@ -542,10 +542,12 @@ and written only on evidence this process observed itself:
   Its retirement step, `test_support::retire_idle_service`, asks the owner to
   retire through the maintenance acquisition, retrying while attached clients
   make it refuse, until one deadline carried across those retries:
-  `memory.startup_timeout_secs` (30 s by default) from its first request, the
-  same deadline each maintenance attempt enforces on its start-lock wait,
-  owner response and owner-lock wait. It covers an owner that has not shown it
-  is closing (a client still attached, the start lock held, or no reply yet);
+  `memory.startup_timeout_secs` (30 s by default) from its first request,
+  never longer than the deadline each maintenance attempt enforces on its
+  start-lock wait, owner response and owner-lock wait (the longer of
+  `startup_timeout_secs` and the close budget below). It covers an owner that
+  has not shown it is closing (a client still attached, the start lock held,
+  or no reply yet);
   no fixture-only bound applies. A request that finds no live endpoint while
   the owner's records show it still opening (an open-activity record not
   marked failing, and no endpoint record) is not a closing reading: an
@@ -584,8 +586,10 @@ and written only on evidence this process observed itself:
   whose best-effort record write failed, publishes no record, so its open
   reads as a close (only in-process test owners are untokened). No
   close step is stamped, so which close step is slow is not known. The
-  product's own maintenance election deadline (`startup_timeout_secs`, 30 s by
-  default) is shorter than that close budget; aligning it is separate work.
+  product's own maintenance permit acquisition waits, from its start, for the
+  longer of that close budget and `startup_timeout_secs` on its start-lock
+  wait, owner response and owner-lock wait, so it does not fail behind an
+  owner whose close is still within the budget that owner allows itself.
 - `test_support::await_store_quiescence(&directory, lifecycle_root)` does the
   same for one store whose engine ran in another process, such as a spawned
   `kuru` executable.
