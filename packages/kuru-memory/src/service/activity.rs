@@ -1946,6 +1946,16 @@ mod tests {
     // must not retire the endpoint while that write is pending.
     #[tokio::test]
     async fn the_publishers_last_write_lands_before_the_endpoint_retires() -> Result<()> {
+        // Red without `finish_writes` only on a current-thread runtime: on a
+        // multi-thread one the gated writes can race the endpoint retire, and
+        // this test could pass without the ordering it gates.
+        ensure!(
+            matches!(
+                tokio::runtime::Handle::current().runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::CurrentThread
+            ),
+            "the last-write ordering fixture requires a current-thread runtime"
+        );
         warm_runtime_cache().await?;
         let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
@@ -1991,6 +2001,12 @@ mod tests {
             // Released before the gate opens: a close that retires its
             // endpoint without awaiting the publisher reaches the next pause
             // in this same scheduler pass, before the gated write can run.
+            // Two facts make that hold, and so keep this test red without
+            // `finish_writes`: the current-thread runtime asserted above
+            // polls woken tasks in FIFO order, so the close runs before the
+            // publisher; and `EndpointRecord::retire` is a synchronous `fn`,
+            // so the close reaches `AfterEndpointRetire` without yielding.
+            // If either changes, re-establish red without `finish_writes`.
             pause.release.notify_one();
             gate.add_permits(1);
             pause.entered.notified().await;
