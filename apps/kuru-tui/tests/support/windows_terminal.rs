@@ -9,6 +9,9 @@ use std::{
 };
 
 pub const READY: Duration = Duration::from_secs(10);
+// Includes the actual memory shutdown grace/escalation and one pending commit.
+// Also bounds closing the console to drain output after an observed exit.
+pub const EXIT: Duration = Duration::from_secs(30);
 const TICK: Duration = Duration::from_millis(20);
 const OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 
@@ -258,7 +261,14 @@ impl Terminal {
                 return Ok(());
             }
             if let Some(status) = self.child.try_wait()? {
-                bail!("{description}: child exited {status:?}\n{}", self.screen());
+                let drained = self.drain_after_exit();
+                if ready(self) {
+                    return Ok(());
+                }
+                bail!(
+                    "{description}: child exited {status:?}; {drained}\n{}",
+                    self.screen()
+                );
             }
             ensure!(
                 Instant::now() < deadline,
@@ -266,6 +276,67 @@ impl Terminal {
                 self.screen()
             );
         }
+    }
+
+    /// Waits for the child's exit without reading or closing the console, so
+    /// the caller can still act on the live console. The output pump keeps
+    /// draining ConPTY into its unbounded channel meanwhile.
+    pub fn wait_exited(&mut self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "ConPTY child did not exit within {timeout:?}\n{}",
+                self.screen()
+            );
+            std::thread::sleep(TICK);
+        }
+    }
+
+    // ConPTY keeps its output pipe open after the child exits: portable-pty
+    // shares the pseudoconsole between master and slave, and only dropping the
+    // master runs ClosePseudoConsole. Close it as `finish` does, bounded by
+    // EXIT, so conhost flushes the final frame and the pump reaches EOF; then
+    // move everything queued into `output` and the parser. Returns a summary
+    // for the exit error; a cleanup failure is reported there, never replacing
+    // the exit itself.
+    fn drain_after_exit(&mut self) -> String {
+        let closed = self.console.close(EXIT);
+        let mut eof = false;
+        let mut issue = None;
+        loop {
+            match self.receive.try_recv() {
+                Ok(Ok(bytes)) => {
+                    self.parser.process(&bytes);
+                    self.output.extend(bytes);
+                }
+                Ok(Err(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                    ) => {}
+                Ok(Err(error)) => {
+                    issue.get_or_insert_with(|| format!("; output error: {error}"));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    eof = true;
+                    break;
+                }
+                // Only a close that timed out leaves the pump running.
+                Err(mpsc::TryRecvError::Empty) => break,
+            }
+        }
+        let closed = match closed {
+            Ok(()) => String::new(),
+            Err(error) => format!("; console close: {error:#}"),
+        };
+        format!(
+            "output EOF reached={eof}{closed}{}",
+            issue.unwrap_or_default()
+        )
     }
 
     pub fn text(&mut self, values: &[&str], timeout: Duration) -> Result<()> {

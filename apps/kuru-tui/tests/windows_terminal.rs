@@ -20,11 +20,9 @@ use std::{
 mod memory;
 #[path = "support/windows_terminal.rs"]
 mod terminal;
-use terminal::{READY, Terminal};
+use terminal::{EXIT, READY, Terminal};
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-// Includes the actual memory shutdown grace/escalation and one pending commit.
-const EXIT: Duration = Duration::from_secs(30);
 
 #[test]
 fn composer_coordinates_use_physical_rows_after_conpty_autowrap() {
@@ -451,6 +449,41 @@ async fn native_conpty_trust_refusal_and_persistent_choice_precede_the_alternate
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_conpty_wait_drains_the_line_written_just_before_exit() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    // The child prints one line and exits at once. A wait that sees the exit
+    // must not drop that line from what the caller observes afterwards.
+    let temporary = kuru_memory::test_support::tempdir()?;
+    let system = kuru_platform::windows::process::system_directory()?;
+    let root = system.parent().context("System32 parent")?;
+    let mut terminal = Terminal::spawn(
+        &temporary.path().join("drain-on-exit"),
+        json!({
+            "mode":"app",
+            "binary":system.join("cmd.exe"),
+            "args":["/d", "/c", "echo", "DRAIN_ON_EXIT_MARKER"],
+            "environment":{"SystemRoot":root},
+            "cwd":temporary.path(),
+        }),
+        38,
+        130,
+    )?;
+    let error = terminal
+        .wait("child prints its marker and exits", READY, |_| false)
+        .unwrap_err();
+    ensure!(error.to_string().contains("child exited"), "{error:#}");
+    ensure!(
+        error.to_string().contains("output EOF reached=true"),
+        "{error:#}"
+    );
+    ensure!(
+        String::from_utf8_lossy(&terminal.output).contains("DRAIN_ON_EXIT_MARKER"),
+        "the line written just before exit was dropped: {error:#}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_console_modes_restore_after_partial_initialization_and_errors() -> Result<()> {
     let _serial = SERIAL.lock().await;
     let sandbox = Sandbox::warmed().await?;
@@ -507,13 +540,11 @@ async fn native_conpty_error_drop_returns_while_console_close_is_delayed() -> Re
     let _serial = SERIAL.lock().await;
     let sandbox = Sandbox::warmed().await?;
     let mut terminal = sandbox.start("drop-error", "partial-error", &[], true, "demo", &[])?;
-    let error = terminal
-        .text(&["marker-the-error-fixture-never-renders"], READY)
-        .unwrap_err();
-    ensure!(
-        error.to_string().contains("child exited"),
-        "expected the real console fixture's exit, got {error:#}"
-    );
+    // Observe the exit without the wait's drain, which closes the console:
+    // this test wraps the live master below to observe the drop's closure.
+    terminal
+        .wait_exited(READY)
+        .context("expected the real console fixture's exit")?;
     let report: Value =
         serde_json::from_slice(&std::fs::read(sandbox.root.join("drop-error/report.json"))?)?;
     assert_eq!(report["status"], 1);

@@ -587,7 +587,9 @@ fn terminal_timeouts_report_the_launch_and_a_process_tree_snapshot() -> Result<(
 }
 
 #[test]
-fn terminal_wait_reports_output_still_queued_when_the_exit_is_seen() -> Result<()> {
+fn terminal_wait_drains_the_line_written_just_before_exit() -> Result<()> {
+    // The child writes LATE and exits at once. A wait that sees the exit must
+    // not drop that last line from what the caller observes afterwards.
     let mut terminal = fixture("late-output")?;
     let mut paused = false;
     let error = terminal
@@ -604,6 +606,15 @@ fn terminal_wait_reports_output_still_queued_when_the_exit_is_seen() -> Result<(
         .unwrap_err()
         .to_string();
     assert!(paused, "{error}");
+    // The wait drained the queued line into `output` and the screen, in order,
+    // before it returned; no later read is needed to observe it.
+    let output = String::from_utf8_lossy(&terminal.output);
+    let early = output.find("EARLY").with_context(|| error.clone())?;
+    let late = output
+        .find("LATE")
+        .with_context(|| format!("the line written just before exit was dropped: {error}"))?;
+    assert!(early < late, "{error}");
+    assert!(terminal.screen().contains("LATE"), "{error}");
     let (before, after) = error
         .split_once("output not yet read when the exit was seen")
         .with_context(|| format!("no late-output section: {error}"))?;
@@ -612,6 +623,7 @@ fn terminal_wait_reports_output_still_queued_when_the_exit_is_seen() -> Result<(
     assert!(before.contains("EARLY"), "{error}");
     assert!(!before.contains("LATE"), "{error}");
     assert!(after.contains("LATE"), "{error}");
+    assert!(after.contains("EOF reached=true"), "{error}");
     // The report's complete output includes what was still queued.
     let (_, complete) = after
         .split_once("complete PTY output (")
@@ -621,12 +633,6 @@ fn terminal_wait_reports_output_still_queued_when_the_exit_is_seen() -> Result<(
         "{error}"
     );
     assert!(after.contains("child exited"), "{error}");
-    // Reporting leaves what the caller observes unchanged: the queued output
-    // reaches `output` only through a later read, in order.
-    let late = |output: &[u8]| output.windows(4).any(|bytes| bytes == b"LATE");
-    assert!(!late(&terminal.output), "{error}");
-    terminal.read_for(Duration::from_millis(100))?;
-    assert!(late(&terminal.output), "{error}");
     Ok(())
 }
 
