@@ -622,7 +622,10 @@ handle closes. A `ServiceOwner::open` that fails releases its owner lock after
 its store has closed and reaped Dolt, and before the open returns, so a starter
 can elect a successor on that lock at once. The test
 `a_failed_open_releases_its_owner_lock_despite_a_duplicate_descriptor` holds a
-duplicate of the failing owner's lock across its open.
+duplicate of the failing owner's lock across its open. A maintenance permit
+holds both locks and releases the owner lock before the start lock, the reverse
+of their acquisition, so a starter that wins the start lock does not meet a
+departing permit's owner lock.
 
 An owner ends itself when its last attachment releases, so a fixture that
 needs a running owner chooses its lifetime policy. `ServeKnobs`

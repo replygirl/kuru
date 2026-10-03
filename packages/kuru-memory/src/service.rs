@@ -2413,10 +2413,12 @@ impl Drop for ServiceLock {
 /// Retains both election and owner authority while an explicit maintenance
 /// operation inspects or moves this project's storage. An active service must
 /// retire before this permit can be acquired; a new starter cannot elect until
-/// the permit is dropped.
+/// the permit is dropped. Fields drop in declaration order, so the owner lock
+/// is released before the start lock, the reverse of their acquisition: a
+/// starter that elects on the freed start lock then finds the owner lock free.
 pub(crate) struct MaintenancePermit {
-    _start: ServiceLock,
     _owner: ServiceLock,
+    _start: ServiceLock,
 }
 
 /// Where a maintenance permit acquisition is, for a caller whose own bound
@@ -2600,8 +2602,8 @@ pub(crate) async fn acquire_maintenance_permit_traced(
     start.verify()?;
     owner.verify()?;
     Ok(MaintenancePermit {
-        _start: start,
         _owner: owner,
+        _start: start,
     })
 }
 

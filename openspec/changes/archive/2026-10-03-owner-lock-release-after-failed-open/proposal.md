@@ -25,7 +25,9 @@ existed, but its drop did not use it.
 
 - `ServiceLock` unlocks explicitly before its handle closes on every ending:
   `release()` as before, and now its drop, so every error return, a dropped
-  `MaintenancePermit` and every probe release the lock at once.
+  `MaintenancePermit` and every probe release the lock at once. A dropped
+  `MaintenancePermit` releases its owner lock before its start lock, the
+  reverse of acquisition, by field order.
 - A failed `ServiceOwner::open` whose store had opened releases its owner lock
   explicitly after `close_store_and_record` (record marked, store closed and
   Dolt reaped, record retired) and before it returns; a release failure is added
@@ -47,7 +49,8 @@ released description keep the lock held past the open's return.
 ## Impact
 
 - `packages/kuru-memory/src/service.rs`: `ServiceLock` (`Drop`, `file()`,
-  `release`), `ServiceOwner::open_hooked` failure path, test hook use.
+  `release`), `MaintenancePermit` field order, `ServiceOwner::open_hooked`
+  failure path, test hook use.
 - `packages/kuru-memory/src/service/activity.rs`: `OwnerHooks::duplicate_owner_lock`
   (test-only) and the regression test.
 - Docs: `docs/development.md`.

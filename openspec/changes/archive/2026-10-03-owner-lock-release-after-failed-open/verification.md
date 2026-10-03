@@ -9,7 +9,9 @@
 - [x] 2.1 @integration (agent) `mise run //packages/kuru-memory:test` (full) -> observed: exit 0, lib 698 passed, 0 failed, 6 ignored (713.0 s); bundle_build 10, memory 5, server_lifecycle 12, supervisor_snapshot 1 passed; wall 741 s
 - [x] 2.2 @integration (agent) `mise run //packages/kuru-memory:test -- service::activity` five times -> observed: five runs, each `37 passed; 0 failed` (21.4-26.0 s), including the unchanged `a_failed_endpoint_publication_marks_then_retires_the_record`
 
+- [x] 2.3 @integration (agent) after `MaintenancePermit` was reordered to release Owner before Start: `mise run //packages/kuru-memory:test` (full) -> observed 2026-10-03 macOS arm64: exit 0, lib 698 passed, 0 failed, 6 ignored (696.4 s); bundle_build 10, memory 5, server_lifecycle 12, supervisor_snapshot 1 passed
+
 ## 3. Static checks
 
-- [x] 3.1 @unit (agent) `mise run format:check`, `mise run lint`, `mise run lint:windows`, `mise run typecheck`, `mise run docs:check`, `mise run cospec -- validate --all --strict` -> observed: each exit 0 (docs tasks run with `NODE_OPTIONS` unset; the shell's preload breaks the docs toolchain); validate 0 errors, 0 warnings
+- [x] 3.1 @unit (agent) `mise run format:check`, `mise run lint`, `mise run lint:windows`, `mise run typecheck`, `mise run docs:check`, `mise run cospec -- validate --all --strict` -> observed: each exit 0 (docs tasks run with `NODE_OPTIONS` unset; the shell's preload breaks the docs toolchain); validate 0 errors, 0 warnings. Re-run after the `MaintenancePermit` reorder: each exit 0 (`format:check` and `lint` exit 1 under the shell's `NODE_OPTIONS` preload in the docs toolchain step, 0 with it unset)
 - [~] 3.2 @runtime (agent) native memory partitions in PR CI on every supported platform -> defer: PR CI runs after the branch is pushed and a PR is opened; CI reruns are not used as evidence here
