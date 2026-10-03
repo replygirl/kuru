@@ -524,7 +524,15 @@ pub struct Harness {
     progress: watch::Sender<Option<FacingProgress>>,
     context: watch::Sender<ContextSnapshot>,
     context_epoch: Arc<AtomicU64>,
+    /// The provider's model listing, filled by the first successful
+    /// `models()` call. A failed listing leaves it empty so the next metadata
+    /// lookup retries; that lookup proceeds with the embedded catalog and the
+    /// assumed context window instead of failing.
     model_infos: OnceCell<Vec<ModelInfo>>,
+    /// Set by the first failed listing so a provider whose catalog stays
+    /// unavailable warns once per harness, the same lifetime as the cache; a
+    /// session switch resets neither.
+    model_catalog_warned: AtomicBool,
     invocation_ordinal: AtomicU64,
     pub(crate) operation_id: String,
     aborted_turn: Arc<Mutex<Option<AbortedTurn>>>,
@@ -820,6 +828,7 @@ impl Harness {
             context,
             context_epoch: Arc::new(AtomicU64::new(0)),
             model_infos: OnceCell::new(),
+            model_catalog_warned: AtomicBool::new(false),
             invocation_ordinal: AtomicU64::new(0),
             operation_id: Uuid::new_v4().to_string(),
             aborted_turn: Arc::new(Mutex::new(None)),
@@ -976,10 +985,30 @@ impl Harness {
     }
 
     async fn selected_model_metadata(&self) -> Result<ModelMetadata> {
-        let models = self
+        let models = match self
             .model_infos
-            .get_or_init(|| async { self.provider.models().await.unwrap_or_default() })
-            .await;
+            .get_or_try_init(|| self.provider.models())
+            .await
+        {
+            Ok(models) => models.as_slice(),
+            Err(error) => {
+                if !self.model_catalog_warned.swap(true, Ordering::Relaxed) {
+                    // The diagnostics ring keeps only the allow-listed
+                    // operation and status; the model and provider error text
+                    // reach other subscribers but are never persisted there.
+                    let error = format!("{error:#}");
+                    tracing::warn!(
+                        target: "kuru.runtime",
+                        operation = "model-catalog",
+                        status = "unavailable",
+                        model = %self.config.model,
+                        error = %error,
+                        "model catalog unavailable"
+                    );
+                }
+                &[]
+            }
+        };
         let route = match self.config.provider.as_str() {
             "codex" => ModelRoute::CodexSubscription,
             "responses"
@@ -7416,5 +7445,231 @@ mod tool_result_tests {
             assert!(output.contains(TRUNCATED));
             assert_complete_markers(output);
         }
+    }
+}
+
+#[cfg(test)]
+mod model_catalog_tests {
+    use super::*;
+
+    /// The message of the runtime's unavailable-catalog warning.
+    const CATALOG_WARNING: &str = "model catalog unavailable";
+
+    /// Warnings observed per `model` field, scoped so concurrent tests in this
+    /// binary cannot see or hide each other's records.
+    static CATALOG_WARNINGS: std::sync::Mutex<Vec<(String, String)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    #[derive(Default)]
+    struct WarningFields {
+        message: String,
+        model: String,
+        error: String,
+    }
+
+    impl tracing::field::Visit for WarningFields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "model" => self.model = value.to_owned(),
+                "error" => self.error = value.to_owned(),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            match field.name() {
+                "message" => self.message = format!("{value:?}"),
+                "model" => self.model = format!("{value:?}"),
+                "error" => self.error = format!("{value:?}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// The process-wide recorder of `kuru.runtime` catalog warnings.
+    ///
+    /// Installed once as the global default so every thread resolves to it;
+    /// a thread-scoped subscriber can miss callsites another thread cached as
+    /// never enabled (see kuru-memory's `RetainedStageRecorder`). No other
+    /// code in this test binary installs a subscriber.
+    struct CatalogWarningRecorder;
+
+    impl tracing::Subscriber for CatalogWarningRecorder {
+        fn register_callsite(
+            &self,
+            metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            if metadata.target() == "kuru.runtime" && metadata.is_event() {
+                tracing::subscriber::Interest::always()
+            } else {
+                tracing::subscriber::Interest::never()
+            }
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "kuru.runtime" && metadata.is_event()
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = WarningFields::default();
+            event.record(&mut fields);
+            if *event.metadata().level() == tracing::Level::WARN
+                && fields.message == CATALOG_WARNING
+            {
+                CATALOG_WARNINGS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((fields.model, fields.error));
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Install [`CatalogWarningRecorder`] once, then rebuild every cached
+    /// callsite interest against it.
+    fn install_catalog_warning_recorder() {
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "this is the process-wide recorder the ban points to: installed once per test process behind a OnceLock, then every cached callsite interest is rebuilt"
+            )]
+            tracing::subscriber::set_global_default(CatalogWarningRecorder).expect(
+                "the catalog warning recorder is the only global tracing subscriber in kuru-runtime's tests",
+            );
+        });
+        tracing::callsite::rebuild_interest_cache();
+    }
+
+    fn catalog_warnings(model: &str) -> Vec<String> {
+        CATALOG_WARNINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(recorded, _)| recorded == model)
+            .map(|(_, error)| error.clone())
+            .collect()
+    }
+
+    /// Fails `models()` for its first `failures` calls, then lists one model
+    /// that advertises a context window.
+    struct FlakyCatalogProvider {
+        model: String,
+        failures: usize,
+        model_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    const ADVERTISED_CONTEXT: u64 = 77_777;
+
+    #[async_trait::async_trait]
+    impl Provider for FlakyCatalogProvider {
+        async fn stream(
+            &self,
+            request: kuru_core::CompletionRequest,
+            sink: &mut dyn kuru_connectors::ProviderSink,
+        ) -> anyhow::Result<()> {
+            sink.emit(kuru_connectors::ProviderEvent::Completed(
+                self.complete(request).await?,
+            ))
+            .await
+        }
+
+        async fn models(&self) -> Result<Vec<kuru_core::ModelInfo>> {
+            let call = self.model_calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.failures {
+                bail!("catalog endpoint unavailable (attempt {})", call + 1);
+            }
+            Ok(vec![kuru_core::ModelInfo {
+                id: self.model.clone(),
+                name: self.model.clone(),
+                efforts: vec![],
+                default_effort: None,
+                metadata: ModelMetadata {
+                    context_window_tokens: Some(kuru_core::Sourced::advertised(ADVERTISED_CONTEXT)),
+                    ..ModelMetadata::default()
+                },
+            }])
+        }
+
+        async fn complete(&self, _request: kuru_core::CompletionRequest) -> Result<Completion> {
+            Ok(Completion::from_legacy("answer", vec![], 1, 1))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_model_catalog_is_retried_and_warned_once_per_session() {
+        install_catalog_warning_recorder();
+        let model = "catalog-retry-model";
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let provider = Arc::new(FlakyCatalogProvider {
+            model: model.into(),
+            failures: 2,
+            model_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let harness = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: model.into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let calls_before = provider.model_calls.load(Ordering::SeqCst);
+        assert_eq!(calls_before, 0, "construction must not list models");
+
+        // Two failed listings: each call proceeds with the fallback metadata.
+        for attempt in 1..=2 {
+            let metadata = harness.selected_model_metadata().await.unwrap();
+            assert_eq!(
+                metadata.context_window_tokens, None,
+                "attempt {attempt} must fall back to the assumed context window"
+            );
+            assert_eq!(provider.model_calls.load(Ordering::SeqCst), attempt);
+        }
+        assert_eq!(
+            harness
+                .selected_model_metadata()
+                .await
+                .unwrap()
+                .context_window_tokens,
+            Some(kuru_core::Sourced::advertised(ADVERTISED_CONTEXT)),
+            "the listing after the failures must reach the real catalog"
+        );
+        assert_eq!(provider.model_calls.load(Ordering::SeqCst), 3);
+        // The successful listing is cached for the rest of the session.
+        harness.context_budget().await.unwrap();
+        assert_eq!(provider.model_calls.load(Ordering::SeqCst), 3);
+
+        let warnings = catalog_warnings(model);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a provider down for several calls warns once per session: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("catalog endpoint unavailable (attempt 1)"),
+            "the warning carries the first failure: {warnings:?}"
+        );
+        memory.close().await.unwrap();
     }
 }
