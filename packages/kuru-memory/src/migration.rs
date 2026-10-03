@@ -43,6 +43,32 @@ pub(crate) struct MigrationReceipt {
     pub state: usize,
 }
 
+/// How long the legacy snapshot may go without progress while its source is
+/// busy or locked. Progress restarts the bound, so a large database or slow
+/// storage completes however long the whole copy takes.
+const SNAPSHOT_STALL_BOUND: Duration = Duration::from_secs(30);
+
+/// Drives backup steps until `Done`, failing only after `SNAPSHOT_STALL_BOUND`
+/// passes with no `More` step since the last progress.
+fn run_backup(
+    mut step: impl FnMut() -> rusqlite::Result<StepResult>,
+    mut now: impl FnMut() -> Instant,
+) -> Result<()> {
+    let mut deadline = now() + SNAPSHOT_STALL_BOUND;
+    loop {
+        ensure!(
+            now() < deadline,
+            "legacy memory snapshot made no progress for {} s while the source was busy or locked; retry when it is free",
+            SNAPSHOT_STALL_BOUND.as_secs()
+        );
+        match step()? {
+            StepResult::Done => return Ok(()),
+            StepResult::More => deadline = now() + SNAPSHOT_STALL_BOUND,
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
 pub(crate) fn prepare(data_dir: &Path, project_scope: &str) -> Result<Option<LegacyImport>> {
     let source = data_dir.join("memory.sqlite3");
     let metadata = match fs::symlink_metadata(&source) {
@@ -72,18 +98,7 @@ pub(crate) fn prepare(data_dir: &Path, project_scope: &str) -> Result<Option<Leg
     let mut snapshot = Connection::open(&candidate)?;
     // Backup sees accepted WAL content while preserving source DB/WAL data.
     let backup = Backup::new(&source, &mut snapshot)?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        ensure!(
-            Instant::now() < deadline,
-            "legacy memory snapshot deadline exceeded; close older writers and retry"
-        );
-        match backup.step(256)? {
-            StepResult::Done => break,
-            StepResult::More => {}
-            _ => std::thread::sleep(Duration::from_millis(10)),
-        }
-    }
+    run_backup(|| backup.step(256), Instant::now)?;
     drop(backup);
     validate(&snapshot)?;
     let prefix = format!("{project_scope}/");
@@ -294,6 +309,70 @@ mod tests {
     use serde_json::json;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
+
+    /// A clock the test advances by a fixed step on every reading.
+    fn stepping_clock(step: Duration) -> impl FnMut() -> Instant {
+        let mut current = Instant::now();
+        move || {
+            current += step;
+            current
+        }
+    }
+
+    #[test]
+    fn snapshot_that_keeps_progressing_completes_past_the_stall_bound() {
+        // 100 progress steps, each 20 s apart on the mock clock: about 2,000 s in
+        // total, far past the 30 s bound, but never 30 s without progress.
+        let mut remaining = 100;
+        let mut steps = 0;
+        run_backup(
+            || {
+                steps += 1;
+                if remaining == 0 {
+                    return Ok(StepResult::Done);
+                }
+                remaining -= 1;
+                Ok(StepResult::More)
+            },
+            stepping_clock(Duration::from_secs(10)),
+        )
+        .unwrap();
+        assert_eq!(steps, 101);
+    }
+
+    #[test]
+    fn snapshot_stalled_on_a_busy_source_fails_naming_the_stall() {
+        // Each Busy iteration reads the clock once and advances it 11 s, so the
+        // 30 s bound passes after a few steps; the real 10 ms pause therefore
+        // runs at most three times instead of being injected.
+        let mut steps = 0;
+        let error = run_backup(
+            || {
+                steps += 1;
+                Ok(StepResult::Busy)
+            },
+            stepping_clock(Duration::from_secs(11)),
+        )
+        .unwrap_err();
+        assert!(steps <= 3, "{steps}");
+        assert_eq!(
+            error.to_string(),
+            "legacy memory snapshot made no progress for 30 s while the source was busy or locked; retry when it is free"
+        );
+    }
+
+    #[test]
+    fn snapshot_step_error_propagates() {
+        let error = run_backup(
+            || Err(rusqlite::Error::InvalidQuery),
+            stepping_clock(Duration::from_secs(1)),
+        )
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<rusqlite::Error>().is_some(),
+            "{error:#}"
+        );
+    }
 
     fn fixture() -> test_support::TempDir {
         test_support::TempDir::new("kuru-legacy memory café 東京-", None).unwrap()
