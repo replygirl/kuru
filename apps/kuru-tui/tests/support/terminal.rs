@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     io::{Read, Write},
     os::unix::net::UnixStream,
     process::Command,
@@ -20,8 +19,8 @@ const TICK: Duration = Duration::from_millis(20);
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
 type RestorationCheck = dyn Fn(&dyn MasterPty) -> Result<bool>;
 const OUTPUT_QUEUE: usize = 8;
-// Escaped PTY output shown whole in an unexpected-end report, and the window in
-// which output still queued at an observed exit is collected for it.
+// Escaped PTY output shown whole in an unexpected-end report, and the bound on
+// draining output still queued at an observed exit until the reader closes.
 const REPORT_OUTPUT_LIMIT: usize = 16 * 1024;
 const LATE_OUTPUT_WINDOW: Duration = Duration::from_millis(500);
 type OutputReceiver = mpsc::Receiver<std::io::Result<Vec<u8>>>;
@@ -139,9 +138,6 @@ pub struct Terminal {
     restored: Box<RestorationCheck>,
     parser: vt100::Parser,
     pub output: Vec<u8>,
-    // Reader messages taken only to report them. Later reads consume these
-    // first, so `output` and the parser advance exactly as if never taken.
-    pending: VecDeque<std::io::Result<Vec<u8>>>,
 }
 
 impl Terminal {
@@ -210,17 +206,13 @@ impl Terminal {
             restored,
             parser: vt100::Parser::new(rows, cols, 0),
             output: Vec::new(),
-            pending: VecDeque::new(),
         })
     }
 
     fn receive_output(
-        &mut self,
+        &self,
         timeout: Duration,
     ) -> Result<std::result::Result<std::io::Result<Vec<u8>>, mpsc::RecvTimeoutError>> {
-        if let Some(message) = self.pending.pop_front() {
-            return Ok(Ok(message));
-        }
         Ok(self
             .receive
             .as_ref()
@@ -276,51 +268,42 @@ impl Terminal {
             Ok(pid) => kuru_platform::unix::snapshot::describe(pid),
             Err(error) => format!("snapshot unavailable: {error}"),
         };
-        let mut complete = self.output.clone();
-        for bytes in self.pending.iter().flatten() {
-            complete.extend_from_slice(bytes);
-        }
         format!(
             "launch: {}; child {state}; complete PTY output ({} bytes): {}; {tree}",
             self.launch,
-            complete.len(),
-            escaped(&complete, REPORT_OUTPUT_LIMIT)
+            self.output.len(),
+            escaped(&self.output, REPORT_OUTPUT_LIMIT)
         )
     }
 
-    // Output still queued when an exit was observed. It is held in `pending`
-    // for the report only: `output` and the parser are unchanged when the wait
-    // returns, and a later read consumes it in order.
-    fn late_output(&mut self) -> String {
+    // Output still queued when an exit was observed: what the child wrote just
+    // before exiting. Process exit closes the last slave descriptor, so drain
+    // into `output` and the parser until the reader reports that close (EIO or
+    // EOF) or `LATE_OUTPUT_WINDOW` ends. Returns the report section.
+    fn drain_after_exit(&mut self) -> Result<String> {
         let deadline = Instant::now() + LATE_OUTPUT_WINDOW;
         let mut late = Vec::new();
-        let mut ended = "reader still open when the window closed";
-        while let (Some(receive), Some(remaining)) = (
-            self.receive.as_ref(),
-            deadline.checked_duration_since(Instant::now()),
-        ) {
-            match receive.recv_timeout(remaining.min(TICK)) {
+        let mut eof = false;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match self.receive_output(remaining.min(TICK))? {
                 Ok(Ok(bytes)) => {
-                    late.extend_from_slice(&bytes);
-                    self.pending.push_back(Ok(bytes));
+                    self.parser.process(&bytes);
+                    self.output.extend_from_slice(&bytes);
+                    late.extend(bytes);
                 }
-                Ok(Err(error)) => {
-                    self.pending.push_back(Err(error));
-                    ended = "reader closed";
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    ended = "reader closed";
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    eof = true;
                     break;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
-        format!(
-            "output not yet read when the exit was seen: {} bytes ({ended}): {}",
+        Ok(format!(
+            "output not yet read when the exit was seen: {} bytes (EOF reached={eof} \
+             within {LATE_OUTPUT_WINDOW:?}): {}",
             late.len(),
             escaped(&late, REPORT_OUTPUT_LIMIT)
-        )
+        ))
     }
 
     fn child_id(&self) -> Result<u32> {
@@ -342,10 +325,15 @@ impl Terminal {
                 return Ok(());
             }
             if let Some(status) = self.child.try_wait()? {
+                // Diagnostics show what was read when the exit was seen; the
+                // drain then completes `output` before the predicate decides.
+                let observed = self.diagnostics();
+                let late = self.drain_after_exit()?;
+                if predicate(self)? {
+                    return Ok(());
+                }
                 bail!(
-                    "{description}: process exited {status:?}\n{}\n{}\n{}",
-                    self.diagnostics(),
-                    self.late_output(),
+                    "{description}: process exited {status:?}\n{observed}\n{late}\n{}",
                     self.report()
                 );
             }
