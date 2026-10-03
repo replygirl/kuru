@@ -153,8 +153,24 @@ impl Fixture {
 
     fn command_from(&self, script: &str) -> Command {
         let mut command = Command::new("/bin/bash");
+        command.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script));
+        self.configure(command)
+    }
+
+    /// Runs `prelude` in a parent shell that then executes the bootstrap, so
+    /// the bootstrap inherits what the prelude sets, such as an ignored signal.
+    fn wrapped(&self, prelude: &str) -> Command {
+        let mut command = Command::new("/bin/bash");
         command
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
+            .arg("-c")
+            .arg(format!("{prelude}\nexec /bin/bash \"$0\" \"$@\""))
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("support/install.sh"))
+            .args(["--version", self.version, "--target", self.target]);
+        self.configure(command)
+    }
+
+    fn configure(&self, mut command: Command) -> Command {
+        command
             .current_dir(self.root.path())
             .env_clear()
             .env("PATH", &self.tools)
@@ -432,6 +448,8 @@ case ${FIXTURE_TRANSPORT:-ok} in
   fail-after-data)
     cat "$asset"
     exit 22 ;;
+  record-core-limit)
+    ulimit -H -c >> "$FIXTURE_ROOT/producer-core-limits" ;;
 esac
 exec cat "$asset"
 "#;
@@ -1234,6 +1252,59 @@ async fn manifest_and_archive_downloads_are_bounded_including_a_producer_that_st
     assert!(
         survivors.is_empty(),
         "oversized producer survived cleanup: {survivors:?}"
+    );
+}
+
+/// The size-limit message must not depend on the caller's signal disposition.
+/// An ancestor that ignores SIGXFSZ, which a non-interactive shell cannot
+/// reset, turns the write past the cap into EFBIG: the producer exits 1 with a
+/// cap-sized output instead of being stopped with status 153.
+#[tokio::test]
+async fn size_limit_failures_are_reported_when_the_caller_ignores_sigxfsz() {
+    let fixture = Fixture::new(TARGETS[0], "0.2.0");
+    let manifest = fixture.release.join("SHA256SUMS");
+    let original = fs::read(&manifest).unwrap();
+    File::options()
+        .write(true)
+        .open(&manifest)
+        .unwrap()
+        .set_len(64 * 1024 + 1)
+        .unwrap();
+    failure(
+        &fixture.run(fixture.wrapped("trap '' XFSZ")).await,
+        "local release asset exceeds size limit",
+    );
+    fixture.unchanged();
+    fs::write(&manifest, original).unwrap();
+    File::options()
+        .write(true)
+        .open(fixture.archive())
+        .unwrap()
+        .set_len(LIMIT + 1)
+        .unwrap();
+    failure(
+        &fixture.run(fixture.wrapped("trap '' XFSZ")).await,
+        "local release asset exceeds size limit",
+    );
+    fixture.unchanged();
+}
+
+/// A producer stopped at its cap must not leave a core dump in the installer's
+/// working directory, whatever core-dump limit the installer inherits.
+#[tokio::test]
+async fn bounded_producers_cannot_write_core_dumps() {
+    let fixture = Fixture::new(TARGETS[0], "0.2.0");
+    let mut command = fixture.explicit();
+    command
+        .env_remove("KURU_RELEASE_BASE")
+        .env("FIXTURE_TRANSPORT", "record-core-limit");
+    success(&fixture.run(command).await);
+    fixture.installed(&fixture.destination);
+    let limits = fs::read_to_string(fixture.path("producer-core-limits")).unwrap();
+    assert_eq!(
+        limits.lines().collect::<Vec<_>>(),
+        ["0"; 3],
+        "bounded producers kept a core-dump hard limit"
     );
 }
 
