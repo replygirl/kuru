@@ -826,7 +826,7 @@ pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
     .await
     .with_context(|| {
         format!(
-            "idle managed owner did not retire within 10 seconds; {}; {trace}; active-client refusals={refusals}",
+            "managed owner retirement did not complete within 10 seconds; {}; {trace}; active-client refusals={refusals}",
             owner_state(options)
         )
     })??;
@@ -870,7 +870,7 @@ pub(crate) fn owner_state(options: &OpenOptions) -> String {
                 let stage = activity.stages.last().copied();
                 let stage = stage.map(crate::service::activity::describe_stage);
                 format!(
-                    "owner still opening; last stage = {}; no endpoint published",
+                    "owner still opening; last stage = {}; no endpoint record present",
                     stage.as_deref().unwrap_or("none")
                 )
             }
