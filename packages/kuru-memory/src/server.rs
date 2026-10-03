@@ -168,7 +168,6 @@ impl std::error::Error for TemplateVerdict {}
 /// Worst-case owned close, as bounded by `close_pools_and_owner`: the first
 /// graceful pool drain, the Windows lifetime close, the supervisor reap
 /// allowance in `finish_owner`, and the post-reap pool drain.
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn close_budget() -> Duration {
     CLOSE_GRACE
         .saturating_add(KILL_GRACE)
