@@ -26,6 +26,7 @@ use crate::{
 };
 
 mod diagnostics;
+pub(crate) use diagnostics::TransportKind;
 mod sse;
 #[cfg(test)]
 mod subscription_tests;

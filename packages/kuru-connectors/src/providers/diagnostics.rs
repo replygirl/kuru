@@ -37,13 +37,34 @@ impl Operation {
             Self::ChatgptCatalog => "chatgpt-catalog",
         }
     }
+
+    /// The API-key Responses route, as opposed to the ChatGPT subscription
+    /// route. Quota, billing and usage wording differs between the two.
+    pub(super) const fn is_responses(self) -> bool {
+        matches!(self, Self::ResponsesCompletion | Self::ResponsesCatalog)
+    }
 }
 
-#[derive(Debug)]
-enum TransportKind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransportKind {
     Timeout,
     Connect,
     Other,
+}
+
+impl TransportKind {
+    /// Classify a transport failure by its symptom only. Callers format their
+    /// own message from the kind and never from the error, whose `Display`
+    /// can carry a URL.
+    pub(crate) fn classify(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout
+        } else if error.is_connect() {
+            Self::Connect
+        } else {
+            Self::Other
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -68,14 +89,10 @@ impl std::error::Error for TransportFailure {}
 pub(super) fn transport(operation: Operation, error: reqwest::Error) -> Error {
     // A connection classification records only the transport symptom. It says
     // nothing about dispatch and must never make a request safe to replay.
-    let kind = if error.is_timeout() {
-        TransportKind::Timeout
-    } else if error.is_connect() {
-        TransportKind::Connect
-    } else {
-        TransportKind::Other
-    };
-    Error::new(TransportFailure { operation, kind })
+    Error::new(TransportFailure {
+        operation,
+        kind: TransportKind::classify(&error),
+    })
 }
 
 pub(super) async fn successful(response: Response, operation: Operation) -> Result<Response> {
@@ -97,10 +114,7 @@ pub(super) async fn rejected(mut response: Response, operation: Operation) -> Re
     let retryable = match status {
         StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE => true,
         StatusCode::TOO_MANY_REQUESTS => {
-            !matches!(
-                operation,
-                Operation::ResponsesCompletion | Operation::ResponsesCatalog
-            ) || !is_responses_quota(body.as_ref())
+            !operation.is_responses() || !is_responses_quota(body.as_ref())
         }
         _ => false,
     };
@@ -159,41 +173,56 @@ pub(super) fn client() -> Error {
     Error::msg("Provider HTTP client initialization failed")
 }
 
-pub(super) fn stream_failed() -> Error {
-    Error::msg("ChatGPT completion stream failed before completion")
+pub(super) fn stream_failed(operation: Operation) -> Error {
+    Error::msg(format!("{operation} stream failed before completion"))
 }
 
-pub(super) fn stream_protocol() -> Error {
-    Error::msg("ChatGPT completion stream contained invalid protocol data")
+pub(super) fn stream_protocol(operation: Operation) -> Error {
+    Error::msg(format!(
+        "{operation} stream contained invalid protocol data"
+    ))
 }
 
 pub(super) fn function_arguments(operation: Operation) -> Error {
     Error::msg(format!("{operation} contained invalid function arguments"))
 }
 
-pub(super) fn stream_event(event: &Value) -> Error {
-    match event
+/// Classify a terminal stream failure by its bounded vendor code. Quota, usage
+/// and overload wording follows the route: the API-key Responses route never
+/// points the user at a ChatGPT subscription, and the ChatGPT route keeps its
+/// subscription wording.
+pub(super) fn stream_event(operation: Operation, event: &Value) -> Error {
+    let responses = operation.is_responses();
+    let message = match event
         .pointer("/response/error/code")
         .or_else(|| event.pointer("/error/code"))
         .and_then(Value::as_str)
     {
         Some("context_length_exceeded") => {
-            Error::msg("ChatGPT completion exceeded the model context limit")
+            format!("{operation} exceeded the model context limit")
+        }
+        Some("insufficient_quota") if responses => {
+            format!("{operation} is blocked by an API quota or billing limit")
         }
         Some("insufficient_quota") => {
-            Error::msg("ChatGPT completion is blocked by a subscription quota limit")
+            format!("{operation} is blocked by a subscription quota limit")
         }
-        Some("usage_not_included") => {
-            Error::msg("ChatGPT subscription does not include this usage")
+        Some("usage_not_included") if responses => {
+            format!("{operation} usage is not included in the API account's plan or billing")
         }
+        Some("usage_not_included") => "ChatGPT subscription does not include this usage".into(),
         Some("cyber_policy" | "misalignment_policy_violation" | "bio_policy") => {
-            Error::msg("ChatGPT completion was blocked by policy")
+            format!("{operation} was blocked by policy")
         }
-        Some("invalid_prompt") => Error::msg("ChatGPT completion request was rejected"),
-        Some("server_is_overloaded") => Error::msg("ChatGPT service is overloaded"),
-        Some("rate_limit_exceeded") => Error::msg("ChatGPT completion is rate limited"),
-        _ => stream_failed(),
-    }
+        Some("invalid_prompt") => format!("{operation} request was rejected"),
+        Some("server_is_overloaded") if responses => {
+            format!("{operation} service is overloaded")
+        }
+        Some("server_is_overloaded") => "ChatGPT service is overloaded".into(),
+        Some("rate_limit_exceeded") => format!("{operation} is rate limited"),
+        _ => return stream_failed(operation),
+    };
+    Error::msg(message)
 }
 
 fn status_message(operation: Operation, status: StatusCode, body: Option<&Value>) -> String {
@@ -201,10 +230,7 @@ fn status_message(operation: Operation, status: StatusCode, body: Option<&Value>
         .and_then(|body| body.pointer("/error/code"))
         .and_then(Value::as_str);
     let status = status.as_u16();
-    let responses = matches!(
-        operation,
-        Operation::ResponsesCompletion | Operation::ResponsesCatalog
-    );
+    let responses = operation.is_responses();
     if responses && matches!(status, 400 | 403 | 404) && code == Some("model_not_found") {
         return format!(
             "{operation} selected model is unavailable or access is denied (HTTP {status})"
@@ -317,5 +343,136 @@ mod tests {
             ),
             "ChatGPT completion is rate limited (HTTP 429)"
         );
+    }
+
+    fn stream_code(operation: Operation, code: &str) -> String {
+        stream_event(
+            operation,
+            &json!({"type":"response.failed","response":{"error":{"code":code,"message":"stream-secret"}}}),
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn stream_messages_name_the_route_that_failed() {
+        let table = [
+            (
+                "context_length_exceeded",
+                "Responses completion exceeded the model context limit",
+                "ChatGPT completion exceeded the model context limit",
+            ),
+            (
+                "insufficient_quota",
+                "Responses completion is blocked by an API quota or billing limit",
+                "ChatGPT completion is blocked by a subscription quota limit",
+            ),
+            (
+                "usage_not_included",
+                "Responses completion usage is not included in the API account's plan or billing",
+                "ChatGPT subscription does not include this usage",
+            ),
+            (
+                "cyber_policy",
+                "Responses completion was blocked by policy",
+                "ChatGPT completion was blocked by policy",
+            ),
+            (
+                "misalignment_policy_violation",
+                "Responses completion was blocked by policy",
+                "ChatGPT completion was blocked by policy",
+            ),
+            (
+                "bio_policy",
+                "Responses completion was blocked by policy",
+                "ChatGPT completion was blocked by policy",
+            ),
+            (
+                "invalid_prompt",
+                "Responses completion request was rejected",
+                "ChatGPT completion request was rejected",
+            ),
+            (
+                "server_is_overloaded",
+                "Responses completion service is overloaded",
+                "ChatGPT service is overloaded",
+            ),
+            (
+                "rate_limit_exceeded",
+                "Responses completion is rate limited",
+                "ChatGPT completion is rate limited",
+            ),
+            (
+                "future-unknown-code",
+                "Responses completion stream failed before completion",
+                "ChatGPT completion stream failed before completion",
+            ),
+        ];
+        for (code, responses, chatgpt) in table {
+            let api = stream_code(Operation::ResponsesCompletion, code);
+            let subscription = stream_code(Operation::ChatgptCompletion, code);
+            assert_eq!(api, responses, "{code}");
+            assert_eq!(subscription, chatgpt, "{code}");
+            assert!(
+                !api.contains("ChatGPT") && !api.contains("subscription"),
+                "{api}"
+            );
+            assert!(
+                !subscription.contains("API") && !subscription.contains("billing"),
+                "{subscription}"
+            );
+            assert!(!api.contains("stream-secret") && !subscription.contains("stream-secret"));
+        }
+        let top_level = stream_event(
+            Operation::ResponsesCompletion,
+            &json!({"type":"error","error":{"code":"insufficient_quota"}}),
+        );
+        assert_eq!(
+            top_level.to_string(),
+            "Responses completion is blocked by an API quota or billing limit"
+        );
+        assert_eq!(
+            stream_failed(Operation::ResponsesCompletion).to_string(),
+            "Responses completion stream failed before completion"
+        );
+        assert_eq!(
+            stream_failed(Operation::ChatgptCompletion).to_string(),
+            "ChatGPT completion stream failed before completion"
+        );
+        assert_eq!(
+            stream_protocol(Operation::ResponsesCompletion).to_string(),
+            "Responses completion stream contained invalid protocol data"
+        );
+        assert_eq!(
+            stream_protocol(Operation::ChatgptCompletion).to_string(),
+            "ChatGPT completion stream contained invalid protocol data"
+        );
+    }
+
+    #[test]
+    fn provider_transport_reuses_the_shared_classifier_wording() {
+        assert!(Operation::ResponsesCompletion.is_responses());
+        assert!(Operation::ResponsesCatalog.is_responses());
+        assert!(!Operation::ChatgptCompletion.is_responses());
+        assert!(!Operation::ChatgptCatalog.is_responses());
+        for (kind, expected) in [
+            (
+                TransportKind::Timeout,
+                "Responses completion transport timed out",
+            ),
+            (
+                TransportKind::Connect,
+                "Responses completion transport connection failed",
+            ),
+            (
+                TransportKind::Other,
+                "Responses completion transport failed",
+            ),
+        ] {
+            let failure = TransportFailure {
+                operation: Operation::ResponsesCompletion,
+                kind,
+            };
+            assert_eq!(failure.to_string(), expected);
+        }
     }
 }
