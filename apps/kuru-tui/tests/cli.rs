@@ -1743,6 +1743,45 @@ fn discovered_local_config_accepts_non_git_roots_and_rejects_ambiguous_index_sta
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("index status is ambiguous"));
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn discovered_local_config_waits_for_a_slow_git_index_check() {
+    let env = Sandbox::new();
+    let config_dir = env.project.join(".kuru");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("config.local.toml"), "mode='freudian'").unwrap();
+    std::fs::create_dir(env.project.join(".git")).unwrap();
+    // The fixture `git` paces itself past the former 5 s cap before reporting
+    // the untracked status, as a large index or slow disk would.
+    let tools = env.root.path().join("slow git");
+    std::fs::create_dir(&tools).unwrap();
+    std::fs::copy(
+        env!("CARGO_BIN_EXE_kuru-slow-git-fixture"),
+        tools.join(format!("git{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(tools).chain(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(std::env::split_paths),
+        ),
+    )
+    .unwrap();
+    let output = env
+        .command()
+        .env("PATH", path)
+        .arg("config")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("mode = \"freudian\""));
+}
+
 #[test]
 fn managed_locks_and_typed_overrides_apply_before_demo_dispatch() {
     let env = Sandbox::new();

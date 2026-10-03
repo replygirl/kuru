@@ -21,6 +21,11 @@ name = "kuru-cli-windows-fixture"
 path = "tests/fixtures/windows_cli.rs"
 required-features = ["test-support"]
 
+[[bin]]
+name = "kuru-slow-git-fixture"
+path = "tests/fixtures/slow_git.rs"
+required-features = ["test-support"]
+
 [dependencies]
 kuru-delivery.workspace = true
 anyhow.workspace = true
