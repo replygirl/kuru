@@ -575,6 +575,42 @@ async fn explicit_github_and_custom_mirror_versions_use_literal_release_director
     }
 }
 
+/// Bounded reads must not depend on a FIFO handoff between two children.
+///
+/// The bootstrap once streamed each bounded call through a FIFO to a capped
+/// reader. On macOS that reader sometimes never saw end of file after its
+/// producer exited, so the run hung; a stream the producer could not open hung
+/// it every time. That kernel race cannot be forced from user space, but this
+/// hostile `mkfifo`, whose FIFOs cannot be opened for writing, drives the
+/// never-paired case deterministically: the FIFO protocol waits for the
+/// fixture's bound, while the file-size-limited producer never creates a FIFO.
+#[tokio::test]
+async fn bounded_reads_install_through_the_mirror_without_a_fifo_handoff() {
+    let fixture = Fixture::new(TARGETS[0], "0.2.0");
+    fs::remove_file(fixture.tools.join("mkfifo")).unwrap();
+    executable(
+        &fixture.tools.join("mkfifo"),
+        format!(
+            "#!/bin/bash\n: > \"$FIXTURE_ROOT/mkfifo-called\"\n'{}' \"$@\" && '{}' 0400 \"$1\"\n",
+            system_tool("mkfifo").display(),
+            system_tool("chmod").display(),
+        )
+        .as_bytes(),
+    );
+    let mut command = fixture.explicit();
+    command
+        .env_remove("KURU_RELEASE_BASE")
+        .args(["--release-base", "https://fixture.invalid/releases/0.2.0/"]);
+    success(&fixture.run(command).await);
+    fixture.installed(&fixture.destination);
+    assert!(
+        !fixture.path("mkfifo-called").exists(),
+        "bounded reads still create a FIFO"
+    );
+    let requests = fs::read_to_string(fixture.path("requests")).unwrap();
+    assert_eq!(requests.lines().count(), 3);
+}
+
 #[tokio::test]
 async fn host_detection_selects_each_supported_archive_and_rejects_unknown_hosts() {
     for (os, arch, target) in [
@@ -1054,7 +1090,7 @@ async fn checksum_missing_corrupt_ambiguous_and_malformed_inputs_preserve_the_in
         "{trace}"
     );
     assert!(trace.contains("kuru_producer="), "{trace}");
-    assert!(trace.contains("kuru_consumer="), "{trace}");
+    assert!(trace.contains("ulimit -f"), "{trace}");
     assert!(trace.contains(" wait "), "{trace}");
     fixture.unchanged();
 }
