@@ -51,7 +51,7 @@ Mutation checks: the tasks below that ask for a temporary product mutation to wa
 - [x] 4.5 m1#53: replace the 10 s `owner.close()` bound at 6703 with `close_budget()` (32 s); verify by reading the diff and running the test
   Evidence: done.
 - [x] 4.6 m1#54: replace `Served::finish`'s 20 s at 6736 for its 16 call sites (6818, 6940, 6971, 6981, 7024, 7033, 7089, 7109, 7119, 7190, 7381, 7386, 7448, 7490, 7496, 7582); verify by reading the diff and running the settlement tests
-  Evidence: done with `rpc::OPERATION_TIMEOUT` (35 s) rather than `QUERY_TIMEOUT`, a code-backed difference. `Served::finish` joins both halves of one round trip, for writes and outcome queries alike. The client half fails at its reply deadline, `OPERATION_TIMEOUT`. A write's own work (`QUERY_TIMEOUT`) and an outcome handler's `HANDLER_BUDGET` both fit inside it, leaving `REPLY_MARGIN` for the reply (rpc.rs:705-718). `QUERY_TIMEOUT` alone would leave no room for the reply. The doc comment on `finish` states this.
+  Evidence: done with `rpc::OPERATION_TIMEOUT` (35 s) rather than `QUERY_TIMEOUT`, a code-backed difference. `Served::finish` joins both halves of one round trip, for writes and outcome queries alike. The client half fails at its reply deadline, `OPERATION_TIMEOUT`. A write's own work (`QUERY_TIMEOUT`) and an outcome handler's `HANDLER_BUDGET` both fit inside it, leaving `REPLY_MARGIN` for the reply (rpc.rs:705-718). `QUERY_TIMEOUT` alone would leave no room for the reply. The doc comment on `finish` states this. The remainder 90 s outer bound of `settled_fixture` still encloses this bound and 4.8's; on a slow run that outer can fire first, with a less specific message. It is a remainder row and is unchanged here.
 - [x] 4.7 m1#56: replace `SettlementFixture::close`'s 20 s at 6855 with `close_budget()` (32 s), one edit for the 10 tests that use `settled_fixture`; verify by reading the diff and running them
   Evidence: done.
 - [x] 4.8 m1#57: replace `next_wait_event`'s 10 s at 6890, one edit for its 17 call sites; verify by reading the diff and running the settlement tests
@@ -65,7 +65,7 @@ Mutation checks: the tasks below that ask for a temporary product mutation to wa
 ## 5. packages/kuru-memory/src/service/rpc.rs (cfg(test) code and one visibility edit)
 
 - [x] 5.1 m2#29: replace the `timeout(10 s, pause.release.notified())` in `pause_after_registration` (1006), and with it m2#30 (`pause_before_settlement`, 1023) and m2#31 (`pause_before_dispatch`, 1179), with `OPERATION_TIMEOUT` (35 s, same file) unless the code shows a tighter enclosing handler deadline, which is then recorded and used; verify by reading the diff for no value change and by the 8 tests that use `progress.pause_next(..)` (service.rs 6621, 6959, 6996, 7094, 7401, 7463, 7517, 9198)
-  Evidence: done; all three use a cfg(test) `TEST_PAUSE_RELEASE_WITHIN` = `OPERATION_TIMEOUT`. No enclosing handler deadline wraps them: the pauses sit in `serve_attached` (rpc.rs:1349), `respond` (1438) and `process` (1535), none under a timeout. The doc comment gives the derivation: the paused request's client gives up on its reply at its reply deadline, so a test that held the pause longer could not observe that reply anyway. The failure messages now name the reply deadline; no test matched the old text. The visibility edit is exception (b) in 3fa5318e (see the note at the top), with no value change.
+  Evidence: done; all three use a cfg(test) `TEST_PAUSE_RELEASE_WITHIN` = `OPERATION_TIMEOUT`. No enclosing handler deadline wraps them: the pauses sit in `serve_attached` (rpc.rs:1349), `respond` (1438) and `process` (1535), none under a timeout. The doc comment gives the derivation: the paused request's client gives up on its reply at its reply deadline, so a test that held the pause longer could not observe that reply anyway. That argument is exact for the tests whose client awaits the paused reply. In `accepted_write_holds_the_owner_after_its_client_leaves` (service.rs:9198 on the base) the client leaves on purpose, so it does not apply there; the bound is still the reply deadline, above the old 10 s, and the inventory's named shape. The failure messages now name the reply deadline; no test matched the old text. The visibility edit is exception (b) in 3fa5318e (see the note at the top), with no value change.
 
 ## 6. packages/kuru-memory/src/spawn_gate.rs (tests)
 
@@ -140,14 +140,18 @@ Mutation checks: the tasks below that ask for a temporary product mutation to wa
 
 ## 15. Checks
 
-- [ ] 15.1 Run `mise run //packages/kuru-memory:test` and the narrower filters used while iterating, and record pass counts and any failure with its cause; state that local runs do not reproduce a loaded CI runner
-  Evidence: pending.
-- [ ] 15.2 Run `mise run //packages/kuru-memory:lint`, `mise run //packages/kuru-memory:lint:windows`, `mise run format:check` and `mise run typecheck` and record each exit code
-  Evidence: pending.
-- [ ] 15.3 Verify the diff touches only the owned files and this change's openspec directory (and not `mise.lock`, nor `src/test_support*`), and that no new `from_secs(` or `from_millis(` literal lacks a derivation, by reading the branch's commits and searching the diff for added literals
-  Evidence: pending.
+- [x] 15.1 Run `mise run //packages/kuru-memory:test` and the narrower filters used while iterating, and record pass counts and any failure with its cause; state that local runs do not reproduce a loaded CI runner
+  Evidence (2026-10-04, local macOS 27.0 arm64, uninstrumented debug build, on the code of 02c517db): `mise run //packages/kuru-memory:test` exited 0 in 1265 s. The lib had 710 passed, 0 failed and 6 ignored (the `#[ignore]`d measurement harnesses) in 1222.5 s. The integration targets: `bundle_build` 10 passed, `memory` 5, `server_lifecycle` 12, `supervisor_snapshot` 1, and `windows_lifecycle` 0 (Windows-only, compiled out here). There were no failures. The narrower runs while iterating are recorded at 1.6, 2.2, 3.2, 10.2 and 13.2; all passed. Local runs do not reproduce a loaded CI runner.
+- [x] 15.2 Run `mise run //packages/kuru-memory:lint`, `mise run //packages/kuru-memory:lint:windows`, `mise run format:check` and `mise run typecheck` and record each exit code
+  Evidence: in this order, `mise run format:check` exited 0, `//packages/kuru-memory:lint` 0, `//packages/kuru-memory:lint:windows` 0 and `mise run typecheck` 0 (all workspace packages and apps, including kuru-tui, in 162 s). The two lint runs in the final sequence were cache hits. Their full compiles on the same source, after the last code edit, also exited 0: 39.6 s on the host and 61.4 s for `x86_64-pc-windows-msvc`.
+- [x] 15.3 Verify the diff touches only the owned files and this change's openspec directory (and not `mise.lock`, nor `src/test_support*`), and that no new `from_secs(` or `from_millis(` literal lacks a derivation, by reading the branch's commits and searching the diff for added literals
+  Evidence: `git diff --name-only 63942438 HEAD` lists these 16 code files: `src/test_budgets.rs` and `src/lib.rs` (exception (b)), `src/service/rpc.rs` (the `OPERATION_TIMEOUT` widening and cfg(test) code), and the 13 other owned files. Beyond those, only this change's openspec files changed. It lists no `mise.lock` and nothing under `src/test_support*`. In facade.rs, the only non-test addition is the 7-line cfg(test) seam (1.4). The added lines matching `Duration::from_*` are these, none of them a new unexplained bound:
+  - the existing 20 ms reconnect cadence at 5586, re-indented when its outer bound was removed;
+  - the `OPERATION_TIMEOUT` line, changed in visibility only;
+  - two bounds derived from configuration (`startup_timeout_secs` at 8.1 and 13.2);
+  - the existing 6 s `SLEEP(6)` stimulus, named `SLEEP` (13.5).
 - [ ] 15.4 Validate with `mise run cospec -- validate memory-derived-waits --strict`, confirm the apply gate is clear, and archive before the final commit, confirming the archive exists
-  Evidence: pending.
+  Evidence: `mise run cospec -- validate memory-derived-waits --strict` exited 0 (0 errors, 0 warnings) on this tasks.md. The apply gate was clear (exit 0) at the start of implementation, as the orchestrator recorded. Archive is deferred to the orchestrator at merge, because 15.5 and 15.6 await CI; it was not run here.
 - [ ] 15.5 CI evidence: the native test jobs on Linux, macOS and Windows run the changed memory tests to green, including the Windows-only sites; awaits CI
   Evidence: awaits CI.
 - [ ] 15.6 CI evidence: the combined coverage run holds the 90% workspace line gate with the changed tests; awaits CI
