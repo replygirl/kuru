@@ -56,6 +56,36 @@ Inference, not measured: once it merges, `wait_text` (:352), `submit` (:440) and
 `startup_timeout` (:107-115) sit above the hunk and do not move. This change edits
 no line in 174-210.
 
+### Site found by this PR's CI (not in the inventory)
+
+| Id | Where | Bound now | Derive from |
+| --- | --- | --- | --- |
+| ci#1 | the empty `<Stage>.hold` markers in `tests/terminal.rs` (`real_pty_first_launch_shows_the_creating_sentence_while_the_template_builds`; `smoke`, run by `real_pty_accepts_chat_navigation_commands_and_restores_terminal`) and `tests/cli.rs` (`cli_new_project_shows_engine_preparation_then_creation_and_keeps_json_on_stdout`, two markers) | the owner's hold bound `hold_limit` = `memory.startup_timeout_secs` (30 s default), kuru-memory `src/service/activity.rs:957` | the holding test's wait that ends in the marker's removal: `sandbox.startup_timeout` (terminal), `Streaming::WAIT` (CLI, 180 s, a hand-summed literal with its derivation written) |
+
+PR CI run 37180709856 at head bacb9288, job 111373013270 (`native-tests
+(ubuntu-latest) / Coverage partition (ubuntu-latest, 5)`), failed
+`real_pty_first_launch_shows_the_creating_sentence_while_the_template_builds`
+(`terminal` binary: 5 passed, 1 failed). The owner logged `memory open hold
+failed: open hold on CreatingDatabase was not released`; the test then failed
+with `the store template cache was used before creation began`. The owner's
+test-support hold (`hold`, `service/activity.rs:870`) waits for the test to remove
+its marker under `hold_limit`, a product window unrelated to the test's wait for the
+creating sentence (`sandbox.startup_timeout`, about 112 s at the 30 s default). That
+message is the one the hold's removal loop raises at its bound, so the hold expired
+before the test removed the marker, and creation, with the template build, went
+ahead. That the runner showed the sentence only after 30 s is inferred from the
+expiry, not measured.
+
+The hold is a flat test-support wait in kuru-memory's seam, outside this change's
+files. PR #214 (`memory-open-hold-budget`) bounds it instead by the budget the
+holding test writes into the marker, as ASCII decimal milliseconds; an empty marker
+keeps the 30 s bound. This change writes each marker's content as the budget of the
+wait that ends in its removal, before the owner is spawned. Once #214 is on main the
+owner's deadline starts at the stage, and the test's wait, at least as long, started
+before the owner could reach the stage: the hold cannot expire while the test still
+waits, so the test removes the marker while it is held. Until then the seam ignores
+the content; the adoption is inert, and this change alone does not fix the failure.
+
 ## What Changes
 
 - `tests/support/terminal.rs` derives `READY_TIMEOUT` once, at its definition, as
@@ -100,6 +130,14 @@ no line in 174-210.
   under the frame-wait bound. The absence windows (t1#43 reduced, t1#44, t2#33) and the
   fork race (t2#9) are deferred: no product event falls due inside them for a barrier to
   be ordered after, and t2#9's helper has no seam for a later deadline.
+- ci#1: the open-hold markers at three sites (`smoke` and
+  `real_pty_first_launch_shows_the_creating_sentence_while_the_template_builds` in
+  `tests/terminal.rs`, the two markers of
+  `cli_new_project_shows_engine_preparation_then_creation_and_keeps_json_on_stdout` in
+  `tests/cli.rs`) are written with the budget of the wait that ends in their removal:
+  `sandbox.startup_timeout` for the creating-sentence waits, `Streaming::WAIT` for each
+  CLI stage wait. This adopts PR #214's hand-off contract and takes effect once #214
+  merges; see `blocking-changes.md`.
 - The one kuru-memory commit that adds `kuru_memory::test_budgets` under `test-support`
   is cherry-picked from PR 1 (`test/memory-derived-waits`) until that PR merges; see
   `blocking-changes.md`.
@@ -145,6 +183,9 @@ Recorded so they are not mistaken for oversights; none is changed here.
   frame wait, about 130 s for an exit after `/quit`, about 635 s for one A2A request or
   for a runtime-test turn, and about 13.6 minutes for one `kuru run`. Passing runs take
   the same time.
+- Once #214 merges, an open hold lasts up to its test's wait (about 112 s in the
+  terminal tests, 180 s per CLI stage) instead of 30 s; the marker's removal still
+  ends it, so a passing run takes the same time.
 - `server.rs` and `unix_shell_turn.rs` include `support/terminal.rs` (Unix only, with
   `#[allow(dead_code)]` as `trust.rs` does) to reach `startup_timeout`, and
   `support/turn_budget.rs`; `src/ui/runtime_tests.rs` includes the latter by path.
