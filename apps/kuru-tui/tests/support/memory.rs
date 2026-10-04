@@ -34,15 +34,21 @@ const PRIVATE_DIAGNOSTICS: &str = "Dolt startup/lifetime failed; private diagnos
 const SERVER_LOG: &str = "server.log";
 
 /// The bounded tail of each Dolt log `owner_text` names after
-/// [`PRIVATE_DIAGNOSTICS`], one labelled line per distinct path; empty when
-/// it names none.
+/// [`PRIVATE_DIAGNOSTICS`], one line per distinct path; empty when it names
+/// none. A read tail carries the helper's own label, which names the path; a
+/// path that is not read is named once before the reason.
 ///
 /// Owner stderr is untrusted text. A named path is taken through the first
 /// [`SERVER_LOG`] that ends the line or is followed by `':'`, so a Windows
 /// drive colon cannot end it early. It is read only when it is absolute and
-/// lexically strictly beneath `root` through ordinary components only (no
-/// `..` or `.`), and its canonical form is strictly beneath the canonical
-/// root, which rejects a symlinked escape. The read is
+/// spelled through prefix, root and ordinary components only (no `..` or
+/// `.`), and its canonical form is strictly beneath the canonical `root`.
+/// Containment is decided canonically because the owner names its stage from
+/// the canonical data directory (`fs::canonicalize` in
+/// `packages/kuru-memory/src/server.rs`) while `root` is spelled as the
+/// temporary directory gave it: macOS's `/var` alias and Windows' verbatim
+/// `\\?\` prefix make the two spellings differ. The canonical comparison also
+/// rejects a symlinked escape. The read is
 /// [`kuru_memory::test_support::fixture_server_log`]: the checked private
 /// read, which refuses symlinked components, capped at that helper's
 /// `STARTUP_LOG_BYTES` (above the server's own `LOG_LIMIT` on this log) and
@@ -68,40 +74,42 @@ fn named_private_diagnostics(root: &Path, owner_text: &str) -> String {
     }
     let mut report = String::new();
     for path in named {
-        let outcome = named_log_tail(root, Path::new(path));
-        report.push_str(&format!("\nnamed private diagnostics ({path}): {outcome}"));
+        match named_log_tail(root, Path::new(path)) {
+            Ok(tail) => report.push_str(&format!("\nnamed private diagnostics: {tail}")),
+            Err(reason) => {
+                report.push_str(&format!("\nnamed private diagnostics ({path}): {reason}"));
+            }
+        }
     }
     report
 }
 
-/// The helper's labelled tail of `log`, or why it was not read.
-fn named_log_tail(root: &Path, log: &Path) -> String {
-    let lexically_within = log.is_absolute()
-        && log.strip_prefix(root).is_ok_and(|beneath| {
-            beneath.components().next().is_some()
-                && beneath
-                    .components()
-                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+/// The helper's tail of `log`, labelled with that path, or why it was not
+/// read.
+fn named_log_tail(root: &Path, log: &Path) -> Result<String, String> {
+    use std::path::Component;
+    let ordinary = log.is_absolute()
+        && log.components().all(|part| {
+            matches!(
+                part,
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+            )
         });
-    if !lexically_within {
-        return format!("not read: outside the fixture root {}", root.display());
+    if !ordinary {
+        return Err("not read: not an absolute path through ordinary components".to_owned());
     }
-    let canonical_root = match std::fs::canonicalize(root) {
-        Ok(path) => path,
-        Err(error) => return format!("not read: the fixture root does not resolve: {error}"),
-    };
-    let canonical = match std::fs::canonicalize(log) {
-        Ok(path) => path,
-        Err(error) => return format!("not read: missing or unresolvable: {error}"),
-    };
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|error| format!("not read: the fixture root does not resolve: {error}"))?;
+    let canonical = std::fs::canonicalize(log)
+        .map_err(|error| format!("not read: missing or unresolvable: {error}"))?;
     if canonical == canonical_root || !canonical.starts_with(&canonical_root) {
-        return format!(
+        return Err(format!(
             "not read: resolves outside the fixture root {} to {}",
             canonical_root.display(),
             canonical.display()
-        );
+        ));
     }
-    kuru_memory::test_support::fixture_server_log(log.to_path_buf()).unwrap_or_else(|| {
+    kuru_memory::test_support::fixture_server_log(log.to_path_buf()).ok_or_else(|| {
         "not read: the checked private read refused it (not a private single-link \
          regular file within the helper's read cap, or removed meanwhile)"
             .to_owned()
@@ -392,14 +400,24 @@ mod tests {
 
     /// A private `stage/server.log` holding `bytes` beneath `root`, created
     /// through the platform's private primitives so the checked read accepts
-    /// it on every OS. The path is spelled from `root` as given, as an owner
-    /// spells it from its data directory: the platform reports macOS's
-    /// `/var` alias resolved.
+    /// it on every OS. The path is spelled from `root` as the temporary
+    /// directory gave it, which keeps macOS's `/var` alias; an owner names
+    /// its stage from the canonical data directory instead, the spelling
+    /// [`canonical_log`] gives.
     fn private_log(root: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
         let stage = Directory::open(root, Privacy::OwnerOnly, NameRetention::Movable)?
             .create_private_directory(OsStr::new("stage"))?;
         stage.create_new(OsStr::new(SERVER_LOG))?.write_all(bytes)?;
         Ok(root.join("stage").join(SERVER_LOG))
+    }
+
+    /// The same `stage/server.log` as the owner names it: `request.directory`
+    /// joined with [`SERVER_LOG`], where the server has canonicalized the
+    /// directory (`packages/kuru-memory/src/server.rs`). That differs from
+    /// `root`'s spelling on macOS (`/private/var`) and Windows (`\\?\`) and
+    /// may coincide with it on Linux.
+    fn canonical_log(root: &Path) -> anyhow::Result<PathBuf> {
+        Ok(std::fs::canonicalize(root)?.join("stage").join(SERVER_LOG))
     }
 
     /// The owner stderr line from PR #209's failed fixture, naming `log`.
@@ -420,7 +438,7 @@ mod tests {
         assert_eq!(
             report,
             format!(
-                "\nnamed private diagnostics ({0}): fixture Dolt server log tail ({0}): \
+                "\nnamed private diagnostics: fixture Dolt server log tail ({}): \
                  dolt: fixture reason for exiting",
                 log.display()
             )
@@ -428,6 +446,23 @@ mod tests {
         // A second mention of the same log appends it once.
         let twice = format!("{0}{0}", owner_text(&log));
         assert_eq!(named_private_diagnostics(root.path(), &twice), report);
+        root.release(Ok(()))
+    }
+
+    #[test]
+    fn the_owners_canonical_spelling_of_an_in_root_log_is_appended() -> anyhow::Result<()> {
+        let root = kuru_memory::test_support::tempdir()?;
+        private_log(root.path(), b"dolt: fixture reason for exiting")?;
+        let named = canonical_log(root.path())?;
+        let report = named_private_diagnostics(root.path(), &owner_text(&named));
+        assert_eq!(
+            report,
+            format!(
+                "\nnamed private diagnostics: fixture Dolt server log tail ({}): \
+                 dolt: fixture reason for exiting",
+                named.display()
+            )
+        );
         root.release(Ok(()))
     }
 
@@ -443,7 +478,7 @@ mod tests {
         assert!(report.ends_with("xEND"), "{report}");
         assert!(!report.contains("BEGIN"), "{report}");
         let label = format!(
-            "\nnamed private diagnostics ({0}): fixture Dolt server log tail ({0}): ",
+            "\nnamed private diagnostics: fixture Dolt server log tail ({}): ",
             log.display()
         );
         let tail = report
@@ -467,7 +502,7 @@ mod tests {
         assert!(!absolute.contains("OUTSIDE-SENTINEL"), "{absolute}");
         assert!(
             absolute.contains(&format!(
-                "({}): not read: outside the fixture root",
+                "({}): not read: resolves outside the fixture root",
                 outside.display()
             )),
             "{absolute}"
@@ -492,20 +527,26 @@ mod tests {
         let dotted = named_private_diagnostics(root.path(), &owner_text(&escape));
         assert!(!dotted.contains("OUTSIDE-SENTINEL"), "{dotted}");
         assert!(
-            dotted.contains("not read: outside the fixture root"),
+            dotted.contains(&format!(
+                "({}): not read: not an absolute path through ordinary components",
+                escape.display()
+            )),
             "{dotted}"
         );
 
-        // A Windows path keeps its drive colon and reaches the report whole.
+        // A Windows path in the verbatim spelling the owner's canonical
+        // directory has there keeps its drive colon and reaches the report
+        // whole. Why it is not read depends on the host (a relative name on
+        // Unix, a missing file on Windows), so only the refusal is asserted.
+        let verbatim = r"\\?\C:\fixture\stage\server.log";
         let windows = named_private_diagnostics(
             root.path(),
-            &format!("{PRIVATE_DIAGNOSTICS}C:\\fixture\\stage\\server.log: Dolt exited\n"),
+            &format!("{PRIVATE_DIAGNOSTICS}{verbatim}: Dolt exited\n"),
         );
         assert!(
-            windows.contains(
-                "named private diagnostics (C:\\fixture\\stage\\server.log): not read: \
-                 outside the fixture root"
-            ),
+            windows.starts_with(&format!(
+                "\nnamed private diagnostics ({verbatim}): not read: "
+            )),
             "{windows}"
         );
         elsewhere.release(Ok(()))?;
@@ -551,7 +592,9 @@ mod tests {
     fn the_owner_report_appends_the_named_log_after_owner_stderr() -> anyhow::Result<()> {
         let root = kuru_memory::test_support::tempdir()?;
         let data = root.path().join("data");
-        let log = private_log(root.path(), b"dolt: fixture reason for exiting")?;
+        private_log(root.path(), b"dolt: fixture reason for exiting")?;
+        // The owner's spelling, while the fixture holds the root as given.
+        let log = canonical_log(root.path())?;
         let cleanup = ServiceCleanup::new(root, &data);
         let text = owner_text(&log);
         std::fs::write(cleanup.owner_diagnostic_path(), &text)?;
@@ -561,8 +604,8 @@ mod tests {
         assert_eq!(
             report,
             format!(
-                "\nowner stderr ({}):\n{text}\nnamed private diagnostics ({1}): fixture Dolt \
-                 server log tail ({1}): dolt: fixture reason for exiting",
+                "\nowner stderr ({}):\n{text}\nnamed private diagnostics: fixture Dolt server \
+                 log tail ({}): dolt: fixture reason for exiting",
                 cleanup.owner_diagnostic_path().display(),
                 log.display()
             )
