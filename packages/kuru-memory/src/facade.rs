@@ -97,6 +97,9 @@ struct RemoteSession {
     successor: Mutex<Option<ServiceAttachment>>,
     #[cfg(test)]
     replacement_hook: Mutex<Option<Arc<ReplacementHook>>>,
+    /// Test observation: the owner refused this client a dream lease.
+    #[cfg(test)]
+    dream_lease_refused: tokio::sync::Notify,
 }
 
 /// Armed while an exchange runs on a writable session's primary attachment.
@@ -417,6 +420,8 @@ impl RemoteSession {
             successor: Mutex::new(None),
             #[cfg(test)]
             replacement_hook: Mutex::new(None),
+            #[cfg(test)]
+            dream_lease_refused: tokio::sync::Notify::new(),
         });
         let attachment = Arc::new(AsyncMutex::new(attachment));
         session.register(&attachment)?;
@@ -2162,6 +2167,8 @@ impl MemoryStore {
                                 });
                             }
                             ServiceValue::DreamLease { acquired: false } => {
+                                #[cfg(test)]
+                                dedicated.session.dream_lease_refused.notify_one();
                                 tokio::time::sleep(DREAM_LEASE_POLL).await;
                             }
                             _ => bail!("memory service returned the wrong dream-lease response"),
@@ -3138,6 +3145,18 @@ mod tests {
         }
     }
 
+    /// A poll for a write the owner accepted before the client paused: the
+    /// owner commits it within its write budget (`QUERY_TIMEOUT`, taken by
+    /// `write_deadline`), so the commit is visible within that budget.
+    const OWNER_COMMIT_WITHIN: Duration = store::QUERY_TIMEOUT;
+
+    /// A served owner's reap once its retirement permit is held: the owner
+    /// task returns when its store close does, which the product bounds by
+    /// `server::close_budget()`.
+    fn owner_reap_within() -> Duration {
+        crate::server::close_budget()
+    }
+
     async fn cancel_before_session_acceptance<F>(remote: &RemoteView, operation: F) -> Result<()>
     where
         F: std::future::Future<Output = Result<store::SessionLifecycleOutcome>>,
@@ -3305,7 +3324,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "public transcript fixture owner did not reap",
                         )
                         .await
@@ -3395,7 +3414,7 @@ mod tests {
                         tokio::time::timeout(Duration::from_secs(5), create_pause.sent.notified())
                             .await
                             .context("accepted create frame was not flushed")?;
-                        tokio::time::timeout(Duration::from_secs(10), async {
+                        tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                             loop {
                                 if sibling
                                     .session_catalog_record("managed-lifecycle")
@@ -3456,7 +3475,7 @@ mod tests {
                         tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
                             .await
                             .context("accepted lifecycle frame was not flushed")?;
-                        tokio::time::timeout(Duration::from_secs(10), async {
+                        tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                             loop {
                                 let page = sibling.session_catalog_page(None, None, None, 16).await?;
                                 if matches!(page.records.as_slice(), [record] if record.label == "renamed" && record.lifecycle_generation == 1)
@@ -3536,7 +3555,7 @@ mod tests {
                         })
                         .await
                         .context("accepted remove frame was not flushed")??;
-                        tokio::time::timeout(Duration::from_secs(10), async {
+                        tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                             loop {
                                 let record = sibling.session_catalog_record("managed-lifecycle").await?;
                                 if record.as_ref().is_some_and(|record| {
@@ -3612,7 +3631,7 @@ mod tests {
                         })
                         .await
                         .context("accepted restore frame was not flushed")??;
-                        tokio::time::timeout(Duration::from_secs(10), async {
+                        tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                             loop {
                                 let record = sibling.session_catalog_record("managed-lifecycle").await?;
                                 if record.as_ref().is_some_and(|record| {
@@ -3772,7 +3791,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "managed lifecycle fixture owner did not reap",
                         )
                         .await
@@ -3911,7 +3930,7 @@ mod tests {
                         tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
                             .await
                             .context("accepted fork frame was not flushed")?;
-                        tokio::time::timeout(Duration::from_secs(10), async {
+                        tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                             loop {
                                 let page =
                                     sibling.session_catalog_page(None, None, None, 16).await?;
@@ -4015,7 +4034,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "managed fork fixture owner did not reap",
                         )
                         .await
@@ -4161,7 +4180,7 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), barrier.wait_sent())
                     .await
                     .context("mode checkpoint request was not sent")?;
-                tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                     loop {
                         let catalog = sibling
                             .session_catalog_record(session)
@@ -4211,7 +4230,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "managed mode fixture owner did not reap",
                         )
                         .await
@@ -4300,7 +4319,7 @@ mod tests {
                         tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
                             .await
                             .context("accepted public-turn admission frame was not flushed")?;
-                        tokio::time::timeout(Duration::from_secs(10), async {
+                        tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                             loop {
                                 let page = sibling
                                     .public_transcript_page("managed-turn", None, 16)
@@ -4376,7 +4395,7 @@ mod tests {
                         })
                         .await
                         .context("accepted public-turn settlement frame was not flushed")??;
-                        tokio::time::timeout(Duration::from_secs(10), async {
+                        tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                             loop {
                                 let page = sibling.public_transcript_page("managed-turn", None, 16).await?;
                                 if matches!(page.records.as_slice(), [store::PublicTranscriptEntry::Turn { record }]
@@ -4564,7 +4583,7 @@ mod tests {
                         })
                         .await
                         .context("accepted older continuation frame was not flushed")??;
-                        tokio::time::timeout(Duration::from_secs(10), async {
+                        tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                             loop {
                                 let page = sibling.public_transcript_page("managed-turn", None, 16).await?;
                                 if matches!(page.pending.as_ref(), Some(record)
@@ -4648,7 +4667,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "managed public-turn fixture owner did not reap",
                         )
                         .await
@@ -4803,7 +4822,7 @@ mod tests {
                         tokio::time::timeout(Duration::from_secs(5), barrier.wait_sent())
                             .await
                             .context("accepted legacy continuation frame was not flushed")?;
-                        tokio::time::timeout(Duration::from_secs(10), async {
+                        tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                             loop {
                                 let page = sibling
                                     .public_transcript_page("legacy-managed", None, 16)
@@ -4852,7 +4871,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "managed legacy continuation owner did not reap",
                         )
                         .await
@@ -4922,7 +4941,7 @@ mod tests {
                         tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
                             .await
                             .context("accepted write frame was not flushed")?;
-                        tokio::time::timeout(Duration::from_secs(10), async {
+                        tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                             loop {
                                 if sibling.get("accepted-lost-reply").await? == Some(json!(1)) {
                                     break Ok::<(), anyhow::Error>(());
@@ -4959,7 +4978,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "cancelled write fixture owner did not reap",
                         )
                         .await
@@ -5040,7 +5059,7 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
                     .await
                     .context("reasoning summary reply frame was not flushed")?;
-                tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                     loop {
                         if sibling.get(&key).await? == Some(expected.clone()) {
                             break Ok::<(), anyhow::Error>(());
@@ -5099,7 +5118,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "reasoning summary fixture owner did not reap",
                         )
                         .await
@@ -5291,7 +5310,7 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
                     .await
                     .context("context checkpoint frame was not flushed")?;
-                tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                     loop {
                         if inspector
                             .context_summary_cursor(actor, "session-a", actor)
@@ -5467,7 +5486,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "session checkpoint fixture owner did not reap",
                         )
                         .await
@@ -5555,8 +5574,12 @@ mod tests {
                     // already-owned store without adding a sibling attachment;
                     // otherwise that sibling can win the reservation race and
                     // correctly cause selected abandonment to be refused.
+                    // No inner bound: the owner reaches the ref deletion through
+                    // several statements of a multi-step candidate operation with
+                    // no single product budget, so the enclosing
+                    // `FixtureDeadline` bounds this poll.
                     let mut last_status = None;
-                    tokio::time::timeout(Duration::from_secs(10), async {
+                    async {
                         loop {
                             if served.is_finished() {
                                 let ended = served
@@ -5574,28 +5597,31 @@ mod tests {
                             }
                             tokio::time::sleep(Duration::from_millis(20)).await;
                         }
-                    })
+                    }
                     .await
                     .with_context(|| {
                         format!("selected ref was not reclaimed: {last_status:?}")
-                    })??;
+                    })?;
                     drop(owner_inspection);
                     // Now retain an authenticated sibling in the original
                     // generation before cancelling the held client reply.
-                    let mut original_generation =
-                        tokio::time::timeout(Duration::from_secs(10), async {
-                            loop {
-                                match remote.session.factory.connect().await {
-                                    Ok(attachment) => break Ok::<_, anyhow::Error>(attachment),
-                                    Err(error) if service::is_peer_closed(&error) => {
-                                        tokio::time::sleep(Duration::from_millis(20)).await;
-                                    }
-                                    Err(error) => return Err(error),
+                    // No inner bound: the owner drops its reservation when the
+                    // abandonment returns, a multi-step candidate operation
+                    // with no single product budget, so the enclosing
+                    // `FixtureDeadline` bounds this wait.
+                    let mut original_generation = async {
+                        loop {
+                            match remote.session.factory.connect().await {
+                                Ok(attachment) => break Ok::<_, anyhow::Error>(attachment),
+                                Err(error) if service::is_peer_closed(&error) => {
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
                                 }
+                                Err(error) => return Err(error),
                             }
-                        })
-                        .await
-                        .context("selected abandon reservation did not release")??;
+                        }
+                    }
+                    .await
+                    .context("selected abandon reservation did not release")?;
                     writer.abort();
                     let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
                         .await
@@ -5646,7 +5672,7 @@ mod tests {
                             _gate,
                             &options,
                             &project,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "selected ref old owner did not reap",
                         )
                         .await?;
@@ -5696,7 +5722,7 @@ mod tests {
                             .retire(
                                 &options,
                                 None,
-                                Duration::from_secs(10),
+                                owner_reap_within(),
                                 "selected ref fixture's current owner did not reap",
                             )
                             .await
@@ -5789,7 +5815,7 @@ mod tests {
                             bail!("witness could not open the exact candidate ref")
                         };
                         ensure!(branch == remote.pinned_view);
-                        tokio::time::timeout(Duration::from_secs(10), async {
+                        tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                             loop {
                                 let value = witness
                                     .call(ServiceCall::View {
@@ -5834,7 +5860,9 @@ mod tests {
                             // A one-shot successor open; see
                             // `crate::spawn_gate::excluding_spawns`.
                             let ((), gate) = crate::spawn_gate::excluding_spawns(_gate, async {
-                                let permit = tokio::time::timeout(Duration::from_secs(10), async {
+                                // The permit waits out the old owner's close within
+                                // the product's maintenance deadline.
+                                let permit = tokio::time::timeout(service::maintenance_deadline(&options), async {
                                     loop {
                                         match service::acquire_maintenance_permit(&options).await {
                                             Ok(permit) => break Ok::<_, anyhow::Error>(permit),
@@ -5852,7 +5880,7 @@ mod tests {
                                 .await
                                 .context("closed candidate transports did not drain before owner retirement")??;
                                 served
-                                    .reap(Duration::from_secs(10), "candidate unit old owner did not reap")
+                                    .reap(owner_reap_within(), "candidate unit old owner did not reap")
                                     .await?;
                                 drop(permit);
                                 let successor = service::ServiceOwner::open(options.clone(), &project).await?;
@@ -5934,7 +5962,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "candidate unit fixture owner did not reap",
                         )
                         .await
@@ -6015,7 +6043,7 @@ mod tests {
 
                         // The sibling's ref inspection is the visibility proof: the head
                         // moves off the base only when the owner committed the write.
-                        let head = tokio::time::timeout(Duration::from_secs(10), async {
+                        let head = tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
                             loop {
                                 let status = sibling.candidate_ref_status(&branch).await?;
                                 if let Some(head) = status.head.filter(|head| *head != base) {
@@ -6037,10 +6065,13 @@ mod tests {
                         // is live, before it changes anything. Release the writer's
                         // transports; each refusal is a complete request/reply round
                         // trip, so retrying it until the owner has seen them close
-                        // needs no timer.
+                        // needs no timer. No inner bound: each call has its client
+                        // reply deadline, and the accepted abandonment is a
+                        // multi-step candidate operation with no single product
+                        // budget, so the enclosing `FixtureDeadline` bounds the loop.
                         private.close_transport_for_test().await?;
                         memory.close_transport_for_test().await?;
-                        tokio::time::timeout(Duration::from_secs(10), async {
+                        async {
                             loop {
                                 match sibling.abandon_candidate_ref(&branch, &base, &head).await {
                                     Ok(()) => break Ok::<(), anyhow::Error>(()),
@@ -6059,9 +6090,9 @@ mod tests {
                                     Err(error) => break Err(error),
                                 }
                             }
-                        })
+                        }
                         .await
-                        .context("sibling could not abandon the exact candidate ref")??;
+                        .context("sibling could not abandon the exact candidate ref")?;
                         ensure!(
                             sibling.candidate_ref_status(&branch).await?.state
                                 == store::CandidateRefState::Missing,
@@ -6098,7 +6129,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "reclaimed candidate ref fixture owner did not reap",
                         )
                         .await
@@ -6229,7 +6260,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "promotion facade fixture owner did not reap",
                         )
                         .await
@@ -6347,7 +6378,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "candidate conflict fixture owner did not reap",
                         )
                         .await
@@ -6425,7 +6456,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "usage facade fixture owner did not reap",
                         )
                         .await
@@ -6524,7 +6555,7 @@ mod tests {
                                     _gate,
                                     &options,
                                     &project,
-                                    Duration::from_secs(10),
+                                    owner_reap_within(),
                                     "candidate fixture old owner did not reap",
                                 )
                                 .await?
@@ -6609,7 +6640,7 @@ mod tests {
                         .retire(
                             &options,
                             None,
-                            Duration::from_secs(10),
+                            owner_reap_within(),
                             "candidate facade fixture owner did not reap",
                         )
                         .await
@@ -6664,15 +6695,27 @@ mod tests {
                         let second = open().await?;
 
                         let first_lease = first.acquire_dream_lease().await?;
+                        let Backend::Remote(second_remote) = &second.backend else {
+                            bail!("the second managed dream is not attached to the owner")
+                        };
+                        let second_session = second_remote.session.clone();
                         let mut waiting = tokio::spawn({
                             let second = second.clone();
                             async move { second.acquire_dream_lease().await }
                         });
                         let waiting_cleanup = AbortOnDrop(waiting.abort_handle());
+                        // The owner's refusal of the waiting dream, not a window,
+                        // shows the lease is not granted concurrently.
+                        tokio::select! {
+                            biased;
+                            () = second_session.dream_lease_refused.notified() => {}
+                            ended = &mut waiting => bail!(
+                                "a second managed dream acquired the project lease concurrently: {:?}",
+                                ended.map(|acquired| acquired.map(|_| ()))
+                            ),
+                        }
                         ensure!(
-                            tokio::time::timeout(Duration::from_millis(250), &mut waiting)
-                                .await
-                                .is_err(),
+                            !waiting.is_finished(),
                             "a second managed dream acquired the project lease concurrently"
                         );
                         second
@@ -6730,7 +6773,7 @@ mod tests {
                     served
                         .retire(
                             &options,
-                            Some(Duration::from_secs(20)),
+                            Some(service::maintenance_deadline(&options)),
                             Duration::from_secs(5),
                             "managed dream owner did not finish reaping",
                         )
@@ -6809,8 +6852,11 @@ mod tests {
                             "losing local open changed the live owner publication"
                         );
                         let held = remote.attachment.lock().await;
+                        // An independent read answers within its own reply
+                        // deadline (`OPERATION_TIMEOUT`); one serialized behind the
+                        // held attachment never would.
                         let concurrent_revision =
-                            tokio::time::timeout(Duration::from_secs(5), first.revision())
+                            tokio::time::timeout(service::rpc::OPERATION_TIMEOUT, first.revision())
                                 .await
                                 .context(
                                     "a busy client connection serialized an independent read",
@@ -6946,7 +6992,7 @@ mod tests {
                     served
                         .retire(
                             &options,
-                            Some(Duration::from_secs(20)),
+                            Some(service::maintenance_deadline(&options)),
                             Duration::from_secs(5),
                             "managed owner did not finish reaping",
                         )
