@@ -4542,6 +4542,14 @@ impl MemoryStore {
     pub(crate) async fn acquire_dream_lease(&self) -> OwnedMutexGuard<()> {
         self.shared.dream.clone().lock_owned().await
     }
+    /// The shared server handle, which a test teardown scope retains to close
+    /// it without keeping this open's other resources, such as its fixture
+    /// permit, alive.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn server_for_teardown(&self) -> Server {
+        self.shared.server.clone()
+    }
+
     /// Explicitly shut down this shared server handle and every view that
     /// clones it. Dropping a view only releases that view.
     pub async fn close(self) -> Result<()> {

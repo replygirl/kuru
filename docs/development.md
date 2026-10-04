@@ -134,8 +134,16 @@ store a test opens before it returns. A test can prove it with
 every supervisor the test started that is unreaped or was dropped live;
 `test_support::test_supervisors()` marks every supervisor the calling test
 starts, for a fixture that opens its store before it could take a mark.
-`kuru-runtime` tests end with `crate::tests::close_stores([...])`, which
-closes the stores they still hold and asserts that list is empty.
+A teardown that is a test's last statement runs only on success; an
+assertion failure, a panic or an early `?` return drops the store live.
+`test_support::closing(async { ... }).await` runs the whole body instead:
+while it is active on the test's thread, every local store the body opens is
+retained, and it closes them all after the body returns, fails or panics
+(close is idempotent), then resumes a panic or asserts that list is empty.
+Every async `kuru-runtime` test runs its body in it, and the unit test
+`every_async_test_runs_its_body_in_the_closing_scope` names any that does
+not. `crate::tests::close_stores([...])` remains for closing a store
+mid-test, such as before a reopen or at the end of a loop iteration.
 
 The merge refuses a receipt without that digest or an export that differs from
 it or from its totals. It requires every partition to report the same files,
