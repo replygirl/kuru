@@ -2,7 +2,6 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -384,7 +383,11 @@ async fn closed_foreground_approval_refuses_without_network_dispatch() {
         let target = harness.topology.parts[0].id.clone();
         let (sender, mut receiver) = mpsc::channel::<ApprovalRequest>(1);
         let close = tokio::spawn(async move {
-            let request = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+        // The request follows turn admission's `memory.get` (engine.rs:1499)
+        // and the actor's context reads: memory statements under the budget
+        // `turn_admission_deadline` follows.
+        let request =
+            tokio::time::timeout(crate::tests::turn_admission_deadline(), receiver.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -430,8 +433,11 @@ async fn cancelled_pending_approval_cannot_dispatch_later() {
                 ApprovalSender::new(sender),
             );
             tokio::pin!(run);
+        // The request follows turn admission's `memory.get` (engine.rs:1499)
+        // and the actor's context reads: memory statements under the budget
+        // `turn_admission_deadline` follows.
             let request = tokio::select! {
-                request = tokio::time::timeout(Duration::from_secs(10), receiver.recv()) =>
+            request = tokio::time::timeout(crate::tests::turn_admission_deadline(), receiver.recv()) =>
                     request.unwrap().unwrap(),
                 result = &mut run => panic!("turn settled before asking permission: {result:?}"),
             };

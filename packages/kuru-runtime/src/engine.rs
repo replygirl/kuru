@@ -6817,7 +6817,10 @@ mod publication_tests {
                 let harness = harness.clone();
                 async move { harness.lock().await.resume_session("resume-race").await }
             });
-            tokio::time::timeout(Duration::from_secs(10), reached)
+        // `resume_session` reconciles and reads the catalog record, the
+        // session and the topology before its pause (engine.rs:1183-1222):
+        // memory statements under the budget `turn_admission_deadline` follows.
+        tokio::time::timeout(crate::tests::turn_admission_deadline(), reached)
                 .await
                 .unwrap()
                 .unwrap();
@@ -6872,7 +6875,8 @@ mod publication_tests {
                     .await
                 }
             });
-            tokio::time::timeout(Duration::from_secs(10), reached)
+        // One session-catalog statement precedes the pause (engine.rs:4887-4888).
+        tokio::time::timeout(kuru_memory::test_budgets::QUERY_TIMEOUT, reached)
                 .await
                 .unwrap()
                 .unwrap();
@@ -6920,7 +6924,8 @@ mod publication_tests {
                     .await
                 }
             });
-            tokio::time::timeout(Duration::from_secs(10), reached)
+        // One session-catalog statement precedes the pause (engine.rs:4887-4888).
+        tokio::time::timeout(kuru_memory::test_budgets::QUERY_TIMEOUT, reached)
                 .await
                 .unwrap()
                 .unwrap();

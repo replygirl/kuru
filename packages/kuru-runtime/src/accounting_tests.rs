@@ -3625,7 +3625,10 @@ async fn cancellation_settles_admitted_usage_without_a_terminal_report() {
             harness.shutdown(false).await.unwrap();
             result
         });
-        tokio::time::timeout(std::time::Duration::from_secs(5), observed.notified())
+    // The provider stream starts after turn admission's `memory.get`
+    // (engine.rs:1499) and the actor's context reads (actor.rs:415, :445):
+    // memory statements under the budget `turn_admission_deadline` follows.
+    tokio::time::timeout(crate::tests::turn_admission_deadline(), observed.notified())
             .await
             .unwrap();
         watch
