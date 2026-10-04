@@ -3371,29 +3371,56 @@ async fn start_database(
         {
             #[cfg(all(test, unix))]
             adoption_fault::engine_started(child);
-            let mut phase = "checking the bootstrap data directory";
-            let initialized = timeout(
-                deadline.saturating_duration_since(Instant::now()),
-                initialize_database(&pool, directory, identity, &mut phase),
-            )
-            .await;
+            let initialized =
+                bootstrap_database(&pool, directory, identity, deadline, &mut foreign).await;
             pool.close().await;
             match initialized {
                 // Not this store's server: keep observing the owned Dolt,
                 // whose own exit reports the taken port to the bounded retry.
-                Ok(Err(error)) if error.downcast_ref::<ForeignDataDirectory>().is_some() => {
+                Ok(BootstrapOutcome::Foreign(error)) => {
                     foreign = Some(error);
                 }
-                initialized => {
-                    return initialized
-                        .with_context(|| {
-                            format!("Dolt database bootstrap deadline exceeded while {phase}")
-                        })?
-                        .with_context(|| format!("Dolt database bootstrap failed while {phase}"));
-                }
+                Ok(BootstrapOutcome::Initialized) => return Ok(()),
+                Err(error) => return Err(error),
             }
         }
         sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[derive(Debug)]
+enum BootstrapOutcome {
+    Initialized,
+    Foreign(anyhow::Error),
+}
+
+async fn bootstrap_database(
+    pool: &MySqlPool,
+    directory: &Path,
+    identity: &mut Identity,
+    deadline: Instant,
+    foreign: &mut Option<anyhow::Error>,
+) -> Result<BootstrapOutcome> {
+    let mut phase = "checking the bootstrap data directory";
+    let initialized = timeout(deadline.saturating_duration_since(Instant::now()), async {
+        #[cfg(all(test, unix))]
+        bootstrap_fault::before_datadir(foreign.is_some()).await;
+        initialize_database(pool, directory, identity, &mut phase, foreign).await
+    })
+    .await;
+    match initialized {
+        Ok(Err(error)) if error.downcast_ref::<ForeignDataDirectory>().is_some() => {
+            Ok(BootstrapOutcome::Foreign(error))
+        }
+        Err(_) if foreign.is_some() => Err(foreign.take().expect("retained foreign observation")
+            .context("the last data-directory probe timed out; retaining the previously observed foreign listener")
+            .context("authenticated Dolt startup deadline exceeded")),
+        initialized => {
+            initialized
+                .with_context(|| format!("Dolt database bootstrap deadline exceeded while {phase}"))?
+                .with_context(|| format!("Dolt database bootstrap failed while {phase}"))?;
+            Ok(BootstrapOutcome::Initialized)
+        }
     }
 }
 
@@ -3402,6 +3429,7 @@ async fn initialize_database(
     directory: &Path,
     identity: &mut Identity,
     phase: &mut &'static str,
+    foreign: &mut Option<anyhow::Error>,
 ) -> Result<()> {
     let datadir: String = sqlx::query_scalar("SELECT @@datadir")
         .fetch_one(pool)
@@ -3411,6 +3439,9 @@ async fn initialize_database(
             .with_context(|| format!("resolve Dolt bootstrap datadir {datadir:?}"))?,
         ForeignDataDirectory
     );
+    // This probe reached the correct server: earlier foreign evidence must
+    // not describe a later failure in this server's bootstrap.
+    *foreign = None;
     // A pending template identity names the key it was created under. Only
     // while the store is uninitialized is that key compared, before any
     // write: once adopted, the key is provenance, and a later build opens the
@@ -3441,6 +3472,8 @@ async fn initialize_database(
         adopt_template(pool, identity, phase).await?;
     } else if !identity.initialized {
         *phase = "creating the project database";
+        #[cfg(all(test, unix))]
+        bootstrap_fault::before_project_create().await;
         sqlx::query(BOOTSTRAP_CREATE_DATABASE).execute(pool).await?;
         *phase = "creating the project identity table";
         sqlx::query(BOOTSTRAP_CREATE_IDENTITY).execute(pool).await?;
@@ -3514,6 +3547,40 @@ async fn initialize_database(
         write_record(&directory.join("identity.json"), identity)?;
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod bootstrap_fault {
+    use super::*;
+
+    #[derive(Clone)]
+    pub(super) enum Fault {
+        RepeatedForeignProbe(Arc<std::sync::atomic::AtomicBool>),
+        ProjectCreate(Arc<std::sync::atomic::AtomicBool>),
+    }
+
+    tokio::task_local! {
+        pub(super) static FAULT: Fault;
+    }
+
+    pub(super) async fn before_datadir(foreign_observed: bool) {
+        if foreign_observed
+            && let Ok(Fault::RepeatedForeignProbe(entered)) = FAULT.try_with(Clone::clone)
+        {
+            entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+    }
+
+    pub(super) async fn before_project_create() {
+        if let Ok(Fault::ProjectCreate(entered)) = FAULT.try_with(Clone::clone) {
+            entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            // The real datadir query has finished. Only this test runtime's
+            // injected stall now advances to the existing deadline virtually.
+            tokio::time::pause();
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// Whether `rows` is exactly one identity row holding `instance` and `scope`.
