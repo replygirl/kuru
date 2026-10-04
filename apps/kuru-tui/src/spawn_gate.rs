@@ -68,29 +68,32 @@ mod tests {
 
     #[tokio::test]
     async fn an_in_flight_spawn_excludes_lock_acquisition_until_it_finishes() {
-        // A private gate, so these observations are unaffected by whatever the
-        // rest of the suite is doing to the process-wide one.
-        static GATE: Gate = Gate::new();
-        let (acquired, observed) = mpsc::channel();
-        let spawning = GATE.spawning().await;
-        // A live spawn guard admits other spawns and excludes lock acquisition.
-        assert!(GATE.0.try_read().is_ok());
-        assert!(GATE.0.try_write().is_err());
-        let waiter = thread::spawn(move || {
-            let exclusive = GATE.locking();
-            // A live lock guard excludes every spawn, so this thread can only
-            // have been released after the spawn guard above was dropped.
-            assert!(GATE.0.try_read().is_err());
-            drop(exclusive);
-            acquired.send(()).unwrap();
-        });
-        assert!(matches!(
-            observed.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
-        drop(spawning);
-        waiter.join().unwrap();
-        observed.recv().unwrap();
+        kuru_memory::test_support::closing(async {
+            // A private gate, so these observations are unaffected by whatever the
+            // rest of the suite is doing to the process-wide one.
+            static GATE: Gate = Gate::new();
+            let (acquired, observed) = mpsc::channel();
+            let spawning = GATE.spawning().await;
+            // A live spawn guard admits other spawns and excludes lock acquisition.
+            assert!(GATE.0.try_read().is_ok());
+            assert!(GATE.0.try_write().is_err());
+            let waiter = thread::spawn(move || {
+                let exclusive = GATE.locking();
+                // A live lock guard excludes every spawn, so this thread can only
+                // have been released after the spawn guard above was dropped.
+                assert!(GATE.0.try_read().is_err());
+                drop(exclusive);
+                acquired.send(()).unwrap();
+            });
+            assert!(matches!(
+                observed.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            drop(spawning);
+            waiter.join().unwrap();
+            observed.recv().unwrap();
+        })
+        .await
     }
 
     #[test]

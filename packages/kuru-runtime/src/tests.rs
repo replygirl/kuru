@@ -210,100 +210,13 @@ async fn close_stores_requires_every_store_the_test_opened() {
     .await
 }
 
-/// The async tests in `source` whose body is not exactly one
-/// [`kuru_memory::test_support::closing`] scope, as `line name`. A body
-/// outside the scope can drop a live store, whose supervisor then outlives
-/// the test process and writes a late coverage profile.
-fn tests_outside_closing(source: &str) -> Vec<String> {
-    let lines = source.lines().collect::<Vec<_>>();
-    let mut unscoped = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        if !line.trim_start().starts_with("#[tokio::test") {
-            continue;
-        }
-        let Some(signature) = (index..lines.len()).find(|&at| lines[at].contains("async fn "))
-        else {
-            unscoped.push(format!("{}: no async fn after #[tokio::test]", index + 1));
-            continue;
-        };
-        let name = lines[signature]
-            .split("async fn ")
-            .nth(1)
-            .and_then(|rest| rest.split(['(', '<']).next())
-            .unwrap_or_default();
-        let opened = (signature..lines.len()).find(|&at| lines[at].trim_end().ends_with('{'));
-        let scoped = opened
-            .and_then(|at| lines.get(at + 1))
-            .is_some_and(|first| {
-                first
-                    .trim_start()
-                    .starts_with("kuru_memory::test_support::closing(")
-            });
-        if !scoped {
-            unscoped.push(format!("{}: {name}", signature + 1));
-        }
-    }
-    unscoped
-}
-
-fn rust_sources(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
-    for entry in std::fs::read_dir(directory).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            rust_sources(&path, found);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
-            found.push(path);
-        }
-    }
-}
-
 #[test]
 fn every_async_test_runs_its_body_in_the_closing_scope() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut sources = Vec::new();
-    rust_sources(&root, &mut sources);
-    sources.sort();
-    let mut scanned = 0;
-    let mut unscoped = Vec::new();
-    for path in sources {
-        let source = std::fs::read_to_string(&path).unwrap();
-        scanned += source.matches("#[tokio::test").count();
-        let relative = path.strip_prefix(&root).unwrap().display().to_string();
-        unscoped.extend(
-            tests_outside_closing(&source)
-                .into_iter()
-                .map(|test| format!("{relative}:{test}")),
-        );
-    }
-    assert!(scanned > 0, "found no async tests under {}", root.display());
-    assert!(
-        unscoped.is_empty(),
-        "run each async test's body in `kuru_memory::test_support::closing(async {{ ... }}).await`, \
-         so every store it opens is closed on every exit path: {unscoped:#?}"
+    kuru_memory::test_support::assert_async_tests_run_in_closing(
+        &root,
+        &kuru_memory::test_support::rust_sources(&root),
     );
-}
-
-#[test]
-fn the_closing_scan_names_a_test_outside_the_scope() {
-    let source = "\
-@test]
-async fn scoped() {
-    kuru_memory::test_support::closing(async {
-        let _ = 1;
-    })
-    .await
-}
-
-@test(start_paused = true)]
-async fn drops_its_store() -> anyhow::Result<()> {
-    let memory = MemoryStore::temporary().await?;
-    drop(memory);
-    Ok(())
-}
-";
-    // Assembled here, so this file's own scan does not read it as a test.
-    let source = source.replace("@test", "#[tokio::test");
-    assert_eq!(tests_outside_closing(&source), ["10: drops_its_store"]);
 }
 
 async fn fixture(mode: Mode, fake: Arc<dyn Provider>) -> (TempDir, Harness) {

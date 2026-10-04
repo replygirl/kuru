@@ -2169,51 +2169,55 @@ mod permission_tests {
 
     #[tokio::test]
     async fn automatic_permission_claim_is_reviewed_but_trust_does_not_grant_a_call() {
-        let _gate = crate::spawn_gate::locking_async().await;
-        let temporary = tempfile::tempdir().unwrap();
-        let project = temporary.path().join("project");
-        let data = temporary.path().join("data");
-        std::fs::create_dir_all(project.join(".kuru")).unwrap();
-        std::fs::write(
-            project.join(".kuru/config.toml"),
-            concat!(
-                "[[permissions]]\naction='ask'\n",
-                "selector={kind='native',name='file_write'}\n"
-            ),
-        )
-        .unwrap();
-        let root = Arc::new(
-            Directory::open(&project, Privacy::Inherited, NameRetention::Movable).unwrap(),
-        );
-        let snapshot =
-            ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
-        let cli = Cli::try_parse_from(["kuru", "tool", "file_write", "--args", "{}"]).unwrap();
-        let error = preflight(&cli, &root, &data, &snapshot).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("workspace authority is not approved")
-        );
-        assert!(all_claim_categories().contains(&AuthorityClaimCategory::ToolPermissions));
-        ApprovalStore::new(&data, &root)
-            .approve_command(snapshot.manifest())
-            .unwrap();
-        preflight(&cli, &root, &data, &snapshot).unwrap();
-        let config = snapshot.finalize(&ProjectPreferences::default()).unwrap();
-        let host = permission_host(&data, root, &config, &snapshot, true).unwrap();
-        let refused = host
-            .execute(
-                "file_write",
-                serde_json::json!({"path":"note.txt","content":"must not be written"}),
+        kuru_memory::test_support::closing(async {
+            let _gate = crate::spawn_gate::locking_async().await;
+            let temporary = tempfile::tempdir().unwrap();
+            let project = temporary.path().join("project");
+            let data = temporary.path().join("data");
+            std::fs::create_dir_all(project.join(".kuru")).unwrap();
+            std::fs::write(
+                project.join(".kuru/config.toml"),
+                concat!(
+                    "[[permissions]]\naction='ask'\n",
+                    "selector={kind='native',name='file_write'}\n"
+                ),
             )
-            .await
-            .unwrap_err();
-        assert!(
-            kuru_connectors::is_permission_denied(&refused),
-            "unexpected projected tool error: {refused:#}"
-        );
-        assert!(!project.join("note.txt").exists());
-        host.shutdown().await.unwrap();
+            .unwrap();
+            let root = Arc::new(
+                Directory::open(&project, Privacy::Inherited, NameRetention::Movable).unwrap(),
+            );
+            let snapshot =
+                ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default())
+                    .unwrap();
+            let cli = Cli::try_parse_from(["kuru", "tool", "file_write", "--args", "{}"]).unwrap();
+            let error = preflight(&cli, &root, &data, &snapshot).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("workspace authority is not approved")
+            );
+            assert!(all_claim_categories().contains(&AuthorityClaimCategory::ToolPermissions));
+            ApprovalStore::new(&data, &root)
+                .approve_command(snapshot.manifest())
+                .unwrap();
+            preflight(&cli, &root, &data, &snapshot).unwrap();
+            let config = snapshot.finalize(&ProjectPreferences::default()).unwrap();
+            let host = permission_host(&data, root, &config, &snapshot, true).unwrap();
+            let refused = host
+                .execute(
+                    "file_write",
+                    serde_json::json!({"path":"note.txt","content":"must not be written"}),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                kuru_connectors::is_permission_denied(&refused),
+                "unexpected projected tool error: {refused:#}"
+            );
+            assert!(!project.join("note.txt").exists());
+            host.shutdown().await.unwrap();
+        })
+        .await
     }
 }
 

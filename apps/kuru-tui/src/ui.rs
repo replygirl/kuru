@@ -4007,280 +4007,292 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn scheduler_rotates_ready_sources_and_yields_to_siblings() {
-        use futures::stream;
+        kuru_memory::test_support::closing(async {
+            use futures::stream;
 
-        let mut input = stream::repeat_with(|| Ok(TerminalEvent::Resize(80, 24)));
-        let (completion_tx, mut completion_rx) = mpsc::channel(1);
-        completion_tx
-            .send((7, Ok(DispatchOutcome::Command("completed".into()))))
-            .await
-            .unwrap();
-        let (activity_tx, mut activity_rx) = broadcast::channel(4);
-        activity_tx
-            .send(Event::Active {
-                actor: "part".into(),
-                detail: "ready".into(),
-            })
-            .unwrap();
-        let mut scheduler = Scheduler::new();
-        let deadline = TokioInstant::now() - Duration::from_millis(1);
-        let (progress_tx, mut progress_rx) = mpsc::channel(1);
-        tokio::spawn(async move {
-            progress_tx.send(()).await.unwrap();
-        });
+            let mut input = stream::repeat_with(|| Ok(TerminalEvent::Resize(80, 24)));
+            let (completion_tx, mut completion_rx) = mpsc::channel(1);
+            completion_tx
+                .send((7, Ok(DispatchOutcome::Command("completed".into()))))
+                .await
+                .unwrap();
+            let (activity_tx, mut activity_rx) = broadcast::channel(4);
+            activity_tx
+                .send(Event::Active {
+                    actor: "part".into(),
+                    detail: "ready".into(),
+                })
+                .unwrap();
+            let mut scheduler = Scheduler::new();
+            let deadline = TokioInstant::now() - Duration::from_millis(1);
+            let (progress_tx, mut progress_rx) = mpsc::channel(1);
+            tokio::spawn(async move {
+                progress_tx.send(()).await.unwrap();
+            });
 
-        let wake = next_wake(
-            &scheduler,
-            &mut input,
-            &mut completion_rx,
-            &mut activity_rx,
-            WakeAvailability {
-                input: true,
-                completion: true,
-                activity: true,
-            },
-            deadline,
-        )
-        .await;
-        assert!(matches!(
-            wake,
-            Wake::Terminal(Some(Ok(TerminalEvent::Resize(80, 24))))
-        ));
-        assert!(
-            progress_rx.try_recv().is_ok(),
-            "production next_wake did not yield to a ready sibling"
-        );
-        scheduler.served(WakeSource::Terminal);
+            let wake = next_wake(
+                &scheduler,
+                &mut input,
+                &mut completion_rx,
+                &mut activity_rx,
+                WakeAvailability {
+                    input: true,
+                    completion: true,
+                    activity: true,
+                },
+                deadline,
+            )
+            .await;
+            assert!(matches!(
+                wake,
+                Wake::Terminal(Some(Ok(TerminalEvent::Resize(80, 24))))
+            ));
+            assert!(
+                progress_rx.try_recv().is_ok(),
+                "production next_wake did not yield to a ready sibling"
+            );
+            scheduler.served(WakeSource::Terminal);
 
-        let wake = next_wake(
-            &scheduler,
-            &mut input,
-            &mut completion_rx,
-            &mut activity_rx,
-            WakeAvailability {
-                input: true,
-                completion: true,
-                activity: true,
-            },
-            deadline,
-        )
-        .await;
-        assert!(matches!(
-            wake,
-            Wake::Completion(Some((7, Ok(DispatchOutcome::Command(_)))))
-        ));
-        scheduler.served(WakeSource::Completion);
+            let wake = next_wake(
+                &scheduler,
+                &mut input,
+                &mut completion_rx,
+                &mut activity_rx,
+                WakeAvailability {
+                    input: true,
+                    completion: true,
+                    activity: true,
+                },
+                deadline,
+            )
+            .await;
+            assert!(matches!(
+                wake,
+                Wake::Completion(Some((7, Ok(DispatchOutcome::Command(_)))))
+            ));
+            scheduler.served(WakeSource::Completion);
 
-        let wake = next_wake(
-            &scheduler,
-            &mut input,
-            &mut completion_rx,
-            &mut activity_rx,
-            WakeAvailability {
-                input: true,
-                completion: true,
-                activity: true,
-            },
-            deadline,
-        )
-        .await;
-        assert!(matches!(wake, Wake::Activity(Ok(Event::Active { .. }))));
-        scheduler.served(WakeSource::Activity);
+            let wake = next_wake(
+                &scheduler,
+                &mut input,
+                &mut completion_rx,
+                &mut activity_rx,
+                WakeAvailability {
+                    input: true,
+                    completion: true,
+                    activity: true,
+                },
+                deadline,
+            )
+            .await;
+            assert!(matches!(wake, Wake::Activity(Ok(Event::Active { .. }))));
+            scheduler.served(WakeSource::Activity);
 
-        let wake = next_wake(
-            &scheduler,
-            &mut input,
-            &mut completion_rx,
-            &mut activity_rx,
-            WakeAvailability {
-                input: true,
-                completion: true,
-                activity: true,
-            },
-            deadline,
-        )
-        .await;
-        assert!(matches!(wake, Wake::Animation));
+            let wake = next_wake(
+                &scheduler,
+                &mut input,
+                &mut completion_rx,
+                &mut activity_rx,
+                WakeAvailability {
+                    input: true,
+                    completion: true,
+                    activity: true,
+                },
+                deadline,
+            )
+            .await;
+            assert!(matches!(wake, Wake::Animation));
+        })
+        .await
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn progress_burst_coalesces_and_ready_terminal_input_still_wins() {
-        use futures::stream;
+        kuru_memory::test_support::closing(async {
+            use futures::stream;
 
-        let (sender, mut progress_rx) = watch::channel(None);
-        for seq in 1..=1000 {
-            sender.send_replace(Some(progress("turn", 1, seq)));
-        }
-        let mut input = stream::repeat_with(|| Ok(TerminalEvent::Resize(80, 24)));
-        let (_completion_tx, mut completion_rx) = mpsc::channel(1);
-        let (_activity_tx, mut activity_rx) = broadcast::channel(1);
-        let available = WakeAvailability {
-            input: true,
-            completion: true,
-            activity: true,
-        };
-        let mut scheduler = Scheduler {
-            first: WakeSource::Progress,
-        };
-        let deadline = TokioInstant::now() + Duration::from_secs(60);
-        let wake = next_wake_with_progress(
-            &scheduler,
-            &mut input,
-            &mut completion_rx,
-            &mut activity_rx,
-            &mut progress_rx,
-            available,
-            true,
-            deadline,
-        )
-        .await;
-        assert!(matches!(wake, Wake::Progress(Ok(()))));
-        assert_eq!(progress_rx.borrow_and_update().as_ref().unwrap().seq, 1000);
-        scheduler.first = WakeSource::Terminal;
-        sender.send_replace(Some(progress("turn", 1, 1001)));
-        let wake = next_wake_with_progress(
-            &scheduler,
-            &mut input,
-            &mut completion_rx,
-            &mut activity_rx,
-            &mut progress_rx,
-            available,
-            true,
-            deadline,
-        )
-        .await;
-        assert!(matches!(
-            wake,
-            Wake::Terminal(Some(Ok(TerminalEvent::Resize(80, 24))))
-        ));
-        let mut paint = PreviewPaint::default();
-        let started = TokioInstant::now();
-        paint.mark();
-        assert!(paint.due(started), "first preview must paint promptly");
-        paint.painted(started);
-        for tick in 1..80 {
+            let (sender, mut progress_rx) = watch::channel(None);
+            for seq in 1..=1000 {
+                sender.send_replace(Some(progress("turn", 1, seq)));
+            }
+            let mut input = stream::repeat_with(|| Ok(TerminalEvent::Resize(80, 24)));
+            let (_completion_tx, mut completion_rx) = mpsc::channel(1);
+            let (_activity_tx, mut activity_rx) = broadcast::channel(1);
+            let available = WakeAvailability {
+                input: true,
+                completion: true,
+                activity: true,
+            };
+            let mut scheduler = Scheduler {
+                first: WakeSource::Progress,
+            };
+            let deadline = TokioInstant::now() + Duration::from_secs(60);
+            let wake = next_wake_with_progress(
+                &scheduler,
+                &mut input,
+                &mut completion_rx,
+                &mut activity_rx,
+                &mut progress_rx,
+                available,
+                true,
+                deadline,
+            )
+            .await;
+            assert!(matches!(wake, Wake::Progress(Ok(()))));
+            assert_eq!(progress_rx.borrow_and_update().as_ref().unwrap().seq, 1000);
+            scheduler.first = WakeSource::Terminal;
+            sender.send_replace(Some(progress("turn", 1, 1001)));
+            let wake = next_wake_with_progress(
+                &scheduler,
+                &mut input,
+                &mut completion_rx,
+                &mut activity_rx,
+                &mut progress_rx,
+                available,
+                true,
+                deadline,
+            )
+            .await;
+            assert!(matches!(
+                wake,
+                Wake::Terminal(Some(Ok(TerminalEvent::Resize(80, 24))))
+            ));
+            let mut paint = PreviewPaint::default();
+            let started = TokioInstant::now();
             paint.mark();
+            assert!(paint.due(started), "first preview must paint promptly");
+            paint.painted(started);
+            for tick in 1..80 {
+                paint.mark();
+                assert!(
+                    !paint.due(started + Duration::from_millis(tick)),
+                    "a burst caused a preview-only redraw before 80 ms at {tick} ms"
+                );
+            }
+            let mut reduced = fixture();
+            reduced.busy = true;
+            reduced.motion = false;
+            reduced.focused = false;
+            assert!(!reduced.advance_animation(Duration::from_millis(80)));
             assert!(
-                !paint.due(started + Duration::from_millis(tick)),
-                "a burst caused a preview-only redraw before 80 ms at {tick} ms"
+                paint.due(started + PREVIEW_PAINT_INTERVAL),
+                "reduced motion or lost focus must not suppress a pending preview"
             );
-        }
-        let mut reduced = fixture();
-        reduced.busy = true;
-        reduced.motion = false;
-        reduced.focused = false;
-        assert!(!reduced.advance_animation(Duration::from_millis(80)));
-        assert!(
-            paint.due(started + PREVIEW_PAINT_INTERVAL),
-            "reduced motion or lost focus must not suppress a pending preview"
-        );
+        })
+        .await
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn queued_completion_wakes_without_waiting_for_the_animation_deadline() {
-        use futures::stream;
+        kuru_memory::test_support::closing(async {
+            use futures::stream;
 
-        let mut input = stream::pending();
-        let (completion_tx, mut completion_rx) = mpsc::channel(1);
-        completion_tx
-            .send((3, Ok(DispatchOutcome::Command("ready".into()))))
-            .await
-            .unwrap();
-        let (_activity_tx, mut activity_rx) = broadcast::channel(1);
-        let scheduler = Scheduler::new();
-        let wake = next_wake(
-            &scheduler,
-            &mut input,
-            &mut completion_rx,
-            &mut activity_rx,
-            WakeAvailability {
-                input: true,
-                completion: true,
-                activity: true,
-            },
-            TokioInstant::now() + Duration::from_secs(60),
-        )
-        .await;
-        assert!(matches!(
-            wake,
-            Wake::Completion(Some((3, Ok(DispatchOutcome::Command(_)))))
-        ));
+            let mut input = stream::pending();
+            let (completion_tx, mut completion_rx) = mpsc::channel(1);
+            completion_tx
+                .send((3, Ok(DispatchOutcome::Command("ready".into()))))
+                .await
+                .unwrap();
+            let (_activity_tx, mut activity_rx) = broadcast::channel(1);
+            let scheduler = Scheduler::new();
+            let wake = next_wake(
+                &scheduler,
+                &mut input,
+                &mut completion_rx,
+                &mut activity_rx,
+                WakeAvailability {
+                    input: true,
+                    completion: true,
+                    activity: true,
+                },
+                TokioInstant::now() + Duration::from_secs(60),
+            )
+            .await;
+            assert!(matches!(
+                wake,
+                Wake::Completion(Some((3, Ok(DispatchOutcome::Command(_)))))
+            ));
+        })
+        .await
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn closed_activity_keeps_completion_and_terminal_input_usable() {
-        use futures::stream;
+        kuru_memory::test_support::closing(async {
+            use futures::stream;
 
-        let mut input = stream::iter([Ok(TerminalEvent::Resize(80, 24))]);
-        let (completion_tx, mut completion_rx) = mpsc::channel(1);
-        completion_tx
-            .send((8, Ok(DispatchOutcome::Command("ready".into()))))
-            .await
-            .unwrap();
-        let (activity_tx, mut activity_rx) = broadcast::channel(1);
-        drop(activity_tx);
-        let mut scheduler = Scheduler {
-            first: WakeSource::Activity,
-        };
-        let animation_at = TokioInstant::now() + Duration::from_secs(60);
+            let mut input = stream::iter([Ok(TerminalEvent::Resize(80, 24))]);
+            let (completion_tx, mut completion_rx) = mpsc::channel(1);
+            completion_tx
+                .send((8, Ok(DispatchOutcome::Command("ready".into()))))
+                .await
+                .unwrap();
+            let (activity_tx, mut activity_rx) = broadcast::channel(1);
+            drop(activity_tx);
+            let mut scheduler = Scheduler {
+                first: WakeSource::Activity,
+            };
+            let animation_at = TokioInstant::now() + Duration::from_secs(60);
 
-        let wake = next_wake(
-            &scheduler,
-            &mut input,
-            &mut completion_rx,
-            &mut activity_rx,
-            WakeAvailability {
-                input: true,
-                completion: true,
-                activity: true,
-            },
-            animation_at,
-        )
-        .await;
-        assert!(matches!(
-            wake,
-            Wake::Activity(Err(broadcast::error::RecvError::Closed))
-        ));
-        scheduler.served(WakeSource::Activity);
-        let activity_open = activity_still_open(true, true);
-        assert!(!activity_open);
+            let wake = next_wake(
+                &scheduler,
+                &mut input,
+                &mut completion_rx,
+                &mut activity_rx,
+                WakeAvailability {
+                    input: true,
+                    completion: true,
+                    activity: true,
+                },
+                animation_at,
+            )
+            .await;
+            assert!(matches!(
+                wake,
+                Wake::Activity(Err(broadcast::error::RecvError::Closed))
+            ));
+            scheduler.served(WakeSource::Activity);
+            let activity_open = activity_still_open(true, true);
+            assert!(!activity_open);
 
-        let wake = next_wake(
-            &scheduler,
-            &mut input,
-            &mut completion_rx,
-            &mut activity_rx,
-            WakeAvailability {
-                input: true,
-                completion: true,
-                activity: activity_open,
-            },
-            animation_at,
-        )
-        .await;
-        assert!(matches!(
-            wake,
-            Wake::Terminal(Some(Ok(TerminalEvent::Resize(80, 24))))
-        ));
-        scheduler.served(WakeSource::Terminal);
+            let wake = next_wake(
+                &scheduler,
+                &mut input,
+                &mut completion_rx,
+                &mut activity_rx,
+                WakeAvailability {
+                    input: true,
+                    completion: true,
+                    activity: activity_open,
+                },
+                animation_at,
+            )
+            .await;
+            assert!(matches!(
+                wake,
+                Wake::Terminal(Some(Ok(TerminalEvent::Resize(80, 24))))
+            ));
+            scheduler.served(WakeSource::Terminal);
 
-        let wake = next_wake(
-            &scheduler,
-            &mut input,
-            &mut completion_rx,
-            &mut activity_rx,
-            WakeAvailability {
-                input: true,
-                completion: true,
-                activity: activity_open,
-            },
-            animation_at,
-        )
-        .await;
-        assert!(matches!(
-            wake,
-            Wake::Completion(Some((8, Ok(DispatchOutcome::Command(_)))))
-        ));
+            let wake = next_wake(
+                &scheduler,
+                &mut input,
+                &mut completion_rx,
+                &mut activity_rx,
+                WakeAvailability {
+                    input: true,
+                    completion: true,
+                    activity: activity_open,
+                },
+                animation_at,
+            )
+            .await;
+            assert!(matches!(
+                wake,
+                Wake::Completion(Some((8, Ok(DispatchOutcome::Command(_)))))
+            ));
+        })
+        .await
     }
 
     #[test]
@@ -4317,32 +4329,35 @@ mod tests {
 
     #[tokio::test]
     async fn abort_fence_awaits_owned_dispatch_cancellation() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
+        kuru_memory::test_support::closing(async {
+            use std::sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            };
 
-        struct OnDrop(Arc<AtomicBool>);
-        impl Drop for OnDrop {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
+            struct OnDrop(Arc<AtomicBool>);
+            impl Drop for OnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
             }
-        }
 
-        let dropped = Arc::new(AtomicBool::new(false));
-        let observed = dropped.clone();
-        let (ready, entered) = tokio::sync::oneshot::channel();
-        let mut job = Some(tokio::spawn(async move {
-            let _drop = OnDrop(observed);
-            ready.send(()).unwrap();
-            std::future::pending::<()>().await;
-        }));
-        entered.await.unwrap();
-        let mut generation = 9;
-        abort_and_fence(&mut job, &mut generation).await;
-        assert_eq!(generation, 10);
-        assert!(job.is_none());
-        assert!(dropped.load(Ordering::SeqCst));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let observed = dropped.clone();
+            let (ready, entered) = tokio::sync::oneshot::channel();
+            let mut job = Some(tokio::spawn(async move {
+                let _drop = OnDrop(observed);
+                ready.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }));
+            entered.await.unwrap();
+            let mut generation = 9;
+            abort_and_fence(&mut job, &mut generation).await;
+            assert_eq!(generation, 10);
+            assert!(job.is_none());
+            assert!(dropped.load(Ordering::SeqCst));
+        })
+        .await
     }
 
     #[test]

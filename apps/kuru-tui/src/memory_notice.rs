@@ -106,84 +106,90 @@ mod tests {
 
     #[tokio::test]
     async fn state_is_pending_until_current_or_newer_and_rejects_malformed_values() {
-        let store = {
-            // Held across the supervisor and engine spawns; see `crate::spawn_gate`.
-            let _gate = crate::spawn_gate::spawning().await;
-            MemoryStore::temporary().await.unwrap()
-        };
-        let shutdown = store.clone();
-        let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
-        let cleanup_directory = store.status().await.unwrap().directory;
-        let directory = format!("{cleanup_directory:?}");
-        assert!(notice.text().contains(&directory));
-        for control in [
-            "kuru memory notes ID",
-            "kuru memory export --format json --output PATH",
-            "kuru memory forget ID --note SEQUENCE",
-            "kuru memory purge --help",
-        ] {
-            assert!(notice.text().contains(control), "{control}");
-        }
-        notice.record().await.unwrap();
-        assert!(
-            MemoryNotice::pending(store.clone())
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        let key = notice.key.clone();
-        store.put(&key, &json!({ "version": 0 })).await.unwrap();
-        assert!(
-            MemoryNotice::pending(store.clone())
-                .await
-                .unwrap()
-                .is_some()
-        );
-
-        store
-            .put(&key, &json!({ "version": VERSION + 1 }))
-            .await
-            .unwrap();
-        assert!(
-            MemoryNotice::pending(store.clone())
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        store
-            .put(&key, &json!({ "version": "invalid" }))
-            .await
-            .unwrap();
-        let error = MemoryNotice::pending(store)
-            .await
-            .err()
-            .expect("malformed state");
-        assert!(format!("{error:#}").contains("numeric version"));
-        shutdown.close().await.unwrap();
-        assert!(!cleanup_directory.exists());
-    }
-
-    #[tokio::test]
-    async fn failed_headless_write_or_flush_does_not_record_the_notice() {
-        for fail_flush in [false, true] {
+        kuru_memory::test_support::closing(async {
             let store = {
                 // Held across the supervisor and engine spawns; see `crate::spawn_gate`.
                 let _gate = crate::spawn_gate::spawning().await;
                 MemoryStore::temporary().await.unwrap()
             };
             let shutdown = store.clone();
-            let cleanup_directory = store.status().await.unwrap().directory;
             let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
-            let error = notice
-                .announce_to(&mut FailingNoticeWriter { fail_flush })
+            let cleanup_directory = store.status().await.unwrap().directory;
+            let directory = format!("{cleanup_directory:?}");
+            assert!(notice.text().contains(&directory));
+            for control in [
+                "kuru memory notes ID",
+                "kuru memory export --format json --output PATH",
+                "kuru memory forget ID --note SEQUENCE",
+                "kuru memory purge --help",
+            ] {
+                assert!(notice.text().contains(control), "{control}");
+            }
+            notice.record().await.unwrap();
+            assert!(
+                MemoryNotice::pending(store.clone())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            let key = notice.key.clone();
+            store.put(&key, &json!({ "version": 0 })).await.unwrap();
+            assert!(
+                MemoryNotice::pending(store.clone())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+
+            store
+                .put(&key, &json!({ "version": VERSION + 1 }))
                 .await
-                .unwrap_err();
-            assert!(format!("{error:#}").contains("notice"));
-            assert!(MemoryNotice::pending(store).await.unwrap().is_some());
+                .unwrap();
+            assert!(
+                MemoryNotice::pending(store.clone())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            store
+                .put(&key, &json!({ "version": "invalid" }))
+                .await
+                .unwrap();
+            let error = MemoryNotice::pending(store)
+                .await
+                .err()
+                .expect("malformed state");
+            assert!(format!("{error:#}").contains("numeric version"));
             shutdown.close().await.unwrap();
             assert!(!cleanup_directory.exists());
-        }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn failed_headless_write_or_flush_does_not_record_the_notice() {
+        kuru_memory::test_support::closing(async {
+            for fail_flush in [false, true] {
+                let store = {
+                    // Held across the supervisor and engine spawns; see `crate::spawn_gate`.
+                    let _gate = crate::spawn_gate::spawning().await;
+                    MemoryStore::temporary().await.unwrap()
+                };
+                let shutdown = store.clone();
+                let cleanup_directory = store.status().await.unwrap().directory;
+                let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
+                let error = notice
+                    .announce_to(&mut FailingNoticeWriter { fail_flush })
+                    .await
+                    .unwrap_err();
+                assert!(format!("{error:#}").contains("notice"));
+                assert!(MemoryNotice::pending(store).await.unwrap().is_some());
+                shutdown.close().await.unwrap();
+                assert!(!cleanup_directory.exists());
+            }
+        })
+        .await
     }
 }

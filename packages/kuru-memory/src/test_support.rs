@@ -48,7 +48,9 @@ pub mod lifecycle_trace;
 /// Coverage-runner spawn rows naming the test behind each detached child
 /// (inert unless the runner enables them).
 pub mod spawn_ledger;
-pub use closing::closing;
+pub use closing::{
+    assert_async_tests_run_in_closing, closing, rust_sources, tests_outside_closing,
+};
 pub(crate) mod template;
 /// The CI usage-scan scaling check over aged stores (`usage-scan-fixture`,
 /// `measure-usage-scan`); compiled only on Unix, where its CI job runs.

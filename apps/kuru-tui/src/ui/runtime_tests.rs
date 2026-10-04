@@ -180,402 +180,419 @@ async fn assert_runtime_projection(view: &View, harness: &Arc<tokio::sync::Mutex
 
 #[tokio::test]
 async fn slash_commands_change_real_runtime_state_and_validate_errors() {
-    let memory = temporary_memory().await;
-    let candidate_source = memory.clone();
-    let (_dir, mut h, models) = fixture_with_memory(memory).await;
-    assert!(command_text(dispatch(&mut h, &models, "/parts").await.unwrap()).contains("manager"));
-    let tools: serde_json::Value = serde_json::from_str(&command_text(
-        dispatch(&mut h, &models, "/tools").await.unwrap(),
-    ))
-    .unwrap();
-    assert!(
-        tools["tools"]
-            .as_array()
-            .is_some_and(|tools| { tools.iter().any(|tool| tool["name"] == "file_read") })
-    );
-    assert_eq!(tools["mcp"], serde_json::json!([]));
-    dispatch(&mut h, &models, "/mode freudian").await.unwrap();
-    assert_eq!(h.config.mode, Mode::Freudian);
-    dispatch(&mut h, &models, "/model demo").await.unwrap();
-    assert_eq!(h.config.effort.as_deref(), Some("low"));
-    dispatch(&mut h, &models, "/effort high").await.unwrap();
-    assert_eq!(h.config.effort.as_deref(), Some("high"));
-    assert!(
-        dispatch(&mut h, &models, "/effort impossible")
-            .await
-            .is_err()
-    );
-    dispatch(&mut h, &models, "/effort default").await.unwrap();
-    assert!(h.config.effort.is_none());
-    let ids = h.topology.parts[..2]
-        .iter()
-        .map(|p| p.id.clone())
-        .collect::<Vec<_>>();
-    dispatch(&mut h, &models, &format!("/focus {}", ids[0]))
-        .await
+    kuru_memory::test_support::closing(async {
+        let memory = temporary_memory().await;
+        let candidate_source = memory.clone();
+        let (_dir, mut h, models) = fixture_with_memory(memory).await;
+        assert!(
+            command_text(dispatch(&mut h, &models, "/parts").await.unwrap()).contains("manager")
+        );
+        let tools: serde_json::Value = serde_json::from_str(&command_text(
+            dispatch(&mut h, &models, "/tools").await.unwrap(),
+        ))
         .unwrap();
-    assert!(h.topology.focus.is_some());
-    dispatch(&mut h, &models, "/focus auto").await.unwrap();
-    assert!(h.topology.focus.is_none());
-    dispatch(
-        &mut h,
-        &models,
-        &format!("/relate alliance {},{}", ids[0], ids[1]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(h.topology.relationships.len(), 1);
-    let first = match dispatch(&mut h, &models, "hello").await.unwrap() {
-        DispatchOutcome::Turn(result) => result,
-        DispatchOutcome::Command(_)
-        | DispatchOutcome::Session { .. }
-        | DispatchOutcome::Sessions(_)
-        | DispatchOutcome::SessionBoundaries { .. } => {
-            panic!("ordinary input did not run a turn")
-        }
-    };
-    assert!(!first.reused);
-    let usage_before_retry = h.session_usage().await.unwrap();
-    let cost = command_text(dispatch(&mut h, &models, "/cost").await.unwrap());
-    assert!(cost.contains(&format!(
-        "{} provider invocations",
-        usage_before_retry.invocation_count
-    )));
-    assert!(cost.contains("API-equivalent estimate (not a subscription charge)"));
-    let history = h.history().await.unwrap();
-    let retry = match dispatch(&mut h, &models, "/retry").await.unwrap() {
-        DispatchOutcome::Turn(result) => result,
-        DispatchOutcome::Command(_)
-        | DispatchOutcome::Session { .. }
-        | DispatchOutcome::Sessions(_)
-        | DispatchOutcome::SessionBoundaries { .. } => {
-            panic!("retry did not return a turn")
-        }
-    };
-    assert!(retry.reused);
-    assert_eq!(retry.output.text, first.output.text);
-    assert_eq!(h.history().await.unwrap(), history);
-    assert_eq!(h.session_usage().await.unwrap(), usage_before_retry);
-    assert!(
-        command_text(
-            dispatch(&mut h, &models, &format!("/memory {}", ids[0]))
+        assert!(
+            tools["tools"]
+                .as_array()
+                .is_some_and(|tools| { tools.iter().any(|tool| tool["name"] == "file_read") })
+        );
+        assert_eq!(tools["mcp"], serde_json::json!([]));
+        dispatch(&mut h, &models, "/mode freudian").await.unwrap();
+        assert_eq!(h.config.mode, Mode::Freudian);
+        dispatch(&mut h, &models, "/model demo").await.unwrap();
+        assert_eq!(h.config.effort.as_deref(), Some("low"));
+        dispatch(&mut h, &models, "/effort high").await.unwrap();
+        assert_eq!(h.config.effort.as_deref(), Some("high"));
+        assert!(
+            dispatch(&mut h, &models, "/effort impossible")
                 .await
-                .unwrap()
+                .is_err()
+        );
+        dispatch(&mut h, &models, "/effort default").await.unwrap();
+        assert!(h.config.effort.is_none());
+        let ids = h.topology.parts[..2]
+            .iter()
+            .map(|p| p.id.clone())
+            .collect::<Vec<_>>();
+        dispatch(&mut h, &models, &format!("/focus {}", ids[0]))
+            .await
+            .unwrap();
+        assert!(h.topology.focus.is_some());
+        dispatch(&mut h, &models, "/focus auto").await.unwrap();
+        assert!(h.topology.focus.is_none());
+        dispatch(
+            &mut h,
+            &models,
+            &format!("/relate alliance {},{}", ids[0], ids[1]),
         )
-        .contains("hello")
-    );
-    assert!(command_text(dispatch(&mut h, &models, "/dream").await.unwrap()).contains("summaries"));
-    let notes: serde_json::Value = serde_json::from_str(&command_text(
-        dispatch(&mut h, &models, &format!("/notes {}", ids[0]))
+        .await
+        .unwrap();
+        assert_eq!(h.topology.relationships.len(), 1);
+        let first = match dispatch(&mut h, &models, "hello").await.unwrap() {
+            DispatchOutcome::Turn(result) => result,
+            DispatchOutcome::Command(_)
+            | DispatchOutcome::Session { .. }
+            | DispatchOutcome::Sessions(_)
+            | DispatchOutcome::SessionBoundaries { .. } => {
+                panic!("ordinary input did not run a turn")
+            }
+        };
+        assert!(!first.reused);
+        let usage_before_retry = h.session_usage().await.unwrap();
+        let cost = command_text(dispatch(&mut h, &models, "/cost").await.unwrap());
+        assert!(cost.contains(&format!(
+            "{} provider invocations",
+            usage_before_retry.invocation_count
+        )));
+        assert!(cost.contains("API-equivalent estimate (not a subscription charge)"));
+        let history = h.history().await.unwrap();
+        let retry = match dispatch(&mut h, &models, "/retry").await.unwrap() {
+            DispatchOutcome::Turn(result) => result,
+            DispatchOutcome::Command(_)
+            | DispatchOutcome::Session { .. }
+            | DispatchOutcome::Sessions(_)
+            | DispatchOutcome::SessionBoundaries { .. } => {
+                panic!("retry did not return a turn")
+            }
+        };
+        assert!(retry.reused);
+        assert_eq!(retry.output.text, first.output.text);
+        assert_eq!(h.history().await.unwrap(), history);
+        assert_eq!(h.session_usage().await.unwrap(), usage_before_retry);
+        assert!(
+            command_text(
+                dispatch(&mut h, &models, &format!("/memory {}", ids[0]))
+                    .await
+                    .unwrap()
+            )
+            .contains("hello")
+        );
+        assert!(
+            command_text(dispatch(&mut h, &models, "/dream").await.unwrap()).contains("summaries")
+        );
+        let notes: serde_json::Value = serde_json::from_str(&command_text(
+            dispatch(&mut h, &models, &format!("/notes {}", ids[0]))
+                .await
+                .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(notes["identity"], ids[0]);
+        assert_eq!(notes["requested_limit"], 100);
+        assert_eq!(notes["truncated"], false);
+        assert!(notes["notes"].as_array().is_some_and(|notes| {
+            notes.iter().any(|note| {
+                note["sequence"].as_i64().is_some()
+                    && note["content"] == "[demo] Offline demo memory consolidation."
+            })
+        }));
+        h.apply_dream(vec![kuru_runtime::DreamProposal::Add {
+            name: "Extra".into(),
+            role: h.topology.parts[0].role.clone(),
+            instruction: "Complement".into(),
+        }])
+        .await
+        .unwrap();
+        dispatch(&mut h, &models, "/undo-dream").await.unwrap();
+        let status: serde_json::Value = serde_json::from_str(&command_text(
+            dispatch(&mut h, &models, "/memory-status").await.unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(status["engine"], "dolt");
+        let revisions: serde_json::Value = serde_json::from_str(&command_text(
+            dispatch(&mut h, &models, "/memory-history").await.unwrap(),
+        ))
+        .unwrap();
+        assert!(
+            revisions
+                .as_array()
+                .is_some_and(|revisions| !revisions.is_empty())
+        );
+        let candidate = candidate_source
+            .begin_candidate("TUI exact-ref recovery")
+            .await
+            .unwrap();
+        let branch = candidate.branch().to_owned();
+        let base = candidate.base().to_owned();
+        let candidate_view = candidate.view();
+        candidate_view
+            .append("fixture/tui-candidate", "user", "private TUI value")
+            .await
+            .unwrap();
+        let head = candidate_view.revision().await.unwrap();
+        drop(candidate_view);
+        drop(candidate);
+        let candidates: serde_json::Value = serde_json::from_str(&command_text(
+            dispatch(&mut h, &models, "/memory-candidates")
+                .await
+                .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(candidates["candidates"][0]["branch"], branch);
+        assert_eq!(candidates["candidates"][0]["base"], base);
+        assert_eq!(candidates["candidates"][0]["head"], head);
+        let inspected: serde_json::Value = serde_json::from_str(&command_text(
+            dispatch(
+                &mut h,
+                &models,
+                &format!("/memory-candidate-status {branch}"),
+            )
             .await
             .unwrap(),
-    ))
-    .unwrap();
-    assert_eq!(notes["identity"], ids[0]);
-    assert_eq!(notes["requested_limit"], 100);
-    assert_eq!(notes["truncated"], false);
-    assert!(notes["notes"].as_array().is_some_and(|notes| {
-        notes.iter().any(|note| {
-            note["sequence"].as_i64().is_some()
-                && note["content"] == "[demo] Offline demo memory consolidation."
-        })
-    }));
-    h.apply_dream(vec![kuru_runtime::DreamProposal::Add {
-        name: "Extra".into(),
-        role: h.topology.parts[0].role.clone(),
-        instruction: "Complement".into(),
-    }])
+        ))
+        .unwrap();
+        assert_eq!(inspected["candidate"]["state"], "open_unchanged");
+        let abandoned: serde_json::Value = serde_json::from_str(&command_text(
+            dispatch(
+                &mut h,
+                &models,
+                &format!("/memory-candidate-abandon {branch} {base} {head}"),
+            )
+            .await
+            .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(abandoned["branch"], branch);
+        assert_eq!(abandoned["state"], "abandoned");
+        let missing: serde_json::Value = serde_json::from_str(&command_text(
+            dispatch(
+                &mut h,
+                &models,
+                &format!("/memory-candidate-status {branch}"),
+            )
+            .await
+            .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(missing["candidate"]["state"], "missing");
+        assert_eq!(missing["operation_outcome"], "unproved");
+        for bad in [
+            "/unknown",
+            "/relate",
+            "/mode unknown",
+            "/model",
+            "/effort",
+            "/memory missing",
+            "/memory-candidate-abandon incomplete",
+        ] {
+            assert!(dispatch(&mut h, &models, bad).await.is_err(), "{bad}");
+        }
+    })
     .await
-    .unwrap();
-    dispatch(&mut h, &models, "/undo-dream").await.unwrap();
-    let status: serde_json::Value = serde_json::from_str(&command_text(
-        dispatch(&mut h, &models, "/memory-status").await.unwrap(),
-    ))
-    .unwrap();
-    assert_eq!(status["engine"], "dolt");
-    let revisions: serde_json::Value = serde_json::from_str(&command_text(
-        dispatch(&mut h, &models, "/memory-history").await.unwrap(),
-    ))
-    .unwrap();
-    assert!(
-        revisions
-            .as_array()
-            .is_some_and(|revisions| !revisions.is_empty())
-    );
-    let candidate = candidate_source
-        .begin_candidate("TUI exact-ref recovery")
-        .await
-        .unwrap();
-    let branch = candidate.branch().to_owned();
-    let base = candidate.base().to_owned();
-    let candidate_view = candidate.view();
-    candidate_view
-        .append("fixture/tui-candidate", "user", "private TUI value")
-        .await
-        .unwrap();
-    let head = candidate_view.revision().await.unwrap();
-    drop(candidate_view);
-    drop(candidate);
-    let candidates: serde_json::Value = serde_json::from_str(&command_text(
-        dispatch(&mut h, &models, "/memory-candidates")
-            .await
-            .unwrap(),
-    ))
-    .unwrap();
-    assert_eq!(candidates["candidates"][0]["branch"], branch);
-    assert_eq!(candidates["candidates"][0]["base"], base);
-    assert_eq!(candidates["candidates"][0]["head"], head);
-    let inspected: serde_json::Value = serde_json::from_str(&command_text(
-        dispatch(
-            &mut h,
-            &models,
-            &format!("/memory-candidate-status {branch}"),
-        )
-        .await
-        .unwrap(),
-    ))
-    .unwrap();
-    assert_eq!(inspected["candidate"]["state"], "open_unchanged");
-    let abandoned: serde_json::Value = serde_json::from_str(&command_text(
-        dispatch(
-            &mut h,
-            &models,
-            &format!("/memory-candidate-abandon {branch} {base} {head}"),
-        )
-        .await
-        .unwrap(),
-    ))
-    .unwrap();
-    assert_eq!(abandoned["branch"], branch);
-    assert_eq!(abandoned["state"], "abandoned");
-    let missing: serde_json::Value = serde_json::from_str(&command_text(
-        dispatch(
-            &mut h,
-            &models,
-            &format!("/memory-candidate-status {branch}"),
-        )
-        .await
-        .unwrap(),
-    ))
-    .unwrap();
-    assert_eq!(missing["candidate"]["state"], "missing");
-    assert_eq!(missing["operation_outcome"], "unproved");
-    for bad in [
-        "/unknown",
-        "/relate",
-        "/mode unknown",
-        "/model",
-        "/effort",
-        "/memory missing",
-        "/memory-candidate-abandon incomplete",
-    ] {
-        assert!(dispatch(&mut h, &models, bad).await.is_err(), "{bad}");
-    }
 }
 
 #[tokio::test]
 async fn compact_command_dispatches_locally_and_reports_exact_retained_range() {
-    let memory = temporary_memory().await;
-    let source = memory.clone();
-    let provider = CapturingProvider::new();
-    let (_directory, mut harness, models) = harness_with_provider(memory, provider.clone()).await;
-    let actor = harness.topology.parts[0].id.clone();
-    let namespace = harness.namespace(&actor);
-    source
-        .append_session_message(
-            &namespace,
-            &harness.session.id,
-            &kuru_core::Message::text("user", "manual command source"),
-        )
-        .await
-        .unwrap();
-
-    let invalid = dispatch(&mut harness, &models, "/compact inactive-target")
-        .await
-        .unwrap_err();
-    assert!(
-        invalid.to_string().contains("unknown or ambiguous"),
-        "{invalid:#}"
-    );
-    assert!(provider.requests().is_empty());
-
-    let notice = command_text(
-        dispatch(&mut harness, &models, &format!("/compact {actor}"))
+    kuru_memory::test_support::closing(async {
+        let memory = temporary_memory().await;
+        let source = memory.clone();
+        let provider = CapturingProvider::new();
+        let (_directory, mut harness, models) =
+            harness_with_provider(memory, provider.clone()).await;
+        let actor = harness.topology.parts[0].id.clone();
+        let namespace = harness.namespace(&actor);
+        source
+            .append_session_message(
+                &namespace,
+                &harness.session.id,
+                &kuru_core::Message::text("user", "manual command source"),
+            )
             .await
-            .unwrap(),
-    );
-    assert!(notice.starts_with(&format!("Compacted {actor} source sequences (0, 1] as ")));
-    assert!(notice.ends_with("; original records remain stored."));
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].actor.ends_with("#compact"));
-    assert!(
-        !serde_json::to_string(&requests[0])
-            .unwrap()
-            .contains("/compact")
-    );
+            .unwrap();
 
-    let no_op = command_text(
-        dispatch(&mut harness, &models, &format!("/compact {actor}"))
+        let invalid = dispatch(&mut harness, &models, "/compact inactive-target")
             .await
-            .unwrap(),
-    );
-    assert_eq!(
-        no_op,
-        format!("No eligible uncompacted history for {actor}; original records remain stored.")
-    );
-    assert_eq!(provider.requests().len(), 1);
-    harness.shutdown(false).await.unwrap();
-    source.close().await.unwrap();
+            .unwrap_err();
+        assert!(
+            invalid.to_string().contains("unknown or ambiguous"),
+            "{invalid:#}"
+        );
+        assert!(provider.requests().is_empty());
+
+        let notice = command_text(
+            dispatch(&mut harness, &models, &format!("/compact {actor}"))
+                .await
+                .unwrap(),
+        );
+        assert!(notice.starts_with(&format!("Compacted {actor} source sequences (0, 1] as ")));
+        assert!(notice.ends_with("; original records remain stored."));
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].actor.ends_with("#compact"));
+        assert!(
+            !serde_json::to_string(&requests[0])
+                .unwrap()
+                .contains("/compact")
+        );
+
+        let no_op = command_text(
+            dispatch(&mut harness, &models, &format!("/compact {actor}"))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            no_op,
+            format!("No eligible uncompacted history for {actor}; original records remain stored.")
+        );
+        assert_eq!(provider.requests().len(), 1);
+        harness.shutdown(false).await.unwrap();
+        source.close().await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn session_commands_switch_and_export_without_provider_dispatch() {
-    let memory = temporary_memory().await;
-    let provider = CapturingProvider::new();
-    let (directory, mut harness, models) = harness_with_provider(memory, provider.clone()).await;
-    let original = harness.session.id.clone();
+    kuru_memory::test_support::closing(async {
+        let memory = temporary_memory().await;
+        let provider = CapturingProvider::new();
+        let (directory, mut harness, models) = harness_with_provider(memory, provider.clone()).await;
+        let original = harness.session.id.clone();
 
-    let listed = dispatch(&mut harness, &models, "/sessions").await.unwrap();
-    assert!(matches!(
-        listed,
-        DispatchOutcome::Sessions(sessions)
-            if sessions.iter().any(|session| session.id == original)
-    ));
-    let created = dispatch(&mut harness, &models, "/new").await.unwrap();
-    let DispatchOutcome::Session { initial, .. } = created else {
-        panic!("new session did not refresh the visible session")
-    };
-    let fresh = initial.session;
-    assert_ne!(fresh, original);
-    assert!(initial.transcript.is_empty());
-    assert!(provider.requests().is_empty());
+        let listed = dispatch(&mut harness, &models, "/sessions").await.unwrap();
+        assert!(matches!(
+            listed,
+            DispatchOutcome::Sessions(sessions)
+                if sessions.iter().any(|session| session.id == original)
+        ));
+        let created = dispatch(&mut harness, &models, "/new").await.unwrap();
+        let DispatchOutcome::Session { initial, .. } = created else {
+            panic!("new session did not refresh the visible session")
+        };
+        let fresh = initial.session;
+        assert_ne!(fresh, original);
+        assert!(initial.transcript.is_empty());
+        assert!(provider.requests().is_empty());
 
-    let resumed = dispatch(&mut harness, &models, &format!("/resume {original}"))
-        .await
-        .unwrap();
-    assert!(matches!(
-        resumed,
-        DispatchOutcome::Session { initial, .. } if initial.session == original
-    ));
-    let turn = dispatch(&mut harness, &models, "create a settled fork boundary")
-        .await
-        .unwrap();
-    assert!(matches!(turn, DispatchOutcome::Turn(_)));
-    let turn_requests = provider.requests().len();
-    assert!(turn_requests > 0);
-    let sessions = match dispatch(&mut harness, &models, "/sessions").await.unwrap() {
-        DispatchOutcome::Sessions(sessions) => sessions,
-        _ => panic!("sessions command did not return the catalog"),
-    };
-    let node = sessions
-        .iter()
-        .find(|session| session.id == original)
-        .and_then(|session| session.catalog.head_node_id.clone())
-        .unwrap();
-    let renamed = dispatch(
-        &mut harness,
-        &models,
-        &format!("/session-rename {fresh} retained label"),
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        renamed,
-        DispatchOutcome::Sessions(sessions)
-            if sessions.iter().any(|session| session.id == fresh && session.catalog.label == "retained label")
-    ));
-    let removed = dispatch(&mut harness, &models, &format!("/session-remove {fresh}"))
-        .await
-        .unwrap();
-    assert!(matches!(
-        removed,
-        DispatchOutcome::Sessions(sessions)
-            if sessions.iter().any(|session| session.id == fresh && session.catalog.lifecycle_state == kuru_memory::SessionLifecycleState::Removed)
-    ));
-    let restored = dispatch(&mut harness, &models, &format!("/session-restore {fresh}"))
-        .await
-        .unwrap();
-    assert!(matches!(
-        restored,
-        DispatchOutcome::Sessions(sessions)
-            if sessions.iter().any(|session| session.id == fresh && session.catalog.lifecycle_state == kuru_memory::SessionLifecycleState::Active)
-    ));
-    let boundaries = dispatch(
-        &mut harness,
-        &models,
-        &format!("/session-boundaries {original}"),
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        boundaries,
-        DispatchOutcome::SessionBoundaries { session_id, boundaries, next: None }
-            if session_id == original
-                && boundaries.iter().any(|boundary| boundary.node_id == node)
-    ));
-    assert_eq!(provider.requests().len(), turn_requests);
-    let forked = dispatch(
-        &mut harness,
-        &models,
-        &format!("/session-fork {original} {node} selected fork"),
-    )
-    .await
-    .unwrap();
-    let child = match forked {
-        DispatchOutcome::Session { initial, notice } => {
-            assert!(notice.contains("current project memory remains shared"));
-            initial.session
-        }
-        _ => panic!("fork command did not select its child"),
-    };
-    assert_ne!(child, original);
-    assert_ne!(child, fresh);
-    assert_eq!(provider.requests().len(), turn_requests);
-    let destination = directory.path().join("public session.md");
-    let feedback = command_text(
-        dispatch(
+        let resumed = dispatch(&mut harness, &models, &format!("/resume {original}"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            resumed,
+            DispatchOutcome::Session { initial, .. } if initial.session == original
+        ));
+        let turn = dispatch(&mut harness, &models, "create a settled fork boundary")
+            .await
+            .unwrap();
+        assert!(matches!(turn, DispatchOutcome::Turn(_)));
+        let turn_requests = provider.requests().len();
+        assert!(turn_requests > 0);
+        let sessions = match dispatch(&mut harness, &models, "/sessions").await.unwrap() {
+            DispatchOutcome::Sessions(sessions) => sessions,
+            _ => panic!("sessions command did not return the catalog"),
+        };
+        let node = sessions
+            .iter()
+            .find(|session| session.id == original)
+            .and_then(|session| session.catalog.head_node_id.clone())
+            .unwrap();
+        let renamed = dispatch(
             &mut harness,
             &models,
-            &format!("/export {}", destination.display()),
+            &format!("/session-rename {fresh} retained label"),
         )
         .await
-        .unwrap(),
-    );
-    assert!(feedback.contains("Exported public session"));
-    let exported = std::fs::read_to_string(&destination).unwrap();
-    assert!(exported.contains("Kuru public session export"));
-    assert!(exported.contains(&child));
-    assert!(exported.contains(&original));
-    assert!(!exported.contains(&fresh));
-    std::fs::write(&destination, "selected destination sentinel").unwrap();
-    let feedback = command_text(
-        dispatch(
+        .unwrap();
+        assert!(matches!(
+            renamed,
+            DispatchOutcome::Sessions(sessions)
+                if sessions.iter().any(|session| session.id == fresh && session.catalog.label == "retained label")
+        ));
+        let removed = dispatch(&mut harness, &models, &format!("/session-remove {fresh}"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            removed,
+            DispatchOutcome::Sessions(sessions)
+                if sessions.iter().any(|session| session.id == fresh && session.catalog.lifecycle_state == kuru_memory::SessionLifecycleState::Removed)
+        ));
+        let restored = dispatch(&mut harness, &models, &format!("/session-restore {fresh}"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            restored,
+            DispatchOutcome::Sessions(sessions)
+                if sessions.iter().any(|session| session.id == fresh && session.catalog.lifecycle_state == kuru_memory::SessionLifecycleState::Active)
+        ));
+        let boundaries = dispatch(
             &mut harness,
             &models,
-            &format!("/export {}", destination.display()),
+            &format!("/session-boundaries {original}"),
         )
         .await
-        .unwrap(),
-    );
-    assert!(feedback.contains("Exported public session"));
-    let replaced = std::fs::read_to_string(&destination).unwrap();
-    assert!(replaced.contains("Kuru public session export"));
-    assert!(!replaced.contains("selected destination sentinel"));
-    assert_eq!(provider.requests().len(), turn_requests);
-    harness.shutdown(false).await.unwrap();
+        .unwrap();
+        assert!(matches!(
+            boundaries,
+            DispatchOutcome::SessionBoundaries { session_id, boundaries, next: None }
+                if session_id == original
+                    && boundaries.iter().any(|boundary| boundary.node_id == node)
+        ));
+        assert_eq!(provider.requests().len(), turn_requests);
+        let forked = dispatch(
+            &mut harness,
+            &models,
+            &format!("/session-fork {original} {node} selected fork"),
+        )
+        .await
+        .unwrap();
+        let child = match forked {
+            DispatchOutcome::Session { initial, notice } => {
+                assert!(notice.contains("current project memory remains shared"));
+                initial.session
+            }
+            _ => panic!("fork command did not select its child"),
+        };
+        assert_ne!(child, original);
+        assert_ne!(child, fresh);
+        assert_eq!(provider.requests().len(), turn_requests);
+        let destination = directory.path().join("public session.md");
+        let feedback = command_text(
+            dispatch(
+                &mut harness,
+                &models,
+                &format!("/export {}", destination.display()),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(feedback.contains("Exported public session"));
+        let exported = std::fs::read_to_string(&destination).unwrap();
+        assert!(exported.contains("Kuru public session export"));
+        assert!(exported.contains(&child));
+        assert!(exported.contains(&original));
+        assert!(!exported.contains(&fresh));
+        std::fs::write(&destination, "selected destination sentinel").unwrap();
+        let feedback = command_text(
+            dispatch(
+                &mut harness,
+                &models,
+                &format!("/export {}", destination.display()),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(feedback.contains("Exported public session"));
+        let replaced = std::fs::read_to_string(&destination).unwrap();
+        assert!(replaced.contains("Kuru public session export"));
+        assert!(!replaced.contains("selected destination sentinel"));
+        assert_eq!(provider.requests().len(), turn_requests);
+        harness.shutdown(false).await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn retry_without_a_local_submission_is_narrowly_rejected() {
-    let (_dir, mut harness, models) = fixture().await;
-    let error = dispatch(&mut harness, &models, "/retry").await.unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("this session has no local submission to retry")
-    );
-    assert!(harness.history().await.unwrap().is_empty());
+    kuru_memory::test_support::closing(async {
+        let (_dir, mut harness, models) = fixture().await;
+        let error = dispatch(&mut harness, &models, "/retry").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("this session has no local submission to retry")
+        );
+        assert!(harness.history().await.unwrap().is_empty());
+    })
+    .await
 }
 
 struct BlockingProvider {
@@ -811,162 +828,130 @@ async fn reopen_store(options: kuru_memory::OpenOptions) -> MemoryStore {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_history() {
-    let (data_root, project, options, store) = persistent_store().await;
-    let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
-    let (project, harness, models) =
-        harness_with_provider_in(project, store.clone(), Arc::new(DemoProvider)).await;
-    assert!(harness.history().await.unwrap().is_empty());
+    kuru_memory::test_support::closing(async {
+        let (data_root, project, options, store) = persistent_store().await;
+        let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
+        let (project, harness, models) =
+            harness_with_provider_in(project, store.clone(), Arc::new(DemoProvider)).await;
+        assert!(harness.history().await.unwrap().is_empty());
 
-    let (input_tx, input_rx) = mpsc::channel(1);
-    let input = Box::pin(stream::unfold(input_rx, |mut input_rx| async move {
-        input_rx.recv().await.map(|event| (Ok(event), input_rx))
-    }));
-    let loop_task = tokio::spawn(async move {
-        let mut terminal = Terminal::new(TestBackend::new(120, 45)).unwrap();
-        let result = run_loop_with_stream_and_notice(
-            &mut terminal,
-            harness,
-            models,
-            input,
-            Some(notice),
-            crate::commands::Registry::default(),
-        )
-        .await;
-        let buffer = terminal.backend().buffer();
-        let screen = buffer
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        let rows = Layout::vertical([
-            Constraint::Length(if buffer.area.height >= 16 { 2 } else { 1 }),
-            Constraint::Min(0),
-            Constraint::Length(1),
-            Constraint::Length(5), // Empty editor: two input rows, one control row, and borders.
-            Constraint::Length(1),
-        ])
-        .split(buffer.area);
-        let transcript =
-            Layout::horizontal([Constraint::Min(0), Constraint::Length(34)]).split(rows[1])[0];
-        let transcript_text = (transcript.y..transcript.bottom())
-            .map(|y| {
-                (transcript.x..transcript.right())
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let input = Box::pin(stream::unfold(input_rx, |mut input_rx| async move {
+            input_rx.recv().await.map(|event| (Ok(event), input_rx))
+        }));
+        let loop_task = tokio::spawn(async move {
+            let mut terminal = Terminal::new(TestBackend::new(120, 45)).unwrap();
+            let result = run_loop_with_stream_and_notice(
+                &mut terminal,
+                harness,
+                models,
+                input,
+                Some(notice),
+                crate::commands::Registry::default(),
+            )
+            .await;
+            let buffer = terminal.backend().buffer();
+            let screen = buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            let rows = Layout::vertical([
+                Constraint::Length(if buffer.area.height >= 16 { 2 } else { 1 }),
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(5), // Empty editor: two input rows, one control row, and borders.
+                Constraint::Length(1),
+            ])
+            .split(buffer.area);
+            let transcript =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(34)]).split(rows[1])[0];
+            let transcript_text = (transcript.y..transcript.bottom())
+                .map(|y| {
+                    (transcript.x..transcript.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (result, screen, transcript_text)
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if MemoryNotice::pending(store.clone())
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("notice was not recorded after a completed initial frame");
+        input_tx
+            .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+        let (result, screen, transcript_text) =
+            tokio::time::timeout(Duration::from_secs(10), loop_task)
+                .await
+                .expect("notice loop did not exit")
+                .expect("notice loop task panicked");
+        result.unwrap();
+        assert!(screen.contains("Memory is ready at"), "{screen}");
+        let transcript_text = transcript_text
+            .split_whitespace()
             .collect::<Vec<_>>()
-            .join("\n");
-        (result, screen, transcript_text)
-    });
+            .join(" ");
+        assert!(
+            transcript_text.contains("Read notes with kuru memory notes ID;"),
+            "{transcript_text}"
+        );
 
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if MemoryNotice::pending(store.clone())
+        // Close before reopening: a dropped store would leave its live Dolt to a
+        // detached reaper, and in the closing scope would keep it until the test ends.
+        store.close().await.unwrap();
+        let reopened = reopen_store(options).await;
+        assert!(
+            MemoryNotice::pending(reopened.clone())
                 .await
                 .unwrap()
                 .is_none()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        );
+        let snapshot = reopened.begin_active_export().await.unwrap();
+        let page = snapshot.page(None).await.unwrap();
+        assert!(page.records.iter().all(|record| match record {
+            StorageRecord::Message { content, .. } => !content.contains("Memory is ready at"),
+            StorageRecord::State { .. }
+            | StorageRecord::ContextSummary { .. }
+            | StorageRecord::ContextCursor { .. }
+            | StorageRecord::SessionCatalog { .. }
+            | StorageRecord::PublicTurn { .. } => true,
+        }));
+        reopened.close().await.unwrap();
+        drop(project);
+        drop(data_root);
     })
     .await
-    .expect("notice was not recorded after a completed initial frame");
-    input_tx
-        .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('c'),
-            crossterm::event::KeyModifiers::CONTROL,
-        )))
-        .await
-        .unwrap();
-    let (result, screen, transcript_text) =
-        tokio::time::timeout(Duration::from_secs(10), loop_task)
-            .await
-            .expect("notice loop did not exit")
-            .expect("notice loop task panicked");
-    result.unwrap();
-    assert!(screen.contains("Memory is ready at"), "{screen}");
-    let transcript_text = transcript_text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert!(
-        transcript_text.contains("Read notes with kuru memory notes ID;"),
-        "{transcript_text}"
-    );
-
-    drop(store);
-    let reopened = reopen_store(options).await;
-    assert!(
-        MemoryNotice::pending(reopened.clone())
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let snapshot = reopened.begin_active_export().await.unwrap();
-    let page = snapshot.page(None).await.unwrap();
-    assert!(page.records.iter().all(|record| match record {
-        StorageRecord::Message { content, .. } => !content.contains("Memory is ready at"),
-        StorageRecord::State { .. }
-        | StorageRecord::ContextSummary { .. }
-        | StorageRecord::ContextCursor { .. }
-        | StorageRecord::SessionCatalog { .. }
-        | StorageRecord::PublicTurn { .. } => true,
-    }));
-    reopened.close().await.unwrap();
-    drop(project);
-    drop(data_root);
 }
 
 #[tokio::test]
 async fn failed_initial_tui_draw_never_marks_the_notice_shown() {
-    let (data_root, project, options, store) = persistent_store().await;
-    let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
-    let provider = BlockingProvider::new();
-    let (project, harness, models) =
-        harness_with_provider_in(project, store.clone(), Arc::new(DemoProvider)).await;
-    let mut terminal = Terminal::new(FailingBackend::initially_failing(provider)).unwrap();
-    let input = Box::pin(stream::empty());
-    let error = run_loop_with_stream_and_notice(
-        &mut terminal,
-        harness,
-        models,
-        input,
-        Some(notice),
-        crate::commands::Registry::default(),
-    )
-    .await
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("injected backend failure"));
-
-    drop(store);
-    let reopened = reopen_store(options).await;
-    assert!(
-        MemoryNotice::pending(reopened.clone())
-            .await
-            .unwrap()
-            .is_some()
-    );
-    reopened.close().await.unwrap();
-    drop(project);
-    drop(data_root);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn notice_text_never_reaches_the_provider_request_for_a_real_tui_turn() {
-    let (data_root, project, _options, store) = persistent_store().await;
-    let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
-    let provider = CapturingProvider::new();
-    let (project, harness, models) =
-        harness_with_provider_in(project, store.clone(), provider.clone()).await;
-    let (input_tx, input_rx) = mpsc::channel(8);
-    let input = Box::pin(stream::unfold(input_rx, |mut input_rx| async move {
-        input_rx.recv().await.map(|event| (Ok(event), input_rx))
-    }));
-    let loop_task = tokio::spawn(async move {
-        let mut terminal = Terminal::new(TestBackend::new(120, 45)).unwrap();
-        run_loop_with_stream_and_notice(
+    kuru_memory::test_support::closing(async {
+        let (data_root, project, options, store) = persistent_store().await;
+        let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
+        let provider = BlockingProvider::new();
+        let (project, harness, models) =
+            harness_with_provider_in(project, store.clone(), Arc::new(DemoProvider)).await;
+        let mut terminal = Terminal::new(FailingBackend::initially_failing(provider)).unwrap();
+        let input = Box::pin(stream::empty());
+        let error = run_loop_with_stream_and_notice(
             &mut terminal,
             harness,
             models,
@@ -975,513 +960,573 @@ async fn notice_text_never_reaches_the_provider_request_for_a_real_tui_turn() {
             crate::commands::Registry::default(),
         )
         .await
-    });
-    for character in "turn reaches provider".chars() {
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("injected backend failure"));
+
+        // Close before reopening: a dropped store would leave its live Dolt to a
+        // detached reaper, and in the closing scope would keep it until the test ends.
+        store.close().await.unwrap();
+        let reopened = reopen_store(options).await;
+        assert!(
+            MemoryNotice::pending(reopened.clone())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        reopened.close().await.unwrap();
+        drop(project);
+        drop(data_root);
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notice_text_never_reaches_the_provider_request_for_a_real_tui_turn() {
+    kuru_memory::test_support::closing(async {
+        let (data_root, project, _options, store) = persistent_store().await;
+        let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
+        let provider = CapturingProvider::new();
+        let (project, harness, models) =
+            harness_with_provider_in(project, store.clone(), provider.clone()).await;
+        let (input_tx, input_rx) = mpsc::channel(8);
+        let input = Box::pin(stream::unfold(input_rx, |mut input_rx| async move {
+            input_rx.recv().await.map(|event| (Ok(event), input_rx))
+        }));
+        let loop_task = tokio::spawn(async move {
+            let mut terminal = Terminal::new(TestBackend::new(120, 45)).unwrap();
+            run_loop_with_stream_and_notice(
+                &mut terminal,
+                harness,
+                models,
+                input,
+                Some(notice),
+                crate::commands::Registry::default(),
+            )
+            .await
+        });
+        for character in "turn reaches provider".chars() {
+            input_tx
+                .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(character),
+                    crossterm::event::KeyModifiers::NONE,
+                )))
+                .await
+                .unwrap();
+        }
         input_tx
             .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char(character),
+                crossterm::event::KeyCode::Enter,
                 crossterm::event::KeyModifiers::NONE,
             )))
             .await
             .unwrap();
-    }
-    input_tx
-        .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
-        )))
-        .await
-        .unwrap();
-    provider.wait_for_request().await;
-    let requests = provider.requests();
-    assert!(requests.iter().any(|request| {
-        request
-            .messages
-            .iter()
-            .any(|message| message.plain_text() == Some("turn reaches provider"))
-    }));
-    assert!(requests.iter().all(|request| {
-        request
-            .messages
-            .iter()
-            .all(|message| !message.text_projection().contains("Memory is ready at"))
-    }));
+        provider.wait_for_request().await;
+        let requests = provider.requests();
+        assert!(requests.iter().any(|request| {
+            request
+                .messages
+                .iter()
+                .any(|message| message.plain_text() == Some("turn reaches provider"))
+        }));
+        assert!(requests.iter().all(|request| {
+            request
+                .messages
+                .iter()
+                .all(|message| !message.text_projection().contains("Memory is ready at"))
+        }));
 
-    drop(input_tx);
-    let error = tokio::time::timeout(Duration::from_secs(10), loop_task)
-        .await
-        .expect("TUI loop did not clean up after input closure")
-        .expect("TUI loop task panicked")
-        .unwrap_err();
-    assert!(format!("{error:#}").contains("terminal input closed"));
-    // The loop released its harness; reap this store's Dolt before its root drops.
-    store.close().await.unwrap();
-    drop(project);
-    drop(data_root);
+        drop(input_tx);
+        let error = tokio::time::timeout(Duration::from_secs(10), loop_task)
+            .await
+            .expect("TUI loop did not clean up after input closure")
+            .expect("TUI loop task panicked")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("terminal input closed"));
+        // The loop released its harness; reap this store's Dolt before its root drops.
+        store.close().await.unwrap();
+        drop(project);
+        drop(data_root);
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_loop_eof_read_and_draw_failures_abort_the_owned_provider_before_returning() {
-    for failure in [Failure::Eof, Failure::Read, Failure::Draw] {
-        let provider = BlockingProvider::new();
-        let (_directory, harness) = blocking_fixture(provider.clone()).await;
-        let input = controlled_input(provider.clone(), failure);
-        let error = tokio::time::timeout(Duration::from_secs(15), async {
-            match failure {
-                Failure::Eof | Failure::Read => {
-                    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-                    run_loop_with_stream(&mut terminal, harness, vec![], input).await
+    kuru_memory::test_support::closing(async {
+        for failure in [Failure::Eof, Failure::Read, Failure::Draw] {
+            let provider = BlockingProvider::new();
+            let (_directory, harness) = blocking_fixture(provider.clone()).await;
+            let input = controlled_input(provider.clone(), failure);
+            let error = tokio::time::timeout(Duration::from_secs(15), async {
+                match failure {
+                    Failure::Eof | Failure::Read => {
+                        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                        run_loop_with_stream(&mut terminal, harness, vec![], input).await
+                    }
+                    Failure::Draw => {
+                        let mut terminal =
+                            Terminal::new(FailingBackend::new(provider.clone())).unwrap();
+                        run_loop_with_stream(&mut terminal, harness, vec![], input).await
+                    }
                 }
-                Failure::Draw => {
-                    let mut terminal =
-                        Terminal::new(FailingBackend::new(provider.clone())).unwrap();
-                    run_loop_with_stream(&mut terminal, harness, vec![], input).await
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "{failure:?} loop timeout: provider started={}, dropped={}",
-                provider.started.load(Ordering::SeqCst),
-                provider.dropped.load(Ordering::SeqCst)
-            )
-        })
-        .unwrap_err();
-        let expected = match failure {
-            Failure::Eof => "terminal input closed",
-            Failure::Read => "terminal input: injected terminal read failure",
-            Failure::Draw => "terminal draw: injected backend failure",
-        };
-        assert!(format!("{error:#}").contains(expected), "{error:#}");
-        let started = provider.started.load(Ordering::SeqCst);
-        let dropped = provider.dropped.load(Ordering::SeqCst);
-        assert!(started > 0, "{expected} returned before provider entry");
-        assert!(
-            dropped >= started,
-            "{expected} returned before every active provider future dropped: started={started}, dropped={dropped}"
-        );
-    }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{failure:?} loop timeout: provider started={}, dropped={}",
+                    provider.started.load(Ordering::SeqCst),
+                    provider.dropped.load(Ordering::SeqCst)
+                )
+            })
+            .unwrap_err();
+            let expected = match failure {
+                Failure::Eof => "terminal input closed",
+                Failure::Read => "terminal input: injected terminal read failure",
+                Failure::Draw => "terminal draw: injected backend failure",
+            };
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            let started = provider.started.load(Ordering::SeqCst);
+            let dropped = provider.dropped.load(Ordering::SeqCst);
+            assert!(started > 0, "{expected} returned before provider entry");
+            assert!(
+                dropped >= started,
+                "{expected} returned before every active provider future dropped: started={started}, dropped={dropped}"
+            );
+        }
+    })
+    .await
 }
 
 #[tokio::test]
 async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations() {
-    let (_directory, harness, _) = fixture().await;
-    let mut events = harness.subscribe();
-    let harness = Arc::new(tokio::sync::Mutex::new(harness));
-    let initial = {
-        let harness = harness.lock().await;
-        project_initial_view(&harness).await.unwrap()
-    };
-    let mut view = View::from_initial(initial, vec![]);
-    let mut job = None;
+    kuru_memory::test_support::closing(async {
+        let (_directory, harness, _) = fixture().await;
+        let mut events = harness.subscribe();
+        let harness = Arc::new(tokio::sync::Mutex::new(harness));
+        let initial = {
+            let harness = harness.lock().await;
+            project_initial_view(&harness).await.unwrap()
+        };
+        let mut view = View::from_initial(initial, vec![]);
+        let mut job = None;
 
-    seed_stale_runtime(&mut view);
-    view.begin_operation();
-    let session = view.session.clone();
-    let outcome = apply_completion(
-        (
+        seed_stale_runtime(&mut view);
+        view.begin_operation();
+        let session = view.session.clone();
+        let outcome = apply_completion(
+            (
+                4,
+                Ok(DispatchOutcome::Turn(ControlledTurnOutput {
+                    output: TurnOutput {
+                        session,
+                        speaker: view.parts[0].0.clone(),
+                        text: "authoritative completion".into(),
+                        relationship: None,
+                        input_tokens: 11,
+                        output_tokens: 7,
+                        limited: false,
+                        limit_reasons: Some(vec![]),
+                        response_outcome: Some(ResponseOutcome::Text),
+                        events: vec![],
+                    },
+                    reused: false,
+                })),
+            ),
             4,
-            Ok(DispatchOutcome::Turn(ControlledTurnOutput {
-                output: TurnOutput {
-                    session,
-                    speaker: view.parts[0].0.clone(),
-                    text: "authoritative completion".into(),
-                    relationship: None,
-                    input_tokens: 11,
-                    output_tokens: 7,
-                    limited: false,
-                    limit_reasons: Some(vec![]),
-                    response_outcome: Some(ResponseOutcome::Text),
-                    events: vec![],
-                },
-                reused: false,
-            })),
-        ),
-        4,
-        &mut events,
-        &mut view,
-        &harness,
-        &mut job,
-        false,
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        outcome,
-        CompletionState::Settled { quit: false, .. }
-    ));
-    assert_eq!(
-        view.transcript.last().unwrap().1,
-        "authoritative completion"
-    );
-    assert_eq!(view.status, "Complete");
-    assert!(!view.busy);
-    assert!(view.operation_start.is_none());
-    assert_eq!(
-        view.completion_metadata[&0],
-        "11 input tokens · 7 output tokens"
-    );
-    assert_runtime_projection(&view, &harness).await;
-
-    let transcript = view.transcript.clone();
-    let outcome = apply_completion(
-        (
-            5,
-            Ok(DispatchOutcome::Turn(ControlledTurnOutput {
-                output: TurnOutput {
-                    session: view.session.clone(),
-                    speaker: view.parts[0].0.clone(),
-                    text: "authoritative completion".into(),
-                    relationship: None,
-                    input_tokens: 11,
-                    output_tokens: 7,
-                    limited: false,
-                    limit_reasons: Some(vec![]),
-                    response_outcome: Some(ResponseOutcome::Text),
-                    events: vec![],
-                },
-                reused: true,
-            })),
-        ),
-        5,
-        &mut events,
-        &mut view,
-        &harness,
-        &mut job,
-        false,
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        outcome,
-        CompletionState::Settled { quit: false, .. }
-    ));
-    assert_eq!(view.transcript, transcript);
-    assert_eq!(view.status, "Complete · stored result reused");
-    assert!(
-        view.notice
-            .as_deref()
-            .is_some_and(|notice| notice.contains("no new provider or tool work"))
-    );
-
-    seed_stale_runtime(&mut view);
-    view.begin_operation();
-    let outcome = apply_completion(
-        (5, Ok(DispatchOutcome::Command("Mode: freudian".into()))),
-        5,
-        &mut events,
-        &mut view,
-        &harness,
-        &mut job,
-        false,
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        outcome,
-        CompletionState::Settled { quit: false, .. }
-    ));
-    assert_eq!(view.status, "Complete");
-    assert!(
-        view.notice
-            .as_deref()
-            .is_some_and(|notice| notice.contains("saved for this project"))
-    );
-    assert!(view.operation_start.is_none());
-    assert_runtime_projection(&view, &harness).await;
-
-    seed_stale_runtime(&mut view);
-    view.begin_operation();
-    let outcome = apply_completion(
-        (6, Err(anyhow::anyhow!("controlled dispatch failure"))),
-        6,
-        &mut events,
-        &mut view,
-        &harness,
-        &mut job,
-        false,
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        outcome,
-        CompletionState::Settled { quit: false, .. }
-    ));
-    assert_eq!(view.status, "Failed · details in conversation");
-    assert!(view.transcript.last().is_some_and(
-        |(role, text)| role == "error" && text.contains("controlled dispatch failure")
-    ));
-    assert!(view.operation_start.is_none());
-    assert_runtime_projection(&view, &harness).await;
-
-    seed_stale_runtime(&mut view);
-    view.begin_operation();
-    view.completion_locked = true;
-    job = Some(tokio::spawn(std::future::pending()));
-    let before = (
-        view.transcript.clone(),
-        view.status.clone(),
-        view.busy,
-        view.operation_start,
-        view.turns,
-        view.mode.clone(),
-        view.model.clone(),
-        view.effort.clone(),
-        view.parts.clone(),
-        view.relationships.clone(),
-        view.focus.clone(),
-        view.completion_locked,
-    );
-    let outcome = apply_completion(
-        (6, Ok(DispatchOutcome::Command("STALE".into()))),
-        7,
-        &mut events,
-        &mut view,
-        &harness,
-        &mut job,
-        false,
-    )
-    .await
-    .unwrap();
-    assert_eq!(outcome, CompletionState::Stale);
-    assert_eq!(
-        (
-            view.transcript,
-            view.status,
-            view.busy,
-            view.operation_start,
-            view.turns,
-            view.mode,
-            view.model,
-            view.effort,
-            view.parts,
-            view.relationships,
-            view.focus,
-            view.completion_locked,
-        ),
-        before
-    );
-    assert!(
-        job.is_some(),
-        "a stale completion must not clear the live job"
-    );
-    job.take().unwrap().abort();
-}
-
-#[tokio::test]
-async fn cancellation_consumes_an_answer_that_won_the_completion_race() {
-    let (_directory, harness, _) = fixture().await;
-    let mut events = harness.subscribe();
-    let harness = Arc::new(tokio::sync::Mutex::new(harness));
-    let initial = {
-        let harness = harness.lock().await;
-        project_initial_view(&harness).await.unwrap()
-    };
-    let mut view = View::from_initial(initial, vec![]);
-    view.begin_operation();
-    let output = TurnOutput {
-        session: view.session.clone(),
-        speaker: view.parts[0].0.clone(),
-        text: "answer won cancellation".into(),
-        relationship: None,
-        input_tokens: 5,
-        output_tokens: 3,
-        limited: false,
-        limit_reasons: Some(vec![]),
-        response_outcome: Some(ResponseOutcome::Text),
-        events: vec![],
-    };
-    let (tx, mut completions) = mpsc::channel(1);
-    let token = CancellationToken::new();
-    let worker_token = token.clone();
-    let mut job = Some(tokio::spawn(async move {
-        while !worker_token.is_cancelled() {
-            tokio::task::yield_now().await;
-        }
-        tx.send((
-            7,
-            Ok(DispatchOutcome::Turn(ControlledTurnOutput {
-                output,
-                reused: false,
-            })),
-        ))
-        .await
-        .unwrap();
-    }));
-    let mut cancellation = Some(token);
-    let mut generation = 7;
-    let mut quit_pending = false;
-    assert!(
-        !cancel_operation(
-            &mut completions,
             &mut events,
             &mut view,
             &harness,
             &mut job,
-            &mut cancellation,
-            &mut generation,
-            &mut quit_pending,
+            false,
         )
         .await
-        .unwrap()
-    );
-    assert_eq!(view.status, "Complete");
-    assert_eq!(view.transcript.last().unwrap().1, "answer won cancellation");
-    assert!(job.is_none());
-    assert!(cancellation.is_none());
-    assert_eq!(generation, 8);
-    harness.lock().await.shutdown(false).await.unwrap();
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            CompletionState::Settled { quit: false, .. }
+        ));
+        assert_eq!(
+            view.transcript.last().unwrap().1,
+            "authoritative completion"
+        );
+        assert_eq!(view.status, "Complete");
+        assert!(!view.busy);
+        assert!(view.operation_start.is_none());
+        assert_eq!(
+            view.completion_metadata[&0],
+            "11 input tokens · 7 output tokens"
+        );
+        assert_runtime_projection(&view, &harness).await;
+
+        let transcript = view.transcript.clone();
+        let outcome = apply_completion(
+            (
+                5,
+                Ok(DispatchOutcome::Turn(ControlledTurnOutput {
+                    output: TurnOutput {
+                        session: view.session.clone(),
+                        speaker: view.parts[0].0.clone(),
+                        text: "authoritative completion".into(),
+                        relationship: None,
+                        input_tokens: 11,
+                        output_tokens: 7,
+                        limited: false,
+                        limit_reasons: Some(vec![]),
+                        response_outcome: Some(ResponseOutcome::Text),
+                        events: vec![],
+                    },
+                    reused: true,
+                })),
+            ),
+            5,
+            &mut events,
+            &mut view,
+            &harness,
+            &mut job,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            CompletionState::Settled { quit: false, .. }
+        ));
+        assert_eq!(view.transcript, transcript);
+        assert_eq!(view.status, "Complete · stored result reused");
+        assert!(
+            view.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("no new provider or tool work"))
+        );
+
+        seed_stale_runtime(&mut view);
+        view.begin_operation();
+        let outcome = apply_completion(
+            (5, Ok(DispatchOutcome::Command("Mode: freudian".into()))),
+            5,
+            &mut events,
+            &mut view,
+            &harness,
+            &mut job,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            CompletionState::Settled { quit: false, .. }
+        ));
+        assert_eq!(view.status, "Complete");
+        assert!(
+            view.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("saved for this project"))
+        );
+        assert!(view.operation_start.is_none());
+        assert_runtime_projection(&view, &harness).await;
+
+        seed_stale_runtime(&mut view);
+        view.begin_operation();
+        let outcome = apply_completion(
+            (6, Err(anyhow::anyhow!("controlled dispatch failure"))),
+            6,
+            &mut events,
+            &mut view,
+            &harness,
+            &mut job,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            CompletionState::Settled { quit: false, .. }
+        ));
+        assert_eq!(view.status, "Failed · details in conversation");
+        assert!(view.transcript.last().is_some_and(
+            |(role, text)| role == "error" && text.contains("controlled dispatch failure")
+        ));
+        assert!(view.operation_start.is_none());
+        assert_runtime_projection(&view, &harness).await;
+
+        seed_stale_runtime(&mut view);
+        view.begin_operation();
+        view.completion_locked = true;
+        job = Some(tokio::spawn(std::future::pending()));
+        let before = (
+            view.transcript.clone(),
+            view.status.clone(),
+            view.busy,
+            view.operation_start,
+            view.turns,
+            view.mode.clone(),
+            view.model.clone(),
+            view.effort.clone(),
+            view.parts.clone(),
+            view.relationships.clone(),
+            view.focus.clone(),
+            view.completion_locked,
+        );
+        let outcome = apply_completion(
+            (6, Ok(DispatchOutcome::Command("STALE".into()))),
+            7,
+            &mut events,
+            &mut view,
+            &harness,
+            &mut job,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, CompletionState::Stale);
+        assert_eq!(
+            (
+                view.transcript,
+                view.status,
+                view.busy,
+                view.operation_start,
+                view.turns,
+                view.mode,
+                view.model,
+                view.effort,
+                view.parts,
+                view.relationships,
+                view.focus,
+                view.completion_locked,
+            ),
+            before
+        );
+        assert!(
+            job.is_some(),
+            "a stale completion must not clear the live job"
+        );
+        job.take().unwrap().abort();
+    })
+    .await
+}
+
+#[tokio::test]
+async fn cancellation_consumes_an_answer_that_won_the_completion_race() {
+    kuru_memory::test_support::closing(async {
+        let (_directory, harness, _) = fixture().await;
+        let mut events = harness.subscribe();
+        let harness = Arc::new(tokio::sync::Mutex::new(harness));
+        let initial = {
+            let harness = harness.lock().await;
+            project_initial_view(&harness).await.unwrap()
+        };
+        let mut view = View::from_initial(initial, vec![]);
+        view.begin_operation();
+        let output = TurnOutput {
+            session: view.session.clone(),
+            speaker: view.parts[0].0.clone(),
+            text: "answer won cancellation".into(),
+            relationship: None,
+            input_tokens: 5,
+            output_tokens: 3,
+            limited: false,
+            limit_reasons: Some(vec![]),
+            response_outcome: Some(ResponseOutcome::Text),
+            events: vec![],
+        };
+        let (tx, mut completions) = mpsc::channel(1);
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+        let mut job = Some(tokio::spawn(async move {
+            while !worker_token.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+            tx.send((
+                7,
+                Ok(DispatchOutcome::Turn(ControlledTurnOutput {
+                    output,
+                    reused: false,
+                })),
+            ))
+            .await
+            .unwrap();
+        }));
+        let mut cancellation = Some(token);
+        let mut generation = 7;
+        let mut quit_pending = false;
+        assert!(
+            !cancel_operation(
+                &mut completions,
+                &mut events,
+                &mut view,
+                &harness,
+                &mut job,
+                &mut cancellation,
+                &mut generation,
+                &mut quit_pending,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(view.status, "Complete");
+        assert_eq!(view.transcript.last().unwrap().1, "answer won cancellation");
+        assert!(job.is_none());
+        assert!(cancellation.is_none());
+        assert_eq!(generation, 8);
+        harness.lock().await.shutdown(false).await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn queued_completion_wakes_before_a_future_animation_deadline_and_reaches_completion() {
-    let (_directory, harness, _) = fixture().await;
-    let harness = Arc::new(tokio::sync::Mutex::new(harness));
-    let initial = {
-        let harness = harness.lock().await;
-        project_initial_view(&harness).await.unwrap()
-    };
-    let mut view = View::from_initial(initial, vec![]);
-    let mut input = stream::pending();
-    let (completion_tx, mut completion_rx) = mpsc::channel(1);
-    let (_activity_tx, mut events) = broadcast::channel(1);
-    let deadline = TokioInstant::now() + Duration::from_secs(60);
-    let frame = view.frame;
-    view.begin_operation();
-    let scheduler = Scheduler::new();
+    kuru_memory::test_support::closing(async {
+        let (_directory, harness, _) = fixture().await;
+        let harness = Arc::new(tokio::sync::Mutex::new(harness));
+        let initial = {
+            let harness = harness.lock().await;
+            project_initial_view(&harness).await.unwrap()
+        };
+        let mut view = View::from_initial(initial, vec![]);
+        let mut input = stream::pending();
+        let (completion_tx, mut completion_rx) = mpsc::channel(1);
+        let (_activity_tx, mut events) = broadcast::channel(1);
+        let deadline = TokioInstant::now() + Duration::from_secs(60);
+        let frame = view.frame;
+        view.begin_operation();
+        let scheduler = Scheduler::new();
 
-    let mut wake = Box::pin(next_wake(
-        &scheduler,
-        &mut input,
-        &mut completion_rx,
-        &mut events,
-        WakeAvailability {
-            input: true,
-            completion: true,
-            activity: true,
-        },
-        deadline,
-    ));
-    for stage in ["cooperative yield", "all-pending select"] {
-        futures::future::poll_fn(|context| {
-            assert!(
-                matches!(wake.as_mut().poll(context), Poll::Pending),
-                "scheduler unexpectedly resolved while reaching {stage}"
-            );
-            Poll::Ready(())
-        })
-        .await;
-    }
-    completion_tx
-        .send((
+        let mut wake = Box::pin(next_wake(
+            &scheduler,
+            &mut input,
+            &mut completion_rx,
+            &mut events,
+            WakeAvailability {
+                input: true,
+                completion: true,
+                activity: true,
+            },
+            deadline,
+        ));
+        for stage in ["cooperative yield", "all-pending select"] {
+            futures::future::poll_fn(|context| {
+                assert!(
+                    matches!(wake.as_mut().poll(context), Poll::Pending),
+                    "scheduler unexpectedly resolved while reaching {stage}"
+                );
+                Poll::Ready(())
+            })
+            .await;
+        }
+        completion_tx
+            .send((
+                3,
+                Ok(DispatchOutcome::Command("scheduler completion".into())),
+            ))
+            .await
+            .unwrap();
+        let wake = wake.await;
+        let Wake::Completion(Some(completion)) = wake else {
+            panic!("completion should wake before the future animation deadline");
+        };
+        let mut job = None;
+        let result = apply_completion(
+            completion,
             3,
-            Ok(DispatchOutcome::Command("scheduler completion".into())),
-        ))
+            &mut events,
+            &mut view,
+            &harness,
+            &mut job,
+            false,
+        )
         .await
         .unwrap();
-    let wake = wake.await;
-    let Wake::Completion(Some(completion)) = wake else {
-        panic!("completion should wake before the future animation deadline");
-    };
-    let mut job = None;
-    let result = apply_completion(
-        completion,
-        3,
-        &mut events,
-        &mut view,
-        &harness,
-        &mut job,
-        false,
-    )
+        assert!(matches!(
+            result,
+            CompletionState::Settled { quit: false, .. }
+        ));
+        assert_eq!(view.frame, frame, "completion must not advance motion time");
+        assert_eq!(
+            view.transcript.last(),
+            Some(&(String::from("kuru"), String::from("scheduler completion")))
+        );
+    })
     .await
-    .unwrap();
-    assert!(matches!(
-        result,
-        CompletionState::Settled { quit: false, .. }
-    ));
-    assert_eq!(view.frame, frame, "completion must not advance motion time");
-    assert_eq!(
-        view.transcript.last(),
-        Some(&(String::from("kuru"), String::from("scheduler completion")))
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completion_caps_activity_while_a_concurrent_sender_continues_producing() {
-    let (_directory, harness, _) = fixture().await;
-    let harness = Arc::new(tokio::sync::Mutex::new(harness));
-    let initial = {
-        let harness = harness.lock().await;
-        project_initial_view(&harness).await.unwrap()
-    };
-    let mut view = View::from_initial(initial, vec![]);
-    let (activity_tx, mut events) = broadcast::channel(1024);
-    for index in 0..(ACTIVITY_DRAIN_CAP + 44) {
-        activity_tx
-            .send(kuru_runtime::Event::ToolStarted {
-                actor: "part".into(),
-                call_id: format!("queued-{index}"),
-                name: format!("queued-{index}"),
+    kuru_memory::test_support::closing(async {
+        let (_directory, harness, _) = fixture().await;
+        let harness = Arc::new(tokio::sync::Mutex::new(harness));
+        let initial = {
+            let harness = harness.lock().await;
+            project_initial_view(&harness).await.unwrap()
+        };
+        let mut view = View::from_initial(initial, vec![]);
+        let (activity_tx, mut events) = broadcast::channel(1024);
+        for index in 0..(ACTIVITY_DRAIN_CAP + 44) {
+            activity_tx
+                .send(kuru_runtime::Event::ToolStarted {
+                    actor: "part".into(),
+                    call_id: format!("queued-{index}"),
+                    name: format!("queued-{index}"),
+                })
+                .unwrap();
+        }
+        let producer = {
+            let activity_tx = activity_tx.clone();
+            thread::spawn(move || {
+                for index in 0..128 {
+                    activity_tx
+                        .send(kuru_runtime::Event::ToolStarted {
+                            actor: "part".into(),
+                            call_id: format!("concurrent-{index}"),
+                            name: format!("concurrent-{index}"),
+                        })
+                        .unwrap();
+                    thread::yield_now();
+                }
             })
-            .unwrap();
-    }
-    let producer = {
-        let activity_tx = activity_tx.clone();
-        thread::spawn(move || {
-            for index in 0..128 {
-                activity_tx
-                    .send(kuru_runtime::Event::ToolStarted {
-                        actor: "part".into(),
-                        call_id: format!("concurrent-{index}"),
-                        name: format!("concurrent-{index}"),
-                    })
-                    .unwrap();
-                thread::yield_now();
-            }
-        })
-    };
+        };
 
-    view.begin_operation();
-    let mut job = None;
-    let result = apply_completion(
-        (
+        view.begin_operation();
+        let mut job = None;
+        let result = apply_completion(
+            (
+                9,
+                Ok(DispatchOutcome::Command("completed after activity".into())),
+            ),
             9,
-            Ok(DispatchOutcome::Command("completed after activity".into())),
-        ),
-        9,
-        &mut events,
-        &mut view,
-        &harness,
-        &mut job,
-        false,
-    )
-    .await
-    .unwrap();
-    producer.join().unwrap();
+            &mut events,
+            &mut view,
+            &harness,
+            &mut job,
+            false,
+        )
+        .await
+        .unwrap();
+        producer.join().unwrap();
 
-    assert!(matches!(
-        result,
-        CompletionState::Settled { quit: false, .. }
-    ));
-    assert_eq!(
-        view.activity.len(),
-        100,
-        "the view keeps its documented tail"
-    );
-    assert_eq!(
-        events.len(),
-        44 + 128,
-        "completion drains one captured cap while the sender keeps later activity queued"
-    );
-    assert_eq!(
-        view.transcript.last(),
-        Some(&(
-            String::from("kuru"),
-            String::from("completed after activity")
-        ))
-    );
-    assert!(!view.busy);
-    assert!(view.operation_start.is_none());
-    assert_runtime_projection(&view, &harness).await;
+        assert!(matches!(
+            result,
+            CompletionState::Settled { quit: false, .. }
+        ));
+        assert_eq!(
+            view.activity.len(),
+            100,
+            "the view keeps its documented tail"
+        );
+        assert_eq!(
+            events.len(),
+            44 + 128,
+            "completion drains one captured cap while the sender keeps later activity queued"
+        );
+        assert_eq!(
+            view.transcript.last(),
+            Some(&(
+                String::from("kuru"),
+                String::from("completed after activity")
+            ))
+        );
+        assert!(!view.busy);
+        assert!(view.operation_start.is_none());
+        assert_runtime_projection(&view, &harness).await;
+    })
+    .await
 }
