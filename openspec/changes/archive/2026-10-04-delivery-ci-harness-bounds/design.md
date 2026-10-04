@@ -6,8 +6,8 @@ Root cause: the harness bounds individual commands, settles and launches with li
 
 ## Decisions
 
-- The shard deadline chain is the only source: a command, list or capture waits on its exit event bounded by `remaining_until(deadline)`; cleanup and settle bounds derive from the `EVIDENCE_RESERVE` slice kept between the shard deadline and the job limit, so they always fit inside it.
-- Open-time bounds derive from the product's own budgets (startup and close budgets in kuru-memory/kuru-core) plus the platform process API's cleanup bound, each cited at the constant; where no product budget exists the wait takes the job deadline.
+- Coverage commands, lists, captures and ordinary-exit settle/drain waits use the shard deadline chain. Stopped-tree cleanup waits take equal slices of `EVIDENCE_RESERVE`; post-test receipt probes use the job limit less the final evidence slice.
+- Open-time run and retirement bounds derive from the product's own startup, statement, reply and close budgets in kuru-memory/kuru-core, each cited at the constant. The stock listening-port queries and Windows post-terminate Job reap have no product bound of their own and use the harness's run bound; port-query expiry is report-only, and a failed Job reap stops the series with an infrastructure error.
 - A constant is deleted when the event it waits for already carries a bound; it is kept only with its derivation and a pin test of that derivation.
 - The release workflow `tests` job records `KURU_COVERAGE_JOB_STARTED` and `KURU_COVERAGE_JOB_MINUTES` exactly as `ci.yml` and `native-tests.yml` do; the deadline arithmetic is unchanged.
 - The full per-point table (what it bounds, governing budget, derived value or deletion, meaning of expiry) lives in the untracked `tmp/roadmap/store-creation-design/derivation-delivery-ci-harness.md`; the derivation at each constant is the durable record.
