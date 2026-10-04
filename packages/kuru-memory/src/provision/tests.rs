@@ -1036,7 +1036,9 @@ async fn cancellation_retains_stage_and_lock_until_real_extraction_stops() {
         "worker retains installation lock until its filesystem writes stop"
     );
     release.send(()).unwrap();
-    let _lock = cache_lock(&cache, Duration::from_secs(10)).await.unwrap();
+    // The released extraction worker has no time bound of its own; a product
+    // provisioner waits `LOCK_TIMEOUT` for this lock behind such a holder.
+    let _lock = cache_lock(&cache, LOCK_TIMEOUT).await.unwrap();
     assert!(!stage.exists());
     assert_eq!(fs::read_dir(cache.join(DOLT_VERSION)).unwrap().count(), 0);
     drop(_lock);
@@ -1087,7 +1089,9 @@ async fn paused_probe(
         .await
         .unwrap()
         .unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // The real probe child writes the marker at its start; the product runs
+    // that child under `VERSION_TIMEOUT` (`verify_version_recorded`).
+    let deadline = tokio::time::Instant::now() + VERSION_TIMEOUT;
     while !home.join("tmp/started").try_exists().unwrap() {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -1124,7 +1128,9 @@ async fn cancellation_during_actual_probe_retains_stage_and_lock_but_never_activ
     )
     .unwrap();
     nix::unistd::write(&release, b"continue\n").unwrap();
-    let lock = cache_lock(&cache, Duration::from_secs(10)).await.unwrap();
+    // The cold-probe thread holds the lease until its probe returns, which the
+    // product bounds by `VERSION_TIMEOUT` (`CheckedColdProbe::probe`).
+    let lock = cache_lock(&cache, VERSION_TIMEOUT).await.unwrap();
     drop(release);
     assert!(!candidate.exists());
     assert!(!home.exists());
@@ -1180,8 +1186,10 @@ fn runtime_destruction_during_probe_retains_process_resources_until_exit_without
     )
     .unwrap();
     nix::unistd::write(&release, b"continue\n").unwrap();
+    // The cold-probe thread holds the lease until its probe returns, which the
+    // product bounds by `VERSION_TIMEOUT` (`CheckedColdProbe::probe`).
     let _lock = observer
-        .block_on(cache_lock(&cache, Duration::from_secs(10)))
+        .block_on(cache_lock(&cache, VERSION_TIMEOUT))
         .unwrap();
     drop(release);
     assert!(!candidate.exists());
@@ -1789,7 +1797,9 @@ async fn cancelled_extraction_receipts_a_refused_stage_before_releasing_the_lock
     release.send(()).unwrap();
     // The worker releases the lock only after resolving its stage, so the
     // moment this contender holds it the retention must already be recorded.
-    let lock = cache_lock(&cache, Duration::from_secs(10)).await.unwrap();
+    // The released extraction worker has no time bound of its own; a product
+    // provisioner waits `LOCK_TIMEOUT` for this lock behind such a holder.
+    let lock = cache_lock(&cache, LOCK_TIMEOUT).await.unwrap();
     let versions = cache.canonicalize().unwrap().join(DOLT_VERSION);
     let receipt = only_leftover_receipt(&versions);
     assert_eq!(receipt["published"], false);
