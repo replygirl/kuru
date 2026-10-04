@@ -88,10 +88,14 @@ budget), not the product startup window.
   written file.
 - **Why the same figure outlasts the test's wait** (inference from the call
   order, not a new mechanism): the owner's deadline starts when it reaches the
-  stage, which is after the test spawned the child, and the test's wait started
-  at that spawn. So `stage_start + budget > spawn + budget`: while the test is
-  still waiting, the hold is still holding. When the test's wait itself expires
-  the test has already failed, so the hold's later expiry changes no outcome.
+  stage, and the test's wait begins before the owner can reach the stage: the
+  owner is a further process the spawned client starts, and it passes its
+  earlier stages first. In `tests/cli.rs` the test's second wait begins as it
+  removes the first marker, before the released owner can reach the second
+  stage. So `stage_start + budget > wait_start + budget`: while the test is
+  still waiting, the hold is still holding. When the test's wait itself
+  expires the test has already failed, so the hold's later expiry changes no
+  outcome.
 - **Callers to adopt it in #212, not here:** `apps/kuru-tui/tests/terminal.rs`
   (`smoke` at ~2562, and `real_pty_first_launch_shows_the_creating_sentence_while_the_template_builds`
   at ~2855) and `apps/kuru-tui/tests/cli.rs` (~3522-3535, two markers; the budget
