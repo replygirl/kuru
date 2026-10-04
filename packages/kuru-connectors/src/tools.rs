@@ -2422,13 +2422,19 @@ mod tests {
     #[cfg(unix)]
     const SHELL_OBSERVE_INTERVAL: Duration = Duration::from_millis(10);
     /// `ShellRegistry::shutdown` re-checks for an empty registry, then for its
-    /// deadline, every interval (unix_shell.rs:590-607), so its result is ready
-    /// by the allowance plus one interval. Its deadline starts on the same poll
-    /// as a timer around `ToolHost::shutdown`, whose `join!` polls the shell
-    /// branch first (tools.rs:1683-1687); without MCP aliases or hooks, the
-    /// other branches return at once.
+    /// deadline, every interval (unix_shell.rs:590-607). Its last check, after
+    /// a sleep begun just before its deadline, is due by that deadline plus one
+    /// interval. A timer around `ToolHost::shutdown` fixes its own deadline when
+    /// it is constructed; the registry's deadline is set during the first poll
+    /// after that (unix_shell.rs:577-590), through `join!`, which polls the
+    /// shell branch first (tools.rs:1683-1687). One more interval is the
+    /// written allowance for that ordering. When both are due on the same
+    /// timer tick, `Timeout` polls the shutdown before its own deadline, so
+    /// only their due times matter. Without MCP aliases or hooks, the other
+    /// branches return at once.
     #[cfg(unix)]
-    const SHELL_SHUTDOWN: Duration = SHELL_CLEANUP_ALLOWANCE.saturating_add(SHELL_OBSERVE_INTERVAL);
+    const SHELL_SHUTDOWN: Duration =
+        SHELL_CLEANUP_ALLOWANCE.saturating_add(SHELL_OBSERVE_INTERVAL.saturating_mul(2));
     /// The shell tool's default `timeout_ms`, restated from tools.rs:1344.
     #[cfg(unix)]
     const SHELL_DEFAULT_TIMEOUT_MS: u64 = 30_000;

@@ -173,7 +173,12 @@ pub enum Step {
     /// Hold the peer, without recording, until the product closes its stdin.
     Park,
     /// Hold the peer until the test calls [`StdioFixture::release`] with this
-    /// name. The name is one plan word: it must not contain whitespace.
+    /// name. The name is one plan word: it must not contain whitespace. Place
+    /// it after the [`Step::Read`] of a request the product awaits under
+    /// `crate::IO_TIMEOUT` (`rpc.rs:545,555`; `mcp.rs:1948`): the peer fails
+    /// once that long has passed without a release, when the held request has
+    /// already failed in the product. The bound is a backstop for an owner
+    /// killed before its cleanup, never what decides a test.
     AwaitRelease(&'static str),
     Eof,
 }
@@ -225,7 +230,8 @@ impl StdioFixture {
                         !name.is_empty() && !name.contains(char::is_whitespace),
                         "release name must be one plan word"
                     );
-                    format!("await-release {name}\n")
+                    // The second word is the held request's product budget.
+                    format!("await-release {name} {}\n", crate::IO_TIMEOUT.as_millis())
                 }
                 Step::Eof => "eof\n".into(),
             })

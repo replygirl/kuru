@@ -2803,7 +2803,9 @@ mod tests {
         // (providers/diagnostics.rs:280). Without that bound this fails at
         // the stream's `COMPLETION_TIMEOUT`.
         let error = provider.complete(request()).await.unwrap_err();
-        release.send(()).unwrap();
+        // A server that already panicked has dropped its receiver; the join
+        // below reports that panic.
+        let _ = release.send(());
         let diagnostic = format!("{error:#}");
         assert!(
             diagnostic.contains("service failed (HTTP 502)"),
@@ -3096,6 +3098,10 @@ mod tests {
         .unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
+        // A detached replay of the cancelled attempt would be sent after its
+        // first retry delay: equal jitter on a 500 ms base, so at most 500 ms
+        // (src/retry.rs:127-138,258-270), since a fixture `Reply` sends no
+        // `Retry-After`. This 1 s exceeds that, so the count below shows none.
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(peer.requests.lock().await.len(), 2);
         provider.complete(continuation).await.unwrap();
