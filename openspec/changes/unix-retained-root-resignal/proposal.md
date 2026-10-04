@@ -14,6 +14,9 @@ Add one nonblocking platform pre-reap step driven by existing caller loops. It
 retains one read-only membership worker, observes only after root exit, and
 freshly checks the exact unreaped root before each additional ordered signal
 sweep. Snapshot admission and polling use the caller's absolute deadline.
+The retained worker publishes one completion wake so existing caller loops
+can observe finished work before their poll timer expires. Final coverage
+disposal exact-reaps an already-exited root while preserving unconfirmed cleanup.
 Existing root reap, post-reap absence, pipe gates, primary errors and retained
 cleanup remain in their owning callers. Immediate termination and Drop remain
 immediate; no signal is permitted after reap or disarm.

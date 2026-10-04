@@ -26,6 +26,9 @@ listings pending. Snapshot admission MUST use bounded spawn-lock acquisition
 and the absolute inspection deadline. Worker cancellation/expiry MUST retain
 helper cleanup ownership; late results MUST NOT cause signals. After reap or
 disarm, only read-only group observation is permitted.
+Completion waiting MUST retain its receiver across caller cancellation and use
+the caller's existing poll/deadline; it MUST NOT join an unfinished worker or
+replace the pre-reap step's result classification and fresh signal authority.
 
 The Unix boundary MUST NOT claim that a process group provides atomic
 owner-death containment or controls processes that deliberately escape it.
@@ -72,3 +75,11 @@ post-reap absence and output gates or allocate another cleanup allowance.
 #### Scenario: Unix cleanup is cancelled and resumed
 - **WHEN** an async cleanup poll is cancelled while a membership worker is pending
 - **THEN** the owner retains and consumes that single job on resume and never uses a late result after expiry, reap or disarm to signal the tree.
+
+#### Scenario: Unix membership completes before the next caller poll
+- **WHEN** the retained read-only worker completes helper cleanup within the caller's deadline
+- **THEN** its retained completion wake advances the existing loop without waiting for the full poll timer, and only a finished worker is joined before readiness is classified.
+
+#### Scenario: Coverage disposes an expired pending Unix owner
+- **WHEN** final coverage supervision returns unconfirmed with an exited root and a pending membership helper
+- **THEN** final disposal reaps only the exact exited root, keeps the unconfirmed result, and leaves helper cleanup under its read-only continuation without signalling.

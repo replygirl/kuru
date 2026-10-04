@@ -148,6 +148,7 @@ pub enum PreReap {
 
 struct MembershipJob {
     worker: JoinHandle<io::Result<Vec<snapshot::GroupMember>>>,
+    completion: Option<tokio::sync::oneshot::Receiver<()>>,
     cancelled: Arc<AtomicBool>,
     deadline: Instant,
 }
@@ -426,20 +427,26 @@ impl OwnedProcessGroup {
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancellation = Arc::clone(&cancelled);
         let group = self.group.as_raw_nonzero().get().unsigned_abs();
+        let (completed, completion) = tokio::sync::oneshot::channel();
         let started = thread::Builder::new()
             .name("kuru-group-membership".into())
             .spawn(move || {
-                snapshot::group_members_until(
+                let result = snapshot::group_members_until(
                     std::path::Path::new(snapshot::PS),
                     group,
                     deadline,
                     &cancellation,
-                )
+                );
+                // The wake follows helper reap and both reader joins. Result
+                // classification and the finished-thread join stay in the owner.
+                let _ = completed.send(());
+                result
             });
         match started {
             Ok(worker) => {
                 self.membership = Some(MembershipJob {
                     worker,
+                    completion: Some(completion),
                     cancelled,
                     deadline,
                 });
@@ -450,6 +457,40 @@ impl OwnedProcessGroup {
                 PreReap::Pending
             }
             Err(error) => PreReap::Unobserved(error.kind()),
+        }
+    }
+
+    /// Wait for the retained worker or the caller's next poll, without taking
+    /// its result, joining it, or granting signal authority.
+    ///
+    /// Cancellation retains the receiver. Completion is only a wake hint;
+    /// [`Self::pre_reap_step`] still checks deadlines and joins finished work.
+    pub async fn wait_pre_reap(&mut self, poll: Duration, deadline: Instant) {
+        let limit = Instant::now()
+            .checked_add(poll)
+            .map_or(deadline, |next| next.min(deadline));
+        if Instant::now() >= limit {
+            return;
+        }
+        let Some(job) = &mut self.membership else {
+            tokio::time::sleep_until(limit.into()).await;
+            return;
+        };
+        if job.worker.is_finished() {
+            return;
+        }
+        if let Some(completion) = &mut job.completion {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(limit.into()) => return,
+                _ = completion => job.completion = None,
+            }
+        }
+        // Sending the wake precedes the native thread's finished flag. Yield
+        // through that small exit gap within the same poll/deadline, never
+        // blocking on a join or turning the wake into readiness.
+        while !job.worker.is_finished() && Instant::now() < limit {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -618,6 +659,7 @@ fn join_membership(job: MembershipJob) -> io::Result<Vec<snapshot::GroupMember>>
         worker,
         cancelled,
         deadline,
+        ..
     } = job;
     let result = worker
         .join()
@@ -1213,6 +1255,268 @@ mod tests {
         }
     }
 
+    struct WakeFixture {
+        owner: OwnedProcessGroup,
+        release: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl WakeFixture {
+        fn new() -> Self {
+            let mut command = Command::new("/bin/sleep");
+            command.arg("30");
+            let mut owner = OwnedProcessGroup::spawn(command, INHERITED).unwrap();
+            owner.terminate_before_reap();
+            let limit = Instant::now() + TEST_BOUND;
+            while !matches!(owner.root_state(), RootState::Exited) && Instant::now() < limit {
+                thread::yield_now();
+            }
+            let exited = matches!(owner.root_state(), RootState::Exited);
+            if !exited {
+                finish_test_owner(&mut owner).unwrap();
+            }
+            assert!(exited, "wake fixture root did not exit");
+            Self {
+                owner,
+                release: None,
+            }
+        }
+
+        fn install(
+            &mut self,
+            work: impl FnOnce(
+                tokio::sync::oneshot::Sender<()>,
+            ) -> io::Result<Vec<snapshot::GroupMember>>
+            + Send
+            + 'static,
+        ) {
+            let (completed, completion) = tokio::sync::oneshot::channel();
+            self.owner.membership = Some(MembershipJob {
+                worker: thread::spawn(move || work(completed)),
+                completion: Some(completion),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                deadline: Instant::now() + TEST_BOUND,
+            });
+        }
+    }
+
+    impl Drop for WakeFixture {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            // Every fixture root was already observed exited. Recover it even
+            // if an assertion fails while the read-only worker is gated.
+            let _ = self.owner.reap_if_exited();
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_before_wait_is_not_lost_or_consumed_as_readiness() {
+        use std::{future::Future, task::Context};
+
+        let mut fixture = WakeFixture::new();
+        fixture.install(|completed| {
+            completed.send(()).unwrap();
+            Ok(Vec::new())
+        });
+        let limit = Instant::now() + TEST_BOUND;
+        while !fixture
+            .owner
+            .membership
+            .as_ref()
+            .unwrap()
+            .worker
+            .is_finished()
+            && Instant::now() < limit
+        {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .worker
+                .is_finished()
+        );
+        let mut waiting = Box::pin(fixture.owner.wait_pre_reap(TEST_BOUND, limit));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_ready()
+        );
+        drop(waiting);
+        // Waiting never takes the result or reaps the retained root.
+        assert!(fixture.owner.membership.is_some());
+        assert!(matches!(fixture.owner.root_state(), RootState::Exited));
+        assert_eq!(fixture.owner.pre_reap_step(limit), PreReap::Ready);
+    }
+
+    #[tokio::test]
+    async fn cancelled_completion_wait_retains_the_same_receiver_and_job() {
+        use std::{future::Future, task::Context};
+
+        let mut fixture = WakeFixture::new();
+        let (release, gate) = std::sync::mpsc::channel();
+        fixture.release = Some(release);
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        fixture.install(move |completed| {
+            entered.send(()).unwrap();
+            gate.recv().unwrap();
+            completed.send(()).unwrap();
+            Ok(Vec::new())
+        });
+        tokio::time::timeout(TEST_BOUND, entry)
+            .await
+            .unwrap()
+            .unwrap();
+        let limit = Instant::now() + TEST_BOUND;
+        let mut waiting = Box::pin(fixture.owner.wait_pre_reap(TEST_BOUND, limit));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        drop(waiting);
+        assert!(
+            fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .completion
+                .is_some()
+        );
+        fixture.release.take().unwrap().send(()).unwrap();
+        tokio::time::timeout(TEST_BOUND, fixture.owner.wait_pre_reap(TEST_BOUND, limit))
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.owner.membership_jobs, 0,
+            "resumption admitted another worker"
+        );
+        assert!(
+            fixture.owner.membership.is_some(),
+            "wait consumed the listing result"
+        );
+        assert_eq!(fixture.owner.pre_reap_step(limit), PreReap::Ready);
+    }
+
+    #[tokio::test]
+    async fn completion_exit_gap_and_expired_event_do_not_join_or_signal() {
+        use std::{future::Future, task::Context};
+
+        let mut fixture = WakeFixture::new();
+        let (release, gate) = std::sync::mpsc::channel();
+        fixture.release = Some(release);
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        fixture.install(move |completed| {
+            // Model the real publication-to-thread-exit gap causally.
+            completed.send(()).unwrap();
+            entered.send(()).unwrap();
+            gate.recv().unwrap();
+            Ok(Vec::new())
+        });
+        tokio::time::timeout(TEST_BOUND, entry)
+            .await
+            .unwrap()
+            .unwrap();
+        // An already-published wake cannot outrun an expired caller limit.
+        fixture
+            .owner
+            .wait_pre_reap(TEST_BOUND, Instant::now())
+            .await;
+        assert!(
+            fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .completion
+                .is_some()
+        );
+        let limit = Instant::now() + TEST_BOUND;
+        let mut waiting = Box::pin(fixture.owner.wait_pre_reap(TEST_BOUND, limit));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        drop(waiting);
+        assert!(
+            fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .completion
+                .is_none()
+        );
+        assert!(
+            !fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .worker
+                .is_finished()
+        );
+        let calls = fixture.owner.syscall_count();
+        assert_eq!(fixture.owner.pre_reap_step(limit), PreReap::Pending);
+        assert_eq!(
+            fixture.owner.syscall_count(),
+            calls + 1,
+            "completion signalled or reaped the root"
+        );
+        // Completion and expiry are both visible: expiry wins and cancels,
+        // while an unfinished join remains forbidden.
+        let expired = Instant::now();
+        fixture.owner.wait_pre_reap(TEST_BOUND, expired).await;
+        let calls = fixture.owner.syscall_count();
+        assert_eq!(
+            fixture.owner.pre_reap_step(expired),
+            PreReap::ExpiredPending
+        );
+        assert_eq!(fixture.owner.syscall_count(), calls);
+        assert!(
+            fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .cancelled
+                .load(Ordering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnected_completion_wait_exposes_worker_panic_without_readiness() {
+        let mut fixture = WakeFixture::new();
+        fixture.install(|_completed| panic!("injected membership worker panic"));
+        let limit = Instant::now() + TEST_BOUND;
+        tokio::time::timeout(TEST_BOUND, fixture.owner.wait_pre_reap(TEST_BOUND, limit))
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .worker
+                .is_finished()
+        );
+        assert_eq!(
+            fixture.owner.pre_reap_step(limit),
+            PreReap::Unobserved(io::ErrorKind::Other)
+        );
+        assert!(matches!(fixture.owner.root_state(), RootState::Exited));
+    }
+
     #[test]
     fn real_second_sweep_removes_omitted_descendant_before_root_reap() {
         for suppress in [true, false] {
@@ -1367,6 +1671,7 @@ mod tests {
                 }
                 owner.membership = Some(MembershipJob {
                     worker,
+                    completion: None,
                     cancelled: Arc::new(AtomicBool::new(false)),
                     deadline: limit,
                 });
@@ -1541,6 +1846,7 @@ mod tests {
                 wait.recv().unwrap();
                 Ok(vec![test_row(group + 1, group, false)])
             }),
+            completion: None,
             cancelled: cancelled.clone(),
             deadline,
         });

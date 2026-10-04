@@ -14,6 +14,13 @@ roots are pending without snapshots. Exited roots retain one read-only worker
 containing only the group number, cancellation flag and absolute deadline.
 Completed worker cleanup precedes its result. Polls join only finished workers;
 cancellation of an async caller retains the same job in its process owner.
+The existing worker retains one Tokio completion receiver. It publishes the
+wake only after snapshot helper cleanup and reader joins return. A bounded
+platform wait wakes on completion or the caller's existing poll/deadline;
+it never consumes listing results or signals. The tiny wake-to-thread-exit
+gap uses cooperative yields within that same bound, never an unfinished join.
+Cancelled waits retain the receiver and job. Synchronous shell cleanup uses
+its existing owned runtime for this bounded wait, preserving post-reap backoff.
 Helper observation interruption does not disarm; other observation errors
 permanently disarm helper signals. Reader startup is fallible, with the owned
 helper and any already-started reader retained through partial setup cleanup.
@@ -47,6 +54,9 @@ and output drains remain independent success gates. Drop stays immediate.
 Hooks perform the existing exact-root reap fallback at expiry even if helper
 cleanup is pending, then report cleanup unconfirmed. A late helper remains
 under its read-only worker; it cannot make that fallback report success.
+Coverage performs this fallback only at final process disposal, so a cancelled
+wait can still resume its retained root and membership job. Disposal never
+signals or converts an unconfirmed supervision result into success.
 Retained-shell rounds poll pending pre-reap work, but return to once-per-round
 read-only observations after the root is reaped.
 
@@ -56,6 +66,10 @@ One `ps` helper adds normal cleanup latency; measure fixed successful
 hook/shell batches before and after, including concurrent admission. A listing
 is not atomic containment evidence and may miss a concurrent fork; preserve
 the final absence gate. Escaped groups remain outside scope.
+Completion wakes remove avoidable caller polling sleep; native inspection
+and the helper's existing polling cadence remain measured costs. Verify lost
+wakes, cancelled/resumed waits, deadline/event ties, panic/disconnection and
+publication before actual worker exit without premature joins or readiness.
 
 Native spawn, scheduling, helper kill/reap and reader joins are not preemptible
 hard real-time operations. Absolute admission/polling limits preserve responsive

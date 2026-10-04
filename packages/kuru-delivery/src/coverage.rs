@@ -1954,6 +1954,8 @@ struct GroupProcess {
     /// Bound for [`TestProcess::terminate`]'s retries of an interrupted group
     /// signal, which takes no deadline of its own.
     cleanup_bound: Duration,
+    #[cfg(test)]
+    pending_membership: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 #[cfg(unix)]
@@ -1968,11 +1970,31 @@ impl GroupProcess {
             observed: "not observed".to_owned(),
             presence: None,
             cleanup_bound,
+            #[cfg(test)]
+            pending_membership: None,
         })
     }
 
     fn take_stdout(&mut self) -> std::io::Result<tokio::process::ChildStdout> {
         tokio::process::ChildStdout::from_std(self.owner.take_stdout()?)
+    }
+
+    fn pre_reap_step(&mut self, deadline: std::time::Instant) -> kuru_platform::unix::PreReap {
+        #[cfg(test)]
+        if let Some(pending) = &mut self.pending_membership {
+            if matches!(
+                pending.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ) {
+                return if std::time::Instant::now() >= deadline {
+                    kuru_platform::unix::PreReap::ExpiredPending
+                } else {
+                    kuru_platform::unix::PreReap::Pending
+                };
+            }
+            self.pending_membership = None;
+        }
+        self.owner.pre_reap_step(deadline)
     }
 
     /// Consume the transition, reap the exact root, then confirm absence.
@@ -1986,14 +2008,6 @@ impl GroupProcess {
         use kuru_platform::unix::{GroupPresence, PreReap, Reap, Termination};
 
         let limit = deadline;
-        let mut expired = |what: &str| {
-            self.observed
-                .push_str(&format!("; settle: {what} at the wait deadline"));
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("owned test process group {what} before the wait deadline"),
-            )
-        };
         loop {
             match self.owner.terminate_before_reap() {
                 Termination::Signalled(_) | Termination::InvalidPhase => break,
@@ -2001,12 +2015,12 @@ impl GroupProcess {
                 Termination::Disarmed(reason) => return Err(disarmed(reason)),
             }
             if tokio::time::Instant::now() >= limit {
-                return Err(expired("could not be signalled"));
+                return Err(self.expired_settle("could not be signalled"));
             }
             tokio::time::sleep(GROUP_POLL).await;
         }
         let status = loop {
-            match self.owner.pre_reap_step(limit.into_std()) {
+            match self.pre_reap_step(limit.into_std()) {
                 PreReap::Ready | PreReap::Reaped | PreReap::Expired => {
                     match self.owner.reap_if_exited() {
                         Reap::Reaped(status) => break status,
@@ -2028,9 +2042,9 @@ impl GroupProcess {
                 }
             }
             if tokio::time::Instant::now() >= limit {
-                return Err(expired("root was not reaped"));
+                return Err(self.expired_settle("root was not reaped"));
             }
-            tokio::time::sleep(GROUP_POLL).await;
+            self.owner.wait_pre_reap(GROUP_POLL, limit.into_std()).await;
         };
         let mut listing = self.owner.permission_listing(limit.into_std());
         loop {
@@ -2046,10 +2060,30 @@ impl GroupProcess {
                 }
             }
             if tokio::time::Instant::now() >= limit {
-                return Err(expired("remained present after its root was reaped"));
+                return Err(self.expired_settle("remained present after its root was reaped"));
             }
             tokio::time::sleep(GROUP_POLL).await;
         }
+    }
+
+    fn expired_settle(&mut self, what: &str) -> std::io::Error {
+        self.observed
+            .push_str(&format!("; settle: {what} at the wait deadline"));
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("owned test process group {what} before the wait deadline"),
+        )
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GroupProcess {
+    fn drop(&mut self) {
+        // Final disposal cannot leave an already-exited standard child
+        // unreaped while its cancelled read-only helper finishes separately.
+        // This never signals or changes the unconfirmed wait result. A
+        // cancelled wait retains this owner and does not run this fallback.
+        let _ = self.owner.reap_if_exited();
     }
 }
 
@@ -2073,7 +2107,23 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     S: std::future::Future<Output = RunnerSignal>,
 {
-    let mut child = GroupProcess::spawn(command, stdio, cleanup_bound)?;
+    let child = GroupProcess::spawn(command, stdio, cleanup_bound)?;
+    supervise_owned_group(child, relay, log, remaining, cleanup_bound, interrupt).await
+}
+
+#[cfg(unix)]
+async fn supervise_owned_group<W, S>(
+    mut child: GroupProcess,
+    relay: W,
+    log: PathBuf,
+    remaining: Duration,
+    cleanup_bound: Duration,
+    interrupt: S,
+) -> Result<Supervision>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    S: std::future::Future<Output = RunnerSignal>,
+{
     let output = match child.take_stdout() {
         Ok(output) => output,
         Err(error) => {
@@ -3351,6 +3401,135 @@ mod tests {
     /// `tail -f /dev/null`, which blocks until the group signal ends it, so
     /// no member's lifetime races a bound.
     const GROUP_BOUND: Duration = RUNNER_CLEANUP_TIMEOUT;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_final_pending_helper_expiry_reaps_root_and_keeps_unconfirmed_result() {
+        use kuru_platform::unix::RootState;
+        use rustix::process::{Pid, WaitId, WaitIdOptions, WaitOptions, waitid, waitpid};
+        use std::{future::Future, task::Context};
+
+        let mut unreaped = Vec::new();
+        for interrupted in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let pid_file = temp.path().join("root.pid");
+            let mut command = group_command("printf '%s\\n' $$ > \"$1\"; exit 0");
+            command.arg("fixture").arg(&pid_file);
+            let mut child = GroupProcess::spawn(command, GROUP_STDIO, GROUP_BOUND).unwrap();
+            let limit = std::time::Instant::now() + GROUP_BOUND;
+            loop {
+                let state = child.owner.root_state();
+                if matches!(state, RootState::Exited) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < limit,
+                    "fixture root did not exit: {state:?}"
+                );
+                tokio::time::sleep(GROUP_POLL).await;
+            }
+            let pid = fs::read_to_string(pid_file)
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+            let pid = Pid::from_raw(pid).unwrap();
+            // Inject the caller's pending-helper state with a causally gated
+            // read-only continuation; the product root is a real owned child.
+            let (release, gate) = std::sync::mpsc::channel();
+            let (completed, completion) = tokio::sync::oneshot::channel();
+            let (entered, entry) = tokio::sync::oneshot::channel();
+            let helper = std::thread::spawn(move || {
+                entered.send(()).unwrap();
+                let _ = gate.recv();
+                let _ = completed.send(());
+            });
+            tokio::time::timeout(GROUP_BOUND, entry)
+                .await
+                .unwrap()
+                .unwrap();
+            child.pending_membership = Some(completion);
+            let mut waiting = Box::pin(child.wait(GROUP_BOUND));
+            assert!(
+                waiting
+                    .as_mut()
+                    .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                    .is_pending()
+            );
+            drop(waiting);
+            assert!(
+                child.pending_membership.is_some(),
+                "cancelled wait dropped its pending job"
+            );
+            let error = child.wait(Duration::ZERO).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(
+                matches!(child.owner.root_state(), RootState::Exited),
+                "nonfinal expiry reaped the retained root"
+            );
+            assert!(!helper.is_finished());
+
+            let interrupt = async move {
+                if interrupted {
+                    RunnerSignal::Terminate
+                } else {
+                    std::future::pending().await
+                }
+            };
+            let supervision = supervise_owned_group(
+                child,
+                tokio::io::sink(),
+                temp.path().join("pending.stdout.log"),
+                Duration::ZERO,
+                Duration::ZERO,
+                interrupt,
+            )
+            .await
+            .unwrap();
+            // The same owner is now finally disposed. Observe the exact child
+            // without reaping first, and recover before asserting a regression
+            // failure so the negative control cannot leave a zombie behind.
+            let observed = waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            );
+            if observed.as_ref().is_ok_and(Option::is_some) {
+                waitpid(Some(pid), WaitOptions::empty()).unwrap();
+            }
+            let helper_pending = !helper.is_finished();
+            release.send(()).unwrap();
+            helper.join().unwrap();
+            if !matches!(observed, Err(rustix::io::Errno::CHILD)) {
+                unreaped.push((interrupted, format!("{observed:?}")));
+            }
+            assert!(
+                helper_pending,
+                "final disposal reported or waited for helper completion"
+            );
+            let (cleanup, presence) = match supervision {
+                Supervision::Stalled(evidence) if !interrupted => {
+                    (evidence.cleanup, evidence.presence_after_reap)
+                }
+                Supervision::Interrupted(evidence) if interrupted => {
+                    (evidence.cleanup, evidence.presence_after_reap)
+                }
+                _ => {
+                    panic!(
+                        "pending cleanup reported the wrong supervision outcome (interrupted={interrupted})"
+                    )
+                }
+            };
+            assert!(cleanup.starts_with("Err("), "{cleanup}");
+            assert_eq!(
+                presence, None,
+                "unconfirmed evidence was replaced with success"
+            );
+        }
+        assert!(
+            unreaped.is_empty(),
+            "final disposal left exited roots unreaped: {unreaped:?}"
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]

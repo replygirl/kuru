@@ -824,7 +824,9 @@ async fn cleanup_owner(owner: &mut Owner, graceful: bool, deadline: Instant) -> 
         if Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        owner
+            .wait_pre_reap(Duration::from_millis(10), deadline)
+            .await;
     }
     let mut listing = owner.permission_listing(deadline);
     loop {

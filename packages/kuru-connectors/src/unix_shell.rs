@@ -913,10 +913,10 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
         finish_with_cleanup(
             &mut group,
             result,
-            stdout,
-            stderr,
+            (stdout, stderr),
             &finish,
             cleanup_allowance,
+            &runtime,
             #[cfg(test)]
             &test_hooks,
         )
@@ -926,6 +926,7 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
         Ok(false) => retain_until_confirmed(
             &mut group,
             &finish,
+            &runtime,
             #[cfg(test)]
             &test_hooks,
         ),
@@ -938,6 +939,7 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
             retain_until_confirmed(
                 &mut group,
                 &finish,
+                &runtime,
                 #[cfg(test)]
                 &test_hooks,
             );
@@ -1093,14 +1095,16 @@ async fn read_until_terminal(
 fn finish_with_cleanup(
     group: &mut OwnedProcessGroup,
     primary: ShellRead,
-    stdout: Option<tokio::process::ChildStdout>,
-    stderr: Option<tokio::process::ChildStderr>,
+    pipes: (
+        Option<tokio::process::ChildStdout>,
+        Option<tokio::process::ChildStderr>,
+    ),
     finish: &WorkerFinish,
     cleanup_allowance: Duration,
+    runtime: &tokio::runtime::Runtime,
     #[cfg(test)] test_hooks: &TestHooks,
 ) -> bool {
-    drop(stdout);
-    drop(stderr);
+    drop(pipes);
     #[cfg(test)]
     test_hooks.panic_if_armed(TestPoint::CleanupPanic);
     let cleanup_deadline = Instant::now() + cleanup_allowance;
@@ -1108,6 +1112,7 @@ fn finish_with_cleanup(
         group,
         cleanup_deadline,
         false,
+        runtime,
         #[cfg(test)]
         test_hooks,
     ) {
@@ -1142,6 +1147,7 @@ fn finish_with_cleanup(
 fn retain_until_confirmed(
     group: &mut OwnedProcessGroup,
     finish: &WorkerFinish,
+    runtime: &tokio::runtime::Runtime,
     #[cfg(test)] test_hooks: &TestHooks,
 ) {
     // Once the caller receives its bounded result the worker remains the owner.
@@ -1168,6 +1174,7 @@ fn retain_until_confirmed(
                 group,
                 deadline,
                 true,
+                runtime,
                 #[cfg(test)]
                 test_hooks,
             )
@@ -1209,6 +1216,7 @@ fn cleanup_until(
     group: &mut OwnedProcessGroup,
     deadline: Instant,
     retained_round: bool,
+    runtime: &tokio::runtime::Runtime,
     #[cfg(test)] test_hooks: &TestHooks,
 ) -> Result<ExitStatus> {
     let mut listing = group.permission_listing(deadline);
@@ -1230,7 +1238,7 @@ fn cleanup_until(
         if Instant::now() >= deadline {
             bail!("cleanup confirmation timed out")
         }
-        thread::sleep(OBSERVE_INTERVAL);
+        runtime.block_on(group.wait_pre_reap(OBSERVE_INTERVAL, deadline));
     }
 }
 
@@ -1331,13 +1339,17 @@ mod tests {
         assert!(matches!(group.reap_if_exited(), Reap::Reaped(_)));
         let hooks = TestHooks::new();
         hooks.set_point(TestPoint::GroupPending);
-        let first = cleanup_until(&mut group, limit, true, &hooks).unwrap_err();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let first = cleanup_until(&mut group, limit, true, &runtime, &hooks).unwrap_err();
         assert_eq!(
             first.to_string(),
             "retained group cleanup remains unconfirmed"
         );
         // The next retained round may independently observe actual absence.
-        assert!(cleanup_until(&mut group, limit, true, &hooks).is_ok());
+        assert!(cleanup_until(&mut group, limit, true, &runtime, &hooks).is_ok());
     }
 
     fn retained_root(path: &Path) -> Arc<Directory> {

@@ -1164,7 +1164,7 @@ async fn reap_after_exit(owner: &mut HookOwner, limit: Instant) -> Result<bool> 
         if let Some(status) = hook_reap_step(owner, limit, step)? {
             break status.success();
         }
-        tokio::time::sleep(POLL).await;
+        owner.wait_pre_reap(POLL, limit).await;
     };
     ensure_group_absent(owner, limit).await?;
     Ok(status)
@@ -1213,7 +1213,7 @@ async fn cleanup_owned(owner: &mut HookOwner, deadline: Instant) -> Result<()> {
         if hook_reap_step(owner, deadline, step)?.is_some() {
             break;
         }
-        tokio::time::sleep(POLL).await;
+        owner.wait_pre_reap(POLL, deadline).await;
     }
     ensure_group_absent(owner, deadline).await
 }
