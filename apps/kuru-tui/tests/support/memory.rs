@@ -25,6 +25,89 @@ pub struct ServiceCleanup {
 /// The name, in each fixture's private root, of its owner diagnostic file.
 const OWNER_DIAGNOSTIC: &str = "owner-diagnostic.log";
 
+/// How the memory server names a failed Dolt start's private log
+/// (`packages/kuru-memory/src/server.rs`), which owner stderr carries verbatim
+/// in its `{error:#}` chain: this prefix, the store directory joined with
+/// [`SERVER_LOG`], then `": "` and Dolt's own failure.
+const PRIVATE_DIAGNOSTICS: &str = "Dolt startup/lifetime failed; private diagnostics: ";
+/// The file name that producer joins to the store directory.
+const SERVER_LOG: &str = "server.log";
+
+/// The bounded tail of each Dolt log `owner_text` names after
+/// [`PRIVATE_DIAGNOSTICS`], one labelled line per distinct path; empty when
+/// it names none.
+///
+/// Owner stderr is untrusted text. A named path is taken through the first
+/// [`SERVER_LOG`] that ends the line or is followed by `':'`, so a Windows
+/// drive colon cannot end it early. It is read only when it is absolute and
+/// lexically strictly beneath `root` through ordinary components only (no
+/// `..` or `.`), and its canonical form is strictly beneath the canonical
+/// root, which rejects a symlinked escape. The read is
+/// [`kuru_memory::test_support::fixture_server_log`]: the checked private
+/// read, which refuses symlinked components, capped at that helper's
+/// `STARTUP_LOG_BYTES` (above the server's own `LOG_LIMIT` on this log) and
+/// cut to its `STARTUP_TAIL_BYTES` tail, the bound kuru-memory's fixtures
+/// already apply to this same log. A rejected, missing or refused path is
+/// reported instead; nothing here panics.
+fn named_private_diagnostics(root: &Path, owner_text: &str) -> String {
+    let mut named: Vec<&str> = Vec::new();
+    for line in owner_text.lines() {
+        for (start, _) in line.match_indices(PRIVATE_DIAGNOSTICS) {
+            let rest = &line[start + PRIVATE_DIAGNOSTICS.len()..];
+            let end = rest.match_indices(SERVER_LOG).find_map(|(at, _)| {
+                let end = at + SERVER_LOG.len();
+                let after = &rest[end..];
+                (after.is_empty() || after.starts_with(':')).then_some(end)
+            });
+            if let Some(path) = end.map(|end| &rest[..end])
+                && !named.contains(&path)
+            {
+                named.push(path);
+            }
+        }
+    }
+    let mut report = String::new();
+    for path in named {
+        let outcome = named_log_tail(root, Path::new(path));
+        report.push_str(&format!("\nnamed private diagnostics ({path}): {outcome}"));
+    }
+    report
+}
+
+/// The helper's labelled tail of `log`, or why it was not read.
+fn named_log_tail(root: &Path, log: &Path) -> String {
+    let lexically_within = log.is_absolute()
+        && log.strip_prefix(root).is_ok_and(|beneath| {
+            beneath.components().next().is_some()
+                && beneath
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+        });
+    if !lexically_within {
+        return format!("not read: outside the fixture root {}", root.display());
+    }
+    let canonical_root = match std::fs::canonicalize(root) {
+        Ok(path) => path,
+        Err(error) => return format!("not read: the fixture root does not resolve: {error}"),
+    };
+    let canonical = match std::fs::canonicalize(log) {
+        Ok(path) => path,
+        Err(error) => return format!("not read: missing or unresolvable: {error}"),
+    };
+    if canonical == canonical_root || !canonical.starts_with(&canonical_root) {
+        return format!(
+            "not read: resolves outside the fixture root {} to {}",
+            canonical_root.display(),
+            canonical.display()
+        );
+    }
+    kuru_memory::test_support::fixture_server_log(log.to_path_buf()).unwrap_or_else(|| {
+        "not read: the checked private read refused it (not a private single-link \
+         regular file within the helper's read cap, or removed meanwhile)"
+            .to_owned()
+    })
+}
+
 impl ServiceCleanup {
     /// `root` is a guarded fixture root: after this cleanup awaits every
     /// project store's quiescence, its teardown checks the recorded result.
@@ -59,15 +142,28 @@ impl ServiceCleanup {
     }
 
     /// What every owner this fixture's children elected wrote to stderr, as
-    /// a failure-message suffix; empty when no owner wrote anything.
+    /// a failure-message suffix; empty when no owner wrote anything. Each
+    /// private Dolt log that stderr names inside this fixture's root follows
+    /// as a bounded tail ([`named_private_diagnostics`]).
     pub fn owner_diagnostic(&self) -> String {
         match std::fs::read(&self.owner_diagnostic) {
             Ok(bytes) if bytes.is_empty() => String::new(),
-            Ok(bytes) => format!(
-                "\nowner stderr ({}):\n{}",
-                self.owner_diagnostic.display(),
-                String::from_utf8_lossy(&bytes)
-            ),
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                // The diagnostic file sits directly in the fixture root. Take
+                // the root from it rather than from `self.root`, which a failed
+                // cleanup has already taken while keeping the root on disk:
+                // that failure is when this report matters most.
+                let named = self
+                    .owner_diagnostic
+                    .parent()
+                    .map(|root| named_private_diagnostics(root, &text))
+                    .unwrap_or_default();
+                format!(
+                    "\nowner stderr ({}):\n{text}{named}",
+                    self.owner_diagnostic.display()
+                )
+            }
             Err(error) => format!(
                 "\nowner stderr unreadable ({}): {error}",
                 self.owner_diagnostic.display()
@@ -286,4 +382,191 @@ pub fn configuration_with(root: &Path, cache: &Path) -> anyhow::Result<PathBuf> 
         toml::to_string(&config)?,
     )?;
     Ok(directory)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kuru_platform::fs::{Directory, NameRetention, Privacy};
+    use std::{ffi::OsStr, io::Write as _};
+
+    /// A private `stage/server.log` holding `bytes` beneath `root`, created
+    /// through the platform's private primitives so the checked read accepts
+    /// it on every OS. The path is spelled from `root` as given, as an owner
+    /// spells it from its data directory: the platform reports macOS's
+    /// `/var` alias resolved.
+    fn private_log(root: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+        let stage = Directory::open(root, Privacy::OwnerOnly, NameRetention::Movable)?
+            .create_private_directory(OsStr::new("stage"))?;
+        stage.create_new(OsStr::new(SERVER_LOG))?.write_all(bytes)?;
+        Ok(root.join("stage").join(SERVER_LOG))
+    }
+
+    /// The owner stderr line from PR #209's failed fixture, naming `log`.
+    fn owner_text(log: &Path) -> String {
+        format!(
+            "memory service owner open failed: open and adopt the copied template stage: \
+             memory server startup failed: {PRIVATE_DIAGNOSTICS}{}: Dolt exited before \
+             readiness (exit status: 1)\n",
+            log.display()
+        )
+    }
+
+    #[test]
+    fn an_in_root_log_tail_is_appended_with_its_label() -> anyhow::Result<()> {
+        let root = kuru_memory::test_support::tempdir()?;
+        let log = private_log(root.path(), b"dolt: fixture reason for exiting")?;
+        let report = named_private_diagnostics(root.path(), &owner_text(&log));
+        assert_eq!(
+            report,
+            format!(
+                "\nnamed private diagnostics ({0}): fixture Dolt server log tail ({0}): \
+                 dolt: fixture reason for exiting",
+                log.display()
+            )
+        );
+        // A second mention of the same log appends it once.
+        let twice = format!("{0}{0}", owner_text(&log));
+        assert_eq!(named_private_diagnostics(root.path(), &twice), report);
+        root.release(Ok(()))
+    }
+
+    #[test]
+    fn only_the_bounded_tail_of_a_large_log_is_appended() -> anyhow::Result<()> {
+        let root = kuru_memory::test_support::tempdir()?;
+        // Twice the helper's 4 KiB tail, within its 40 KiB read cap.
+        let mut bytes = b"BEGIN".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', 8 * 1024));
+        bytes.extend_from_slice(b"END");
+        let log = private_log(root.path(), &bytes)?;
+        let report = named_private_diagnostics(root.path(), &owner_text(&log));
+        assert!(report.ends_with("xEND"), "{report}");
+        assert!(!report.contains("BEGIN"), "{report}");
+        let label = format!(
+            "\nnamed private diagnostics ({0}): fixture Dolt server log tail ({0}): ",
+            log.display()
+        );
+        let tail = report
+            .strip_prefix(&label)
+            .context("the tail carries its label")?;
+        assert!(
+            tail.len() * 2 <= bytes.len(),
+            "tail of {} bytes exceeds half the {}-byte log",
+            tail.len(),
+            bytes.len()
+        );
+        root.release(Ok(()))
+    }
+
+    #[test]
+    fn a_log_outside_the_root_is_reported_and_not_read() -> anyhow::Result<()> {
+        let root = kuru_memory::test_support::tempdir()?;
+        let elsewhere = kuru_memory::test_support::tempdir()?;
+        let outside = private_log(elsewhere.path(), b"OUTSIDE-SENTINEL")?;
+        let absolute = named_private_diagnostics(root.path(), &owner_text(&outside));
+        assert!(!absolute.contains("OUTSIDE-SENTINEL"), "{absolute}");
+        assert!(
+            absolute.contains(&format!(
+                "({}): not read: outside the fixture root",
+                outside.display()
+            )),
+            "{absolute}"
+        );
+
+        // Each fixture root is `<temp>/<container>/private`, so
+        // `<root>/../../<other container>/private/stage/server.log` names
+        // the same file through the root's own prefix.
+        let temp = root
+            .path()
+            .parent()
+            .and_then(Path::parent)
+            .context("fixture root container")?;
+        let escape = root
+            .path()
+            .join("..")
+            .join("..")
+            .join(elsewhere.path().strip_prefix(temp)?)
+            .join("stage")
+            .join(SERVER_LOG);
+        assert!(std::fs::metadata(&escape)?.is_file(), "escape resolves");
+        let dotted = named_private_diagnostics(root.path(), &owner_text(&escape));
+        assert!(!dotted.contains("OUTSIDE-SENTINEL"), "{dotted}");
+        assert!(
+            dotted.contains("not read: outside the fixture root"),
+            "{dotted}"
+        );
+
+        // A Windows path keeps its drive colon and reaches the report whole.
+        let windows = named_private_diagnostics(
+            root.path(),
+            &format!("{PRIVATE_DIAGNOSTICS}C:\\fixture\\stage\\server.log: Dolt exited\n"),
+        );
+        assert!(
+            windows.contains(
+                "named private diagnostics (C:\\fixture\\stage\\server.log): not read: \
+                 outside the fixture root"
+            ),
+            "{windows}"
+        );
+        elsewhere.release(Ok(()))?;
+        root.release(Ok(()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_escape_is_reported_and_not_read() -> anyhow::Result<()> {
+        let root = kuru_memory::test_support::tempdir()?;
+        let elsewhere = kuru_memory::test_support::tempdir()?;
+        let outside = private_log(elsewhere.path(), b"OUTSIDE-SENTINEL")?;
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(outside.parent().context("stage")?, &link)?;
+        let report = named_private_diagnostics(root.path(), &owner_text(&link.join(SERVER_LOG)));
+        std::fs::remove_file(&link)?;
+        assert!(!report.contains("OUTSIDE-SENTINEL"), "{report}");
+        assert!(
+            report.contains("not read: resolves outside the fixture root"),
+            "{report}"
+        );
+        elsewhere.release(Ok(()))?;
+        root.release(Ok(()))
+    }
+
+    #[test]
+    fn a_missing_in_root_log_is_reported() -> anyhow::Result<()> {
+        let root = kuru_memory::test_support::tempdir()?;
+        let missing = root.path().join("stage").join(SERVER_LOG);
+        let report = named_private_diagnostics(root.path(), &owner_text(&missing));
+        assert!(
+            report.starts_with(&format!(
+                "\nnamed private diagnostics ({}): not read: missing or unresolvable: ",
+                missing.display()
+            )),
+            "{report}"
+        );
+        assert!(named_private_diagnostics(root.path(), "no named diagnostics\n").is_empty());
+        root.release(Ok(()))
+    }
+
+    #[test]
+    fn the_owner_report_appends_the_named_log_after_owner_stderr() -> anyhow::Result<()> {
+        let root = kuru_memory::test_support::tempdir()?;
+        let data = root.path().join("data");
+        let log = private_log(root.path(), b"dolt: fixture reason for exiting")?;
+        let cleanup = ServiceCleanup::new(root, &data);
+        let text = owner_text(&log);
+        std::fs::write(cleanup.owner_diagnostic_path(), &text)?;
+        let report = cleanup.owner_diagnostic();
+        // The fixture's failure output, for a reader of this test's log.
+        println!("managed-memory fixture{report}");
+        assert_eq!(
+            report,
+            format!(
+                "\nowner stderr ({}):\n{text}\nnamed private diagnostics ({1}): fixture Dolt \
+                 server log tail ({1}): dolt: fixture reason for exiting",
+                cleanup.owner_diagnostic_path().display(),
+                log.display()
+            )
+        );
+        cleanup.release(Ok(()))
+    }
 }

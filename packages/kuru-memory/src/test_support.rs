@@ -1428,7 +1428,12 @@ pub(crate) fn fixture_startup_error(options: &OpenOptions, error: Error) -> Erro
     }
 }
 
-fn fixture_server_log(log: PathBuf) -> Option<String> {
+/// The labelled tail of a fixture's Dolt `server.log`, read through the
+/// checked private read within `STARTUP_LOG_BYTES` and cut to the last
+/// `STARTUP_TAIL_BYTES`; `None` when that read refuses or fails. Public so
+/// the kuru-tui managed-memory fixture can report the log an owner's
+/// diagnostic names with this same bound.
+pub fn fixture_server_log(log: PathBuf) -> Option<String> {
     let bytes = files::read_bytes(&log, STARTUP_LOG_BYTES).ok()?;
     let tail = &bytes[bytes.len().saturating_sub(STARTUP_TAIL_BYTES)..];
     Some(format!(
