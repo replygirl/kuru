@@ -35,3 +35,4 @@ mod staging;
 pub mod targets;
 #[cfg(windows)]
 pub mod update;
+pub mod update_budget;

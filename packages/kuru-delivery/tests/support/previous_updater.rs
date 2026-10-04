@@ -14,7 +14,14 @@ use kuru_delivery::{
 };
 use std::{ffi::OsString, fs, path::Path, time::Duration};
 
-const DEADLINE: Duration = Duration::from_secs(180);
+/// Bound for each launch of the installed executable. The longest
+/// product-bounded launch here is the previous release's Windows update, whose
+/// parent waits on its trusted helper for at most the handoff budget (the same
+/// at v0.7.0 through v0.9.0). The Unix update, `--version`, completions and man
+/// generation have no product budget and rely on this backstop alone; the
+/// `install` and `verify-staged` jobs running them record no job start, so no
+/// job deadline is observable. See `support/launch_budget.rs`.
+pub const DEADLINE: Duration = kuru_delivery::update_budget::handoff();
 
 /// A candidate release directory the previous updater reads through
 /// `--release-base`, and what installing it must produce.

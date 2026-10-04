@@ -40,8 +40,12 @@ static TARGET: LazyLock<&'static str> = LazyLock::new(|| {
     target
 });
 const VERSION: &str = "0.2.0";
-const TIMEOUT: Duration = Duration::from_secs(180);
 
+// Stock PowerShell startup and `Add-Type` compilation have no budget of their
+// own; `install.ps1` ends its own stalled reads, downloads, DEFLATE framing
+// and recovery wait through its exit. See the derivation record.
+#[path = "support/launch_budget.rs"]
+mod launch_budget;
 #[path = "support/powershell_diagnostic.rs"]
 mod powershell_diagnostic;
 #[path = "support/stock_powershell.rs"]
@@ -201,7 +205,7 @@ impl Fixture {
     }
 
     async fn run(&self, command: &mut Command) -> Output {
-        output(command, TIMEOUT)
+        output(command, launch_budget::until_job_deadline())
             .await
             .expect("bounded stock PowerShell bootstrap process failed")
     }
@@ -359,7 +363,7 @@ fn success(result: &Output) {
 }
 
 async fn line(pipe: &mut Pipe) -> String {
-    tokio::time::timeout(TIMEOUT, async {
+    tokio::time::timeout(launch_budget::until_job_deadline(), async {
         let mut bytes = Vec::new();
         loop {
             let byte = pipe.read_u8().await?;
