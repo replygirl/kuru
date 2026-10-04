@@ -35,6 +35,25 @@ use super::{
 };
 use crate::memory_notice::MemoryNotice;
 
+#[path = "../../tests/support/turn_budget.rs"]
+mod turn_budget;
+use turn_budget::{TURN_BUDGET, TURN_SETTLEMENT};
+
+/// The fixture startup budget: `startup_timeout` at the default
+/// `startup_timeout_secs`, as tests/support/terminal.rs derives it (two staged
+/// starts, each the configured startup plus a 2 s supervisor handshake; a
+/// staged shutdown of 8 s graceful, 3 s forced reap and 2 s acknowledgment;
+/// then one reply deadline, `OPERATION_TIMEOUT`, plus the 250 + 100 ms frame
+/// allowance). Restated once here because that module is Unix-only and
+/// outside this crate's unit tests.
+fn fixture_startup_budget() -> Duration {
+    let startup = Duration::from_secs(kuru_core::MemoryConfig::default().startup_timeout_secs);
+    (startup + Duration::from_secs(2)) * 2
+        + Duration::from_secs(8 + 3 + 2)
+        + kuru_memory::test_budgets::OPERATION_TIMEOUT
+        + Duration::from_millis(250 + 100)
+}
+
 async fn fixture() -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
     fixture_with_memory(temporary_memory().await).await
 }
@@ -103,7 +122,9 @@ impl CapturingProvider {
     async fn wait_for_request(&self) {
         let notified = self.started.notified();
         if self.requests.lock().unwrap().is_empty() {
-            tokio::time::timeout(Duration::from_secs(10), notified)
+            // The provider request is a step of the submitted turn, inside the
+            // runtime's whole-turn budget.
+            tokio::time::timeout(TURN_BUDGET, notified)
                 .await
                 .expect("provider did not receive the TUI turn");
         }
@@ -615,7 +636,8 @@ impl BlockingProvider {
         if self.started.load(Ordering::SeqCst) > 0 {
             return Ok(());
         }
-        tokio::time::timeout(Duration::from_secs(5), notified)
+        // The provider starts inside the submitted turn, within its budget.
+        tokio::time::timeout(TURN_BUDGET, notified)
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "provider did not start"))?;
         if self.started.load(Ordering::SeqCst) == 0 {
@@ -877,7 +899,9 @@ async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_h
             (result, screen, transcript_text)
         });
 
-        tokio::time::timeout(Duration::from_secs(10), async {
+        // The loop records the notice during its own startup, which has no
+        // separate product budget; the fixture startup budget bounds it.
+        tokio::time::timeout(fixture_startup_budget(), async {
             loop {
                 if MemoryNotice::pending(store.clone())
                     .await
@@ -1036,7 +1060,10 @@ async fn notice_text_never_reaches_the_provider_request_for_a_real_tui_turn() {
         }));
 
         drop(input_tx);
-        let error = tokio::time::timeout(Duration::from_secs(10), loop_task)
+        // Input closure cancels the turn, which settles within the runtime's
+        // post-cancel allowance; the store is Local (`MemoryStore::open`), whose
+        // shutdown reconciles make no statement, so no reply deadline is added.
+        let error = tokio::time::timeout(TURN_SETTLEMENT, loop_task)
             .await
             .expect("TUI loop did not clean up after input closure")
             .expect("TUI loop task panicked")
@@ -1057,7 +1084,11 @@ async fn real_loop_eof_read_and_draw_failures_abort_the_owned_provider_before_re
             let provider = BlockingProvider::new();
             let (_directory, harness) = blocking_fixture(provider.clone()).await;
             let input = controlled_input(provider.clone(), failure);
-            let error = tokio::time::timeout(Duration::from_secs(15), async {
+            // The turn reaches the provider within its budget (the inner
+            // `wait_started` bound), then the injected failure cancels it and it
+            // settles; the Local store's shutdown reconciles make no statement.
+            // Strictly above `wait_started`'s bound, so that failure reports first.
+            let error = tokio::time::timeout(TURN_BUDGET + TURN_SETTLEMENT, async {
                 match failure {
                     Failure::Eof | Failure::Read => {
                         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();

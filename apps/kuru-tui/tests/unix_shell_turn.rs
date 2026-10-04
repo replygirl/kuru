@@ -29,8 +29,29 @@ use tokio::{
 
 #[path = "support/memory.rs"]
 mod memory;
+#[allow(dead_code, reason = "this suite uses only `startup_timeout`")]
+#[path = "support/terminal.rs"]
+mod terminal;
+#[path = "support/turn_budget.rs"]
+mod turn_budget;
 
-const CLI_TIMEOUT: Duration = Duration::from_secs(45);
+/// Bound for one `kuru run` against the fake provider, and for the waits that
+/// enclose one: the staged memory startup budget (`startup_timeout` at the
+/// default `startup_timeout_secs`, which `configuration_with` writes), then
+/// the runtime's whole-turn budget (`TURN_BUDGET`: `kuru run` calls
+/// `run_local_controlled`, which runs the same `run_controlled_inner` as A2A
+/// ingress), then the shutdown's two Remote reconciles at `OPERATION_TIMEOUT`,
+/// as for `EXIT_TIMEOUT` in tests/terminal.rs. `--no-dream` leaves no exit
+/// dream; this CLI configures no MCP alias or hook, and its shell call leaves
+/// the shell registry when its worker finishes inside the turn, so the tool
+/// host has nothing to join. About 13.6 minutes, under the native test job's
+/// 45-minute timeout.
+fn cli_timeout() -> Duration {
+    terminal::startup_timeout(Duration::from_secs(
+        kuru_core::MemoryConfig::default().startup_timeout_secs,
+    )) + turn_budget::TURN_BUDGET
+        + kuru_memory::test_budgets::OPERATION_TIMEOUT.saturating_mul(2)
+}
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_LIMIT: usize = 128 * 1024;
 const SHELL_MARKER: &str = "SHELL_TURN_RECEIPT";
@@ -349,7 +370,7 @@ async fn run_sandbox_with_capture_limit(
             .enable_all()
             .build()
             .context("create retained CLI fixture runtime")?
-            .block_on(bounded_output(&mut command, CLI_TIMEOUT, capture_limit))
+            .block_on(bounded_output(&mut command, cli_timeout(), capture_limit))
             .context("run bounded kuru CLI fixture")
             .map(|output| CliRun { output, sandbox })
     })
@@ -794,7 +815,7 @@ async fn trace_file(data: &std::path::Path) -> Result<PathBuf> {
 }
 
 async fn wait_for_provider_gate(gate: &Gate, worker: &JoinHandle<Result<CliRun>>) -> Result<()> {
-    let deadline = Instant::now() + CLI_TIMEOUT;
+    let deadline = Instant::now() + cli_timeout();
     while gate.started.load(Ordering::Acquire) == 0 {
         ensure!(
             !worker.is_finished(),
@@ -826,7 +847,7 @@ async fn diagnostic_write_failure_keeps_a_completed_cli_turn_authoritative() -> 
     }
     .await;
     gate.release();
-    let run = timeout(CLI_TIMEOUT, &mut worker)
+    let run = timeout(cli_timeout(), &mut worker)
         .await
         .context("bounded CLI worker did not finish after diagnostic replacement")?
         .context("retained CLI worker panicked")??;

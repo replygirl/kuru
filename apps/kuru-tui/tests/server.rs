@@ -21,14 +21,8 @@ mod memory;
 #[path = "support/terminal.rs"]
 mod terminal;
 
-/// The runtime's A2A ingress budget for one request: a turn may run for 600 s
-/// (`tokio::time::timeout(Duration::from_secs(600), ..)` in kuru-runtime
-/// src/server.rs:190), then cancellation allows 35 s more for accepted memory
-/// work and the answer race to settle (src/server.rs:197). Documented in
-/// docs/protocols.md ("up to 10 minutes", "up to 35 more seconds"). Restated
-/// here because the runtime keeps both values inline. A hung request now
-/// reports after about 635 s, inside the native test job's timeout.
-const A2A_REQUEST_BUDGET: Duration = Duration::from_secs(600 + 35);
+#[path = "support/turn_budget.rs"]
+mod turn_budget;
 
 /// The server's exit after its interrupt: `serve` returns on the signal, then
 /// the CLI runs `harness.shutdown(false)` (src/cli.rs `Command::Serve`). As for
@@ -212,7 +206,11 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
         .context("missing server address")?;
     let base = format!("http://{address}");
     let client = reqwest::Client::builder()
-        .timeout(A2A_REQUEST_BUDGET)
+        // Each request (the card reads, the refused POST and the
+        // `SendMessage` turn) is bounded by the runtime's ingress budget for
+        // one turn; a hung request reports after about 635 s, inside the
+        // native test job's timeout.
+        .timeout(turn_budget::TURN_BUDGET)
         .build()?;
     let card: Value = client
         .get(format!("{base}/.well-known/agent-card.json"))
