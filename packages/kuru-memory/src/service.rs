@@ -2992,6 +2992,16 @@ impl EndpointRecord {
         let bytes = match crate::files::read_bytes_then(&path, HANDSHAKE_LIMIT as u64, between) {
             Ok(bytes) => bytes,
             Err(error) if is_not_found(&error) => return Ok(None),
+            // A private record that replaced the held one before its verify is
+            // a successor owner publishing during handover, which readiness
+            // treats as keep waiting; the next read finds the new record.
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(kuru_platform::fs::is_name_replaced) =>
+            {
+                return Ok(None);
+            }
             // Retirement renames the record away before its object can be
             // marked for deletion, so a read that failed only because it met
             // a retiring owner (on Windows, a held handle that became
@@ -6228,6 +6238,171 @@ mod tests {
                 .is_none(),
             "a discovery read that met retirement returned the retired record"
         );
+    }
+
+    /// An endpoint record published under its owner in a fresh data directory.
+    fn published_endpoint() -> (tempfile::TempDir, String, ServiceLock) {
+        let data = tempfile::tempdir().unwrap();
+        let scope = format!("project/{}", "e".repeat(64));
+        let owner = ServiceLock::try_acquire(data.path(), &scope, ServiceLockKind::Owner)
+            .unwrap()
+            .unwrap();
+        let mut record = EndpointRecord {
+            authority: authority(),
+            address: "socket-retiring".into(),
+        };
+        record.authority.project_scope = scope.clone();
+        record.publish(data.path(), &owner).unwrap();
+        (data, scope, owner)
+    }
+
+    /// Move the held record off its discovery name to the retirement stage,
+    /// as a retiring owner does, keeping its object linked there.
+    fn stage_held_record(data: &Path, scope: &str) -> Result<()> {
+        let record = EndpointRecord::path(data, scope)?;
+        std::fs::rename(&record, record.with_file_name(RETIRED_ENDPOINT))?;
+        Ok(())
+    }
+
+    /// The error of a discovery read that must still refuse what it found:
+    /// the original denial, not a replaced name and not a missing record.
+    fn refused_discovery(read: Result<Option<EndpointRecord>>) -> anyhow::Error {
+        let error = match read {
+            Ok(found) => panic!(
+                "a refused record was read as {}",
+                if found.is_some() {
+                    "a record"
+                } else {
+                    "no record"
+                }
+            ),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "read private memory service endpoint",
+            "{error:#}"
+        );
+        let denial = error
+            .downcast_ref::<io::Error>()
+            .unwrap_or_else(|| panic!("the refusal lost its filesystem error: {error:#}"));
+        assert_eq!(denial.kind(), io::ErrorKind::PermissionDenied, "{error:#}");
+        assert!(
+            !kuru_platform::fs::is_name_replaced(denial),
+            "a refused replacement was typed as a replaced name: {error:#}"
+        );
+        error
+    }
+
+    /// A discovery read whose held record a retiring owner stages, and a
+    /// successor replaces with its own private record before the read
+    /// verifies the name, finds no record; the next read finds the successor.
+    #[test]
+    fn a_read_that_meets_a_successor_record_finds_none_then_the_successor() {
+        let _gate = crate::spawn_gate::locking();
+        let (data, scope, owner) = published_endpoint();
+        let mut successor = EndpointRecord {
+            authority: authority(),
+            address: "socket-successor".into(),
+        };
+        successor.authority.project_scope = scope.clone();
+        successor.authority.service_generation = "successor-generation".into();
+
+        let mut replaced = None;
+        let read = EndpointRecord::read_then(data.path(), &scope, || {
+            replaced = Some(
+                stage_held_record(data.path(), &scope)
+                    .and_then(|()| successor.publish(data.path(), &owner)),
+            );
+        });
+
+        replaced
+            .expect("the hook ran between reading and verifying the record")
+            .expect("the successor failed to publish while a discovery read held the record");
+        let read = match read {
+            Ok(read) => read,
+            Err(error) => panic!("a discovery read failed on a successor's record: {error:#}"),
+        };
+        assert!(
+            read.is_none(),
+            "a discovery read that met a successor returned the replaced record"
+        );
+        let next = EndpointRecord::read(data.path(), &scope)
+            .unwrap()
+            .expect("the next discovery read found no successor record");
+        assert_eq!(next.address, successor.address);
+        assert_eq!(
+            next.authority.service_generation,
+            successor.authority.service_generation
+        );
+    }
+
+    /// A replacement that is not a regular file is still refused by the
+    /// checked read of the name, not taken for a successor's record.
+    #[test]
+    fn a_read_that_meets_a_non_regular_replacement_is_refused() {
+        let _gate = crate::spawn_gate::locking();
+        let (data, scope, _owner) = published_endpoint();
+        let path = EndpointRecord::path(data.path(), &scope).unwrap();
+
+        let mut replaced = None;
+        let read = EndpointRecord::read_then(data.path(), &scope, || {
+            replaced = Some(
+                stage_held_record(data.path(), &scope)
+                    .and_then(|()| Ok(std::fs::create_dir(&path)?)),
+            );
+        });
+
+        replaced
+            .expect("the hook ran between reading and verifying the record")
+            .expect("a directory did not replace the held record");
+        refused_discovery(read);
+    }
+
+    /// A replacement that is not private, and the held record itself losing
+    /// its privacy, are still refused by the checked read of the name. The
+    /// non-private object uses Unix modes, as the other memory privacy
+    /// fixtures do.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_that_meets_a_privacy_denial_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _gate = crate::spawn_gate::locking();
+        let shared = std::fs::Permissions::from_mode(0o644);
+        let (data, scope, owner) = published_endpoint();
+        let path = EndpointRecord::path(data.path(), &scope).unwrap();
+        let mut successor = EndpointRecord {
+            authority: authority(),
+            address: "socket-successor".into(),
+        };
+        successor.authority.project_scope = scope.clone();
+
+        let mut replaced = None;
+        let read = EndpointRecord::read_then(data.path(), &scope, || {
+            replaced = Some(
+                stage_held_record(data.path(), &scope)
+                    .and_then(|()| successor.publish(data.path(), &owner))
+                    .and_then(|()| Ok(std::fs::set_permissions(&path, shared.clone())?)),
+            );
+        });
+        replaced
+            .expect("the hook ran between reading and verifying the record")
+            .expect("a non-private record did not replace the held record");
+        let error = refused_discovery(read);
+        assert!(format!("{error:#}").contains("private object"), "{error:#}");
+
+        let (data, scope, _owner) = published_endpoint();
+        let path = EndpointRecord::path(data.path(), &scope).unwrap();
+        let mut widened = None;
+        let read = EndpointRecord::read_then(data.path(), &scope, || {
+            widened = Some(std::fs::set_permissions(&path, shared.clone()));
+        });
+        widened
+            .expect("the hook ran between reading and verifying the record")
+            .expect("the held record's mode did not change");
+        let error = refused_discovery(read);
+        assert!(format!("{error:#}").contains("private object"), "{error:#}");
     }
 
     #[tokio::test]
