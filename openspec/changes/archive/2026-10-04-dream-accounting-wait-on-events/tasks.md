@@ -99,6 +99,18 @@
   each exited 0. `mise run cospec -- validate dream-accounting-wait-on-events
   --strict` exited 0 and `apply --json` returned gate `clear`. Local runs do
   not reproduce the loaded Windows coverage runner.
-- [ ] 2.3 After the PR's CI run, record whether the windows-latest runs of this
+- [x] 2.3 After the PR's CI run, record whether the windows-latest runs of this
   test passed, naming run and job ids; name unrun checks and reasons.
   Evidence to collect: CI run and job ids.
+  Evidence (PR #218, CI run 37190863573, attempt 1, head 68c38b1c): the run
+  succeeded with 62 jobs succeeded, 4 skipped and 0 failed. The log line
+  `accounting_tests::abandoned_dream_keeps_usage_after_reopen_without_advancing_main
+  ... ok` appears on ubuntu-latest (coverage partition 6), macos-latest
+  (coverage partition 2), windows-latest (coverage partition 6) and
+  windows-11-arm (behavior partition 6). It did not run on ubuntu-24.04-arm,
+  which runs only the memory partitions. Coverage: ubuntu-latest 94.80%,
+  macos-latest 94.79%, windows-latest 93.90%, all above the 90% gate. The
+  per-job detail is recorded in the untracked roadmap notes
+  (`tmp/roadmap/families-reconciliation-2026-10-sources/pr218-ci.md`); job ids
+  are not restated here. Independent review: ACCEPT on 4d4dfdab (pre-PR), its
+  should-fixes applied in 68c38b1c and posted on PR #218.
