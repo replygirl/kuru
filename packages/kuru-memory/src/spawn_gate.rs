@@ -486,10 +486,18 @@ mod tests {
                     drop(exclusive);
                 });
         });
-        let early =
-            tokio::time::timeout(std::time::Duration::from_millis(200), &mut acquired_seen).await;
+        // Wait, without a window, until the taker holds the write lock: it
+        // then waits only for the creation this test holds. The write lock
+        // is uncontended, so only a taker that ended early stops it.
+        while GATE.lock.try_read().is_ok() {
+            assert!(!taker.is_finished(), "the lock taker ended before queuing");
+            tokio::task::yield_now().await;
+        }
         assert!(
-            early.is_err(),
+            matches!(
+                acquired_seen.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
             "the lock taker overlapped a child creation in flight"
         );
         drop(creation);
