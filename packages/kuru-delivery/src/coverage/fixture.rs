@@ -394,6 +394,7 @@ impl Launcher for ScriptedLauncher {
                 cleanup: "Ok(())".to_owned(),
                 presence_after_reap: None,
                 output: "complete".to_owned(),
+                wait: "scripted wait timed out".to_owned(),
             })));
         }
         let selected = launch.args.len() as isize - 1;

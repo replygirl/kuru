@@ -166,13 +166,16 @@ The partition runner stops test executables at a deadline derived from the job's
 `timeout-minutes`, less a fixed evidence reserve, and checks it before every
 invocation. Every bounded wait before the tests derives from that one deadline:
 the toolchain and source probes, `cargo-llvm-cov show-env`, each executable's
-`--list` run, and the settle of an exited test process group all end on their
-own event or at the deadline, never at a shorter fixed bound. Compilation is not
+`--list` run, and the settle and output drain of an exited test executable all
+end on their own event or at the deadline, never at a shorter fixed bound. No
+product process inherits a test's output, so an exited executable whose output
+is still open at the deadline fails the partition as a stall recording that a
+process outside the owned tree holds it. Compilation is not
 under that deadline: only the hosted job limit bounds it, without evidence. The
 receipt's identity probes follow the tests and their exports, so they end by the
 job limit less one slice of the reserve. The reserve is split into four equal
 slices: a stopped test tree's three cleanup waits (the group signal, the reap
-and absence confirmation, and the output drain) take one each, and the last is
+and absence confirmation, and its output drain) take one each, and the last is
 left for the failure record and the diagnostics upload. A test executable still
 running at the deadline is
 terminated through its owned Job on Windows or its owned process group on Unix,

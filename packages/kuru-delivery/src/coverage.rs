@@ -61,9 +61,9 @@ const RESERVE_SLICES: u64 = 4;
 /// evidence reserve, 600 s / 4 = 150 s, so the three cleanup waits of a stall
 /// end at most 450 s after the shard deadline and leave the evidence step its
 /// 150 s inside the job limit. Expiry is recorded in the stall or interrupt
-/// evidence; the partition is already failing. A test process's settle after
-/// an ordinary exit is not bounded by it: that settle is part of the wait
-/// that carries the shard deadline.
+/// evidence; the partition is already failing. A test process's settle and
+/// output drain after an ordinary exit are not bounded by it: both are part of
+/// the executable's wait, which carries the shard deadline.
 const RUNNER_CLEANUP_TIMEOUT: Duration =
     Duration::from_secs(EVIDENCE_RESERVE.as_secs() / RESERVE_SLICES);
 const TEST_LOG_LIMIT: u64 = 32 * 1024 * 1024;
@@ -1091,6 +1091,9 @@ struct StallEvidence {
     cleanup: String,
     presence_after_reap: Option<String>,
     output: String,
+    /// Why the executable's wait ended at the deadline, for the partition's
+    /// error only: [`StallReport`]'s schema is pinned and gains no field.
+    wait: String,
 }
 
 enum Supervision {
@@ -1302,6 +1305,15 @@ where
 /// At the deadline, sample, terminate and await bounded cleanup, then return the
 /// observed progress. Output draining is bounded in both outcomes: a process
 /// outside the owned tree may still hold the pipe after the tree is quiescent.
+///
+/// After an ordinary exit the drain is the rest of the executable's own wait,
+/// so it takes the time left before the shard deadline, like the settle before
+/// it. The owned tree is then confirmed gone, and no product process inherits a
+/// test's stdout (kuru-memory starts its owner with stdout null on both
+/// platforms and its supervisor with a private pipe), so the pipe stays open
+/// only for a process that leaked it. Still open at the deadline, the
+/// executable is reported as a stall naming that holder. After a stopped tree
+/// the drain takes one cleanup slice ([`RUNNER_CLEANUP_TIMEOUT`]).
 async fn supervise<P, R, W>(
     process: &mut P,
     output: R,
@@ -1317,7 +1329,7 @@ where
 {
     let deadline = tokio::time::Instant::now() + remaining;
     let mut progress = LibtestProgress::default();
-    let (waited, sample, termination, cleanup, presence_after_reap, output) = {
+    let (waited, sample, termination, cleanup, presence_after_reap, output, drained) = {
         let mut relay = std::pin::pin!(relay_output(output, relay, &log, &mut progress));
         let mut relayed = None;
         let waited = loop {
@@ -1336,12 +1348,25 @@ where
         } else {
             (None, String::new(), String::new(), None)
         };
-        let output = match relayed {
-            Some(outcome) => outcome,
-            None => match tokio::time::timeout(cleanup_bound, &mut relay).await {
-                Ok(outcome) => outcome,
-                Err(_) => format!(
-                    "stopped after {cleanup_bound:?}: a process outside the owned tree still holds the output"
+        let (output, drained) = match relayed {
+            Some(outcome) => (outcome, true),
+            None if waited.is_err() => {
+                match tokio::time::timeout(cleanup_bound, &mut relay).await {
+                    Ok(outcome) => (outcome, true),
+                    Err(_) => (
+                        format!(
+                            "stopped after {cleanup_bound:?}: a process outside the owned tree still holds the output"
+                        ),
+                        false,
+                    ),
+                }
+            }
+            None => match tokio::time::timeout_at(deadline, &mut relay).await {
+                Ok(outcome) => (outcome, true),
+                Err(_) => (
+                    "stopped at the shard deadline: a process outside the owned tree still holds the output"
+                        .to_owned(),
+                    false,
                 ),
             },
         };
@@ -1352,15 +1377,27 @@ where
             cleanup,
             presence_after_reap,
             output,
+            drained,
         )
     };
     match waited {
-        Ok(status) => {
+        Ok(status) if drained => {
             if output != "complete" {
                 eprintln!("coverage runner output relay: {output}");
             }
             Ok(Supervision::Exited(status, progress.announced))
         }
+        // The tree exited and settled, so nothing is left to terminate; the
+        // root's observation and the confirmed absence are the evidence.
+        Ok(status) => Ok(Supervision::Stalled(Box::new(StallEvidence {
+            progress,
+            sample: process.sample(),
+            termination: String::new(),
+            cleanup: String::new(),
+            presence_after_reap: process.presence_after_reap(),
+            output,
+            wait: format!("the test process exited ({status}) but its output stayed open"),
+        }))),
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
             Ok(Supervision::Stalled(Box::new(StallEvidence {
                 progress,
@@ -1369,6 +1406,7 @@ where
                 cleanup,
                 presence_after_reap,
                 output,
+                wait: error.to_string(),
             })))
         }
         Err(error) => bail!(
@@ -1817,11 +1855,12 @@ async fn dispatch_with<L: Launcher>(
             Supervision::Stalled(evidence) => {
                 record.invocations.push(invocation);
                 finish_record(&mut record, ledger, target_dir)?;
+                let wait = evidence.wait.clone();
                 let report = stall_report(artifact, &executable, *deadline, evidence, &log)?;
                 let path = diagnostics.join(format!("{label}.stall.json"));
                 write_json(&path, &report)?;
                 bail!(
-                    "coverage partition deadline reached while {executable} was running; unfinished tests: {:?}; latest results: {:?}; evidence: {}",
+                    "coverage partition deadline reached while waiting for {executable}: {wait}; unfinished tests: {:?}; latest results: {:?}; evidence: {}",
                     report.unfinished_tests,
                     report.recent_results.last(),
                     path.display()
@@ -1869,6 +1908,7 @@ fn stall_report(
         cleanup,
         presence_after_reap,
         output,
+        wait: _,
     } = *evidence;
     Ok(StallReport {
         schema: SCHEMA,
@@ -3137,6 +3177,60 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn an_exited_tree_whose_output_stays_open_stalls_at_the_shard_deadline() {
+        use tokio::io::AsyncWriteExt;
+
+        let temp = TempDir::new().unwrap();
+        let log = temp.path().join("held.stdout.log");
+        // The tree exits at once, but the writer stays open, as when a process
+        // outside the owned tree leaked the pipe.
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        writer
+            .write_all(b"running 1 test\ntest one ... ok\n")
+            .await
+            .unwrap();
+        let mut process = FakeProcess {
+            exit_after: Some(Duration::ZERO),
+            terminated: false,
+            terminate_result: true,
+        };
+        let started = tokio::time::Instant::now();
+        let supervision = supervise(
+            &mut process,
+            reader,
+            tokio::io::sink(),
+            log.clone(),
+            FAKE_DEADLINE,
+            FAKE_CLEANUP,
+        )
+        .await
+        .unwrap();
+        // The drain takes the shard deadline, not a cleanup slice after it.
+        assert_eq!(started.elapsed(), FAKE_DEADLINE);
+        assert!(!process.terminated, "an exited tree was terminated");
+        let Supervision::Stalled(evidence) = supervision else {
+            panic!("a held output pipe was reported as an ordinary exit");
+        };
+        assert!(evidence.progress.unfinished().is_empty());
+        assert_eq!(evidence.progress.recent, ["test one ... ok"]);
+        assert_eq!(
+            evidence.output,
+            "stopped at the shard deadline: a process outside the owned tree still holds the output"
+        );
+        assert!(
+            evidence.wait.starts_with("the test process exited ("),
+            "{}",
+            evidence.wait
+        );
+        assert_eq!(evidence.termination, "");
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            "running 1 test\ntest one ... ok\n"
+        );
+        drop(writer);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn supervision_terminates_a_stalled_tree_at_the_deadline_with_evidence() {
         use tokio::io::AsyncWriteExt;
 
@@ -3254,9 +3348,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let log = temp.path().join("exit.stdout.log");
         let (relay, mut relayed) = tokio::io::duplex(4096);
-        let started = std::time::Instant::now();
         // The background member stays in the root's group and holds its stdout.
-        // Only the post-exit group signal lets the relay reach end of file.
+        // Only the post-exit group signal lets the relay reach end of file; a
+        // drain still open at the deadline is reported as a stall instead.
         let supervision = supervise_group(
             group_command("tail -f /dev/null & printf 'test one ... ok\\n'; exit 3"),
             GROUP_STDIO,
@@ -3269,13 +3363,9 @@ mod tests {
         .await
         .unwrap();
         let Supervision::Exited(status, _) = supervision else {
-            panic!("an exiting root was reported as stalled");
+            panic!("the relay waited for the group member instead of signalling it");
         };
         assert_eq!(status.code(), Some(3), "{status:?}");
-        assert!(
-            started.elapsed() < GROUP_BOUND,
-            "the relay waited for the group member instead of signalling it"
-        );
         let mut copied = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut relayed, &mut copied)
             .await

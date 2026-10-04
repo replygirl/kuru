@@ -379,7 +379,7 @@ impl Host for System {
     async fn capture(&mut self, invocation: &Invocation, deadline: u64) -> Result<String> {
         let Some(remaining) = remaining_until(deadline)? else {
             bail!(
-                "coverage partition deadline {deadline} passed before running {}",
+                "coverage deadline {deadline} passed before running {}",
                 invocation.describe()
             );
         };
