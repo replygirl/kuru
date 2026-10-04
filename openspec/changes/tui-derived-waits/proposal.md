@@ -58,60 +58,73 @@ no line in 174-210.
 
 ## What Changes
 
-- `tests/support/terminal.rs` derives `READY_TIMEOUT` once, at its definition, from
-  `kuru_memory::service::OPERATION_TIMEOUT` plus a frame allowance, with the
-  derivation in a comment there. `startup_timeout()` (which adds `READY_TIMEOUT`)
-  therefore grows by the same amount, and so do `trust.rs`'s uses through the shared
-  module. This is the intended effect of one definition, not a widening, and
-  `startup_timeout_secs` itself does not change.
-- `tests/terminal.rs` derives `EXIT_TIMEOUT` once, at its definition, from the
-  `/quit` shutdown path, with its figures shared with `startup_timeout()` rather
-  than restated a third time.
-- `wait_exit` ends its drain on reader EOF/EIO under a derived cleanup budget instead
-  of a flat 1 s; the same constant may serve `LATE_OUTPUT_WINDOW`.
-- `tests/support/windows_terminal.rs` derives `READY` the same way, and its dependents
-  follow. It is linted for the Windows target only; it runs natively in CI.
-- Product values that are not public (`IO_TIMEOUT`, the runtime's inline 600 s A2A
-  request budget, `QUERY_TIMEOUT`) are restated at one test constant each, citing the
-  defining file and line and the docs page that documents it. No visibility changes in
-  kuru-connectors or kuru-runtime.
-- The CLI, server, `unix_shell_turn` and `runtime_tests` waits take their bounds from
-  those constants, each with its derivation at the site or in the constant's comment.
-- Thin windows (t1#43, t1#44, t2#9, t2#32, t2#33) end on an observable event where a
-  few lines of test support allow it; otherwise the site is recorded as deferred in
-  `tasks.md` with a code-backed reason.
-- The one kuru-memory commit that makes `OPERATION_TIMEOUT` public under
-  `test-support` is cherry-picked from PR 1 (`test/memory-derived-waits`) until that PR
-  merges; see `blocking-changes.md`.
+- `tests/support/terminal.rs` derives `READY_TIMEOUT` once, at its definition, as
+  `kuru_memory::test_budgets::OPERATION_TIMEOUT` plus `FRAME_ALLOWANCE` (the idle
+  ambient interval, 250 ms, plus the idle animation wake, 100 ms), with the derivation
+  in a comment there and a const assertion that it stays above `OPERATION_TIMEOUT`.
+  `startup_timeout()` (which adds `READY_TIMEOUT`) grows by the same amount, and so do
+  `trust.rs`'s uses through the shared module. This is the intended effect of one
+  definition, not a widening, and `startup_timeout_secs` itself does not change. The
+  same module restates the connectors' `IO_TIMEOUT` (60 s) once.
+- `tests/terminal.rs` derives `EXIT_TIMEOUT` once, at its definition, from the `/quit`
+  shutdown path: two Remote reconciles at `OPERATION_TIMEOUT`, the tool host's MCP join
+  at `IO_TIMEOUT`, and one `FRAME_ALLOWANCE`. The child's `memory.close()` on Remote only
+  drains its attachments, so the owner's `close_budget()` is not on this path and no
+  owner-close term is added.
+- `wait_exit`'s 1 s post-exit drain is not changed: no descendant of the PTY child
+  inherits the slave, so no product budget sits inside the drain. A comment there now
+  says so.
+- `tests/support/windows_terminal.rs` derives `READY` with the same expression, and its
+  dependents follow. It is linted for the Windows target only; it runs natively in CI.
+- The CLI and server waits take their bounds from the restated `IO_TIMEOUT`, the staged
+  memory startup budget, the runtime's inline A2A request budget (600 s plus 35 s,
+  restated once in `server.rs`) and two Remote reconciles, each with its derivation at
+  the site or in the constant's comment.
+- The animated halves of the thin windows (t1#43, t2#32) end on the observed repaint
+  under the frame-wait bound. The absence windows (t1#43 reduced, t1#44, t2#33) and the
+  fork race (t2#9) are deferred: no product event falls due inside them for a barrier to
+  be ordered after, and t2#9's helper has no seam for a later deadline.
+- The turn-path waits (`unix_shell_turn.rs` `CLI_TIMEOUT`, t2#16; `runtime_tests.rs`
+  t2#78, t2#79, t2#80, t2#82, t2#83) are deferred. Their enclosed product work is one
+  turn's (or one `kuru run`'s) memory sequence: measured at about 150 statement budgets
+  before the first provider request, and about 130 Remote calls per `kuru run`. A strict
+  count-times-budget bound exceeds the 45-minute native test job timeout, so it could
+  never report, and a progress-gap wait needs a test-support seam in `kuru-memory`.
+  `tasks.md` records the measurements and a candidate derivation for the orchestrator.
+- The one kuru-memory commit that adds `kuru_memory::test_budgets` under `test-support`
+  is cherry-picked from PR 1 (`test/memory-derived-waits`) until that PR merges; see
+  `blocking-changes.md`.
 
 ## What Does Not Change
 
-- No product code. `apps/kuru-tui/src` changes only inside `#[cfg(test)]`
-  `src/ui/runtime_tests.rs`. No change to `startup_timeout_secs`, no retry, and no
-  weakening of isolation, ownership, recovery or the uncertain-write fence.
-- Remainder rows stay as they are unless they sit on a line already being edited.
-  Known ones, recorded so they are not mistaken for oversights: `runtime_tests.rs:884`
-  (the same `timeout(10 s, loop_task)` shape as :1011), `terminal.rs:2637` (the 4100 ms
-  read before the window), `support/terminal.rs:662` (`Drop`'s 1 s `close`), the Windows
-  `EXIT` (30 s) and `windows_terminal.rs:162-163` (the Windows `startup`
-  arithmetic), `server.rs:155` (the Windows twin's 80 s) and `server.rs:175`.
-- No new helper unless it replaces three or more sites. No literal without a stated
-  derivation. No visibility change in `kuru-memory` beyond PR 1's one commit.
+- No product code. `apps/kuru-tui/src` is not edited. No change to
+  `startup_timeout_secs`, no retry, and no weakening of isolation, ownership, recovery
+  or the uncertain-write fence.
+- Remainder rows stay as they are. Known ones, recorded so they are not mistaken for
+  oversights: `runtime_tests.rs:884` (the same `timeout(10 s, loop_task)` shape as
+  :1011), `terminal.rs:2637` (the 4100 ms read before the window),
+  `support/terminal.rs` `Drop`'s 1 s `close`, the Windows `EXIT` (30 s, now below both
+  `READY` and the two Remote reconciles its Ctrl-C exit encloses) and
+  `windows_terminal.rs:162-163` (the Windows `startup` arithmetic), `server.rs:155` (the
+  Windows twin's 80 s) and `server.rs:175`, and `cli.rs:791,797` (the 5 s loopback
+  forwarder).
+- No new helper. No literal without a stated derivation. No visibility change in
+  `kuru-memory` beyond PR 1's one commit.
 - The assertions after each wait are byte-identical.
 
 ## Impact
 
-- Files (the nine owned by the site list): `apps/kuru-tui/src/ui/runtime_tests.rs`,
-  `tests/cli.rs`, `tests/embedded_runtime.rs`, `tests/server.rs`,
-  `tests/support/terminal.rs`, `tests/support/windows_terminal.rs`,
-  `tests/terminal.rs`, `tests/unix_shell_turn.rs`, `tests/windows_terminal.rs`; this
-  change's openspec directory; and PR 1's one cherry-picked commit.
-- A hung test now reports after its derived bound, several times longer than before
-  (from 35 s to several minutes, set per site, instead of 5 to 45 s), bounded in CI by
-  the existing native job `timeout-minutes`. Passing runs take the same time.
-- `server.rs` and `unix_shell_turn.rs` may include `support/terminal.rs` under
-  `#[cfg(unix)]` (with `#[allow(dead_code)]`, as `trust.rs` does) to reach the shared
-  constants; that is a test-module include, not a new helper.
+- Files: `tests/cli.rs`, `tests/server.rs`, `tests/support/terminal.rs`,
+  `tests/support/windows_terminal.rs`, `tests/terminal.rs` and `tests/windows_terminal.rs`
+  under `apps/kuru-tui`; this change's openspec directory; and PR 1's one cherry-picked
+  commit. `src/ui/runtime_tests.rs`, `tests/embedded_runtime.rs` and
+  `tests/unix_shell_turn.rs` are not edited (their sites are deferred).
+- A hung test now reports after its derived bound instead of 5 to 15 s: about 35 s for a
+  frame wait, about 130 s for an exit after `/quit`, up to about 635 s for one A2A
+  request. Passing runs take the same time.
+- `server.rs` includes `support/terminal.rs` under `#[cfg(unix)]` (with
+  `#[allow(dead_code)]`, as `trust.rs` does) to reach `startup_timeout`; that is a
+  test-module include, not a new helper.
 - Windows-only files cannot run here. They must pass `mise run
   //apps/kuru-tui:lint:windows`, and run natively in PR CI only.
 - Test only; no runtime, documentation or dependency change.
