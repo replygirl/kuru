@@ -23,21 +23,53 @@ reports a replaced name as `io::ErrorKind::PermissionDenied`, the same kind as
 the privacy and identity denials, so a reader cannot tell a replaced name from a
 privacy defect.
 
+Independent review of PR #209 (head 124012e7) found that on Windows, for a
+successor publishing directly over the held record, the typed outcome covers
+only a publication landing inside `verify`, between its held check and its
+reopen of the name. A publication landing earlier, after the
+reader's byte read and before `verify`'s held check, leaves the held object
+delete-pending with no link; `verify`'s strict held check refused that as an
+untyped `PermissionDenied` ("pending deletion"), where Unix reports the same
+state as `NotFound` ("regular file was unlinked"), which `read_then` already
+reads as a miss. The attach could therefore still fail on Windows (inferred
+from code; not observed natively).
+
 ## What Changes
 
 - `Directory::verify` reports a replaced name as a typed outcome distinct from
   every denial. Existing callers that propagate the error with `?` observe the
   same kind and message as before.
-- The typed outcome is carried through `files::read_held_then`.
-- `EndpointRecord::read_then` maps only that outcome to `Ok(None)`, a miss, so
-  the existing readiness poll re-reads under its existing budget and the next
-  read returns the successor's record. A replacement that is not private, any
-  privacy denial and every other error keep failing as today.
-- One sentence in the documentation states that a record replaced during a read
-  is a miss that the next poll re-reads.
+- `Directory::verify` inspects its held handle through the platform's retained
+  inspection (`retained_file_info`) instead of the strict one. On Windows a POSIX
+  replacement of the name leaves the held object delete-pending with no link;
+  the strict inspection refused that as an untyped `PermissionDenied` ("pending
+  deletion"), so a successor publishing between the reader's byte read and
+  `verify`'s held check still failed the attach. It now reports `NotFound`
+  "regular file was unlinked", exactly as Unix already does for the same state.
+  A delete-pending object that still has a link stays refused. Unix behaviour is
+  unchanged (its retained inspection is its strict one).
+- `files::read_held_then` is unchanged: its `?` keeps the `io::Error`, typed
+  source included, at the root of the `anyhow::Error`.
+- `EndpointRecord::read_then` maps the typed outcome to `Ok(None)`, a miss, and
+  its existing `NotFound` arm now covers the unlinked held record on Windows as
+  on Unix, so the existing readiness poll re-reads under its existing budget and
+  the next read returns the successor's record. A replacement that is not a
+  private regular file, any privacy denial and every other error keep failing as
+  today.
+- The documentation states that a record replaced between a read and its verify
+  is a miss on both platforms (`docs/memory.md`), and the activity-record
+  sentence in `docs/development.md` now says the held-handle check reports an
+  unlinked record on Windows as on Unix.
 
-No retry loop, wait, literal, budget or privacy check is added or changed, and
-no other `verify` caller changes behaviour.
+No retry loop, wait, literal, budget or privacy check is added or changed.
+
+One caller-visible change is accepted by the lead: every other
+`Directory::verify` caller on Windows now sees `NotFound` "regular file was
+unlinked" instead of `PermissionDenied` "filesystem object is pending deletion
+or has an invalid size" for a held file left delete-pending with no link, the
+state a POSIX replacement of its name produces, matching what Unix callers
+already see for an unlinked held file. The callers that branch on `NotFound`
+are listed in `design.md`.
 
 ## Capabilities
 
@@ -52,13 +84,16 @@ design. No delta spec is needed.
 
 ## Impact
 
-- `packages/kuru-platform/src/fs.rs` (`Directory::verify`, replaced-name outcome
-  and unit test)
-- `packages/kuru-memory/src/files.rs` (`read_held_then`)
+- `packages/kuru-platform/src/fs.rs` (`Directory::verify`: replaced-name outcome
+  and retained held-handle inspection; unit tests)
 - `packages/kuru-memory/src/service.rs` (`EndpointRecord::read_then` and tests)
-- One sentence in `docs/memory.md` beside the retiring-service wait paragraph.
-- No dependency, protocol, configuration or public API change; other `verify`
-  callers in kuru-connectors and kuru-memory are unchanged.
+- `packages/kuru-memory/src/files.rs` unchanged; `fs/windows.rs` and
+  `fs/unix.rs` unchanged (the existing `retained_file_info` is reused).
+- `docs/memory.md` beside the retiring-service wait paragraph, and the
+  activity-record sentence in `docs/development.md`.
+- No dependency, protocol or configuration change. The public API change is
+  additive: `kuru_platform::fs::is_name_replaced`. Other `verify` callers keep
+  their kind and message, except the accepted Windows `NotFound` parity above.
 
 ## Surfaces
 

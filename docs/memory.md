@@ -236,7 +236,10 @@ retiring service is not an error in itself. If the shutdown outlasts the timeout
 service was still shutting down. If a successor's record replaces the endpoint
 record after a command reads it and before the command verifies it, the command
 treats the endpoint as not yet published and keeps waiting as it does for any
-unpublished endpoint; a replacement that is not private is still refused.
+unpublished endpoint; a replacement that is not a private regular file is still
+refused. On Windows as on Unix, a held record that the replacement unlinks
+reads as unlinked rather than as an access denial, so a command whose held
+record was replaced reads it as not yet published on both platforms.
 
 A writable session keeps at least one attachment across a cancelled or failed
 memory call. Kuru does not resend the request; the reply is still recovered from

@@ -2991,10 +2991,14 @@ impl EndpointRecord {
         let path = Self::path(data_dir, scope)?;
         let bytes = match crate::files::read_bytes_then(&path, HANDSHAKE_LIMIT as u64, between) {
             Ok(bytes) => bytes,
+            // An absent name is not yet published. So is a held record that a
+            // successor's publication over the name unlinked before its verify,
+            // which reads as unlinked on Windows as on Unix.
             Err(error) if is_not_found(&error) => return Ok(None),
-            // A private record that replaced the held one before its verify is
-            // a successor owner publishing during handover, which readiness
-            // treats as keep waiting; the next read finds the new record.
+            // A private record that replaced the held one, still linked, before
+            // its verify is a successor owner publishing during handover, which
+            // readiness treats as keep waiting: the next readiness read, or for
+            // maintenance the next request, finds the new record.
             Err(error)
                 if error
                     .downcast_ref::<io::Error>()
@@ -6322,6 +6326,50 @@ mod tests {
         let read = match read {
             Ok(read) => read,
             Err(error) => panic!("a discovery read failed on a successor's record: {error:#}"),
+        };
+        assert!(
+            read.is_none(),
+            "a discovery read that met a successor returned the replaced record"
+        );
+        let next = EndpointRecord::read(data.path(), &scope)
+            .unwrap()
+            .expect("the next discovery read found no successor record");
+        assert_eq!(next.address, successor.address);
+        assert_eq!(
+            next.authority.service_generation,
+            successor.authority.service_generation
+        );
+    }
+
+    /// A discovery read whose held record a successor's publication replaces
+    /// in place, with no retirement staging it aside, before the read
+    /// verifies the name finds no record on every platform: the held object
+    /// is unlinked (on Windows, left delete-pending with no link). The next
+    /// read finds the successor.
+    #[test]
+    fn a_read_that_meets_a_successor_published_over_it_finds_none_then_the_successor() {
+        let _gate = crate::spawn_gate::locking();
+        let (data, scope, owner) = published_endpoint();
+        let mut successor = EndpointRecord {
+            authority: authority(),
+            address: "socket-successor".into(),
+        };
+        successor.authority.project_scope = scope.clone();
+        successor.authority.service_generation = "successor-generation".into();
+
+        let mut replaced = None;
+        let read = EndpointRecord::read_then(data.path(), &scope, || {
+            replaced = Some(successor.publish(data.path(), &owner));
+        });
+
+        replaced
+            .expect("the hook ran between reading and verifying the record")
+            .expect("the successor failed to publish over a record a discovery read held");
+        let read = match read {
+            Ok(read) => read,
+            Err(error) => {
+                panic!("a discovery read failed on a successor published over it: {error:#}")
+            }
         };
         assert!(
             read.is_none(),

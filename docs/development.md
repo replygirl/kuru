@@ -764,11 +764,12 @@ window; a record it read that is gone, or one marked failing, ends the wait at
 once (see [configuration](configuration.md)). Gone means that the lookup of the
 record's name, or of its directory, found nothing (`files::is_missing_name`). A
 record replaced over its name after the client opened it fails the platform's
-handle check as unlinked, with no OS error code (Unix), or as delete-pending
-(Windows); either way it is not a missing name, that read decides nothing and
-the next poll's lookup does. Beyond extending or ending its own
-starter's readiness wait, the record grants no authority: election,
-attachment, recovery and retirement never read it, and a failed write never
+handle check as unlinked, with no OS error code, on Unix and on Windows (where
+the replaced object is left delete-pending with no link); it is not a missing
+name, that read decides nothing and the next poll's lookup does. Beyond
+extending or ending its own starter's readiness wait, the record grants no
+authority: election, attachment, recovery and retirement never read it, and a
+failed write never
 fails or delays the open. The owner always replaces it by publishing a complete
 staged record over its name, and retires it (rename, then remove) inside its
 close, after the endpoint is retired and before the store closes (after it,

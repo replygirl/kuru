@@ -422,7 +422,11 @@ pub fn make_executable(file: &File) -> io::Result<()> {
 }
 
 fn checked_file(file: &File) -> io::Result<FileInfo> {
-    let info = regular_file_info(file)?;
+    single_link(regular_file_info(file)?)
+}
+
+/// An unlinked regular file is not found; one with another hardlink is denied.
+fn single_link(info: FileInfo) -> io::Result<FileInfo> {
     if info.links == 0 {
         return Err(not_found("regular file was unlinked"));
     }
@@ -610,11 +614,15 @@ impl Directory {
 
     /// Call after locking and before using an object whose name must be stable.
     ///
-    /// A name that now identifies another object is denied only after that
-    /// object passed the same checked read, so [`is_name_replaced`] never
-    /// matches a non-regular, hardlinked or non-private replacement.
+    /// The held handle is inspected as a retained one: a POSIX replacement of
+    /// its name, which on Windows leaves it delete-pending with no link, reads
+    /// as unlinked (`NotFound`) on every platform, while a delete-pending
+    /// object that still has a link stays denied. A name that now identifies
+    /// another object is denied only after that object passed the same checked
+    /// read, so [`is_name_replaced`] never matches a non-regular, hardlinked or
+    /// non-private replacement.
     pub fn verify(&self, name: &OsStr, file: &File) -> io::Result<()> {
-        let held = checked_file(file)?;
+        let held = single_link(retained_file_info(file)?)?;
         let current = self.read(name)?;
         if held.identity != checked_file(&current)?.identity {
             return Err(io::Error::new(
@@ -1102,6 +1110,58 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
             refused("a non-private file");
         }
+    }
+
+    /// A held handle whose name a staged private file replaces, published the
+    /// way checked records are (POSIX replacement), is unlinked on every
+    /// platform: not denied, and not a replaced name.
+    #[test]
+    fn verify_reads_a_held_file_replaced_by_publication_as_unlinked() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let name = OsStr::new("record");
+        directory
+            .create_new(name)
+            .unwrap()
+            .write_all(b"held")
+            .unwrap();
+        let held = directory.read(name).unwrap();
+        directory.verify(name, &held).unwrap();
+        let stage = Directory::ensure_private(&directory.path().join("staging")).unwrap();
+        let staged = OsStr::new("record.tmp");
+        let mut successor = stage.create_new(staged).unwrap();
+        successor.write_all(b"successor").unwrap();
+        directory
+            .publish_file(
+                &stage,
+                staged,
+                &successor,
+                name,
+                Publication::ReplaceRegular,
+            )
+            .unwrap_or_else(|error| panic!("the successor did not publish: {error:?}"));
+
+        assert_eq!(retained_file_info(&held).unwrap().links, 0);
+        // Windows leaves the replaced object delete-pending, which the strict
+        // inspection of a newly admitted handle refuses as denied.
+        #[cfg(windows)]
+        {
+            let strict = regular_file_info(&held).unwrap_err();
+            assert_eq!(strict.kind(), io::ErrorKind::PermissionDenied, "{strict:?}");
+            assert_eq!(
+                strict.to_string(),
+                "filesystem object is pending deletion or has an invalid size"
+            );
+        }
+        let error = directory.verify(name, &held).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error:?}");
+        assert_eq!(error.to_string(), "regular file was unlinked");
+        assert_eq!(error.raw_os_error(), None);
+        assert!(!is_name_replaced(&error), "{error:?}");
+        assert_eq!(
+            std::fs::read(directory.path().join(name)).unwrap(),
+            b"successor"
+        );
     }
 
     #[test]
