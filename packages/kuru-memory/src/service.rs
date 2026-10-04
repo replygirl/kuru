@@ -8984,7 +8984,9 @@ mod tests {
             let root = tempfile::tempdir()?;
             let (project, scope, data, options) = owner_fixture(root.path())?;
             let _gate = crate::spawn_gate::spawning().await;
-            let owner = ServiceOwner::open(options, &project).await?;
+            let owner = ServiceOwner::open(options.clone(), &project)
+                .await
+                .map_err(|error| crate::test_support::fixture_startup_error(&options, error))?;
             let authority = owner.authority().clone();
             let (mut knobs, mut events) = observed(Admission::AnyAttachment, None);
             knobs.recheck = Duration::from_millis(100);
@@ -9029,6 +9031,59 @@ mod tests {
         .with_context(|| {
             format!("live attachment accept-timeout fixture exceeded its {deadline:?} deadline")
         })??;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_owner_open_preserves_real_startup_log_when_annotated() -> Result<()> {
+        let real_dolt = crate::test_support::warm_runtime_cache().await?;
+        let root = tempfile::tempdir()?;
+        let (project, _scope, _data, mut options) = owner_fixture(root.path())?;
+        let failing_dolt = root.path().join("failing-dolt");
+        let real_dolt = real_dolt.to_string_lossy().replace('\'', "'\\''");
+        std::fs::write(
+            &failing_dolt,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = version ]; then\n  exec '{real_dolt}' \"$@\"\nfi\nprintf '%s\\n' 'fixture-injected-dolt-startup-failure' >&2\nexit 1\n"
+            ),
+        )?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&failing_dolt, std::fs::Permissions::from_mode(0o700))?;
+        }
+        options.config.dolt_binary = Some(failing_dolt);
+
+        let _gate = crate::spawn_gate::spawning().await;
+        let raw_error = ServiceOwner::open(options.clone(), &project)
+            .await
+            .err()
+            .context("fixture Dolt must fail before the owner is ready")?;
+        let raw_rendered = format!("{raw_error:#}");
+        ensure!(
+            raw_rendered.contains("Dolt exited before readiness"),
+            "fixture startup did not reach the Dolt readiness failure: {raw_rendered}"
+        );
+        ensure!(
+            !raw_rendered.contains("fixture Dolt server log tail"),
+            "the unannotated owner-open error unexpectedly included the fixture log"
+        );
+        let primary = raw_error.to_string();
+
+        let annotated = crate::test_support::fixture_startup_error(&options, raw_error);
+        let annotated_rendered = format!("{annotated:#}");
+        ensure!(
+            annotated_rendered.contains("fixture Dolt server log tail")
+                && annotated_rendered.contains("fixture-injected-dolt-startup-failure"),
+            "the fixture's bounded Dolt startup log was not retained: {annotated_rendered}"
+        );
+        ensure!(
+            annotated
+                .chain()
+                .nth(1)
+                .is_some_and(|cause| cause.to_string() == primary),
+            "startup annotation replaced the original error: {annotated_rendered}"
+        );
         Ok(())
     }
 
