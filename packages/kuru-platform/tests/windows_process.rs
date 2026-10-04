@@ -18,20 +18,21 @@ use std::{
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 /// The only wall-clock bound the platform owns that these tests reach: the
-/// stdio pipe accept in `stdio` (`src/windows/pipe.rs:742`,
-/// `accept_connection(Duration::from_secs(5))`), which every `Stdio::Pipe`
+/// stdio pipe accept in `kuru_platform::windows::pipe::stdio`
+/// (`accept_connection(Duration::from_secs(5))`), which every `Stdio::Pipe`
 /// spawn awaits. The fixture child's own connect, accept, close and wait
 /// bounds are the same 5 s (`tests/fixtures/process.rs`), so a fixture's own
 /// error is observed before the parent's wait on it ends.
 const NATIVE_BOUND: Duration = Duration::from_secs(5);
 
 /// Allowance for creating a fixture child process and its runtime before its
-/// own work begins, restated from `CHILD_START_MARGIN`
-/// (`packages/kuru-memory/src/test_support.rs:546`, crate-private there).
+/// own work begins, restated from
+/// `kuru_memory::test_support::CHILD_START_MARGIN` (`cfg(test)` and
+/// crate-private there).
 const CHILD_START: Duration = Duration::from_secs(5);
 
 /// One wait's failure bound in this file: [`NATIVE_BOUND`] plus
-/// [`CHILD_START`], 10 s. The process fixture restates it for its
+/// [`CHILD_START`], 10 s. [`budget_arg`] adds one to each budgeted fixture's
 /// self-timeout.
 ///
 /// No product bound applies to these waits. The platform's `Pipe::close`,
@@ -57,10 +58,15 @@ fn series(limits: u32, shorts: u32) -> Duration {
     LIMIT * limits + SHORT * shorts
 }
 
-/// A parked fixture mode's last argument: the parent's own wait budget on it,
-/// from which the fixture derives its orphan-reaping self-timeout.
+/// A budgeted fixture mode's last argument: its orphan-reaping self-timeout,
+/// which the fixture uses as is. `budget` is a [`series`] of the parent's waits
+/// from the spawn until it no longer needs the fixture running. The added
+/// [`LIMIT`] covers the parent's unbounded steps after its last counted wait
+/// (a thread join, a synchronous lock check, `try_wait`) and the gap between
+/// the parent's clock and the fixture's, which starts only once it runs. So
+/// the parent's waits decide first, and the self-timeout only reaps an orphan.
 fn budget_arg(budget: Duration) -> OsString {
-    budget.as_millis().to_string().into()
+    budget.saturating_add(LIMIT).as_millis().to_string().into()
 }
 
 #[tokio::test]
@@ -989,6 +995,13 @@ async fn dropping_a_trusted_handle_does_not_terminate_its_lifetime_peer() {
 fn cancelled_partial_frame_closes_pipe_and_reaps_peer_before_runtime_shutdown() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().to_owned();
+    // The thread's accept, readiness read, two closes, remainder read and
+    // reap, plus one LIMIT for the child's creation and the runtime's
+    // construction and shutdown, which no inner wait bounds; and its one probe
+    // that must time out. The peer is passed the same budget: it ends on the
+    // EOF of this thread's close, inside this series, so its self-timeout
+    // cannot end it first.
+    let budget = series(7, 1);
     let (sender, receiver) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1001,6 +1014,7 @@ fn cancelled_partial_frame_closes_pipe_and_reaps_peer_before_runtime_shutdown() 
                 &directory,
                 &[OsStr::new("rendezvous-partial-frame"), listener.address()],
             );
+            spawn.args.push(budget_arg(budget));
             spawn.stdout = Stdio::Pipe;
             let mut child = spawn.spawn().await.unwrap();
             let mut channel = BufReader::new(listener.accept(&child, LIMIT).await.unwrap());
@@ -1037,12 +1051,8 @@ fn cancelled_partial_frame_closes_pipe_and_reaps_peer_before_runtime_shutdown() 
         drop(runtime);
         sender.send(()).unwrap();
     });
-    // The thread's accept, readiness read, two closes, remainder read and
-    // reap, plus one LIMIT for the child's creation and the runtime's
-    // construction and shutdown, which no inner wait bounds; and its one probe
-    // that must time out.
     receiver
-        .recv_timeout(series(7, 1))
+        .recv_timeout(budget)
         .expect("partial-frame cancellation stranded its child, pipe or Tokio runtime");
     thread.join().unwrap();
 }

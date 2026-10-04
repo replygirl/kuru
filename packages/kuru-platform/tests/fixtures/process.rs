@@ -9,43 +9,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::timeout(guard()?, run()).await?
 }
 
-/// The parent's per-wait bound, `LIMIT` in `tests/windows_process.rs`: the
-/// platform's 5 s stdio accept (`src/windows/pipe.rs:742`) plus the 5 s
-/// child-start allowance restated there from kuru-memory's
-/// `CHILD_START_MARGIN`. Restated because this fixture is a separate binary.
-#[cfg(windows)]
-const PARENT_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// This fixture's self-timeout, which only reaps an orphan and never decides
 /// an outcome. A parked mode is ended by its parent's termination, but a
 /// `Lifetime::TrustedSupervisor` handle does not terminate on drop, so a
 /// parent that panics first would leave it parked for good.
 ///
-/// A parent that parks this fixture passes its own wait budget on it, in
-/// milliseconds, as the argument after the mode's fixed arguments: the series
-/// bound of its longest wait on the fixture, or its `LIMIT` where it waits
-/// once. The self-timeout is that budget plus one [`PARENT_LIMIT`] for the
-/// parent's termination and reap after it, and its clock starts only once this
-/// process runs, so the parent's wait always ends first.
+/// A parent that parks this fixture, or whose own step ends it, passes the
+/// self-timeout in milliseconds as the argument after the mode's fixed
+/// arguments, and this process uses it as is. The parent derives it at
+/// `budget_arg` in `tests/windows_process.rs`: a series of the parent's waits
+/// from the spawn until it no longer needs this process running, plus one
+/// `LIMIT` for the parent's unbounded steps after its last counted wait and
+/// the gap between the two clocks.
 ///
 /// A launch that passes no budget keeps the existing 30 s backstop, not
-/// derived here: the non-parked modes, which end on their own events; the
-/// `capture-stall` and `capture-flood` modes, whose parent is
-/// `tests/windows_commands.rs`; and the `console-owner` mode's `idle` child.
+/// derived here: the parked `capture-stall` and `capture-flood` modes, whose
+/// parent is `tests/windows_commands.rs`; the `console-owner` mode's `idle`
+/// child, ended by `interrupt()`; `startup`, which polls for a release file
+/// its test never writes, so only the close of the `owner-startup` fixture's
+/// `OwnedJob` at that owner's termination ends it; `rendezvous`, ended when
+/// its parent (the test, or `trusted-owner` at its termination) drops or
+/// closes the pipe; `duplex`, ended by its parent's payload; and the remaining
+/// modes, which end on their own work or on input their parent supplies.
 #[cfg(windows)]
 fn guard() -> Result<std::time::Duration, Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let budget = match args.first().and_then(|mode| mode.to_str()) {
         Some("idle") => args.get(1),
-        Some("rendezvous-stall" | "trusted-owner") => args.get(2),
+        Some("rendezvous-stall" | "rendezvous-partial-frame" | "trusted-owner") => args.get(2),
         Some("owner" | "owner-startup") => args.get(4),
         _ => None,
     };
     Ok(match budget {
         Some(budget) => std::time::Duration::from_millis(
             budget.to_str().ok_or("non-UTF-8 fixture budget")?.parse()?,
-        )
-        .saturating_add(PARENT_LIMIT),
+        ),
         None => std::time::Duration::from_secs(30),
     })
 }
