@@ -770,9 +770,11 @@ mod cancellation_tests {
         let before = memory.revision().await.unwrap();
         let candidate = memory.begin_candidate("accepted promotion").await.unwrap();
         let (promoted, release) = harness.pause_after_next_memory_write();
+        let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+        let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
         let cancellation = CancellationToken::new();
         let controlled = cancellation.clone();
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             let result = harness
                 .finish_dream(&candidate, topology, &report, &controlled)
                 .await;
@@ -784,13 +786,19 @@ mod cancellation_tests {
             .unwrap();
         let accepted = memory.revision().await.unwrap();
         assert_ne!(accepted, before);
+        watch
+            .timings
+            .mark("promotion accepted; cancelling and releasing the write");
         cancellation.cancel();
         release.send(()).unwrap();
-        let (mut harness, candidate, result) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), task)
-                .await
-                .expect("accepted dream promotion did not settle")
-                .unwrap();
+        let (mut harness, candidate, result) = crate::progress_wait::join_on_progress(
+            &mut task,
+            &mut watch,
+            gap,
+            "accepted dream promotion",
+            |(_, _, result)| crate::progress_wait::describe_result(&result),
+        )
+        .await;
         result.unwrap();
         assert_eq!(memory.revision().await.unwrap(), accepted);
         assert!(candidate.view().revision().await.is_err());
@@ -1188,7 +1196,9 @@ mod cancellation_tests {
         let original_parts = harness.topology.parts.len();
         let role = harness.topology.parts[0].role.clone();
         let (staged, release) = harness.pause_before_next_dream_promotion();
-        let dream = tokio::spawn(async move {
+        let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+        let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+        let mut dream = tokio::spawn(async move {
             let result = harness
                 .apply_dream(vec![DreamProposal::Add {
                     name: "Stale proposal".into(),
@@ -1207,11 +1217,18 @@ mod cancellation_tests {
             .await
             .unwrap();
         let live_revision = memory.revision().await.unwrap();
+        watch
+            .timings
+            .mark("live advanced; releasing the staged promotion");
         release.send(()).unwrap();
-        let (mut harness, result) = tokio::time::timeout(std::time::Duration::from_secs(10), dream)
-            .await
-            .expect("conflicting dream did not settle")
-            .unwrap();
+        let (mut harness, result) = crate::progress_wait::join_on_progress(
+            &mut dream,
+            &mut watch,
+            gap,
+            "conflicting dream",
+            |(_, result)| crate::progress_wait::describe_result(&result),
+        )
+        .await;
         assert!(result.unwrap_err().is::<CandidateConflict>());
         assert_eq!(harness.topology.parts.len(), original_parts);
         assert_eq!(memory.revision().await.unwrap(), live_revision);

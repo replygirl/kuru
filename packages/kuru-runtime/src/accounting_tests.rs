@@ -3518,18 +3518,23 @@ async fn cancellation_settles_admitted_usage_without_a_terminal_report() {
     let directory = tempfile::tempdir().unwrap();
     let memory = MemoryStore::temporary().await.unwrap();
     let observed = Arc::new(Notify::new());
+    let timings = crate::step_timings::StepTimings::recording();
     let provider = Arc::new(CancelAfterUsage {
         observed: observed.clone(),
-        timings: crate::step_timings::StepTimings::default(),
+        timings: timings.clone(),
     });
     let mut harness = Harness::new(config(), directory.path(), memory.clone(), provider, None)
         .await
         .unwrap();
+    harness.step_timings = timings.clone();
+    let mut watch =
+        crate::progress_wait::TaskWatch::new(timings, harness.subscribe(), harness.hook_host());
+    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
     let target = harness.topology.parts[0].id.clone();
     let session = harness.session.id.clone();
     let cancellation = CancellationToken::new();
     let control = cancellation.clone();
-    let running = tokio::spawn(async move {
+    let mut running = tokio::spawn(async move {
         let result = harness
             .run_controlled("cancel me", Some(&target), "cancelled-turn", &control)
             .await;
@@ -3539,11 +3544,18 @@ async fn cancellation_settles_admitted_usage_without_a_terminal_report() {
     tokio::time::timeout(std::time::Duration::from_secs(5), observed.notified())
         .await
         .unwrap();
+    watch
+        .timings
+        .mark("first usage observed; cancelling the turn");
     cancellation.cancel();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), running)
-        .await
-        .unwrap()
-        .unwrap();
+    let _ = crate::progress_wait::join_on_progress(
+        &mut running,
+        &mut watch,
+        gap,
+        "cancelled turn",
+        |result| crate::progress_wait::describe_result(&result),
+    )
+    .await;
     let usage = memory
         .usage_ledger()
         .unwrap()
@@ -3576,6 +3588,12 @@ async fn abandoned_dream_keeps_usage_after_reopen_without_advancing_main() {
         .await
         .unwrap();
     harness.step_timings = timings.clone();
+    let mut watch = crate::progress_wait::TaskWatch::new(
+        timings.clone(),
+        harness.subscribe(),
+        harness.hook_host(),
+    );
+    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
     let session = harness.session.id.clone();
     let main_before = memory.revision().await.unwrap();
     let cancellation = CancellationToken::new();
@@ -3590,14 +3608,19 @@ async fn abandoned_dream_keeps_usage_after_reopen_without_advancing_main() {
         .await
         .is_err()
     {
-        explain_expired_dream_wait(&mut running, &cancellation, &timings).await;
+        explain_expired_dream_wait(&mut running, &cancellation, &timings, gap).await;
     }
+    timings.mark("first usage observed; cancelling the dream");
     cancellation.cancel();
-    let error = tokio::time::timeout(std::time::Duration::from_secs(10), running)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
+    let error = crate::progress_wait::join_on_progress(
+        &mut running,
+        &mut watch,
+        gap,
+        "cancelled dream",
+        |result| crate::progress_wait::describe_result(&result),
+    )
+    .await
+    .unwrap_err();
     assert!(crate::turn_was_cancelled(&error));
     assert_eq!(memory.revision().await.unwrap(), main_before);
     let before = memory
@@ -3626,12 +3649,13 @@ async fn abandoned_dream_keeps_usage_after_reopen_without_advancing_main() {
 /// its 5 s wait for the provider's first usage observation expires, saying what
 /// the dream task did instead. The bound itself is unchanged. Timings are read
 /// before anything cancels the task, then the task is cancelled and awaited
-/// under a short bound so the report separates an early error from a slow
-/// prelude.
+/// under the fixture's derived gap so the report separates an early error from
+/// a slow prelude.
 async fn explain_expired_dream_wait(
     running: &mut tokio::task::JoinHandle<Result<crate::DreamReport>>,
     cancellation: &CancellationToken,
     timings: &crate::step_timings::StepTimings,
+    gap: std::time::Duration,
 ) -> ! {
     let steps = timings.render();
     let outcome = if running.is_finished() {
@@ -3641,18 +3665,10 @@ async fn explain_expired_dream_wait(
         )
     } else {
         cancellation.cancel();
-        match tokio::time::timeout(std::time::Duration::from_secs(10), &mut *running).await {
-            Ok(joined) => format!(
-                "the dream task was still running at the deadline; after cancellation it finished: {}",
-                describe_dream_outcome(joined)
-            ),
-            Err(_) => {
-                running.abort();
-                "the dream task was still running at the deadline and did not finish within 10 s \
-                 of cancellation; it was aborted"
-                    .into()
-            }
-        }
+        let settled =
+            crate::progress_wait::settle(running, gap, |result| describe_dream_outcome(Ok(result)))
+                .await;
+        format!("the dream task was still running at the deadline; after cancellation {settled}")
     };
     panic!(
         "the dream provider call was not reached within 5 s\n{outcome}\n\

@@ -49,6 +49,24 @@ impl StepTimings {
         })
     }
 
+    /// The most recently completed step and when it completed, for a stall
+    /// report that names where an operation went silent.
+    pub(crate) fn last(&self) -> String {
+        let Some(recorded) = &self.0 else {
+            return "step timings were not recorded".into();
+        };
+        recorded
+            .steps
+            .lock()
+            .ok()
+            .and_then(|steps| {
+                steps
+                    .last()
+                    .map(|(step, elapsed)| format!("{step} at +{:.1} ms", millis(*elapsed)))
+            })
+            .unwrap_or_else(|| "(no step completed)".into())
+    }
+
     /// One line per completed step, in completion order, and the time now.
     pub(crate) fn render(&self) -> String {
         let Some(recorded) = &self.0 else {
