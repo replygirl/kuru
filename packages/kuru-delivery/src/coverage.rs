@@ -10,6 +10,7 @@ pub mod orchestrate;
 pub mod partition;
 pub mod plan;
 pub mod seed;
+pub mod spawns;
 
 use crate::{archive, command};
 use anyhow::{Context, Result, bail, ensure};
@@ -862,6 +863,40 @@ pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
 }
 
 fn append_runner_record(ledger: &Path, record: &RunnerRecord) -> Result<()> {
+    append_ledger_line(ledger, serde_json::to_vec(record)?)
+}
+
+/// Name the test executable behind the profiles its listing process wrote:
+/// one spawn row per new `%p-%m` profile, so a later profile with the same
+/// module signature names this executable.
+fn record_listing_profiles(
+    ledger: &Path,
+    target_dir: &Path,
+    executable: &Path,
+    key: &str,
+    before: &[String],
+) -> Result<()> {
+    let at = unix_now()?;
+    for name in spawns::profile_names(target_dir)? {
+        if before.binary_search(&name).is_ok() {
+            continue;
+        }
+        if let Some(profile) = spawns::ProfileName::parse(&name) {
+            let row = spawns::SpawnRecord::new(
+                profile.pid,
+                spawns::TEST_EXECUTABLE,
+                &executable.to_string_lossy(),
+                key,
+                at,
+            );
+            append_ledger_line(ledger, serde_json::to_vec(&row)?)?;
+        }
+    }
+    Ok(())
+}
+
+/// Append one line to the runner ledger within its size limit.
+fn append_ledger_line(ledger: &Path, mut bytes: Vec<u8>) -> Result<()> {
     let current = match fs::symlink_metadata(ledger) {
         Ok(metadata) => {
             ensure!(
@@ -873,7 +908,6 @@ fn append_runner_record(ledger: &Path, record: &RunnerRecord) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
         Err(error) => return Err(error.into()),
     };
-    let mut bytes = serde_json::to_vec(record)?;
     bytes.push(b'\n');
     ensure!(
         current
@@ -1336,6 +1370,9 @@ struct Launch<'a> {
     args: &'a [String],
     log: PathBuf,
     remaining: Duration,
+    /// The runner ledger, named to test support through
+    /// [`spawns::SPAWN_LEDGER_ENV`] so its detached children leave spawn rows.
+    ledger: &'a Path,
 }
 
 /// The dispatcher's process boundary: listing an executable's tests and
@@ -1376,6 +1413,7 @@ impl Launcher for SystemLauncher {
             args,
             log,
             remaining,
+            ledger,
         } = launch;
         #[cfg(not(windows))]
         let _ = artifact;
@@ -1420,7 +1458,11 @@ impl Launcher for SystemLauncher {
                 spec.lifetime = Lifetime::FixtureBreakawayJob;
             }
             spec.args = args.iter().map(OsString::from).collect();
-            spec.environment = std::env::vars_os().collect();
+            spec.environment = std::env::vars_os()
+                .filter(|(name, _)| name != spawns::SPAWN_LEDGER_ENV)
+                .collect();
+            spec.environment
+                .push((spawns::SPAWN_LEDGER_ENV.into(), ledger.as_os_str().into()));
             spec.stdin = inherited_stdio(StandardStream::Input)?;
             // The runner relays stdout to the job log and observes libtest progress.
             spec.stdout = Stdio::Pipe;
@@ -1449,6 +1491,7 @@ impl Launcher for SystemLauncher {
             let mut command = std::process::Command::new(executable);
             command
                 .args(args.iter())
+                .env(spawns::SPAWN_LEDGER_ENV, ledger)
                 .stdin(std::process::Stdio::inherit())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit());
@@ -1604,6 +1647,7 @@ async fn dispatch_with<L: Launcher>(
     // Every partition lists every executable: the lists prove completeness,
     // and in an instrumented partition the list run leaves each object a profile.
     let list_started = unix_now()?;
+    let before_list = spawns::profile_names(target_dir)?;
     let listed = match launcher
         .list(&executable_path, remaining.min(LIST_TIMEOUT))
         .await
@@ -1616,6 +1660,7 @@ async fn dispatch_with<L: Launcher>(
             return Err(error.context(format!("list the tests of {executable}")));
         }
     };
+    record_listing_profiles(ledger, target_dir, &executable_path, &key, &before_list)?;
     record.list_sha256 = partition::list_sha256(&listed);
     record.invocations.push(InvocationRecord {
         kind: plan::LIST.to_owned(),
@@ -1701,6 +1746,7 @@ async fn dispatch_with<L: Launcher>(
                 args: &selection,
                 log: log.clone(),
                 remaining,
+                ledger,
             })
             .await;
         let supervision = match supervision {
@@ -3587,6 +3633,19 @@ mod tests {
         }
         // The empty executable is listed and omitted in every partition.
         assert!(records.iter().any(|record| record.listed.is_empty()));
+        // Each listing process's profile names its executable by process ID,
+        // in the same ledger, without entering the plan.
+        let rows = plan::read_spawns(&ledger).unwrap();
+        assert_eq!(rows.len(), records.len());
+        for (record, row) in records.iter().zip(&rows) {
+            assert_eq!(row.role, spawns::TEST_EXECUTABLE);
+            assert_eq!(row.test, record.artifact);
+            assert_eq!(row.pid as usize, record.profraw_before + 1);
+            assert!(
+                Path::new(&row.executable).ends_with(&record.executable),
+                "{row:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4318,8 +4377,11 @@ mod tests {
                     executable: &executable,
                     artifact: &artifact,
                     args,
-                    log,
+                    log: log.clone(),
                     remaining: Duration::from_secs(120),
+                    // Beside the log, never the log: a spawn row must not
+                    // land in output the test reads.
+                    ledger: &log.with_extension("ledger.jsonl"),
                 })
                 .await
                 .unwrap()

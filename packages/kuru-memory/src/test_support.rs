@@ -43,6 +43,9 @@ pub(crate) mod engine_contract;
 pub(crate) mod engine_ledger;
 /// Env-gated lifecycle ordering measurement trace (inert unless enabled).
 pub mod lifecycle_trace;
+/// Coverage-runner spawn rows naming the test behind each detached child
+/// (inert unless the runner enables them).
+pub mod spawn_ledger;
 pub(crate) mod template;
 /// The CI usage-scan scaling check over aged stores (`usage-scan-fixture`,
 /// `measure-usage-scan`); compiled only on Unix, where its CI job runs.
@@ -1131,6 +1134,46 @@ pub(crate) fn owner_state(options: &OpenOptions) -> String {
             .to_owned(),
         Err(error) => format!("owner state unreadable: open-activity record: {error:#}"),
     }
+}
+
+/// The supervisors a test is about to start: take the mark on the test's own
+/// thread before it opens memory, then pass it to [`unawaited_supervisors`]
+/// before the test returns.
+#[derive(Clone, Debug)]
+pub struct SupervisorMark {
+    first: u64,
+    label: String,
+}
+
+/// Mark the next Dolt supervisor this process registers, for the calling
+/// test, as [`lifecycle_trace::label`] names it.
+pub fn supervisor_mark() -> SupervisorMark {
+    SupervisorMark {
+        first: engine_ledger::next_id(),
+        label: lifecycle_trace::label(),
+    }
+}
+
+/// Every Dolt supervisor the calling test starts in this process, whenever it
+/// starts them: a fixture that must open its store before it can take a
+/// [`supervisor_mark`] passes this to [`unawaited_supervisors`] at teardown.
+/// The mark is the test's label, its thread name, which is unique within one
+/// test executable.
+pub fn test_supervisors() -> SupervisorMark {
+    SupervisorMark {
+        first: 0,
+        label: lifecycle_trace::label(),
+    }
+}
+
+/// Every Dolt supervisor the marked test started since `mark` whose exit it
+/// did not await: one still unreaped, or one whose store was dropped without
+/// a close. A dropped store's supervisor is reaped by a detached thread after
+/// it stops Dolt on its own, so it can outlive the test process and write its
+/// coverage profile after the partition's tests. Empty once every store the
+/// test opened was closed.
+pub fn unawaited_supervisors(mark: &SupervisorMark) -> Vec<String> {
+    engine_ledger::with(|ledger| ledger.unawaited_since(mark.first, &mark.label))
 }
 
 /// Wait, without polling, until the managed owner for `options` has released

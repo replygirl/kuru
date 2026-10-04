@@ -6,11 +6,14 @@
 //! recomputes every assignment from the recorded list and returns the
 //! [`PartitionPlan`] the receipt binds; the merge validates each uploaded
 //! ledger again and requires the plans of one OS to be disjoint and complete.
+//! Spawn rows ([`super::spawns`]) share the file; they name processes for
+//! diagnostics and never enter a plan.
 
 use super::{
     Inventory, RUNNER_LEDGER_LIMIT, SCHEMA, digest_json,
     partition::{self, PartitionScheme},
     read_bounded, runnable_artifacts,
+    spawns::SpawnRecord,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -154,14 +157,33 @@ pub fn check_exclusions(
     Ok(())
 }
 
-/// Read a runner ledger, refusing schema-1 records by name.
+/// Read a runner ledger's runner records, refusing schema-1 records by name.
+/// Spawn rows ([`read_spawns`]) are parsed strictly and set aside.
 pub fn read_ledger(path: &Path) -> Result<Vec<RunnerRecord>> {
+    Ok(read_rows(path)?.0)
+}
+
+/// Read a runner ledger's spawn rows: the processes test support and the
+/// runner recorded, for naming the test behind a raw profile.
+pub fn read_spawns(path: &Path) -> Result<Vec<SpawnRecord>> {
+    Ok(read_rows(path)?.1)
+}
+
+fn read_rows(path: &Path) -> Result<(Vec<RunnerRecord>, Vec<SpawnRecord>)> {
     let bytes = read_bounded(path, RUNNER_LEDGER_LIMIT)?;
     let text = std::str::from_utf8(&bytes).context("coverage runner ledger is not UTF-8")?;
     let mut records = Vec::new();
+    let mut spawns = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let value: serde_json::Value = serde_json::from_str(line)
             .with_context(|| format!("parse runner ledger line {}", index + 1))?;
+        if SpawnRecord::is_spawn_row(&value) {
+            spawns.push(
+                SpawnRecord::parse(value)
+                    .with_context(|| format!("parse runner ledger spawn row {}", index + 1))?,
+            );
+            continue;
+        }
         match value.get("schema").and_then(serde_json::Value::as_u64) {
             Some(1) => bail!(
                 "runner ledger line {} uses coverage schema 1 (package shards)",
@@ -178,7 +200,7 @@ pub fn read_ledger(path: &Path) -> Result<Vec<RunnerRecord>> {
                 .with_context(|| format!("parse runner ledger line {}", index + 1))?,
         );
     }
-    Ok(records)
+    Ok((records, spawns))
 }
 
 fn check_listed(record: &RunnerRecord) -> Result<()> {

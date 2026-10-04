@@ -679,6 +679,15 @@ impl Server {
             // supervisor's later startup or the delayed authentication probe.
             #[cfg(test)]
             drop(creation);
+            // Test-support only: the supervisor leaves this process group, so
+            // a coverage partition names the test behind it if it outlives
+            // that test.
+            #[cfg(any(test, feature = "test-support"))]
+            crate::test_support::spawn_ledger::record(
+                child.id(),
+                Path::new(command.get_program()),
+                crate::test_support::spawn_ledger::DOLT_SUPERVISOR,
+            );
             crate::open_timeline::stamp(crate::open_timeline::Event::SupervisorSpawned);
             drop(_test_spawn_guard);
             let mut owner = Owner {
@@ -756,6 +765,14 @@ impl Server {
                 .await
                 .context("start memory lifetime supervisor")?;
             let spawned = Instant::now();
+            // Test-support only: name the test behind a supervisor that
+            // outlives it.
+            #[cfg(any(test, feature = "test-support"))]
+            crate::test_support::spawn_ledger::record(
+                child.id(),
+                &options.supervisor,
+                crate::test_support::spawn_ledger::DOLT_SUPERVISOR,
+            );
             crate::open_timeline::stamp(crate::open_timeline::Event::SupervisorSpawned);
             drop(_test_spawn_guard);
             let accept = listener.accept(

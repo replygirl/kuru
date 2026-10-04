@@ -110,6 +110,33 @@ between means an instrumented process outlived the partition's tests; the
 partition fails naming those profiles instead of blaming the port. A test must
 therefore not leave an instrumented child running after it returns.
 
+The failure also names each changed profile's writer. A raw profile is named
+`<prefix>-<pid>-<signature>_<pool>.profraw`, and the signature (`%m`) is
+computed per executable, not per test. The runner sets
+`KURU_COVERAGE_SPAWN_LEDGER` to its ledger on every test process, and test
+support appends one spawn row (`"record": "spawn"`: pid, parent, role,
+executable and originating test) for every instrumented child that leaves the
+test's process group, which the runner's group cleanup never reaches: memory
+Dolt supervisors and service owners (`kuru_memory::test_support::spawn_ledger`,
+forwarded to an owner's own spawns) and pseudo-terminal children. The runner
+adds a row for each test executable's listing profile. The partition then
+reports a new profile as "pid N is the `<role>` `<executable>` started by test
+`<name>`" and names the executables that share its signature. Spawn rows share
+the runner ledger file but never enter a partition plan.
+
+A local memory store dropped without `close()` hands its supervisor to a
+detached reaper thread: the supervisor stops Dolt and exits on its own, and
+when that test is the last one its executable runs, it exits after the test
+process and writes its profile during the partition's exports. Close every
+store a test opens before it returns. A test can prove it with
+`test_support::supervisor_mark()` before it opens memory and
+`test_support::unawaited_supervisors(&mark)` before it returns, which lists
+every supervisor the test started that is unreaped or was dropped live;
+`test_support::test_supervisors()` marks every supervisor the calling test
+starts, for a fixture that opens its store before it could take a mark.
+`kuru-runtime` tests end with `crate::tests::close_stores([...])`, which
+closes the stores they still hold and asserts that list is empty.
+
 The merge refuses a receipt without that digest or an export that differs from
 it or from its totals. It requires every partition to report the same files,
 instantiations, group locations and mapped lines, unions each instantiation's

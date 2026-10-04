@@ -57,6 +57,8 @@ async fn preferences_survive_reopening_without_resuming_chats_or_crossing_projec
         .unwrap();
     harness.set_effort(None).await.unwrap();
     harness.shutdown(false).await.unwrap();
+    // Close the first owner before reopening, rather than dropping it live.
+    harness.memory.clone().close().await.unwrap();
     drop(harness);
 
     let memory = MemoryStore::open(options).await.unwrap();
@@ -134,7 +136,7 @@ async fn preferences_survive_reopening_without_resuming_chats_or_crossing_projec
     );
     // Reap the reopened store's Dolt before `state` is released.
     drop(resumed);
-    memory.close().await.unwrap();
+    crate::tests::close_stores([memory]).await;
 }
 
 #[tokio::test]
@@ -181,6 +183,7 @@ async fn model_choices_are_provider_specific_and_mode_changes_preserve_all_pairs
         Some("high")
     );
     assert_eq!(preferences.mode, Some(Mode::Polyvagal));
+    crate::tests::close_stores([memory]).await;
 }
 
 #[tokio::test]
@@ -237,6 +240,7 @@ async fn failed_preference_updates_leave_live_choices_topology_and_saved_prefere
             .unwrap(),
         before_preferences
     );
+    crate::tests::close_stores([memory]).await;
 }
 
 #[tokio::test]
@@ -280,4 +284,5 @@ async fn corrupt_preferences_are_reported_instead_of_silently_reset_or_partially
             Some(broken)
         );
     }
+    crate::tests::close_stores([memory]).await;
 }

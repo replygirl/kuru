@@ -68,6 +68,7 @@ async fn notes_view_is_provider_free_and_separate_from_conversation() {
             truncated: false,
         }
     );
+    crate::tests::close_stores([memory]).await;
 }
 
 #[tokio::test]
@@ -119,6 +120,7 @@ async fn forgetting_exact_current_note_keeps_dream_rows_and_other_namespaces() -
         .is_err()
     );
     assert_eq!(memory.revision().await?, committed);
+    crate::tests::close_stores([memory]).await;
     Ok(())
 }
 
@@ -167,6 +169,7 @@ async fn notes_view_reads_exact_archived_part_and_relationship_only() {
             .await
             .is_err()
     );
+    crate::tests::close_stores([memory]).await;
 }
 
 #[tokio::test]
@@ -220,5 +223,6 @@ async fn notes_view_reports_n_plus_one_and_validates_its_live_mode() -> Result<(
     );
     assert_eq!(candidate.view().revision().await?, candidate_revision);
     assert_eq!(memory.revision().await?, revision);
+    crate::tests::close_stores([memory]).await;
     Ok(())
 }

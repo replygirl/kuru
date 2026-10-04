@@ -1372,6 +1372,11 @@ async fn spawn_service(
     for (name, value) in crate::test_support::lifecycle_trace::forwarded() {
         command.env(name, value);
     }
+    // Test-support only: the owner's own spawns name the same test.
+    #[cfg(any(test, feature = "test-support"))]
+    for (name, value) in crate::test_support::spawn_ledger::forwarded() {
+        command.env(name, value);
+    }
     #[cfg(test)]
     for (name, value) in activity::owner_test_environment() {
         command.env(name, value);
@@ -1380,7 +1385,16 @@ async fn spawn_service(
     // `crate::spawn_gate`.
     #[cfg(test)]
     let _creation = crate::spawn_gate::child_creation().await;
-    command.spawn().context("start project memory service")
+    let child = command.spawn().context("start project memory service")?;
+    // Test-support only: the owner leaves this process group, so a coverage
+    // partition names the test behind it if it outlives that test.
+    #[cfg(any(test, feature = "test-support"))]
+    crate::test_support::spawn_ledger::record(
+        child.id(),
+        executable,
+        crate::test_support::spawn_ledger::MEMORY_OWNER,
+    );
+    Ok(child)
 }
 
 #[cfg(windows)]
@@ -1415,6 +1429,9 @@ async fn spawn_service(
     // Test-support measurement only: forward the inert-by-default trace.
     #[cfg(any(test, feature = "test-support"))]
     layers.push(crate::test_support::lifecycle_trace::forwarded());
+    // Test-support only: the owner's own spawns name the same test.
+    #[cfg(any(test, feature = "test-support"))]
+    layers.push(crate::test_support::spawn_ledger::forwarded());
     #[cfg(test)]
     layers.push(activity::owner_test_environment());
     command.environment = owner_environment(
@@ -1424,10 +1441,18 @@ async fn spawn_service(
         layers,
     )
     .context("compose the memory service environment")?;
-    command
+    let child = command
         .spawn()
         .await
-        .context("start independent or outer-contained project memory service")
+        .context("start independent or outer-contained project memory service")?;
+    // Test-support only: name the test behind an owner that outlives it.
+    #[cfg(any(test, feature = "test-support"))]
+    crate::test_support::spawn_ledger::record(
+        child.id(),
+        executable,
+        crate::test_support::spawn_ledger::MEMORY_OWNER,
+    );
+    Ok(child)
 }
 
 /// The Windows owner's explicit environment: the system variables, the

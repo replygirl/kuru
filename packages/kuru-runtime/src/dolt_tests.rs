@@ -244,6 +244,7 @@ async fn explicit_cancellation_keeps_live_dream_state_and_private_histories_isol
     let output = harness.run("Continue after cancellation").await.unwrap();
     assert_eq!(output.text, "A later conversation still works");
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([memory]).await;
 }
 
 #[tokio::test]
@@ -606,6 +607,7 @@ async fn stale_promotion_keeps_later_live_data_and_discards_all_candidate_effect
     let output = harness.run("Continue after failed dream").await.unwrap();
     assert_eq!(output.text, "Another candidate summary");
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([memory]).await;
 }
 
 #[tokio::test]
@@ -945,6 +947,7 @@ async fn cancelled_live_undo_reconciles_before_a_later_save() {
             .any(|message| message.text_projection() == "later conversation survives")
     );
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([memory]).await;
 }
 
 #[tokio::test]
@@ -1006,4 +1009,5 @@ async fn reconciliation_publishes_only_durable_choices_before_the_next_mutation(
     assert_eq!(harness.config.model, "durable-model");
     assert!(harness.pending_publication.is_none());
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([memory]).await;
 }

@@ -7433,6 +7433,7 @@ mod publication_tests {
             assert!(harness.pending_publication.is_none());
         }
         harness.shutdown(false).await.unwrap();
+        crate::tests::close_stores([memory]).await;
     }
 }
 
