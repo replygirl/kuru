@@ -433,6 +433,9 @@ thread_local! {
     /// Fired once, on this thread, while creating a standard-input pipe: on
     /// Apple between `pipe()` and close-on-exec.
     static WINDOW: RefCell<Seam> = const { RefCell::new(None) };
+    /// Fired once, on this thread, when the platform spawn lock is already
+    /// held, before waiting for it.
+    static BLOCKED: RefCell<Seam> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -861,6 +864,7 @@ fn presence(result: rustix::io::Result<()>) -> GroupPresence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read as _;
 
     const INHERITED: StdioPlan =
         StdioPlan::new(StdioSlot::Inherit, StdioSlot::Inherit, StdioSlot::Inherit);
@@ -1435,6 +1439,131 @@ mod tests {
         assert!(owner.take_stderr().is_err());
         drop((input, output, error));
         finish_test_owner(&mut owner).unwrap();
+    }
+
+    /// What the second spawn did first while the first was in its window.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Second {
+        Blocked,
+        Spawned,
+        Failed,
+    }
+
+    #[test]
+    fn concurrent_owned_spawn_cannot_copy_a_pipe_in_its_window() {
+        // The sibling owner tests' bound; nothing here sleeps.
+        let bound = Duration::from_secs(5);
+        let cat = || {
+            let mut command = Command::new("/bin/cat");
+            command.env_clear();
+            command
+        };
+        let (entered, in_window) = std::sync::mpsc::channel::<()>();
+        let (event, events) = std::sync::mpsc::channel::<Second>();
+        let (seen, first_seen) = std::sync::mpsc::channel();
+        // A pauses after creating its stdin pipe (on Apple before either end
+        // is close-on-exec) until B reports what it did first. It never waits
+        // for B's spawn alone, so a serialised B cannot deadlock it.
+        let first = std::thread::spawn(move || {
+            WINDOW.with(|window| {
+                *window.borrow_mut() = Some(Box::new(move || {
+                    let _ = entered.send(());
+                    let _ = seen.send(events.recv_timeout(bound));
+                }));
+            });
+            let plan = StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Null);
+            OwnedProcessGroup::spawn(cat(), plan)
+        });
+        let second = std::thread::spawn(move || {
+            in_window.recv_timeout(bound).map_err(|error| {
+                io::Error::other(format!("A never reached its window: {error}"))
+            })?;
+            let blocked = event.clone();
+            BLOCKED.with(|seam| {
+                *seam.borrow_mut() = Some(Box::new(move || {
+                    let _ = blocked.send(Second::Blocked);
+                }));
+            });
+            let plan = StdioPlan::new(StdioSlot::Pipe, StdioSlot::Null, StdioSlot::Null);
+            let spawned = OwnedProcessGroup::spawn(cat(), plan);
+            BLOCKED.with(|seam| seam.borrow_mut().take());
+            let _ = event.send(if spawned.is_ok() {
+                Second::Spawned
+            } else {
+                Second::Failed
+            });
+            spawned
+        });
+        let (first, second) = (first.join().unwrap(), second.join().unwrap());
+        let (mut first, mut second) = (first.unwrap(), second.unwrap());
+        let first_event = first_seen.try_recv();
+        let (first_input, first_output) = (first.take_stdin(), first.take_stdout());
+        let second_input = second.take_stdin();
+        // B's input stays open: a copy of A's input write end inherited by B's
+        // cat would keep A's cat from reaching end of file.
+        drop(first_input);
+        let (finished, eof) = std::sync::mpsc::channel();
+        let reader = first_output.map(|mut output| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = finished.send(output.read_to_end(&mut bytes).map(|_| bytes.len()));
+            })
+        });
+        let first_eof = eof.recv_timeout(bound);
+        drop(second_input);
+        let settled = [
+            settle_without_sleep(&mut first, bound),
+            settle_without_sleep(&mut second, bound),
+        ];
+        if first_eof.is_ok() || eof.recv_timeout(bound).is_ok() {
+            if let Ok(reader) = reader {
+                reader.join().unwrap();
+            }
+        }
+        assert!(
+            matches!(first_eof, Ok(Ok(0))),
+            "A's cat did not reach end of file within {bound:?} while B ran: {first_eof:?} \
+             (B's first event: {first_event:?})"
+        );
+        assert_eq!(
+            first_event,
+            Ok(Ok(Second::Blocked)),
+            "B must wait for the platform spawn lock while A is in its window"
+        );
+        for result in settled {
+            result.unwrap();
+        }
+    }
+
+    /// [`finish_test_owner`] without sleeping between bounded polls.
+    fn settle_without_sleep(owner: &mut OwnedProcessGroup, bound: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + bound;
+        loop {
+            match owner.terminate_before_reap() {
+                Termination::Signalled(_) | Termination::InvalidPhase => break,
+                Termination::Interrupted if Instant::now() < deadline => {}
+                result => return Err(format!("test transition cleanup: {result:?}")),
+            }
+            std::thread::yield_now();
+        }
+        loop {
+            match owner.reap_if_exited() {
+                Reap::Reaped(_) => break,
+                Reap::NotExited | Reap::Interrupted if Instant::now() < deadline => {}
+                result => return Err(format!("test root reap cleanup: {result:?}")),
+            }
+            std::thread::yield_now();
+        }
+        let mut listing = owner.permission_listing(deadline);
+        loop {
+            match listing.resolve_blocking(owner.presence_after_reap()) {
+                GroupPresence::Absent | GroupPresence::Recycled => return Ok(()),
+                GroupPresence::Present | GroupPresence::PermissionDenied
+                    if Instant::now() < deadline => {}
+                result => return Err(format!("test group cleanup: {result:?}")),
+            }
+            std::thread::yield_now();
+        }
     }
 
     fn finish_test_owner(owner: &mut OwnedProcessGroup) -> Result<(), String> {

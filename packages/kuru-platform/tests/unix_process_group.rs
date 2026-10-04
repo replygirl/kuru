@@ -8,7 +8,7 @@ use std::{
     io::{self, BufReader, Read},
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc,
+    sync::{Arc, Barrier, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -391,4 +391,88 @@ fn consumed_transition_still_reaps_and_confirms_absence() {
     assert!(cleanup.confirmed, "{}", cleanup.detail);
     assert!(cleanup.status.is_some(), "{}", cleanup.detail);
     observation.unwrap();
+}
+
+/// Wait for end of file on one child's output from a reader thread, bounded.
+fn end_of_file_within(
+    output: io::Result<std::process::ChildStdout>,
+    bound: Duration,
+) -> Result<(), String> {
+    let mut output = output.map_err(|error| format!("output: {error}"))?;
+    let (finished, eof) = mpsc::channel();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = finished.send(output.read_to_end(&mut bytes).map(|_| bytes.len()));
+    });
+    match eof.recv_timeout(bound) {
+        Ok(Ok(0)) => Ok(()),
+        result => Err(format!("no end of file within {bound:?}: {result:?}")),
+    }
+}
+
+/// Terminate, reap and confirm absence, yielding instead of sleeping.
+fn settle(owner: &mut OwnedProcessGroup) -> Result<(), String> {
+    let deadline = Instant::now() + LIMIT;
+    loop {
+        match owner.terminate_before_reap() {
+            Termination::Signalled(_) | Termination::InvalidPhase => break,
+            Termination::Interrupted if Instant::now() < deadline => thread::yield_now(),
+            result => return Err(format!("termination={result:?}")),
+        }
+    }
+    loop {
+        match owner.reap_if_exited() {
+            Reap::Reaped(_) => break,
+            Reap::NotExited | Reap::Interrupted if Instant::now() < deadline => {
+                thread::yield_now();
+            }
+            result => return Err(format!("reap={result:?}")),
+        }
+    }
+    let mut listing = owner.permission_listing(deadline);
+    loop {
+        match listing.resolve_blocking(owner.presence_after_reap()) {
+            GroupPresence::Absent | GroupPresence::Recycled => return Ok(()),
+            GroupPresence::Present | GroupPresence::PermissionDenied
+                if Instant::now() < deadline =>
+            {
+                thread::yield_now();
+            }
+            result => return Err(format!("group_presence={result:?}")),
+        }
+    }
+}
+
+#[test]
+fn concurrent_owned_children_each_reach_their_own_end_of_file() {
+    let plan = StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Null);
+    for iteration in 0..50 {
+        let start = Arc::new(Barrier::new(2));
+        let launch = |start: Arc<Barrier>| {
+            thread::spawn(move || {
+                let mut command = Command::new("/bin/cat");
+                command.env_clear();
+                start.wait();
+                OwnedProcessGroup::spawn(command, plan)
+            })
+        };
+        let (first, second) = (launch(Arc::clone(&start)), launch(start));
+        let (first, second) = (first.join().unwrap(), second.join().unwrap());
+        let (mut first, mut second) = (first.unwrap(), second.unwrap());
+        let second_input = second.take_stdin();
+        drop(first.take_stdin());
+        // The second child is still running with its input open.
+        let first_eof = end_of_file_within(first.take_stdout(), LIMIT);
+        drop(second_input);
+        let second_eof = end_of_file_within(second.take_stdout(), LIMIT);
+        let settled = [settle(&mut first), settle(&mut second)];
+        assert_eq!(
+            (first_eof, second_eof),
+            (Ok(()), Ok(())),
+            "iteration {iteration}: a child held the other's input pipe"
+        );
+        for result in settled {
+            result.unwrap();
+        }
+    }
 }
