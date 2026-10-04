@@ -110,8 +110,11 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// A local run records no job, so the window starts at this process's first
-/// bounded launch, with the shortest limit any coverage job has.
+/// A run that records no job (a local run, or the release workflow's ordinary
+/// `mise run test` pass) gets a window starting at this process's first
+/// bounded launch, with the shortest limit any coverage job has. In the
+/// release `tests` job that window is not tied to the job's own start; see
+/// the derivation record's follow-on.
 static LOCAL_JOB: LazyLock<(u64, u64)> = LazyLock::new(|| {
     let minutes = workflow_job_minutes().into_iter().min().unwrap();
     (unix_now(), minutes)
@@ -137,8 +140,11 @@ pub fn remaining_at(job: (u64, u64), now: u64) -> Result<Duration, String> {
 /// until the running coverage job's inner test deadline. This is the deadline
 /// the coverage orchestrator itself enforces on the test process, inside the
 /// job's evidence reserve, so a stall is reported in the job by whichever of
-/// the two observes it first. A local run, which records no job, gets the
-/// window a coverage job of the shortest limit gives a test that starts it.
+/// the two observes it first. A run that records no job gets the window a
+/// coverage job of the shortest limit gives a test that starts it. Coverage
+/// jobs set the limit only on their test steps while the start persists for
+/// the job, and only those steps run these binaries, so a run that records
+/// one without the other is refused.
 pub fn until_job_deadline() -> Duration {
     let job = recorded_job().unwrap_or_else(|| *LOCAL_JOB);
     remaining_at(job, unix_now()).unwrap_or_else(|error| panic!("{error}"))
