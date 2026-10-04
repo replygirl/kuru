@@ -173,6 +173,42 @@ fn call(name: &str, args: Value) -> ToolCall {
         arguments: args,
     }
 }
+/// Close every store the calling test still holds open, then require that the
+/// test awaited each Dolt supervisor it started, wherever it opened the store.
+/// A store dropped without a close hands its supervisor to a detached reaper
+/// thread: the supervisor stops Dolt and exits on its own, after the test, and
+/// when the test is the last of its executable that exit writes a coverage
+/// profile after the partition's tests have finished, which the coverage
+/// partition rejects. Call it as each test's last step, after every other
+/// store was closed or passed here; closing an already closed store is a no-op.
+pub(crate) async fn close_stores(stores: impl IntoIterator<Item = MemoryStore>) {
+    for store in stores {
+        store.close().await.unwrap();
+    }
+    assert_eq!(
+        unawaited_test_supervisors(),
+        Vec::<String>::new(),
+        "the test must close every memory store it opened before it returns"
+    );
+}
+
+fn unawaited_test_supervisors() -> Vec<String> {
+    kuru_memory::test_support::unawaited_supervisors(&kuru_memory::test_support::test_supervisors())
+}
+
+#[tokio::test]
+async fn close_stores_requires_every_store_the_test_opened() {
+    let memory = MemoryStore::temporary().await.unwrap();
+    let unawaited = unawaited_test_supervisors();
+    assert_eq!(unawaited.len(), 1, "{unawaited:?}");
+    assert!(
+        unawaited[0].contains("has not been reaped"),
+        "{unawaited:?}"
+    );
+    close_stores([memory]).await;
+    assert_eq!(unawaited_test_supervisors(), Vec::<String>::new());
+}
+
 async fn fixture(mode: Mode, fake: Arc<dyn Provider>) -> (TempDir, Harness) {
     let directory = tempfile::tempdir().unwrap();
     let config = Config {
@@ -217,6 +253,7 @@ async fn equal_activation_keeps_the_same_speaker_across_completed_turns() {
     let second = harness.run("second equal turn").await.unwrap();
     assert_eq!(second.speaker, first.speaker);
     harness.shutdown(false).await.unwrap();
+    close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -418,6 +455,7 @@ async fn cold_ties_follow_each_modes_authored_order() {
             event.kind() == "speaker-selection" && event.detail() == "mode-authored-order"
         }));
         harness.shutdown(false).await.unwrap();
+        close_stores([harness.memory.clone()]).await;
     }
 }
 
@@ -449,6 +487,7 @@ async fn authored_tie_break_skips_missing_parts_and_falls_back_to_stable_ids() {
     assert_eq!(speaker, "dream-a");
     assert_eq!(reason, "stable-id-order");
     harness.shutdown(false).await.unwrap();
+    close_stores([harness.memory.clone()]).await;
 }
 
 struct FailingSpeaker(AtomicBool);
@@ -522,6 +561,7 @@ async fn failed_speaking_does_not_replace_completed_speaker() {
         Some(completed.as_str())
     );
     harness.shutdown(false).await.unwrap();
+    close_stores([harness.memory.clone()]).await;
     drop(directory);
 }
 
@@ -560,19 +600,22 @@ async fn peers_are_concurrent_bounded_and_never_receive_each_others_private_cont
     assert_eq!(harness.history().await.unwrap().len(), 2);
     assert!(fake.peak.load(Ordering::SeqCst) > 1);
     assert!(fake.peak.load(Ordering::SeqCst) <= harness.config.max_parallel);
-    let requests = fake.requests.lock().unwrap();
-    assert_eq!(requests.len(), harness.topology.parts.len() + 1);
-    for request in requests
-        .iter()
-        .filter(|r| !r.actor.ends_with(&private_owner))
     {
-        assert!(
-            !serde_json::to_string(request)
-                .unwrap()
-                .contains("PRIVATE-OWNER-SECRET")
-        );
+        let requests = fake.requests.lock().unwrap();
+        assert_eq!(requests.len(), harness.topology.parts.len() + 1);
+        for request in requests
+            .iter()
+            .filter(|r| !r.actor.ends_with(&private_owner))
+        {
+            assert!(
+                !serde_json::to_string(request)
+                    .unwrap()
+                    .contains("PRIVATE-OWNER-SECRET")
+            );
+        }
+        assert_eq!(result.input_tokens, 7 * requests.len() as u64);
     }
-    assert_eq!(result.input_tokens, 7 * requests.len() as u64);
+    close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -615,6 +658,7 @@ async fn peer_messages_route_directly_with_a2a_provenance_and_tool_receipts() {
             .iter()
             .any(|m| m.role == "tool" && m.text_projection().contains("delivered"))
     );
+    close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -669,25 +713,28 @@ async fn relationships_preserve_their_own_history_without_access_to_part_notes()
             .iter()
             .any(|m| m.text_projection().contains("RELATION-ONLY-NOTE"))
     );
-    let requests = fake.requests.lock().unwrap();
-    let group = requests
-        .iter()
-        .find(|r| r.actor.ends_with(&relation.id))
-        .unwrap();
-    assert!(!group.instructions.contains("PART-ONLY-NOTE"));
-    assert!(
-        group
-            .messages
+    {
+        let requests = fake.requests.lock().unwrap();
+        let group = requests
             .iter()
-            .any(|m| m.text_projection().contains("RELATION-ONLY-NOTE"))
-    );
-    for request in requests.iter().filter(|r| !r.actor.ends_with(&relation.id)) {
+            .find(|r| r.actor.ends_with(&relation.id))
+            .unwrap();
+        assert!(!group.instructions.contains("PART-ONLY-NOTE"));
         assert!(
-            !serde_json::to_string(request)
-                .unwrap()
-                .contains("RELATION-ONLY-NOTE")
+            group
+                .messages
+                .iter()
+                .any(|m| m.text_projection().contains("RELATION-ONLY-NOTE"))
         );
+        for request in requests.iter().filter(|r| !r.actor.ends_with(&relation.id)) {
+            assert!(
+                !serde_json::to_string(request)
+                    .unwrap()
+                    .contains("RELATION-ONLY-NOTE")
+            );
+        }
     }
+    close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1913,6 +1960,7 @@ async fn invalid_tool_calls_are_visible_to_the_model_and_cannot_change_state() {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     assert_eq!(result_sha256.as_deref(), Some(digest.as_str()));
+    close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1945,6 +1993,7 @@ async fn modeled_state_selects_a_peer_and_stores_private_notes() {
             .iter()
             .any(|r| r.actor.ends_with(&id) && r.instructions.contains("durable priority"))
     );
+    close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1989,6 +2038,7 @@ async fn cyclic_peers_stop_at_peer_round_limit() {
     assert_eq!(output.response_outcome, Some(crate::ResponseOutcome::Text));
     assert!(output.events.iter().any(|e| e.kind() == "budget"));
     assert!(fake.requests.lock().unwrap().len() <= 10);
+    close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2008,6 +2058,7 @@ async fn empty_response_is_separate_from_resource_limits() {
     assert_eq!(output.limit_reasons, Some(vec![]));
     assert_eq!(output.response_outcome, Some(crate::ResponseOutcome::Empty));
     harness.shutdown(false).await.unwrap();
+    close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2045,6 +2096,7 @@ async fn tool_call_limit_is_reported_without_a_peer_round_limit() {
         "the budget-refused invocation settles exactly once"
     );
     harness.shutdown(false).await.unwrap();
+    close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2111,6 +2163,7 @@ async fn dreaming_adds_retires_and_undoes_without_losing_memories() {
             .active
     );
     assert!(harness.undo_dream().await.is_err());
+    close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2140,11 +2193,11 @@ async fn dream_additions_persist_the_equal_peer_preamble() {
         canonical_peer_instruction(tendency).unwrap(),
         "dream additions must persist the same equal-peer preamble as builtins"
     );
+    close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
 async fn provider_free_undo_preserves_sessions_and_archives_added_identities() {
-    let supervisors = kuru_memory::test_support::supervisor_mark();
     let (_directory, mut harness) = fixture(Mode::Ifs, Fake::new(|_| answer("Summary"))).await;
     let config = harness.config.clone();
     let scope = harness.scope.clone();
@@ -2197,15 +2250,7 @@ async fn provider_free_undo_preserves_sessions_and_archives_added_identities() {
             .unwrap()
             .active
     );
-    // Close, rather than drop, the last handle: a dropped store's supervisor
-    // stops Dolt and exits on its own after the test returns, and as the last
-    // test of a coverage run it outlived the test process.
-    memory.close().await.unwrap();
-    assert_eq!(
-        kuru_memory::test_support::unawaited_supervisors(&supervisors),
-        Vec::<String>::new(),
-        "the test must await its memory supervisor's exit before it returns"
-    );
+    close_stores([memory]).await;
 }
 
 #[tokio::test]
@@ -2219,10 +2264,11 @@ async fn injected_host_must_match_the_canonical_workspace() {
         ..Config::default()
     };
     let host = ToolHost::new(other.path(), &config).unwrap();
+    let memory = MemoryStore::temporary().await.unwrap();
     let result = Harness::with_tool_host(
         config,
         workspace.path(),
-        MemoryStore::temporary().await.unwrap(),
+        memory.clone(),
         Fake::new(|_| answer("unused")),
         None,
         host,
@@ -2234,6 +2280,7 @@ async fn injected_host_must_match_the_canonical_workspace() {
             .to_string()
             .contains("does not match the canonical workspace")
     );
+    close_stores([memory]).await;
 }
 
 #[tokio::test]
@@ -2279,6 +2326,7 @@ async fn dreaming_rejects_last_role_removal_unknown_roles_names_and_capacity_ove
             .await
             .is_err()
     );
+    close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2326,6 +2374,7 @@ async fn dreaming_uses_isolated_actor_histories_and_runs_periodically() {
             .count(),
         6
     );
+    close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2477,6 +2526,7 @@ async fn manual_focus_and_relationship_validation_reject_invalid_topology() {
         },
     );
     h.save().await.unwrap();
+    close_stores([h.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2517,6 +2567,7 @@ async fn rpc(app: axum::Router, body: Value, token: &str, version: &str) -> (u16
 async fn a2a_server_enforces_auth_validates_protocol_and_returns_peer_output() {
     let provider = Fake::new(|_| answer("real A2A answer"));
     let (_dir, h) = fixture(Mode::Freudian, provider.clone()).await;
+    let memory = h.memory.clone();
     let shared = Arc::new(tokio::sync::Mutex::new(h));
     assert!(crate::server::router(shared.clone(), "http://localhost", "short").is_err());
     let app = crate::server::router(shared, "http://localhost", "test-token-123456").unwrap();
@@ -2617,4 +2668,5 @@ async fn a2a_server_enforces_auth_validates_protocol_and_returns_peer_output() {
         serde_json::from_slice(&to_bytes(card.into_body(), 10000).await.unwrap()).unwrap();
     assert_eq!(card["supportedInterfaces"][0]["protocolVersion"], "1.0");
     assert_eq!(card["capabilities"]["streaming"], false);
+    close_stores([memory]).await;
 }

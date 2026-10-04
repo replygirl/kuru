@@ -131,7 +131,11 @@ process and writes its profile during the partition's exports. Close every
 store a test opens before it returns. A test can prove it with
 `test_support::supervisor_mark()` before it opens memory and
 `test_support::unawaited_supervisors(&mark)` before it returns, which lists
-every supervisor the test started that is unreaped or was dropped live.
+every supervisor the test started that is unreaped or was dropped live;
+`test_support::test_supervisors()` marks every supervisor the calling test
+starts, for a fixture that opens its store before it could take a mark.
+`kuru-runtime` tests end with `crate::tests::close_stores([...])`, which
+closes the stores they still hold and asserts that list is empty.
 
 The merge refuses a receipt without that digest or an export that differs from
 it or from its totals. It requires every partition to report the same files,

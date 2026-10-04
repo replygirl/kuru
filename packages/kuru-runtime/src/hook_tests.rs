@@ -457,6 +457,7 @@ async fn inspection_skips_hooks_while_runtime_rewrite_preserves_the_durable_inpu
             .is_some_and(|text| text.contains("original input"))
     }));
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -527,6 +528,7 @@ async fn deliberation_hook_cannot_turn_a_cognitive_call_into_external_dispatch()
         } if name == "a2a_send"
     )));
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
     server.abort();
 }
 
@@ -629,6 +631,7 @@ async fn tool_hooks_cover_deliberation_and_speaking_calls_and_keep_results_separ
     );
     assert_eq!(output.text, "final answer");
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -694,6 +697,7 @@ async fn rewritten_file_read_is_checked_against_the_final_root_before_execution(
             .any(|event| { is_hook(event, "pre_tool", Some("rewritten"), None) })
     );
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -866,6 +870,7 @@ async fn granted_file_read_cannot_be_rewritten_into_shell_or_mcp() {
         assert!(!project.path().join("shell-rewrite-ran").exists());
         assert_eq!(mcp_calls.load(Ordering::SeqCst), 0);
         harness.shutdown(false).await.unwrap();
+        crate::tests::close_stores([harness.memory.clone()]).await;
     }
     server.abort();
     server.await.unwrap_err();
@@ -944,6 +949,7 @@ async fn rejected_annotation_write_does_not_replay_or_relabel_a_settled_mutating
         hook_annotation(message).is_some_and(|value| value["call_id"] == "deliberation-hook-call")
     }));
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1197,6 +1203,7 @@ async fn parallel_post_hooks_settle_independently_but_rejoin_in_original_call_or
     assert!(receipts[0].contains("first bytes"));
     assert!(receipts[1].contains("second bytes"));
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1293,6 +1300,7 @@ async fn post_turn_failure_continues_without_changing_the_answer_or_starting_a_t
         })
     }));
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1411,6 +1419,7 @@ async fn post_turn_never_runs_before_settlement_and_failed_annotation_cannot_und
         b"x"
     );
     settled.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone(), settled.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1497,6 +1506,7 @@ async fn post_tool_annotation_stays_with_its_actor_and_can_be_omitted_by_context
         hook_annotation(message).is_some_and(|value| value["annotation"] == "PRIVATE-HOOK-SENTINEL")
     }));
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1539,6 +1549,7 @@ async fn speaker_stop_preserves_the_selected_peer_and_makes_no_speaking_dispatch
         );
         assert_eq!(harness.topology.parts[0].id, target);
         harness.shutdown(false).await.unwrap();
+        crate::tests::close_stores([harness.memory.clone()]).await;
     }
 }
 
@@ -1586,6 +1597,7 @@ async fn speaker_observe_receives_the_validated_selection_and_keeps_its_dispatch
             "{mode}"
         );
         harness.shutdown(false).await.unwrap();
+        crate::tests::close_stores([harness.memory.clone()]).await;
     }
 }
 
@@ -1666,6 +1678,7 @@ async fn speaker_hook_cannot_substitute_an_explicitly_selected_peer() {
                 .any(|message| { message == &Message::text("user", "address the selected peer") })
         );
         harness.shutdown(false).await.unwrap();
+        crate::tests::close_stores([harness.memory.clone()]).await;
     }
 }
 
@@ -1720,6 +1733,7 @@ async fn dream_tool_rewrites_stay_within_dream_validation_and_annotations_promot
                     && value["turn_id"].is_null()))
     );
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1849,6 +1863,7 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
         survived.exists()
     );
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 type DreamJoin = (Harness, Result<crate::DreamReport>);
@@ -1986,6 +2001,7 @@ async fn pre_turn_denial_malformed_output_and_timeout_refuse_before_provider_dis
         let history = harness.history().await.unwrap();
         assert_eq!(history[0], Message::text("user", "durable original"));
         harness.shutdown(false).await.unwrap();
+        crate::tests::close_stores([harness.memory.clone()]).await;
     }
 }
 
@@ -2027,6 +2043,7 @@ async fn denied_pre_tool_hook_reaches_the_model_without_dropping_its_call() {
         );
     }
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2084,6 +2101,7 @@ async fn exhausted_post_budget_keeps_answer_and_records_a_separate_failure() {
     );
     assert_eq!(provider.requests.lock().unwrap().len(), 2);
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2133,6 +2151,7 @@ async fn refused_pre_turn_can_retry_exact_identity_without_duplicate_durable_inp
     );
     assert_eq!(history[0], Message::text("user", "original retry input"));
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2226,6 +2245,7 @@ async fn rewritten_safe_retry_uses_its_own_public_turn_after_marker_or_later_ans
                 .any(|message| message.role == crate::INTERRUPTION_ROLE)
         );
         harness.shutdown(false).await.unwrap();
+        crate::tests::close_stores([harness.memory.clone()]).await;
     }
 }
 
@@ -2327,4 +2347,5 @@ async fn retry_that_no_longer_rewrites_projects_the_original_input_again() {
                 .any(|message| message.text_projection().contains("stale rewrite"))
     }));
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }

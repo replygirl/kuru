@@ -285,6 +285,7 @@ async fn pre_turn_rewrite_reaches_the_provider_without_its_durable_hook_provenan
         Some(&Message::text("user", "platform original"))
     );
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -327,6 +328,7 @@ async fn pre_tool_tool_substitution_is_refused_before_dispatch() {
         } if name == "a2a_send"
     )));
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -377,4 +379,5 @@ async fn cancelled_pre_turn_hook_is_reaped_before_the_turn_returns() {
     assert_eq!(harness.hook_host().in_flight_hooks(), 0);
     assert!(provider.requests.lock().unwrap().is_empty());
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }

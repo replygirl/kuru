@@ -660,6 +660,11 @@ mod tests {
         let first = next_id();
         let unawaited = || with(|ledger| ledger.unawaited_since(first, &label));
         assert_eq!(unawaited(), Vec::<String>::new());
+        assert_eq!(
+            super::super::unawaited_supervisors(&super::super::test_supervisors()).len(),
+            1,
+            "the test-wide mark covers a supervisor started before a later mark"
+        );
 
         let closed = register(&store);
         assert_eq!(unawaited().len(), 1, "a live supervisor is unawaited");

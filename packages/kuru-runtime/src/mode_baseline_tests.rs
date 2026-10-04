@@ -136,6 +136,7 @@ async fn all_four_modes_allow_one_hop_speaking_consultation_with_a_relationship(
         assert!(consulted[0].actor.ends_with(&relation.id));
         assert!(consulted[0].tools.is_empty());
         harness.shutdown(false).await.unwrap();
+        crate::tests::close_stores([harness.memory.clone()]).await;
     }
 }
 
@@ -269,6 +270,7 @@ async fn all_four_modes_keep_direct_peer_routes_and_round_budget() {
             }));
         }
         harness.shutdown(false).await.unwrap();
+        crate::tests::close_stores([harness.memory.clone()]).await;
     }
 }
 
@@ -446,6 +448,7 @@ async fn all_four_modes_keep_pre_extraction_requests_and_facing_outcomes() {
         );
         assert_eq!(harness.history().await.unwrap().len(), 10);
         harness.shutdown(false).await.unwrap();
+        crate::tests::close_stores([harness.memory.clone()]).await;
     }
 }
 

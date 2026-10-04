@@ -263,11 +263,14 @@ async fn captured_instruction_graph_reaches_provider_in_reviewed_order() {
         )
         .await
         .unwrap();
-    let requests = provider.requests.lock().unwrap();
-    let instructions = &requests.last().unwrap().instructions;
-    assert!(instructions.contains("CHANGED-INSTRUCTION"));
-    assert!(instructions.contains("LATER-INSTRUCTION"));
-    assert!(!instructions.contains("IMPORTED-INSTRUCTION"));
+    {
+        let requests = provider.requests.lock().unwrap();
+        let instructions = &requests.last().unwrap().instructions;
+        assert!(instructions.contains("CHANGED-INSTRUCTION"));
+        assert!(instructions.contains("LATER-INSTRUCTION"));
+        assert!(!instructions.contains("IMPORTED-INSTRUCTION"));
+    }
+    crate::tests::close_stores([harness.memory.clone(), changed_harness.memory.clone()]).await;
 }
 
 struct OneToolProvider {
@@ -1459,6 +1462,7 @@ async fn tool_only_deliberation_proceeds_to_a_useful_speaking_turn() {
             .iter()
             .any(|request| request.instructions.contains("Phase: speak"))
     );
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1622,6 +1626,7 @@ async fn every_dream_call_gets_a_receipt_including_foreign_retirement_and_excess
         );
         assert_eq!(receipts[3]["call_id"], "excess-2");
     }
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1649,27 +1654,30 @@ async fn a_different_speaker_sees_public_answers_but_not_private_memories() {
         .run_for("Add tests for that implementation", Some(&second))
         .await
         .unwrap();
-    let requests = provider.requests.lock().unwrap();
-    let second_request = requests
-        .iter()
-        .find(|request| request.actor.ends_with(&second))
-        .unwrap();
-    assert!(
-        second_request
-            .instructions
-            .contains("PUBLIC-ANSWER: use a buffered reader")
-    );
-    assert!(
-        second_request
-            .instructions
-            .contains("Shared public conversation")
-    );
-    assert!(
-        !serde_json::to_string(second_request)
-            .unwrap()
-            .contains("PRIVATE-MEMORY-ONLY")
-    );
-    assert!(!second_request.instructions.contains("A private draft"));
+    {
+        let requests = provider.requests.lock().unwrap();
+        let second_request = requests
+            .iter()
+            .find(|request| request.actor.ends_with(&second))
+            .unwrap();
+        assert!(
+            second_request
+                .instructions
+                .contains("PUBLIC-ANSWER: use a buffered reader")
+        );
+        assert!(
+            second_request
+                .instructions
+                .contains("Shared public conversation")
+        );
+        assert!(
+            !serde_json::to_string(second_request)
+                .unwrap()
+                .contains("PRIVATE-MEMORY-ONLY")
+        );
+        assert!(!second_request.instructions.contains("A private draft"));
+    }
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1763,10 +1771,13 @@ async fn different_actors_share_leading_instructions_before_private_identity() {
         )
         .await
         .unwrap();
-    let requests = provider.requests.lock().unwrap();
-    let renamed = requests.last().unwrap();
-    assert_eq!(before_identity(&renamed.instructions), common);
-    assert!(renamed.instructions.contains(" renamed"));
+    {
+        let requests = provider.requests.lock().unwrap();
+        let renamed = requests.last().unwrap();
+        assert_eq!(before_identity(&renamed.instructions), common);
+        assert!(renamed.instructions.contains(" renamed"));
+    }
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1793,10 +1804,13 @@ async fn shared_transcript_keeps_whole_unicode_rows_without_byte_slicing() {
         )
         .await
         .unwrap();
-    let requests = provider.requests.lock().unwrap();
-    let instructions = &requests.last().unwrap().instructions;
-    assert!(instructions.contains(&"🪶".repeat(20_000)));
-    assert!(!instructions.contains("[truncated]"));
+    {
+        let requests = provider.requests.lock().unwrap();
+        let instructions = &requests.last().unwrap().instructions;
+        assert!(instructions.contains(&"🪶".repeat(20_000)));
+        assert!(!instructions.contains("[truncated]"));
+    }
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1857,6 +1871,7 @@ async fn archived_part_and_relationship_histories_remain_inspectable_without_rou
     );
     harness.undo_dream().await.unwrap();
     assert!(harness.resolve(&retiring).is_ok());
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1884,6 +1899,7 @@ async fn undo_archives_new_members_and_preserves_their_memories() {
         "new insight"
     );
     assert!(harness.undo_dream().await.is_err());
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1925,6 +1941,7 @@ async fn a_large_tool_batch_retains_all_current_receipts_for_protocol_replay() {
     .await;
     let output = harness.run("Remember this work").await.unwrap();
     assert_eq!(output.text, "Received 64 receipts");
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1965,6 +1982,7 @@ async fn failed_dream_save_restores_topology_and_leaves_undo_state_untouched() {
             .unwrap()
             .is_none()
     );
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -1993,6 +2011,7 @@ async fn failed_mode_focus_and_relationship_saves_leave_the_running_pool_intact(
     assert_eq!(harness.session.mode, Mode::Freudian);
     assert_eq!(serde_json::to_value(&harness.topology).unwrap(), before);
     assert_eq!(harness.actors.keys().cloned().collect::<Vec<_>>(), actors);
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2081,6 +2100,7 @@ async fn large_private_context_keeps_every_current_tool_receipt_whole() {
         16,
         "fitting the request must not delete optional notes"
     );
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2098,6 +2118,7 @@ async fn malformed_current_tool_receipts_fail_before_provider_invocation() {
         );
     }
     assert!(provider.requests.lock().unwrap().is_empty());
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2167,6 +2188,7 @@ async fn a_models_relationship_proposal_selects_the_temporary_group_as_speaker()
             .any(|request| request.actor.ends_with(&relation.id)
                 && request.instructions.contains("temporary alliance"))
     );
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2233,6 +2255,7 @@ async fn a_speaking_peer_consults_another_peer_without_recursive_delegation() {
             .count(),
         1
     );
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2269,6 +2292,7 @@ async fn partial_provider_failures_leave_other_peers_usable_and_total_failure_is
     assert_eq!(history.len(), 2);
     assert_eq!(history[1].role, INTERRUPTION_ROLE);
     assert_eq!(history[1].text_projection(), INTERRUPTION_TEXT);
+    crate::tests::close_stores([harness.memory.clone(), unavailable.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2298,6 +2322,7 @@ async fn dreaming_accepts_a_valid_model_proposal_and_failed_undo_remains_recover
     harness.undo_dream().await.unwrap();
     assert!(harness.resolve(&new_part).is_err());
     assert!(harness.memory_for(&new_part).await.is_ok());
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2355,19 +2380,22 @@ async fn speaking_peers_send_only_explicit_messages_to_configured_external_a2a_a
         .await
         .unwrap();
     assert_eq!(output.text, "Applied the external review");
-    let records = received.lock().unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["method"], "SendMessage");
-    assert_eq!(
-        records[0]["params"]["message"]["contextId"],
-        format!("{}:{}", harness.session.id, output.speaker)
-    );
-    assert_eq!(
-        records[0]["params"]["message"]["parts"][0]["text"],
-        "Review this explicitly shared question"
-    );
-    assert!(!records[0].to_string().contains("PRIVATE-NOT-EXPORTED"));
-    server.abort();
+    {
+        let records = received.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["method"], "SendMessage");
+        assert_eq!(
+            records[0]["params"]["message"]["contextId"],
+            format!("{}:{}", harness.session.id, output.speaker)
+        );
+        assert_eq!(
+            records[0]["params"]["message"]["parts"][0]["text"],
+            "Review this explicitly shared question"
+        );
+        assert!(!records[0].to_string().contains("PRIVATE-NOT-EXPORTED"));
+        server.abort();
+    }
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
@@ -2586,6 +2614,8 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
     );
     assert_eq!(provider.starts.load(Ordering::SeqCst), calls_before_retry);
     shared.lock().await.shutdown(false).await.unwrap();
+    let memory = shared.lock().await.memory.clone();
+    crate::tests::close_stores([memory]).await;
 }
 
 #[cfg(unix)]
@@ -2634,4 +2664,5 @@ async fn one_rejected_model_does_not_discard_other_peers_dream_summaries() {
         }
     }
     harness.shutdown(false).await.unwrap();
+    crate::tests::close_stores([harness.memory.clone()]).await;
 }

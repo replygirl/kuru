@@ -1152,6 +1152,18 @@ pub fn supervisor_mark() -> SupervisorMark {
     }
 }
 
+/// Every Dolt supervisor the calling test starts in this process, whenever it
+/// starts them: a fixture that must open its store before it can take a
+/// [`supervisor_mark`] passes this to [`unawaited_supervisors`] at teardown.
+/// The mark is the test's label, its thread name, which is unique within one
+/// test executable.
+pub fn test_supervisors() -> SupervisorMark {
+    SupervisorMark {
+        first: 0,
+        label: lifecycle_trace::label(),
+    }
+}
+
 /// Every Dolt supervisor the marked test started since `mark` whose exit it
 /// did not await: one still unreaped, or one whose store was dropped without
 /// a close. A dropped store's supervisor is reaped by a detached thread after
