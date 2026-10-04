@@ -5,6 +5,19 @@
 //! neither a PID nor the child, so callers cannot reap the root and later
 //! signal a recycled numeric group. This is process authority, not sandboxing:
 //! processes that leave the fresh group are outside this boundary.
+//!
+//! Owned spawns create their stdio pipes close-on-exec and start the child
+//! under one platform spawn lock, so a concurrent owned child cannot inherit
+//! another's pipe ends (std's macOS pipes set close-on-exec in a second step,
+//! and posix_spawn and fork copy the descriptor table as it is). The bounded
+//! process snapshot spawns under the same lock. Unrelated legacy spawns and
+//! other non-atomic descriptor creation can still inherit, or leak into owned
+//! children; concurrent callers requiring isolation must use the platform
+//! consistently. On std's fork path, a legacy spawn that inherits an owned
+//! spawn's exec-error pipe stalls that spawn until the legacy child exits, and
+//! every later owned spawn, including the cleanup snapshot, waits behind it;
+//! the remedy is moving those legacy spawns behind the platform, not a
+//! timeout.
 
 use rustix::{
     io::Errno,
@@ -19,11 +32,28 @@ use std::{
     fmt, io,
     os::{fd::OwnedFd, unix::process::CommandExt},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError},
     time::{Duration, Instant},
 };
 
 pub mod snapshot;
+
+/// Orders every platform spawn's descriptor creation against every other
+/// platform spawn's descriptor-table copy. Guards no data.
+static SPAWN: Mutex<()> = Mutex::new(());
+
+/// Hold the platform spawn lock across pipe creation and child creation only.
+/// No caller code, waiting or child I/O runs under it in product builds.
+fn spawn_lock() -> MutexGuard<'static, ()> {
+    match SPAWN.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            blocked_seam();
+            SPAWN.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+}
 
 const MAX_EINTR_ATTEMPTS: usize = 8;
 
@@ -179,11 +209,13 @@ impl OwnedProcessGroup {
     /// the child's ends, so std creates no stdio pipe of its own.
     pub fn spawn(mut command: Command, stdio: StdioPlan) -> io::Result<Self> {
         command.process_group(0);
+        let spawning = spawn_lock();
         let started = launch(&mut command, stdio);
         // The Command owns the child's pipe ends. Close them before returning:
         // a parent copy of its own child's stdout write end would keep that
         // pipe from ever reaching end of file.
         drop(command);
+        drop(spawning);
         let (child, [stdin, stdout, stderr]) = started?;
         // rustix reads the standard Child's native identity infallibly. Keep
         // this immediately after spawn: an error return must never drop a
@@ -406,7 +438,7 @@ fn prepare(slot: StdioSlot, stream: Stream) -> io::Result<Prepared> {
 }
 
 /// A pipe whose ends are both close-on-exec before any platform spawn can
-/// copy them.
+/// copy them: the caller holds the platform spawn lock.
 #[cfg(not(target_vendor = "apple"))]
 fn cloexec_pipe(stream: Stream) -> io::Result<(OwnedFd, OwnedFd)> {
     let ends = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
@@ -449,6 +481,16 @@ fn window_seam(stream: Stream) {
 
 #[cfg(not(test))]
 fn window_seam(_: Stream) {}
+
+#[cfg(test)]
+fn blocked_seam() {
+    if let Some(seam) = BLOCKED.with(|blocked| blocked.borrow_mut().take()) {
+        seam();
+    }
+}
+
+#[cfg(not(test))]
+fn blocked_seam() {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Observation {
@@ -1515,10 +1557,12 @@ mod tests {
             settle_without_sleep(&mut first, bound),
             settle_without_sleep(&mut second, bound),
         ];
-        if first_eof.is_ok() || eof.recv_timeout(bound).is_ok() {
-            if let Ok(reader) = reader {
-                reader.join().unwrap();
-            }
+        // Join the reader only once it has reported; after both groups are
+        // gone nothing else holds A's output write end.
+        if (first_eof.is_ok() || eof.recv_timeout(bound).is_ok())
+            && let Ok(reader) = reader
+        {
+            reader.join().unwrap();
         }
         assert!(
             matches!(first_eof, Ok(Ok(0))),

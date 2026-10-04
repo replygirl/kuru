@@ -313,7 +313,8 @@ fn list_within(program: &Path, timeout: Duration) -> io::Result<String> {
             format!("no time left to run {program:?}"),
         ));
     }
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args([
             "-A",
             "-o",
@@ -322,8 +323,13 @@ fn list_within(program: &Path, timeout: Duration) -> io::Result<String> {
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    // std creates these pipes inside spawn; under the platform spawn lock no
+    // owned child can copy them before they are close-on-exec.
+    let spawning = super::spawn_lock();
+    let spawned = command.spawn();
+    drop(spawning);
+    let mut child = spawned
         .map_err(|error| io::Error::new(error.kind(), format!("spawn {program:?}: {error}")))?;
     let (sender, receiver) = mpsc::channel();
     let drain = |pipe: Option<Box<dyn Read + Send>>, stream: &'static str| {
