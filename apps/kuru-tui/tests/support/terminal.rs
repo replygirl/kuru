@@ -631,9 +631,10 @@ impl Terminal {
         // opener get null stdio, kuru-memory `spawn_service` and
         // src/authentication.rs `open_browser`; tool shells, hooks and MCP
         // stdio servers get pipes). EOF is therefore already due when the exit
-        // is seen, and this bound reports a leaked holder; it encloses no
-        // product budget to derive from.
-        let drain_deadline = Instant::now() + Duration::from_secs(1);
+        // is seen, and only this process's reader thread stands between them.
+        // The drain spends what remains of the caller's `timeout`, not a flat
+        // window a descheduled reader could miss; reaching it reports a leaked
+        // holder.
         loop {
             match self.receive_output(TICK)? {
                 Ok(Ok(bytes)) => {
@@ -643,8 +644,8 @@ impl Terminal {
                 Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     ensure!(
-                        Instant::now() < drain_deadline,
-                        "PTY output did not close after process exit\n{}",
+                        Instant::now() < deadline,
+                        "PTY output did not close after process exit within the {timeout:?} wait\n{}",
                         self.diagnostics()
                     );
                 }
