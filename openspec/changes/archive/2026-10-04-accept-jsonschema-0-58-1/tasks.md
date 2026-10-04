@@ -41,3 +41,9 @@ acceptance does not claim a hosted or post-merge result.
   local links and anchors. Native Windows behavioral acceptance and the combined
   coverage gate were not repeated locally for this scoped dependency acceptance;
   the final hosted workflow supplies those checks before merge.
+
+## Current-main integration (2026-10-04)
+
+The earlier hosted run [37215452265](https://github.com/replygirl/kuru/actions/runs/37215452265) failed in Ubuntu coverage partition 4 while `idle_accept_deadlines_do_not_close_live_attachment` opened its store: Dolt exited with status 1 before readiness. The retained artifact did not include its private server log, so the underlying cause remains unknown; this is not attributed to jsonschema or claimed fixed by an unrelated change.
+
+Rebased cleanly onto main `cd55218782a50e9b21c905dd42874b487fa4a46a`, including the separately merged startup diagnostics from PR #213 and intervening fixes. Both dependency and acceptance commits remain patch-equivalent (`git range-diff` reports `=` for each); no dependency, feature or lockfile value changed during integration. A fresh final-head CI run is required. No unchanged failed job was rerun. The earlier owning-package behavioral evidence remains applicable to the unchanged dependency source; ordinary hooks provide refreshed static checks, while native integration is verified by the new hosted run.
