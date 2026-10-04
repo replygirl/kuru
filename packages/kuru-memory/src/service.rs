@@ -2661,7 +2661,7 @@ impl std::fmt::Display for MaintenanceTrace {
 /// meets an owner's close does not fail while that close is still within the
 /// budget the owner itself allows, and a configured startup timeout longer
 /// than the close budget still bounds the wait behind a starting owner.
-fn maintenance_deadline(options: &crate::store::OpenOptions) -> Duration {
+pub(crate) fn maintenance_deadline(options: &crate::store::OpenOptions) -> Duration {
     crate::server::close_budget().max(Duration::from_secs(options.config.startup_timeout_secs))
 }
 

@@ -541,11 +541,12 @@ and written only on evidence this process observed itself:
   attaches a cleanup failure or the guard's verdict to that outcome.
   Its retirement step, `test_support::retire_idle_service`, asks the owner to
   retire through the maintenance acquisition, retrying while attached clients
-  make it refuse, until one deadline carried across those retries:
-  `memory.startup_timeout_secs` (30 s by default) from its first request,
-  never longer than the deadline each maintenance attempt enforces on its
-  start-lock wait, owner response and owner-lock wait (the longer of
-  `startup_timeout_secs` and the close budget below). It covers an owner that
+  make it refuse, until one deadline carried across those retries: the
+  product's own maintenance request budget (`service::maintenance_deadline`,
+  the longer of `memory.startup_timeout_secs`, 30 s by default, and the close
+  budget below, 32 s) from its first request, the same budget each
+  maintenance attempt enforces on its start-lock wait, owner response and
+  owner-lock wait. It covers an owner that
   has not shown it is closing (a client still attached, the start lock held,
   or no reply yet);
   no fixture-only bound applies. A request that finds no live endpoint while
@@ -569,11 +570,11 @@ and written only on evidence this process observed itself:
   backstop. The close budget's expiry
   (`managed owner did not release its lock within its close budget of 32s;
   <N>ms since the first retirement request found it closing (<reading>);
-  <owner state>; <trace>`) and the asking deadline's expiry (`managed owner
-  retirement did not complete within memory.startup_timeout_secs (30s; <N>ms
-  since the first request), and no request found the owner closing; <owner
+  <owner state>; <trace>`) and the asking phase's expiry (`managed owner
+  retirement asking phase: no request found the owner closing within the
+  maintenance request budget (32s; <N>ms since the first request); <owner
   state>; <trace>; active-client refusals=<R>`, also for an attempt failing at
-  that deadline) both name the state of the owner they waited
+  that budget) both name the state of the owner they waited
   behind, read at expiry from that owner's records without taking a lock:
   `owner published` (endpoint record present), `owner still opening; last
   stage = X; no endpoint record present` (an open-activity record
@@ -581,8 +582,8 @@ and written only on evidence this process observed itself:
   reason = ...` (a failing record), or `owner closing; last phase = endpoint
   and activity records retired` (its store close, Dolt reap or lock release
   outstanding). A served owner reads as opening only between its two record
-  retirements (a close stalled exactly there is asked until the startup
-  deadline and reported as opening), and an owner without a starter token, or
+  retirements (a close stalled exactly there is asked until the maintenance
+  request budget and reported as opening), and an owner without a starter token, or
   whose best-effort record write failed, publishes no record, so its open
   reads as a close (only in-process test owners are untokened). No
   close step is stamped, so which close step is slow is not known. The
