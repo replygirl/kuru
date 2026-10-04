@@ -3377,9 +3377,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_group_observes_presence_only_after_reaping_its_root() {
-        let mut process =
-            GroupProcess::spawn(group_command("tail -f /dev/null & wait"), GROUP_STDIO, GROUP_BOUND)
-                .unwrap();
+        let mut process = GroupProcess::spawn(
+            group_command("tail -f /dev/null & wait"),
+            GROUP_STDIO,
+            GROUP_BOUND,
+        )
+        .unwrap();
         let _output = process.take_stdout().unwrap();
         let error = process.wait(Duration::from_millis(100)).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
@@ -3477,7 +3480,8 @@ mod tests {
             printf 'running 2 tests\\ntest done ... ok\\n'; \
             printf 'test stuck has been running for over 60 seconds\\n'; \
             wait";
-        let mut group = GroupProcess::spawn(group_command(script), GROUP_STDIO, GROUP_BOUND).unwrap();
+        let mut group =
+            GroupProcess::spawn(group_command(script), GROUP_STDIO, GROUP_BOUND).unwrap();
         let output = group.take_stdout().unwrap();
         // The relay observes each line before it relays it, so once the stuck
         // line arrives here the progress already holds it; only then does the
