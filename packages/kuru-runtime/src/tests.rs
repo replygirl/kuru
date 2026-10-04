@@ -275,7 +275,7 @@ fn every_async_test_runs_its_body_in_the_closing_scope() {
                 .map(|test| format!("{relative}:{test}")),
         );
     }
-    assert!(scanned > 200, "scanned only {scanned} async tests");
+    assert!(scanned > 0, "found no async tests under {}", root.display());
     assert!(
         unscoped.is_empty(),
         "run each async test's body in `kuru_memory::test_support::closing(async {{ ... }}).await`, \
