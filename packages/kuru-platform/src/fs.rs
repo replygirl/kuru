@@ -310,6 +310,35 @@ fn not_found(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, message)
 }
 
+/// The source of [`Directory::verify`]'s replaced-name denial: the name now
+/// identifies another regular file that passed every check the held one did.
+/// Its kind, message and debug form match the plain denial it replaces.
+struct NameReplaced;
+
+const NAME_REPLACED: &str = "file name no longer identifies the held object";
+
+impl std::fmt::Display for NameReplaced {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(NAME_REPLACED)
+    }
+}
+
+impl std::fmt::Debug for NameReplaced {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(NAME_REPLACED, formatter)
+    }
+}
+
+impl std::error::Error for NameReplaced {}
+
+/// Whether `error` is [`Directory::verify`] finding its name replaced by
+/// another private regular file, as distinct from every denial of an object.
+pub fn is_name_replaced(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<NameReplaced>())
+}
+
 /// Child operations take one literal native component, preserving Unix names.
 pub fn validate_component(name: &OsStr) -> io::Result<()> {
     let mut parts = Path::new(name).components();
@@ -393,7 +422,11 @@ pub fn make_executable(file: &File) -> io::Result<()> {
 }
 
 fn checked_file(file: &File) -> io::Result<FileInfo> {
-    let info = regular_file_info(file)?;
+    single_link(regular_file_info(file)?)
+}
+
+/// An unlinked regular file is not found; one with another hardlink is denied.
+fn single_link(info: FileInfo) -> io::Result<FileInfo> {
     if info.links == 0 {
         return Err(not_found("regular file was unlinked"));
     }
@@ -580,11 +613,22 @@ impl Directory {
     }
 
     /// Call after locking and before using an object whose name must be stable.
+    ///
+    /// The held handle is inspected as a retained one: a POSIX replacement of
+    /// its name, which on Windows leaves it delete-pending with no link, reads
+    /// as unlinked (`NotFound`) on every platform, while a delete-pending
+    /// object that still has a link stays denied. A name that now identifies
+    /// another object is denied only after that object passed the same checked
+    /// read, so [`is_name_replaced`] never matches a non-regular, hardlinked or
+    /// non-private replacement.
     pub fn verify(&self, name: &OsStr, file: &File) -> io::Result<()> {
-        let held = checked_file(file)?;
+        let held = single_link(retained_file_info(file)?)?;
         let current = self.read(name)?;
         if held.identity != checked_file(&current)?.identity {
-            return Err(denied("file name no longer identifies the held object"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                NameReplaced,
+            ));
         }
         Ok(())
     }
@@ -980,6 +1024,143 @@ mod tests {
                 & 0o077,
             0,
             "staged payload directory lost owner-only traversal"
+        );
+    }
+
+    /// A private directory holding `record` open, after that object moved to
+    /// `displaced`, where it keeps its one link, leaving `record` free.
+    fn held_then_displaced() -> (tempfile::TempDir, Directory, File) {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let name = OsStr::new("record");
+        directory
+            .create_new(name)
+            .unwrap()
+            .write_all(b"held")
+            .unwrap();
+        let held = directory.read(name).unwrap();
+        directory.verify(name, &held).unwrap();
+        std::fs::rename(
+            directory.path().join(name),
+            directory.path().join("displaced"),
+        )
+        .unwrap();
+        (temporary, directory, held)
+    }
+
+    #[test]
+    fn verify_types_a_name_replaced_by_a_private_regular_file() {
+        let (_temporary, directory, held) = held_then_displaced();
+        let name = OsStr::new("record");
+        directory
+            .create_new(name)
+            .unwrap()
+            .write_all(b"successor")
+            .unwrap();
+
+        let error = directory.verify(name, &held).unwrap_err();
+        assert!(is_name_replaced(&error), "{error:?}");
+        let plain = denied("file name no longer identifies the held object");
+        assert_eq!(error.kind(), plain.kind());
+        assert_eq!(error.to_string(), plain.to_string());
+        assert_eq!(format!("{error:?}"), format!("{plain:?}"));
+        assert_eq!(error.raw_os_error(), None);
+        assert!(!is_name_replaced(&plain), "{plain:?}");
+    }
+
+    #[test]
+    fn verify_keeps_checked_read_denials_of_a_replacement_untyped() {
+        let (_temporary, directory, held) = held_then_displaced();
+        let name = OsStr::new("record");
+        let path = directory.path().join(name);
+        let refused = |what: &str| {
+            let error = directory.verify(name, &held).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied,
+                "{what}: {error:?}"
+            );
+            assert!(!is_name_replaced(&error), "{what}: {error:?}");
+        };
+
+        std::fs::create_dir(&path).unwrap();
+        refused("a directory");
+        std::fs::remove_dir(&path).unwrap();
+
+        directory
+            .create_new(OsStr::new("linked"))
+            .unwrap()
+            .write_all(b"linked")
+            .unwrap();
+        std::fs::hard_link(directory.path().join("linked"), &path).unwrap();
+        refused("a hardlinked file");
+        std::fs::remove_file(&path).unwrap();
+
+        // The non-private object uses Unix modes, as the other privacy
+        // fixtures outside the Windows security module do.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            directory
+                .create_new(name)
+                .unwrap()
+                .write_all(b"shared")
+                .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            refused("a non-private file");
+        }
+    }
+
+    /// A held handle whose name a staged private file replaces, published the
+    /// way checked records are (POSIX replacement), is unlinked on every
+    /// platform: not denied, and not a replaced name.
+    #[test]
+    fn verify_reads_a_held_file_replaced_by_publication_as_unlinked() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let name = OsStr::new("record");
+        directory
+            .create_new(name)
+            .unwrap()
+            .write_all(b"held")
+            .unwrap();
+        let held = directory.read(name).unwrap();
+        directory.verify(name, &held).unwrap();
+        let stage = Directory::ensure_private(&directory.path().join("staging")).unwrap();
+        let staged = OsStr::new("record.tmp");
+        let mut successor = stage.create_new(staged).unwrap();
+        successor.write_all(b"successor").unwrap();
+        directory
+            .publish_file(
+                &stage,
+                staged,
+                &successor,
+                name,
+                Publication::ReplaceRegular,
+            )
+            .unwrap_or_else(|error| panic!("the successor did not publish: {error:?}"));
+
+        assert_eq!(retained_file_info(&held).unwrap().links, 0);
+        // Windows leaves the replaced object delete-pending, which the strict
+        // inspection of a newly admitted handle refuses as denied.
+        #[cfg(windows)]
+        {
+            let strict = regular_file_info(&held).unwrap_err();
+            assert_eq!(strict.kind(), io::ErrorKind::PermissionDenied, "{strict:?}");
+            assert_eq!(
+                strict.to_string(),
+                "filesystem object is pending deletion or has an invalid size"
+            );
+        }
+        let error = directory.verify(name, &held).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error:?}");
+        assert_eq!(error.to_string(), "regular file was unlinked");
+        assert_eq!(error.raw_os_error(), None);
+        assert!(!is_name_replaced(&error), "{error:?}");
+        assert_eq!(
+            std::fs::read(directory.path().join(name)).unwrap(),
+            b"successor"
         );
     }
 
