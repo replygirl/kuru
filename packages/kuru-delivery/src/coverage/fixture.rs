@@ -258,6 +258,8 @@ impl Workspace {
                 llvm_cov: None,
                 profile_env: &profile_env(),
                 output,
+                // Evidence is written for a given identity; no probe runs.
+                deadline: 0,
             },
             identity(mode),
         )
@@ -340,6 +342,10 @@ pub struct ScriptedLauncher {
     pub failing_run: Option<usize>,
     pub stall: bool,
     pub list_error: bool,
+    /// The bound each list was given, in order.
+    pub list_bounds: Vec<std::time::Duration>,
+    /// The time left each exact selection was given, in order.
+    pub run_bounds: Vec<std::time::Duration>,
     pub run_error: bool,
     /// Where each process writes one raw profile, as an instrumented one would.
     pub profiles: Option<PathBuf>,
@@ -361,7 +367,8 @@ impl ScriptedLauncher {
 }
 
 impl Launcher for ScriptedLauncher {
-    async fn list(&mut self, executable: &Path, _: std::time::Duration) -> Result<String> {
+    async fn list(&mut self, executable: &Path, bound: std::time::Duration) -> Result<String> {
+        self.list_bounds.push(bound);
         if self.list_error {
             bail!("scripted list failure");
         }
@@ -375,6 +382,7 @@ impl Launcher for ScriptedLauncher {
         }
         self.profile()?;
         self.runs.push(launch.args.to_vec());
+        self.run_bounds.push(launch.remaining);
         fs::write(&launch.log, b"running\n")?;
         if self.stall {
             let mut progress = LibtestProgress::default();
@@ -386,6 +394,7 @@ impl Launcher for ScriptedLauncher {
                 cleanup: "Ok(())".to_owned(),
                 presence_after_reap: None,
                 output: "complete".to_owned(),
+                wait: "scripted wait timed out".to_owned(),
             })));
         }
         let selected = launch.args.len() as isize - 1;

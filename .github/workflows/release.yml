@@ -50,6 +50,12 @@ jobs:
       # Keep the genuine test-profile Kuru input below its production archive bound.
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
+      # The delivery tests bound launches with no budget of their own by this
+      # job's inner test deadline, as coverage jobs do, instead of a window
+      # from their own first launch.
+      - name: Record the job start for the inner test deadline
+        shell: bash
+        run: printf 'KURU_COVERAGE_JOB_STARTED=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
@@ -97,6 +103,9 @@ jobs:
             install -y --no-install-recommends dbus gnome-keyring libsecret-tools
       - name: Run Ubuntu native tests with the OS secret store
         shell: bash
+        env:
+          # Must equal this job's timeout-minutes.
+          KURU_COVERAGE_JOB_MINUTES: "60"
         run: |
           # The Linux keyring backend requires the real Secret Service default
           # collection. Give this headless runner its own session and fixture

@@ -36,7 +36,6 @@ const SCHEMA: u32 = 2;
 const LLVM_COV_VERSION: &str = "cargo-llvm-cov 0.9.1";
 const INSTRUMENTATION: &str = "cargo-test-no-run;workspace;all-targets;all-features;locked;instrument-coverage;exact-libtest-executables;partitioned-exact-tests";
 const UNINSTRUMENTED: &str = "cargo-test-no-run;packages;all-targets;all-features;locked;uninstrumented;exact-libtest-executables;partitioned-exact-tests";
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
 const JSON_LIMIT: u64 = 16 * 1024 * 1024;
 const MANIFEST_LIMIT: u64 = 1024 * 1024;
@@ -44,14 +43,29 @@ const PROFILE_LIMIT: u64 = 512 * 1024 * 1024;
 const PROFILE_TOTAL_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 const PROFILE_COUNT_LIMIT: usize = 4096;
 const RUNNER_LEDGER_LIMIT: u64 = 16 * 1024 * 1024;
-const RUNNER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bound for one executable's `--list` run and its captured output.
-const LIST_TIMEOUT: Duration = Duration::from_secs(120);
 const LIST_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 /// Time kept between the partition's test deadline and its hosted job limit. It
 /// covers tree termination and cleanup, fast refusal of the remaining Cargo
 /// test executables, LCOV export, evidence writing and the diagnostics upload.
 const EVIDENCE_RESERVE: Duration = Duration::from_secs(10 * 60);
+/// The serial steps a stalled partition spends inside [`EVIDENCE_RESERVE`]
+/// after its shard deadline, each given an equal slice: the stopped test
+/// tree's three cleanup waits (the signal retries in `terminate`, the reap
+/// and absence confirmation, and the drain of its output relay; Windows
+/// terminates its Job in one call and spends two), then the evidence step:
+/// the fast refusal of the remaining executables, `failure.txt` and the
+/// workflow's diagnostics upload.
+const RESERVE_SLICES: u64 = 4;
+/// Bound for each wait after a test tree is stopped: at the shard deadline,
+/// on a runner signal, or when its stdout pipe is missing. One slice of the
+/// evidence reserve, 600 s / 4 = 150 s, so the three cleanup waits of a stall
+/// end at most 450 s after the shard deadline and leave the evidence step its
+/// 150 s inside the job limit. Expiry is recorded in the stall or interrupt
+/// evidence; the partition is already failing. A test process's settle and
+/// output drain after an ordinary exit are not bounded by it: both are part of
+/// the executable's wait, which carries the shard deadline.
+const RUNNER_CLEANUP_TIMEOUT: Duration =
+    Duration::from_secs(EVIDENCE_RESERVE.as_secs() / RESERVE_SLICES);
 const TEST_LOG_LIMIT: u64 = 32 * 1024 * 1024;
 const RECENT_RESULT_LIMIT: usize = 20;
 const PENDING_LINE_LIMIT: usize = 64 * 1024;
@@ -761,6 +775,17 @@ pub fn shard_deadline(job_started: u64, job_minutes: u64) -> Result<u64> {
         .context("coverage deadline overflows")
 }
 
+/// The latest moment a partition's post-test evidence work may run: the hosted
+/// job limit less the evidence step's slice of the reserve
+/// ([`RUNNER_CLEANUP_TIMEOUT`]), so a stalled receipt probe fails inside the
+/// job and the diagnostics upload keeps its share. The receipt runs after the
+/// tests and their exports, which may end past the shard deadline.
+pub fn evidence_deadline(job_started: u64, job_minutes: u64) -> Result<u64> {
+    shard_deadline(job_started, job_minutes)?
+        .checked_add(EVIDENCE_RESERVE.as_secs() - RUNNER_CLEANUP_TIMEOUT.as_secs())
+        .context("coverage evidence deadline overflows")
+}
+
 pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
     let RunnerConfigOptions {
         root,
@@ -1066,6 +1091,9 @@ struct StallEvidence {
     cleanup: String,
     presence_after_reap: Option<String>,
     output: String,
+    /// Why the executable's wait ended at the deadline, for the partition's
+    /// error only: [`StallReport`]'s schema is pinned and gains no field.
+    wait: String,
 }
 
 enum Supervision {
@@ -1277,6 +1305,15 @@ where
 /// At the deadline, sample, terminate and await bounded cleanup, then return the
 /// observed progress. Output draining is bounded in both outcomes: a process
 /// outside the owned tree may still hold the pipe after the tree is quiescent.
+///
+/// After an ordinary exit the drain is the rest of the executable's own wait,
+/// so it takes the time left before the shard deadline, like the settle before
+/// it. The owned tree is then confirmed gone, and no product process inherits a
+/// test's stdout (kuru-memory starts its owner with stdout null on both
+/// platforms and its supervisor with a private pipe), so the pipe stays open
+/// only for a process that leaked it. Still open at the deadline, the
+/// executable is reported as a stall naming that holder. After a stopped tree
+/// the drain takes one cleanup slice ([`RUNNER_CLEANUP_TIMEOUT`]).
 async fn supervise<P, R, W>(
     process: &mut P,
     output: R,
@@ -1292,7 +1329,7 @@ where
 {
     let deadline = tokio::time::Instant::now() + remaining;
     let mut progress = LibtestProgress::default();
-    let (waited, sample, termination, cleanup, presence_after_reap, output) = {
+    let (waited, sample, termination, cleanup, presence_after_reap, output, drained) = {
         let mut relay = std::pin::pin!(relay_output(output, relay, &log, &mut progress));
         let mut relayed = None;
         let waited = loop {
@@ -1311,12 +1348,25 @@ where
         } else {
             (None, String::new(), String::new(), None)
         };
-        let output = match relayed {
-            Some(outcome) => outcome,
-            None => match tokio::time::timeout(cleanup_bound, &mut relay).await {
-                Ok(outcome) => outcome,
-                Err(_) => format!(
-                    "stopped after {cleanup_bound:?}: a process outside the owned tree still holds the output"
+        let (output, drained) = match relayed {
+            Some(outcome) => (outcome, true),
+            None if waited.is_err() => {
+                match tokio::time::timeout(cleanup_bound, &mut relay).await {
+                    Ok(outcome) => (outcome, true),
+                    Err(_) => (
+                        format!(
+                            "stopped after {cleanup_bound:?}: a process outside the owned tree still holds the output"
+                        ),
+                        false,
+                    ),
+                }
+            }
+            None => match tokio::time::timeout_at(deadline, &mut relay).await {
+                Ok(outcome) => (outcome, true),
+                Err(_) => (
+                    "stopped at the shard deadline: a process outside the owned tree still holds the output"
+                        .to_owned(),
+                    false,
                 ),
             },
         };
@@ -1327,15 +1377,27 @@ where
             cleanup,
             presence_after_reap,
             output,
+            drained,
         )
     };
     match waited {
-        Ok(status) => {
+        Ok(status) if drained => {
             if output != "complete" {
                 eprintln!("coverage runner output relay: {output}");
             }
             Ok(Supervision::Exited(status, progress.announced))
         }
+        // The tree exited and settled, so nothing is left to terminate; the
+        // root's observation and the confirmed absence are the evidence.
+        Ok(status) => Ok(Supervision::Stalled(Box::new(StallEvidence {
+            progress,
+            sample: process.sample(),
+            termination: String::new(),
+            cleanup: String::new(),
+            presence_after_reap: process.presence_after_reap(),
+            output,
+            wait: format!("the test process exited ({status}) but its output stayed open"),
+        }))),
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
             Ok(Supervision::Stalled(Box::new(StallEvidence {
                 progress,
@@ -1344,6 +1406,7 @@ where
                 cleanup,
                 presence_after_reap,
                 output,
+                wait: error.to_string(),
             })))
         }
         Err(error) => bail!(
@@ -1521,7 +1584,7 @@ fn count_profiles(target: &Path) -> Result<usize> {
 }
 
 /// The time left before the deadline, or `None` once it has passed.
-fn remaining_until(deadline: u64) -> Result<Option<Duration>> {
+pub(crate) fn remaining_until(deadline: u64) -> Result<Option<Duration>> {
     let now = unix_now()?;
     Ok((now < deadline).then(|| Duration::from_secs(deadline - now)))
 }
@@ -1646,10 +1709,13 @@ async fn dispatch_with<L: Launcher>(
 
     // Every partition lists every executable: the lists prove completeness,
     // and in an instrumented partition the list run leaves each object a profile.
+    // The list ends on its exit and output EOF, bounded like every selection by
+    // the shard deadline alone: a list still running there fails the partition
+    // with the list error, inside the evidence reserve.
     let list_started = unix_now()?;
     let before_list = spawns::profile_names(target_dir)?;
     let listed = match launcher
-        .list(&executable_path, remaining.min(LIST_TIMEOUT))
+        .list(&executable_path, remaining)
         .await
         .and_then(|text| partition::parse_libtest_list(&text))
     {
@@ -1789,11 +1855,12 @@ async fn dispatch_with<L: Launcher>(
             Supervision::Stalled(evidence) => {
                 record.invocations.push(invocation);
                 finish_record(&mut record, ledger, target_dir)?;
+                let wait = evidence.wait.clone();
                 let report = stall_report(artifact, &executable, *deadline, evidence, &log)?;
                 let path = diagnostics.join(format!("{label}.stall.json"));
                 write_json(&path, &report)?;
                 bail!(
-                    "coverage partition deadline reached while {executable} was running; unfinished tests: {:?}; latest results: {:?}; evidence: {}",
+                    "coverage partition deadline reached while waiting for {executable}: {wait}; unfinished tests: {:?}; latest results: {:?}; evidence: {}",
                     report.unfinished_tests,
                     report.recent_results.last(),
                     path.display()
@@ -1841,6 +1908,7 @@ fn stall_report(
         cleanup,
         presence_after_reap,
         output,
+        wait: _,
     } = *evidence;
     Ok(StallReport {
         schema: SCHEMA,
@@ -1883,8 +1951,9 @@ struct GroupProcess {
     /// Last non-reaping root observation, for the stall sample.
     observed: String,
     presence: Option<String>,
-    /// Bound for the transition, reap and absence confirmation after exit.
-    settle_bound: Duration,
+    /// Bound for [`TestProcess::terminate`]'s retries of an interrupted group
+    /// signal, which takes no deadline of its own.
+    cleanup_bound: Duration,
 }
 
 #[cfg(unix)]
@@ -1892,13 +1961,13 @@ impl GroupProcess {
     fn spawn(
         command: std::process::Command,
         stdio: StdioPlan,
-        settle_bound: Duration,
+        cleanup_bound: Duration,
     ) -> std::io::Result<Self> {
         Ok(Self {
             owner: kuru_platform::unix::OwnedProcessGroup::spawn(command, stdio)?,
             observed: "not observed".to_owned(),
             presence: None,
-            settle_bound,
+            cleanup_bound,
         })
     }
 
@@ -1908,27 +1977,21 @@ impl GroupProcess {
 
     /// Consume the transition, reap the exact root, then confirm absence.
     ///
-    /// Settling is bounded by `settle_bound` and never outlives the caller's
-    /// `deadline`: a settle cut short by that deadline reports `TimedOut`, as
-    /// the wait it belongs to would, so the caller's cleanup still applies.
+    /// Settling is part of the wait it belongs to and is bounded by that
+    /// wait's `deadline` alone: the shard deadline after an ordinary exit, the
+    /// cleanup bound after termination. A settle cut short there reports
+    /// `TimedOut`, as the wait would, so the caller's stall cleanup applies,
+    /// and the step it was in stays in the stall sample.
     async fn settle(&mut self, deadline: tokio::time::Instant) -> std::io::Result<ExitStatus> {
         use kuru_platform::unix::{GroupPresence, Reap, Termination};
 
-        let bound = self.settle_bound;
-        let own = tokio::time::Instant::now() + bound;
-        let (limit, kind, within) = if deadline < own {
-            (
-                deadline,
-                std::io::ErrorKind::TimedOut,
-                "before the wait deadline",
-            )
-        } else {
-            (own, std::io::ErrorKind::Other, "within the settle bound")
-        };
-        let expired = |what: &str| {
+        let limit = deadline;
+        let mut expired = |what: &str| {
+            self.observed
+                .push_str(&format!("; settle: {what} at the wait deadline"));
             std::io::Error::new(
-                kind,
-                format!("owned test process group {what} {within} ({bound:?})"),
+                std::io::ErrorKind::TimedOut,
+                format!("owned test process group {what} before the wait deadline"),
             )
         };
         loop {
@@ -2070,7 +2133,7 @@ impl TestProcess for GroupProcess {
     async fn terminate(&mut self) -> std::io::Result<()> {
         use kuru_platform::unix::Termination;
 
-        let limit = tokio::time::Instant::now() + self.settle_bound;
+        let limit = tokio::time::Instant::now() + self.cleanup_bound;
         loop {
             match self.owner.terminate_before_reap() {
                 // The transition may already have been consumed by a settling exit.
@@ -2113,10 +2176,24 @@ pub fn validate_run_ledger(
     plan::validate_run_ledger(&inventory, partition, host, &EXCLUDED_ARTIFACTS, &records)
 }
 
-async fn checked_output(root: &Path, program: &OsStr, args: &[&str]) -> Result<String> {
+/// Run one identity probe to its exit and output EOF, bounded by the time left
+/// before `deadline` (Unix seconds). A probe still running there fails the
+/// partition with the command's own timeout diagnostics.
+async fn checked_output(
+    root: &Path,
+    program: &OsStr,
+    args: &[&str],
+    deadline: u64,
+) -> Result<String> {
+    let Some(remaining) = remaining_until(deadline)? else {
+        bail!(
+            "coverage deadline {deadline} passed before running {}",
+            Path::new(program).display()
+        );
+    };
     let mut child = command::rooted(root, program);
     child.args(args);
-    let output = command::bounded_output(&mut child, COMMAND_TIMEOUT, COMMAND_OUTPUT_LIMIT)
+    let output = command::bounded_output(&mut child, remaining, COMMAND_OUTPUT_LIMIT)
         .await
         .with_context(|| format!("run {}", Path::new(program).display()))?;
     ensure!(
@@ -2130,39 +2207,45 @@ async fn checked_output(root: &Path, program: &OsStr, args: &[&str]) -> Result<S
 }
 
 /// The exact source and toolchain identity of this runner. `llvm_cov` names
-/// the pinned cargo-llvm-cov executable of an instrumented partition.
+/// the pinned cargo-llvm-cov executable of an instrumented partition. Every
+/// probe ends by `deadline` (Unix seconds): the shard deadline before the
+/// tests, [`evidence_deadline`] for the receipt.
 async fn identity(
     root: &Path,
     expected_source: &str,
     llvm_cov: Option<&Path>,
+    deadline: u64,
 ) -> Result<ReceiptIdentity> {
-    let source = checked_output(root, OsStr::new("git"), &["rev-parse", "HEAD"]).await?;
+    let probe = |program: &'static str, args: &'static [&'static str]| {
+        checked_output(root, OsStr::new(program), args, deadline)
+    };
+    let source = probe("git", &["rev-parse", "HEAD"]).await?;
     ensure!(
         source == expected_source,
         "coverage source is {source}, expected {expected_source}"
     );
-    let tree = checked_output(root, OsStr::new("git"), &["rev-parse", "HEAD^{tree}"]).await?;
-    let status = checked_output(
-        root,
-        OsStr::new("git"),
-        &["status", "--porcelain=v1", "--untracked-files=no"],
-    )
-    .await?;
+    let tree = probe("git", &["rev-parse", "HEAD^{tree}"]).await?;
+    let status = probe("git", &["status", "--porcelain=v1", "--untracked-files=no"]).await?;
     ensure!(
         status.is_empty(),
         "coverage source has modified tracked files"
     );
-    let rustc = checked_output(root, OsStr::new("rustc"), &["-vV"]).await?;
+    let rustc = probe("rustc", &["-vV"]).await?;
     let target = rustc
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
         .context("rustc identity omits host target")?
         .to_owned();
-    let cargo = checked_output(root, OsStr::new("cargo"), &["-vV"]).await?;
+    let cargo = probe("cargo", &["-vV"]).await?;
     let cargo_llvm_cov = match llvm_cov {
         Some(llvm_cov) => {
-            let version =
-                checked_output(root, llvm_cov.as_os_str(), &["llvm-cov", "--version"]).await?;
+            let version = checked_output(
+                root,
+                llvm_cov.as_os_str(),
+                &["llvm-cov", "--version"],
+                deadline,
+            )
+            .await?;
             ensure!(
                 version == LLVM_COV_VERSION,
                 "expected {LLVM_COV_VERSION}, got {version}"
@@ -2196,13 +2279,17 @@ struct ReceiptIdentity {
     target_os: String,
 }
 
-/// Reject a different or modified tracked source before compiling.
+/// Reject a different or modified tracked source before compiling, with every
+/// probe ending by `deadline` (the shard deadline, Unix seconds).
 pub async fn verify_source(
     root: &Path,
     expected_source: &str,
     llvm_cov: Option<&Path>,
+    deadline: u64,
 ) -> Result<()> {
-    identity(root, expected_source, llvm_cov).await.map(drop)
+    identity(root, expected_source, llvm_cov, deadline)
+        .await
+        .map(drop)
 }
 
 /// Hash one raw profile without following links, within the size bound.
@@ -2338,6 +2425,9 @@ pub struct ReceiptOptions<'a> {
     /// Uploaded beside the receipt, which carries its digest.
     pub profile_env: &'a ProfileEnv,
     pub output: &'a Path,
+    /// When the receipt's identity probes must have ended, in Unix seconds:
+    /// the partition's [`evidence_deadline`].
+    pub deadline: u64,
 }
 
 /// Bind the partition's plan, ledgers and coverage to its exact identity and
@@ -2348,11 +2438,12 @@ pub async fn write_receipt(options: &ReceiptOptions<'_>) -> Result<()> {
         run_attempt,
         expected_source,
         llvm_cov,
+        deadline,
         ..
     } = options;
     canonical_attempt(run_attempt)
         .context("coverage run attempt must be a positive integer without leading zeros")?;
-    let observed = identity(root, expected_source, *llvm_cov).await?;
+    let observed = identity(root, expected_source, *llvm_cov, *deadline).await?;
     write_evidence(options, observed)
 }
 
@@ -2829,6 +2920,7 @@ mod tests {
                 llvm_cov: None,
                 profile_env: &ProfileEnv::new(),
                 output: &path.join("output"),
+                deadline: shard_deadline(unix_now().unwrap(), 45).unwrap(),
             })
             .await
             .unwrap_err()
@@ -2851,6 +2943,29 @@ mod tests {
         assert!(shard_deadline(1_000, 0).is_err());
         assert!(shard_deadline(u64::MAX, 90).is_err());
         assert!(shard_deadline(1_000, u64::MAX).is_err());
+    }
+
+    /// A stall's cleanup waits and the evidence step after them each take one
+    /// equal slice of the reserve, so all of them end inside the job limit,
+    /// and the receipt's deadline leaves the evidence step its slice.
+    #[test]
+    fn cleanup_and_receipt_bounds_are_slices_of_the_evidence_reserve() {
+        let job = 1_000 + 45 * 60;
+        let deadline = shard_deadline(1_000, 45).unwrap();
+        assert_eq!(
+            RUNNER_CLEANUP_TIMEOUT,
+            Duration::from_secs(EVIDENCE_RESERVE.as_secs() / RESERVE_SLICES)
+        );
+        assert_eq!(RUNNER_CLEANUP_TIMEOUT, Duration::from_secs(150));
+        // Three serial cleanup waits (terminate retries, reap and absence,
+        // relay drain), then the evidence step's slice.
+        let cleaned = deadline + 3 * RUNNER_CLEANUP_TIMEOUT.as_secs();
+        assert_eq!(cleaned + RUNNER_CLEANUP_TIMEOUT.as_secs(), job);
+        assert_eq!(
+            evidence_deadline(1_000, 45).unwrap(),
+            job - RUNNER_CLEANUP_TIMEOUT.as_secs()
+        );
+        assert!(evidence_deadline(1_000, EVIDENCE_RESERVE.as_secs() / 60).is_err());
     }
 
     #[test]
@@ -3062,6 +3177,60 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn an_exited_tree_whose_output_stays_open_stalls_at_the_shard_deadline() {
+        use tokio::io::AsyncWriteExt;
+
+        let temp = TempDir::new().unwrap();
+        let log = temp.path().join("held.stdout.log");
+        // The tree exits at once, but the writer stays open, as when a process
+        // outside the owned tree leaked the pipe.
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        writer
+            .write_all(b"running 1 test\ntest one ... ok\n")
+            .await
+            .unwrap();
+        let mut process = FakeProcess {
+            exit_after: Some(Duration::ZERO),
+            terminated: false,
+            terminate_result: true,
+        };
+        let started = tokio::time::Instant::now();
+        let supervision = supervise(
+            &mut process,
+            reader,
+            tokio::io::sink(),
+            log.clone(),
+            FAKE_DEADLINE,
+            FAKE_CLEANUP,
+        )
+        .await
+        .unwrap();
+        // The drain takes the shard deadline, not a cleanup slice after it.
+        assert_eq!(started.elapsed(), FAKE_DEADLINE);
+        assert!(!process.terminated, "an exited tree was terminated");
+        let Supervision::Stalled(evidence) = supervision else {
+            panic!("a held output pipe was reported as an ordinary exit");
+        };
+        assert!(evidence.progress.unfinished().is_empty());
+        assert_eq!(evidence.progress.recent, ["test one ... ok"]);
+        assert_eq!(
+            evidence.output,
+            "stopped at the shard deadline: a process outside the owned tree still holds the output"
+        );
+        assert!(
+            evidence.wait.starts_with("the test process exited ("),
+            "{}",
+            evidence.wait
+        );
+        assert_eq!(evidence.termination, "");
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            "running 1 test\ntest one ... ok\n"
+        );
+        drop(writer);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn supervision_terminates_a_stalled_tree_at_the_deadline_with_evidence() {
         use tokio::io::AsyncWriteExt;
 
@@ -3165,8 +3334,12 @@ mod tests {
     const GROUP_STDIO: StdioPlan =
         StdioPlan::new(StdioSlot::Null, StdioSlot::Pipe, StdioSlot::Inherit);
 
-    #[cfg(unix)]
-    const GROUP_BOUND: Duration = Duration::from_secs(20);
+    /// Bound for these tests' real-process group waits: the production
+    /// [`RUNNER_CLEANUP_TIMEOUT`], the longest the runner itself waits on a
+    /// stopped test tree. Group members that must outlive the root are
+    /// `tail -f /dev/null`, which blocks until the group signal ends it, so
+    /// no member's lifetime races a bound.
+    const GROUP_BOUND: Duration = RUNNER_CLEANUP_TIMEOUT;
 
     #[cfg(unix)]
     #[tokio::test]
@@ -3174,11 +3347,11 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let log = temp.path().join("exit.stdout.log");
         let (relay, mut relayed) = tokio::io::duplex(4096);
-        let started = std::time::Instant::now();
-        // The background sleep stays in the root's group and holds its stdout.
-        // Only the post-exit group signal lets the relay reach end of file.
+        // The background member stays in the root's group and holds its stdout.
+        // Only the post-exit group signal lets the relay reach end of file; a
+        // drain still open at the deadline is reported as a stall instead.
         let supervision = supervise_group(
-            group_command("sleep 300 & printf 'test one ... ok\\n'; exit 3"),
+            group_command("tail -f /dev/null & printf 'test one ... ok\\n'; exit 3"),
             GROUP_STDIO,
             relay,
             log.clone(),
@@ -3189,13 +3362,9 @@ mod tests {
         .await
         .unwrap();
         let Supervision::Exited(status, _) = supervision else {
-            panic!("an exiting root was reported as stalled");
+            panic!("the relay waited for the group member instead of signalling it");
         };
         assert_eq!(status.code(), Some(3), "{status:?}");
-        assert!(
-            started.elapsed() < GROUP_BOUND,
-            "the relay waited for the group member instead of signalling it"
-        );
         let mut copied = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut relayed, &mut copied)
             .await
@@ -3207,9 +3376,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_group_observes_presence_only_after_reaping_its_root() {
-        let mut process =
-            GroupProcess::spawn(group_command("sleep 300 & wait"), GROUP_STDIO, GROUP_BOUND)
-                .unwrap();
+        let mut process = GroupProcess::spawn(
+            group_command("tail -f /dev/null & wait"),
+            GROUP_STDIO,
+            GROUP_BOUND,
+        )
+        .unwrap();
         let _output = process.take_stdout().unwrap();
         let error = process.wait(Duration::from_millis(100)).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
@@ -3238,7 +3410,7 @@ mod tests {
         assert_eq!(quick.presence_after_reap().as_deref(), Some("Absent"));
 
         // A missing stdout pipe is refused after the group is cleaned up.
-        let unpiped = group_command("sleep 300");
+        let unpiped = group_command("tail -f /dev/null");
         let temp = TempDir::new().unwrap();
         let error = supervise_group(
             unpiped,
@@ -3257,25 +3429,90 @@ mod tests {
         assert!(error.contains("cleanup=Ok("), "{error}");
     }
 
+    /// A real owned group whose wait reaches its deadline once `deadline`
+    /// resolves, and is the group's own wait after that: the stall test's
+    /// deadline follows the output it must see instead of a wall-clock race.
+    #[cfg(unix)]
+    struct DeadlineAt {
+        group: GroupProcess,
+        deadline: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    #[cfg(unix)]
+    impl TestProcess for DeadlineAt {
+        async fn wait(&mut self, timeout: Duration) -> std::io::Result<ExitStatus> {
+            if let Some(deadline) = self.deadline.as_mut() {
+                // The group's wait is cancellation-safe.
+                tokio::select! {
+                    waited = self.group.wait(timeout) => return waited,
+                    _ = deadline => {
+                        self.deadline = None;
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "the stall test's deadline followed the stuck test's line",
+                        ));
+                    }
+                }
+            }
+            self.group.wait(timeout).await
+        }
+        fn sample(&self) -> Option<String> {
+            self.group.sample()
+        }
+        async fn terminate(&mut self) -> std::io::Result<()> {
+            self.group.terminate().await
+        }
+        fn presence_after_reap(&self) -> Option<String> {
+            self.group.presence_after_reap()
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_group_stall_is_terminated_reaped_and_reported() {
         let temp = TempDir::new().unwrap();
         let log = temp.path().join("stall.stdout.log");
-        let script = "printf 'running 2 tests\\ntest done ... ok\\n'; \
+        // The member is started first, so it is in the group before the line
+        // that ends the wait is printed: a group signal racing the member's
+        // fork could otherwise miss it.
+        let script = "tail -f /dev/null & \
+            printf 'running 2 tests\\ntest done ... ok\\n'; \
             printf 'test stuck has been running for over 60 seconds\\n'; \
-            sleep 300 & wait";
-        let supervision = supervise_group(
-            group_command(script),
-            GROUP_STDIO,
-            tokio::io::sink(),
+            wait";
+        let mut group =
+            GroupProcess::spawn(group_command(script), GROUP_STDIO, GROUP_BOUND).unwrap();
+        let output = group.take_stdout().unwrap();
+        // The relay observes each line before it relays it, so once the stuck
+        // line arrives here the progress already holds it; only then does the
+        // deadline fire. GROUP_BOUND remains the wait's own deadline.
+        let (relay, relayed) = tokio::io::duplex(4096);
+        let (reached, deadline) = tokio::sync::oneshot::channel();
+        let reader = tokio::spawn(async move {
+            let mut reached = Some(reached);
+            let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(relayed));
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.starts_with("test stuck has been running")
+                    && let Some(reached) = reached.take()
+                {
+                    let _ = reached.send(());
+                }
+            }
+        });
+        let mut process = DeadlineAt {
+            group,
+            deadline: Some(deadline),
+        };
+        let supervision = supervise(
+            &mut process,
+            output,
+            relay,
             log.clone(),
-            Duration::from_millis(750),
             GROUP_BOUND,
-            std::future::pending(),
+            GROUP_BOUND,
         )
         .await
         .unwrap();
+        reader.await.unwrap();
         let Supervision::Stalled(evidence) = supervision else {
             panic!("a stalled group was reported as exited");
         };
@@ -3315,7 +3552,7 @@ mod tests {
         // readiness line names the group only after both are in place.
         let interrupt = runner_signals().unwrap();
         let supervision = supervise_group(
-            group_command("sleep 300 & printf 'ready %s\\n' $$; wait"),
+            group_command("tail -f /dev/null & printf 'ready %s\\n' $$; wait"),
             GROUP_STDIO,
             tokio::io::stdout(),
             PathBuf::from(directory).join("signal.stdout.log"),
@@ -3789,6 +4026,55 @@ mod tests {
             plan::validate_run_ledger(&workspace.value, &partition, fixture::HOST, &[], &records)
                 .is_err()
         );
+    }
+
+    /// An executable's list and each of its selections are bounded by the
+    /// time left before the shard deadline alone. The list was capped by a
+    /// 120 s literal, so a list slower than that failed the partition while
+    /// the deadline still allowed it to finish.
+    #[tokio::test]
+    async fn list_and_selections_take_the_time_left_before_the_shard_deadline() {
+        let workspace = fixture::Workspace::new(Mode::Uninstrumented);
+        let temp = workspace.temp.path();
+        let mut launcher = workspace.launcher();
+        let partition = PartitionScheme::new(1, 1).unwrap();
+        let artifact = workspace.runnable()[0];
+        let executable = workspace
+            .target
+            .join(artifact.executable.as_deref().unwrap());
+        let ledger = temp.join("ledger.jsonl");
+        let diagnostics = temp.join("diagnostics");
+        fs::create_dir(&diagnostics).unwrap();
+        let current = workspace.root.join(&artifact.package_root);
+        // The shard deadline of a 45-minute job starting now.
+        let deadline = shard_deadline(unix_now().unwrap(), 45).unwrap();
+        let before = unix_now().unwrap();
+        dispatch_with(
+            &mut launcher,
+            &DispatchOptions {
+                root: &workspace.root,
+                inventory: &workspace.inventory,
+                host: fixture::HOST,
+                partition: &partition,
+                target_dir: &workspace.target,
+                ledger: &ledger,
+                diagnostics: &diagnostics,
+                deadline,
+                executable: &executable,
+                args: &[],
+            },
+            &current,
+            &[],
+        )
+        .await
+        .unwrap();
+        let after = unix_now().unwrap();
+        let left = (deadline - after)..=(deadline - before);
+        assert_eq!(launcher.list_bounds.len(), 1);
+        assert!(!launcher.run_bounds.is_empty());
+        for bound in launcher.list_bounds.iter().chain(&launcher.run_bounds) {
+            assert!(left.contains(&bound.as_secs()), "{bound:?} not in {left:?}");
+        }
     }
 
     #[tokio::test]
@@ -4303,6 +4589,8 @@ mod tests {
             llvm_cov: None,
             profile_env: Box::leak(Box::new(ProfileEnv::new())),
             output: Box::leak(temp.join("out").into_boxed_path()),
+            // Evidence is written for a given identity; no probe runs.
+            deadline: 0,
         };
         let error = write_evidence(
             &options(Mode::Uninstrumented, None),
@@ -4400,10 +4688,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let executable = std::env::current_exe().unwrap();
         let listed = partition::parse_libtest_list(
-            &SystemLauncher
-                .list(&executable, LIST_TIMEOUT)
-                .await
-                .unwrap(),
+            &SystemLauncher.list(&executable, GROUP_BOUND).await.unwrap(),
         )
         .unwrap();
         for probe in PROBES {
@@ -4444,7 +4729,7 @@ mod tests {
         assert!(status.success(), "{status:?}");
         assert_eq!(announced, Some(2));
         let error = SystemLauncher
-            .list(&temp.path().join("missing"), LIST_TIMEOUT)
+            .list(&temp.path().join("missing"), GROUP_BOUND)
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("list the tests"), "{error:#}");
@@ -4454,10 +4739,26 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_group_settle_is_bounded_by_the_wait_deadline() {
-        let command = group_command("sleep 30 & exit 0");
+        use kuru_platform::unix::RootState;
+
+        let command = group_command("tail -f /dev/null & exit 0");
         let unpiped = StdioPlan::new(StdioSlot::Null, StdioSlot::Null, StdioSlot::Inherit);
-        let mut child = GroupProcess::spawn(command, unpiped, Duration::from_secs(60)).unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut child = GroupProcess::spawn(command, unpiped, GROUP_BOUND).unwrap();
+        // The settle path, not the running timeout, is under test: observe the
+        // root's exit, without reaping it, before the zero-length wait.
+        let limit = std::time::Instant::now() + GROUP_BOUND;
+        loop {
+            let state = child.owner.root_state();
+            if matches!(state, RootState::Exited) {
+                break;
+            }
+            assert!(
+                matches!(state, RootState::Running | RootState::Interrupted)
+                    && std::time::Instant::now() < limit,
+                "the root did not exit within {GROUP_BOUND:?}: {state:?}"
+            );
+            tokio::time::sleep(GROUP_POLL).await;
+        }
         let started = std::time::Instant::now();
         match child.wait(Duration::ZERO).await {
             Ok(status) => assert!(status.success()),
@@ -4527,11 +4828,18 @@ mod tests {
         );
         let head = String::from_utf8(git(root, &["rev-parse", "HEAD"]).await.stdout).unwrap();
         fs::write(root.join("source.rs"), "const VALUE: u8 = 2;\n").unwrap();
-        let error = identity(root, head.trim(), Some(Path::new("missing-llvm-cov")))
-            .await
-            .unwrap_err();
+        // A partition's shard deadline for a job starting now.
+        let deadline = shard_deadline(unix_now().unwrap(), 45).unwrap();
+        let error = identity(
+            root,
+            head.trim(),
+            Some(Path::new("missing-llvm-cov")),
+            deadline,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("modified tracked files"));
-        let error = identity(root, "0000", None).await.unwrap_err();
+        let error = identity(root, "0000", None, deadline).await.unwrap_err();
         assert!(error.to_string().contains("expected 0000"), "{error}");
         assert!(
             git(root, &["checkout", "--", "source.rs"])
@@ -4539,7 +4847,7 @@ mod tests {
                 .status
                 .success()
         );
-        let observed = identity(root, head.trim(), None).await.unwrap();
+        let observed = identity(root, head.trim(), None, deadline).await.unwrap();
         assert_eq!(observed.source, head.trim());
         assert_eq!(observed.cargo_llvm_cov, None);
         assert!(
@@ -4548,6 +4856,18 @@ mod tests {
                 .contains(&format!("host: {}", observed.target))
         );
         assert_eq!(observed.target_os, std::env::consts::OS);
-        verify_source(root, head.trim(), None).await.unwrap();
+        verify_source(root, head.trim(), None, deadline)
+            .await
+            .unwrap();
+        // A probe whose deadline has passed is refused before it runs.
+        let passed = unix_now().unwrap();
+        let error = verify_source(root, head.trim(), None, passed)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("deadline {passed} passed before running git")),
+            "{error}"
+        );
     }
 }

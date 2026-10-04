@@ -778,12 +778,20 @@ fn describe(records: &[Record]) -> String {
         .iter()
         .map(|record| record.observation.max_bracket_ms)
         .fold(0.0_f64, f64::max);
+    let (poll, bound) = (
+        super::RETIRE_POLL.as_millis(),
+        super::RETIRE_BOUND.as_secs(),
+    );
     let between = if first.mode.retire_wait {
-        "After the first launch, the warm reopen and the new project the harness waits for \
-         the memory owner to retire, polling every 100 ms (bound 120 s)."
+        format!(
+            "After the first launch, the warm reopen and the new project the harness waits for \
+             the memory owner to retire, polling every {poll} ms (bound {bound} s)."
+        )
     } else {
-        "Ramp series: no run waits for the owner to retire, so owners accumulate; one final \
-         wait (polling every 100 ms, bound 120 s) follows the last run."
+        format!(
+            "Ramp series: no run waits for the owner to retire, so owners accumulate; one final \
+             wait (polling every {poll} ms, bound {bound} s) follows the last run."
+        )
     };
     format!(
         "Observer: {observed}, sampled every {:.0} ms (the sampler sleeps for the rest of each \

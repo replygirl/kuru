@@ -18,25 +18,23 @@
 use super::{
     COMMAND_OUTPUT_LIMIT, LLVM_COV_VERSION, Mode, ProfileEnv, RUNNER_LEDGER_FILE, ReceiptOptions,
     RunnerConfigOptions, WORKSPACE_PACKAGES, artifact_os_label, canonical_attempt,
-    check_partitioning, discard_compile_profiles, lcov, ledger, lines, merge,
-    partition::PartitionScheme, plan, seed, unix_now, workspace_identity, write_inventory,
-    write_json, write_new, write_runner_config,
+    check_partitioning, discard_compile_profiles, evidence_deadline, lcov, ledger, lines, merge,
+    partition::PartitionScheme, plan, remaining_until, seed, shard_deadline, unix_now,
+    workspace_identity, write_inventory, write_json, write_new, write_runner_config,
 };
 use crate::command;
 use anyhow::{Context, Result, bail, ensure};
+#[cfg(windows)]
+use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 /// The pinned cargo-llvm-cov tool request resolved through mise.
 const LLVM_COV_TOOL: &str = "aqua:taiki-e/cargo-llvm-cov@0.9.1";
-/// Bound for short captured commands. `show-env` resolves full Cargo metadata,
-/// which may fetch dependency manifests on a cold runner.
-const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Private state directory created inside the fresh coverage target.
 const STATE: &str = "kuru-shard-state";
 /// State copied beside `failure.txt` when a partition fails after creating it.
@@ -350,19 +348,25 @@ impl Invocation {
 /// Every process interaction of the orchestrator.
 trait Host {
     /// Run a short command and return its trimmed standard output. Output is
-    /// bounded and the command is timed out.
-    async fn capture(&mut self, invocation: &Invocation) -> Result<String>;
+    /// bounded, and the command must end by `deadline` (Unix seconds). Every
+    /// capture precedes the tests, so callers pass the shard deadline: like
+    /// any other pre-test step, a capture still running there (`show-env`
+    /// resolving Cargo metadata on a cold runner, for example) fails the
+    /// partition with its diagnostics inside the evidence reserve.
+    async fn capture(&mut self, invocation: &Invocation, deadline: u64) -> Result<String>;
     /// Run a command to completion without a timeout. Standard output goes to
     /// a new file or, without one, to this job's log; standard error is
     /// inherited. Compilation and the test run are not under the partition
     /// deadline: the Cargo runner enforces that per test selection.
     async fn stream(&mut self, invocation: &Invocation, stdout: Option<&Path>) -> Result<()>;
-    /// Reject a different or modified tracked source (git, rustc, cargo).
+    /// Reject a different or modified tracked source (git, rustc, cargo),
+    /// every probe ending by `deadline` (the shard deadline).
     async fn verify_source(
         &mut self,
         root: &Path,
         source: &str,
         llvm_cov: Option<&Path>,
+        deadline: u64,
     ) -> Result<()>;
     /// Bind the partition's evidence to its exact identity (git, rustc, cargo).
     async fn receipt(&mut self, options: &ReceiptOptions<'_>) -> Result<()>;
@@ -372,11 +376,17 @@ trait Host {
 struct System;
 
 impl Host for System {
-    async fn capture(&mut self, invocation: &Invocation) -> Result<String> {
+    async fn capture(&mut self, invocation: &Invocation, deadline: u64) -> Result<String> {
+        let Some(remaining) = remaining_until(deadline)? else {
+            bail!(
+                "coverage deadline {deadline} passed before running {}",
+                invocation.describe()
+            );
+        };
         let mut child = command::rooted(&invocation.cwd, &invocation.program);
         child.args(&invocation.args);
         child.envs(invocation.env.iter().map(|(key, value)| (key, value)));
-        let output = command::bounded_output(&mut child, CAPTURE_TIMEOUT, COMMAND_OUTPUT_LIMIT)
+        let output = command::bounded_output(&mut child, remaining, COMMAND_OUTPUT_LIMIT)
             .await
             .with_context(|| format!("run {}", invocation.describe()))?;
         ensure!(
@@ -409,8 +419,9 @@ impl Host for System {
         root: &Path,
         source: &str,
         llvm_cov: Option<&Path>,
+        deadline: u64,
     ) -> Result<()> {
-        super::verify_source(root, source, llvm_cov).await
+        super::verify_source(root, source, llvm_cov, deadline).await
     }
 
     async fn receipt(&mut self, options: &ReceiptOptions<'_>) -> Result<()> {
@@ -678,6 +689,9 @@ async fn prepare<H: Host>(
     state_slot: &mut Option<PathBuf>,
 ) -> Result<Prepared> {
     let started = unix_now()?;
+    // Every pre-test capture and source probe ends by the partition's shard
+    // deadline, the one the Cargo runner enforces on each test selection.
+    let deadline = shard_deadline(inputs.job_started, inputs.job_minutes)?;
     let root = resolved_directory(root).context("coverage root")?;
     // One coverage writer per target: a partition never reuses an existing tree.
     create_fresh_directory(&inputs.target, "coverage target")?;
@@ -696,11 +710,10 @@ async fn prepare<H: Host>(
     let llvm_cov = match inputs.mode {
         Mode::Instrumented => {
             let bin = host
-                .capture(&Invocation::new(
-                    "mise",
-                    &["bin-paths", LLVM_COV_TOOL],
-                    &root,
-                ))
+                .capture(
+                    &Invocation::new("mise", &["bin-paths", LLVM_COV_TOOL], &root),
+                    deadline,
+                )
                 .await?;
             let mut lines = bin.lines().filter(|line| !line.trim().is_empty());
             let (Some(bin), None) = (lines.next(), lines.next()) else {
@@ -715,17 +728,16 @@ async fn prepare<H: Host>(
                 llvm_cov.display()
             );
             let version = host
-                .capture(&Invocation::new(
-                    &llvm_cov,
-                    &["llvm-cov", "--version"],
-                    &root,
-                ))
+                .capture(
+                    &Invocation::new(&llvm_cov, &["llvm-cov", "--version"], &root),
+                    deadline,
+                )
                 .await?;
             ensure!(
                 version == LLVM_COV_VERSION,
                 "expected {LLVM_COV_VERSION}, got {version}"
             );
-            host.verify_source(&root, &common.source, Some(&llvm_cov))
+            host.verify_source(&root, &common.source, Some(&llvm_cov), deadline)
                 .await?;
             env.push((
                 OsString::from("CARGO_LLVM_COV_TARGET_DIR"),
@@ -739,6 +751,7 @@ async fn prepare<H: Host>(
                 .capture(
                     &Invocation::new(&llvm_cov, &["llvm-cov", "show-env", "--pwsh"], &root)
                         .with_env(&env),
+                    deadline,
                 )
                 .await?;
             coverage =
@@ -762,7 +775,8 @@ async fn prepare<H: Host>(
             Some(llvm_cov)
         }
         Mode::Uninstrumented => {
-            host.verify_source(&root, &common.source, None).await?;
+            host.verify_source(&root, &common.source, None, deadline)
+                .await?;
             None
         }
     };
@@ -935,7 +949,10 @@ async fn run_shard<H: Host>(
     } = prepared;
 
     let rustc = host
-        .capture(&Invocation::new("rustc", &["-vV"], &root))
+        .capture(
+            &Invocation::new("rustc", &["-vV"], &root),
+            shard_deadline(inputs.job_started, inputs.job_minutes)?,
+        )
         .await?;
     let hosts: Vec<_> = rustc
         .lines()
@@ -1097,6 +1114,9 @@ async fn run_shard<H: Host>(
         llvm_cov: llvm_cov.as_deref(),
         profile_env: &digested_env,
         output: &inputs.output,
+        // The receipt follows the tests and their exports, which may end past
+        // the shard deadline, so its probes take the evidence deadline.
+        deadline: evidence_deadline(inputs.job_started, inputs.job_minutes)?,
     })
     .await
     .context("coverage partition receipt failed")?;
@@ -1655,6 +1675,8 @@ mod tests {
         late_profile: Option<Call>,
         /// Whether the seeded dependency was already in the target at build.
         seeded_at_build: Option<bool>,
+        /// The deadline each capture, source check and receipt was given.
+        deadlines: Vec<(Call, u64)>,
     }
 
     impl Fake {
@@ -1693,6 +1715,7 @@ mod tests {
                 summary_offset: 0,
                 late_profile: None,
                 seeded_at_build: None,
+                deadlines: Vec::new(),
             }
         }
 
@@ -1934,13 +1957,20 @@ mod tests {
     }
 
     impl Host for Fake {
-        async fn capture(&mut self, invocation: &Invocation) -> Result<String> {
+        async fn capture(&mut self, invocation: &Invocation, deadline: u64) -> Result<String> {
             self.invocations.push(invocation.clone());
             let args: Vec<_> = invocation
                 .args
                 .iter()
                 .map(|arg| arg.to_str().unwrap())
                 .collect();
+            let call = match (invocation.program.to_str(), &args[..]) {
+                (Some("mise"), _) => Call::BinPaths,
+                (Some("rustc"), _) => Call::Rustc,
+                (_, ["llvm-cov", "--version"]) => Call::Version,
+                _ => Call::ShowEnv,
+            };
+            self.deadlines.push((call, deadline));
             if invocation.program == "mise" {
                 self.call(Call::BinPaths)?;
                 return Ok(self
@@ -2063,7 +2093,9 @@ mod tests {
             root: &Path,
             source: &str,
             llvm_cov: Option<&Path>,
+            deadline: u64,
         ) -> Result<()> {
+            self.deadlines.push((Call::VerifySource, deadline));
             assert_eq!(root, self.workspace);
             assert_eq!(source, fixture::SOURCE);
             if let Some(llvm_cov) = llvm_cov {
@@ -2074,6 +2106,7 @@ mod tests {
         }
 
         async fn receipt(&mut self, options: &ReceiptOptions<'_>) -> Result<()> {
+            self.deadlines.push((Call::Receipt, options.deadline));
             self.call(Call::Receipt)?;
             assert!(!options.profiles.join("kuru-0-0.profraw").exists());
             self.late(Call::Receipt, options.profiles)?;
@@ -2192,6 +2225,64 @@ mod tests {
 
     const INSTRUMENTED: Step = Step::Shard(Mode::Instrumented);
     const UNINSTRUMENTED: Step = Step::Shard(Mode::Uninstrumented);
+
+    /// Every pre-test capture and source probe ends at the shard deadline the
+    /// Cargo runner enforces, and the receipt at the evidence deadline after
+    /// it: no process bound is a literal shorter than the job allows.
+    #[tokio::test]
+    async fn every_process_bound_takes_the_partitions_deadline_chain() {
+        for step in [INSTRUMENTED, UNINSTRUMENTED] {
+            let mut scenario = Scenario::new(step);
+            let started: u64 = scenario.vars[&format!("{INPUT_PREFIX}JOB_STARTED")]
+                .parse()
+                .unwrap();
+            scenario.run(step).await.unwrap();
+            let shard = shard_deadline(started, 45).unwrap();
+            let evidence = evidence_deadline(started, 45).unwrap();
+            let expected: Vec<_> = scenario
+                .fake
+                .calls
+                .iter()
+                .filter_map(|call| match call {
+                    Call::BinPaths
+                    | Call::Version
+                    | Call::VerifySource
+                    | Call::ShowEnv
+                    | Call::Rustc => Some((*call, shard)),
+                    Call::Receipt => Some((*call, evidence)),
+                    _ => None,
+                })
+                .collect();
+            assert!(expected.contains(&(Call::Rustc, shard)), "{expected:?}");
+            assert_eq!(scenario.fake.deadlines, expected, "{step:?}");
+        }
+        // The chain: the evidence deadline follows the shard deadline by the
+        // reserve less the slice kept for the diagnostics upload, inside the
+        // job limit.
+        assert_eq!(
+            evidence_deadline(1_000, 45).unwrap() - shard_deadline(1_000, 45).unwrap(),
+            super::super::EVIDENCE_RESERVE.as_secs()
+                - super::super::RUNNER_CLEANUP_TIMEOUT.as_secs()
+        );
+        assert!(evidence_deadline(1_000, 45).unwrap() < 1_000 + 45 * 60);
+    }
+
+    /// A capture is refused once its deadline has passed, naming it.
+    #[tokio::test]
+    async fn a_capture_past_its_deadline_is_refused_without_running() {
+        let temp = TempDir::new().unwrap();
+        let missing = Invocation::new("/nonexistent/kuru-probe", &[], temp.path());
+        let passed = unix_now().unwrap();
+        let error = System
+            .capture(&missing, passed)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("deadline {passed} passed before running")),
+            "{error}"
+        );
+    }
 
     #[tokio::test]
     async fn instrumented_partitions_sequence_inventory_runner_export_and_receipt() {
@@ -3118,13 +3209,15 @@ mod tests {
     async fn system_host_streams_and_captures_real_children() {
         let temp = TempDir::new().unwrap();
         let mut host = System;
+        // A partition's shard deadline for a job starting now.
+        let deadline = shard_deadline(unix_now().unwrap(), 45).unwrap();
         let echo = Invocation::new(
             "/bin/sh",
             &["-c", "printf '%s' \"$KURU_ORCHESTRATE_PROBE\""],
             temp.path(),
         )
         .with_env(&[("KURU_ORCHESTRATE_PROBE".into(), " value ".into())]);
-        assert_eq!(host.capture(&echo).await.unwrap(), "value");
+        assert_eq!(host.capture(&echo, deadline).await.unwrap(), "value");
         let output = temp.path().join("streamed.json");
         host.stream(&echo, Some(&output)).await.unwrap();
         assert_eq!(fs::read(&output).unwrap(), b" value ");
@@ -3138,7 +3231,11 @@ mod tests {
         .await
         .unwrap();
         let failing = Invocation::new("/bin/sh", &["-c", "echo nope >&2; exit 4"], temp.path());
-        let error = host.capture(&failing).await.unwrap_err().to_string();
+        let error = host
+            .capture(&failing, deadline)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             error.contains("failed with") && error.contains("nope"),
             "{error}"
@@ -3149,10 +3246,14 @@ mod tests {
             "{error}"
         );
         let missing = Invocation::new("/nonexistent/kuru-probe", &[], temp.path());
-        assert!(host.capture(&missing).await.is_err());
+        assert!(host.capture(&missing, deadline).await.is_err());
         assert!(host.stream(&missing, None).await.is_err());
         let binary = Invocation::new("/bin/sh", &["-c", "printf '\\377'"], temp.path());
-        let error = host.capture(&binary).await.unwrap_err().to_string();
+        let error = host
+            .capture(&binary, deadline)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("non-UTF-8"), "{error}");
     }
 
@@ -3161,8 +3262,10 @@ mod tests {
     async fn system_host_streams_and_captures_real_windows_children() {
         let temp = TempDir::new().unwrap();
         let mut host = System;
+        // A partition's shard deadline for a job starting now.
+        let deadline = shard_deadline(unix_now().unwrap(), 45).unwrap();
         let echo = Invocation::new("cmd.exe", &["/c", "echo value"], temp.path());
-        assert_eq!(host.capture(&echo).await.unwrap(), "value");
+        assert_eq!(host.capture(&echo, deadline).await.unwrap(), "value");
         let output = temp.path().join("streamed.txt");
         host.stream(&echo, Some(&output)).await.unwrap();
         assert_eq!(fs::read_to_string(&output).unwrap().trim(), "value");
@@ -3170,7 +3273,11 @@ mod tests {
         assert!(host.stream(&echo, Some(&output)).await.is_err());
         host.stream(&echo, None).await.unwrap();
         let failing = Invocation::new("cmd.exe", &["/c", "exit 4"], temp.path());
-        let error = host.capture(&failing).await.unwrap_err().to_string();
+        let error = host
+            .capture(&failing, deadline)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("failed with"), "{error}");
         let error = host.stream(&failing, None).await.unwrap_err().to_string();
         assert!(error.contains("failed with"), "{error}");
