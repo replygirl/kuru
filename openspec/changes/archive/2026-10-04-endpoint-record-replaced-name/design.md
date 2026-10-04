@@ -121,15 +121,41 @@ state. The lead accepted this change. Audit of every `.verify(` call site in
   strict `checked_file`, still reports `PermissionDenied` "pending deletion" on
   Windows where Unix reports `NotFound`. In `read_then` that error is neither
   `NotFound` nor the typed outcome, and the probe finds the successor's record,
-  so that attach still fails on Windows. The window is the few instructions
-  between `CreateFileW` returning and the handle's first inspection. It is
-  ordinary admission, which this change keeps strict by decision; the
-  documentation claims only the window between a read and its verify. If it is
-  ever observed (that error text with `read private memory service endpoint`
-  on Windows), the open's held-handle inspection is the place to decide.
+  so that attach still fails on Windows. The window is not a few instructions:
+  `open_file`'s admission (`checked_file` -> `regular_file_info` ->
+  `inspect_info`) reads the delete-pending bit in `inspect_info`'s second
+  metadata query (`FileStandardInfo`, after the `FileAttributeTagInfo` query),
+  so it spans `CreateFileW` returning through two metadata syscalls. That is the
+  same order as the read-to-verify half this change closes (a `ReadFile`, the
+  `between` hook and one or two metadata syscalls), so it must not be read as
+  negligible. It is ordinary admission, which this change keeps strict by
+  decision; the documentation claims only the window between a read and its
+  verify. If it is ever observed (that error text with
+  `read private memory service endpoint` on Windows), the open's held-handle
+  inspection is the place to decide.
+  - Fix shape: the same `single_link(retained_file_info(..))` swap at
+    `open_file`'s admission (about `fs.rs:590`). It admits no object that strict
+    admission refuses: a delete-pending object with zero links becomes
+    `NotFound` instead of `PermissionDenied`, and one with a live link stays
+    denied. It does change the kind every checked open's caller sees on Windows
+    for that state (`Directory::read`, `read_write`, `create_new`, `lock_file`),
+    and about 25 of those callers branch on `NotFound` (`update.rs`
+    `absent`/`load`, `file_edits.rs` `target_snapshot`, `auth/store.rs`
+    `read_record`, `permission_store.rs`, `trust.rs`, `memory_export.rs`,
+    `mcp_cache.rs`, among others). That wider caller audit is why it needs its
+    own change rather than this one.
+  - Scheduling: a scheduled follow-on, not left to lapse. It was catalogued in
+    the team's flake catalogue on 2026-10-04 and reported to the lead for
+    assignment.
 - On Windows the retirement path deletes its staged record with the legacy
   delete disposition, which keeps the name occupied while a reader holds it;
   `retained_info` keeps refusing that linked delete-pending object, so
   `a_read_that_meets_retirement_finds_no_record` still reaches `read_then`'s
   probe arm (inference: it assumes NTFS reports the occupied name as a link;
-  the test asserts only `Ok(None)`, which holds either way).
+  the test asserts only `Ok(None)`, which holds either way). The judgement that
+  this case is unreachable in practice is inference from the documented close
+  ordering (`docs/development.md`: retire inside close) and the maintenance
+  loop's lock gate, not traced in code: a successor can publish only after
+  acquiring the owner lock that the retiring owner releases after its store
+  close, which is seconds against the reader's microsecond read-to-verify gap.
+  The owner-lock release site was not read.
