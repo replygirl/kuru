@@ -164,8 +164,17 @@ runner and no instrumented objects.
 
 The partition runner stops test executables at a deadline derived from the job's
 `timeout-minutes`, less a fixed evidence reserve, and checks it before every
-invocation. Compilation is not under that deadline: only the hosted job limit
-bounds it, without evidence. A test executable still running at the deadline is
+invocation. Every bounded wait before the tests derives from that one deadline:
+the toolchain and source probes, `cargo-llvm-cov show-env`, each executable's
+`--list` run, and the settle of an exited test process group all end on their
+own event or at the deadline, never at a shorter fixed bound. Compilation is not
+under that deadline: only the hosted job limit bounds it, without evidence. The
+receipt's identity probes follow the tests and their exports, so they end by the
+job limit less one slice of the reserve. The reserve is split into four equal
+slices: a stopped test tree's three cleanup waits (the group signal, the reap
+and absence confirmation, and the output drain) take one each, and the last is
+left for the failure record and the diagnostics upload. A test executable still
+running at the deadline is
 terminated through its owned Job on Windows or its owned process group on Unix,
 and the partition fails with a
 `<prefix>-coverage-diagnostics-<os>-partition-<k>-attempt-<n>` artifact holding
@@ -1413,12 +1422,12 @@ network, login or credential store), in this order:
 
 1. `first-launch`: empty engine cache and data directory: engine extraction and
    a new project's staged creation. The harness then waits for the memory owner
-   to retire (30 s idle, then close).
+   to retire (it retires as soon as its client detaches, then closes).
 2. `cold-existing`: the same project with no live owner: one engine start. It
    runs right after the first launch, so the page cache is warm.
-3. `warm-reopen`: immediately afterwards, inside the owner's idle window. The
-   record says whether the command attached to the live owner or had to start
-   one. The harness then waits for retirement again.
+3. `warm-reopen`: immediately afterwards, while the cold open's owner may still
+   be retiring. The record says whether the command attached to the live owner
+   or had to start one. The harness then waits for retirement again.
 4. `new-project`: a second, different project directory opened with the same
    data directory and engine cache, so the engine is already extracted and
    only the project is new. The harness then waits for retirement again. It
@@ -1557,7 +1566,7 @@ request's head against its base, not runners of different kinds.
 
 `KURU_OPEN_TIME_FILES=off` runs the control series: processes only.
 `KURU_OPEN_TIME_RETIRE_WAIT=off` runs the ramp: consecutive iterations start
-while earlier owners are still inside their idle window, so owners accumulate
+while earlier owners may still be retiring, so owners accumulate
 and the census shows it; there, the cold-existing case attaches to the owner
 the first launch just started, which its owner path reports. The iteration
 directories are kept until one final retirement wait after the last run.
@@ -1571,9 +1580,17 @@ A failed open is a run with no readiness signal (neither a `ready` marker nor
 Both are results, recorded with the exit status and first error line; under
 the gate a failed open is also a violation, reported after the series
 completes. Only an infrastructure failure, such as a process that has not
-retired after 120 s (polled every 100 ms), stops the series early with a
+retired after 62 s (polled every 100 ms), stops the series early with a
 non-zero exit (a stopped series is not gated), and that process is never
-killed. The sampling period and the retirement
+killed. That bound is the owner's longest retirement path: the startup timeout
+it waits for a starter that never attaches, or one in-flight memory statement
+(30 s either way), then its owned server close (32 s). Each measured command is
+bounded by the first launch's store creation at every one of its own bounds
+(310 s, the first-project fresh-open budget with three engine starts) plus one
+memory request reply (35 s), 345 s; past it the command is stopped and its run
+recorded as timed out. These bounds restate kuru-memory and kuru-core values,
+since the delivery tool does not depend on them, and a unit test pins each
+restated value to its source. The sampling period and the retirement
 poll belong to this unshipped measurement tool; they are stated in every summary
 and are not waits in product or test code.
 

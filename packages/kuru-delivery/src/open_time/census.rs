@@ -15,9 +15,13 @@ use serde::{Deserialize, Serialize};
 use super::observe::{Processes, Role, Seen, millis};
 
 /// Bound on one listening-port query (`lsof` on macOS, `NETSTAT.EXE` on
-/// Windows); past it the ports are recorded as unavailable.
+/// Windows), which ends on its exit and output EOF. No product or vendor
+/// budget bounds these stock commands; the census brackets each measured run,
+/// so a query takes the harness's bound on one command it runs and waits for,
+/// [`super::RUN_BOUND`]. Past it the ports are recorded as unavailable, a
+/// report column only.
 #[cfg(any(target_os = "macos", windows))]
-const QUERY_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+const QUERY_BOUND: std::time::Duration = super::RUN_BOUND;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Census {

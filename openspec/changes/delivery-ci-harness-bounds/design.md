@@ -16,7 +16,8 @@ Root cause: the harness bounds individual commands, settles and launches with li
 
 - Removing a short literal lets a genuinely hung child consume the partition's remaining time before failing, with the stall sampler's diagnostics rather than an early "did not settle". Accepted: it matches the shard deadline model, and diagnostics are retained on expiry.
 - The inline-test race fixes replace wall-clock sleeps with observed events; they must not weaken what the tests assert.
-- Open-time budgets that rise relative to the old literals lengthen the worst-case gate job; the job limit still bounds it.
+- Open-time bounds move both ways. The run bound rises from 180 s to 345 s, because the old value was below the product's own 310 s first-project creation budget. The census query bound becomes that run bound, which lengthens the worst-case gate job; the 60-minute job limit still bounds it. The retirement bound falls from 120 s to 62 s, the owner's longest product retirement path, so an owner that outlives its own budgets stops the series sooner. Nothing is killed.
+- The settle after an ordinary exit loses its 30 s bound. A settle still running at the shard deadline is reported as a stall. The settle step it was in is appended to the stall sample, because `StallReport`'s schema is pinned and gains no field.
 
 ## Operational surface
 

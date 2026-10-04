@@ -1050,3 +1050,127 @@ fn template_work_is_only_a_build_or_capture_stage_in_the_engine_cache() {
         "data/memory/templates/.build-k"
     );
 }
+
+/// Each restated product budget is still the value its owning crate defines,
+/// and the bounds compose them as their derivations say. A product change
+/// fails here instead of silently drifting from the harness's bounds.
+#[test]
+fn product_budgets_match_their_sources() {
+    use super::{
+        CLOSE_BUDGET, CLOSE_GRACE, FIRST_PROJECT_STARTS, KILL_GRACE, OPERATION_TIMEOUT,
+        QUERY_TIMEOUT, RETIRE_BOUND, RUN_BOUND, STARTUP, SUPERVISOR_TRANSPORT_ALLOWANCE,
+    };
+    use std::time::Duration;
+
+    let packages = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    // Whitespace is removed, so formatting changes do not matter.
+    let source = |path: &str| -> String {
+        std::fs::read_to_string(packages.join(path))
+            .unwrap_or_else(|error| panic!("read {path}: {error}"))
+            .split_whitespace()
+            .collect()
+    };
+    let defines = |path: &str, text: &str| {
+        let compact: String = text.split_whitespace().collect();
+        assert!(
+            source(path).contains(&compact),
+            "{path} no longer has {text}"
+        );
+    };
+    let secs = |duration: Duration| duration.as_secs();
+    defines(
+        "kuru-core/src/config.rs",
+        &format!("startup_timeout_secs: {},", secs(STARTUP)),
+    );
+    let server = "kuru-memory/src/server.rs";
+    defines(
+        server,
+        &format!(
+            "const CLOSE_GRACE: Duration = Duration::from_secs({});",
+            secs(CLOSE_GRACE)
+        ),
+    );
+    defines(
+        server,
+        &format!(
+            "const KILL_GRACE: Duration = Duration::from_secs({});",
+            secs(KILL_GRACE)
+        ),
+    );
+    defines(
+        server,
+        &format!(
+            "const SUPERVISOR_TRANSPORT_ALLOWANCE: Duration = Duration::from_secs({});",
+            secs(SUPERVISOR_TRANSPORT_ALLOWANCE)
+        ),
+    );
+    defines(
+        server,
+        "const SUPERVISOR_REAP_ALLOWANCE: Duration = CLOSE_GRACE
+            .saturating_add(KILL_GRACE)
+            .saturating_add(SUPERVISOR_TRANSPORT_ALLOWANCE);",
+    );
+    defines(
+        server,
+        "fn close_budget() -> Duration {
+            CLOSE_GRACE
+                .saturating_add(KILL_GRACE)
+                .saturating_add(SUPERVISOR_REAP_ALLOWANCE)
+                .saturating_add(CLOSE_GRACE)
+        }",
+    );
+    defines(
+        "kuru-memory/src/store.rs",
+        &format!(
+            "const QUERY_TIMEOUT: Duration = Duration::from_secs({});",
+            secs(QUERY_TIMEOUT)
+        ),
+    );
+    defines(
+        "kuru-memory/src/service/rpc.rs",
+        &format!(
+            "const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs({});",
+            secs(OPERATION_TIMEOUT)
+        ),
+    );
+    let support = "kuru-memory/src/test_support.rs";
+    defines(
+        support,
+        &format!("Self::FirstProject => {FIRST_PROJECT_STARTS},"),
+    );
+    defines(support, "Self::Cold => 2,");
+    defines(support, "self.starts() - 1");
+    defines(
+        support,
+        "fn starts_budget(starts: u32, closes: u32) -> std::time::Duration {
+            let startup = default_startup();
+            startup
+                .saturating_add(
+                    server_start_budget()
+                        .saturating_add(crate::store::QUERY_TIMEOUT)
+                        .saturating_mul(starts),
+                )
+                .saturating_add(crate::server::close_budget().saturating_mul(closes))
+                .saturating_add(startup)
+        }",
+    );
+    defines(
+        support,
+        "default_startup().saturating_add(crate::server::SUPERVISOR_TRANSPORT_ALLOWANCE)",
+    );
+    // The owner retires on its last detach and waits the startup timeout for
+    // a starter that never attaches; it has no idle timeout.
+    let service = "kuru-memory/src/service.rs";
+    defines(
+        service,
+        "fn owner_retires_at_once_when_its_starter_detaches()",
+    );
+    defines(service, "first_attachment: Some(self.startup_timeout),");
+    assert!(!source(service).contains("SERVICE_IDLE_TIMEOUT"));
+
+    assert_eq!(CLOSE_BUDGET, Duration::from_secs(32));
+    assert_eq!(RUN_BOUND, Duration::from_secs(310 + 35));
+    assert_eq!(RETIRE_BOUND, Duration::from_secs(30 + 32));
+    let options = super::Options::new("kuru".into(), "out".into());
+    assert_eq!(options.run_bound, RUN_BOUND);
+}

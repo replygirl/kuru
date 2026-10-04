@@ -185,8 +185,10 @@ pub async fn run(launch: &Launch, epoch: Instant, bound: Duration) -> Result<Fin
     let completed = tokio::time::timeout(bound, async {
         let (read, stdout) = tokio::join!(lines(&mut stderr, epoch, &kept), drain(&mut stdout));
         // Both pipes are at EOF, so the root has exited or closed them; the
-        // wait proves the owned Job is quiescent.
-        let status = child.wait(Duration::from_secs(10)).await;
+        // wait proves the owned Job is quiescent. It ends on that event: the
+        // enclosing `bound`, which started first, decides a Job that never
+        // quiesces, as a timed-out run.
+        let status = child.wait(bound).await;
         (read, stdout, status, millis(epoch.elapsed()))
     })
     .await;
@@ -206,8 +208,13 @@ pub async fn run(launch: &Launch, epoch: Instant, bound: Duration) -> Result<Fin
         }
         Err(_) => {
             child.terminate().context("stop the timed-out command")?;
+            // Terminating the Job ends every member at once; the wait proves
+            // it. The platform API has no cleanup budget of its own, so the
+            // reap takes the run's bound again: a Job still active after it is
+            // an infrastructure error that stops the series. (Unix reaps the
+            // killed root without a bound.)
             let status = child
-                .wait(Duration::from_secs(10))
+                .wait(bound)
                 .await
                 .context("reap the timed-out command")?;
             Ok(Finished {

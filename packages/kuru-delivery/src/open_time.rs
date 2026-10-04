@@ -8,8 +8,9 @@
 //! 1. `first-launch`: empty engine cache and data (engine extraction, a new
 //!    project's staged creation), then a wait for the owner to retire;
 //! 2. `cold-existing`: the same project with no live owner;
-//! 3. `warm-reopen`: immediately after, inside the owner's idle window, then a
-//!    wait for retirement;
+//! 3. `warm-reopen`: immediately after, while the cold open's owner may still
+//!    be retiring (it retires as soon as its client detaches), then a wait
+//!    for retirement;
 //! 4. `new-project`: a second, different project in the same data directory
 //!    and engine cache, so the engine is warm and only the project is new,
 //!    then a wait for retirement.
@@ -67,9 +68,83 @@ const RECORDS: &str = "records.jsonl";
 const SUMMARY: &str = "summary.md";
 /// Holds the gate's second series' `records.jsonl`, beside the first's.
 const RETRY: &str = "retry";
-/// The owner idles 30 s after its last client (kuru-memory
-/// `SERVICE_IDLE_TIMEOUT`), then closes its engine and supervisor.
-const RETIRE_BOUND: Duration = Duration::from_secs(120);
+/// kuru-core `MemoryConfig::default().startup_timeout_secs` (config.rs): one
+/// engine's startup timeout, and the owner's wait for a starter to attach.
+///
+/// This and the product budgets below are restated from the crates that own
+/// them, because the delivery tool does not depend on kuru-memory (the
+/// open-time job compiles it alone); `product_budgets_match_their_sources`
+/// pins each to its source text.
+const STARTUP: Duration = Duration::from_secs(30);
+/// kuru-memory `server::SUPERVISOR_TRANSPORT_ALLOWANCE` (server.rs), added to
+/// the startup timeout for readiness and to the stop graces for the
+/// supervisor's exit report.
+const SUPERVISOR_TRANSPORT_ALLOWANCE: Duration = Duration::from_secs(2);
+/// kuru-memory `server::CLOSE_GRACE` and `KILL_GRACE` (server.rs).
+const CLOSE_GRACE: Duration = Duration::from_secs(8);
+const KILL_GRACE: Duration = Duration::from_secs(3);
+/// kuru-memory `server::close_budget()` (server.rs): the graceful pool
+/// drain, the Windows lifetime close, the supervisor reap allowance
+/// (`CLOSE_GRACE + KILL_GRACE + SUPERVISOR_TRANSPORT_ALLOWANCE`) and the
+/// post-reap pool drain, 8 + 3 + 13 + 8 = 32 s.
+const CLOSE_BUDGET: Duration = Duration::from_secs(
+    CLOSE_GRACE.as_secs()
+        + KILL_GRACE.as_secs()
+        + (CLOSE_GRACE.as_secs() + KILL_GRACE.as_secs() + SUPERVISOR_TRANSPORT_ALLOWANCE.as_secs())
+        + CLOSE_GRACE.as_secs(),
+);
+/// kuru-memory `store::QUERY_TIMEOUT` (store.rs): one memory statement.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// kuru-memory `service::rpc::OPERATION_TIMEOUT` (service/rpc.rs): the reply
+/// to one request a client sends its memory owner.
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(35);
+/// kuru-memory `test_support::FreshOpen::FirstProject` (test_support.rs): the
+/// engine starts and owned closes of the first open for a store template,
+/// which builds the template, then copies it (staging, then active). The
+/// open-time gate holds a release build's first launch to exactly these
+/// three starts (`ci.yml`).
+const FIRST_PROJECT_STARTS: u64 = 3;
+const FIRST_PROJECT_CLOSES: u64 = FIRST_PROJECT_STARTS - 1;
+/// Bound on one measured command (and on `kuru --version`); past it the
+/// command is stopped and the run recorded `timed_out`. The longest case is
+/// the first launch, which creates the per-machine store template. Its store
+/// creation, at every one of its own bounds, is kuru-memory's fresh-open
+/// budget for a first project (`test_support::starts_budget`): the startup
+/// lock wait, each engine start (startup timeout and transport allowance)
+/// with one statement, each owned close, and the staged directory's
+/// quiescence wait: 30 + 3 x (32 + 30) + 2 x 32 + 30 = 310 s. The run's memory
+/// requests add one reply budget (35 s), under the single-stall model of
+/// kuru-memory's `fixture_deadline`: a request past its own bound fails the
+/// run before this one. 345 s. Engine extraction and process start have no
+/// product bound of their own and rely on this one.
+const RUN_BOUND: Duration = Duration::from_secs(
+    STARTUP.as_secs()
+        + FIRST_PROJECT_STARTS
+            * (STARTUP.as_secs()
+                + SUPERVISOR_TRANSPORT_ALLOWANCE.as_secs()
+                + QUERY_TIMEOUT.as_secs())
+        + FIRST_PROJECT_CLOSES * CLOSE_BUDGET.as_secs()
+        + STARTUP.as_secs()
+        + OPERATION_TIMEOUT.as_secs(),
+);
+/// Bound on the wait for every process from a scratch root to retire. The
+/// owner retires as soon as its last client detaches (kuru-memory
+/// `service.rs`, `owner_retires_at_once_when_its_starter_detaches`); it has
+/// no idle window. Retirement is then its store close: the write drain
+/// behind at most one in-flight statement (`QUERY_TIMEOUT`, 30 s) and the
+/// owned server close (`close_budget()`, 32 s), which reaps the supervisor and
+/// engine. An owner whose starter never attached (a run that failed or timed
+/// out first) instead waits the startup timeout (30 s) for it, with no write
+/// in flight, then closes. The longer of the two paths: max(30, 30) + 32 =
+/// 62 s. Past it the series stops with an infrastructure error naming what is
+/// still alive; nothing is killed.
+const RETIRE_BOUND: Duration = Duration::from_secs(
+    if QUERY_TIMEOUT.as_secs() > STARTUP.as_secs() {
+        QUERY_TIMEOUT.as_secs()
+    } else {
+        STARTUP.as_secs()
+    } + CLOSE_BUDGET.as_secs(),
+);
 /// The measurement tool's poll for process exit while it waits for
 /// retirement; reported with every summary.
 const RETIRE_POLL: Duration = Duration::from_millis(100);
@@ -121,7 +196,7 @@ impl Options {
             interval: Duration::from_millis(20),
             files: true,
             retire_wait: true,
-            run_bound: Duration::from_secs(180),
+            run_bound: RUN_BOUND,
             prompt: "measure".into(),
             gate: None,
         }
