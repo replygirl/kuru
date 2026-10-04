@@ -504,7 +504,9 @@ async fn cancellation_before_shared_tool_dispatch_runs_no_file_mutation() {
         let target = harness.topology.parts[0].id.clone();
         let cancellation = CancellationToken::new();
         let controlled = cancellation.clone();
-        let task = tokio::spawn(async move {
+    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+    let mut task = tokio::spawn(async move {
             let result = harness
                 .run_controlled(
                     "cancel before the tool",
@@ -515,16 +517,23 @@ async fn cancellation_before_shared_tool_dispatch_runs_no_file_mutation() {
                 .await;
             (harness, result)
         });
-        tokio::time::timeout(std::time::Duration::from_secs(30), entered)
+    // Admission persists the session catalog and transcript, and the actor reads
+    // its context, before the provider is reached: memory statements under the
+    // budget `turn_admission_deadline` follows.
+    tokio::time::timeout(crate::tests::turn_admission_deadline(), entered)
             .await
             .expect("speaking provider did not reach the held tool response")
             .unwrap();
         cancellation.cancel();
         let _ = release.send(());
-        let (mut harness, result) = tokio::time::timeout(std::time::Duration::from_secs(10), task)
-            .await
-            .expect("cancelled pre-dispatch turn did not settle")
-            .unwrap();
+    let (mut harness, result) = crate::progress_wait::join_on_progress(
+        &mut task,
+        &mut watch,
+        gap,
+        "cancelled pre-dispatch turn",
+        |(_, result)| crate::progress_wait::describe_result(&result),
+    )
+    .await;
         assert!(turn_was_cancelled(&result.unwrap_err()));
         assert!(!project.path().join("not-created.txt").exists());
         let history = harness.history().await.unwrap();
@@ -569,7 +578,9 @@ async fn accepted_file_mutation_survives_cancellation_without_replay() {
         let target = harness.topology.parts[0].id.clone();
         let cancellation = CancellationToken::new();
         let controlled = cancellation.clone();
-        let task = tokio::spawn(async move {
+    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+    let mut task = tokio::spawn(async move {
             let result = harness
                 .run_controlled(
                     "publish one file",
@@ -580,7 +591,10 @@ async fn accepted_file_mutation_survives_cancellation_without_replay() {
                 .await;
             (harness, result, target)
         });
-        let receipt = tokio::time::timeout(std::time::Duration::from_secs(30), receipt)
+    // The receipt reaches the provider after admission, the file write, the
+    // receipt's persistence and the actor's context reads: memory statements
+    // under the budget `turn_admission_deadline` follows, and a local file write.
+    let receipt = tokio::time::timeout(crate::tests::turn_admission_deadline(), receipt)
             .await
             .expect("provider did not observe the accepted file receipt")
             .unwrap();
@@ -605,11 +619,14 @@ async fn accepted_file_mutation_survives_cancellation_without_replay() {
             "one durable write"
         );
         cancellation.cancel();
-        let (mut harness, result, target) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), task)
-                .await
-                .expect("cancelled post-file turn did not settle")
-                .unwrap();
+    let (mut harness, result, target) = crate::progress_wait::join_on_progress(
+        &mut task,
+        &mut watch,
+        gap,
+        "cancelled post-file turn",
+        |(_, result, _)| crate::progress_wait::describe_result(&result),
+    )
+    .await;
         assert!(turn_was_cancelled(&result.unwrap_err()));
         let checkpoint = harness
             .file_checkpoint(&checkpoint)
@@ -700,7 +717,17 @@ async fn accepted_cognitive_writes_reconcile_before_cancellation_stops_peer_work
         let (written, release) = harness.pause_after_next_memory_write();
         let cancellation = CancellationToken::new();
         let controlled = cancellation.clone();
-        let task = tokio::spawn(async move {
+    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+    // The fixture configures the cancelled post-tool hook on Unix only; its
+    // join then also encloses that hook's run and the host's quiesce bound.
+    #[cfg(unix)]
+    let gap = crate::progress_wait::dream_gap_bound(
+        &cancelled_post_tool_hook().post_tool[0],
+        watch.hooks.quiesce_bound(),
+    );
+    #[cfg(not(unix))]
+    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+    let mut task = tokio::spawn(async move {
             let result = harness
                 .run_controlled(
                     "accept cognitive writes",
@@ -711,17 +738,23 @@ async fn accepted_cognitive_writes_reconcile_before_cancellation_stops_peer_work
                 .await;
             (harness, result, target)
         });
-        tokio::time::timeout(std::time::Duration::from_secs(30), written)
+    // The paused write follows admission, the actor's context reads and the
+    // accepted note's write: memory statements under the budget
+    // `turn_admission_deadline` follows.
+    tokio::time::timeout(crate::tests::turn_admission_deadline(), written)
             .await
             .expect("accepted state write did not reach publication")
             .unwrap();
         cancellation.cancel();
         release.send(()).unwrap();
-        let (mut harness, result, target) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), task)
-                .await
-                .expect("cancelled cognitive turn did not settle")
-                .unwrap();
+    let (mut harness, result, target) = crate::progress_wait::join_on_progress(
+        &mut task,
+        &mut watch,
+        gap,
+        "cancelled cognitive turn",
+        |(_, result, _)| crate::progress_wait::describe_result(&result),
+    )
+    .await;
         assert!(turn_was_cancelled(&result.unwrap_err()));
         let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
         #[cfg(unix)]
@@ -808,7 +841,14 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
         let mut events = harness.subscribe();
         let cancellation = CancellationToken::new();
         let controlled = cancellation.clone();
-        let task = tokio::spawn(async move {
+    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+    // The join also encloses the cancelled post-tool hook's run and the host's
+    // quiesce bound.
+    let gap = crate::progress_wait::dream_gap_bound(
+        &cancelled_post_tool_hook().post_tool[0],
+        watch.hooks.quiesce_bound(),
+    );
+    let mut task = tokio::spawn(async move {
             let result = harness
                 .run_controlled(
                     "start one owned shell",
@@ -834,11 +874,14 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
         .await
         .expect("shell never published its admitted process identity");
         cancellation.cancel();
-        let (mut harness, result, target) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), task)
-                .await
-                .expect("cancelled shell turn did not settle")
-                .unwrap();
+    let (mut harness, result, target) = crate::progress_wait::join_on_progress(
+        &mut task,
+        &mut watch,
+        gap,
+        "cancelled shell turn",
+        |(_, result, _)| crate::progress_wait::describe_result(&result),
+    )
+    .await;
         assert!(turn_was_cancelled(&result.unwrap_err()));
         let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
         assert_eq!(
@@ -874,9 +917,9 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
             .unwrap_err();
         assert!(retry.to_string().contains("may have reached external work"));
         assert_eq!(provider.issued.load(Ordering::SeqCst), 1);
-        tokio::time::timeout(std::time::Duration::from_secs(10), harness.shutdown(false))
+    tokio::time::timeout(crate::tests::shutdown_guard(), harness.shutdown(false))
             .await
-            .expect("owned shell cleanup exceeded the shutdown bound")
+        .expect("owned shell cleanup exceeded shutdown_guard() (MCP cleanup plus one statement)")
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -1023,7 +1066,9 @@ async fn cancelled_http_mcp_mutation_is_received_once_and_session_is_closed() {
         tokio::pin!(call_seen);
         let cancellation = CancellationToken::new();
         let controlled = cancellation.clone();
-        let task = tokio::spawn(async move {
+    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+    let mut task = tokio::spawn(async move {
             let result = harness
                 .run_controlled(
                     "send one MCP mutation",
@@ -1034,15 +1079,33 @@ async fn cancelled_http_mcp_mutation_is_received_once_and_session_is_closed() {
                 .await;
             (harness, result, target)
         });
-        tokio::time::timeout(std::time::Duration::from_secs(30), &mut call_seen)
+    // Before the call, the turn admits itself and builds the MCP catalog
+    // (initialize and tools/list, each under the connectors' I/O bound), so the
+    // wait spans several sequential product-bounded steps of one turn: the
+    // turn's own budget bounds it, and a turn that ends first ends the wait.
+    tokio::time::timeout(crate::tests::TURN_BUDGET, async {
+        tokio::select! {
+            () = &mut call_seen => {}
+            joined = &mut task => panic!(
+                "the HTTP MCP turn ended before the fixture received the mutation: {}",
+                match joined {
+                    Ok((_, result, _)) => crate::progress_wait::describe_result(&result),
+                    Err(error) => error.to_string(),
+                }
+            ),
+        }
+    })
             .await
             .expect("HTTP MCP fixture did not receive the mutation");
         cancellation.cancel();
-        let (mut harness, result, target) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), task)
-                .await
-                .expect("cancelled HTTP MCP turn did not settle")
-                .unwrap();
+    let (mut harness, result, target) = crate::progress_wait::join_on_progress(
+        &mut task,
+        &mut watch,
+        gap,
+        "cancelled HTTP MCP turn",
+        |(_, result, _)| crate::progress_wait::describe_result(&result),
+    )
+    .await;
         assert!(turn_was_cancelled(&result.unwrap_err()));
         let retry = harness
             .run_controlled(
@@ -1065,9 +1128,11 @@ async fn cancelled_http_mcp_mutation_is_received_once_and_session_is_closed() {
                 .count(),
             1
         );
-        tokio::time::timeout(std::time::Duration::from_secs(10), harness.shutdown(false))
+    tokio::time::timeout(crate::tests::shutdown_guard(), harness.shutdown(false))
             .await
-            .expect("HTTP MCP session cleanup exceeded the shutdown bound")
+        .expect(
+            "HTTP MCP session cleanup exceeded shutdown_guard() (MCP cleanup plus one statement)",
+        )
             .unwrap();
         let requests = state.requests.lock().await;
         assert_eq!(
@@ -1185,7 +1250,17 @@ async fn cancelled_admitted_peer_consultation_is_not_replayed() {
         tokio::pin!(consultation);
         let cancellation = CancellationToken::new();
         let controlled = cancellation.clone();
-        let task = tokio::spawn(async move {
+    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+    // The fixture configures the cancelled post-tool hook on Unix only; its
+    // join then also encloses that hook's run and the host's quiesce bound.
+    #[cfg(unix)]
+    let gap = crate::progress_wait::dream_gap_bound(
+        &cancelled_post_tool_hook().post_tool[0],
+        watch.hooks.quiesce_bound(),
+    );
+    #[cfg(not(unix))]
+    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+    let mut task = tokio::spawn(async move {
             let result = harness
                 .run_controlled(
                     "consult one peer",
@@ -1196,15 +1271,20 @@ async fn cancelled_admitted_peer_consultation_is_not_replayed() {
                 .await;
             (harness, result, target)
         });
-        tokio::time::timeout(std::time::Duration::from_secs(30), &mut consultation)
+    // The consultation starts after admission and both peers' context reads:
+    // memory statements under the budget `turn_admission_deadline` follows.
+    tokio::time::timeout(crate::tests::turn_admission_deadline(), &mut consultation)
             .await
             .expect("peer consultation was not admitted");
         cancellation.cancel();
-        let (mut harness, result, target) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), task)
-                .await
-                .expect("cancelled peer consultation did not settle")
-                .unwrap();
+    let (mut harness, result, target) = crate::progress_wait::join_on_progress(
+        &mut task,
+        &mut watch,
+        gap,
+        "cancelled peer consultation",
+        |(_, result, _)| crate::progress_wait::describe_result(&result),
+    )
+    .await;
         assert!(turn_was_cancelled(&result.unwrap_err()));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
@@ -1308,23 +1388,37 @@ async fn shutdown_reports_dream_deadline_and_mcp_cleanup_failure_together() {
         tokio::pin!(dream_started);
         let cleanup_seen = state.call_seen.notified();
         tokio::pin!(cleanup_seen);
-        let task = tokio::spawn(async move {
+    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+    let mut task = tokio::spawn(async move {
             let result = harness.shutdown(true).await;
             (harness, result)
         });
-        tokio::time::timeout(std::time::Duration::from_secs(10), dream_started)
+    // The shutdown dream reaches its provider after shutdown's reconcile and
+    // the dream's candidate creation (dream.rs:99): memory statements under
+    // the budget `turn_admission_deadline` follows.
+    tokio::time::timeout(crate::tests::turn_admission_deadline(), dream_started)
             .await
             .expect("shutdown dream did not start");
         tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(31)).await;
         tokio::time::resume();
-        tokio::time::timeout(std::time::Duration::from_secs(10), cleanup_seen)
+    // After the dream deadline, shutdown aborts and awaits the actors,
+    // reconciles (abandoning the candidate) and then runs the tool host's
+    // cleanup, whose MCP DELETE is sent inside the connectors' I/O bound:
+    // the shutdown guard's enclosure.
+    tokio::time::timeout(crate::tests::shutdown_guard(), cleanup_seen)
             .await
             .expect("ToolHost cleanup did not attempt the negotiated MCP DELETE");
-        let (harness, result) = tokio::time::timeout(std::time::Duration::from_secs(10), task)
-            .await
-            .expect("aggregate shutdown did not settle after MCP cleanup failure")
-            .unwrap();
+    // What remains is the DELETE's response inside the MCP host's cleanup
+    // join, under the connectors' I/O bound (kuru-connectors src/mcp.rs:1203).
+    let (harness, result) = crate::progress_wait::join_on_progress(
+        &mut task,
+        &mut watch,
+        crate::tests::CONNECTOR_IO_TIMEOUT,
+        "aggregate shutdown after MCP cleanup failure",
+        |(_, result)| crate::progress_wait::describe_result(&result),
+    )
+    .await;
         let error = format!("{:#}", result.unwrap_err());
         assert!(
             error.contains("shutdown dream exceeded 30 seconds"),
@@ -1398,7 +1492,9 @@ async fn cancelled_outbound_a2a_request_is_received_once_without_replay() {
         tokio::pin!(request_seen);
         let cancellation = CancellationToken::new();
         let controlled = cancellation.clone();
-        let task = tokio::spawn(async move {
+    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+    let mut task = tokio::spawn(async move {
             let result = harness
                 .run_controlled(
                     "send one external request",
@@ -1409,15 +1505,20 @@ async fn cancelled_outbound_a2a_request_is_received_once_without_replay() {
                 .await;
             (harness, result, target)
         });
-        tokio::time::timeout(std::time::Duration::from_secs(30), &mut request_seen)
+    // The request is sent after admission and the actor's context reads:
+    // memory statements under the budget `turn_admission_deadline` follows.
+    tokio::time::timeout(crate::tests::turn_admission_deadline(), &mut request_seen)
             .await
             .expect("outbound A2A fixture did not receive the request");
         cancellation.cancel();
-        let (mut harness, result, target) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), task)
-                .await
-                .expect("cancelled outbound A2A turn did not settle")
-                .unwrap();
+    let (mut harness, result, target) = crate::progress_wait::join_on_progress(
+        &mut task,
+        &mut watch,
+        gap,
+        "cancelled outbound A2A turn",
+        |(_, result, _)| crate::progress_wait::describe_result(&result),
+    )
+    .await;
         assert!(turn_was_cancelled(&result.unwrap_err()));
         let retry = harness
             .run_controlled(
@@ -2600,14 +2701,17 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
                 .iter()
                 .any(|message| message.role == "user" && message.text_projection() == "Start a task")
         );
-        tokio::time::timeout(Duration::from_secs(10), async {
+    // The second provider enters after its peer's own transcript and
+    // private-context reads: memory statements under the budget
+    // `turn_admission_deadline` follows.
+    tokio::time::timeout(crate::tests::turn_admission_deadline(), async {
             while provider.active.load(Ordering::SeqCst) != 2 {
                 tokio::task::yield_now().await;
             }
     })
     .await
     .expect("two parallel providers must enter while another peer remains queued");
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(crate::tests::turn_admission_deadline(), async {
         while started_work
             .iter()
             .map(|counter| counter.load(Ordering::SeqCst))
@@ -2626,8 +2730,12 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
     );
 
     // Both parallel providers must drop; the queued third peer must never
-    // begin the cancelled invocation before the next turn is admitted.
-    let permit = tokio::time::timeout(Duration::from_secs(2), async {
+    // begin the cancelled invocation before the next turn is admitted. This is
+    // an eventual drain, not a promptness check: each actor settles its usage
+    // ledger entry (actor.rs:700), a write under one `QUERY_TIMEOUT` write
+    // budget, before it releases its permit, so the drain is bounded by that
+    // budget rather than by a guessed 2 s.
+    let permit = tokio::time::timeout(kuru_memory::test_budgets::QUERY_TIMEOUT, async {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         cancellation
@@ -2639,7 +2747,7 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
             .expect("actor pool remains open")
     })
     .await
-    .expect("cancellation must drop parallel provider work and release both permits within 2s");
+    .expect("cancellation must drop parallel provider work and release both permits within one QUERY_TIMEOUT");
     assert_eq!(provider.active.load(Ordering::SeqCst), 0);
     drop(permit);
 

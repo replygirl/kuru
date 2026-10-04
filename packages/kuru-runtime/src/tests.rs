@@ -56,6 +56,48 @@ pub(crate) fn turn_admission_deadline() -> Duration {
     Duration::from_secs(MemoryConfig::default().startup_timeout_secs)
 }
 
+/// What the runtime allows a turn after its cancellation, for accepted memory
+/// work and the answer race to settle: 35 s (src/server.rs:197;
+/// docs/protocols.md, "allows up to 35 more seconds").
+pub(crate) const TURN_SETTLEMENT: Duration = Duration::from_secs(35);
+
+/// The runtime's whole-turn budget: a turn may run for 600 s (`run_controlled`
+/// under `tokio::time::timeout(Duration::from_secs(600), ..)`, src/server.rs:190;
+/// docs/protocols.md, "up to 10 minutes"), then `TURN_SETTLEMENT`. Restated
+/// because the runtime keeps both values inline, as kuru-tui's test support does.
+pub(crate) const TURN_BUDGET: Duration = Duration::from_secs(600).saturating_add(TURN_SETTLEMENT);
+
+/// The connectors' I/O bound for one MCP RPC and for the MCP host's concurrent
+/// client cleanup: 60 s (kuru-connectors src/lib.rs:74, `pub(crate)`; applied at
+/// src/mcp.rs:1203 and :1948-1949). Restated because the crate keeps it private.
+pub(crate) const CONNECTOR_IO_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Backstop for `Harness::shutdown`'s cleanup (src/engine.rs:1066-1091: abort
+/// and await the actors, `reconcile()`, then the tool host), under the
+/// single-stall model kuru-memory's `fixture_deadline` documents: the longest
+/// single bound it encloses plus one statement budget.
+///
+/// - The longest bound is the tool host's concurrent cleanup (kuru-connectors
+///   src/tools.rs:1678-1687): the MCP host's client join under
+///   `CONNECTOR_IO_TIMEOUT` (60 s), beside the shell cleanup allowance (5 s,
+///   src/unix_shell.rs:36) and the hook quiesce bound (10 s, src/hooks.rs:39).
+/// - `QUERY_TIMEOUT` covers the statements of the `reconcile()` calls
+///   (src/engine.rs:2441). On these fixtures' Local stores its candidate
+///   recoveries and successor rebind return without a statement. The store's
+///   own reconcile issues statements only for a pending uncertain write (the
+///   session-end wait under `QUERY_TIMEOUT` and one receipt query,
+///   kuru-memory src/store.rs:3885-3925), a pending live-value publication
+///   adds one `get` per update, and an open dream candidate adds its
+///   abandonment (src/engine.rs:2654: a branch-session retirement and one
+///   write, each under `QUERY_TIMEOUT`). After completed turns and refusals
+///   none is pending, so the three `shutdown(false)` guards enclose no
+///   statement; the shutdown dream's cleanup wait in review_tests encloses
+///   that one abandonment. A stalled statement reports its own error inside
+///   this bound.
+pub(crate) fn shutdown_guard() -> Duration {
+    CONNECTOR_IO_TIMEOUT.saturating_add(kuru_memory::test_budgets::QUERY_TIMEOUT)
+}
+
 struct Fake {
     requests: Mutex<Vec<CompletionRequest>>,
     respond: Box<Responder>,
@@ -155,7 +197,10 @@ impl Provider for Fake {
         if let Some(barrier) = &self.first_pair
             && self.started.fetch_add(1, Ordering::SeqCst) < 2
         {
-            tokio::time::timeout(Duration::from_secs(10), barrier.wait()).await?;
+            // The second peer reaches its provider call only after its own
+            // transcript and private-context reads, each a memory statement
+            // under the budget `turn_admission_deadline` follows.
+            tokio::time::timeout(turn_admission_deadline(), barrier.wait()).await?;
         }
         self.active.fetch_sub(1, Ordering::SeqCst);
         let reply = (self.respond)(&request);
@@ -1041,7 +1086,7 @@ async fn authorized_native_reads_overlap_but_feed_results_back_in_provider_order
             .unwrap()
             .with_parallel_read_test_gate(gate.clone());
         let memory = MemoryStore::temporary().await.unwrap();
-        let harness = Harness::with_tool_host(
+    let mut harness = Harness::with_tool_host(
             config,
             directory.path(),
             memory.clone(),
@@ -1054,7 +1099,9 @@ async fn authorized_native_reads_overlap_but_feed_results_back_in_provider_order
         let actor_id = harness.topology.parts[0].id.clone();
         let controlled_actor = actor_id.clone();
         let mut events = harness.subscribe();
-        let task = tokio::spawn(async move {
+    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+    let mut task = tokio::spawn(async move {
             let mut harness = harness;
             let output = harness
                 .run_controlled(
@@ -1102,10 +1149,14 @@ async fn authorized_native_reads_overlap_but_feed_results_back_in_provider_order
         .await
         .expect("the separately released search call did not settle");
         gate.release_named("first.txt");
-        let (mut harness, output) = tokio::time::timeout(Duration::from_secs(10), task)
-            .await
-            .expect("ordered parallel reads did not drain")
-            .unwrap();
+    let (mut harness, output) = crate::progress_wait::join_on_progress(
+        &mut task,
+        &mut watch,
+        gap,
+        "ordered parallel reads",
+        |(_, output)| crate::progress_wait::describe_result(&output),
+    )
+    .await;
         let output = output.unwrap();
         assert_eq!(output.text, "Both checked reads completed");
         let observations = output
@@ -1170,7 +1221,11 @@ async fn authorized_web_fetch_overlaps_checked_search_and_keeps_result_order() {
         // are bounded by the test's own gate and request waits, not by this fixture.
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            tokio::time::timeout(Duration::from_secs(10), async {
+        // The client sends its headers inside web fetch's 20 s `FETCH_TIMEOUT`
+        // (kuru-connectors src/web_fetch.rs:24, crate-private), which the memory
+        // startup budget behind `turn_admission_deadline` exceeds, so a stalled
+        // send reports the client's own error first.
+        tokio::time::timeout(turn_admission_deadline(), async {
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 1024];
                 while !request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -1265,7 +1320,7 @@ async fn authorized_web_fetch_overlaps_checked_search_and_keeps_result_order() {
             .with_parallel_read_test_gate(gate.clone())
             .with_web_fetch_test_route("parallel.fixture", address);
         let memory = MemoryStore::temporary().await.unwrap();
-        let harness = Harness::with_tool_host(
+    let mut harness = Harness::with_tool_host(
             config,
             directory.path(),
             memory.clone(),
@@ -1277,7 +1332,9 @@ async fn authorized_web_fetch_overlaps_checked_search_and_keeps_result_order() {
         .unwrap();
         let actor = harness.topology.parts[0].id.clone();
         let mut events = harness.subscribe();
-        let task = tokio::spawn(async move {
+    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+    let mut task = tokio::spawn(async move {
             let mut harness = harness;
             let output = harness
                 .run_controlled(
@@ -1293,7 +1350,10 @@ async fn authorized_web_fetch_overlaps_checked_search_and_keeps_result_order() {
             .await
             .expect("web and search calls did not reach checked execution together");
         gate.release_named("web_fetch");
-        tokio::time::timeout(Duration::from_secs(10), request_observed)
+    // After the release, the client's send runs inside web fetch's 20 s
+    // `FETCH_TIMEOUT` (kuru-connectors src/web_fetch.rs:24, crate-private),
+    // which the memory startup budget behind `turn_admission_deadline` exceeds.
+    tokio::time::timeout(turn_admission_deadline(), request_observed)
             .await
             .expect("authorized web call did not reach its isolated transport")
             .expect("web overlap server dropped before observing the request");
@@ -1310,10 +1370,14 @@ async fn authorized_web_fetch_overlaps_checked_search_and_keeps_result_order() {
     .await
     .expect("search did not settle while the web response remained held");
     response_release.send(()).unwrap();
-    let (mut harness, output) = tokio::time::timeout(Duration::from_secs(10), task)
-        .await
-        .expect("web/search wave did not drain")
-        .unwrap();
+    let (mut harness, output) = crate::progress_wait::join_on_progress(
+        &mut task,
+        &mut watch,
+        gap,
+        "web/search wave",
+        |(_, output)| crate::progress_wait::describe_result(&output),
+    )
+    .await;
     let output = output.unwrap();
     assert_eq!(output.text, "Fetch and search completed");
     {
@@ -1683,7 +1747,7 @@ async fn cancelled_parallel_wave_drains_every_owned_read_before_returning() {
             .unwrap()
             .with_parallel_read_test_gate(gate.clone());
         let memory = MemoryStore::temporary().await.unwrap();
-        let harness = Harness::with_tool_host(
+    let mut harness = Harness::with_tool_host(
             config,
             &directory_path,
             memory.clone(),
@@ -1697,7 +1761,9 @@ async fn cancelled_parallel_wave_drains_every_owned_read_before_returning() {
         let target = harness.topology.parts[0].id.clone();
         let cancellation = CancellationToken::new();
         let controlled = cancellation.clone();
-        let task = tokio::spawn(async move {
+    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+    let mut task = tokio::spawn(async move {
             let mut harness = harness;
             let result = harness
                 .run_controlled(
@@ -1717,10 +1783,14 @@ async fn cancelled_parallel_wave_drains_every_owned_read_before_returning() {
         // can settle. The two cancelled observations required below therefore
         // prove the outer turn retained and drained both owned futures.
         gate.release();
-        let (mut harness, result) = tokio::time::timeout(Duration::from_secs(10), task)
-            .await
-            .expect("cancelled parallel wave did not drain")
-            .unwrap();
+    let (mut harness, result) = crate::progress_wait::join_on_progress(
+        &mut task,
+        &mut watch,
+        gap,
+        "cancelled parallel wave",
+        |(_, result)| crate::progress_wait::describe_result(&result),
+    )
+    .await;
         assert!(crate::turn_was_cancelled(&result.unwrap_err()));
         let mut settled = Vec::new();
         let mut later_started = false;
@@ -1811,7 +1881,7 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
             .unwrap()
             .with_parallel_read_test_gate(gate.clone());
         let memory = MemoryStore::temporary().await.unwrap();
-        let harness = Harness::with_tool_host(
+    let mut harness = Harness::with_tool_host(
             config,
             &project_path,
             memory.clone(),
@@ -1824,7 +1894,9 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
         let target = harness.topology.parts[0].id.clone();
         let cancellation = CancellationToken::new();
         let controlled = cancellation.clone();
-        let task = tokio::spawn(async move {
+    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+    let mut task = tokio::spawn(async move {
             let mut harness = harness;
             let result = harness
                 .run_controlled(
@@ -1850,7 +1922,10 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
         assert_eq!(std::fs::read(&original).unwrap(), b"admitted bytes");
         gate.release();
 
-        let continuation = tokio::time::timeout(Duration::from_secs(10), observed)
+    // The continuation follows the settled receipts' persistence and the
+    // actor's private-context read, each a memory statement under the budget
+    // `turn_admission_deadline` follows.
+    let continuation = tokio::time::timeout(turn_admission_deadline(), observed)
             .await
             .expect("provider did not observe the mixed completion receipts")
             .unwrap();
@@ -1883,10 +1958,14 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
         );
 
         cancellation.cancel();
-        let (mut harness, result, target) = tokio::time::timeout(Duration::from_secs(10), task)
-            .await
-            .expect("cancelled mixed completion did not settle")
-            .unwrap();
+    let (mut harness, result, target) = crate::progress_wait::join_on_progress(
+        &mut task,
+        &mut watch,
+        gap,
+        "cancelled mixed completion",
+        |(_, result, _)| crate::progress_wait::describe_result(&result),
+    )
+    .await;
         assert!(crate::turn_was_cancelled(&result.unwrap_err()));
         let checkpoint = harness
             .file_checkpoint(&checkpoint)
@@ -1895,8 +1974,11 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
         assert_eq!(checkpoint.state, CheckpointState::Applied);
         assert_eq!(checkpoint.path, "accepted.txt");
         assert_eq!(provider.issued.load(Ordering::SeqCst), 1);
+    // Admission reads the stored journal (`memory.get`, engine.rs:1499) and
+    // refuses before any provider work: one statement under the budget
+    // `turn_admission_deadline` follows.
         let retry = tokio::time::timeout(
-            Duration::from_secs(10),
+        turn_admission_deadline(),
             harness.run_controlled(
                 "refuse one read and publish one write",
                 Some(&target),
@@ -1913,11 +1995,11 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
             std::fs::read_to_string(project.path().join("accepted.txt")).unwrap(),
             "one mixed write"
         );
-        tokio::time::timeout(Duration::from_secs(30), harness.shutdown(false))
+    tokio::time::timeout(shutdown_guard(), harness.shutdown(false))
             .await
             .expect("mixed-effect harness shutdown did not finish")
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(30), memory.close())
+    tokio::time::timeout(kuru_memory::test_budgets::close_budget(), memory.close())
             .await
             .expect("mixed-effect memory close did not finish")
             .unwrap();
