@@ -1,7 +1,7 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use kuru_delivery::{
-    advisory, archive, bundle, coverage, docs, published_windows, repo, shell_support,
+    advisory, archive, bundle, coverage, docs, open_time, published_windows, repo, shell_support,
 };
 use std::{ffi::OsString, path::PathBuf};
 
@@ -100,6 +100,61 @@ enum Command {
     Repo {
         #[arg(long, default_value = ".")]
         root: PathBuf,
+    },
+    /// Measure a release kuru executable's memory open time from outside.
+    /// Report only unless every gate variable is set; then exact engine
+    /// starts per case and the new-project and cold-existing median budgets
+    /// are checked, and a violation exits non-zero after the records are
+    /// written. A median budget miss alone measures one more full series
+    /// (records in `<output>/retry/`), which decides; a count violation in
+    /// either series fails at once.
+    OpenTime {
+        #[arg(long, env = "KURU_OPEN_TIME_BINARY")]
+        binary: PathBuf,
+        #[arg(long, env = "KURU_OPEN_TIME_OUTPUT")]
+        output: PathBuf,
+        /// Parent of the private scratch root (default: the temporary directory).
+        #[arg(long, env = "KURU_OPEN_TIME_SCRATCH")]
+        scratch: Option<PathBuf>,
+        /// Iterations; each runs the four cases once.
+        #[arg(long, env = "KURU_OPEN_TIME_ITERATIONS", default_value_t = 10)]
+        iterations: usize,
+        /// Host label for the summary, such as the CI runner label.
+        #[arg(long, env = "KURU_OPEN_TIME_LABEL")]
+        label: Option<String>,
+        /// Also append the summary to this file (a CI job summary).
+        #[arg(long, env = "GITHUB_STEP_SUMMARY")]
+        summary: Option<PathBuf>,
+        /// Sampling period of the process and file observer, in milliseconds.
+        #[arg(long, env = "KURU_OPEN_TIME_INTERVAL_MS", default_value_t = 20)]
+        interval_ms: u64,
+        /// `off` runs the control series: processes only, no file listing.
+        #[arg(long, env = "KURU_OPEN_TIME_FILES", default_value = "on", value_parser = ["on", "off"])]
+        files: String,
+        /// `off` runs the ramp series: no wait for owner retirement between
+        /// runs, one wait after the last.
+        #[arg(long, env = "KURU_OPEN_TIME_RETIRE_WAIT", default_value = "on", value_parser = ["on", "off"])]
+        retire_wait: String,
+        /// Gate: exact engine starts of every first launch.
+        #[arg(long, env = open_time::gate::FIRST_LAUNCH_STARTS)]
+        expect_first_launch_starts: Option<usize>,
+        /// Gate: exact engine starts of every cold open of an existing project.
+        #[arg(long, env = open_time::gate::COLD_EXISTING_STARTS)]
+        expect_cold_existing_starts: Option<usize>,
+        /// Gate: exact engine starts of every warm reopen per owner path, as
+        /// `<path>=<starts>` pairs separated by commas, for example
+        /// `attached=0,spawned-owner=1`; a path not listed fails.
+        #[arg(long, env = open_time::gate::WARM_REOPEN_STARTS)]
+        expect_warm_reopen_starts: Option<String>,
+        /// Gate: exact engine starts of every new project.
+        #[arg(long, env = open_time::gate::NEW_PROJECT_STARTS)]
+        expect_new_project_starts: Option<usize>,
+        /// Gate: budget in ms for the new-project median open to ready.
+        #[arg(long, env = open_time::gate::NEW_PROJECT_BUDGET_MS)]
+        budget_new_project_ms: Option<u64>,
+        /// Gate: budget in ms for the cold-existing median open to ready.
+        #[arg(long, env = open_time::gate::COLD_EXISTING_BUDGET_MS)]
+        budget_cold_existing_ms: Option<u64>,
     },
 }
 
@@ -419,6 +474,66 @@ async fn main() -> Result<()> {
             let errors = docs::check(&root, &base)?;
             ensure!(errors.is_empty(), "{}", errors.join("\n"));
             println!("Public docs artifacts, local links and anchors passed ({base}).");
+        }
+        Command::OpenTime {
+            binary,
+            output,
+            scratch,
+            iterations,
+            label,
+            summary,
+            interval_ms,
+            files,
+            retire_wait,
+            expect_first_launch_starts,
+            expect_cold_existing_starts,
+            expect_warm_reopen_starts,
+            expect_new_project_starts,
+            budget_new_project_ms,
+            budget_cold_existing_ms,
+        } => {
+            let gate = open_time::gate::Settings {
+                first_launch_starts: expect_first_launch_starts,
+                cold_existing_starts: expect_cold_existing_starts,
+                new_project_starts: expect_new_project_starts,
+                warm_reopen_starts: expect_warm_reopen_starts,
+                new_project_budget_ms: budget_new_project_ms,
+                cold_existing_budget_ms: budget_cold_existing_ms,
+            }
+            .gate()?;
+            let mut options = open_time::Options::new(binary, output);
+            options.gate = gate;
+            options.scratch = scratch;
+            options.iterations = iterations;
+            if let Some(label) = label {
+                options.label = label;
+            }
+            options.summary = summary.filter(|path| !path.as_os_str().is_empty());
+            options.interval = std::time::Duration::from_millis(interval_ms);
+            options.files = files == "on";
+            options.retire_wait = retire_wait == "on";
+            let report = open_time::run(&options).await?;
+            println!("{}", report.summary);
+            println!(
+                "Recorded {} runs in {} series ({} failed to open, {} failed after opening).",
+                report.records, report.series, report.failed_opens, report.failed_after_open
+            );
+            match (&options.gate, &report.gate) {
+                (Some(gate), Some(judgement)) => {
+                    let decided = match judgement.decision.series() {
+                        Some(2) => "the second series",
+                        _ => "the first series",
+                    };
+                    ensure!(
+                        judgement.passed(),
+                        "open-time gate failed, decided by {decided}:\n{}",
+                        judgement.describe(gate)
+                    );
+                    println!("Open-time gate passed. Decided by {decided}.");
+                }
+                (Some(_), None) => bail!("the open-time gate was not evaluated"),
+                (None, _) => println!("Report only: no gate variable is set."),
+            }
         }
         Command::Repo { root } => {
             let errors = repo::check(&root)?;

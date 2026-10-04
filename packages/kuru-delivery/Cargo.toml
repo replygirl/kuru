@@ -17,6 +17,7 @@ tooling = [
   "dep:base64",
   "dep:rustix",
   "dep:serde_yaml_ng",
+  "dep:sysinfo",
 ]
 
 [[bin]]
@@ -58,6 +59,7 @@ toml = { workspace = true, optional = true }
 scraper = { workspace = true, optional = true }
 roxmltree = { workspace = true, optional = true }
 serde_yaml_ng = { workspace = true, optional = true }
+sysinfo = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, optional = true, features = ["fs", "process"] }
