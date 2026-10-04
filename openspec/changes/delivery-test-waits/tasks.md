@@ -58,7 +58,7 @@ Acceptance evidence is recorded against each task as its check finishes; unrun c
 
 - [x] 6.1 Run the kuru-delivery test, lint (host and Windows target), format and typecheck tasks and the cospec checks, and record observed results and unrun checks with reasons
   - All results are local, on macOS arm64.
-  - `mise run //packages/kuru-delivery:typecheck`: exit 0. `//packages/kuru-delivery:lint`: exit 0. `//packages/kuru-delivery:lint:windows`: first run failed (the `Duration` import in `advisory.rs` was unused on Windows, where its users are `cfg(unix)`); after gating the import on `cfg(unix)`, exit 0.
+  - `mise run //packages/kuru-delivery:typecheck`: exit 0. `//packages/kuru-delivery:lint`: exit 0. `//packages/kuru-delivery:lint:windows`: first run failed (the `Duration` import in `advisory.rs` was unused on Windows, where its users are `cfg(unix)`); after gating the import on `cfg(unix)`, exit 0, and exit 0 again on the committed tree at c7eec6de.
   - `mise run format:check`: first run failed on rustfmt layout after later edits; after `format:rust:fix`, exit 0.
   - `mise run //packages/kuru-delivery:test`: exit 0 in two full runs (the second after the final formatting), every binary `ok` (lib 253 passed, advisory 17, bootstrap_install 28, powershell_diagnostics 10; `previous_published_release_updates_to_this_tree` is `#[ignore]` and was not run, as before).
   - Repetition on the built test binaries: advisory 10/10, bootstrap_install 5/5, bundle_prepare 10/10, lib `bundle::` 10/10, powershell_diagnostics 5/5, release_notes 3/3 and release_workflow 2/2. The last two ran under the task's pinned `cocogitto`/`communique` via `mise exec`; run outside that environment, release_notes fails on the unpinned Communiqué, which is unrelated to this change.
