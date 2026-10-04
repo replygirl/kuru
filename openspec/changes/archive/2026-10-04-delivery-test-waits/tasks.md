@@ -64,5 +64,9 @@ Acceptance evidence is recorded against each task as its check finishes; unrun c
   - Repetition on the built test binaries: advisory 10/10, bootstrap_install 5/5, bundle_prepare 10/10, lib `bundle::` 10/10, powershell_diagnostics 5/5, release_notes 3/3 and release_workflow 2/2. The last two ran under the task's pinned `cocogitto`/`communique` via `mise exec`; run outside that environment, release_notes fails on the unpinned Communiqué, which is unrelated to this change.
   - `mise run cospec -- validate delivery-test-waits --strict`: 0 errors, 0 warnings. `mise run cospec:managed:check`: no drift.
   - Not run here: the Windows-only `windows_update.rs` and `bootstrap_windows.rs` (verified by `lint:windows` only; native evidence is CI's) and coverage (CI-enforced).
-- [ ] 6.2 Run `mise run cospec -- validate delivery-test-waits --strict`, open the PR, and record CI evidence from job logs for the final head
-  - Not done in this stage: the PR is opened and CI evidence recorded by the orchestrating session after push.
+- [x] 6.2 Run `mise run cospec -- validate delivery-test-waits --strict`, open the PR, and record CI evidence from job logs for the final head
+  - PR #217, head `4656ca4cf78f5dc7bb35d7d2940ee5300faa2c81`; `gh pr checks 217` shows every job `pass` (the four `dolt-windows-arm64` jobs and `Pin-verified Windows arm64 engine input` skipped, none failed), run 37190060027.
+  - Coverage gate (90%), read from the merge job logs: ubuntu-latest 94.81% (job 111402926774), macos-latest 94.79% (job 111403601972), windows-latest 93.91% (job 111404038393).
+  - Native behavior and installation: `native-tests (windows-11-arm) / Behavior merge` pass (job 111404375021, partitions 1-8 pass), and `Installation, offline runtime and update` pass on ubuntu-latest (111400337309), macos-latest (111400337299), windows-latest (111400337272) and windows-11-arm (111401208896). This is the native behavior evidence for the Windows-only `windows_update.rs` under `update_handoff()` (d2#58).
+  - `Lint (x86_64-pc-windows-msvc)` pass (job 111400336835); `ci-gate` pass (job 111411517051).
+  - Validation at archive: `mise run cospec -- validate delivery-test-waits --strict` run before archiving.

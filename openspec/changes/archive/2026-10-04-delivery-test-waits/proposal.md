@@ -21,8 +21,10 @@ Source of the fix points: `tmp/roadmap/test-wait-inventory-2026-10.md` section 3
 points (21 S, 1 M) across 14 files, 202 call sites. Row ids refer to the
 per-pass source tables (d1 for `src`, d2 for `tests`).
 
-- Derivation table (authored in the implementation's commit message and the
-  `launch_budget.rs` doc, each constant's derivation written at the constant):
+- Derivation table (kept with the sweep's shared notes at
+  `tmp/roadmap/store-creation-design/derivation-delivery-test-waits.md`, each
+  constant's derivation also written at the constant and in the
+  `launch_budget.rs` doc):
   one entry per fix point naming the governing product budget or event, the
   allowance, and the arithmetic.
 - 30 s and 180 s families on the shape-A launch budget: d2#24
