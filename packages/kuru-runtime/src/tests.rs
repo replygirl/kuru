@@ -72,7 +72,7 @@ pub(crate) const TURN_BUDGET: Duration = Duration::from_secs(600).saturating_add
 /// src/mcp.rs:1203 and :1948-1949). Restated because the crate keeps it private.
 pub(crate) const CONNECTOR_IO_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Backstop for `Harness::shutdown`'s cleanup (src/engine.rs:1066-1091: abort
+/// Backstop for `Harness::shutdown`'s cleanup (src/engine.rs:1066-1095: abort
 /// and await the actors, `reconcile()`, then the tool host), under the
 /// single-stall model kuru-memory's `fixture_deadline` documents: the longest
 /// single bound it encloses plus one statement budget.
