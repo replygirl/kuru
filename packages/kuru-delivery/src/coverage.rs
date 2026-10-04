@@ -4379,7 +4379,9 @@ mod tests {
                     args,
                     log: log.clone(),
                     remaining: Duration::from_secs(120),
-                    ledger: &log,
+                    // Beside the log, never the log: a spawn row must not
+                    // land in output the test reads.
+                    ledger: &log.with_extension("ledger.jsonl"),
                 })
                 .await
                 .unwrap()
