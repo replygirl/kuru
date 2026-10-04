@@ -2,7 +2,7 @@
 
 ## 1. Design verification
 
-- [ ] 1.1 Obtain fable's verification of design.md (mechanism citations, lock scope within platform spawns, forced-race test shape) before implementing and verify the review is recorded in the roadmap note
+- [x] 1.1 Obtain fable's verification of design.md (mechanism citations, lock scope within platform spawns, forced-race test shape) before implementing and verify the review is recorded in the roadmap note
 
 ## 2. Platform spawn path
 

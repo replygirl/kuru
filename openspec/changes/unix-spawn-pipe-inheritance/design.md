@@ -102,12 +102,17 @@ inventoried. No product code uses `pre_exec`. Windows spawns go through
    standard descriptor as `ChildStdio::Explicit` (`common.rs:410-417`,
    `unix.rs:704-724`), and an end that lands on 0-2 (a standard descriptor
    closed in the parent) takes std's `duplicate()` path, which is
-   `F_DUPFD_CLOEXEC` and atomic, so neither creates an inheritable copy. The
-   parent end is kept as `OwnedFd` and returned by the unchanged `take_*`
-   methods via `ChildStdin/ChildStdout/ChildStderr::from(OwnedFd)` (stable
-   since 1.74). `Command` is consumed and dropped inside `spawn` before the
-   lock is released, closing the parent's copies of the child ends; otherwise
-   the parent would hold its own child's stdout write end and never read EOF.
+   `F_DUPFD_CLOEXEC` and atomic (INFERRED: `FileDesc::duplicate` is outside
+   the sparse clone's cited lines), so neither creates an inheritable copy.
+   The parent end is kept as `OwnedFd` and returned by the unchanged `take_*`
+   methods via `ChildStdin/ChildStdout/ChildStderr::from(OwnedFd)` (INFERRED
+   stable since 1.74: `os/fd/owned.rs` and `process.rs` are not in the sparse
+   clone; the build proves the conversions exist on the pinned toolchain).
+   `Command` is consumed and dropped explicitly (`drop(command)`) inside
+   `spawn` before the lock guard is released, closing the parent's copies of
+   the child ends; otherwise the parent would hold its own child's stdout
+   write end and never read EOF. A parameter outlives a local guard, so the
+   explicit drop is what orders it.
    `Stdio::null()` opens `/dev/null` with `O_CLOEXEC` (atomic) and `Inherit`
    creates nothing, so std makes no inheritable stdio descriptor. The
    exec-error pipe of std's fork path is still std's, but it is created inside
@@ -121,10 +126,12 @@ inventoried. No product code uses `pre_exec`. Windows spawns go through
    diagnostic drain until the bounded snapshot timeout.
 
 4. **Forced-race regression (unit test in `src/unix.rs`, every Unix).**
-   Two thread-local `cfg(test)` seams: `window` (called after pipe creation:
-   between `pipe()` and close-on-exec on Apple, after `pipe_with(CLOEXEC)`
-   elsewhere) and `blocked` (called when `try_lock` finds the lock held,
-   before `lock`). Thread A spawns `cat` (stdin pipe, stdout pipe, stderr
+   Two thread-local `cfg(test)` seams, each taken and fired at most once:
+   `window`, fired only while creating the STDIN slot's pipe (between `pipe()`
+   and close-on-exec on Apple, after `pipe_with(CLOEXEC)` elsewhere); a plan
+   whose stdin is not a pipe never fires it, so no later pipe can be paused
+   after stdin is already close-on-exec. `blocked` is fired when `try_lock`
+   finds the lock held, before `lock`. Thread A spawns `cat` (stdin pipe, stdout pipe, stderr
    null); its `window` seam fires once, signals B, then waits on a channel for
    B's first event, either `Blocked` (from B's seam) or `Spawned` (sent by B's
    test code after its spawn returns), bounded by the five-second bound the
@@ -136,7 +143,10 @@ inventoried. No product code uses `pre_exec`. Windows spawns go through
    ends and reports `Spawned`; on Apple those ends are not yet close-on-exec
    and survive B's exec. The test then drops A's stdin and requires A's stdout
    to reach EOF (A's `cat` exited) within the bound while it still holds B's
-   stdin open, and asserts B's first event was `Blocked`. Only afterward does
+   stdin open, and asserts B's first event was `Blocked`. The EOF wait is a
+   reader thread on A's stdout plus `recv_timeout` against the bound; the test
+   thread never blocks on a read, and on any failure it still drops B's stdin
+   and cleans both groups before panicking. Only afterward does
    it drop B's stdin and clean both groups up through the existing owner
    transition (reap after stdout EOF, bounded by the same deadline, yielding
    rather than sleeping). The leak self-resolves when B's child exits, so that
@@ -162,7 +172,11 @@ inventoried. No product code uses `pre_exec`. Windows spawns go through
    set close-on-exec in a second step). Unrelated legacy spawns and other
    non-atomic descriptor creation can still inherit, or leak into owned
    children; concurrent callers requiring isolation must use the platform
-   consistently."
+   consistently. On std's fork path, a legacy spawn that inherits an owned
+   spawn's exec-error pipe stalls that spawn until the legacy child exits, and
+   every later owned spawn, including the cleanup snapshot, waits behind it;
+   the remedy is moving those legacy spawns behind the platform, not a
+   timeout."
 
 ## Risks / Trade-offs
 
@@ -170,14 +184,18 @@ inventoried. No product code uses `pre_exec`. Windows spawns go through
   code runs under it (`pre_exec` closures run only in the child), and it is not
   ordered with the memory crate's test-only tokio gates. A forked child gets a
   locked copy but execs or `_exit`s without touching it. Poison is ignored.
-- [Stall amplification] On std's fork path the spawn blocks reading its
-  exec-error pipe. If a legacy spawn inherits that write end in its own
-  window, that owned spawn stalls until the legacy child exits (pre-existing),
-  and now every later owned spawn queues behind it. The window requires a
-  legacy spawn at that instant; legacy spawns are startup/login/update paths
-  plus memory service restarts. Recorded as a residual risk and a reason to
-  move remaining long-lived spawns (memory supervisor, engine) behind the
-  platform in a follow-on; not mitigated with a timeout here.
+- [Stall amplification, acknowledged severity change] On std's fork path the
+  spawn blocks reading its exec-error pipe. If a legacy spawn (memory
+  supervisor `server.rs:675`, Dolt engine `engine.rs:45`) inherits that write
+  end in its own window, that owned spawn stalls until the legacy child exits.
+  That per-spawn stall is pre-existing; with the lock it becomes process-wide
+  for owned spawns: the stalled spawn holds the lock and every later owned
+  spawn (tools, MCP, hooks) and the cleanup `ps` snapshot waits behind it, for
+  a Dolt-lifetime child unboundedly. The window requires a legacy spawn at
+  that instant; legacy spawns are startup/login/update paths plus memory
+  service restarts. Mitigation is migrating the memory supervisor and engine
+  spawns behind the platform (follow-on), not a timeout. Acknowledged through
+  the lead's instruction to implement with fable's required changes.
 - [Async runtime] `OwnedProcessGroup::spawn` is synchronous and is called from
   tokio tasks (`unix_shell`, `rpc`). A worker can block for the owned spawns
   queued ahead of it: syscall work of about a millisecond each on macOS, no

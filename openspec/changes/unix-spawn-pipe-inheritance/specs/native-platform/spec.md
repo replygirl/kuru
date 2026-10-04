@@ -28,17 +28,21 @@ before spawn returns.
 
 ### Requirement: Concurrent owned Unix spawns keep pipes private
 
-Every Unix child the platform starts (the fresh-process-group owner and the
-bounded process snapshot) SHALL create its stdio pipes close-on-exec and start
-the child under one process-wide platform spawn lock, so no other platform
-spawn can copy a descriptor table that holds a pipe end without close-on-exec.
-Where the OS creates pipes close-on-exec atomically the platform MUST use that
-call. The lock MUST be private to the platform, held only across pipe creation
-and child creation, never across caller code, waiting, or I/O on the child.
+The fresh-process-group owner SHALL create its stdio pipes close-on-exec and
+start the child under one process-wide platform spawn lock, and the bounded
+process snapshot SHALL start its child under the same lock, so its std pipes
+are created under the lock; no other platform spawn can then copy a
+descriptor table that holds a pipe end without close-on-exec. Where the OS
+creates pipes close-on-exec atomically the owner MUST use that call. The lock
+MUST be private to the platform and, in product builds, held only across pipe
+creation and child creation, never across caller code, waiting, or I/O on the
+child; only test builds may run their own seams under it.
 The platform MUST NOT claim isolation from spawns or descriptor creation that
 bypass it: an unrelated legacy spawn can still inherit an owned pipe end in its
 own window, and an owned child can still inherit descriptors that other code
-creates without atomic close-on-exec.
+creates without atomic close-on-exec. On std's fork path a legacy spawn that
+inherits an owned spawn's exec-error pipe stalls that spawn, and with it every
+later platform spawn, until the legacy child exits.
 
 #### Scenario: Concurrent owned children reach end of file independently
 
