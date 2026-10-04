@@ -27,25 +27,39 @@ must be external to apt.
   rounded up to whole minutes (748 s -> 13; the 32 s left covers the guard and
   the attempt messages). Every number carries its derivation in a comment at
   the site (see Measured basis); no guessed literal.
+- `.github/workflows/release.yml`: job `tests` (the release's ordinary native
+  test pass, which `plan` needs; it runs only on a release dispatch) has the
+  identical step. It gets exactly the same bounded shape: the same backstop
+  comment and `timeout-minutes: 13`, and byte-identical run text, so the
+  derivation comments apply verbatim (the 43 s healthy term was measured on the
+  native-tests partitions; see Measured basis). The step keeps its existing keys
+  (it has no `if:`, the job being Ubuntu only); nothing else in release.yml
+  changes.
 - `packages/kuru-delivery/tests/repo_validation.rs`: the constant `FIXED_APT`
-  that pins the step text for both `native-tests.yml` and `release.yml` is split
-  so native-tests gets the new text and release.yml keeps the old text;
-  `incident_apt_update_over_every_source_is_rejected` is updated; one new
-  assertion shows that removing `-o Dir::Etc::sourceparts=/dev/null` from one
-  apt-get inside the new retry loop of native-tests.yml still yields the "over
-  every configured apt source" error naming that command. The validator
+  that pins the step text for both `native-tests.yml` and `release.yml` now
+  pins the new text (the two workflows' run text is identical);
+  `incident_apt_update_over_every_source_is_rejected` keeps its expected errors;
+  one new assertion shows that removing `-o Dir::Etc::sourceparts=/dev/null`
+  from one apt-get inside the new retry loop, in native-tests.yml (job `shard`)
+  and in release.yml (job `tests`), still yields the "over every configured apt
+  source" error naming that job and command. The validator
   (`packages/kuru-delivery/src/repo/workflows.rs`, apt rule) must still see both
   fetches in the new shape; no new validator rule.
 - `packages/kuru-delivery/tests/release_workflow.rs` (found during
   implementation): `native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed`
   collected every line of the native `shard` job that trims to
   `timeout-minutes: ` and required exactly `["45"]`, so the new step-level
-  bound would fail it. Its filter now reads only the job-level key at job
-  indentation (`    timeout-minutes: `); the assertion it guards
-  (`KURU_COVERAGE_JOB_MINUTES` equals the job's limit) is unchanged. The only
-  way to keep the diff to two files would be to drop the step-level backstop.
-- Non-goals: `release.yml` has an identical step and is left unchanged (reported
-  as a follow-on); no other workflow step or file, no new workflow, no retry of
+  bound would fail it. It now (a) reads only the job-level key at job
+  indentation (`    timeout-minutes: `) for the 45 limit, the assertion it
+  guards (`KURU_COVERAGE_JOB_MINUTES` equals the job's limit) being unchanged,
+  and (b) pins the apt step's step-level backstop at step indentation
+  (`        timeout-minutes: `) as exactly `["13"]`. The only way to leave this
+  file unchanged would be to drop the step-level backstop. No test in this
+  file collects `timeout-minutes` lines or the apt step text from release.yml's
+  `tests` job (`required_release_checks_precede_the_only_publication_job` only
+  checks that the job contains `timeout-minutes: 60` and other fixed strings),
+  so the release copy needs no change here.
+- Non-goals: no other workflow step or file, no new workflow, no retry of
   tests. This is the single sanctioned retry shape here: vendor-side (Ubuntu
   archive / Azure mirror), never a retry of tests.
 - Docs: `docs/development.md` (apt rule paragraph near line 304) describes the
@@ -55,11 +69,17 @@ must be external to apt.
 ## Impact
 
 Jobs: every Ubuntu partition of `native-tests (ubuntu-latest)` (and any other
-Linux caller of `native-tests.yml`). Healthy runs are unaffected (attempt 1
-succeeds in tens of seconds); a stall now ends within the step bound with apt's
-status instead of a 45-minute job cancel. No secrets, required-check names or
-job names change. The step cannot be provoked into a stall in CI, so the stall
-behavior is reasoned from the shape, not observed.
+Linux caller of `native-tests.yml`), and release.yml's `tests` job on a release
+dispatch. Healthy runs are unaffected (attempt 1 succeeds in tens of seconds); a
+stall now ends within the step bound with apt's status instead of a 45-minute
+(native-tests) or 60-minute (release `tests`) job cancel. No secrets,
+required-check names or job names change. The step cannot be provoked into a
+stall in CI, so the stall behavior is reasoned from the shape, not observed.
+PR CI does not run release.yml's `tests` job (it runs only on a release
+dispatch, an external action that requires authorization), so the release copy
+is evidenced by its byte-identical run text with the CI-exercised native-tests
+step, the validator and repository tests, and actionlint/shellcheck, not by a
+release run.
 
 ## Measured basis
 
@@ -126,6 +146,14 @@ budget is 127 s + 17 s + 43 s (the healthy whole-step maximum above, a
 conservative allowance for one fetch, including the ~26 s dpkg phase) =
 187 s, and its `timeout-minutes` is 2 attempts x 2 fetches x 187 s = 748 s,
 rounded up to 13 minutes.
+
+Release copy (added when release.yml was folded in, 2026-10-04): the 43 s
+maximum and its 200-job sample were measured on `native-tests (ubuntu-latest) /
+Coverage partition` jobs running this same step. release.yml's `tests` job runs
+the byte-identical run text on the same `ubuntu-latest` runner label
+(`runs-on: ubuntu-latest`, release.yml job `tests`), so the derivation and both
+numbers (187 s per fetch, 13 minutes per step) apply to it verbatim. No
+release-run timing was measured for this change.
 
 ## Surfaces
 

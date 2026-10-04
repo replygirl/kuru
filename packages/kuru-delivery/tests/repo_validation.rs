@@ -475,9 +475,9 @@ const WORKFLOWS: [&str; 6] = [
     "release.yml",
 ];
 
-/// The fixed apt step text in native-tests.yml: each fetch is bounded and
-/// the update and install pair runs at most twice.
-const NATIVE_APT: &str = r#"          # These packages come from the Ubuntu archive. apt reads only its deb822
+/// The fixed apt step text in native-tests.yml and release.yml: each fetch is
+/// bounded and the update and install pair runs at most twice.
+const FIXED_APT: &str = r#"          # These packages come from the Ubuntu archive. apt reads only its deb822
           # list and no other sources.list.d entry, so an outage of a third-party
           # repository on the runner image cannot fail this step; errors from the
           # archive still fail it.
@@ -515,19 +515,6 @@ const NATIVE_APT: &str = r#"          # These packages come from the Ubuntu arch
           echo "::error::Ubuntu archive apt attempt 2 of 2 failed with exit status $status (124 = timed out after $budget s)"
           exit "$status"
 "#;
-/// The fixed apt step text in release.yml.
-const RELEASE_APT: &str = "          # These packages come from the Ubuntu archive. apt reads only its deb822
-          # list and no other sources.list.d entry, so an outage of a third-party
-          # repository on the runner image cannot fail this step; errors from the
-          # archive still fail it.
-          if [ ! -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-            echo 'The runner image has no Ubuntu archive list at /etc/apt/sources.list.d/ubuntu.sources' >&2
-            exit 1
-          fi
-          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null update
-          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null \\
-            install -y --no-install-recommends dbus gnome-keyring libsecret-tools
-";
 /// The same step before the fix, as run 36453397286 partition 7 ran it.
 const INCIDENT_APT: &str = "          sudo apt-get update
           sudo apt-get install -y --no-install-recommends dbus gnome-keyring libsecret-tools
@@ -777,11 +764,12 @@ fn incident_apt_update_over_every_source_is_rejected() {
     // Run 36453397286, Ubuntu coverage partition 7: `apt-get update` failed
     // on packages.microsoft.com (403), a runner-image list the step never used.
     let repo = Repository::with_workflows();
-    for (name, fixed) in [
-        ("native-tests.yml", NATIVE_APT),
-        ("release.yml", RELEASE_APT),
-    ] {
-        repo.replace(&format!(".github/workflows/{name}"), fixed, INCIDENT_APT);
+    for name in ["native-tests.yml", "release.yml"] {
+        repo.replace(
+            &format!(".github/workflows/{name}"),
+            FIXED_APT,
+            INCIDENT_APT,
+        );
     }
     let errors = repo.workflow_errors();
     let expected: Vec<String> = [
@@ -798,12 +786,12 @@ fn incident_apt_update_over_every_source_is_rejected() {
     })
     .collect();
     assert_eq!(errors, expected);
-    // The bounded retry loop hides neither fetch: each begins its own command
-    // after only the `timeout "$budget" sudo` prefix, so reading the parts
-    // directory again in one of them is still rejected.
+    // The bounded retry loop hides neither fetch in either workflow: each
+    // begins its own command after only the `timeout "$budget" sudo` prefix,
+    // so reading the parts directory again in one of them is still rejected.
     let list = "-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources";
     let parts = " -o Dir::Etc::sourceparts=/dev/null";
-    for (line, command) in [
+    let fetches = [
         (
             format!(
                 "            timeout \"$budget\" sudo apt-get {list}{parts} update || status=$?\n"
@@ -816,26 +804,29 @@ fn incident_apt_update_over_every_source_is_rejected() {
                 "apt-get {list} install -y --no-install-recommends dbus gnome-keyring libsecret-tools"
             ),
         ),
-    ] {
-        let repo = Repository::with_workflows();
-        repo.replace(
-            ".github/workflows/native-tests.yml",
-            &line,
-            &line.replacen(parts, "", 1),
-        );
-        assert_eq!(
-            repo.workflow_errors(),
-            [format!(
-                ".github/workflows/native-tests.yml: job shard step Install Ubuntu native secret-store fixture tools runs `{command}` over every configured apt source; name the needed list with one -o Dir::Etc::sourcelist=/..., make the last -o Dir::Etc::sourceparts=/dev/null, and pass no -c"
-            )]
-        );
+    ];
+    for (name, job) in [("native-tests.yml", "shard"), ("release.yml", "tests")] {
+        for (line, command) in &fetches {
+            let repo = Repository::with_workflows();
+            repo.replace(
+                &format!(".github/workflows/{name}"),
+                line,
+                &line.replacen(parts, "", 1),
+            );
+            assert_eq!(
+                repo.workflow_errors(),
+                [format!(
+                    ".github/workflows/{name}: job {job} step Install Ubuntu native secret-store fixture tools runs `{command}` over every configured apt source; name the needed list with one -o Dir::Etc::sourcelist=/..., make the last -o Dir::Etc::sourceparts=/dev/null, and pass no -c"
+                )]
+            );
+        }
     }
     // Naming a list is not enough while the parts directory is still read,
     // and the `apt` front end fetches the same way.
     let repo = Repository::with_workflows();
     repo.replace(
         ".github/workflows/release.yml",
-        RELEASE_APT,
+        FIXED_APT,
         "          sudo apt -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources update; sudo apt-get -oDir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -oDir::Etc::sourceparts=/dev/null install -y dbus\n          sudo -E DEBIAN_FRONTEND=noninteractive apt-get upgrade\n",
     );
     let unrestricted = |command: &str| {
@@ -858,7 +849,7 @@ fn incident_apt_update_over_every_source_is_rejected() {
     let repo = Repository::with_workflows();
     repo.replace(
         ".github/workflows/release.yml",
-        RELEASE_APT,
+        FIXED_APT,
         "          sudo sh -c 'apt-get update'\n          bash --noprofile -ec \"apt-get -y upgrade\"\n          bash -o pipefail -c 'apt-get dist-upgrade'\n          sudo add-apt-repository -y universe\n          sudo add-apt-repository -yn universe\n          sudo apt-add-repository --no-update ppa:example/tools\n",
     );
     assert_eq!(
@@ -878,7 +869,7 @@ fn incident_apt_update_over_every_source_is_rejected() {
     let restricted = "-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null";
     repo.replace(
         ".github/workflows/release.yml",
-        RELEASE_APT,
+        FIXED_APT,
         &format!(
             "          sudo -u root apt-get update\n          timeout 300 sudo apt-get -q update\n          sudo apt-get {restricted} -o Dir::Etc::sourceparts=/etc/apt/sources.list.d update\n          sudo apt-get {restricted} -o Dir::Etc::sourcelist=/etc/apt/sources.list install -y dbus\n          sudo apt-get -c /tmp/apt.conf {restricted} upgrade\n          sudo apt-get -o dir::etc::SOURCELIST=/etc/apt/sources.list.d/ubuntu.sources --option=DIR::ETC::SOURCEPARTS=/dev/null -yo Dir::Etc::sourceparts=/dev/null update\n"
         ),
@@ -901,7 +892,7 @@ fn incident_apt_update_over_every_source_is_rejected() {
     let repo = Repository::with_workflows();
     repo.replace(
         ".github/workflows/release.yml",
-        RELEASE_APT,
+        FIXED_APT,
         &format!("          APT_CONFIG=/tmp/apt.conf sudo -E apt-get {restricted} update\n"),
     );
     repo.replace(
