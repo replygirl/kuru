@@ -1086,7 +1086,7 @@ async fn authorized_native_reads_overlap_but_feed_results_back_in_provider_order
             .unwrap()
             .with_parallel_read_test_gate(gate.clone());
         let memory = MemoryStore::temporary().await.unwrap();
-    let mut harness = Harness::with_tool_host(
+        let mut harness = Harness::with_tool_host(
             config,
             directory.path(),
             memory.clone(),
@@ -1099,9 +1099,9 @@ async fn authorized_native_reads_overlap_but_feed_results_back_in_provider_order
         let actor_id = harness.topology.parts[0].id.clone();
         let controlled_actor = actor_id.clone();
         let mut events = harness.subscribe();
-    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
-    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
-    let mut task = tokio::spawn(async move {
+        let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+        let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+        let mut task = tokio::spawn(async move {
             let mut harness = harness;
             let output = harness
                 .run_controlled(
@@ -1149,14 +1149,14 @@ async fn authorized_native_reads_overlap_but_feed_results_back_in_provider_order
         .await
         .expect("the separately released search call did not settle");
         gate.release_named("first.txt");
-    let (mut harness, output) = crate::progress_wait::join_on_progress(
-        &mut task,
-        &mut watch,
-        gap,
-        "ordered parallel reads",
-        |(_, output)| crate::progress_wait::describe_result(&output),
-    )
-    .await;
+        let (mut harness, output) = crate::progress_wait::join_on_progress(
+            &mut task,
+            &mut watch,
+            gap,
+            "ordered parallel reads",
+            |(_, output)| crate::progress_wait::describe_result(&output),
+        )
+        .await;
         let output = output.unwrap();
         assert_eq!(output.text, "Both checked reads completed");
         let observations = output
@@ -1747,7 +1747,7 @@ async fn cancelled_parallel_wave_drains_every_owned_read_before_returning() {
             .unwrap()
             .with_parallel_read_test_gate(gate.clone());
         let memory = MemoryStore::temporary().await.unwrap();
-    let mut harness = Harness::with_tool_host(
+        let mut harness = Harness::with_tool_host(
             config,
             &directory_path,
             memory.clone(),
@@ -1761,9 +1761,9 @@ async fn cancelled_parallel_wave_drains_every_owned_read_before_returning() {
         let target = harness.topology.parts[0].id.clone();
         let cancellation = CancellationToken::new();
         let controlled = cancellation.clone();
-    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
-    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
-    let mut task = tokio::spawn(async move {
+        let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+        let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+        let mut task = tokio::spawn(async move {
             let mut harness = harness;
             let result = harness
                 .run_controlled(
@@ -1783,14 +1783,14 @@ async fn cancelled_parallel_wave_drains_every_owned_read_before_returning() {
         // can settle. The two cancelled observations required below therefore
         // prove the outer turn retained and drained both owned futures.
         gate.release();
-    let (mut harness, result) = crate::progress_wait::join_on_progress(
-        &mut task,
-        &mut watch,
-        gap,
-        "cancelled parallel wave",
-        |(_, result)| crate::progress_wait::describe_result(&result),
-    )
-    .await;
+        let (mut harness, result) = crate::progress_wait::join_on_progress(
+            &mut task,
+            &mut watch,
+            gap,
+            "cancelled parallel wave",
+            |(_, result)| crate::progress_wait::describe_result(&result),
+        )
+        .await;
         assert!(crate::turn_was_cancelled(&result.unwrap_err()));
         let mut settled = Vec::new();
         let mut later_started = false;
@@ -1881,7 +1881,7 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
             .unwrap()
             .with_parallel_read_test_gate(gate.clone());
         let memory = MemoryStore::temporary().await.unwrap();
-    let mut harness = Harness::with_tool_host(
+        let mut harness = Harness::with_tool_host(
             config,
             &project_path,
             memory.clone(),
@@ -1894,9 +1894,9 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
         let target = harness.topology.parts[0].id.clone();
         let cancellation = CancellationToken::new();
         let controlled = cancellation.clone();
-    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
-    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
-    let mut task = tokio::spawn(async move {
+        let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+        let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+        let mut task = tokio::spawn(async move {
             let mut harness = harness;
             let result = harness
                 .run_controlled(
@@ -1922,10 +1922,10 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
         assert_eq!(std::fs::read(&original).unwrap(), b"admitted bytes");
         gate.release();
 
-    // The continuation follows the settled receipts' persistence and the
-    // actor's private-context read, each a memory statement under the budget
-    // `turn_admission_deadline` follows.
-    let continuation = tokio::time::timeout(turn_admission_deadline(), observed)
+        // The continuation follows the settled receipts' persistence and the
+        // actor's private-context read, each a memory statement under the budget
+        // `turn_admission_deadline` follows.
+        let continuation = tokio::time::timeout(turn_admission_deadline(), observed)
             .await
             .expect("provider did not observe the mixed completion receipts")
             .unwrap();
@@ -1958,14 +1958,14 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
         );
 
         cancellation.cancel();
-    let (mut harness, result, target) = crate::progress_wait::join_on_progress(
-        &mut task,
-        &mut watch,
-        gap,
-        "cancelled mixed completion",
-        |(_, result, _)| crate::progress_wait::describe_result(&result),
-    )
-    .await;
+        let (mut harness, result, target) = crate::progress_wait::join_on_progress(
+            &mut task,
+            &mut watch,
+            gap,
+            "cancelled mixed completion",
+            |(_, result, _)| crate::progress_wait::describe_result(&result),
+        )
+        .await;
         assert!(crate::turn_was_cancelled(&result.unwrap_err()));
         let checkpoint = harness
             .file_checkpoint(&checkpoint)
@@ -1974,11 +1974,11 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
         assert_eq!(checkpoint.state, CheckpointState::Applied);
         assert_eq!(checkpoint.path, "accepted.txt");
         assert_eq!(provider.issued.load(Ordering::SeqCst), 1);
-    // Admission reads the stored journal (`memory.get`, engine.rs:1499) and
-    // refuses before any provider work: one statement under the budget
-    // `turn_admission_deadline` follows.
+        // Admission reads the stored journal (`memory.get`, engine.rs:1499) and
+        // refuses before any provider work: one statement under the budget
+        // `turn_admission_deadline` follows.
         let retry = tokio::time::timeout(
-        turn_admission_deadline(),
+            turn_admission_deadline(),
             harness.run_controlled(
                 "refuse one read and publish one write",
                 Some(&target),
@@ -1995,11 +1995,11 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
             std::fs::read_to_string(project.path().join("accepted.txt")).unwrap(),
             "one mixed write"
         );
-    tokio::time::timeout(shutdown_guard(), harness.shutdown(false))
+        tokio::time::timeout(shutdown_guard(), harness.shutdown(false))
             .await
             .expect("mixed-effect harness shutdown did not finish")
             .unwrap();
-    tokio::time::timeout(kuru_memory::test_budgets::close_budget(), memory.close())
+        tokio::time::timeout(kuru_memory::test_budgets::close_budget(), memory.close())
             .await
             .expect("mixed-effect memory close did not finish")
             .unwrap();

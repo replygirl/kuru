@@ -1815,16 +1815,16 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
 
         let project = tempfile::tempdir().unwrap();
         let marker = project.path().join("second-hook-started");
-    // The second hook and its backgrounded descendant each block opening this
-    // FIFO, which nobody writes, so neither can exit on its own however long
-    // the cancelled join takes. Released before `project` removes it.
-    let hold = project.path().join("descendant-hold");
-    nix::unistd::mkfifo(&hold, nix::sys::stat::Mode::S_IRWXU).unwrap();
-    let _release = ReleaseHold(hold.clone());
+        // The second hook and its backgrounded descendant each block opening this
+        // FIFO, which nobody writes, so neither can exit on its own however long
+        // the cancelled join takes. Released before `project` removes it.
+        let hold = project.path().join("descendant-hold");
+        nix::unistd::mkfifo(&hold, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let _release = ReleaseHold(hold.clone());
         let script = format!(
         "request=$(cat); case \"$request\" in *dream-hook-call-1*) printf '%s' '{{\"decision\":\"annotate\",\"annotation\":\"candidate only\"}}';; *) (printf '%s' $$ > '{0}.tmp'; mv '{0}.tmp' '{0}'; cat '{1}') & cat '{1}';; esac",
             marker.display(),
-        hold.display()
+            hold.display()
         );
         let provider = CapturingProvider::new(ReplyPlan::DreamProposal);
         let hook = shell_hook(&script);
@@ -1852,7 +1852,7 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
                 harness.hook_host(),
             ),
             memory,
-        files: vec![marker.clone()],
+            files: vec![marker.clone()],
         };
         // Each wait ends on its event; only one silent gap longer than the
         // fixture's stated step budget fails it. The bound also encloses the
@@ -1931,9 +1931,9 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
         );
         // The second hook's backgrounded subshell published the owned group id
         // (`$$`, the root's pid, which leads its group) once it was running, and
-    // it blocks on the hold FIFO until released, so only the reap can have
-    // emptied the group. Signal zero and a listing only; observation never
-    // terminates anything, and an unclassifiable number is not `none_of_ours`.
+        // it blocks on the hold FIFO until released, so only the reap can have
+        // emptied the group. Signal zero and a listing only; observation never
+        // terminates anything, and an unclassifiable number is not `none_of_ours`.
         let group: u32 = std::fs::read_to_string(&marker)
             .unwrap()
             .trim()

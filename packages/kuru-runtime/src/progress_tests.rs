@@ -474,9 +474,9 @@ async fn relationship_consultation_and_dream_never_publish_private_streams() {
         let active_parts = harness.topology.parts.len();
         let mut progress = harness.subscribe_progress();
         let run_target = ids[0].clone();
-    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
-    let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
-    let mut run = tokio::spawn(async move {
+        let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+        let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
+        let mut run = tokio::spawn(async move {
             let result = harness
                 .run_local_controlled(
                     "consult then dream",
@@ -513,14 +513,14 @@ async fn relationship_consultation_and_dream_never_publish_private_streams() {
         for _ in 0..active_parts {
             provider.release();
         }
-    let (mut harness, result) = crate::progress_wait::join_on_progress(
-        &mut run,
-        &mut watch,
-        gap,
-        "turn's dream",
-        |(_, result)| crate::progress_wait::describe_result(&result),
-    )
-    .await;
+        let (mut harness, result) = crate::progress_wait::join_on_progress(
+            &mut run,
+            &mut watch,
+            gap,
+            "turn's dream",
+            |(_, result)| crate::progress_wait::describe_result(&result),
+        )
+        .await;
         assert_eq!(result.unwrap().output.text, "settled-two");
         assert!(
             harness

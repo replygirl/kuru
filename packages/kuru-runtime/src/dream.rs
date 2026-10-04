@@ -942,14 +942,14 @@ mod cancellation_tests {
                 ensure!(memory.revision().await? == live);
                 harness.shutdown(false).await?;
                 memory.close().await
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "selected no-send cancellation fixture exceeded fixture_deadline(1, 0) = {deadline:?}"
-            )
-        })??;
-        Ok(())
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "selected no-send cancellation fixture exceeded fixture_deadline(1, 0) = {deadline:?}"
+                )
+            })??;
+            Ok(())
         })
         .await
     }

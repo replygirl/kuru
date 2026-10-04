@@ -906,10 +906,10 @@ async fn cancelled_live_undo_reconciles_before_a_later_save() {
             let harness = harness.clone();
             async move { harness.lock().await.undo_dream().await }
         });
-    // `undo_dream` reads its prepared undo state, then makes its persist
-    // write (dream.rs:521-567): memory statements under the budget
-    // `turn_admission_deadline` follows.
-    tokio::time::timeout(crate::tests::turn_admission_deadline(), written)
+        // `undo_dream` reads its prepared undo state, then makes its persist
+        // write (dream.rs:521-567): memory statements under the budget
+        // `turn_admission_deadline` follows.
+        tokio::time::timeout(crate::tests::turn_admission_deadline(), written)
             .await
             .unwrap()
             .unwrap();

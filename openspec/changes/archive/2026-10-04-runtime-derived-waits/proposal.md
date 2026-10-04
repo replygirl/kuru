@@ -172,6 +172,13 @@ labelled as such.
   635 s for the one mid-turn MCP wait. Passing runs take the same time.
 - Test only; no runtime, connector, platform, memory or documentation change.
 
+Integration status (2026-10-04): PR #210's budget exports now come from merged
+main, and the duplicate cherry-pick was dropped. The branch is based on PR #221's
+merged whole-test closing scopes at `22e1ee60`; its final diff is limited to the
+nine owned runtime files and this existing archived record. All derived inner
+waits and explicit closing boundaries are preserved. Local integration evidence
+and the distinction from the earlier hosted CI are recorded in task 9.8.
+
 ## Surfaces
 
 - [ ] interactive
