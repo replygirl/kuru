@@ -25,3 +25,22 @@
 - [x] 4.1 @unit (agent) `mise run format:check`, `typecheck`, `lint`, `lint:windows` -> observed: each exit 0. `lint:windows` checks the wrapped `cfg(windows)` `windows_tool_tests`. Re-run after the kuru-tui change: each exit 0, with `lint:windows` also checking kuru-tui's wrapped `cfg(windows)` tests.
 - [x] 4.2 @unit (agent) `mise run cospec -- validate --all --strict` -> observed: exit 0
 - [~] 4.3 @runtime (agent) a native CI coverage shard with this change -> defer: CI reruns are not allowed for this task; the PR's own CI runs every partition
+
+## Integrated with current main (2026-10-04)
+
+Rebased all seven reviewed commits onto main
+`53ce62a2d130b92730a48ad9a3816bea04e42261`, including PR #223's foreign-directory
+startup-probe correction and PR #218's event-based dream wait. The only conflict
+was `accounting_tests.rs`: retained the complete main dream-test body inside the
+closing scope, including progress rearming, early-finish/stall diagnostics,
+cancellation settlement and explicit close-before-reopen boundaries. Six commits
+kept equivalent patches. Across the previously reviewed runtime/TUI and memory
+closing-support sources, only that accounting file differs from the old head;
+its 58-line integration diff contains the expected PR #218 changes.
+
+`mise run format:rust:fix` completed successfully. The package-owned focused test
+`abandoned_dream_keeps_usage_after_reopen_without_advancing_main` passed 1/1 in
+3.54 seconds, using the checksum-pinned local bundle in offline mode and a
+command-local soft descriptor limit of 4096. This is local macOS evidence, not a
+claim about hosted limits or native Windows/Linux execution. Full final-head CI
+remains required; the old macOS foreign-probe failure was not manually rerun.
