@@ -54,11 +54,15 @@ must be external to apt.
   guards (`KURU_COVERAGE_JOB_MINUTES` equals the job's limit) being unchanged,
   and (b) pins the apt step's step-level backstop at step indentation
   (`        timeout-minutes: `) as exactly `["13"]`. The only way to leave this
-  file unchanged would be to drop the step-level backstop. No test in this
-  file collects `timeout-minutes` lines or the apt step text from release.yml's
-  `tests` job (`required_release_checks_precede_the_only_publication_job` only
-  checks that the job contains `timeout-minutes: 60` and other fixed strings),
-  so the release copy needs no change here.
+  file unchanged would be to drop the step-level backstop. The release copy
+  needs its own pin: `repo_validation.rs` pins only the run body, and the
+  release `tests` job was otherwise checked only by `contains` strings, so its
+  `timeout-minutes: 13` could change or vanish unnoticed (round 2 review).
+  `required_release_checks_precede_the_only_publication_job` therefore asserts,
+  next to its keyring-session equality, that release.yml job `tests`' step
+  "Install Ubuntu native secret-store fixture tools" equals native-tests.yml
+  job `shard`'s step of that name apart from native-tests'
+  `if: runner.os == 'Linux'` line, covering the backstop and the run block.
 - Non-goals: no other workflow step or file, no new workflow, no retry of
   tests. This is the single sanctioned retry shape here: vendor-side (Ubuntu
   archive / Azure mirror), never a retry of tests.
