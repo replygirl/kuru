@@ -23,9 +23,10 @@ must be external to apt.
   Dir::Etc::sourceparts=/dev/null`, print the attempt number and, on failure,
   apt's exit status (124 = timed out), and a second failure fails the step with
   that status. No `Acquire::Retries` stacking and no `dpkg --configure -a`
-  recovery. Step `timeout-minutes` = 2 x attempt budget + small margin, rounded
-  up to whole minutes. Every number carries its derivation in a comment at the
-  site (see Measured basis); no guessed literal.
+  recovery. Step `timeout-minutes` = 2 attempts x 2 fetches x attempt budget,
+  rounded up to whole minutes (748 s -> 13; the 32 s left covers the guard and
+  the attempt messages). Every number carries its derivation in a comment at
+  the site (see Measured basis); no guessed literal.
 - `packages/kuru-delivery/tests/repo_validation.rs`: the constant `FIXED_APT`
   that pins the step text for both `native-tests.yml` and `release.yml` is split
   so native-tests gets the new text and release.yml keeps the old text;

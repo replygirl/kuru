@@ -1501,6 +1501,12 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
         .filter_map(|line| line.strip_prefix("    timeout-minutes: "))
         .collect();
     assert_eq!(timeout, ["45"]);
+    // The apt step's backstop, at step indentation; its derivation lives at the site.
+    let backstop: Vec<_> = shards
+        .lines()
+        .filter_map(|line| line.strip_prefix("        timeout-minutes: "))
+        .collect();
+    assert_eq!(backstop, ["13"]);
     let deadlines: Vec<_> = shards
         .lines()
         .filter_map(|line| line.trim().strip_prefix("KURU_COVERAGE_JOB_MINUTES: \""))
