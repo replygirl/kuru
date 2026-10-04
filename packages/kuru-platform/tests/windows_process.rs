@@ -17,8 +17,57 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-const LIMIT: Duration = Duration::from_secs(8);
+/// The only wall-clock bound the platform owns that these tests reach: the
+/// stdio pipe accept in `kuru_platform::windows::pipe::stdio`
+/// (`accept_connection(Duration::from_secs(5))`), which every `Stdio::Pipe`
+/// spawn awaits. The fixture child's own connect, accept, close and wait
+/// bounds are the same 5 s (`tests/fixtures/process.rs`), so a fixture's own
+/// error is observed before the parent's wait on it ends.
+const NATIVE_BOUND: Duration = Duration::from_secs(5);
+
+/// Allowance for creating a fixture child process and its runtime before its
+/// own work begins, restated from
+/// `kuru_memory::test_support::CHILD_START_MARGIN` (`cfg(test)` and
+/// crate-private there).
+const CHILD_START: Duration = Duration::from_secs(5);
+
+/// One wait's failure bound in this file: [`NATIVE_BOUND`] plus
+/// [`CHILD_START`], 10 s. [`budget_arg`] adds one to each budgeted fixture's
+/// self-timeout.
+///
+/// No product bound applies to these waits. The platform's `Pipe::close`,
+/// `accept_connection` (through both listeners' `accept`), `pipe::connect`,
+/// `NativeChild::wait` and `wait_process_handle` take their bound from the
+/// caller, and `NativeChild::terminate` is an unbounded request proved by a
+/// later wait: the test is the caller, and `LIMIT` is its bound for the native
+/// operation plus a child started before it. Readiness and handshake reads
+/// from a just-started child, the in-process service-pipe I/O, polls and reads
+/// of fixture work and the 8 MiB duplex join are pure fixture work; for them
+/// `LIMIT` is the fixture's stated child-start-plus-work allowance. Each wait
+/// ends on its event, so the bound decides only a failure, and it outlives
+/// the fixture's own 5 s bounds. The fixture's 20 s release deadlines are not
+/// derived from it.
+const LIMIT: Duration = NATIVE_BOUND.saturating_add(CHILD_START);
 const SHORT: Duration = Duration::from_millis(80);
+
+/// The bound of an outer wait over `limits` inner waits bounded by [`LIMIT`]
+/// and `shorts` bounded by [`SHORT`], run in series, so each inner wait has its
+/// own bound first. A caller whose span has a step no inner wait bounds (child
+/// creation, runtime construction or shutdown) adds one `LIMIT` for it.
+fn series(limits: u32, shorts: u32) -> Duration {
+    LIMIT * limits + SHORT * shorts
+}
+
+/// A budgeted fixture mode's last argument: its orphan-reaping self-timeout,
+/// which the fixture uses as is. `budget` is a [`series`] of the parent's waits
+/// from the spawn until it no longer needs the fixture running. The added
+/// [`LIMIT`] covers the parent's unbounded steps after its last counted wait
+/// (a thread join, a synchronous lock check, `try_wait`) and the gap between
+/// the parent's clock and the fixture's, which starts only once it runs. So
+/// the parent's waits decide first, and the self-timeout only reaps an orphan.
+fn budget_arg(budget: Duration) -> OsString {
+    budget.saturating_add(LIMIT).as_millis().to_string().into()
+}
 
 #[tokio::test]
 async fn private_service_pipe_accepts_multiple_clients_after_cancelled_wait() {
@@ -101,8 +150,11 @@ async fn ready(child: &mut NativeChild) -> BufReader<Pipe> {
     reader
 }
 
-async fn idle(root: &Path) -> NativeChild {
+/// A parked fixture that only termination ends. `budget` is the parent's wait
+/// on it from its spawn until the parent no longer needs it running.
+async fn idle(root: &Path, budget: Duration) -> NativeChild {
     let mut spawn = spec(root, &[OsStr::new("idle")]);
+    spawn.args.push(budget_arg(budget));
     spawn.stdout = Stdio::Pipe;
     let mut child = spawn.spawn().await.unwrap();
     ready(&mut child).await;
@@ -347,7 +399,8 @@ async fn invalid_creation_intent_fails_before_running_a_fixture() {
 #[tokio::test]
 async fn timeout_retains_tree_ownership_and_termination_is_explicit() {
     let root = tempfile::tempdir().unwrap();
-    let mut child = idle(root.path()).await;
+    // Readiness, then the probe that must time out on the running tree.
+    let mut child = idle(root.path(), series(1, 1)).await;
     assert_eq!(
         child.wait(SHORT).await.unwrap_err().kind(),
         io::ErrorKind::TimedOut
@@ -537,7 +590,10 @@ async fn concurrent_handle_allowlists_keep_stdin_and_output_independent() {
 #[tokio::test]
 async fn owner_death_closes_its_job_and_leaves_an_unrelated_child_usable() {
     let root = tempfile::tempdir().unwrap();
-    let mut unrelated = idle(root.path()).await;
+    // Its own readiness, the owner's creation (which no wait bounds), the
+    // owner's readiness and reap, and the leaf's release before the check
+    // that it still runs.
+    let mut unrelated = idle(root.path(), series(5, 0)).await;
     let root_lock = root.path().join("root.lock");
     let leaf_lock = root.path().join("leaf.lock");
     let release = root.path().join("release");
@@ -550,6 +606,8 @@ async fn owner_death_closes_its_job_and_leaves_an_unrelated_child_usable() {
             release.as_os_str(),
         ],
     );
+    // Its readiness is the only wait before termination.
+    spawn.args.push(budget_arg(LIMIT));
     // No outer Job may mask whether the killed owner's inner Job closes.
     spawn.lifetime = Lifetime::TrustedSupervisor;
     spawn.stdout = Stdio::Pipe;
@@ -568,7 +626,10 @@ async fn owner_death_closes_its_job_and_leaves_an_unrelated_child_usable() {
 #[tokio::test]
 async fn owner_loss_at_child_startup_prevents_work_and_preserves_unrelated_process() {
     let root = tempfile::tempdir().unwrap();
-    let mut unrelated = idle(root.path()).await;
+    // Its own readiness, the owner's creation (which no wait bounds), the
+    // owner's readiness and reap, and the startup lock's release before the
+    // check that it still runs.
+    let mut unrelated = idle(root.path(), series(5, 0)).await;
     let started = root.path().join("startup.lock");
     let release = root.path().join("release-startup");
     let work = root.path().join("work");
@@ -581,6 +642,8 @@ async fn owner_loss_at_child_startup_prevents_work_and_preserves_unrelated_proce
             work.as_os_str(),
         ],
     );
+    // Its readiness is the only wait before termination.
+    spawn.args.push(budget_arg(LIMIT));
     // An outer Job would mask whether the startup child's actual owner cleans it.
     spawn.lifetime = Lifetime::TrustedSupervisor;
     spawn.stdout = Stdio::Pipe;
@@ -609,6 +672,8 @@ async fn trusted_child_survives_its_creator_until_private_lifetime_eof() {
         root.path(),
         &[OsStr::new("trusted-owner"), receipt.as_os_str()],
     );
+    // Its readiness is the only wait before termination.
+    spawn.args.push(budget_arg(LIMIT));
     spawn.lifetime = Lifetime::TrustedSupervisor;
     spawn.stdout = Stdio::Pipe;
     let mut owner = spawn.spawn().await.unwrap();
@@ -723,7 +788,9 @@ async fn split_duplex_tasks_keep_independent_read_and_write_wakeups() {
 #[tokio::test]
 async fn wrong_peer_and_nonlocal_names_are_rejected_without_payload() {
     let root = tempfile::tempdir().unwrap();
-    let mut expected = idle(root.path()).await;
+    // Its readiness, the test's connect and rejected accept, then four
+    // rejected connects and the accept that must time out on it.
+    let mut expected = idle(root.path(), series(3, 5)).await;
     let listener = PrivateListener::bind().unwrap();
     // The test process opens this connection, not the expected live fixture.
     let client = pipe::connect(listener.address(), LIMIT).await.unwrap();
@@ -777,6 +844,11 @@ async fn wrong_peer_and_nonlocal_names_are_rejected_without_payload() {
 fn stalled_overlapped_write_closes_before_peer_exit_and_runtime_shutdown() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().to_owned();
+    // The thread's accept, hello read and two closes, plus one LIMIT for the
+    // child's creation and the runtime's construction and shutdown, which no
+    // inner wait bounds; and its two probes that must time out. The stalled
+    // peer is passed the same budget, so it is parked past this wait.
+    let budget = series(5, 2);
     let (sender, receiver) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -785,10 +857,11 @@ fn stalled_overlapped_write_closes_before_peer_exit_and_runtime_shutdown() {
             .unwrap();
         let child = runtime.block_on(async {
             let listener = PrivateListener::bind().unwrap();
-            let spawn = spec(
+            let mut spawn = spec(
                 &directory,
                 &[OsStr::new("rendezvous-stall"), listener.address()],
             );
+            spawn.args.push(budget_arg(budget));
             let mut child = spawn.spawn().await.unwrap();
             let mut channel = listener.accept(&child, LIMIT).await.unwrap();
             let mut hello = [0; 9];
@@ -827,7 +900,7 @@ fn stalled_overlapped_write_closes_before_peer_exit_and_runtime_shutdown() {
             .unwrap_or_else(|_| panic!("cleanup receiver disappeared"));
     });
     let mut child = receiver
-        .recv_timeout(LIMIT * 2)
+        .recv_timeout(budget)
         .expect("native I/O retained runtime after close");
     thread.join().unwrap();
     assert!(
@@ -922,6 +995,13 @@ async fn dropping_a_trusted_handle_does_not_terminate_its_lifetime_peer() {
 fn cancelled_partial_frame_closes_pipe_and_reaps_peer_before_runtime_shutdown() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().to_owned();
+    // The thread's accept, readiness read, two closes, remainder read and
+    // reap, plus one LIMIT for the child's creation and the runtime's
+    // construction and shutdown, which no inner wait bounds; and its one probe
+    // that must time out. The peer is passed the same budget: it ends on the
+    // EOF of this thread's close, inside this series, so its self-timeout
+    // cannot end it first.
+    let budget = series(7, 1);
     let (sender, receiver) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -934,6 +1014,7 @@ fn cancelled_partial_frame_closes_pipe_and_reaps_peer_before_runtime_shutdown() 
                 &directory,
                 &[OsStr::new("rendezvous-partial-frame"), listener.address()],
             );
+            spawn.args.push(budget_arg(budget));
             spawn.stdout = Stdio::Pipe;
             let mut child = spawn.spawn().await.unwrap();
             let mut channel = BufReader::new(listener.accept(&child, LIMIT).await.unwrap());
@@ -971,7 +1052,7 @@ fn cancelled_partial_frame_closes_pipe_and_reaps_peer_before_runtime_shutdown() 
         sender.send(()).unwrap();
     });
     receiver
-        .recv_timeout(LIMIT * 4)
+        .recv_timeout(budget)
         .expect("partial-frame cancellation stranded its child, pipe or Tokio runtime");
     thread.join().unwrap();
 }
@@ -1014,8 +1095,11 @@ fn missing_and_busy_connects_preserve_distinct_terminal_states() {
         drop(runtime);
         sender.send(()).unwrap();
     });
+    // The thread's one bounded connect, plus one LIMIT for the runtime's
+    // construction and shutdown, which no inner wait bounds; and its two
+    // connects that must fail at once or time out.
     receiver
-        .recv_timeout(LIMIT)
+        .recv_timeout(series(2, 2))
         .expect("terminal native pipe connect states stranded the Tokio runtime");
     thread.join().unwrap();
 }
@@ -1023,7 +1107,8 @@ fn missing_and_busy_connects_preserve_distinct_terminal_states() {
 #[tokio::test]
 async fn diagnostic_sampling_reports_non_decreasing_resources() {
     let root = tempfile::tempdir().unwrap();
-    let mut child = idle(root.path()).await;
+    // Its readiness is the only wait before termination.
+    let mut child = idle(root.path(), LIMIT).await;
     let diagnostic = child.duplicate_diagnostic_handle().unwrap();
     let first = sample_process(&diagnostic).unwrap();
     assert!(
@@ -1070,7 +1155,8 @@ async fn process_object_retained_matches_only_the_exact_identity() {
     assert!(process_object_retained(current).unwrap());
 
     let root = tempfile::tempdir().unwrap();
-    let mut child = idle(root.path()).await;
+    // Its readiness is the only wait before termination.
+    let mut child = idle(root.path(), LIMIT).await;
     let stamp = child.stamp().unwrap();
     assert_eq!(stamp.id, child.id());
     assert_ne!(stamp.created, 0);
