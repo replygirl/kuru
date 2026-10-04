@@ -116,7 +116,10 @@ pub async fn run() -> Result<()> {
                 .execute(&mut *transaction)
                 .await;
         });
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // Each poll needs a second pool connection while the transaction
+        // holds one; the pool bounds that acquisition by its ceiling,
+        // `QUERY_TIMEOUT`.
+        tokio::time::timeout(kuru_memory::test_budgets::QUERY_TIMEOUT, async {
             loop {
                 let query: Option<String> = sqlx::query_scalar(
                     "SELECT INFO FROM information_schema.processlist WHERE ID = ?",
