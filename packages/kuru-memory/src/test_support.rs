@@ -35,6 +35,8 @@ pub(crate) use served_owner::{
 };
 /// Opt-in aged-store fixture for open-time measurement (`age-store`).
 pub mod aged_store;
+/// The teardown scope that closes a test body's stores on every exit path.
+pub(crate) mod closing;
 /// Data-tree copy, byte scan and cross-OS capture format for the engine
 /// contract tests.
 #[cfg(test)]
@@ -46,6 +48,9 @@ pub mod lifecycle_trace;
 /// Coverage-runner spawn rows naming the test behind each detached child
 /// (inert unless the runner enables them).
 pub mod spawn_ledger;
+pub use closing::{
+    assert_async_tests_run_in_closing, closing, rust_sources, tests_outside_closing,
+};
 pub(crate) mod template;
 /// The CI usage-scan scaling check over aged stores (`usage-scan-fixture`,
 /// `measure-usage-scan`); compiled only on Unix, where its CI job runs.

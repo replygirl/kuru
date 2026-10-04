@@ -479,33 +479,36 @@ mod render_tests {
 
     #[tokio::test]
     async fn cancelled_session_spool_cleans_its_owned_stage_and_keeps_destination() {
-        let temporary = tempfile::tempdir().unwrap();
-        let destination = temporary.path().join("session.jsonl");
-        std::fs::write(&destination, b"existing completed export").unwrap();
-        let target = OutputTarget::open_replace(&destination, temporary.path()).unwrap();
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
-            let mut staged = StagedExport::new(target.directory()).unwrap();
-            let mut spool = staged
-                .create_auxiliary(OsStr::new("session.spool"))
-                .unwrap();
-            spool.write_all(b"partial chronological source").unwrap();
-            let stage_path = staged.temp.path.as_ref().unwrap().clone();
-            ready_tx.send(stage_path).unwrap();
-            let _ = release_rx.await;
-            spool.sync_all().unwrap();
-            staged.complete().unwrap();
-        });
-        let stage_path = ready_rx.await.unwrap();
-        assert!(stage_path.join("session.spool").exists());
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert!(!stage_path.exists(), "cancelled spool left an orphan stage");
-        assert_eq!(
-            std::fs::read(destination).unwrap(),
-            b"existing completed export"
-        );
+        kuru_memory::test_support::closing(async {
+            let temporary = tempfile::tempdir().unwrap();
+            let destination = temporary.path().join("session.jsonl");
+            std::fs::write(&destination, b"existing completed export").unwrap();
+            let target = OutputTarget::open_replace(&destination, temporary.path()).unwrap();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                let mut staged = StagedExport::new(target.directory()).unwrap();
+                let mut spool = staged
+                    .create_auxiliary(OsStr::new("session.spool"))
+                    .unwrap();
+                spool.write_all(b"partial chronological source").unwrap();
+                let stage_path = staged.temp.path.as_ref().unwrap().clone();
+                ready_tx.send(stage_path).unwrap();
+                let _ = release_rx.await;
+                spool.sync_all().unwrap();
+                staged.complete().unwrap();
+            });
+            let stage_path = ready_rx.await.unwrap();
+            assert!(stage_path.join("session.spool").exists());
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(!stage_path.exists(), "cancelled spool left an orphan stage");
+            assert_eq!(
+                std::fs::read(destination).unwrap(),
+                b"existing completed export"
+            );
+        })
+        .await
     }
 
     #[test]

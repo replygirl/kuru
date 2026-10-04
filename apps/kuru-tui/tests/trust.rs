@@ -621,38 +621,41 @@ fn lifecycle_hook_trust_preflight_binds_command_event_order_and_bounds() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stdio_and_http_mcp_require_cli_approval_before_activation() {
-    let stdio = NativeMcpFixture::new();
-    let http = HttpMcpFixture::new().await;
-    let sandbox = Sandbox::new(&mcp_config(&stdio, &http));
+    kuru_memory::test_support::closing(async {
+        let stdio = NativeMcpFixture::new();
+        let http = HttpMcpFixture::new().await;
+        let sandbox = Sandbox::new(&mcp_config(&stdio, &http));
 
-    let refused = tokio::task::block_in_place(|| sandbox.run(&["tools"]));
-    assert!(!refused.status.success());
-    assert!(
-        text(&refused.stderr).contains("workspace authority is not approved"),
-        "{}",
-        text(&refused.stderr)
-    );
-    assert_eq!(stdio.started(), 0, "unapproved stdio MCP started");
-    assert_eq!(http.requests(), 0, "unapproved HTTP MCP connected");
-    assert!(!sandbox.data.exists());
+        let refused = tokio::task::block_in_place(|| sandbox.run(&["tools"]));
+        assert!(!refused.status.success());
+        assert!(
+            text(&refused.stderr).contains("workspace authority is not approved"),
+            "{}",
+            text(&refused.stderr)
+        );
+        assert_eq!(stdio.started(), 0, "unapproved stdio MCP started");
+        assert_eq!(http.requests(), 0, "unapproved HTTP MCP connected");
+        assert!(!sandbox.data.exists());
 
-    let approved =
-        tokio::task::block_in_place(|| sandbox.run(&["--trust-workspace-once", "tools"]));
-    assert!(approved.status.success(), "{}", text(&approved.stderr));
-    let tools: Value = serde_json::from_slice(&approved.stdout).unwrap();
-    assert!(tools["tools"].as_array().is_some());
-    assert_eq!(stdio.started(), 1, "approved stdio MCP did not start once");
-    assert_eq!(
-        stdio.completed(),
-        1,
-        "approved stdio MCP did not complete its protocol"
-    );
-    assert_eq!(
-        http.requests(),
-        3,
-        "approved HTTP MCP did not complete initialize, notification, and discovery"
-    );
-    assert!(!sandbox.data.join("trust").exists());
+        let approved =
+            tokio::task::block_in_place(|| sandbox.run(&["--trust-workspace-once", "tools"]));
+        assert!(approved.status.success(), "{}", text(&approved.stderr));
+        let tools: Value = serde_json::from_slice(&approved.stdout).unwrap();
+        assert!(tools["tools"].as_array().is_some());
+        assert_eq!(stdio.started(), 1, "approved stdio MCP did not start once");
+        assert_eq!(
+            stdio.completed(),
+            1,
+            "approved stdio MCP did not complete its protocol"
+        );
+        assert_eq!(
+            http.requests(),
+            3,
+            "approved HTTP MCP did not complete initialize, notification, and discovery"
+        );
+        assert!(!sandbox.data.join("trust").exists());
+    })
+    .await
 }
 
 #[cfg(unix)]
@@ -765,158 +768,170 @@ fn direct_tools_keeps_stdout_json_and_reports_filtered_failed_stdio() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_cli_mcp_tool_results_are_projected_before_stdout() {
-    const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
-    const ORDINARY_CONTROL: &str = "ordinary-control-remains-exact";
-    const MARKER: &str = "[REDACTED:recognized-secret]";
+    kuru_memory::test_support::closing(async {
+        const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
+        const ORDINARY_CONTROL: &str = "ordinary-control-remains-exact";
+        const MARKER: &str = "[REDACTED:recognized-secret]";
 
-    let http = HttpMcpFixture::new().await;
-    let sandbox = Sandbox::new(&http_mcp_config(&http));
-    tokio::task::block_in_place(|| sandbox.success(&["trust", "approve", "--yes"]));
-    let tools = tokio::task::block_in_place(|| sandbox.success(&["tools"]));
-    let tools: Value = serde_json::from_slice(&tools.stdout).unwrap();
-    let name = tools["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|tool| {
-            tool["description"] == "MCP http/projected_result: isolated projection fixture"
-        })
-        .and_then(|tool| tool["name"].as_str())
-        .unwrap();
-    let output = tokio::task::block_in_place(|| sandbox.success(&["tool", name, "--args", "{}"]));
-    let output: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(
-        output["content"][0]["text"],
-        format!("openai_api_key={MARKER}; {ORDINARY_CONTROL}"),
-    );
-    assert_eq!(output["isError"], false);
-    assert_eq!(
-        http.calls(),
-        1,
-        "actual CLI did not call the isolated MCP tool"
-    );
-    assert!(!output.to_string().contains(TOOL_TOKEN));
+        let http = HttpMcpFixture::new().await;
+        let sandbox = Sandbox::new(&http_mcp_config(&http));
+        tokio::task::block_in_place(|| sandbox.success(&["trust", "approve", "--yes"]));
+        let tools = tokio::task::block_in_place(|| sandbox.success(&["tools"]));
+        let tools: Value = serde_json::from_slice(&tools.stdout).unwrap();
+        let name = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| {
+                tool["description"] == "MCP http/projected_result: isolated projection fixture"
+            })
+            .and_then(|tool| tool["name"].as_str())
+            .unwrap();
+        let output =
+            tokio::task::block_in_place(|| sandbox.success(&["tool", name, "--args", "{}"]));
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output["content"][0]["text"],
+            format!("openai_api_key={MARKER}; {ORDINARY_CONTROL}"),
+        );
+        assert_eq!(output["isError"], false);
+        assert_eq!(
+            http.calls(),
+            1,
+            "actual CLI did not call the isolated MCP tool"
+        );
+        assert!(!output.to_string().contains(TOOL_TOKEN));
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_cli_mcp_tool_failures_are_projected_before_stderr() {
-    const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
-    const MARKER: &str = "[REDACTED:recognized-secret]";
+    kuru_memory::test_support::closing(async {
+        const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
+        const MARKER: &str = "[REDACTED:recognized-secret]";
 
-    let http = HttpMcpFixture::new().await;
-    let sandbox = Sandbox::new(&http_mcp_config(&http));
-    tokio::task::block_in_place(|| sandbox.success(&["trust", "approve", "--yes"]));
-    let tools = tokio::task::block_in_place(|| sandbox.success(&["tools"]));
-    let tools: Value = serde_json::from_slice(&tools.stdout).unwrap();
-    let name = tools["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|tool| {
-            tool["description"] == "MCP http/projected_failure: isolated projected error fixture"
-        })
-        .and_then(|tool| tool["name"].as_str())
-        .unwrap();
-    let output = tokio::task::block_in_place(|| sandbox.run(&["tool", name, "--args", "{}"]));
-    let stderr = text(&output.stderr);
-    assert!(!output.status.success(), "{stderr}");
-    assert!(
-        output.stdout.is_empty(),
-        "unexpected stdout: {:?}",
-        output.stdout
-    );
-    assert!(stderr.contains("MCP tool application error"), "{stderr}");
-    assert!(stderr.contains(MARKER), "{stderr}");
-    assert!(!stderr.contains(TOOL_TOKEN), "{stderr}");
-    assert_eq!(
-        http.calls(),
-        1,
-        "actual CLI did not call the isolated MCP error tool"
-    );
+        let http = HttpMcpFixture::new().await;
+        let sandbox = Sandbox::new(&http_mcp_config(&http));
+        tokio::task::block_in_place(|| sandbox.success(&["trust", "approve", "--yes"]));
+        let tools = tokio::task::block_in_place(|| sandbox.success(&["tools"]));
+        let tools: Value = serde_json::from_slice(&tools.stdout).unwrap();
+        let name = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| {
+                tool["description"]
+                    == "MCP http/projected_failure: isolated projected error fixture"
+            })
+            .and_then(|tool| tool["name"].as_str())
+            .unwrap();
+        let output = tokio::task::block_in_place(|| sandbox.run(&["tool", name, "--args", "{}"]));
+        let stderr = text(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert!(
+            output.stdout.is_empty(),
+            "unexpected stdout: {:?}",
+            output.stdout
+        );
+        assert!(stderr.contains("MCP tool application error"), "{stderr}");
+        assert!(stderr.contains(MARKER), "{stderr}");
+        assert!(!stderr.contains(TOOL_TOKEN), "{stderr}");
+        assert_eq!(
+            http.calls(),
+            1,
+            "actual CLI did not call the isolated MCP error tool"
+        );
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_cli_commands_enforce_the_documented_claim_matrix_before_side_effects() {
-    let stdio = NativeMcpFixture::new();
-    let http = HttpMcpFixture::new().await;
-    let sandbox = Sandbox::new(&mixed_manifest_config(&stdio, &http));
-    std::fs::write(
-        sandbox.project.join("AGENTS.md"),
-        "matrix automatic instructions",
-    )
-    .unwrap();
-    let mutation = sandbox.project.join("matrix-mutation");
-    let file_args =
-        json!({"path": "matrix-mutation", "content": "must not be written"}).to_string();
-    let all = CLAIM_LABELS;
-    let tools = &CLAIM_LABELS[..4];
-    let tool = &CLAIM_LABELS[..6];
-    let memory = &CLAIM_LABELS[4..6];
-    let cases = [
-        (vec!["run", "do not run"], all),
-        (vec!["dream"], all),
-        (vec!["serve"], all),
-        (vec!["tools"], tools),
-        (
-            vec!["tool", "file_write", "--args", file_args.as_str()],
-            tool,
-        ),
-        (
-            vec!["models"],
-            &["memory executable", "memory cache", "Responses route"][..],
-        ),
-        (vec!["sessions"], memory),
-        (vec!["memory", "status"], memory),
-        (vec!["undo-dream"], memory),
-        (vec!["auth"], &["Responses route"][..]),
-        (
-            vec!["--allow-shell", "tools"],
-            &["workspace write", "stdio MCP", "HTTP MCP"][..],
-        ),
-        (
-            vec!["--provider", "demo", "models"],
-            &["memory executable", "memory cache"][..],
-        ),
-    ];
-    for (args, expected) in cases {
-        let output = tokio::task::block_in_place(|| sandbox.run(&args));
-        assert_claim_labels(&output, expected);
-        assert!(!mutation.exists(), "{args:?} mutated the workspace");
-        assert_eq!(stdio.started(), 0, "{args:?} started stdio MCP");
-        assert_eq!(http.requests(), 0, "{args:?} opened an HTTP route");
-        assert!(!sandbox.data.exists(), "{args:?} created private state");
-    }
+    kuru_memory::test_support::closing(async {
+        let stdio = NativeMcpFixture::new();
+        let http = HttpMcpFixture::new().await;
+        let sandbox = Sandbox::new(&mixed_manifest_config(&stdio, &http));
+        std::fs::write(
+            sandbox.project.join("AGENTS.md"),
+            "matrix automatic instructions",
+        )
+        .unwrap();
+        let mutation = sandbox.project.join("matrix-mutation");
+        let file_args =
+            json!({"path": "matrix-mutation", "content": "must not be written"}).to_string();
+        let all = CLAIM_LABELS;
+        let tools = &CLAIM_LABELS[..4];
+        let tool = &CLAIM_LABELS[..6];
+        let memory = &CLAIM_LABELS[4..6];
+        let cases = [
+            (vec!["run", "do not run"], all),
+            (vec!["dream"], all),
+            (vec!["serve"], all),
+            (vec!["tools"], tools),
+            (
+                vec!["tool", "file_write", "--args", file_args.as_str()],
+                tool,
+            ),
+            (
+                vec!["models"],
+                &["memory executable", "memory cache", "Responses route"][..],
+            ),
+            (vec!["sessions"], memory),
+            (vec!["memory", "status"], memory),
+            (vec!["undo-dream"], memory),
+            (vec!["auth"], &["Responses route"][..]),
+            (
+                vec!["--allow-shell", "tools"],
+                &["workspace write", "stdio MCP", "HTTP MCP"][..],
+            ),
+            (
+                vec!["--provider", "demo", "models"],
+                &["memory executable", "memory cache"][..],
+            ),
+        ];
+        for (args, expected) in cases {
+            let output = tokio::task::block_in_place(|| sandbox.run(&args));
+            assert_claim_labels(&output, expected);
+            assert!(!mutation.exists(), "{args:?} mutated the workspace");
+            assert_eq!(stdio.started(), 0, "{args:?} started stdio MCP");
+            assert_eq!(http.requests(), 0, "{args:?} opened an HTTP route");
+            assert!(!sandbox.data.exists(), "{args:?} created private state");
+        }
 
-    let status = tokio::task::block_in_place(|| sandbox.run(&["trust", "status"]));
-    assert!(status.status.success(), "{}", text(&status.stderr));
-    let shown = text(&status.stdout);
-    for label in CLAIM_LABELS {
-        assert!(shown.contains(label), "status omitted {label:?}: {shown}");
-    }
-    let config = tokio::task::block_in_place(|| sandbox.run(&["config"]));
-    assert!(config.status.success(), "{}", text(&config.stderr));
-    toml::from_slice::<toml::Value>(&config.stdout).unwrap();
-    let revoke = tokio::task::block_in_place(|| sandbox.run(&["trust", "revoke"]));
-    assert!(revoke.status.success(), "{}", text(&revoke.stderr));
-    assert!(text(&revoke.stdout).contains("No workspace approval"));
-    let update = tokio::task::block_in_place(|| sandbox.run(&["update"]));
-    assert!(!update.status.success());
-    assert!(
-        text(&update.stderr).contains("provide --version VERSION"),
-        "{}",
-        text(&update.stderr)
-    );
-    assert!(!text(&update.stderr).contains("workspace authority"));
-    assert!(!mutation.exists());
-    assert_eq!(stdio.started(), 0);
-    assert_eq!(http.requests(), 0);
-    assert!(!sandbox.data.exists());
+        let status = tokio::task::block_in_place(|| sandbox.run(&["trust", "status"]));
+        assert!(status.status.success(), "{}", text(&status.stderr));
+        let shown = text(&status.stdout);
+        for label in CLAIM_LABELS {
+            assert!(shown.contains(label), "status omitted {label:?}: {shown}");
+        }
+        let config = tokio::task::block_in_place(|| sandbox.run(&["config"]));
+        assert!(config.status.success(), "{}", text(&config.stderr));
+        toml::from_slice::<toml::Value>(&config.stdout).unwrap();
+        let revoke = tokio::task::block_in_place(|| sandbox.run(&["trust", "revoke"]));
+        assert!(revoke.status.success(), "{}", text(&revoke.stderr));
+        assert!(text(&revoke.stdout).contains("No workspace approval"));
+        let update = tokio::task::block_in_place(|| sandbox.run(&["update"]));
+        assert!(!update.status.success());
+        assert!(
+            text(&update.stderr).contains("provide --version VERSION"),
+            "{}",
+            text(&update.stderr)
+        );
+        assert!(!text(&update.stderr).contains("workspace authority"));
+        assert!(!mutation.exists());
+        assert_eq!(stdio.started(), 0);
+        assert_eq!(http.requests(), 0);
+        assert!(!sandbox.data.exists());
 
-    let ordinary = Sandbox::new("max_rounds = 4\n");
-    let output = tokio::task::block_in_place(|| ordinary.run(&["--provider", "demo", "models"]));
-    assert!(output.status.success(), "{}", text(&output.stderr));
-    assert!(!text(&output.stderr).contains("workspace authority"));
-    assert!(!ordinary.data.exists());
+        let ordinary = Sandbox::new("max_rounds = 4\n");
+        let output =
+            tokio::task::block_in_place(|| ordinary.run(&["--provider", "demo", "models"]));
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        assert!(!text(&output.stderr).contains("workspace authority"));
+        assert!(!ordinary.data.exists());
+    })
+    .await
 }
 
 #[test]
@@ -998,64 +1013,67 @@ fn automatic_instruction_sources_are_ordered_safe_and_stale_complete_approval() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_injects_only_the_instruction_bytes_owned_by_the_reviewed_snapshot() {
-    let sandbox = Sandbox::new("");
-    let outer = sandbox.root.path().join("AGENTS.md");
-    let root = sandbox.project.join("AGENTS.md");
-    std::fs::write(&outer, "OUTER-REVIEWED-BYTES").unwrap();
-    std::fs::write(&root, "ROOT-REVIEWED-BYTES").unwrap();
-    let snapshot = ConfigSnapshot::parse(
-        None,
-        &sandbox.project,
-        None,
-        InvocationOverrides {
-            provider: Some("demo".into()),
-            model: Some("demo".into()),
-            no_dream: true,
-            ..InvocationOverrides::default()
-        },
-    )
-    .unwrap();
-    let reviewed = snapshot.instructions().to_owned();
-    let config = snapshot.finalize(&ProjectPreferences::default()).unwrap();
+    kuru_memory::test_support::closing(async {
+        let sandbox = Sandbox::new("");
+        let outer = sandbox.root.path().join("AGENTS.md");
+        let root = sandbox.project.join("AGENTS.md");
+        std::fs::write(&outer, "OUTER-REVIEWED-BYTES").unwrap();
+        std::fs::write(&root, "ROOT-REVIEWED-BYTES").unwrap();
+        let snapshot = ConfigSnapshot::parse(
+            None,
+            &sandbox.project,
+            None,
+            InvocationOverrides {
+                provider: Some("demo".into()),
+                model: Some("demo".into()),
+                no_dream: true,
+                ..InvocationOverrides::default()
+            },
+        )
+        .unwrap();
+        let reviewed = snapshot.instructions().to_owned();
+        let config = snapshot.finalize(&ProjectPreferences::default()).unwrap();
 
-    std::fs::write(&outer, "OUTER-UNREVIEWED-BYTES").unwrap();
-    std::fs::write(&root, "ROOT-UNREVIEWED-BYTES").unwrap();
+        std::fs::write(&outer, "OUTER-UNREVIEWED-BYTES").unwrap();
+        std::fs::write(&root, "ROOT-UNREVIEWED-BYTES").unwrap();
 
-    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(RecordingDemo {
-        instructions: requests.clone(),
-    });
-    let memory = MemoryStore::temporary().await.unwrap();
-    let tools = ToolHost::new(&sandbox.project, &config).unwrap();
-    let mut harness = Harness::with_tool_host_and_instructions(
-        config,
-        &sandbox.project,
-        reviewed,
-        memory.clone(),
-        provider,
-        None,
-        tools,
-    )
-    .await
-    .unwrap();
-    harness
-        .run("verify reviewed instruction bytes")
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingDemo {
+            instructions: requests.clone(),
+        });
+        let memory = MemoryStore::temporary().await.unwrap();
+        let tools = ToolHost::new(&sandbox.project, &config).unwrap();
+        let mut harness = Harness::with_tool_host_and_instructions(
+            config,
+            &sandbox.project,
+            reviewed,
+            memory.clone(),
+            provider,
+            None,
+            tools,
+        )
         .await
         .unwrap();
-    harness.shutdown(true).await.unwrap();
-    memory.close().await.unwrap();
+        harness
+            .run("verify reviewed instruction bytes")
+            .await
+            .unwrap();
+        harness.shutdown(true).await.unwrap();
+        memory.close().await.unwrap();
 
-    let requests = requests.lock().unwrap();
-    assert!(!requests.is_empty());
-    for instructions in requests.iter() {
-        assert!(instructions.contains("OUTER-REVIEWED-BYTES"));
-        assert!(instructions.contains("ROOT-REVIEWED-BYTES"));
-        assert!(!instructions.contains("UNREVIEWED-BYTES"));
-        assert!(
-            instructions.find("OUTER-REVIEWED-BYTES").unwrap()
-                < instructions.find("ROOT-REVIEWED-BYTES").unwrap()
-        );
-    }
+        let requests = requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        for instructions in requests.iter() {
+            assert!(instructions.contains("OUTER-REVIEWED-BYTES"));
+            assert!(instructions.contains("ROOT-REVIEWED-BYTES"));
+            assert!(!instructions.contains("UNREVIEWED-BYTES"));
+            assert!(
+                instructions.find("OUTER-REVIEWED-BYTES").unwrap()
+                    < instructions.find("ROOT-REVIEWED-BYTES").unwrap()
+            );
+        }
+    })
+    .await
 }
 
 #[cfg(unix)]
@@ -1126,126 +1144,129 @@ fn one_shot_is_subset_only_and_persistent_approval_binds_the_full_manifest() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_oauth_claim_requires_exact_root_trust_before_selected_status() {
-    let ca_root = tempfile::tempdir().unwrap();
-    let https = HttpsMcpFixture::start(ca_root.path()).await;
-    let config = format!(
-        "[mcp.secure]\nurl = {:?}\n[mcp.secure.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nclient_secret_env = 'KURU_ABSENT_TEST_MCP_CLIENT_SECRET'\nscopes = ['mcp.read']\n",
-        format!("{}/mcp", https.base)
-    );
-    let sandbox = Sandbox::new(&config);
-    let run = |args: &[&str]| {
-        sandbox
-            .command()
-            .env("KURU_TEST_MCP_CA_PEM", &https.ca_path)
-            .args(args)
-            .output()
-            .unwrap()
-    };
-    for args in [
-        ["mcp", "status", "secure"].as_slice(),
-        ["mcp", "logout", "secure"].as_slice(),
-        ["mcp", "login", "secure", "--device"].as_slice(),
-    ] {
-        let output = run(args);
-        assert!(!output.status.success(), "{args:?}: {output:?}");
-        let error = text(&output.stderr);
-        assert!(
-            error.contains("workspace authority is not approved"),
-            "{args:?}: {error}"
+    kuru_memory::test_support::closing(async {
+        let ca_root = tempfile::tempdir().unwrap();
+        let https = HttpsMcpFixture::start(ca_root.path()).await;
+        let config = format!(
+            "[mcp.secure]\nurl = {:?}\n[mcp.secure.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nclient_secret_env = 'KURU_ABSENT_TEST_MCP_CLIENT_SECRET'\nscopes = ['mcp.read']\n",
+            format!("{}/mcp", https.base)
         );
-        assert!(
-            !error.contains("KURU_ABSENT_TEST_MCP_CLIENT_SECRET"),
-            "{args:?}: {error}"
-        );
+        let sandbox = Sandbox::new(&config);
+        let run = |args: &[&str]| {
+            sandbox
+                .command()
+                .env("KURU_TEST_MCP_CA_PEM", &https.ca_path)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        for args in [
+            ["mcp", "status", "secure"].as_slice(),
+            ["mcp", "logout", "secure"].as_slice(),
+            ["mcp", "login", "secure", "--device"].as_slice(),
+        ] {
+            let output = run(args);
+            assert!(!output.status.success(), "{args:?}: {output:?}");
+            let error = text(&output.stderr);
+            assert!(
+                error.contains("workspace authority is not approved"),
+                "{args:?}: {error}"
+            );
+            assert!(
+                !error.contains("KURU_ABSENT_TEST_MCP_CLIENT_SECRET"),
+                "{args:?}: {error}"
+            );
+            assert_eq!(
+                https.requests(),
+                0,
+                "{args:?} reached OAuth HTTP before trust"
+            );
+            assert!(
+                !sandbox.data.exists(),
+                "{args:?} created private state before trust"
+            );
+        }
+        sandbox.success(&["config"]);
         assert_eq!(
             https.requests(),
             0,
-            "{args:?} reached OAuth HTTP before trust"
+            "pure config inspection activated OAuth HTTP"
         );
         assert!(
             !sandbox.data.exists(),
-            "{args:?} created private state before trust"
+            "pure config inspection created private state"
         );
-    }
-    sandbox.success(&["config"]);
-    assert_eq!(
-        https.requests(),
-        0,
-        "pure config inspection activated OAuth HTTP"
-    );
-    assert!(
-        !sandbox.data.exists(),
-        "pure config inspection created private state"
-    );
 
-    sandbox.success(&["trust", "approve", "--yes"]);
-    assert_eq!(https.requests(), 0, "approval activated OAuth HTTP");
-    let selected = run(&["mcp", "status", "secure"]);
-    assert!(
-        selected.status.success(),
-        "selected status after approval failed: {}",
-        text(&selected.stderr)
-    );
-    let selected: Value = serde_json::from_slice(&selected.stdout).unwrap();
-    assert_eq!(selected["alias"], "secure");
-    assert!(
-        matches!(
-            selected["state"].as_str(),
-            Some("login_required" | "native_store_unavailable")
-        ),
-        "{selected}"
-    );
-    let requests_after_selected = https.requests();
-    if selected["state"] == "login_required" {
+        sandbox.success(&["trust", "approve", "--yes"]);
+        assert_eq!(https.requests(), 0, "approval activated OAuth HTTP");
+        let selected = run(&["mcp", "status", "secure"]);
         assert!(
-            requests_after_selected > 0,
-            "selected approved status did not exercise the fake HTTPS request counter"
+            selected.status.success(),
+            "selected status after approval failed: {}",
+            text(&selected.stderr)
         );
-    }
+        let selected: Value = serde_json::from_slice(&selected.stdout).unwrap();
+        assert_eq!(selected["alias"], "secure");
+        assert!(
+            matches!(
+                selected["state"].as_str(),
+                Some("login_required" | "native_store_unavailable")
+            ),
+            "{selected}"
+        );
+        let requests_after_selected = https.requests();
+        if selected["state"] == "login_required" {
+            assert!(
+                requests_after_selected > 0,
+                "selected approved status did not exercise the fake HTTPS request counter"
+            );
+        }
 
-    let other = sandbox.root.path().join("another-project");
-    std::fs::create_dir(&other).unwrap();
-    std::fs::create_dir(other.join(".kuru")).unwrap();
-    std::fs::write(other.join(".kuru/config.toml"), &config).unwrap();
-    let wrong_root = sandbox
-        .command_at(&other)
-        .env("KURU_TEST_MCP_CA_PEM", &https.ca_path)
-        .args(["mcp", "status", "secure"])
-        .output()
-        .unwrap();
-    assert!(!wrong_root.status.success());
-    assert!(
-        text(&wrong_root.stderr).contains("workspace authority is not approved"),
-        "{}",
-        text(&wrong_root.stderr)
-    );
-    assert_eq!(
-        https.requests(),
-        requests_after_selected,
-        "other root activated OAuth HTTP"
-    );
+        let other = sandbox.root.path().join("another-project");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::create_dir(other.join(".kuru")).unwrap();
+        std::fs::write(other.join(".kuru/config.toml"), &config).unwrap();
+        let wrong_root = sandbox
+            .command_at(&other)
+            .env("KURU_TEST_MCP_CA_PEM", &https.ca_path)
+            .args(["mcp", "status", "secure"])
+            .output()
+            .unwrap();
+        assert!(!wrong_root.status.success());
+        assert!(
+            text(&wrong_root.stderr).contains("workspace authority is not approved"),
+            "{}",
+            text(&wrong_root.stderr)
+        );
+        assert_eq!(
+            https.requests(),
+            requests_after_selected,
+            "other root activated OAuth HTTP"
+        );
 
-    let changed = config.replace("scopes = ['mcp.read']", "scopes = ['mcp.write']");
-    assert_ne!(changed, config);
-    sandbox.write_config(&changed);
-    let stale = run(&["mcp", "status", "secure"]);
-    assert!(!stale.status.success());
-    assert!(
-        text(&stale.stderr).contains("does not match"),
-        "{}",
-        text(&stale.stderr)
-    );
-    assert_eq!(
-        https.requests(),
-        requests_after_selected,
-        "changed final leaf activated OAuth HTTP"
-    );
-    sandbox.success(&["config"]);
-    assert_eq!(
-        https.requests(),
-        requests_after_selected,
-        "post-change inspection activated OAuth HTTP"
-    );
+        let changed = config.replace("scopes = ['mcp.read']", "scopes = ['mcp.write']");
+        assert_ne!(changed, config);
+        sandbox.write_config(&changed);
+        let stale = run(&["mcp", "status", "secure"]);
+        assert!(!stale.status.success());
+        assert!(
+            text(&stale.stderr).contains("does not match"),
+            "{}",
+            text(&stale.stderr)
+        );
+        assert_eq!(
+            https.requests(),
+            requests_after_selected,
+            "changed final leaf activated OAuth HTTP"
+        );
+        sandbox.success(&["config"]);
+        assert_eq!(
+            https.requests(),
+            requests_after_selected,
+            "post-change inspection activated OAuth HTTP"
+        );
+    })
+    .await
 }
 
 #[test]
@@ -1411,139 +1432,142 @@ fn inactive_codex_auth_does_not_read_the_configured_responses_environment() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reached_undo_uses_only_approved_memory_authority_and_no_provider_route() {
-    let http = HttpMcpFixture::new().await;
-    let sandbox = Sandbox::new("");
-    let scope = kuru_runtime::project_scope(&sandbox.project).unwrap();
-    let options =
-        kuru_memory::test_support::warmed_open_options(sandbox.data.clone(), scope.clone())
+    kuru_memory::test_support::closing(async {
+        let http = HttpMcpFixture::new().await;
+        let sandbox = Sandbox::new("");
+        let scope = kuru_runtime::project_scope(&sandbox.project).unwrap();
+        let options =
+            kuru_memory::test_support::warmed_open_options(sandbox.data.clone(), scope.clone())
+                .await
+                .unwrap();
+        let memory = MemoryStore::open(options.clone()).await.unwrap();
+        let mut harness = Harness::new(
+            Config {
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            &sandbox.project,
+            memory.clone(),
+            Arc::new(DemoProvider),
+            None,
+        )
+        .await
+        .unwrap();
+        let role = harness.topology.parts[0].role.clone();
+        harness
+            .apply_dream(vec![DreamProposal::Add {
+                name: "Later observer".into(),
+                role,
+                instruction: "Preserve later private context".into(),
+            }])
             .await
             .unwrap();
-    let memory = MemoryStore::open(options.clone()).await.unwrap();
-    let mut harness = Harness::new(
-        Config {
-            provider: "demo".into(),
-            model: "demo".into(),
-            dream_every: 0,
-            dream_on_exit: false,
+        let added = harness.resolve("Later observer").unwrap();
+        let namespace = harness.namespace(&added);
+        memory
+            .append(&namespace, "user", "later private conversation")
+            .await
+            .unwrap();
+        harness.run("later session conversation").await.unwrap();
+        let session = harness.session.id.clone();
+        let sessions = memory.get(&format!("{scope}/sessions")).await.unwrap();
+        let before_revision = memory.revision().await.unwrap();
+        harness.shutdown(false).await.unwrap();
+        drop(harness);
+        memory.close().await.unwrap();
+
+        let mut config = Config {
+            provider: "responses".into(),
+            model: "fixture-model".into(),
+            api_base: http.url.clone(),
+            api_key_env: "KURU_UNREADABLE_UNDO_KEY".into(),
             ..Config::default()
-        },
-        &sandbox.project,
-        memory.clone(),
-        Arc::new(DemoProvider),
-        None,
-    )
-    .await
-    .unwrap();
-    let role = harness.topology.parts[0].role.clone();
-    harness
-        .apply_dream(vec![DreamProposal::Add {
-            name: "Later observer".into(),
-            role,
-            instruction: "Preserve later private context".into(),
-        }])
-        .await
-        .unwrap();
-    let added = harness.resolve("Later observer").unwrap();
-    let namespace = harness.namespace(&added);
-    memory
-        .append(&namespace, "user", "later private conversation")
-        .await
-        .unwrap();
-    harness.run("later session conversation").await.unwrap();
-    let session = harness.session.id.clone();
-    let sessions = memory.get(&format!("{scope}/sessions")).await.unwrap();
-    let before_revision = memory.revision().await.unwrap();
-    harness.shutdown(false).await.unwrap();
-    drop(harness);
-    memory.close().await.unwrap();
+        };
+        config.memory.cache_dir = Some(kuru_memory::test_support::warmed_cache_dir().await.unwrap());
+        config.memory.offline = true;
+        sandbox.write_config(&toml::to_string(&config).unwrap());
 
-    let mut config = Config {
-        provider: "responses".into(),
-        model: "fixture-model".into(),
-        api_base: http.url.clone(),
-        api_key_env: "KURU_UNREADABLE_UNDO_KEY".into(),
-        ..Config::default()
-    };
-    config.memory.cache_dir = Some(kuru_memory::test_support::warmed_cache_dir().await.unwrap());
-    config.memory.offline = true;
-    sandbox.write_config(&toml::to_string(&config).unwrap());
-
-    let refused =
-        tokio::task::block_in_place(|| sandbox.run(&["--resume", &session, "undo-dream"]));
-    assert!(!refused.status.success());
-    assert!(
-        text(&refused.stderr).contains("workspace authority is not approved"),
-        "{}",
-        text(&refused.stderr)
-    );
-    assert_eq!(http.requests(), 0, "refused undo contacted the provider");
-    assert!(!sandbox.data.join("trust").exists());
-
-    let mut command = sandbox.command();
-    command.args(["--trust-workspace-once", "--resume", &session, "undo-dream"]);
-    #[cfg(unix)]
-    {
-        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
-        command.env(
-            "KURU_UNREADABLE_UNDO_KEY",
-            OsString::from_vec(vec![0xff, 0xfe]),
+        let refused =
+            tokio::task::block_in_place(|| sandbox.run(&["--resume", &session, "undo-dream"]));
+        assert!(!refused.status.success());
+        assert!(
+            text(&refused.stderr).contains("workspace authority is not approved"),
+            "{}",
+            text(&refused.stderr)
         );
-    }
-    let approved = tokio::task::block_in_place(|| command.output().unwrap());
-    assert!(approved.status.success(), "{}", text(&approved.stderr));
-    assert!(text(&approved.stdout).contains("Previous membership restored"));
-    assert_eq!(http.requests(), 0, "approved undo contacted the provider");
-    assert!(!sandbox.data.join("trust").exists());
+        assert_eq!(http.requests(), 0, "refused undo contacted the provider");
+        assert!(!sandbox.data.join("trust").exists());
 
-    // The approved CLI command's managed service retires as soon as that
-    // command exits. Await its exit, so no service is running or closing, and
-    // inspect the committed result with a read-only open: it attaches to no
-    // service and opens the store locally. A direct writable reopen would
-    // instead start a service of this fixture's own.
-    tokio::task::block_in_place(|| memory::await_owner_exit(&options)).unwrap();
-    let mut observed_options = options;
-    observed_options.read_only = true;
-    let project = sandbox.project.canonicalize().unwrap();
-    let (_, opening) = MemoryStore::open_managed_observed(
-        observed_options,
-        project,
-        PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
-    );
-    let memory = opening.await.unwrap();
-    assert!(
-        format!("{memory:?}").contains(r#"backend: "local""#),
-        "the read-only inspection attached to a service instead of opening the store locally: {memory:?}"
-    );
-    assert_ne!(memory.revision().await.unwrap(), before_revision);
-    assert_eq!(
-        memory.get(&format!("{scope}/sessions")).await.unwrap(),
-        sessions
-    );
-    assert!(
-        memory
-            .history(&namespace, 10)
-            .await
-            .unwrap()
-            .iter()
-            .any(|message| message.plain_text() == Some("later private conversation"))
-    );
-    let topology: Topology = serde_json::from_value(
-        memory
-            .get(&format!("{scope}/ifs/topology"))
-            .await
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(
-        !topology
-            .parts
-            .iter()
-            .find(|part| part.id == added)
-            .unwrap()
-            .active
-    );
-    memory.close().await.unwrap();
+        let mut command = sandbox.command();
+        command.args(["--trust-workspace-once", "--resume", &session, "undo-dream"]);
+        #[cfg(unix)]
+        {
+            use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+            command.env(
+                "KURU_UNREADABLE_UNDO_KEY",
+                OsString::from_vec(vec![0xff, 0xfe]),
+            );
+        }
+        let approved = tokio::task::block_in_place(|| command.output().unwrap());
+        assert!(approved.status.success(), "{}", text(&approved.stderr));
+        assert!(text(&approved.stdout).contains("Previous membership restored"));
+        assert_eq!(http.requests(), 0, "approved undo contacted the provider");
+        assert!(!sandbox.data.join("trust").exists());
+
+        // The approved CLI command's managed service retires as soon as that
+        // command exits. Await its exit, so no service is running or closing, and
+        // inspect the committed result with a read-only open: it attaches to no
+        // service and opens the store locally. A direct writable reopen would
+        // instead start a service of this fixture's own.
+        tokio::task::block_in_place(|| memory::await_owner_exit(&options)).unwrap();
+        let mut observed_options = options;
+        observed_options.read_only = true;
+        let project = sandbox.project.canonicalize().unwrap();
+        let (_, opening) = MemoryStore::open_managed_observed(
+            observed_options,
+            project,
+            PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+        );
+        let memory = opening.await.unwrap();
+        assert!(
+            format!("{memory:?}").contains(r#"backend: "local""#),
+            "the read-only inspection attached to a service instead of opening the store locally: {memory:?}"
+        );
+        assert_ne!(memory.revision().await.unwrap(), before_revision);
+        assert_eq!(
+            memory.get(&format!("{scope}/sessions")).await.unwrap(),
+            sessions
+        );
+        assert!(
+            memory
+                .history(&namespace, 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|message| message.plain_text() == Some("later private conversation"))
+        );
+        let topology: Topology = serde_json::from_value(
+            memory
+                .get(&format!("{scope}/ifs/topology"))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !topology
+                .parts
+                .iter()
+                .find(|part| part.id == added)
+                .unwrap()
+                .active
+        );
+        memory.close().await.unwrap();
+    })
+    .await
 }
 
 #[cfg(unix)]

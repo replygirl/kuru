@@ -247,258 +247,278 @@ async fn exported_private_records(memory: &MemoryStore) -> Vec<(String, serde_js
 
 #[tokio::test]
 async fn settled_summary_persists_with_the_admitted_turn_and_stays_out_of_transcript() {
-    let memory = MemoryStore::temporary().await.unwrap();
-    let (_project, mut harness) = harness(memory.clone(), Arc::new(SettledSummaryProvider)).await;
-    let output = harness
-        .run_controlled(
-            "retain the provider summary privately",
-            None,
-            "reasoning-summary-turn",
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(output.text, "public answer");
-    assert!(
-        harness
-            .history()
+    kuru_memory::test_support::closing(async {
+        let memory = MemoryStore::temporary().await.unwrap();
+        let (_project, mut harness) =
+            harness(memory.clone(), Arc::new(SettledSummaryProvider)).await;
+        let output = harness
+            .run_controlled(
+                "retain the provider summary privately",
+                None,
+                "reasoning-summary-turn",
+                &CancellationToken::new(),
+            )
             .await
-            .unwrap()
-            .iter()
-            .all(|message| message.plain_text() != Some("private settled summary"))
-    );
-    let records = exported_private_records(&memory).await;
-    assert_eq!(records.len(), 1);
-    let value = &records[0].1;
-    assert_eq!(value["session_id"], harness.session.id);
-    assert_eq!(value["turn_id"], "reasoning-summary-turn");
-    assert_eq!(value["actor_id"], output.speaker);
-    assert!(
-        value["invocation_id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("v1-") && id.len() > 3)
-    );
-    assert_eq!(value["item_id"], "provider-item");
-    assert_eq!(value["output_index"], 4);
-    assert_eq!(value["summary_index"], 1);
-    assert_eq!(value["text"], "private settled summary");
-    harness.shutdown(false).await.unwrap();
-    memory.close().await.unwrap();
+            .unwrap();
+        assert_eq!(output.text, "public answer");
+        assert!(
+            harness
+                .history()
+                .await
+                .unwrap()
+                .iter()
+                .all(|message| message.plain_text() != Some("private settled summary"))
+        );
+        let records = exported_private_records(&memory).await;
+        assert_eq!(records.len(), 1);
+        let value = &records[0].1;
+        assert_eq!(value["session_id"], harness.session.id);
+        assert_eq!(value["turn_id"], "reasoning-summary-turn");
+        assert_eq!(value["actor_id"], output.speaker);
+        assert!(
+            value["invocation_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("v1-") && id.len() > 3)
+        );
+        assert_eq!(value["item_id"], "provider-item");
+        assert_eq!(value["output_index"], 4);
+        assert_eq!(value["summary_index"], 1);
+        assert_eq!(value["text"], "private settled summary");
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn settled_summary_survives_a_real_memory_reopen_without_entering_history() {
-    let project = tempfile::tempdir().unwrap();
-    let data = kuru_memory::test_support::tempdir().unwrap();
-    let options = kuru_memory::test_support::warmed_open_options(
-        data.path().into(),
-        crate::project_scope(project.path()).unwrap(),
-    )
-    .await
-    .unwrap();
-    let memory = MemoryStore::open(options.clone()).await.unwrap();
-    let mut harness = Harness::new(
-        Config {
-            mode: Mode::Freudian,
-            provider: "demo".into(),
-            model: "demo".into(),
-            dream_every: 0,
-            dream_on_exit: false,
-            ..Config::default()
-        },
-        project.path(),
-        memory.clone(),
-        Arc::new(SettledSummaryProvider),
-        None,
-    )
-    .await
-    .unwrap();
-
-    harness
-        .run_controlled(
-            "retain a summary across reopen",
-            None,
-            "reopened-summary-turn",
-            &CancellationToken::new(),
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let data = kuru_memory::test_support::tempdir().unwrap();
+        let options = kuru_memory::test_support::warmed_open_options(
+            data.path().into(),
+            crate::project_scope(project.path()).unwrap(),
         )
         .await
         .unwrap();
-    assert!(
-        harness
-            .history()
-            .await
-            .unwrap()
-            .iter()
-            .all(|message| message.plain_text() != Some("private settled summary"))
-    );
-    harness.shutdown(false).await.unwrap();
-    memory.close().await.unwrap();
-    drop(harness);
+        let memory = MemoryStore::open(options.clone()).await.unwrap();
+        let mut harness = Harness::new(
+            Config {
+                mode: Mode::Freudian,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            Arc::new(SettledSummaryProvider),
+            None,
+        )
+        .await
+        .unwrap();
 
-    let reopened = MemoryStore::open(options).await.unwrap();
-    let records = exported_private_records(&reopened).await;
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].1["turn_id"], "reopened-summary-turn");
-    assert_eq!(records[0].1["text"], "private settled summary");
-    reopened.close().await.unwrap();
+        harness
+            .run_controlled(
+                "retain a summary across reopen",
+                None,
+                "reopened-summary-turn",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            harness
+                .history()
+                .await
+                .unwrap()
+                .iter()
+                .all(|message| message.plain_text() != Some("private settled summary"))
+        );
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+        drop(harness);
+
+        let reopened = MemoryStore::open(options).await.unwrap();
+        let records = exported_private_records(&reopened).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1["turn_id"], "reopened-summary-turn");
+        assert_eq!(records[0].1["text"], "private settled summary");
+        reopened.close().await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn private_summary_is_not_injected_into_a_new_sessions_provider_context() {
-    let project = tempfile::tempdir().unwrap();
-    let memory = MemoryStore::temporary().await.unwrap();
-    let mut first = Harness::new(
-        Config {
-            mode: Mode::Ifs,
-            provider: "demo".into(),
-            model: "demo".into(),
-            dream_every: 0,
-            dream_on_exit: false,
-            ..Config::default()
-        },
-        project.path(),
-        memory.clone(),
-        Arc::new(SettledSummaryProvider),
-        None,
-    )
-    .await
-    .unwrap();
-    first
-        .run_controlled(
-            "retain a private summary for the first session",
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let mut first = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            Arc::new(SettledSummaryProvider),
             None,
-            "first-private-summary-turn",
-            &CancellationToken::new(),
         )
         .await
         .unwrap();
-    let first_session = first.session.id.clone();
-    first.shutdown(false).await.unwrap();
-    drop(first);
+        first
+            .run_controlled(
+                "retain a private summary for the first session",
+                None,
+                "first-private-summary-turn",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let first_session = first.session.id.clone();
+        first.shutdown(false).await.unwrap();
+        drop(first);
 
-    let provider = Arc::new(RequestRecordingProvider::default());
-    let mut second = Harness::new(
-        Config {
-            mode: Mode::Ifs,
-            provider: "demo".into(),
-            model: "demo".into(),
-            dream_every: 0,
-            dream_on_exit: false,
-            ..Config::default()
-        },
-        project.path(),
-        memory.clone(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    assert_ne!(second.session.id, first_session);
-    second
-        .run_controlled(
-            "start an independent second session",
+        let provider = Arc::new(RequestRecordingProvider::default());
+        let mut second = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            provider.clone(),
             None,
-            "second-private-summary-turn",
-            &CancellationToken::new(),
         )
         .await
         .unwrap();
-    let requests = provider.requests();
-    assert!(!requests.is_empty());
-    assert!(requests.iter().all(|request| {
-        !request.instructions.contains("private settled summary")
-            && request.messages.iter().all(|message| {
-                !message
-                    .text_projection()
-                    .contains("private settled summary")
-            })
-    }));
-    second.shutdown(false).await.unwrap();
-    memory.close().await.unwrap();
+        assert_ne!(second.session.id, first_session);
+        second
+            .run_controlled(
+                "start an independent second session",
+                None,
+                "second-private-summary-turn",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let requests = provider.requests();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|request| {
+            !request.instructions.contains("private settled summary")
+                && request.messages.iter().all(|message| {
+                    !message
+                        .text_projection()
+                        .contains("private settled summary")
+                })
+        }));
+        second.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn failed_completion_after_sidecar_does_not_persist_a_private_summary() {
-    let memory = MemoryStore::temporary().await.unwrap();
-    let (_project, mut harness) =
-        harness(memory.clone(), Arc::new(FailingAfterSummaryProvider)).await;
-    assert!(
-        harness
-            .run_controlled(
-                "fail after sidecar",
-                None,
-                "failed-summary-turn",
-                &CancellationToken::new(),
-            )
-            .await
-            .is_err()
-    );
-    assert!(exported_private_records(&memory).await.is_empty());
-    harness.shutdown(false).await.unwrap();
-    memory.close().await.unwrap();
+    kuru_memory::test_support::closing(async {
+        let memory = MemoryStore::temporary().await.unwrap();
+        let (_project, mut harness) =
+            harness(memory.clone(), Arc::new(FailingAfterSummaryProvider)).await;
+        assert!(
+            harness
+                .run_controlled(
+                    "fail after sidecar",
+                    None,
+                    "failed-summary-turn",
+                    &CancellationToken::new(),
+                )
+                .await
+                .is_err()
+        );
+        assert!(exported_private_records(&memory).await.is_empty());
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn summary_free_completion_does_not_persist_a_private_summary() {
-    let memory = MemoryStore::temporary().await.unwrap();
-    let (_project, mut harness) = harness(memory.clone(), Arc::new(SummaryFreeProvider)).await;
-    let output = harness
-        .run_controlled(
-            "complete without a provider summary",
-            None,
-            "summary-free-turn",
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(output.text, "public answer without a summary");
-    assert!(exported_private_records(&memory).await.is_empty());
-    harness.shutdown(false).await.unwrap();
-    memory.close().await.unwrap();
+    kuru_memory::test_support::closing(async {
+        let memory = MemoryStore::temporary().await.unwrap();
+        let (_project, mut harness) = harness(memory.clone(), Arc::new(SummaryFreeProvider)).await;
+        let output = harness
+            .run_controlled(
+                "complete without a provider summary",
+                None,
+                "summary-free-turn",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.text, "public answer without a summary");
+        assert!(exported_private_records(&memory).await.is_empty());
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn failed_ledger_settlement_after_sidecar_does_not_persist_a_private_summary() {
-    let memory = MemoryStore::temporary().await.unwrap();
-    let (_project, mut harness) = harness(memory.clone(), Arc::new(SettledSummaryProvider)).await;
-    let actor_id = harness.topology.parts[0].id.clone();
-    let turn_id = "ledger-failure-summary-turn";
-    // `run_controlled` uses its durable turn-journal ID as the operation ID.
-    // With the default one deliberation round, the selected speaking request is
-    // the second admitted provider invocation.
-    let invocation_id = speaking_invocation_id(&harness.session.id, turn_id, &actor_id, 1);
-    let invocation = InvocationStart {
-        session_id: harness.session.id.clone(),
-        invocation_id: invocation_id.clone(),
-        operation_id: turn_id.into(),
-        phase: UsagePhase::Speak,
-        actor_id: actor_id.clone(),
-        route: "demo".into(),
-        model: "demo".into(),
-        price_at_invocation: None,
-    };
-    let ledger = memory.usage_ledger().unwrap();
-    ledger.admit(invocation).await.unwrap();
-    ledger
-        .settle(&invocation_id, InvocationOutcome::Failed)
-        .await
-        .unwrap();
-
-    assert!(
-        harness
-            .run_controlled(
-                "fail accounting after a provider sidecar",
-                Some(&actor_id),
-                turn_id,
-                &CancellationToken::new(),
-            )
+    kuru_memory::test_support::closing(async {
+        let memory = MemoryStore::temporary().await.unwrap();
+        let (_project, mut harness) =
+            harness(memory.clone(), Arc::new(SettledSummaryProvider)).await;
+        let actor_id = harness.topology.parts[0].id.clone();
+        let turn_id = "ledger-failure-summary-turn";
+        // `run_controlled` uses its durable turn-journal ID as the operation ID.
+        // With the default one deliberation round, the selected speaking request is
+        // the second admitted provider invocation.
+        let invocation_id = speaking_invocation_id(&harness.session.id, turn_id, &actor_id, 1);
+        let invocation = InvocationStart {
+            session_id: harness.session.id.clone(),
+            invocation_id: invocation_id.clone(),
+            operation_id: turn_id.into(),
+            phase: UsagePhase::Speak,
+            actor_id: actor_id.clone(),
+            route: "demo".into(),
+            model: "demo".into(),
+            price_at_invocation: None,
+        };
+        let ledger = memory.usage_ledger().unwrap();
+        ledger.admit(invocation).await.unwrap();
+        ledger
+            .settle(&invocation_id, InvocationOutcome::Failed)
             .await
-            .is_err(),
-        "a conflicting settled ledger outcome must fail the controlled turn"
-    );
-    assert!(exported_private_records(&memory).await.is_empty());
-    harness.shutdown(false).await.unwrap();
-    memory.close().await.unwrap();
+            .unwrap();
+
+        assert!(
+            harness
+                .run_controlled(
+                    "fail accounting after a provider sidecar",
+                    Some(&actor_id),
+                    turn_id,
+                    &CancellationToken::new(),
+                )
+                .await
+                .is_err(),
+            "a conflicting settled ledger outcome must fail the controlled turn"
+        );
+        assert!(exported_private_records(&memory).await.is_empty());
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    })
+    .await
 }
 
 fn speaking_invocation_id(
@@ -526,57 +546,63 @@ fn speaking_invocation_id(
 
 #[tokio::test]
 async fn rejected_terminal_after_sidecar_does_not_persist_a_private_summary() {
-    let memory = MemoryStore::temporary().await.unwrap();
-    let (_project, mut harness) = harness(
-        memory.clone(),
-        Arc::new(RejectedTerminalAfterSummaryProvider),
-    )
-    .await;
-    assert!(
-        harness
-            .run_controlled(
-                "reject terminal after sidecar",
-                None,
-                "rejected-terminal-summary-turn",
-                &CancellationToken::new(),
-            )
-            .await
-            .is_err(),
-        "a collector-rejected terminal event must fail the controlled turn"
-    );
-    assert!(exported_private_records(&memory).await.is_empty());
-    harness.shutdown(false).await.unwrap();
-    memory.close().await.unwrap();
+    kuru_memory::test_support::closing(async {
+        let memory = MemoryStore::temporary().await.unwrap();
+        let (_project, mut harness) = harness(
+            memory.clone(),
+            Arc::new(RejectedTerminalAfterSummaryProvider),
+        )
+        .await;
+        assert!(
+            harness
+                .run_controlled(
+                    "reject terminal after sidecar",
+                    None,
+                    "rejected-terminal-summary-turn",
+                    &CancellationToken::new(),
+                )
+                .await
+                .is_err(),
+            "a collector-rejected terminal event must fail the controlled turn"
+        );
+        assert!(exported_private_records(&memory).await.is_empty());
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn cancellation_after_sidecar_does_not_persist_a_private_summary() {
-    let memory = MemoryStore::temporary().await.unwrap();
-    let provider = Arc::new(BlockingAfterSummaryProvider {
-        emitted_sidecar: Notify::new(),
-    });
-    let (_project, harness) = harness(memory.clone(), provider.clone()).await;
-    let cancellation = CancellationToken::new();
-    let cancel = cancellation.clone();
-    let emitted = provider.emitted_sidecar.notified();
-    tokio::pin!(emitted);
-    let task = tokio::spawn(async move {
-        let mut harness = harness;
-        let result = harness
-            .run_controlled(
-                "cancel after sidecar",
-                None,
-                "cancelled-summary-turn",
-                &cancel,
-            )
-            .await;
-        (harness, result)
-    });
-    emitted.await;
-    cancellation.cancel();
-    let (mut harness, result) = task.await.unwrap();
-    assert!(turn_was_cancelled(&result.unwrap_err()));
-    assert!(exported_private_records(&memory).await.is_empty());
-    harness.shutdown(false).await.unwrap();
-    memory.close().await.unwrap();
+    kuru_memory::test_support::closing(async {
+        let memory = MemoryStore::temporary().await.unwrap();
+        let provider = Arc::new(BlockingAfterSummaryProvider {
+            emitted_sidecar: Notify::new(),
+        });
+        let (_project, harness) = harness(memory.clone(), provider.clone()).await;
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let emitted = provider.emitted_sidecar.notified();
+        tokio::pin!(emitted);
+        let task = tokio::spawn(async move {
+            let mut harness = harness;
+            let result = harness
+                .run_controlled(
+                    "cancel after sidecar",
+                    None,
+                    "cancelled-summary-turn",
+                    &cancel,
+                )
+                .await;
+            (harness, result)
+        });
+        emitted.await;
+        cancellation.cancel();
+        let (mut harness, result) = task.await.unwrap();
+        assert!(turn_was_cancelled(&result.unwrap_err()));
+        assert!(exported_private_records(&memory).await.is_empty());
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    })
+    .await
 }

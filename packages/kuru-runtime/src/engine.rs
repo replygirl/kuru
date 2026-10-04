@@ -5439,784 +5439,808 @@ mod publication_tests {
 
     #[tokio::test]
     async fn mode_profile_publishes_only_after_durable_state_reconciliation() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let mut harness = Harness::new(
-            Config {
-                mode: Mode::Ifs,
-                provider: "demo".into(),
-                model: "demo".into(),
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            Arc::new(DemoProvider),
-            None,
-        )
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let mut harness = Harness::new(
+                Config {
+                    mode: Mode::Ifs,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                Arc::new(DemoProvider),
+                None,
+            )
+            .await
+            .unwrap();
+            let old_ids = harness
+                .topology
+                .parts
+                .iter()
+                .map(|part| part.id.clone())
+                .collect::<Vec<_>>();
+            let session_id = harness.session.id.clone();
+            assert_eq!(
+                memory
+                    .session_catalog_record(&session_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .mode,
+                Mode::Ifs
+            );
+            let (written, release) = harness.pause_after_next_memory_write();
+            let mut change = Box::pin(harness.set_mode(Mode::Jungian));
+            tokio::select! {
+                result = &mut change => panic!("mode change completed before publication pause: {result:?}"),
+                result = written => result.unwrap(),
+            }
+            drop(change);
+            drop(release);
+            assert_eq!(harness.config.mode, Mode::Ifs);
+            assert_eq!(harness.session.mode, Mode::Ifs);
+            assert_eq!(harness.profile.mode, Mode::Ifs);
+            assert_eq!(
+                harness
+                    .topology
+                    .parts
+                    .iter()
+                    .map(|part| part.id.clone())
+                    .collect::<Vec<_>>(),
+                old_ids
+            );
+            let pending = harness.pending_publication.as_ref().unwrap();
+            assert_eq!(pending.profile.mode, Mode::Jungian);
+            assert_eq!(pending.session.mode, Mode::Jungian);
+            assert_eq!(
+                memory
+                    .session_catalog_record(&session_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .mode,
+                Mode::Jungian
+            );
+            assert!(
+                memory
+                    .get(&format!("{}/jungian/topology", harness.scope))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            harness.reconcile().await.unwrap();
+            assert_eq!(harness.config.mode, Mode::Jungian);
+            assert_eq!(harness.session.mode, Mode::Jungian);
+            assert_eq!(harness.profile.mode, Mode::Jungian);
+            assert_eq!(
+                memory
+                    .session_catalog_record(&session_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .mode,
+                Mode::Jungian
+            );
+            assert_ne!(
+                harness
+                    .topology
+                    .parts
+                    .iter()
+                    .map(|part| part.id.clone())
+                    .collect::<Vec<_>>(),
+                old_ids
+            );
+            assert!(harness.pending_publication.is_none());
+            harness.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
         .await
-        .unwrap();
-        let old_ids = harness
-            .topology
-            .parts
-            .iter()
-            .map(|part| part.id.clone())
-            .collect::<Vec<_>>();
-        let session_id = harness.session.id.clone();
-        assert_eq!(
-            memory
-                .session_catalog_record(&session_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .mode,
-            Mode::Ifs
-        );
-        let (written, release) = harness.pause_after_next_memory_write();
-        let mut change = Box::pin(harness.set_mode(Mode::Jungian));
-        tokio::select! {
-            result = &mut change => panic!("mode change completed before publication pause: {result:?}"),
-            result = written => result.unwrap(),
-        }
-        drop(change);
-        drop(release);
-        assert_eq!(harness.config.mode, Mode::Ifs);
-        assert_eq!(harness.session.mode, Mode::Ifs);
-        assert_eq!(harness.profile.mode, Mode::Ifs);
-        assert_eq!(
-            harness
-                .topology
-                .parts
-                .iter()
-                .map(|part| part.id.clone())
-                .collect::<Vec<_>>(),
-            old_ids
-        );
-        let pending = harness.pending_publication.as_ref().unwrap();
-        assert_eq!(pending.profile.mode, Mode::Jungian);
-        assert_eq!(pending.session.mode, Mode::Jungian);
-        assert_eq!(
-            memory
-                .session_catalog_record(&session_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .mode,
-            Mode::Jungian
-        );
-        assert!(
-            memory
-                .get(&format!("{}/jungian/topology", harness.scope))
-                .await
-                .unwrap()
-                .is_some()
-        );
-        harness.reconcile().await.unwrap();
-        assert_eq!(harness.config.mode, Mode::Jungian);
-        assert_eq!(harness.session.mode, Mode::Jungian);
-        assert_eq!(harness.profile.mode, Mode::Jungian);
-        assert_eq!(
-            memory
-                .session_catalog_record(&session_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .mode,
-            Mode::Jungian
-        );
-        assert_ne!(
-            harness
-                .topology
-                .parts
-                .iter()
-                .map(|part| part.id.clone())
-                .collect::<Vec<_>>(),
-            old_ids
-        );
-        assert!(harness.pending_publication.is_none());
-        harness.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn rejected_mode_checkpoint_keeps_live_and_retained_mode_unchanged() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let config = Config {
-            mode: Mode::Ifs,
-            provider: "demo".into(),
-            model: "demo".into(),
-            dream_every: 0,
-            dream_on_exit: false,
-            ..Config::default()
-        };
-        let mut harness = Harness::new(
-            config.clone(),
-            project.path(),
-            memory.clone(),
-            Arc::new(DemoProvider),
-            None,
-        )
-        .await
-        .unwrap();
-        let session_id = harness.session.id.clone();
-        memory
-            .rename_session(&session_id, 0, "renamed")
-            .await
-            .unwrap();
-        let before = memory.revision().await.unwrap();
-        let error = harness.set_mode(Mode::Jungian).await.unwrap_err();
-        assert!(error.to_string().contains("generation"), "{error:#}");
-        assert_eq!(memory.revision().await.unwrap(), before);
-        assert_eq!(harness.config.mode, Mode::Ifs);
-        assert_eq!(harness.profile.mode, Mode::Ifs);
-        assert_eq!(harness.session.mode, Mode::Ifs);
-        assert_eq!(
-            memory
-                .session_catalog_record(&session_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .mode,
-            Mode::Ifs
-        );
-        assert!(
-            memory
-                .get(&format!("{}/jungian/topology", harness.scope))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        harness.reconcile().await.unwrap();
-        assert!(harness.pending_publication.is_none());
-        drop(harness);
-        let resumed = Harness::new(
-            config,
-            project.path(),
-            memory.clone(),
-            Arc::new(DemoProvider),
-            Some(&session_id),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resumed.session.mode, Mode::Ifs);
-        assert_eq!(resumed.session.label, "renamed");
-        drop(resumed);
-        memory.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn new_turn_admission_refreshes_one_valid_persisted_topology() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let mut harness = Harness::new(
-            Config {
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let config = Config {
                 mode: Mode::Ifs,
                 provider: "demo".into(),
                 model: "demo".into(),
                 dream_every: 0,
                 dream_on_exit: false,
                 ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            Arc::new(DemoProvider),
-            None,
-        )
-        .await
-        .unwrap();
-        let selected = harness.topology.parts[1].id.clone();
-        let mut refreshed = harness.topology.clone();
-        refreshed.focus = Some(Focus {
-            id: selected.clone(),
-            remaining: 3,
-        });
-        memory
-            .put(
-                &format!("{}/{}/topology", harness.scope, harness.profile.mode),
-                &serde_json::to_value(&refreshed).unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let admission = harness
-            .admit_turn(
-                "observe refreshed topology",
+            };
+            let mut harness = Harness::new(
+                config.clone(),
+                project.path(),
+                memory.clone(),
+                Arc::new(DemoProvider),
                 None,
-                "topology-refresh",
-                false,
-                &CancellationToken::new(),
             )
             .await
             .unwrap();
-        assert!(matches!(admission, TurnAdmission::Run { .. }));
-        assert_eq!(harness.topology.focus.as_ref().unwrap().id, selected);
+            let session_id = harness.session.id.clone();
+            memory
+                .rename_session(&session_id, 0, "renamed")
+                .await
+                .unwrap();
+            let before = memory.revision().await.unwrap();
+            let error = harness.set_mode(Mode::Jungian).await.unwrap_err();
+            assert!(error.to_string().contains("generation"), "{error:#}");
+            assert_eq!(memory.revision().await.unwrap(), before);
+            assert_eq!(harness.config.mode, Mode::Ifs);
+            assert_eq!(harness.profile.mode, Mode::Ifs);
+            assert_eq!(harness.session.mode, Mode::Ifs);
+            assert_eq!(
+                memory
+                    .session_catalog_record(&session_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .mode,
+                Mode::Ifs
+            );
+            assert!(
+                memory
+                    .get(&format!("{}/jungian/topology", harness.scope))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            harness.reconcile().await.unwrap();
+            assert!(harness.pending_publication.is_none());
+            drop(harness);
+            let resumed = Harness::new(
+                config,
+                project.path(),
+                memory.clone(),
+                Arc::new(DemoProvider),
+                Some(&session_id),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resumed.session.mode, Mode::Ifs);
+            assert_eq!(resumed.session.label, "renamed");
+            drop(resumed);
+            memory.close().await.unwrap();
+        })
+        .await
+    }
 
-        harness.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
+    #[tokio::test]
+    async fn new_turn_admission_refreshes_one_valid_persisted_topology() {
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let mut harness = Harness::new(
+                Config {
+                    mode: Mode::Ifs,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                Arc::new(DemoProvider),
+                None,
+            )
+            .await
+            .unwrap();
+            let selected = harness.topology.parts[1].id.clone();
+            let mut refreshed = harness.topology.clone();
+            refreshed.focus = Some(Focus {
+                id: selected.clone(),
+                remaining: 3,
+            });
+            memory
+                .put(
+                    &format!("{}/{}/topology", harness.scope, harness.profile.mode),
+                    &serde_json::to_value(&refreshed).unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let admission = harness
+                .admit_turn(
+                    "observe refreshed topology",
+                    None,
+                    "topology-refresh",
+                    false,
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(admission, TurnAdmission::Run { .. }));
+            assert_eq!(harness.topology.focus.as_ref().unwrap().id, selected);
+
+            harness.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[tokio::test]
     async fn completed_turn_retry_is_exact_and_session_scoped() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let provider = Arc::new(CountingProvider::default());
-        let config = Config {
-            mode: Mode::Ifs,
-            provider: "demo".into(),
-            model: "demo".into(),
-            dream_every: 0,
-            dream_on_exit: false,
-            ..Config::default()
-        };
-        let mut first = Harness::new(
-            config.clone(),
-            project.path(),
-            memory.clone(),
-            provider.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        let target = first.topology.parts[0].id.clone();
-        let cancellation = CancellationToken::new();
-        let output = first
-            .run_controlled(
-                "one durable request",
-                Some(&target),
-                "shared-external-id",
-                &cancellation,
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let provider = Arc::new(CountingProvider::default());
+            let config = Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            };
+            let mut first = Harness::new(
+                config.clone(),
+                project.path(),
+                memory.clone(),
+                provider.clone(),
+                None,
             )
             .await
             .unwrap();
-        let serialized = serde_json::to_string(&output).unwrap();
-        let sends = provider.calls.load(Ordering::SeqCst);
-        let topology_key = format!("{}/{}/topology", first.scope, first.profile.mode);
-        let valid_topology = memory.get(&topology_key).await.unwrap().unwrap();
-        memory
-            .put(&topology_key, &json!({"malformed-after-completion": true}))
-            .await
-            .unwrap();
-        let retry = first
-            .run_controlled(
-                "one durable request",
-                Some(&target),
-                "shared-external-id",
-                &cancellation,
-            )
-            .await
-            .unwrap();
-        assert_eq!(serde_json::to_string(&retry).unwrap(), serialized);
-        assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
-        assert_eq!(first.history().await.unwrap().len(), 2);
-        let public = memory
-            .public_transcript_page(&first.session.id, None, 16)
-            .await
-            .unwrap();
-        assert!(public.pending.is_none());
-        assert!(matches!(
-            public.records.as_slice(),
-            [kuru_memory::PublicTranscriptEntry::Turn { record }]
-                if record.turn_id == "shared-external-id"
-                    && record.settlement == PublicTurnSettlement::Completed
-                    && record.speaker_id.as_deref() == Some(output.speaker.as_str())
-                    && record.user_entry == Some(user("one durable request"))
-                    && record.terminal_entries == [assistant(&output.text)]
-        ));
-        memory.put(&topology_key, &valid_topology).await.unwrap();
-        assert!(
-            first
+            let target = first.topology.parts[0].id.clone();
+            let cancellation = CancellationToken::new();
+            let output = first
                 .run_controlled(
-                    "changed request",
+                    "one durable request",
                     Some(&target),
                     "shared-external-id",
                     &cancellation,
                 )
                 .await
-                .unwrap_err()
-                .to_string()
-                .contains("different request")
-        );
-        assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
-        assert_eq!(first.history().await.unwrap().len(), 2);
+                .unwrap();
+            let serialized = serde_json::to_string(&output).unwrap();
+            let sends = provider.calls.load(Ordering::SeqCst);
+            let topology_key = format!("{}/{}/topology", first.scope, first.profile.mode);
+            let valid_topology = memory.get(&topology_key).await.unwrap().unwrap();
+            memory
+                .put(&topology_key, &json!({"malformed-after-completion": true}))
+                .await
+                .unwrap();
+            let retry = first
+                .run_controlled(
+                    "one durable request",
+                    Some(&target),
+                    "shared-external-id",
+                    &cancellation,
+                )
+                .await
+                .unwrap();
+            assert_eq!(serde_json::to_string(&retry).unwrap(), serialized);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
+            assert_eq!(first.history().await.unwrap().len(), 2);
+            let public = memory
+                .public_transcript_page(&first.session.id, None, 16)
+                .await
+                .unwrap();
+            assert!(public.pending.is_none());
+            assert!(matches!(
+                public.records.as_slice(),
+                [kuru_memory::PublicTranscriptEntry::Turn { record }]
+                    if record.turn_id == "shared-external-id"
+                        && record.settlement == PublicTurnSettlement::Completed
+                        && record.speaker_id.as_deref() == Some(output.speaker.as_str())
+                        && record.user_entry == Some(user("one durable request"))
+                        && record.terminal_entries == [assistant(&output.text)]
+            ));
+            memory.put(&topology_key, &valid_topology).await.unwrap();
+            assert!(
+                first
+                    .run_controlled(
+                        "changed request",
+                        Some(&target),
+                        "shared-external-id",
+                        &cancellation,
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("different request")
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
+            assert_eq!(first.history().await.unwrap().len(), 2);
 
-        let mut second = Harness::new(
-            config,
-            project.path(),
-            memory.clone(),
-            provider.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        second
-            .run_controlled(
-                "independent session request",
-                Some(&target),
-                "shared-external-id",
-                &CancellationToken::new(),
+            let mut second = Harness::new(
+                config,
+                project.path(),
+                memory.clone(),
+                provider.clone(),
+                None,
             )
             .await
             .unwrap();
-        assert!(provider.calls.load(Ordering::SeqCst) > sends);
-        assert_eq!(second.history().await.unwrap().len(), 2);
-        first.shutdown(false).await.unwrap();
-        second.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
+            second
+                .run_controlled(
+                    "independent session request",
+                    Some(&target),
+                    "shared-external-id",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(provider.calls.load(Ordering::SeqCst) > sends);
+            assert_eq!(second.history().await.unwrap().len(), 2);
+            first.shutdown(false).await.unwrap();
+            second.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[tokio::test]
     async fn local_retry_reports_reuse_and_a2a_does_not_replace_its_tuple() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let provider = Arc::new(CountingProvider::default());
-        let mut harness = Harness::new(
-            Config {
-                mode: Mode::Ifs,
-                provider: "demo".into(),
-                model: "demo".into(),
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            provider.clone(),
-            None,
-        )
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let provider = Arc::new(CountingProvider::default());
+            let mut harness = Harness::new(
+                Config {
+                    mode: Mode::Ifs,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                provider.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+            let target = harness.topology.parts[0].id.clone();
+            let first = harness
+                .run_local_controlled(
+                    "local request",
+                    Some(&target),
+                    "local-id",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(!first.reused);
+            harness
+                .run_controlled(
+                    "a2a request",
+                    Some(&target),
+                    "a2a-id",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let sends = provider.calls.load(Ordering::SeqCst);
+
+            let retried = harness.retry_last(&CancellationToken::new()).await.unwrap();
+
+            assert!(retried.reused);
+            assert_eq!(retried.output.text, first.output.text);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
+            assert_eq!(harness.history().await.unwrap().len(), 4);
+            harness.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
         .await
-        .unwrap();
-        let target = harness.topology.parts[0].id.clone();
-        let first = harness
-            .run_local_controlled(
-                "local request",
-                Some(&target),
-                "local-id",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(!first.reused);
-        harness
-            .run_controlled(
-                "a2a request",
-                Some(&target),
-                "a2a-id",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let sends = provider.calls.load(Ordering::SeqCst);
-
-        let retried = harness.retry_last(&CancellationToken::new()).await.unwrap();
-
-        assert!(retried.reused);
-        assert_eq!(retried.output.text, first.output.text);
-        assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
-        assert_eq!(harness.history().await.unwrap().len(), 4);
-        harness.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn local_retry_resumes_only_a_pre_dispatch_admission() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let provider = Arc::new(CountingProvider::default());
-        let mut harness = Harness::new(
-            Config {
-                mode: Mode::Ifs,
-                provider: "demo".into(),
-                model: "demo".into(),
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            provider.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        let target = harness.topology.parts[0].id.clone();
-        let admission = harness
-            .admit_turn(
-                "safe local request",
-                Some(&target),
-                "safe-local-id",
-                true,
-                &CancellationToken::new(),
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let provider = Arc::new(CountingProvider::default());
+            let mut harness = Harness::new(
+                Config {
+                    mode: Mode::Ifs,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                provider.clone(),
+                None,
             )
             .await
             .unwrap();
-        let TurnAdmission::Run { key, journal, .. } = admission else {
-            panic!("safe local request was not admitted")
-        };
-        harness.record_interruption(&key, journal).await.unwrap();
-        let pending = memory
-            .public_transcript_page(&harness.session.id, None, 16)
-            .await
-            .unwrap();
-        assert!(matches!(
-            pending.pending.as_ref(),
-            Some(record)
-                if record.settlement == PublicTurnSettlement::Pending
-                    && record.terminal_entries
-                        == [Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT)]
-        ));
+            let target = harness.topology.parts[0].id.clone();
+            let admission = harness
+                .admit_turn(
+                    "safe local request",
+                    Some(&target),
+                    "safe-local-id",
+                    true,
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let TurnAdmission::Run { key, journal, .. } = admission else {
+                panic!("safe local request was not admitted")
+            };
+            harness.record_interruption(&key, journal).await.unwrap();
+            let pending = memory
+                .public_transcript_page(&harness.session.id, None, 16)
+                .await
+                .unwrap();
+            assert!(matches!(
+                pending.pending.as_ref(),
+                Some(record)
+                    if record.settlement == PublicTurnSettlement::Pending
+                        && record.terminal_entries
+                            == [Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT)]
+            ));
 
-        let retried = harness.retry_last(&CancellationToken::new()).await.unwrap();
+            let retried = harness.retry_last(&CancellationToken::new()).await.unwrap();
 
-        assert!(!retried.reused);
-        assert_eq!(harness.history().await.unwrap().len(), 3);
-        let settled = memory
-            .public_transcript_page(&harness.session.id, None, 16)
-            .await
-            .unwrap();
-        assert!(settled.pending.is_none());
-        assert!(matches!(
-            settled.records.as_slice(),
-            [kuru_memory::PublicTranscriptEntry::Turn { record }]
-                if record.settlement == PublicTurnSettlement::Completed
-                    && record.terminal_entries.first()
-                        == Some(&Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT))
-        ));
-        assert!(provider.calls.load(Ordering::SeqCst) > 0);
-        harness.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
+            assert!(!retried.reused);
+            assert_eq!(harness.history().await.unwrap().len(), 3);
+            let settled = memory
+                .public_transcript_page(&harness.session.id, None, 16)
+                .await
+                .unwrap();
+            assert!(settled.pending.is_none());
+            assert!(matches!(
+                settled.records.as_slice(),
+                [kuru_memory::PublicTranscriptEntry::Turn { record }]
+                    if record.settlement == PublicTurnSettlement::Completed
+                        && record.terminal_entries.first()
+                            == Some(&Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT))
+            ));
+            assert!(provider.calls.load(Ordering::SeqCst) > 0);
+            harness.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[tokio::test]
     async fn repeated_safe_retry_parks_one_empty_continuation_without_moving_its_marker() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let provider = Arc::new(CountingProvider::default());
-        let mut harness = Harness::new(
-            Config {
-                mode: Mode::Ifs,
-                provider: "demo".into(),
-                model: "demo".into(),
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            provider.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        let target = harness.topology.parts[0].id.clone();
-        let TurnAdmission::Run { key, journal, .. } = harness
-            .admit_turn(
-                "old safe request",
-                Some(&target),
-                "old-safe-id",
-                false,
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("old safe request was not admitted")
-        };
-        harness.record_interruption(&key, journal).await.unwrap();
-        harness
-            .run_controlled(
-                "later request",
-                Some(&target),
-                "later-id",
-                &CancellationToken::new(),
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let provider = Arc::new(CountingProvider::default());
+            let mut harness = Harness::new(
+                Config {
+                    mode: Mode::Ifs,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                provider.clone(),
+                None,
             )
             .await
             .unwrap();
-
-        let TurnAdmission::Run {
-            key,
-            journal,
-            resolved_target: _,
-        } = harness
-            .admit_turn(
-                "old safe request",
-                Some(&target),
-                "old-safe-id",
-                false,
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("older safe request was not resumed")
-        };
-        let before_revision = memory.revision().await.unwrap();
-        let before_journal = memory.get(&key).await.unwrap();
-        let calls_before_second_safe_stop = provider.calls.load(Ordering::SeqCst);
-        let before_public = memory
-            .public_transcript_page(&harness.session.id, None, 16)
-            .await
-            .unwrap();
-        assert!(matches!(
-            before_public.pending.as_ref(),
-            Some(record)
-                if record.kind == kuru_memory::PublicTurnKind::Continuation
-                    && record.terminal_entries.is_empty()
-                    && record.speaker_id.is_none()
-        ));
-
-        // The logical turn already owns its one durable interruption marker.
-        // A second safe stop therefore returns before any checkpoint: there is
-        // no new public content whose chronological position could be moved.
-        assert!(
-            harness
-                .record_interruption(&key, journal)
+            let target = harness.topology.parts[0].id.clone();
+            let TurnAdmission::Run { key, journal, .. } = harness
+                .admit_turn(
+                    "old safe request",
+                    Some(&target),
+                    "old-safe-id",
+                    false,
+                    &CancellationToken::new(),
+                )
                 .await
                 .unwrap()
-                .is_none()
-        );
-        assert_eq!(memory.revision().await.unwrap(), before_revision);
-        assert_eq!(memory.get(&key).await.unwrap(), before_journal);
-        assert_eq!(
-            provider.calls.load(Ordering::SeqCst),
-            calls_before_second_safe_stop
-        );
-        assert_eq!(
-            memory
+            else {
+                panic!("old safe request was not admitted")
+            };
+            harness.record_interruption(&key, journal).await.unwrap();
+            harness
+                .run_controlled(
+                    "later request",
+                    Some(&target),
+                    "later-id",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+
+            let TurnAdmission::Run {
+                key,
+                journal,
+                resolved_target: _,
+            } = harness
+                .admit_turn(
+                    "old safe request",
+                    Some(&target),
+                    "old-safe-id",
+                    false,
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("older safe request was not resumed")
+            };
+            let before_revision = memory.revision().await.unwrap();
+            let before_journal = memory.get(&key).await.unwrap();
+            let calls_before_second_safe_stop = provider.calls.load(Ordering::SeqCst);
+            let before_public = memory
                 .public_transcript_page(&harness.session.id, None, 16)
                 .await
-                .unwrap(),
-            before_public
-        );
+                .unwrap();
+            assert!(matches!(
+                before_public.pending.as_ref(),
+                Some(record)
+                    if record.kind == kuru_memory::PublicTurnKind::Continuation
+                        && record.terminal_entries.is_empty()
+                        && record.speaker_id.is_none()
+            ));
 
-        harness
-            .run_controlled(
-                "newest request",
-                Some(&target),
-                "newest-id",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let before_final_retry = memory
-            .public_transcript_page(&harness.session.id, None, 16)
-            .await
-            .unwrap();
-        assert!(before_final_retry.pending.is_none());
-        assert_eq!(
-            before_final_retry
+            // The logical turn already owns its one durable interruption marker.
+            // A second safe stop therefore returns before any checkpoint: there is
+            // no new public content whose chronological position could be moved.
+            assert!(
+                harness
+                    .record_interruption(&key, journal)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(memory.revision().await.unwrap(), before_revision);
+            assert_eq!(memory.get(&key).await.unwrap(), before_journal);
+            assert_eq!(
+                provider.calls.load(Ordering::SeqCst),
+                calls_before_second_safe_stop
+            );
+            assert_eq!(
+                memory
+                    .public_transcript_page(&harness.session.id, None, 16)
+                    .await
+                    .unwrap(),
+                before_public
+            );
+
+            harness
+                .run_controlled(
+                    "newest request",
+                    Some(&target),
+                    "newest-id",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let before_final_retry = memory
+                .public_transcript_page(&harness.session.id, None, 16)
+                .await
+                .unwrap();
+            assert!(before_final_retry.pending.is_none());
+            assert_eq!(
+                before_final_retry
+                    .records
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        kuru_memory::PublicTranscriptEntry::Turn { record } => Some(record),
+                        kuru_memory::PublicTranscriptEntry::Legacy { .. } => None,
+                    })
+                    .flat_map(|record| record.terminal_entries.iter())
+                    .filter(|message| message.role == INTERRUPTION_ROLE)
+                    .count(),
+                1
+            );
+
+            harness
+                .run_controlled(
+                    "old safe request",
+                    Some(&target),
+                    "old-safe-id",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let settled = memory
+                .public_transcript_page(&harness.session.id, None, 16)
+                .await
+                .unwrap();
+            assert!(settled.pending.is_none());
+            let turns = settled
                 .records
                 .iter()
                 .filter_map(|entry| match entry {
                     kuru_memory::PublicTranscriptEntry::Turn { record } => Some(record),
                     kuru_memory::PublicTranscriptEntry::Legacy { .. } => None,
                 })
-                .flat_map(|record| record.terminal_entries.iter())
-                .filter(|message| message.role == INTERRUPTION_ROLE)
-                .count(),
-            1
-        );
-
-        harness
-            .run_controlled(
-                "old safe request",
-                Some(&target),
-                "old-safe-id",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let settled = memory
-            .public_transcript_page(&harness.session.id, None, 16)
-            .await
-            .unwrap();
-        assert!(settled.pending.is_none());
-        let turns = settled
-            .records
-            .iter()
-            .filter_map(|entry| match entry {
-                kuru_memory::PublicTranscriptEntry::Turn { record } => Some(record),
-                kuru_memory::PublicTranscriptEntry::Legacy { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(turns.len(), 4);
-        assert_eq!(
-            turns
-                .iter()
-                .filter(|record| record.user_entry.is_some())
-                .count(),
-            3
-        );
-        assert_eq!(
-            turns
-                .iter()
-                .flat_map(|record| record.terminal_entries.iter())
-                .filter(|message| message.role == INTERRUPTION_ROLE)
-                .count(),
-            1
-        );
-        assert!(turns.iter().any(|record| {
-            record.kind == kuru_memory::PublicTurnKind::Continuation
-                && record.turn_id == "old-safe-id"
-                && record.settlement == PublicTurnSettlement::Completed
-                && record.user_entry.is_none()
-        }));
-        assert_eq!(
-            harness.history().await.unwrap(),
-            [
-                user("old safe request"),
-                Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT),
-                user("later request"),
-                assistant("durable answer"),
-                user("newest request"),
-                assistant("durable answer"),
-                assistant("durable answer")
-            ]
-        );
-        assert!(provider.calls.load(Ordering::SeqCst) > calls_before_second_safe_stop);
-        harness.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
+                .collect::<Vec<_>>();
+            assert_eq!(turns.len(), 4);
+            assert_eq!(
+                turns
+                    .iter()
+                    .filter(|record| record.user_entry.is_some())
+                    .count(),
+                3
+            );
+            assert_eq!(
+                turns
+                    .iter()
+                    .flat_map(|record| record.terminal_entries.iter())
+                    .filter(|message| message.role == INTERRUPTION_ROLE)
+                    .count(),
+                1
+            );
+            assert!(turns.iter().any(|record| {
+                record.kind == kuru_memory::PublicTurnKind::Continuation
+                    && record.turn_id == "old-safe-id"
+                    && record.settlement == PublicTurnSettlement::Completed
+                    && record.user_entry.is_none()
+            }));
+            assert_eq!(
+                harness.history().await.unwrap(),
+                [
+                    user("old safe request"),
+                    Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT),
+                    user("later request"),
+                    assistant("durable answer"),
+                    user("newest request"),
+                    assistant("durable answer"),
+                    assistant("durable answer")
+                ]
+            );
+            assert!(provider.calls.load(Ordering::SeqCst) > calls_before_second_safe_stop);
+            harness.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[tokio::test]
     async fn interruption_marker_dedup_is_explicit_and_repairs_legacy_journals() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let mut harness = Harness::new(
-            Config {
-                mode: Mode::Ifs,
-                provider: "demo".into(),
-                model: "demo".into(),
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            Arc::new(FailingProvider),
-            None,
-        )
-        .await
-        .unwrap();
-        let target = harness.topology.parts[0].id.clone();
-        let TurnAdmission::Run {
-            key, mut journal, ..
-        } = harness
-            .admit_turn(
-                "legacy interrupted request",
-                Some(&target),
-                "legacy-interrupted",
-                false,
-                &CancellationToken::new(),
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let mut harness = Harness::new(
+                Config {
+                    mode: Mode::Ifs,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                Arc::new(FailingProvider),
+                None,
             )
             .await
-            .unwrap()
-        else {
-            panic!("new journal must run");
-        };
-        journal.push(TurnTransition::Interrupted).unwrap();
-        let mut legacy = serde_json::to_value(&journal).unwrap();
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("interruption_marker");
-        memory.put(&key, &legacy).await.unwrap();
-
-        harness
-            .run_controlled(
-                "legacy interrupted request",
-                Some(&target),
-                "legacy-interrupted",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap_err();
-        let stored: TurnJournal =
-            serde_json::from_value(memory.get(&key).await.unwrap().unwrap()).unwrap();
-        assert!(stored.interruption_marker);
-        assert_eq!(
-            harness
-                .history()
+            .unwrap();
+            let target = harness.topology.parts[0].id.clone();
+            let TurnAdmission::Run {
+                key, mut journal, ..
+            } = harness
+                .admit_turn(
+                    "legacy interrupted request",
+                    Some(&target),
+                    "legacy-interrupted",
+                    false,
+                    &CancellationToken::new(),
+                )
                 .await
                 .unwrap()
-                .iter()
-                .filter(|message| message.role == INTERRUPTION_ROLE)
-                .count(),
-            1
-        );
-        let public = memory
-            .public_transcript_page(&harness.session.id, None, 16)
-            .await
-            .unwrap();
-        assert!(public.pending.is_none());
-        assert!(matches!(
-            public.records.as_slice(),
-            [kuru_memory::PublicTranscriptEntry::Turn { record }]
-                if record.turn_id == "legacy-interrupted"
-                    && record.settlement == PublicTurnSettlement::Interrupted
-                    && record.speaker_id.as_deref() == Some(INTERRUPTION_ROLE)
-                    && record.terminal_entries
-                        == [Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT)]
-        ));
+            else {
+                panic!("new journal must run");
+            };
+            journal.push(TurnTransition::Interrupted).unwrap();
+            let mut legacy = serde_json::to_value(&journal).unwrap();
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("interruption_marker");
+            memory.put(&key, &legacy).await.unwrap();
 
-        let settled_revision = memory.revision().await.unwrap();
-        let settled_history = harness.history().await.unwrap();
-        let mut events = harness.subscribe();
-        harness.record_interruption(&key, stored).await.unwrap();
-        assert_eq!(memory.revision().await.unwrap(), settled_revision);
-        assert_eq!(harness.history().await.unwrap(), settled_history);
-        assert_eq!(
-            memory
+            harness
+                .run_controlled(
+                    "legacy interrupted request",
+                    Some(&target),
+                    "legacy-interrupted",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            let stored: TurnJournal =
+                serde_json::from_value(memory.get(&key).await.unwrap().unwrap()).unwrap();
+            assert!(stored.interruption_marker);
+            assert_eq!(
+                harness
+                    .history()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|message| message.role == INTERRUPTION_ROLE)
+                    .count(),
+                1
+            );
+            let public = memory
                 .public_transcript_page(&harness.session.id, None, 16)
                 .await
-                .unwrap(),
-            public
-        );
-        assert!(
-            events.try_recv().is_err(),
-            "exact retry emitted another event"
-        );
+                .unwrap();
+            assert!(public.pending.is_none());
+            assert!(matches!(
+                public.records.as_slice(),
+                [kuru_memory::PublicTranscriptEntry::Turn { record }]
+                    if record.turn_id == "legacy-interrupted"
+                        && record.settlement == PublicTurnSettlement::Interrupted
+                        && record.speaker_id.as_deref() == Some(INTERRUPTION_ROLE)
+                        && record.terminal_entries
+                            == [Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT)]
+            ));
 
-        let stored: TurnJournal =
-            serde_json::from_value(memory.get(&key).await.unwrap().unwrap()).unwrap();
-        let mut wrong = stored;
-        wrong.id = "different-turn".into();
-        assert!(harness.record_interruption(&key, wrong).await.is_err());
-        assert_eq!(memory.revision().await.unwrap(), settled_revision);
+            let settled_revision = memory.revision().await.unwrap();
+            let settled_history = harness.history().await.unwrap();
+            let mut events = harness.subscribe();
+            harness.record_interruption(&key, stored).await.unwrap();
+            assert_eq!(memory.revision().await.unwrap(), settled_revision);
+            assert_eq!(harness.history().await.unwrap(), settled_history);
+            assert_eq!(
+                memory
+                    .public_transcript_page(&harness.session.id, None, 16)
+                    .await
+                    .unwrap(),
+                public
+            );
+            assert!(
+                events.try_recv().is_err(),
+                "exact retry emitted another event"
+            );
 
-        let TurnAdmission::Run { .. } = harness
-            .admit_turn(
-                "later pending request",
-                Some(&target),
-                "later-pending",
-                false,
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("later request must admit a pending turn");
-        };
-        let pending = memory
-            .public_transcript_page(&harness.session.id, None, 16)
-            .await
-            .unwrap();
-        assert_eq!(pending.pending.as_ref().unwrap().turn_id, "later-pending");
-        let pending_revision = memory.revision().await.unwrap();
-        let old: TurnJournal =
-            serde_json::from_value(memory.get(&key).await.unwrap().unwrap()).unwrap();
-        assert!(harness.record_interruption(&key, old).await.is_err());
-        assert_eq!(memory.revision().await.unwrap(), pending_revision);
-        assert_eq!(
-            memory
+            let stored: TurnJournal =
+                serde_json::from_value(memory.get(&key).await.unwrap().unwrap()).unwrap();
+            let mut wrong = stored;
+            wrong.id = "different-turn".into();
+            assert!(harness.record_interruption(&key, wrong).await.is_err());
+            assert_eq!(memory.revision().await.unwrap(), settled_revision);
+
+            let TurnAdmission::Run { .. } = harness
+                .admit_turn(
+                    "later pending request",
+                    Some(&target),
+                    "later-pending",
+                    false,
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("later request must admit a pending turn");
+            };
+            let pending = memory
                 .public_transcript_page(&harness.session.id, None, 16)
                 .await
-                .unwrap(),
-            pending
-        );
-        harness.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
+                .unwrap();
+            assert_eq!(pending.pending.as_ref().unwrap().turn_id, "later-pending");
+            let pending_revision = memory.revision().await.unwrap();
+            let old: TurnJournal =
+                serde_json::from_value(memory.get(&key).await.unwrap().unwrap()).unwrap();
+            assert!(harness.record_interruption(&key, old).await.is_err());
+            assert_eq!(memory.revision().await.unwrap(), pending_revision);
+            assert_eq!(
+                memory
+                    .public_transcript_page(&harness.session.id, None, 16)
+                    .await
+                    .unwrap(),
+                pending
+            );
+            harness.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[test]
@@ -6300,603 +6324,621 @@ mod publication_tests {
 
     #[tokio::test]
     async fn projected_events_reach_broadcast_output_and_journal_without_secret_leakage() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let mut harness = Harness::new(
-            Config {
-                mode: Mode::Freudian,
-                provider: "demo".into(),
-                model: "demo".into(),
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            Arc::new(SecretEventProvider),
-            None,
-        )
-        .await
-        .unwrap();
-        let secret = "sk-projection-fixture-1234567890";
-        let secret_actor = format!("actor token={secret}");
-        let old_actor = harness.topology.parts.last().unwrap().id.clone();
-        harness.topology.parts.last_mut().unwrap().id = secret_actor.clone();
-        let actor = harness.actors.remove(&old_actor).unwrap();
-        harness.actors.insert(secret_actor, actor);
-        let mut events = harness.subscribe();
-
-        let output = harness
-            .run_controlled(
-                "projection fixture",
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let mut harness = Harness::new(
+                Config {
+                    mode: Mode::Freudian,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                Arc::new(SecretEventProvider),
                 None,
-                "projection-id",
-                &CancellationToken::new(),
             )
             .await
             .unwrap();
+            let secret = "sk-projection-fixture-1234567890";
+            let secret_actor = format!("actor token={secret}");
+            let old_actor = harness.topology.parts.last().unwrap().id.clone();
+            harness.topology.parts.last_mut().unwrap().id = secret_actor.clone();
+            let actor = harness.actors.remove(&old_actor).unwrap();
+            harness.actors.insert(secret_actor, actor);
+            let mut events = harness.subscribe();
 
-        let serialized_output = serde_json::to_string(&output).unwrap();
-        assert!(!serialized_output.contains(secret));
-        assert!(output.events.iter().any(|event| {
-            event.kind() == "state"
-                && event.detail().contains("activation")
-                && !event.detail().contains(secret)
-        }));
-        assert_eq!(
-            output.events.last().unwrap().detail(),
-            "[response completed]"
-        );
-        let mut broadcast = Vec::new();
-        while let Ok(event) = events.try_recv() {
-            broadcast.push(event);
-        }
-        assert!(!serde_json::to_string(&broadcast).unwrap().contains(secret));
-        let stored = memory
-            .get(&harness.turn_journal_key("projection-id"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored["format"], 2);
-        assert!(!serde_json::to_string(&stored).unwrap().contains(secret));
-        let replay = harness
-            .run_controlled(
-                "projection fixture",
-                None,
-                "projection-id",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            !serde_json::to_string(&replay.events)
+            let output = harness
+                .run_controlled(
+                    "projection fixture",
+                    None,
+                    "projection-id",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+
+            let serialized_output = serde_json::to_string(&output).unwrap();
+            assert!(!serialized_output.contains(secret));
+            assert!(output.events.iter().any(|event| {
+                event.kind() == "state"
+                    && event.detail().contains("activation")
+                    && !event.detail().contains(secret)
+            }));
+            assert_eq!(
+                output.events.last().unwrap().detail(),
+                "[response completed]"
+            );
+            let mut broadcast = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                broadcast.push(event);
+            }
+            assert!(!serde_json::to_string(&broadcast).unwrap().contains(secret));
+            let stored = memory
+                .get(&harness.turn_journal_key("projection-id"))
+                .await
                 .unwrap()
-                .contains(secret)
-        );
-        harness.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
+                .unwrap();
+            assert_eq!(stored["format"], 2);
+            assert!(!serde_json::to_string(&stored).unwrap().contains(secret));
+            let replay = harness
+                .run_controlled(
+                    "projection fixture",
+                    None,
+                    "projection-id",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !serde_json::to_string(&replay.events)
+                    .unwrap()
+                    .contains(secret)
+            );
+            harness.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[tokio::test]
     async fn stopped_started_turn_resumes_once_but_possible_turn_never_dispatches() {
-        let project = tempfile::tempdir().unwrap();
-        let data = kuru_memory::test_support::tempdir().unwrap();
-        let options = kuru_memory::test_support::warmed_open_options(
-            data.path().into(),
-            project_scope(project.path()).unwrap(),
-        )
-        .await
-        .unwrap();
-        let memory = MemoryStore::open(options.clone()).await.unwrap();
-        let provider = Arc::new(CountingProvider::default());
-        let mut first = Harness::new(
-            Config {
-                mode: Mode::Ifs,
-                provider: "demo".into(),
-                model: "demo".into(),
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            provider.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        let session = first.session.id.clone();
-        let target = first.topology.parts[0].id.clone();
-        let cancellation = CancellationToken::new();
-        let TurnAdmission::Run { .. } = first
-            .admit_turn(
-                "resume safely",
-                Some(&target),
-                "started",
-                false,
-                &cancellation,
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("new journal must be runnable");
-        };
-        let first_journal = decode_turn_journal(
-            memory
-                .get(&first.turn_journal_key("started"))
-                .await
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(first_journal.admitted_transcript_row, Some(1));
-        first.shutdown(false).await.unwrap();
-        let mut uncertain = Harness::new(
-            Config {
-                mode: Mode::Ifs,
-                provider: "demo".into(),
-                model: "demo".into(),
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            provider.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        let uncertain_session = uncertain.session.id.clone();
-        let TurnAdmission::Run {
-            key, mut journal, ..
-        } = uncertain
-            .admit_turn(
-                "remain uncertain",
-                Some(&target),
-                "possible",
-                false,
-                &cancellation,
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("new journal must be runnable");
-        };
-        uncertain
-            .mark_possible_dispatch(&key, &mut journal, &cancellation)
-            .await
-            .unwrap();
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-        uncertain.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
-        drop((first, uncertain));
-
-        let memory = MemoryStore::open(options).await.unwrap();
-        let mut resumed = Harness::new(
-            Config {
-                mode: Mode::Ifs,
-                provider: "demo".into(),
-                model: "demo".into(),
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            provider.clone(),
-            Some(&session),
-        )
-        .await
-        .unwrap();
-        resumed
-            .run_controlled(
-                "resume safely",
-                Some(&target),
-                "started",
-                &CancellationToken::new(),
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let data = kuru_memory::test_support::tempdir().unwrap();
+            let options = kuru_memory::test_support::warmed_open_options(
+                data.path().into(),
+                project_scope(project.path()).unwrap(),
             )
             .await
             .unwrap();
-        let sends = provider.calls.load(Ordering::SeqCst);
-        assert!(sends > 0);
-        let journal: TurnJournal = serde_json::from_value(
-            memory
-                .get(&resumed.turn_journal_key("started"))
-                .await
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(matches!(
-            journal.transitions.as_slice(),
-            [
-                TurnTransition::Started,
-                TurnTransition::Resumed,
-                TurnTransition::PossibleDispatch,
-                TurnTransition::Ended
-            ]
-        ));
-        assert_eq!(journal.admitted_transcript_row, Some(1));
-        assert_eq!(
-            resumed.history().await.unwrap(),
-            [user("resume safely"), assistant("durable answer")]
-        );
-        resumed.shutdown(false).await.unwrap();
-
-        let mut uncertain_resumed = Harness::new(
-            Config {
-                mode: Mode::Ifs,
-                provider: "demo".into(),
-                model: "demo".into(),
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            provider.clone(),
-            Some(&uncertain_session),
-        )
-        .await
-        .unwrap();
-        let error = uncertain_resumed
-            .run_controlled(
-                "remain uncertain",
-                Some(&target),
-                "possible",
-                &CancellationToken::new(),
+            let memory = MemoryStore::open(options.clone()).await.unwrap();
+            let provider = Arc::new(CountingProvider::default());
+            let mut first = Harness::new(
+                Config {
+                    mode: Mode::Ifs,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                provider.clone(),
+                None,
             )
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("may have reached external work"));
-        assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
-        assert_eq!(
-            uncertain_resumed.history().await.unwrap(),
-            [user("remain uncertain")]
-        );
-        let private = uncertain_resumed.memory_for(&target).await.unwrap();
-        assert_eq!(
-            private
-                .iter()
-                .map(|message| message.role.as_str())
-                .collect::<Vec<_>>(),
-            ["user", "assistant", "user", "assistant"]
-        );
-        uncertain_resumed.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
+            .unwrap();
+            let session = first.session.id.clone();
+            let target = first.topology.parts[0].id.clone();
+            let cancellation = CancellationToken::new();
+            let TurnAdmission::Run { .. } = first
+                .admit_turn(
+                    "resume safely",
+                    Some(&target),
+                    "started",
+                    false,
+                    &cancellation,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("new journal must be runnable");
+            };
+            let first_journal = decode_turn_journal(
+                memory
+                    .get(&first.turn_journal_key("started"))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(first_journal.admitted_transcript_row, Some(1));
+            first.shutdown(false).await.unwrap();
+            let mut uncertain = Harness::new(
+                Config {
+                    mode: Mode::Ifs,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                provider.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+            let uncertain_session = uncertain.session.id.clone();
+            let TurnAdmission::Run {
+                key, mut journal, ..
+            } = uncertain
+                .admit_turn(
+                    "remain uncertain",
+                    Some(&target),
+                    "possible",
+                    false,
+                    &cancellation,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("new journal must be runnable");
+            };
+            uncertain
+                .mark_possible_dispatch(&key, &mut journal, &cancellation)
+                .await
+                .unwrap();
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            uncertain.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+            drop((first, uncertain));
+
+            let memory = MemoryStore::open(options).await.unwrap();
+            let mut resumed = Harness::new(
+                Config {
+                    mode: Mode::Ifs,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                provider.clone(),
+                Some(&session),
+            )
+            .await
+            .unwrap();
+            resumed
+                .run_controlled(
+                    "resume safely",
+                    Some(&target),
+                    "started",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let sends = provider.calls.load(Ordering::SeqCst);
+            assert!(sends > 0);
+            let journal: TurnJournal = serde_json::from_value(
+                memory
+                    .get(&resumed.turn_journal_key("started"))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(matches!(
+                journal.transitions.as_slice(),
+                [
+                    TurnTransition::Started,
+                    TurnTransition::Resumed,
+                    TurnTransition::PossibleDispatch,
+                    TurnTransition::Ended
+                ]
+            ));
+            assert_eq!(journal.admitted_transcript_row, Some(1));
+            assert_eq!(
+                resumed.history().await.unwrap(),
+                [user("resume safely"), assistant("durable answer")]
+            );
+            resumed.shutdown(false).await.unwrap();
+
+            let mut uncertain_resumed = Harness::new(
+                Config {
+                    mode: Mode::Ifs,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                provider.clone(),
+                Some(&uncertain_session),
+            )
+            .await
+            .unwrap();
+            let error = uncertain_resumed
+                .run_controlled(
+                    "remain uncertain",
+                    Some(&target),
+                    "possible",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("may have reached external work"));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
+            assert_eq!(
+                uncertain_resumed.history().await.unwrap(),
+                [user("remain uncertain")]
+            );
+            let private = uncertain_resumed.memory_for(&target).await.unwrap();
+            assert_eq!(
+                private
+                    .iter()
+                    .map(|message| message.role.as_str())
+                    .collect::<Vec<_>>(),
+                ["user", "assistant", "user", "assistant"]
+            );
+            uncertain_resumed.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[tokio::test]
     async fn fork_resume_uses_the_typed_public_prefix_without_copying_raw_history() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let provider = Arc::new(CountingProvider::default());
-        let config = Config {
-            mode: Mode::Ifs,
-            provider: "demo".into(),
-            model: "demo".into(),
-            dream_every: 0,
-            dream_on_exit: false,
-            ..Config::default()
-        };
-        let mut parent = Harness::new(
-            config.clone(),
-            project.path(),
-            memory.clone(),
-            provider.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        let parent_id = parent.session.id.clone();
-        let target = parent.topology.parts[0].id.clone();
-        parent
-            .run_controlled(
-                "fork-parent-public-sentinel",
-                Some(&target),
-                "fork-parent-turn",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let parent_page = memory
-            .public_transcript_page(&parent_id, None, 16)
-            .await
-            .unwrap();
-        let PublicTranscriptEntry::Turn { record: selected } = &parent_page.records[0] else {
-            panic!("parent must have one settled public turn");
-        };
-        memory
-            .fork_session(
-                &parent_id,
-                parent.session.lifecycle_generation,
-                &selected.node_id,
-                "runtime-fork-child",
-                "runtime fork child",
-            )
-            .await
-            .unwrap();
-        let relation = parent
-            .relate(
-                RelationshipKind::Alliance,
-                parent.topology.parts[..2]
-                    .iter()
-                    .map(|part| part.id.clone())
-                    .collect(),
-            )
-            .await
-            .unwrap();
-        let actor_namespace = parent.checked_namespace(&target).unwrap();
-        let relation_namespace = parent.checked_namespace(&relation.id).unwrap();
-        for (namespace, sentinel) in [
-            (&actor_namespace, "parent-private-actor-only"),
-            (&relation_namespace, "parent-private-relationship-only"),
-        ] {
-            memory
-                .append_session_message(namespace, &parent_id, &Message::text("note", sentinel))
-                .await
-                .unwrap();
-            assert_eq!(
-                memory
-                    .session_history_window(namespace, "runtime-fork-child", 16)
-                    .await
-                    .unwrap()
-                    .total_rows,
-                0,
-                "fork inherited a raw private history row"
-            );
-        }
-        let shared_notes = format!("{}/notes", parent.checked_namespace(&target).unwrap());
-        memory
-            .append(
-                &shared_notes,
-                "note",
-                "current shared project note after fork",
-            )
-            .await
-            .unwrap();
-        parent.shutdown(false).await.unwrap();
-
-        let mut child = Harness::new(
-            config,
-            project.path(),
-            memory.clone(),
-            provider.clone(),
-            Some("runtime-fork-child"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(child.session.turns, 1);
-        assert_eq!(
-            child.session.last_completed_speaker.as_deref(),
-            Some(target.as_str())
-        );
-        assert!(
-            child
-                .notes_for(&target, 16)
-                .await
-                .unwrap()
-                .notes
-                .iter()
-                .any(|note| note.content == "current shared project note after fork")
-        );
-        assert!(child.history().await.unwrap().is_empty());
-        let active = child.sessions().await.unwrap();
-        assert!(
-            active
-                .iter()
-                .any(|record| record.catalog.session_id == parent_id)
-        );
-        assert!(
-            active
-                .iter()
-                .any(|record| record.catalog.session_id == "runtime-fork-child")
-        );
-        assert_eq!(
-            Harness::continuation_session(&memory, project.path())
-                .await
-                .unwrap(),
-            "runtime-fork-child"
-        );
-
-        let child_request_start = provider
-            .messages
-            .lock()
-            .expect("counting provider messages lock")
-            .len();
-        child
-            .run_controlled(
-                "fork-child-suffix",
-                Some(&target),
-                "fork-child-turn",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        {
-            let requests = provider
-                .messages
-                .lock()
-                .expect("counting provider messages lock");
-            assert!(requests.len() > child_request_start);
-            for messages in &requests[child_request_start..] {
-                let projected = serde_json::to_string(messages).unwrap();
-                assert!(!projected.contains("parent-private-actor-only"));
-                assert!(!projected.contains("parent-private-relationship-only"));
-            }
-        }
-        {
-            let requests = provider
-                .instructions
-                .lock()
-                .expect("counting provider instructions lock");
-            assert!(
-                requests
-                    .iter()
-                    .any(|request| request.contains("fork-parent-public-sentinel")),
-                "fork resume omitted its typed inherited public prefix"
-            );
-        }
-        assert_eq!(
-            child.history().await.unwrap(),
-            [user("fork-child-suffix"), assistant("durable answer")]
-        );
-        let child_page = memory
-            .public_transcript_page("runtime-fork-child", None, 16)
-            .await
-            .unwrap();
-        assert_eq!(child_page.records.len(), 2);
-        child.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn resume_rejects_a_catalog_change_before_reset_or_publication() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let mut harness = Harness::new(
-            Config {
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let provider = Arc::new(CountingProvider::default());
+            let config = Config {
                 mode: Mode::Ifs,
                 provider: "demo".into(),
                 model: "demo".into(),
                 dream_every: 0,
                 dream_on_exit: false,
                 ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            Arc::new(CountingProvider::default()),
-            None,
-        )
+            };
+            let mut parent = Harness::new(
+                config.clone(),
+                project.path(),
+                memory.clone(),
+                provider.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+            let parent_id = parent.session.id.clone();
+            let target = parent.topology.parts[0].id.clone();
+            parent
+                .run_controlled(
+                    "fork-parent-public-sentinel",
+                    Some(&target),
+                    "fork-parent-turn",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let parent_page = memory
+                .public_transcript_page(&parent_id, None, 16)
+                .await
+                .unwrap();
+            let PublicTranscriptEntry::Turn { record: selected } = &parent_page.records[0] else {
+                panic!("parent must have one settled public turn");
+            };
+            memory
+                .fork_session(
+                    &parent_id,
+                    parent.session.lifecycle_generation,
+                    &selected.node_id,
+                    "runtime-fork-child",
+                    "runtime fork child",
+                )
+                .await
+                .unwrap();
+            let relation = parent
+                .relate(
+                    RelationshipKind::Alliance,
+                    parent.topology.parts[..2]
+                        .iter()
+                        .map(|part| part.id.clone())
+                        .collect(),
+                )
+                .await
+                .unwrap();
+            let actor_namespace = parent.checked_namespace(&target).unwrap();
+            let relation_namespace = parent.checked_namespace(&relation.id).unwrap();
+            for (namespace, sentinel) in [
+                (&actor_namespace, "parent-private-actor-only"),
+                (&relation_namespace, "parent-private-relationship-only"),
+            ] {
+                memory
+                    .append_session_message(namespace, &parent_id, &Message::text("note", sentinel))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    memory
+                        .session_history_window(namespace, "runtime-fork-child", 16)
+                        .await
+                        .unwrap()
+                        .total_rows,
+                    0,
+                    "fork inherited a raw private history row"
+                );
+            }
+            let shared_notes = format!("{}/notes", parent.checked_namespace(&target).unwrap());
+            memory
+                .append(
+                    &shared_notes,
+                    "note",
+                    "current shared project note after fork",
+                )
+                .await
+                .unwrap();
+            parent.shutdown(false).await.unwrap();
+
+            let mut child = Harness::new(
+                config,
+                project.path(),
+                memory.clone(),
+                provider.clone(),
+                Some("runtime-fork-child"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(child.session.turns, 1);
+            assert_eq!(
+                child.session.last_completed_speaker.as_deref(),
+                Some(target.as_str())
+            );
+            assert!(
+                child
+                    .notes_for(&target, 16)
+                    .await
+                    .unwrap()
+                    .notes
+                    .iter()
+                    .any(|note| note.content == "current shared project note after fork")
+            );
+            assert!(child.history().await.unwrap().is_empty());
+            let active = child.sessions().await.unwrap();
+            assert!(
+                active
+                    .iter()
+                    .any(|record| record.catalog.session_id == parent_id)
+            );
+            assert!(
+                active
+                    .iter()
+                    .any(|record| record.catalog.session_id == "runtime-fork-child")
+            );
+            assert_eq!(
+                Harness::continuation_session(&memory, project.path())
+                    .await
+                    .unwrap(),
+                "runtime-fork-child"
+            );
+
+            let child_request_start = provider
+                .messages
+                .lock()
+                .expect("counting provider messages lock")
+                .len();
+            child
+                .run_controlled(
+                    "fork-child-suffix",
+                    Some(&target),
+                    "fork-child-turn",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            {
+                let requests = provider
+                    .messages
+                    .lock()
+                    .expect("counting provider messages lock");
+                assert!(requests.len() > child_request_start);
+                for messages in &requests[child_request_start..] {
+                    let projected = serde_json::to_string(messages).unwrap();
+                    assert!(!projected.contains("parent-private-actor-only"));
+                    assert!(!projected.contains("parent-private-relationship-only"));
+                }
+            }
+            {
+                let requests = provider
+                    .instructions
+                    .lock()
+                    .expect("counting provider instructions lock");
+                assert!(
+                    requests
+                        .iter()
+                        .any(|request| request.contains("fork-parent-public-sentinel")),
+                    "fork resume omitted its typed inherited public prefix"
+                );
+            }
+            assert_eq!(
+                child.history().await.unwrap(),
+                [user("fork-child-suffix"), assistant("durable answer")]
+            );
+            let child_page = memory
+                .public_transcript_page("runtime-fork-child", None, 16)
+                .await
+                .unwrap();
+            assert_eq!(child_page.records.len(), 2);
+            child.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
         .await
-        .unwrap();
-        let selected = harness.session.id.clone();
-        let operation = harness.operation_id.clone();
-        memory
-            .create_session("resume-race", Mode::Ifs, "captured")
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_a_catalog_change_before_reset_or_publication() {
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let mut harness = Harness::new(
+                Config {
+                    mode: Mode::Ifs,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                Arc::new(CountingProvider::default()),
+                None,
+            )
             .await
             .unwrap();
-        let (reached, release) = harness.pause_before_next_resume_publication();
-        let harness = Arc::new(tokio::sync::Mutex::new(harness));
-        let running = tokio::spawn({
-            let harness = harness.clone();
-            async move { harness.lock().await.resume_session("resume-race").await }
-        });
-        tokio::time::timeout(Duration::from_secs(10), reached)
-            .await
-            .unwrap()
-            .unwrap();
-        let renamed = memory
-            .rename_session("resume-race", 0, "advanced")
-            .await
-            .unwrap();
-        assert_eq!(renamed.lifecycle_generation, 1);
-        release.send(()).unwrap();
-        let error = running.await.unwrap().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("session catalog changed while resuming"),
-            "unexpected stale resume error: {error:#}"
-        );
-        let mut harness = harness.lock().await;
-        assert_eq!(harness.session.id, selected);
-        assert_eq!(harness.operation_id, operation);
-        assert_ne!(harness.session.id, "resume-race");
-        harness.shutdown(false).await.unwrap();
-        drop(harness);
-        memory.close().await.unwrap();
+            let selected = harness.session.id.clone();
+            let operation = harness.operation_id.clone();
+            memory
+                .create_session("resume-race", Mode::Ifs, "captured")
+                .await
+                .unwrap();
+            let (reached, release) = harness.pause_before_next_resume_publication();
+            let harness = Arc::new(tokio::sync::Mutex::new(harness));
+            let running = tokio::spawn({
+                let harness = harness.clone();
+                async move { harness.lock().await.resume_session("resume-race").await }
+            });
+            tokio::time::timeout(Duration::from_secs(10), reached)
+                .await
+                .unwrap()
+                .unwrap();
+            let renamed = memory
+                .rename_session("resume-race", 0, "advanced")
+                .await
+                .unwrap();
+            assert_eq!(renamed.lifecycle_generation, 1);
+            release.send(()).unwrap();
+            let error = running.await.unwrap().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("session catalog changed while resuming"),
+                "unexpected stale resume error: {error:#}"
+            );
+            let mut harness = harness.lock().await;
+            assert_eq!(harness.session.id, selected);
+            assert_eq!(harness.operation_id, operation);
+            assert_ne!(harness.session.id, "resume-race");
+            harness.shutdown(false).await.unwrap();
+            drop(harness);
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[tokio::test]
     async fn session_listing_rejects_a_catalog_change_during_projection() {
-        let project = tempfile::tempdir().unwrap();
-        let scope = project_scope(project.path()).unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        memory
-            .create_session("listing-race", Mode::Ifs, "captured")
-            .await
-            .unwrap();
-        let (reached_tx, reached) = oneshot::channel();
-        let (release, release_rx) = oneshot::channel();
-        let running = tokio::spawn({
-            let memory = memory.clone();
-            async move {
-                session_summaries_inner(
-                    &memory,
-                    &scope,
-                    Some(SessionLifecycleState::Active),
-                    Some(PublicationPause {
-                        reached: reached_tx,
-                        release: release_rx,
-                    }),
-                )
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let scope = project_scope(project.path()).unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            memory
+                .create_session("listing-race", Mode::Ifs, "captured")
                 .await
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(10), reached)
-            .await
-            .unwrap()
-            .unwrap();
-        memory
-            .rename_session("listing-race", 0, "advanced")
-            .await
-            .unwrap();
-        release.send(()).unwrap();
-        let error = running.await.unwrap().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("session catalog changed while its listing was assembled"),
-            "unexpected stale listing error: {error:#}"
-        );
-        memory.close().await.unwrap();
+                .unwrap();
+            let (reached_tx, reached) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            let running = tokio::spawn({
+                let memory = memory.clone();
+                async move {
+                    session_summaries_inner(
+                        &memory,
+                        &scope,
+                        Some(SessionLifecycleState::Active),
+                        Some(PublicationPause {
+                            reached: reached_tx,
+                            release: release_rx,
+                        }),
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(10), reached)
+                .await
+                .unwrap()
+                .unwrap();
+            memory
+                .rename_session("listing-race", 0, "advanced")
+                .await
+                .unwrap();
+            release.send(()).unwrap();
+            let error = running.await.unwrap().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("session catalog changed while its listing was assembled"),
+                "unexpected stale listing error: {error:#}"
+            );
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[tokio::test]
     async fn session_listing_rejects_a_new_session_after_its_catalog_page() {
-        let project = tempfile::tempdir().unwrap();
-        let scope = project_scope(project.path()).unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        memory
-            .create_session("first-listing", Mode::Ifs, "first")
-            .await
-            .unwrap();
-        let (reached_tx, reached) = oneshot::channel();
-        let (release, release_rx) = oneshot::channel();
-        let running = tokio::spawn({
-            let memory = memory.clone();
-            async move {
-                session_summaries_inner(
-                    &memory,
-                    &scope,
-                    Some(SessionLifecycleState::Active),
-                    Some(PublicationPause {
-                        reached: reached_tx,
-                        release: release_rx,
-                    }),
-                )
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let scope = project_scope(project.path()).unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            memory
+                .create_session("first-listing", Mode::Ifs, "first")
                 .await
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(10), reached)
-            .await
-            .unwrap()
-            .unwrap();
-        memory
-            .create_session("second-listing", Mode::Ifs, "second")
-            .await
-            .unwrap();
-        release.send(()).unwrap();
-        let error = running.await.unwrap().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("session catalog changed while its listing was assembled"),
-            "unexpected stale listing error: {error:#}"
-        );
-        memory.close().await.unwrap();
+                .unwrap();
+            let (reached_tx, reached) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            let running = tokio::spawn({
+                let memory = memory.clone();
+                async move {
+                    session_summaries_inner(
+                        &memory,
+                        &scope,
+                        Some(SessionLifecycleState::Active),
+                        Some(PublicationPause {
+                            reached: reached_tx,
+                            release: release_rx,
+                        }),
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(10), reached)
+                .await
+                .unwrap()
+                .unwrap();
+            memory
+                .create_session("second-listing", Mode::Ifs, "second")
+                .await
+                .unwrap();
+            release.send(()).unwrap();
+            let error = running.await.unwrap().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("session catalog changed while its listing was assembled"),
+                "unexpected stale listing error: {error:#}"
+            );
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[derive(Default)]
@@ -7035,296 +7077,311 @@ mod publication_tests {
 
     #[tokio::test]
     async fn provider_cancellation_is_durable_and_releases_the_actor_permit() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let provider = Arc::new(BlockingOnceProvider {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            started: Notify::new(),
-        });
-        let mut harness = Harness::new(
-            Config {
-                mode: Mode::Ifs,
-                provider: "demo".into(),
-                model: "demo".into(),
-                max_parallel: 1,
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            provider.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        let target = harness.topology.parts[0].id.clone();
-        let cancelled_before_admission = CancellationToken::new();
-        cancelled_before_admission.cancel();
-        assert!(turn_was_cancelled(
-            &harness
-                .run_controlled(
-                    "never admitted",
-                    None,
-                    "pre-admission",
-                    &cancelled_before_admission,
-                )
-                .await
-                .unwrap_err()
-        ));
-        assert!(harness.history().await.unwrap().is_empty());
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-        let cancellation = CancellationToken::new();
-        let cancel = cancellation.clone();
-        let started = provider.started.notified();
-        tokio::pin!(started);
-        let task = tokio::spawn(async move {
-            let mut harness = harness;
-            let result = harness
-                .run_controlled("interrupt me", None, "interrupted", &cancel)
-                .await;
-            (harness, result, target)
-        });
-        started.await;
-        cancellation.cancel();
-        let (mut harness, result, target) = task.await.unwrap();
-        assert!(turn_was_cancelled(&result.unwrap_err()));
-        assert_eq!(
-            harness.history().await.unwrap(),
-            [
-                user("interrupt me"),
-                Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT),
-            ]
-        );
-        let calls = provider.calls.load(Ordering::SeqCst);
-        assert_eq!(
-            calls, 1,
-            "waiting peers must stop before provider admission"
-        );
-        let retry = harness
-            .run_controlled(
-                "interrupt me",
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let provider = Arc::new(BlockingOnceProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                started: Notify::new(),
+            });
+            let mut harness = Harness::new(
+                Config {
+                    mode: Mode::Ifs,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    max_parallel: 1,
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                provider.clone(),
                 None,
-                "interrupted",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap_err();
-        assert!(retry.to_string().contains("may have reached external work"));
-        assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
-        harness
-            .run_controlled(
-                "next turn",
-                Some(&target),
-                "next",
-                &CancellationToken::new(),
             )
             .await
             .unwrap();
-        assert!(provider.calls.load(Ordering::SeqCst) > calls);
-        assert_eq!(
-            harness
-                .history()
+            let target = harness.topology.parts[0].id.clone();
+            let cancelled_before_admission = CancellationToken::new();
+            cancelled_before_admission.cancel();
+            assert!(turn_was_cancelled(
+                &harness
+                    .run_controlled(
+                        "never admitted",
+                        None,
+                        "pre-admission",
+                        &cancelled_before_admission,
+                    )
+                    .await
+                    .unwrap_err()
+            ));
+            assert!(harness.history().await.unwrap().is_empty());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            let cancellation = CancellationToken::new();
+            let cancel = cancellation.clone();
+            let started = provider.started.notified();
+            tokio::pin!(started);
+            let task = tokio::spawn(async move {
+                let mut harness = harness;
+                let result = harness
+                    .run_controlled("interrupt me", None, "interrupted", &cancel)
+                    .await;
+                (harness, result, target)
+            });
+            started.await;
+            cancellation.cancel();
+            let (mut harness, result, target) = task.await.unwrap();
+            assert!(turn_was_cancelled(&result.unwrap_err()));
+            assert_eq!(
+                harness.history().await.unwrap(),
+                [
+                    user("interrupt me"),
+                    Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT),
+                ]
+            );
+            let calls = provider.calls.load(Ordering::SeqCst);
+            assert_eq!(
+                calls, 1,
+                "waiting peers must stop before provider admission"
+            );
+            let retry = harness
+                .run_controlled(
+                    "interrupt me",
+                    None,
+                    "interrupted",
+                    &CancellationToken::new(),
+                )
                 .await
-                .unwrap()
-                .iter()
-                .filter(|message| message.role == INTERRUPTION_ROLE)
-                .count(),
-            1
-        );
-        harness.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
+                .unwrap_err();
+            assert!(retry.to_string().contains("may have reached external work"));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
+            harness
+                .run_controlled(
+                    "next turn",
+                    Some(&target),
+                    "next",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(provider.calls.load(Ordering::SeqCst) > calls);
+            assert_eq!(
+                harness
+                    .history()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|message| message.role == INTERRUPTION_ROLE)
+                    .count(),
+                1
+            );
+            harness.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[tokio::test]
     async fn ordinary_post_admission_failure_records_interruption_without_an_answer() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let mut harness = Harness::new(
-            Config {
-                mode: Mode::Freudian,
-                provider: "demo".into(),
-                model: "demo".into(),
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            Arc::new(FailingProvider),
-            None,
-        )
-        .await
-        .unwrap();
-        let target = harness.topology.parts[0].id.clone();
-        let error = harness
-            .run_controlled(
-                "retain failed prompt",
-                Some(&target),
-                "ordinary-failure",
-                &CancellationToken::new(),
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let mut harness = Harness::new(
+                Config {
+                    mode: Mode::Freudian,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                Arc::new(FailingProvider),
+                None,
             )
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("all peers failed"));
-        assert_eq!(
-            harness.history().await.unwrap(),
-            [
-                user("retain failed prompt"),
-                Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT),
-            ]
-        );
-        let provider_context = harness.public_context(&memory).await.unwrap();
-        assert!(!provider_context.contains(INTERRUPTION_ROLE));
-        assert!(!provider_context.contains(INTERRUPTION_TEXT));
-        let journal: TurnJournal = serde_json::from_value(
-            memory
-                .get(&harness.turn_journal_key("ordinary-failure"))
+            .unwrap();
+            let target = harness.topology.parts[0].id.clone();
+            let error = harness
+                .run_controlled(
+                    "retain failed prompt",
+                    Some(&target),
+                    "ordinary-failure",
+                    &CancellationToken::new(),
+                )
                 .await
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(matches!(
-            journal.transitions.as_slice(),
-            [
-                TurnTransition::Started,
-                TurnTransition::PossibleDispatch,
-                TurnTransition::Interrupted
-            ]
-        ));
-        assert!(journal.output.is_none());
-        harness.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
+                .unwrap_err();
+            assert!(error.to_string().contains("all peers failed"));
+            assert_eq!(
+                harness.history().await.unwrap(),
+                [
+                    user("retain failed prompt"),
+                    Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT),
+                ]
+            );
+            let provider_context = harness.public_context(&memory).await.unwrap();
+            assert!(!provider_context.contains(INTERRUPTION_ROLE));
+            assert!(!provider_context.contains(INTERRUPTION_TEXT));
+            let journal: TurnJournal = serde_json::from_value(
+                memory
+                    .get(&harness.turn_journal_key("ordinary-failure"))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(matches!(
+                journal.transitions.as_slice(),
+                [
+                    TurnTransition::Started,
+                    TurnTransition::PossibleDispatch,
+                    TurnTransition::Interrupted
+                ]
+            ));
+            assert!(journal.output.is_none());
+            harness.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[tokio::test]
     async fn accepted_ended_checkpoint_wins_cancellation_and_publication_error() {
-        let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
-        let mut harness = Harness::new(
-            Config {
-                mode: Mode::Freudian,
-                provider: "demo".into(),
-                model: "demo".into(),
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
-            },
-            project.path(),
-            memory.clone(),
-            Arc::new(DemoProvider),
-            None,
-        )
-        .await
-        .unwrap();
-        let target = harness.topology.parts[0].id.clone();
-        let mut events = harness.subscribe();
-        let (written, release) = harness.pause_after_next_memory_write();
-        let cancellation = CancellationToken::new();
-        let task_cancellation = cancellation.clone();
-        let task = tokio::spawn(async move {
-            let output = harness
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let mut harness = Harness::new(
+                Config {
+                    mode: Mode::Freudian,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                Arc::new(DemoProvider),
+                None,
+            )
+            .await
+            .unwrap();
+            let target = harness.topology.parts[0].id.clone();
+            let mut events = harness.subscribe();
+            let (written, release) = harness.pause_after_next_memory_write();
+            let cancellation = CancellationToken::new();
+            let task_cancellation = cancellation.clone();
+            let task = tokio::spawn(async move {
+                let output = harness
+                    .run_controlled(
+                        "the committed answer wins",
+                        Some(&target),
+                        "completion-race",
+                        &task_cancellation,
+                    )
+                    .await;
+                (harness, output, target)
+            });
+            written.await.unwrap();
+            cancellation.cancel();
+            drop(release);
+            let (mut harness, output, target) = task.await.unwrap();
+            let output = output.unwrap();
+            assert_eq!(harness.session.turns, 1);
+            assert_eq!(
+                harness.history().await.unwrap(),
+                [user("the committed answer wins"), assistant(&output.text)]
+            );
+            let stored_journal: TurnJournal = serde_json::from_value(
+                memory
+                    .get(&harness.turn_journal_key("completion-race"))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_vec(stored_journal.output.as_ref().unwrap()).unwrap(),
+                serde_json::to_vec(&output).unwrap()
+            );
+            assert_eq!(
+                memory
+                    .get(&format!(
+                        "{}/{}/topology",
+                        harness.scope, harness.session.mode
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                serde_json::to_value(&harness.topology).unwrap()
+            );
+            assert_eq!(
+                memory
+                    .get(&format!("{}/session/{}", harness.scope, harness.session.id))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                serde_json::to_value(&harness.session).unwrap()
+            );
+            let catalog = memory
+                .session_catalog_record(&harness.session.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(catalog.session_id, harness.session.id);
+            assert_eq!(
+                Harness::list_sessions(&memory, project.path())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|session| session.id == harness.session.id)
+                    .count(),
+                1
+            );
+            let mut observed_response = false;
+            while let Ok(event) = events.try_recv() {
+                if event.kind() == "response" {
+                    assert_eq!(event.detail(), "[response completed]");
+                    observed_response = true;
+                    break;
+                }
+            }
+            assert!(observed_response);
+            let retry = harness
                 .run_controlled(
                     "the committed answer wins",
                     Some(&target),
                     "completion-race",
-                    &task_cancellation,
+                    &CancellationToken::new(),
                 )
-                .await;
-            (harness, output, target)
-        });
-        written.await.unwrap();
-        cancellation.cancel();
-        drop(release);
-        let (mut harness, output, target) = task.await.unwrap();
-        let output = output.unwrap();
-        assert_eq!(harness.session.turns, 1);
-        assert_eq!(
-            harness.history().await.unwrap(),
-            [user("the committed answer wins"), assistant(&output.text)]
-        );
-        let stored_journal: TurnJournal = serde_json::from_value(
-            memory
-                .get(&harness.turn_journal_key("completion-race"))
                 .await
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            serde_json::to_vec(stored_journal.output.as_ref().unwrap()).unwrap(),
-            serde_json::to_vec(&output).unwrap()
-        );
-        assert_eq!(
-            memory
-                .get(&format!(
-                    "{}/{}/topology",
-                    harness.scope, harness.session.mode
-                ))
-                .await
-                .unwrap()
-                .unwrap(),
-            serde_json::to_value(&harness.topology).unwrap()
-        );
-        assert_eq!(
-            memory
-                .get(&format!("{}/session/{}", harness.scope, harness.session.id))
-                .await
-                .unwrap()
-                .unwrap(),
-            serde_json::to_value(&harness.session).unwrap()
-        );
-        let catalog = memory
-            .session_catalog_record(&harness.session.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(catalog.session_id, harness.session.id);
-        assert_eq!(
-            Harness::list_sessions(&memory, project.path())
-                .await
-                .unwrap()
-                .iter()
-                .filter(|session| session.id == harness.session.id)
-                .count(),
-            1
-        );
-        let mut observed_response = false;
-        while let Ok(event) = events.try_recv() {
-            if event.kind() == "response" {
-                assert_eq!(event.detail(), "[response completed]");
-                observed_response = true;
-                break;
-            }
-        }
-        assert!(observed_response);
-        let retry = harness
-            .run_controlled(
-                "the committed answer wins",
-                Some(&target),
-                "completion-race",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            serde_json::to_vec(&retry).unwrap(),
-            serde_json::to_vec(&output).unwrap()
-        );
-        assert_eq!(harness.history().await.unwrap().len(), 2);
-        harness.shutdown(false).await.unwrap();
-        memory.close().await.unwrap();
+                .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&retry).unwrap(),
+                serde_json::to_vec(&output).unwrap()
+            );
+            assert_eq!(harness.history().await.unwrap().len(), 2);
+            harness.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[tokio::test]
     async fn later_state_report_reconciles_prior_durable_publication() {
-        pending_before_next_mutation(false).await;
+        kuru_memory::test_support::closing(async {
+            pending_before_next_mutation(false).await;
+        })
+        .await
     }
 
     #[tokio::test]
     async fn turn_completion_reconciles_prior_durable_publication() {
-        pending_before_next_mutation(true).await;
+        kuru_memory::test_support::closing(async {
+            pending_before_next_mutation(true).await;
+        })
+        .await
     }
 
     async fn pending_before_next_mutation(finalize: bool) {
@@ -7695,89 +7752,96 @@ mod model_catalog_tests {
 
     #[tokio::test]
     async fn failed_model_catalog_is_retried_and_warned_once_per_session() {
-        install_catalog_warning_recorder();
-        let model = "catalog-retry-model";
-        let (harness, provider, memory, _project) =
-            flaky_catalog_harness(model, 2, Duration::ZERO).await;
-        let calls = || provider.model_calls.load(Ordering::SeqCst);
+        kuru_memory::test_support::closing(async {
+            install_catalog_warning_recorder();
+            let model = "catalog-retry-model";
+            let (harness, provider, memory, _project) =
+                flaky_catalog_harness(model, 2, Duration::ZERO).await;
+            let calls = || provider.model_calls.load(Ordering::SeqCst);
 
-        // A failed listing: the lookup proceeds with the fallback metadata.
-        let metadata = harness.selected_model_metadata().await.unwrap();
-        assert_eq!(
-            metadata.context_window_tokens, None,
-            "a failed listing falls back to the assumed context window"
-        );
-        assert_eq!(calls(), 1);
-        // Within the retry delay the fallback is reused without listing.
-        let metadata = harness.selected_model_metadata().await.unwrap();
-        assert_eq!(metadata.context_window_tokens, None);
-        assert_eq!(calls(), 1, "a lookup inside the retry delay must not list");
+            // A failed listing: the lookup proceeds with the fallback metadata.
+            let metadata = harness.selected_model_metadata().await.unwrap();
+            assert_eq!(
+                metadata.context_window_tokens, None,
+                "a failed listing falls back to the assumed context window"
+            );
+            assert_eq!(calls(), 1);
+            // Within the retry delay the fallback is reused without listing.
+            let metadata = harness.selected_model_metadata().await.unwrap();
+            assert_eq!(metadata.context_window_tokens, None);
+            assert_eq!(calls(), 1, "a lookup inside the retry delay must not list");
 
-        // After the delay the listing is retried; a second failure falls back.
-        expire_catalog_retry_delay(&harness);
-        let metadata = harness.selected_model_metadata().await.unwrap();
-        assert_eq!(metadata.context_window_tokens, None);
-        assert_eq!(calls(), 2);
+            // After the delay the listing is retried; a second failure falls back.
+            expire_catalog_retry_delay(&harness);
+            let metadata = harness.selected_model_metadata().await.unwrap();
+            assert_eq!(metadata.context_window_tokens, None);
+            assert_eq!(calls(), 2);
 
-        expire_catalog_retry_delay(&harness);
-        assert_eq!(
-            harness
-                .selected_model_metadata()
-                .await
-                .unwrap()
-                .context_window_tokens,
-            Some(kuru_core::Sourced::advertised(ADVERTISED_CONTEXT)),
-            "the listing after the failures must reach the real catalog"
-        );
-        assert_eq!(calls(), 3);
-        // The successful listing is cached for the rest of the session.
-        harness.context_budget().await.unwrap();
-        assert_eq!(calls(), 3);
+            expire_catalog_retry_delay(&harness);
+            assert_eq!(
+                harness
+                    .selected_model_metadata()
+                    .await
+                    .unwrap()
+                    .context_window_tokens,
+                Some(kuru_core::Sourced::advertised(ADVERTISED_CONTEXT)),
+                "the listing after the failures must reach the real catalog"
+            );
+            assert_eq!(calls(), 3);
+            // The successful listing is cached for the rest of the session.
+            harness.context_budget().await.unwrap();
+            assert_eq!(calls(), 3);
 
-        let warnings = catalog_warnings(model);
-        assert_eq!(
-            warnings.len(),
-            1,
-            "a provider down for several calls warns once per session: {warnings:?}"
-        );
-        assert!(
-            warnings[0].contains("catalog endpoint unavailable (attempt 1)"),
-            "the warning carries the first failure: {warnings:?}"
-        );
-        memory.close().await.unwrap();
+            let warnings = catalog_warnings(model);
+            assert_eq!(
+                warnings.len(),
+                1,
+                "a provider down for several calls warns once per session: {warnings:?}"
+            );
+            assert!(
+                warnings[0].contains("catalog endpoint unavailable (attempt 1)"),
+                "the warning carries the first failure: {warnings:?}"
+            );
+            memory.close().await.unwrap();
+        })
+        .await
     }
 
     #[tokio::test]
     async fn concurrent_lookups_share_one_slow_failed_listing() {
-        install_catalog_warning_recorder();
-        let model = "catalog-concurrent-model";
-        let delay = Duration::from_millis(200);
-        let (harness, provider, memory, _project) = flaky_catalog_harness(model, 1, delay).await;
-        let calls = || provider.model_calls.load(Ordering::SeqCst);
+        kuru_memory::test_support::closing(async {
+            install_catalog_warning_recorder();
+            let model = "catalog-concurrent-model";
+            let delay = Duration::from_millis(200);
+            let (harness, provider, memory, _project) =
+                flaky_catalog_harness(model, 1, delay).await;
+            let calls = || provider.model_calls.load(Ordering::SeqCst);
 
-        // Actor asks look up metadata concurrently; one slow failure must not
-        // be repeated serially by every caller queued behind it.
-        let lookups =
-            futures::future::join_all((0..4).map(|_| harness.selected_model_metadata())).await;
-        assert_eq!(calls(), 1, "concurrent lookups make one listing per window");
-        for metadata in lookups {
-            assert_eq!(metadata.unwrap().context_window_tokens, None);
-        }
-        // The next lookup inside the window still does not list.
-        harness.selected_model_metadata().await.unwrap();
-        assert_eq!(calls(), 1);
+            // Actor asks look up metadata concurrently; one slow failure must not
+            // be repeated serially by every caller queued behind it.
+            let lookups =
+                futures::future::join_all((0..4).map(|_| harness.selected_model_metadata())).await;
+            assert_eq!(calls(), 1, "concurrent lookups make one listing per window");
+            for metadata in lookups {
+                assert_eq!(metadata.unwrap().context_window_tokens, None);
+            }
+            // The next lookup inside the window still does not list.
+            harness.selected_model_metadata().await.unwrap();
+            assert_eq!(calls(), 1);
 
-        expire_catalog_retry_delay(&harness);
-        let lookups =
-            futures::future::join_all((0..4).map(|_| harness.selected_model_metadata())).await;
-        for metadata in lookups {
-            assert_eq!(
-                metadata.unwrap().context_window_tokens,
-                Some(kuru_core::Sourced::advertised(ADVERTISED_CONTEXT))
-            );
-        }
-        assert_eq!(calls(), 2, "the recovered listing is made once and cached");
-        assert_eq!(catalog_warnings(model).len(), 1);
-        memory.close().await.unwrap();
+            expire_catalog_retry_delay(&harness);
+            let lookups =
+                futures::future::join_all((0..4).map(|_| harness.selected_model_metadata())).await;
+            for metadata in lookups {
+                assert_eq!(
+                    metadata.unwrap().context_window_tokens,
+                    Some(kuru_core::Sourced::advertised(ADVERTISED_CONTEXT))
+                );
+            }
+            assert_eq!(calls(), 2, "the recovered listing is made once and cached");
+            assert_eq!(catalog_warnings(model).len(), 1);
+            memory.close().await.unwrap();
+        })
+        .await
     }
 }

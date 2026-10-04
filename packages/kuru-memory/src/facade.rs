@@ -1418,6 +1418,17 @@ impl MemoryStore {
         store::MemoryStore::exists(data_dir, project_scope)
     }
 
+    /// A newly opened local store. Under test support, an active
+    /// [`crate::test_support::closing`] scope on this thread retains it and
+    /// closes it when the test body ends; otherwise this is the identity.
+    fn opened(self) -> Self {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Backend::Local(store) = &self.backend {
+            crate::test_support::closing::register(store.server_for_teardown());
+        }
+        self
+    }
+
     /// Existing direct local opens remain usable by isolated fixtures and
     /// explicit maintenance. A direct open consults no service authority: the
     /// project store lock is held only while a store starts, so it does not
@@ -1434,7 +1445,8 @@ impl MemoryStore {
             backend: Backend::Local(store::MemoryStore::open(options).await?),
             #[cfg(any(test, feature = "test-support"))]
             reject_next_state_write: Arc::new(AtomicBool::new(false)),
-        })
+        }
+        .opened())
     }
 
     pub fn open_observed(
@@ -1449,7 +1461,8 @@ impl MemoryStore {
                 backend: Backend::Local(opening.await?),
                 #[cfg(any(test, feature = "test-support"))]
                 reject_next_state_write: Arc::new(AtomicBool::new(false)),
-            })
+            }
+            .opened())
         })
     }
 
@@ -1478,7 +1491,8 @@ impl MemoryStore {
                             backend: Backend::Local(local),
                             #[cfg(any(test, feature = "test-support"))]
                             reject_next_state_write: Arc::new(AtomicBool::new(false)),
-                        });
+                        }
+                        .opened());
                     }
                 }
             } else {
@@ -1566,7 +1580,8 @@ impl MemoryStore {
         Ok(Self {
             backend: Backend::Local(store::MemoryStore::temporary().await?),
             reject_next_state_write: Arc::new(AtomicBool::new(false)),
-        })
+        }
+        .opened())
     }
 
     /// Isolated test store created by a complete cold open; see
@@ -1576,7 +1591,8 @@ impl MemoryStore {
         Ok(Self {
             backend: Backend::Local(store::MemoryStore::temporary_cold().await?),
             reject_next_state_write: Arc::new(AtomicBool::new(false)),
-        })
+        }
+        .opened())
     }
 
     pub fn usage_ledger(&self) -> Result<UsageLedger> {

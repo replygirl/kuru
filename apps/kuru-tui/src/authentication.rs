@@ -102,45 +102,48 @@ mod tests {
 
     #[tokio::test]
     async fn desktop_handoff_reports_failure_and_keeps_a_running_browser_alive() {
-        // Held across each spawn; see `crate::spawn_gate`.
-        let failed = {
-            let _gate = crate::spawn_gate::spawning().await;
-            tokio::process::Command::new("/bin/sh")
-                .args(["-c", "exit 7"])
-                .spawn()
-                .unwrap()
-        };
-        assert!(
-            browser_handoff(failed, Duration::from_secs(2))
-                .await
-                .is_err()
-        );
+        kuru_memory::test_support::closing(async {
+            // Held across each spawn; see `crate::spawn_gate`.
+            let failed = {
+                let _gate = crate::spawn_gate::spawning().await;
+                tokio::process::Command::new("/bin/sh")
+                    .args(["-c", "exit 7"])
+                    .spawn()
+                    .unwrap()
+            };
+            assert!(
+                browser_handoff(failed, Duration::from_secs(2))
+                    .await
+                    .is_err()
+            );
 
-        let directory = tempfile::tempdir().unwrap();
-        let marker = directory.path().join("browser-alive");
-        let running = {
-            let _gate = crate::spawn_gate::spawning().await;
-            tokio::process::Command::new("/bin/sh")
-                .args([
-                    "-c",
-                    "sleep 0.1; printf desktop > \"$1\"",
-                    "browser-fixture",
-                ])
-                .arg(&marker)
-                .spawn()
-                .unwrap()
-        };
-        browser_handoff(running, Duration::from_millis(5))
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("browser-alive");
+            let running = {
+                let _gate = crate::spawn_gate::spawning().await;
+                tokio::process::Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "sleep 0.1; printf desktop > \"$1\"",
+                        "browser-fixture",
+                    ])
+                    .arg(&marker)
+                    .spawn()
+                    .unwrap()
+            };
+            browser_handoff(running, Duration::from_millis(5))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while std::fs::read_to_string(&marker).ok().as_deref() != Some("desktop") {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while std::fs::read_to_string(&marker).ok().as_deref() != Some("desktop") {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            assert_eq!(std::fs::read_to_string(marker).unwrap(), "desktop");
         })
         .await
-        .unwrap();
-        assert_eq!(std::fs::read_to_string(marker).unwrap(), "desktop");
     }
 }
 

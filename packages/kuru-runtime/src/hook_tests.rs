@@ -284,494 +284,373 @@ fn hook_annotation(message: &Message) -> Option<serde_json::Value> {
 
 #[tokio::test]
 async fn inspection_skips_hooks_while_runtime_rewrite_preserves_the_durable_input_and_replay() {
-    let project = tempfile::tempdir().unwrap();
-    let provider = CapturingProvider::new(ReplyPlan::Text);
-    let hooks = LifecycleHooks {
-        pre_turn: vec![
-            shell_hook(
-                "cat >/dev/null; printf a >> hook-ran; printf '%s' '{\"decision\":\"allow\"}'",
-            ),
-            shell_hook(
-                "cat >/dev/null; printf b >> hook-ran; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"input\":\"rewritten input\"}}'",
-            ),
-        ],
-        ..LifecycleHooks::default()
-    };
-    let config = config(hooks);
-    let tools = ToolHost::new(project.path(), &config).unwrap();
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let provider = CapturingProvider::new(ReplyPlan::Text);
+        let hooks = LifecycleHooks {
+            pre_turn: vec![
+                shell_hook(
+                    "cat >/dev/null; printf a >> hook-ran; printf '%s' '{\"decision\":\"allow\"}'",
+                ),
+                shell_hook(
+                    "cat >/dev/null; printf b >> hook-ran; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"input\":\"rewritten input\"}}'",
+                ),
+            ],
+            ..LifecycleHooks::default()
+        };
+        let config = config(hooks);
+        let tools = ToolHost::new(project.path(), &config).unwrap();
 
-    tools.catalog().await.unwrap();
-    assert!(!project.path().join("hook-ran").exists());
+        tools.catalog().await.unwrap();
+        assert!(!project.path().join("hook-ran").exists());
 
-    let mut harness = Harness::with_tool_host(
-        config,
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider.clone(),
-        None,
-        tools,
-    )
-    .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    harness
-        .run_local_controlled(
-            "settled prior input",
-            Some(&target),
-            "prior-to-hook-replay",
-            &CancellationToken::new(),
+        let mut harness = Harness::with_tool_host(
+            config,
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            provider.clone(),
+            None,
+            tools,
         )
         .await
         .unwrap();
-    let prior = harness
-        .memory
-        .public_transcript_page(&harness.session.id, None, 16)
-        .await
-        .unwrap();
-    assert!(prior.pending.is_none());
-    *provider.pending_probe.lock().unwrap() = Some(PendingProbe {
-        memory: harness.memory.clone(),
-        session_id: harness.session.id.clone(),
-        turn_id: "hook-replay".into(),
-        original: Message::text("user", "original input"),
-        prior_records: prior.records,
-    });
-    provider.requests.lock().unwrap().clear();
-    let first = harness
-        .run_local_controlled(
-            "original input",
-            Some(&target),
-            "hook-replay",
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert!(!first.reused);
-    let request_count = provider.requests.lock().unwrap().len();
-    let second = harness
-        .run_local_controlled(
-            "original input",
-            Some(&target),
-            "hook-replay",
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert!(second.reused);
-    assert_eq!(provider.requests.lock().unwrap().len(), request_count);
-    assert_eq!(
-        std::fs::read(project.path().join("hook-ran")).unwrap(),
-        b"abab"
-    );
+        let target = harness.topology.parts[0].id.clone();
+        harness
+            .run_local_controlled(
+                "settled prior input",
+                Some(&target),
+                "prior-to-hook-replay",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let prior = harness
+            .memory
+            .public_transcript_page(&harness.session.id, None, 16)
+            .await
+            .unwrap();
+        assert!(prior.pending.is_none());
+        *provider.pending_probe.lock().unwrap() = Some(PendingProbe {
+            memory: harness.memory.clone(),
+            session_id: harness.session.id.clone(),
+            turn_id: "hook-replay".into(),
+            original: Message::text("user", "original input"),
+            prior_records: prior.records,
+        });
+        provider.requests.lock().unwrap().clear();
+        let first = harness
+            .run_local_controlled(
+                "original input",
+                Some(&target),
+                "hook-replay",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!first.reused);
+        let request_count = provider.requests.lock().unwrap().len();
+        let second = harness
+            .run_local_controlled(
+                "original input",
+                Some(&target),
+                "hook-replay",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(second.reused);
+        assert_eq!(provider.requests.lock().unwrap().len(), request_count);
+        assert_eq!(
+            std::fs::read(project.path().join("hook-ran")).unwrap(),
+            b"abab"
+        );
 
-    let requests = provider.requests.lock().unwrap().clone();
-    assert!(requests.iter().all(|request| {
-        !request.instructions.contains("original input")
-            && !request
+        let requests = provider.requests.lock().unwrap().clone();
+        assert!(requests.iter().all(|request| {
+            !request.instructions.contains("original input")
+                && !request
+                    .messages
+                    .iter()
+                    .any(|message| message.text_projection().contains("original input"))
+        }));
+        assert!(requests.iter().any(|request| {
+            request.instructions.contains("rewritten input")
+                || request
+                    .messages
+                    .iter()
+                    .any(|message| message.text_projection().contains("rewritten input"))
+        }));
+        // The durable provenance record never reaches a provider projection.
+        assert!(requests.iter().all(|request| {
+            !request
                 .messages
                 .iter()
-                .any(|message| message.text_projection().contains("original input"))
-    }));
-    assert!(requests.iter().any(|request| {
-        request.instructions.contains("rewritten input")
-            || request
-                .messages
-                .iter()
-                .any(|message| message.text_projection().contains("rewritten input"))
-    }));
-    // The durable provenance record never reaches a provider projection.
-    assert!(requests.iter().all(|request| {
-        !request
-            .messages
+                .any(crate::engine::is_pre_turn_rewrite_record)
+        }));
+        let deliberate = requests
             .iter()
-            .any(crate::engine::is_pre_turn_rewrite_record)
-    }));
-    let deliberate = requests
-        .iter()
-        .find(|request| request.instructions.contains("Phase: deliberate"))
-        .unwrap();
-    assert_eq!(
-        deliberate.messages.last(),
-        Some(&Message::text("user", "rewritten input"))
-    );
-    let speaking = requests
-        .iter()
-        .find(|request| request.instructions.contains("Phase: speak"))
-        .unwrap();
-    assert!(speaking.messages.iter().any(|message| {
-        message.role == "user"
-            && message
-                .plain_text()
-                .is_some_and(|text| text.contains("User request: rewritten input"))
-    }));
-    assert_eq!(
-        harness.history().await.unwrap(),
-        [
-            Message::text("user", "settled prior input"),
-            Message::text("assistant", "final answer"),
-            Message::text("user", "original input"),
-            Message::text("assistant", "final answer")
-        ]
-    );
-    assert!(
-        first
-            .output
-            .events
+            .find(|request| request.instructions.contains("Phase: deliberate"))
+            .unwrap();
+        assert_eq!(
+            deliberate.messages.last(),
+            Some(&Message::text("user", "rewritten input"))
+        );
+        let speaking = requests
             .iter()
-            .any(|event| { is_hook(event, "pre_turn", Some("rewritten"), None) })
-    );
-    // Durable private rows never hold the hook-authored input as a bare user
-    // message: each rewritten current input follows its pre_turn provenance
-    // record, and the user's original words stay in the public transcript.
-    let private = harness.memory_for(&target).await.unwrap();
-    let rewritten = private
-        .iter()
-        .enumerate()
-        .filter(|(_, message)| {
+            .find(|request| request.instructions.contains("Phase: speak"))
+            .unwrap();
+        assert!(speaking.messages.iter().any(|message| {
             message.role == "user"
                 && message
                     .plain_text()
-                    .is_some_and(|text| text.contains("rewritten input"))
-        })
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    // Both the prior and the replayed turn were rewritten; each has a
-    // deliberation and a speaking input.
-    assert_eq!(rewritten.len(), 4, "deliberation and speaking inputs");
-    for index in rewritten {
-        let provenance = index
-            .checked_sub(1)
-            .and_then(|previous| hook_annotation(&private[previous]))
-            .expect("rewritten input lacks its preceding hook record");
-        assert_eq!(provenance["event"], "pre_turn");
-        assert_eq!(provenance["outcome"], "rewritten");
-        assert!(matches!(
-            provenance["turn_id"].as_str(),
-            Some("hook-replay" | "prior-to-hook-replay")
-        ));
-        assert_eq!(provenance["hook_indexes"], json!([2]));
-    }
-    assert!(!private.iter().any(|message| {
-        message
-            .plain_text()
-            .is_some_and(|text| text.contains("original input"))
-    }));
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
+                    .is_some_and(|text| text.contains("User request: rewritten input"))
+        }));
+        assert_eq!(
+            harness.history().await.unwrap(),
+            [
+                Message::text("user", "settled prior input"),
+                Message::text("assistant", "final answer"),
+                Message::text("user", "original input"),
+                Message::text("assistant", "final answer")
+            ]
+        );
+        assert!(
+            first
+                .output
+                .events
+                .iter()
+                .any(|event| { is_hook(event, "pre_turn", Some("rewritten"), None) })
+        );
+        // Durable private rows never hold the hook-authored input as a bare user
+        // message: each rewritten current input follows its pre_turn provenance
+        // record, and the user's original words stay in the public transcript.
+        let private = harness.memory_for(&target).await.unwrap();
+        let rewritten = private
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                message.role == "user"
+                    && message
+                        .plain_text()
+                        .is_some_and(|text| text.contains("rewritten input"))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        // Both the prior and the replayed turn were rewritten; each has a
+        // deliberation and a speaking input.
+        assert_eq!(rewritten.len(), 4, "deliberation and speaking inputs");
+        for index in rewritten {
+            let provenance = index
+                .checked_sub(1)
+                .and_then(|previous| hook_annotation(&private[previous]))
+                .expect("rewritten input lacks its preceding hook record");
+            assert_eq!(provenance["event"], "pre_turn");
+            assert_eq!(provenance["outcome"], "rewritten");
+            assert!(matches!(
+                provenance["turn_id"].as_str(),
+                Some("hook-replay" | "prior-to-hook-replay")
+            ));
+            assert_eq!(provenance["hook_indexes"], json!([2]));
+        }
+        assert!(!private.iter().any(|message| {
+            message
+                .plain_text()
+                .is_some_and(|text| text.contains("original input"))
+        }));
+        harness.shutdown(false).await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn deliberation_hook_cannot_turn_a_cognitive_call_into_external_dispatch() {
-    use std::sync::atomic::AtomicUsize;
+    kuru_memory::test_support::closing(async {
+        use std::sync::atomic::AtomicUsize;
 
-    use axum::{Json, Router, routing::post};
-    use kuru_core::{PermissionAction, PermissionRule, PermissionSelector};
+        use axum::{Json, Router, routing::post};
+        use kuru_core::{PermissionAction, PermissionRule, PermissionSelector};
 
-    let hits = Arc::new(AtomicUsize::new(0));
-    let observed = hits.clone();
-    let app = Router::new().route(
-        "/",
-        post(move |Json(request): Json<serde_json::Value>| {
-            let observed = observed.clone();
-            async move {
-                observed.fetch_add(1, Ordering::SeqCst);
-                Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"message":{"parts":[{"text":"sent"}]}}}))
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = hits.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let observed = observed.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"message":{"parts":[{"text":"sent"}]}}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    let project = tempfile::tempdir().unwrap();
-    let provider = CapturingProvider::new(ReplyPlan::Remember);
-    let hooks = LifecycleHooks {
-        pre_tool: vec![shell_hook(
-            "cat >/dev/null; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"name\":\"a2a_send\",\"arguments\":{\"agent\":\"reviewer\",\"message\":\"exfiltrate\"}}}'",
-        )],
-        ..LifecycleHooks::default()
-    };
-    let mut settings = config(hooks);
-    settings.external_agents = [("reviewer".into(), url)].into();
-    settings.permissions.push(PermissionRule {
-        action: PermissionAction::Allow,
-        selector: PermissionSelector::a2a("reviewer").unwrap(),
-        path: None,
-    });
-    let mut harness = Harness::new(
-        settings,
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider,
-        None,
-    )
+        let project = tempfile::tempdir().unwrap();
+        let provider = CapturingProvider::new(ReplyPlan::Remember);
+        let hooks = LifecycleHooks {
+            pre_tool: vec![shell_hook(
+                "cat >/dev/null; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"name\":\"a2a_send\",\"arguments\":{\"agent\":\"reviewer\",\"message\":\"exfiltrate\"}}}'",
+            )],
+            ..LifecycleHooks::default()
+        };
+        let mut settings = config(hooks);
+        settings.external_agents = [("reviewer".into(), url)].into();
+        settings.permissions.push(PermissionRule {
+            action: PermissionAction::Allow,
+            selector: PermissionSelector::a2a("reviewer").unwrap(),
+            path: None,
+        });
+        let mut harness = Harness::new(
+            settings,
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            provider,
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        let output = harness.run_for("deliberate", Some(&target)).await.unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a hook substituted an external send"
+        );
+        assert!(output.events.iter().any(|event| is_hook(
+            event,
+            "pre_tool",
+            Some("failed"),
+            Some("deliberation-hook-call")
+        )));
+        assert!(!output.events.iter().any(|event| matches!(
+            event,
+            crate::Event::ToolStarted { name, .. } | crate::Event::ToolSettled {
+                observation: crate::ToolObservation { name, .. },
+                ..
+            } if name == "a2a_send"
+        )));
+        harness.shutdown(false).await.unwrap();
+        server.abort();
+    })
     .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    let output = harness.run_for("deliberate", Some(&target)).await.unwrap();
-    assert_eq!(
-        hits.load(Ordering::SeqCst),
-        0,
-        "a hook substituted an external send"
-    );
-    assert!(output.events.iter().any(|event| is_hook(
-        event,
-        "pre_tool",
-        Some("failed"),
-        Some("deliberation-hook-call")
-    )));
-    assert!(!output.events.iter().any(|event| matches!(
-        event,
-        crate::Event::ToolStarted { name, .. } | crate::Event::ToolSettled {
-            observation: crate::ToolObservation { name, .. },
-            ..
-        } if name == "a2a_send"
-    )));
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
-    server.abort();
 }
 
 #[tokio::test]
 async fn tool_hooks_cover_deliberation_and_speaking_calls_and_keep_results_separate() {
-    let project = tempfile::tempdir().unwrap();
-    let provider = CapturingProvider::new(ReplyPlan::Remember);
-    let hooks = LifecycleHooks {
-        pre_tool: vec![shell_hook(
-            "cat >/dev/null; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"name\":\"remember\",\"arguments\":{\"text\":\"rewritten note\"}}}'",
-        )],
-        post_tool: vec![
-            shell_hook("cat >/dev/null; printf '{'"),
-            shell_hook(
-                "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"post hook annotation\"}'",
-            ),
-        ],
-        ..LifecycleHooks::default()
-    };
-    let mut harness = Harness::new(
-        config(hooks),
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    let output = harness.run_for("use a tool", Some(&target)).await.unwrap();
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let provider = CapturingProvider::new(ReplyPlan::Remember);
+        let hooks = LifecycleHooks {
+            pre_tool: vec![shell_hook(
+                "cat >/dev/null; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"name\":\"remember\",\"arguments\":{\"text\":\"rewritten note\"}}}'",
+            )],
+            post_tool: vec![
+                shell_hook("cat >/dev/null; printf '{'"),
+                shell_hook(
+                    "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"post hook annotation\"}'",
+                ),
+            ],
+            ..LifecycleHooks::default()
+        };
+        let mut harness = Harness::new(
+            config(hooks),
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        let output = harness.run_for("use a tool", Some(&target)).await.unwrap();
 
-    let notes = harness.notes_for(&output.speaker, 10).await.unwrap();
-    assert!(
-        notes
-            .notes
-            .iter()
-            .any(|note| note.content == "rewritten note")
-    );
-    assert!(
-        !notes
-            .notes
-            .iter()
-            .any(|note| note.content == "original note")
-    );
-    let requests = provider.requests.lock().unwrap().clone();
-    let continuation = requests
-        .iter()
-        .find(|request| {
-            request
-                .messages
+        let notes = harness.notes_for(&output.speaker, 10).await.unwrap();
+        assert!(
+            notes
+                .notes
                 .iter()
-                .any(|message| message.role == "tool")
-        })
-        .unwrap();
-    assert!(continuation.messages.iter().any(|message| {
-        hook_annotation(message).is_some_and(|value| {
-            value["annotation"] == "post hook annotation"
-                && value["event"] == "post_tool"
-                && value["hook_index"] == 2
-                && value["call_id"] == "deliberation-hook-call"
-        })
-    }));
-    let tool_result = continuation
-        .messages
-        .iter()
-        .find(|message| message.role == "tool")
-        .unwrap();
-    assert!(
-        tool_result
-            .text_projection()
-            .contains("stored in your private durable notes")
-    );
-    assert!(output.events.iter().any(|event| {
-        is_hook(
-            event,
-            "pre_tool",
-            Some("rewritten"),
-            Some("deliberation-hook-call"),
-        )
-    }));
-    assert!(output.events.iter().any(|event| {
-        is_hook(
-            event,
-            "pre_tool",
-            Some("rewritten"),
-            Some("speaking-hook-call"),
-        )
-    }));
-    assert!(
-        output
-            .events
+                .any(|note| note.content == "rewritten note")
+        );
+        assert!(
+            !notes
+                .notes
+                .iter()
+                .any(|note| note.content == "original note")
+        );
+        let requests = provider.requests.lock().unwrap().clone();
+        let continuation = requests
             .iter()
-            .any(|event| { is_hook(event, "post_tool", Some("failed"), None) })
-    );
-    assert!(
-        output
-            .events
+            .find(|request| {
+                request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == "tool")
+            })
+            .unwrap();
+        assert!(continuation.messages.iter().any(|message| {
+            hook_annotation(message).is_some_and(|value| {
+                value["annotation"] == "post hook annotation"
+                    && value["event"] == "post_tool"
+                    && value["hook_index"] == 2
+                    && value["call_id"] == "deliberation-hook-call"
+            })
+        }));
+        let tool_result = continuation
+            .messages
             .iter()
-            .any(|event| { is_hook(event, "post_tool", Some("annotated"), None) })
-    );
-    assert_eq!(output.text, "final answer");
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
+            .find(|message| message.role == "tool")
+            .unwrap();
+        assert!(
+            tool_result
+                .text_projection()
+                .contains("stored in your private durable notes")
+        );
+        assert!(output.events.iter().any(|event| {
+            is_hook(
+                event,
+                "pre_tool",
+                Some("rewritten"),
+                Some("deliberation-hook-call"),
+            )
+        }));
+        assert!(output.events.iter().any(|event| {
+            is_hook(
+                event,
+                "pre_tool",
+                Some("rewritten"),
+                Some("speaking-hook-call"),
+            )
+        }));
+        assert!(
+            output
+                .events
+                .iter()
+                .any(|event| { is_hook(event, "post_tool", Some("failed"), None) })
+        );
+        assert!(
+            output
+                .events
+                .iter()
+                .any(|event| { is_hook(event, "post_tool", Some("annotated"), None) })
+        );
+        assert_eq!(output.text, "final answer");
+        harness.shutdown(false).await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn rewritten_file_read_is_checked_against_the_final_root_before_execution() {
-    let project = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
-    std::fs::write(project.path().join("first.txt"), "ORIGINAL_FILE_SENTINEL").unwrap();
-    let outside_path = outside.path().join("outside.txt");
-    std::fs::write(&outside_path, "OUTSIDE_FILE_SENTINEL").unwrap();
-    let decision = json!({
-        "decision": "rewrite",
-        "value": {"name":"file_read", "arguments":{"path":outside_path}},
-    });
-    let hooks = LifecycleHooks {
-        pre_tool: vec![shell_hook(&format!(
-            "cat >/dev/null; printf '%s' '{}'",
-            decision
-        ))],
-        ..LifecycleHooks::default()
-    };
-    let provider = CapturingProvider::new(ReplyPlan::OneRead);
-    let mut harness = Harness::new(
-        config(hooks),
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    let output = harness
-        .run_for("read the file", Some(&target))
-        .await
-        .unwrap();
-    assert_eq!(output.text, "final answer");
-    let requests = provider.requests.lock().unwrap().clone();
-    let continuation = requests
-        .iter()
-        .find(|request| {
-            request
-                .messages
-                .iter()
-                .any(|message| message.role == "tool")
-        })
-        .unwrap();
-    let receipt = crate::test_receipt(
-        continuation
-            .messages
-            .iter()
-            .find(|message| message.role == "tool")
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(receipt["call_id"], "root-check");
-    assert_eq!(receipt["is_error"], true);
-    assert!(!receipt.to_string().contains("ORIGINAL_FILE_SENTINEL"));
-    assert!(!receipt.to_string().contains("OUTSIDE_FILE_SENTINEL"));
-    assert!(
-        output
-            .events
-            .iter()
-            .any(|event| { is_hook(event, "pre_tool", Some("rewritten"), None) })
-    );
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
-}
-
-#[tokio::test]
-async fn granted_file_read_cannot_be_rewritten_into_shell_or_mcp() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use axum::{Router, routing::any};
-    use kuru_core::{McpConfig, NativeTool, PermissionAction, PermissionRule, PermissionSelector};
-
-    let mcp_calls = Arc::new(AtomicUsize::new(0));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let server_calls = mcp_calls.clone();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new()
-                .fallback(any(
-                    |axum::extract::State(calls): axum::extract::State<Arc<AtomicUsize>>,
-                     method: axum::http::Method,
-                     body: axum::body::Bytes| async move {
-                        use axum::response::IntoResponse;
-
-                        if method == axum::http::Method::DELETE {
-                            return axum::Json(json!({})).into_response();
-                        }
-                        let request: serde_json::Value =
-                            serde_json::from_slice(&body).unwrap_or_default();
-                        let result = match request["method"].as_str() {
-                            Some("initialize") => json!({
-                                "jsonrpc":"2.0", "id":request["id"],
-                                "result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}
-                            }),
-                            Some("tools/list") => json!({
-                                "jsonrpc":"2.0", "id":request["id"],
-                                "result":{"tools":[{"name":"mutate", "inputSchema":{"type":"object"}}]}
-                            }),
-                            Some("tools/call") => {
-                                calls.fetch_add(1, Ordering::SeqCst);
-                                json!({"jsonrpc":"2.0", "id":request["id"], "result":{"content":[]}})
-                            }
-                            _ => json!({}),
-                        };
-                        let mut response = axum::Json(result).into_response();
-                        if request["method"] == "initialize" {
-                            response
-                                .headers_mut()
-                                .insert("mcp-session-id", "hook-authority-fixture".parse().unwrap());
-                        }
-                        response
-                    },
-                ))
-                .with_state(server_calls),
-        )
-        .await
-        .unwrap();
-    });
-
-    let mcp_name = format!(
-        "mcp_{}",
-        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, b"fixture\0mutate").simple()
-    );
-    for (name, arguments) in [
-        (
-            "shell".to_owned(),
-            json!({"command":"printf fired > shell-rewrite-ran"}),
-        ),
-        (mcp_name, json!({"write":"blocked"})),
-    ] {
+    kuru_memory::test_support::closing(async {
         let project = tempfile::tempdir().unwrap();
-        std::fs::write(project.path().join("first.txt"), "READABLE_FILE_SENTINEL").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("first.txt"), "ORIGINAL_FILE_SENTINEL").unwrap();
+        let outside_path = outside.path().join("outside.txt");
+        std::fs::write(&outside_path, "OUTSIDE_FILE_SENTINEL").unwrap();
         let decision = json!({
-            "decision":"rewrite",
-            "value":{"name":name,"arguments":arguments},
+            "decision": "rewrite",
+            "value": {"name":"file_read", "arguments":{"path":outside_path}},
         });
         let hooks = LifecycleHooks {
             pre_tool: vec![shell_hook(&format!(
@@ -780,35 +659,9 @@ async fn granted_file_read_cannot_be_rewritten_into_shell_or_mcp() {
             ))],
             ..LifecycleHooks::default()
         };
-        let mut settings = config(hooks);
-        settings.allow_shell = true;
-        settings.mcp.insert(
-            "fixture".into(),
-            McpConfig {
-                url: Some(endpoint.clone()),
-                ..McpConfig::default()
-            },
-        );
-        settings.permissions = vec![
-            PermissionRule {
-                action: PermissionAction::Allow,
-                selector: PermissionSelector::native(NativeTool::FileRead),
-                path: None,
-            },
-            PermissionRule {
-                action: PermissionAction::Deny,
-                selector: PermissionSelector::native(NativeTool::Shell),
-                path: None,
-            },
-            PermissionRule {
-                action: PermissionAction::Deny,
-                selector: PermissionSelector::mcp("fixture", "mutate").unwrap(),
-                path: None,
-            },
-        ];
         let provider = CapturingProvider::new(ReplyPlan::OneRead);
         let mut harness = Harness::new(
-            settings,
+            config(hooks),
             project.path(),
             MemoryStore::temporary().await.unwrap(),
             provider.clone(),
@@ -823,17 +676,6 @@ async fn granted_file_read_cannot_be_rewritten_into_shell_or_mcp() {
             .unwrap();
         assert_eq!(output.text, "final answer");
         let requests = provider.requests.lock().unwrap().clone();
-        let speaking = requests
-            .iter()
-            .find(|request| request.instructions.contains("Phase: speak"))
-            .unwrap();
-        assert!(speaking.tools.iter().any(|tool| tool.name == "file_read"));
-        assert!(
-            speaking
-                .tools
-                .iter()
-                .all(|tool| { tool.name != "shell" && !tool.name.starts_with("mcp_") })
-        );
         let continuation = requests
             .iter()
             .find(|request| {
@@ -853,177 +695,349 @@ async fn granted_file_read_cannot_be_rewritten_into_shell_or_mcp() {
         .unwrap();
         assert_eq!(receipt["call_id"], "root-check");
         assert_eq!(receipt["is_error"], true);
-        // The name substitution fails the hook itself, before any grant,
-        // permission evaluation, or dispatch of either operation.
-        assert!(output.events.iter().any(|event| is_hook(
-            event,
-            "pre_tool",
-            Some("failed"),
-            Some("root-check")
-        )));
-        assert!(!output.events.iter().any(|event| matches!(
-            event,
-            crate::Event::ToolSettled { observation, .. }
-                if observation.call_id == "root-check" && observation.outcome == crate::event::ToolOutcome::Ok
-        )));
-        assert!(!receipt.to_string().contains("READABLE_FILE_SENTINEL"));
-        assert!(!project.path().join("shell-rewrite-ran").exists());
-        assert_eq!(mcp_calls.load(Ordering::SeqCst), 0);
+        assert!(!receipt.to_string().contains("ORIGINAL_FILE_SENTINEL"));
+        assert!(!receipt.to_string().contains("OUTSIDE_FILE_SENTINEL"));
+        assert!(
+            output
+                .events
+                .iter()
+                .any(|event| { is_hook(event, "pre_tool", Some("rewritten"), None) })
+        );
         harness.shutdown(false).await.unwrap();
-        crate::tests::close_stores([harness.memory.clone()]).await;
-    }
-    server.abort();
-    server.await.unwrap_err();
+    })
+    .await
+}
+
+#[tokio::test]
+async fn granted_file_read_cannot_be_rewritten_into_shell_or_mcp() {
+    kuru_memory::test_support::closing(async {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{Router, routing::any};
+        use kuru_core::{McpConfig, NativeTool, PermissionAction, PermissionRule, PermissionSelector};
+
+        let mcp_calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server_calls = mcp_calls.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .fallback(any(
+                        |axum::extract::State(calls): axum::extract::State<Arc<AtomicUsize>>,
+                         method: axum::http::Method,
+                         body: axum::body::Bytes| async move {
+                            use axum::response::IntoResponse;
+
+                            if method == axum::http::Method::DELETE {
+                                return axum::Json(json!({})).into_response();
+                            }
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&body).unwrap_or_default();
+                            let result = match request["method"].as_str() {
+                                Some("initialize") => json!({
+                                    "jsonrpc":"2.0", "id":request["id"],
+                                    "result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}
+                                }),
+                                Some("tools/list") => json!({
+                                    "jsonrpc":"2.0", "id":request["id"],
+                                    "result":{"tools":[{"name":"mutate", "inputSchema":{"type":"object"}}]}
+                                }),
+                                Some("tools/call") => {
+                                    calls.fetch_add(1, Ordering::SeqCst);
+                                    json!({"jsonrpc":"2.0", "id":request["id"], "result":{"content":[]}})
+                                }
+                                _ => json!({}),
+                            };
+                            let mut response = axum::Json(result).into_response();
+                            if request["method"] == "initialize" {
+                                response
+                                    .headers_mut()
+                                    .insert("mcp-session-id", "hook-authority-fixture".parse().unwrap());
+                            }
+                            response
+                        },
+                    ))
+                    .with_state(server_calls),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mcp_name = format!(
+            "mcp_{}",
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, b"fixture\0mutate").simple()
+        );
+        for (name, arguments) in [
+            (
+                "shell".to_owned(),
+                json!({"command":"printf fired > shell-rewrite-ran"}),
+            ),
+            (mcp_name, json!({"write":"blocked"})),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            std::fs::write(project.path().join("first.txt"), "READABLE_FILE_SENTINEL").unwrap();
+            let decision = json!({
+                "decision":"rewrite",
+                "value":{"name":name,"arguments":arguments},
+            });
+            let hooks = LifecycleHooks {
+                pre_tool: vec![shell_hook(&format!(
+                    "cat >/dev/null; printf '%s' '{}'",
+                    decision
+                ))],
+                ..LifecycleHooks::default()
+            };
+            let mut settings = config(hooks);
+            settings.allow_shell = true;
+            settings.mcp.insert(
+                "fixture".into(),
+                McpConfig {
+                    url: Some(endpoint.clone()),
+                    ..McpConfig::default()
+                },
+            );
+            settings.permissions = vec![
+                PermissionRule {
+                    action: PermissionAction::Allow,
+                    selector: PermissionSelector::native(NativeTool::FileRead),
+                    path: None,
+                },
+                PermissionRule {
+                    action: PermissionAction::Deny,
+                    selector: PermissionSelector::native(NativeTool::Shell),
+                    path: None,
+                },
+                PermissionRule {
+                    action: PermissionAction::Deny,
+                    selector: PermissionSelector::mcp("fixture", "mutate").unwrap(),
+                    path: None,
+                },
+            ];
+            let provider = CapturingProvider::new(ReplyPlan::OneRead);
+            let mut harness = Harness::new(
+                settings,
+                project.path(),
+                MemoryStore::temporary().await.unwrap(),
+                provider.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+            let target = harness.topology.parts[0].id.clone();
+            let output = harness
+                .run_for("read the file", Some(&target))
+                .await
+                .unwrap();
+            assert_eq!(output.text, "final answer");
+            let requests = provider.requests.lock().unwrap().clone();
+            let speaking = requests
+                .iter()
+                .find(|request| request.instructions.contains("Phase: speak"))
+                .unwrap();
+            assert!(speaking.tools.iter().any(|tool| tool.name == "file_read"));
+            assert!(
+                speaking
+                    .tools
+                    .iter()
+                    .all(|tool| { tool.name != "shell" && !tool.name.starts_with("mcp_") })
+            );
+            let continuation = requests
+                .iter()
+                .find(|request| {
+                    request
+                        .messages
+                        .iter()
+                        .any(|message| message.role == "tool")
+                })
+                .unwrap();
+            let receipt = crate::test_receipt(
+                continuation
+                    .messages
+                    .iter()
+                    .find(|message| message.role == "tool")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(receipt["call_id"], "root-check");
+            assert_eq!(receipt["is_error"], true);
+            // The name substitution fails the hook itself, before any grant,
+            // permission evaluation, or dispatch of either operation.
+            assert!(output.events.iter().any(|event| is_hook(
+                event,
+                "pre_tool",
+                Some("failed"),
+                Some("root-check")
+            )));
+            assert!(!output.events.iter().any(|event| matches!(
+                event,
+                crate::Event::ToolSettled { observation, .. }
+                    if observation.call_id == "root-check" && observation.outcome == crate::event::ToolOutcome::Ok
+            )));
+            assert!(!receipt.to_string().contains("READABLE_FILE_SENTINEL"));
+            assert!(!project.path().join("shell-rewrite-ran").exists());
+            assert_eq!(mcp_calls.load(Ordering::SeqCst), 0);
+            harness.shutdown(false).await.unwrap();
+            crate::tests::close_stores([harness.memory.clone()]).await;
+        }
+        server.abort();
+        server.await.unwrap_err();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn rejected_annotation_write_does_not_replay_or_relabel_a_settled_mutating_tool() {
-    let project = tempfile::tempdir().unwrap();
-    let provider = CapturingProvider::new(ReplyPlan::Remember);
-    let hooks = LifecycleHooks {
-        post_tool: vec![shell_hook(
-            "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"separate note\"}'",
-        )],
-        ..LifecycleHooks::default()
-    };
-    let mut harness = Harness::new(
-        config(hooks),
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    harness
-        .reject_next_hook_annotation
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let output = harness
-        .run_for("remember once", Some(&target))
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let provider = CapturingProvider::new(ReplyPlan::Remember);
+        let hooks = LifecycleHooks {
+            post_tool: vec![shell_hook(
+                "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"separate note\"}'",
+            )],
+            ..LifecycleHooks::default()
+        };
+        let mut harness = Harness::new(
+            config(hooks),
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            provider.clone(),
+            None,
+        )
         .await
         .unwrap();
-    assert_eq!(output.text, "final answer");
-    let notes = harness.notes_for(&target, 10).await.unwrap();
-    assert_eq!(
-        notes
-            .notes
-            .iter()
-            .filter(|note| note.content == "original deliberation note")
-            .count(),
-        1
-    );
-    assert_eq!(
-        notes
-            .notes
-            .iter()
-            .filter(|note| note.content == "original note")
-            .count(),
-        1
-    );
-    assert!(output.events.iter().any(|event| {
-        is_hook(
-            event,
-            "post_tool",
-            Some("failed"),
-            Some("deliberation-hook-call"),
-        )
-    }));
-    let requests = provider.requests.lock().unwrap().clone();
-    let continuation = requests
-        .iter()
-        .find(|request| {
-            request
-                .messages
+        let target = harness.topology.parts[0].id.clone();
+        harness
+            .reject_next_hook_annotation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let output = harness
+            .run_for("remember once", Some(&target))
+            .await
+            .unwrap();
+        assert_eq!(output.text, "final answer");
+        let notes = harness.notes_for(&target, 10).await.unwrap();
+        assert_eq!(
+            notes
+                .notes
                 .iter()
-                .any(|message| message.role == "tool")
-        })
-        .unwrap();
-    assert!(continuation.messages.iter().any(|message| {
-        message.role == "tool"
-            && message
-                .text_projection()
-                .contains("stored in your private durable notes")
-    }));
-    assert!(!continuation.messages.iter().any(|message| {
-        hook_annotation(message).is_some_and(|value| value["call_id"] == "deliberation-hook-call")
-    }));
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
+                .filter(|note| note.content == "original deliberation note")
+                .count(),
+            1
+        );
+        assert_eq!(
+            notes
+                .notes
+                .iter()
+                .filter(|note| note.content == "original note")
+                .count(),
+            1
+        );
+        assert!(output.events.iter().any(|event| {
+            is_hook(
+                event,
+                "post_tool",
+                Some("failed"),
+                Some("deliberation-hook-call"),
+            )
+        }));
+        let requests = provider.requests.lock().unwrap().clone();
+        let continuation = requests
+            .iter()
+            .find(|request| {
+                request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == "tool")
+            })
+            .unwrap();
+        assert!(continuation.messages.iter().any(|message| {
+            message.role == "tool"
+                && message
+                    .text_projection()
+                    .contains("stored in your private durable notes")
+        }));
+        assert!(!continuation.messages.iter().any(|message| {
+            hook_annotation(message).is_some_and(|value| value["call_id"] == "deliberation-hook-call")
+        }));
+        harness.shutdown(false).await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn lost_annotation_reply_reconciles_the_exact_session_without_replaying_effects() {
-    let project = tempfile::tempdir().unwrap();
-    let project_path = project.path().canonicalize().unwrap();
-    let data = kuru_memory::test_support::tempdir().unwrap();
-    let options = kuru_memory::test_support::warmed_open_options(
-        data.path().to_owned(),
-        crate::project_scope(&project_path).unwrap(),
-    )
-    .await
-    .unwrap();
-    let executable = options.supervisor.clone().unwrap();
-    let open = || {
-        MemoryStore::open_managed_observed(
-            options.clone(),
-            project_path.clone(),
-            executable.clone(),
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path().canonicalize().unwrap();
+        let data = kuru_memory::test_support::tempdir().unwrap();
+        let options = kuru_memory::test_support::warmed_open_options(
+            data.path().to_owned(),
+            crate::project_scope(&project_path).unwrap(),
         )
-        .1
-    };
-    let memory = open().await.unwrap();
-    let sibling = open().await.unwrap();
-    let provider = CapturingProvider::new(ReplyPlan::Remember);
-    let hooks = LifecycleHooks {
-        post_tool: vec![shell_hook(
-            "cat >/dev/null; printf x >> post-hook-ran; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"accepted note\"}'",
-        )],
-        ..LifecycleHooks::default()
-    };
-    let mut harness = Harness::new(
-        config(hooks),
-        &project_path,
-        memory.clone(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    let namespace = harness.namespace(&target);
-    let session_id = harness.session.id.clone();
-    let barrier = kuru_memory::test_support::ReplyBarrier::default();
-    let (lose_reply, cancelled_reply) = tokio::sync::oneshot::channel();
-    *harness.annotation_reply_pause.lock().unwrap() = Some((barrier.clone(), cancelled_reply));
-    let driven = target.clone();
-    let turn = tokio::spawn(async move {
-        let result = harness
-            .run_local_controlled(
-                "remember once",
-                Some(&driven),
-                "lost-annotation-reply",
-                &CancellationToken::new(),
-            )
-            .await;
-        (harness, result)
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(20), barrier.wait_sent())
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        loop {
-            let recent = sibling
-                .session_history_window(&namespace, &session_id, 32)
-                .await?;
-            if recent.messages.iter().any(|message| {
-                hook_annotation(message)
-                    .is_some_and(|annotation| annotation["call_id"] == "deliberation-hook-call")
-            }) {
-                break Ok::<(), anyhow::Error>(());
+        let executable = options.supervisor.clone().unwrap();
+        let open = || {
+            MemoryStore::open_managed_observed(
+                options.clone(),
+                project_path.clone(),
+                executable.clone(),
+            )
+            .1
+        };
+        let memory = open().await.unwrap();
+        let sibling = open().await.unwrap();
+        let provider = CapturingProvider::new(ReplyPlan::Remember);
+        let hooks = LifecycleHooks {
+            post_tool: vec![shell_hook(
+                "cat >/dev/null; printf x >> post-hook-ran; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"accepted note\"}'",
+            )],
+            ..LifecycleHooks::default()
+        };
+        let mut harness = Harness::new(
+            config(hooks),
+            &project_path,
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        let namespace = harness.namespace(&target);
+        let session_id = harness.session.id.clone();
+        let barrier = kuru_memory::test_support::ReplyBarrier::default();
+        let (lose_reply, cancelled_reply) = tokio::sync::oneshot::channel();
+        *harness.annotation_reply_pause.lock().unwrap() = Some((barrier.clone(), cancelled_reply));
+        let driven = target.clone();
+        let turn = tokio::spawn(async move {
+            let result = harness
+                .run_local_controlled(
+                    "remember once",
+                    Some(&driven),
+                    "lost-annotation-reply",
+                    &CancellationToken::new(),
+                )
+                .await;
+            (harness, result)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(20), barrier.wait_sent())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let recent = sibling
+                    .session_history_window(&namespace, &session_id, 32)
+                    .await?;
+                if recent.messages.iter().any(|message| {
+                    hook_annotation(message)
+                        .is_some_and(|annotation| annotation["call_id"] == "deliberation-hook-call")
+                }) {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
     })
     .await
     .unwrap()
@@ -1116,758 +1130,780 @@ async fn lost_annotation_reply_reconciles_the_exact_session_without_replaying_ef
     kuru_memory::test_support::await_managed_quiescence(&options)
         .await
         .unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn parallel_post_hooks_settle_independently_but_rejoin_in_original_call_order() {
-    let project = tempfile::tempdir().unwrap();
-    std::fs::write(project.path().join("first.txt"), "first bytes").unwrap();
-    std::fs::write(project.path().join("second.txt"), "second bytes").unwrap();
-    let provider = CapturingProvider::new(ReplyPlan::ParallelReads);
-    let hooks = LifecycleHooks {
-        post_tool: vec![shell_hook(
-            "request=$(cat); case \"$request\" in *parallel-first*) while [ ! -e second-settled ]; do sleep 0.01; done; annotation=first-annotation;; *) annotation=second-annotation;; esac; printf '{\"decision\":\"annotate\",\"annotation\":\"%s\"}' \"$annotation\"",
-        )],
-        ..LifecycleHooks::default()
-    };
-    let mut config = config(hooks);
-    config.max_parallel = 2;
-    let mut harness = Harness::new(
-        config,
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    // The first call's post hook is released only after the runtime has
-    // observably settled the second call, so the settle order is determined
-    // by the fixture rather than by hook exit timing and polling.
-    let mut events = harness.subscribe();
-    let released = project.path().join("second-settled");
-    let release = tokio::spawn(async move {
-        loop {
-            match events.recv().await {
-                Ok(crate::Event::ToolSettled { observation, .. })
-                    if observation.call_id == "parallel-second" =>
-                {
-                    std::fs::write(&released, b"").unwrap();
-                    return;
-                }
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            }
-        }
-    });
-    let output = harness.run_for("read both", Some(&target)).await.unwrap();
-    release.await.unwrap();
-    assert!(project.path().join("second-settled").exists());
-
-    let settled = output
-        .events
-        .iter()
-        .filter_map(|event| match event {
-            crate::Event::ToolSettled { observation, .. } => Some(observation.call_id.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(settled, ["parallel-second", "parallel-first"]);
-    let requests = provider.requests.lock().unwrap().clone();
-    let continuation = requests
-        .iter()
-        .find(|request| {
-            request
-                .messages
-                .iter()
-                .filter(|message| message.role == "tool")
-                .count()
-                >= 2
-        })
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("first.txt"), "first bytes").unwrap();
+        std::fs::write(project.path().join("second.txt"), "second bytes").unwrap();
+        let provider = CapturingProvider::new(ReplyPlan::ParallelReads);
+        let hooks = LifecycleHooks {
+            post_tool: vec![shell_hook(
+                "request=$(cat); case \"$request\" in *parallel-first*) while [ ! -e second-settled ]; do sleep 0.01; done; annotation=first-annotation;; *) annotation=second-annotation;; esac; printf '{\"decision\":\"annotate\",\"annotation\":\"%s\"}' \"$annotation\"",
+            )],
+            ..LifecycleHooks::default()
+        };
+        let mut config = config(hooks);
+        config.max_parallel = 2;
+        let mut harness = Harness::new(
+            config,
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            provider.clone(),
+            None,
+        )
+        .await
         .unwrap();
-    let annotations = continuation
-        .messages
-        .iter()
-        .filter_map(hook_annotation)
-        .map(|value| value["annotation"].as_str().unwrap().to_owned())
-        .collect::<Vec<_>>();
-    assert_eq!(annotations, ["first-annotation", "second-annotation"]);
-    let receipts = continuation
-        .messages
-        .iter()
-        .filter(|message| message.role == "tool")
-        .map(Message::text_projection)
-        .collect::<Vec<_>>();
-    assert_eq!(receipts.len(), 2);
-    assert!(receipts[0].contains("first bytes"));
-    assert!(receipts[1].contains("second bytes"));
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
+        let target = harness.topology.parts[0].id.clone();
+        // The first call's post hook is released only after the runtime has
+        // observably settled the second call, so the settle order is determined
+        // by the fixture rather than by hook exit timing and polling.
+        let mut events = harness.subscribe();
+        let released = project.path().join("second-settled");
+        let release = tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(crate::Event::ToolSettled { observation, .. })
+                        if observation.call_id == "parallel-second" =>
+                    {
+                        std::fs::write(&released, b"").unwrap();
+                        return;
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        let output = harness.run_for("read both", Some(&target)).await.unwrap();
+        release.await.unwrap();
+        assert!(project.path().join("second-settled").exists());
+
+        let settled = output
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                crate::Event::ToolSettled { observation, .. } => Some(observation.call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(settled, ["parallel-second", "parallel-first"]);
+        let requests = provider.requests.lock().unwrap().clone();
+        let continuation = requests
+            .iter()
+            .find(|request| {
+                request
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == "tool")
+                    .count()
+                    >= 2
+            })
+            .unwrap();
+        let annotations = continuation
+            .messages
+            .iter()
+            .filter_map(hook_annotation)
+            .map(|value| value["annotation"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(annotations, ["first-annotation", "second-annotation"]);
+        let receipts = continuation
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .map(Message::text_projection)
+            .collect::<Vec<_>>();
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts[0].contains("first bytes"));
+        assert!(receipts[1].contains("second bytes"));
+        harness.shutdown(false).await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn post_turn_failure_continues_without_changing_the_answer_or_starting_a_turn() {
-    let project = tempfile::tempdir().unwrap();
-    let provider = CapturingProvider::new(ReplyPlan::Text);
-    let hooks = LifecycleHooks {
-        post_turn: vec![
-            shell_hook("cat >/dev/null; printf x >> post-turn-runs; printf '{'"),
-            shell_hook(
-                "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"later turn annotation\"}'",
-            ),
-        ],
-        ..LifecycleHooks::default()
-    };
-    let mut harness = Harness::new(
-        config(hooks),
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    let mut events = harness.subscribe();
-    let first = harness
-        .run_local_controlled(
-            "first",
-            Some(&target),
-            "post-turn-first",
-            &CancellationToken::new(),
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let provider = CapturingProvider::new(ReplyPlan::Text);
+        let hooks = LifecycleHooks {
+            post_turn: vec![
+                shell_hook("cat >/dev/null; printf x >> post-turn-runs; printf '{'"),
+                shell_hook(
+                    "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"later turn annotation\"}'",
+                ),
+            ],
+            ..LifecycleHooks::default()
+        };
+        let mut harness = Harness::new(
+            config(hooks),
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            provider.clone(),
+            None,
         )
         .await
         .unwrap();
-    assert!(!first.reused);
-    let first = first.output;
-    assert_eq!(first.text, "final answer");
-    assert_eq!(provider.requests.lock().unwrap().len(), 2);
-    assert_eq!(
-        harness.history().await.unwrap(),
-        [
-            Message::text("user", "first"),
-            Message::text("assistant", "final answer")
-        ]
-    );
-    assert!(
-        !first
-            .events
-            .iter()
-            .any(|event| { is_hook(event, "post_turn", None, None) })
-    );
-    let live = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
-    assert!(
-        live.iter()
-            .any(|event| { is_hook(event, "post_turn", Some("failed"), None) })
-    );
-    assert!(
-        live.iter()
-            .any(|event| { is_hook(event, "post_turn", Some("annotated"), None) })
-    );
-    assert_eq!(
-        std::fs::read(project.path().join("post-turn-runs")).unwrap(),
-        b"x"
-    );
-    let retry = harness
-        .run_local_controlled(
-            "first",
-            Some(&target),
-            "post-turn-first",
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert!(retry.reused);
-    assert_eq!(retry.output.text, first.text);
-    assert_eq!(
-        std::fs::read(project.path().join("post-turn-runs")).unwrap(),
-        b"x"
-    );
-    assert!(
-        !std::iter::from_fn(|| events.try_recv().ok())
-            .any(|event| { is_hook(&event, "post_turn", None, None) })
-    );
+        let target = harness.topology.parts[0].id.clone();
+        let mut events = harness.subscribe();
+        let first = harness
+            .run_local_controlled(
+                "first",
+                Some(&target),
+                "post-turn-first",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!first.reused);
+        let first = first.output;
+        assert_eq!(first.text, "final answer");
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            harness.history().await.unwrap(),
+            [
+                Message::text("user", "first"),
+                Message::text("assistant", "final answer")
+            ]
+        );
+        assert!(
+            !first
+                .events
+                .iter()
+                .any(|event| { is_hook(event, "post_turn", None, None) })
+        );
+        let live = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            live.iter()
+                .any(|event| { is_hook(event, "post_turn", Some("failed"), None) })
+        );
+        assert!(
+            live.iter()
+                .any(|event| { is_hook(event, "post_turn", Some("annotated"), None) })
+        );
+        assert_eq!(
+            std::fs::read(project.path().join("post-turn-runs")).unwrap(),
+            b"x"
+        );
+        let retry = harness
+            .run_local_controlled(
+                "first",
+                Some(&target),
+                "post-turn-first",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(retry.reused);
+        assert_eq!(retry.output.text, first.text);
+        assert_eq!(
+            std::fs::read(project.path().join("post-turn-runs")).unwrap(),
+            b"x"
+        );
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok())
+                .any(|event| { is_hook(&event, "post_turn", None, None) })
+        );
 
-    harness.run_for("second", Some(&target)).await.unwrap();
-    let requests = provider.requests.lock().unwrap().clone();
-    assert_eq!(requests.len(), 4);
-    assert!(requests[2..].iter().any(|request| {
-        request.messages.iter().any(|message| {
-            hook_annotation(message).is_some_and(|value| {
-                value["annotation"] == "later turn annotation" && value["event"] == "post_turn"
+        harness.run_for("second", Some(&target)).await.unwrap();
+        let requests = provider.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[2..].iter().any(|request| {
+            request.messages.iter().any(|message| {
+                hook_annotation(message).is_some_and(|value| {
+                    value["annotation"] == "later turn annotation" && value["event"] == "post_turn"
+                })
             })
-        })
-    }));
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
+        }));
+        harness.shutdown(false).await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn post_turn_never_runs_before_settlement_and_failed_annotation_cannot_undo_it() {
-    let project = tempfile::tempdir().unwrap();
-    let memory = MemoryStore::temporary().await.unwrap();
-    let provider = CapturingProvider::new(ReplyPlan::Text);
-    let hooks = LifecycleHooks {
-        post_turn: vec![shell_hook(
-            "cat >/dev/null; printf x >> post-turn-order; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"settled note\"}'",
-        )],
-        ..LifecycleHooks::default()
-    };
-    let mut harness = Harness::new(
-        config(hooks),
-        project.path(),
-        memory.clone(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    let session_id = harness.session.id.clone();
-    let mut events = harness.subscribe();
-    harness
-        .reject_next_turn_settlement
-        .store(true, Ordering::SeqCst);
-    let rejected = harness
-        .run_local_controlled(
-            "settlement rejected",
-            Some(&target),
-            "rejected-settlement",
-            &CancellationToken::new(),
-        )
-        .await;
-    assert!(rejected.is_err(), "the settlement fixture was accepted");
-    assert!(!project.path().join("post-turn-order").exists());
-    assert!(
-        !std::iter::from_fn(|| events.try_recv().ok())
-            .any(|event| { is_hook(&event, "post_turn", None, None) })
-    );
-    let page = memory
-        .public_transcript_page(&session_id, None, 16)
-        .await
-        .unwrap();
-    assert!(!page.records.iter().any(|entry| {
-        matches!(entry, PublicTranscriptEntry::Turn { record }
-            if record.turn_id == "rejected-settlement"
-                && record.settlement == PublicTurnSettlement::Completed)
-    }));
-    harness.shutdown(false).await.unwrap();
-
-    let second_project = tempfile::tempdir().unwrap();
-    let second_memory = MemoryStore::temporary().await.unwrap();
-    let mut settled = Harness::new(
-        config(LifecycleHooks {
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let provider = CapturingProvider::new(ReplyPlan::Text);
+        let hooks = LifecycleHooks {
             post_turn: vec![shell_hook(
                 "cat >/dev/null; printf x >> post-turn-order; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"settled note\"}'",
             )],
             ..LifecycleHooks::default()
-        }),
-        second_project.path(),
-        second_memory.clone(),
-        provider,
-        None,
-    )
+        };
+        let mut harness = Harness::new(
+            config(hooks),
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        let session_id = harness.session.id.clone();
+        let mut events = harness.subscribe();
+        harness
+            .reject_next_turn_settlement
+            .store(true, Ordering::SeqCst);
+        let rejected = harness
+            .run_local_controlled(
+                "settlement rejected",
+                Some(&target),
+                "rejected-settlement",
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(rejected.is_err(), "the settlement fixture was accepted");
+        assert!(!project.path().join("post-turn-order").exists());
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok())
+                .any(|event| { is_hook(&event, "post_turn", None, None) })
+        );
+        let page = memory
+            .public_transcript_page(&session_id, None, 16)
+            .await
+            .unwrap();
+        assert!(!page.records.iter().any(|entry| {
+            matches!(entry, PublicTranscriptEntry::Turn { record }
+                if record.turn_id == "rejected-settlement"
+                    && record.settlement == PublicTurnSettlement::Completed)
+        }));
+        harness.shutdown(false).await.unwrap();
+
+        let second_project = tempfile::tempdir().unwrap();
+        let second_memory = MemoryStore::temporary().await.unwrap();
+        let mut settled = Harness::new(
+            config(LifecycleHooks {
+                post_turn: vec![shell_hook(
+                    "cat >/dev/null; printf x >> post-turn-order; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"settled note\"}'",
+                )],
+                ..LifecycleHooks::default()
+            }),
+            second_project.path(),
+            second_memory.clone(),
+            provider,
+            None,
+        )
+        .await
+        .unwrap();
+        let target = settled.topology.parts[0].id.clone();
+        let session_id = settled.session.id.clone();
+        let mut events = settled.subscribe();
+        settled
+            .reject_next_hook_annotation
+            .store(true, Ordering::SeqCst);
+        let completed = settled
+            .run_local_controlled(
+                "answer survives annotation refusal",
+                Some(&target),
+                "settled-before-hook",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.output.text, "final answer");
+        assert_eq!(
+            std::fs::read(second_project.path().join("post-turn-order")).unwrap(),
+            b"x"
+        );
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok())
+                .any(|event| { is_hook(&event, "post_turn", Some("failed"), None) })
+        );
+        let page = second_memory
+            .public_transcript_page(&session_id, None, 16)
+            .await
+            .unwrap();
+        assert!(page.records.iter().any(|entry| {
+            matches!(entry, PublicTranscriptEntry::Turn { record }
+                if record.turn_id == "settled-before-hook"
+                    && record.settlement == PublicTurnSettlement::Completed)
+        }));
+        let replay = settled
+            .run_local_controlled(
+                "answer survives annotation refusal",
+                Some(&target),
+                "settled-before-hook",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(replay.reused);
+        assert_eq!(replay.output.text, completed.output.text);
+        assert_eq!(
+            std::fs::read(second_project.path().join("post-turn-order")).unwrap(),
+            b"x"
+        );
+        settled.shutdown(false).await.unwrap();
+    })
     .await
-    .unwrap();
-    let target = settled.topology.parts[0].id.clone();
-    let session_id = settled.session.id.clone();
-    let mut events = settled.subscribe();
-    settled
-        .reject_next_hook_annotation
-        .store(true, Ordering::SeqCst);
-    let completed = settled
-        .run_local_controlled(
-            "answer survives annotation refusal",
-            Some(&target),
-            "settled-before-hook",
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(completed.output.text, "final answer");
-    assert_eq!(
-        std::fs::read(second_project.path().join("post-turn-order")).unwrap(),
-        b"x"
-    );
-    assert!(
-        std::iter::from_fn(|| events.try_recv().ok())
-            .any(|event| { is_hook(&event, "post_turn", Some("failed"), None) })
-    );
-    let page = second_memory
-        .public_transcript_page(&session_id, None, 16)
-        .await
-        .unwrap();
-    assert!(page.records.iter().any(|entry| {
-        matches!(entry, PublicTranscriptEntry::Turn { record }
-            if record.turn_id == "settled-before-hook"
-                && record.settlement == PublicTurnSettlement::Completed)
-    }));
-    let replay = settled
-        .run_local_controlled(
-            "answer survives annotation refusal",
-            Some(&target),
-            "settled-before-hook",
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert!(replay.reused);
-    assert_eq!(replay.output.text, completed.output.text);
-    assert_eq!(
-        std::fs::read(second_project.path().join("post-turn-order")).unwrap(),
-        b"x"
-    );
-    settled.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone(), settled.memory.clone()]).await;
 }
 
 #[tokio::test]
 async fn post_tool_annotation_stays_with_its_actor_and_can_be_omitted_by_context_fit() {
-    let project = tempfile::tempdir().unwrap();
-    let provider = Arc::new(AnnotationFitProvider::default());
-    let response = json!({
-        "decision": "annotate",
-        "annotation": "PRIVATE-HOOK-SENTINEL"
-    });
-    let hooks = LifecycleHooks {
-        post_tool: vec![shell_hook(&format!(
-            "cat >/dev/null; printf '%s' '{}'",
-            response
-        ))],
-        ..LifecycleHooks::default()
-    };
-    let mut harness = Harness::new(
-        config(hooks),
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let owner = harness.topology.parts[0].id.clone();
-    let other = harness.topology.parts[1].id.clone();
-    let owner_namespace = harness.namespace(&owner);
-    let session_id = harness.session.id.clone();
-    harness
-        .run_for("emit the private tool annotation", Some(&owner))
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let provider = Arc::new(AnnotationFitProvider::default());
+        let response = json!({
+            "decision": "annotate",
+            "annotation": "PRIVATE-HOOK-SENTINEL"
+        });
+        let hooks = LifecycleHooks {
+            post_tool: vec![shell_hook(&format!(
+                "cat >/dev/null; printf '%s' '{}'",
+                response
+            ))],
+            ..LifecycleHooks::default()
+        };
+        let mut harness = Harness::new(
+            config(hooks),
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            provider.clone(),
+            None,
+        )
         .await
         .unwrap();
-    let before_other = provider.requests.lock().unwrap().len();
-    harness
-        .run_for("read only your own context", Some(&other))
-        .await
-        .unwrap();
-    let requests = provider.requests.lock().unwrap().clone();
-    assert!(
-        requests.len() > before_other,
-        "the other actor made no provider request"
-    );
-    assert!(requests[before_other..].iter().all(|request| {
-        request.actor == harness.namespace(&other)
-            && !request.instructions.contains("PRIVATE-HOOK-SENTINEL")
-            && !request
-                .messages
-                .iter()
-                .any(|message| message.text_projection().contains("PRIVATE-HOOK-SENTINEL"))
-    }));
+        let owner = harness.topology.parts[0].id.clone();
+        let other = harness.topology.parts[1].id.clone();
+        let owner_namespace = harness.namespace(&owner);
+        let session_id = harness.session.id.clone();
+        harness
+            .run_for("emit the private tool annotation", Some(&owner))
+            .await
+            .unwrap();
+        let before_other = provider.requests.lock().unwrap().len();
+        harness
+            .run_for("read only your own context", Some(&other))
+            .await
+            .unwrap();
+        let requests = provider.requests.lock().unwrap().clone();
+        assert!(
+            requests.len() > before_other,
+            "the other actor made no provider request"
+        );
+        assert!(requests[before_other..].iter().all(|request| {
+            request.actor == harness.namespace(&other)
+                && !request.instructions.contains("PRIVATE-HOOK-SENTINEL")
+                && !request
+                    .messages
+                    .iter()
+                    .any(|message| message.text_projection().contains("PRIVATE-HOOK-SENTINEL"))
+        }));
 
-    let before_fit = requests.len();
-    harness.run_for("FIT-PROBE", Some(&owner)).await.unwrap();
-    let requests = provider.requests.lock().unwrap().clone();
-    let attempts = &requests[before_fit..];
-    assert!(
-        attempts.len() > 1,
-        "the private annotation was not fit-tested"
-    );
-    assert!(attempts.iter().all(|request| {
-        request.actor == owner_namespace
-            && request
-                .messages
-                .iter()
-                .any(|message| message.text_projection().contains("FIT-PROBE"))
-    }));
-    assert!(attempts[..attempts.len() - 1].iter().any(|request| {
-        request.messages.iter().any(|message| {
+        let before_fit = requests.len();
+        harness.run_for("FIT-PROBE", Some(&owner)).await.unwrap();
+        let requests = provider.requests.lock().unwrap().clone();
+        let attempts = &requests[before_fit..];
+        assert!(
+            attempts.len() > 1,
+            "the private annotation was not fit-tested"
+        );
+        assert!(attempts.iter().all(|request| {
+            request.actor == owner_namespace
+                && request
+                    .messages
+                    .iter()
+                    .any(|message| message.text_projection().contains("FIT-PROBE"))
+        }));
+        assert!(attempts[..attempts.len() - 1].iter().any(|request| {
+            request.messages.iter().any(|message| {
+                hook_annotation(message)
+                    .is_some_and(|value| value["annotation"] == "PRIVATE-HOOK-SENTINEL")
+            })
+        }));
+        assert!(attempts.last().unwrap().messages.iter().all(|message| {
+            hook_annotation(message)
+                .is_none_or(|value| value["annotation"] != "PRIVATE-HOOK-SENTINEL")
+        }));
+        let history = harness
+            .memory
+            .session_history_window(&owner_namespace, &session_id, 64)
+            .await
+            .unwrap();
+        assert!(history.messages.iter().any(|message| {
             hook_annotation(message)
                 .is_some_and(|value| value["annotation"] == "PRIVATE-HOOK-SENTINEL")
-        })
-    }));
-    assert!(attempts.last().unwrap().messages.iter().all(|message| {
-        hook_annotation(message).is_none_or(|value| value["annotation"] != "PRIVATE-HOOK-SENTINEL")
-    }));
-    let history = harness
-        .memory
-        .session_history_window(&owner_namespace, &session_id, 64)
-        .await
-        .unwrap();
-    assert!(history.messages.iter().any(|message| {
-        hook_annotation(message).is_some_and(|value| value["annotation"] == "PRIVATE-HOOK-SENTINEL")
-    }));
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
+        }));
+        harness.shutdown(false).await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn speaker_stop_preserves_the_selected_peer_and_makes_no_speaking_dispatch() {
-    for mode in Mode::ALL {
-        let project = tempfile::tempdir().unwrap();
-        let provider = CapturingProvider::new(ReplyPlan::Text);
-        let hooks = LifecycleHooks {
-            speaker_selected: vec![shell_hook(
-                "cat >/dev/null; printf x > speaker-hook-ran; printf '%s' '{\"decision\":\"stop\",\"reason\":\"fixture stopped speaker\"}'",
-            )],
-            ..LifecycleHooks::default()
-        };
-        let mut settings = config(hooks);
-        settings.mode = mode;
-        let mut harness = Harness::new(
-            settings,
-            project.path(),
-            MemoryStore::temporary().await.unwrap(),
-            provider.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        let target = harness.topology.parts[0].id.clone();
-        let error = harness
-            .run_for("stop before speaking", Some(&target))
+    kuru_memory::test_support::closing(async {
+        for mode in Mode::ALL {
+            let project = tempfile::tempdir().unwrap();
+            let provider = CapturingProvider::new(ReplyPlan::Text);
+            let hooks = LifecycleHooks {
+                speaker_selected: vec![shell_hook(
+                    "cat >/dev/null; printf x > speaker-hook-ran; printf '%s' '{\"decision\":\"stop\",\"reason\":\"fixture stopped speaker\"}'",
+                )],
+                ..LifecycleHooks::default()
+            };
+            let mut settings = config(hooks);
+            settings.mode = mode;
+            let mut harness = Harness::new(
+                settings,
+                project.path(),
+                MemoryStore::temporary().await.unwrap(),
+                provider.clone(),
+                None,
+            )
             .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("fixture stopped speaker"),
-            "{mode}: {error:#}"
-        );
-        let requests = provider.requests.lock().unwrap().clone();
-        assert_eq!(requests.len(), 1, "{mode}");
-        assert!(requests[0].instructions.contains("Phase: deliberate"));
-        assert_eq!(
-            std::fs::read(project.path().join("speaker-hook-ran")).unwrap(),
-            b"x"
-        );
-        assert_eq!(harness.topology.parts[0].id, target);
-        harness.shutdown(false).await.unwrap();
-        crate::tests::close_stores([harness.memory.clone()]).await;
-    }
+            .unwrap();
+            let target = harness.topology.parts[0].id.clone();
+            let error = harness
+                .run_for("stop before speaking", Some(&target))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("fixture stopped speaker"),
+                "{mode}: {error:#}"
+            );
+            let requests = provider.requests.lock().unwrap().clone();
+            assert_eq!(requests.len(), 1, "{mode}");
+            assert!(requests[0].instructions.contains("Phase: deliberate"));
+            assert_eq!(
+                std::fs::read(project.path().join("speaker-hook-ran")).unwrap(),
+                b"x"
+            );
+            assert_eq!(harness.topology.parts[0].id, target);
+            harness.shutdown(false).await.unwrap();
+            crate::tests::close_stores([harness.memory.clone()]).await;
+        }
+    })
+    .await
 }
 
 #[tokio::test]
 async fn speaker_observe_receives_the_validated_selection_and_keeps_its_dispatch() {
-    for mode in Mode::ALL {
-        let project = tempfile::tempdir().unwrap();
-        let provider = CapturingProvider::new(ReplyPlan::Text);
-        let hooks = LifecycleHooks {
-            speaker_selected: vec![shell_hook(
-                "request=$(cat); case \"$request\" in *'\"speaker\"'*) ;; *) exit 9;; esac; case \"$request\" in *'\"reason\"'*) printf x > speaker-observed; printf '%s' '{\"decision\":\"observe\"}';; *) exit 9;; esac",
-            )],
-            ..LifecycleHooks::default()
-        };
-        let mut settings = config(hooks);
-        settings.mode = mode;
-        let mut harness = Harness::new(
-            settings,
-            project.path(),
-            MemoryStore::temporary().await.unwrap(),
-            provider.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        let target = harness.topology.parts[0].id.clone();
-        let original_topology = serde_json::to_value(&harness.topology).unwrap();
-        let output = harness
-            .run_for("address the selected peer", Some(&target))
+    kuru_memory::test_support::closing(async {
+        for mode in Mode::ALL {
+            let project = tempfile::tempdir().unwrap();
+            let provider = CapturingProvider::new(ReplyPlan::Text);
+            let hooks = LifecycleHooks {
+                speaker_selected: vec![shell_hook(
+                    "request=$(cat); case \"$request\" in *'\"speaker\"'*) ;; *) exit 9;; esac; case \"$request\" in *'\"reason\"'*) printf x > speaker-observed; printf '%s' '{\"decision\":\"observe\"}';; *) exit 9;; esac",
+                )],
+                ..LifecycleHooks::default()
+            };
+            let mut settings = config(hooks);
+            settings.mode = mode;
+            let mut harness = Harness::new(
+                settings,
+                project.path(),
+                MemoryStore::temporary().await.unwrap(),
+                provider.clone(),
+                None,
+            )
             .await
             .unwrap();
-        assert_eq!(output.text, "final answer", "{mode}");
-        assert_eq!(
-            std::fs::read(project.path().join("speaker-observed")).unwrap(),
-            b"x"
-        );
-        assert_eq!(
-            serde_json::to_value(&harness.topology).unwrap(),
-            original_topology
-        );
-        assert!(
-            provider.requests.lock().unwrap().iter().any(|request| {
-                request.instructions.contains("Phase: speak") && request.actor.contains(&target)
-            }),
-            "{mode}"
-        );
-        harness.shutdown(false).await.unwrap();
-        crate::tests::close_stores([harness.memory.clone()]).await;
-    }
+            let target = harness.topology.parts[0].id.clone();
+            let original_topology = serde_json::to_value(&harness.topology).unwrap();
+            let output = harness
+                .run_for("address the selected peer", Some(&target))
+                .await
+                .unwrap();
+            assert_eq!(output.text, "final answer", "{mode}");
+            assert_eq!(
+                std::fs::read(project.path().join("speaker-observed")).unwrap(),
+                b"x"
+            );
+            assert_eq!(
+                serde_json::to_value(&harness.topology).unwrap(),
+                original_topology
+            );
+            assert!(
+                provider.requests.lock().unwrap().iter().any(|request| {
+                    request.instructions.contains("Phase: speak") && request.actor.contains(&target)
+                }),
+                "{mode}"
+            );
+            harness.shutdown(false).await.unwrap();
+            crate::tests::close_stores([harness.memory.clone()]).await;
+        }
+    })
+    .await
 }
 
 #[tokio::test]
 async fn speaker_hook_cannot_substitute_an_explicitly_selected_peer() {
-    for decision in [
-        "rewrite",
-        "observe_with_actor",
-        "observe_with_reason",
-        "stop_with_actor",
-        "malformed",
-        "timeout",
-    ] {
-        let project = tempfile::tempdir().unwrap();
-        let provider = CapturingProvider::new(ReplyPlan::Text);
-        let script = match decision {
-            "rewrite" => format!(
-                "cat >/dev/null; printf '%s' '{}'",
-                json!({"decision":"rewrite", "value":{"actor":"another-peer"}})
-            ),
-            "observe_with_actor" => format!(
-                "cat >/dev/null; printf '%s' '{}'",
-                json!({"decision":"observe", "actor":"another-peer"})
-            ),
-            "observe_with_reason" => format!(
-                "cat >/dev/null; printf '%s' '{}'",
-                json!({"decision":"observe", "reason":"switch selection"})
-            ),
-            "stop_with_actor" => format!(
-                "cat >/dev/null; printf '%s' '{}'",
-                json!({"decision":"stop", "reason":"switch peer", "actor":"another-peer"})
-            ),
-            "malformed" => "cat >/dev/null; printf '{'".to_owned(),
-            "timeout" => "cat >/dev/null; sleep 30".to_owned(),
-            _ => unreachable!(),
-        };
-        let mut hook = shell_hook(&script);
-        if decision == "timeout" {
-            hook.timeout_ms = 50;
-        }
-        let settings = config(LifecycleHooks {
-            speaker_selected: vec![hook],
-            ..LifecycleHooks::default()
-        });
-        let mut harness = Harness::new(
-            settings,
-            project.path(),
-            MemoryStore::temporary().await.unwrap(),
-            provider.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        let target = harness.topology.parts[0].id.clone();
-        let original_topology = serde_json::to_value(&harness.topology).unwrap();
-        let error = harness
-            .run_for("address the selected peer", Some(&target))
+    kuru_memory::test_support::closing(async {
+        for decision in [
+            "rewrite",
+            "observe_with_actor",
+            "observe_with_reason",
+            "stop_with_actor",
+            "malformed",
+            "timeout",
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let provider = CapturingProvider::new(ReplyPlan::Text);
+            let script = match decision {
+                "rewrite" => format!(
+                    "cat >/dev/null; printf '%s' '{}'",
+                    json!({"decision":"rewrite", "value":{"actor":"another-peer"}})
+                ),
+                "observe_with_actor" => format!(
+                    "cat >/dev/null; printf '%s' '{}'",
+                    json!({"decision":"observe", "actor":"another-peer"})
+                ),
+                "observe_with_reason" => format!(
+                    "cat >/dev/null; printf '%s' '{}'",
+                    json!({"decision":"observe", "reason":"switch selection"})
+                ),
+                "stop_with_actor" => format!(
+                    "cat >/dev/null; printf '%s' '{}'",
+                    json!({"decision":"stop", "reason":"switch peer", "actor":"another-peer"})
+                ),
+                "malformed" => "cat >/dev/null; printf '{'".to_owned(),
+                "timeout" => "cat >/dev/null; sleep 30".to_owned(),
+                _ => unreachable!(),
+            };
+            let mut hook = shell_hook(&script);
+            if decision == "timeout" {
+                hook.timeout_ms = 50;
+            }
+            let settings = config(LifecycleHooks {
+                speaker_selected: vec![hook],
+                ..LifecycleHooks::default()
+            });
+            let mut harness = Harness::new(
+                settings,
+                project.path(),
+                MemoryStore::temporary().await.unwrap(),
+                provider.clone(),
+                None,
+            )
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("hook"), "{error:#}");
-        assert_eq!(
-            serde_json::to_value(&harness.topology).unwrap(),
-            original_topology
-        );
-        let requests = provider.requests.lock().unwrap().clone();
-        assert!(!requests.is_empty());
-        assert!(
-            requests
-                .iter()
-                .all(|request| { !request.instructions.contains("Phase: speak") })
-        );
-        assert!(
-            harness
-                .history()
+            .unwrap();
+            let target = harness.topology.parts[0].id.clone();
+            let original_topology = serde_json::to_value(&harness.topology).unwrap();
+            let error = harness
+                .run_for("address the selected peer", Some(&target))
                 .await
-                .unwrap()
-                .iter()
-                .any(|message| { message == &Message::text("user", "address the selected peer") })
-        );
-        harness.shutdown(false).await.unwrap();
-        crate::tests::close_stores([harness.memory.clone()]).await;
-    }
+                .unwrap_err();
+            assert!(error.to_string().contains("hook"), "{error:#}");
+            assert_eq!(
+                serde_json::to_value(&harness.topology).unwrap(),
+                original_topology
+            );
+            let requests = provider.requests.lock().unwrap().clone();
+            assert!(!requests.is_empty());
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| { !request.instructions.contains("Phase: speak") })
+            );
+            assert!(
+                harness.history().await.unwrap().iter().any(|message| {
+                    message == &Message::text("user", "address the selected peer")
+                })
+            );
+            harness.shutdown(false).await.unwrap();
+            crate::tests::close_stores([harness.memory.clone()]).await;
+        }
+    })
+    .await
 }
 
 #[tokio::test]
 async fn dream_tool_rewrites_stay_within_dream_validation_and_annotations_promote_from_candidate() {
-    let project = tempfile::tempdir().unwrap();
-    let provider = CapturingProvider::new(ReplyPlan::DreamProposal);
-    let hooks = LifecycleHooks {
-        pre_tool: vec![shell_hook(
-            "cat >/dev/null; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"name\":\"shell\",\"arguments\":{\"command\":\"printf forbidden > forbidden-marker\"}}}'",
-        )],
-        post_tool: vec![shell_hook(
-            "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"candidate annotation\"}'",
-        )],
-        ..LifecycleHooks::default()
-    };
-    let mut harness = Harness::new(
-        config(hooks),
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider,
-        None,
-    )
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let provider = CapturingProvider::new(ReplyPlan::DreamProposal);
+        let hooks = LifecycleHooks {
+            pre_tool: vec![shell_hook(
+                "cat >/dev/null; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"name\":\"shell\",\"arguments\":{\"command\":\"printf forbidden > forbidden-marker\"}}}'",
+            )],
+            post_tool: vec![shell_hook(
+                "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"candidate annotation\"}'",
+            )],
+            ..LifecycleHooks::default()
+        };
+        let mut harness = Harness::new(
+            config(hooks),
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            provider,
+            None,
+        )
+        .await
+        .unwrap();
+        let actor = harness.topology.parts[0].id.clone();
+        let mut events = harness.subscribe();
+        let report = harness.dream().await.unwrap();
+        // A hook may rewrite arguments only: the attempted tool substitution
+        // fails that hook, and neither the proposal nor `shell` runs.
+        assert!(report.accepted.is_empty());
+        let observed = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            observed
+                .iter()
+                .any(|event| is_hook(event, "pre_tool", Some("failed"), None))
+        );
+        assert!(
+            !observed
+                .iter()
+                .any(|event| is_hook(event, "pre_tool", Some("rewritten"), None))
+        );
+        assert!(!project.path().join("forbidden-marker").exists());
+        assert!(
+            harness
+                .memory_for(&actor)
+                .await
+                .unwrap()
+                .iter()
+                .any(|message| hook_annotation(message)
+                    .is_some_and(|value| value["annotation"] == "candidate annotation"
+                        && value["turn_id"].is_null()))
+        );
+        harness.shutdown(false).await.unwrap();
+    })
     .await
-    .unwrap();
-    let actor = harness.topology.parts[0].id.clone();
-    let mut events = harness.subscribe();
-    let report = harness.dream().await.unwrap();
-    // A hook may rewrite arguments only: the attempted tool substitution
-    // fails that hook, and neither the proposal nor `shell` runs.
-    assert!(report.accepted.is_empty());
-    let observed = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
-    assert!(
-        observed
-            .iter()
-            .any(|event| is_hook(event, "pre_tool", Some("failed"), None))
-    );
-    assert!(
-        !observed
-            .iter()
-            .any(|event| is_hook(event, "pre_tool", Some("rewritten"), None))
-    );
-    assert!(!project.path().join("forbidden-marker").exists());
-    assert!(
-        harness
-            .memory_for(&actor)
-            .await
-            .unwrap()
-            .iter()
-            .any(|message| hook_annotation(message)
-                .is_some_and(|value| value["annotation"] == "candidate annotation"
-                    && value["turn_id"].is_null()))
-    );
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
 }
 
 #[tokio::test]
 async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_descendants() {
-    let project = tempfile::tempdir().unwrap();
-    let marker = project.path().join("second-hook-started");
-    let survived = project.path().join("hook-descendant-survived");
-    let script = format!(
-        "request=$(cat); case \"$request\" in *dream-hook-call-1*) printf '%s' '{{\"decision\":\"annotate\",\"annotation\":\"candidate only\"}}';; *) (printf '%s' $$ > '{0}.tmp'; mv '{0}.tmp' '{0}'; sleep 30; printf survived > '{1}') & sleep 30;; esac",
-        marker.display(),
-        survived.display()
-    );
-    let provider = CapturingProvider::new(ReplyPlan::DreamProposal);
-    let hook = shell_hook(&script);
-    let hooks = LifecycleHooks {
-        post_tool: vec![hook.clone()],
-        ..LifecycleHooks::default()
-    };
-    let memory = MemoryStore::temporary().await.unwrap();
-    let mut harness = Harness::new(
-        config(hooks),
-        project.path(),
-        memory.clone(),
-        provider,
-        None,
-    )
-    .await
-    .unwrap();
-    let actor = harness.topology.parts[0].id.clone();
-    let timings = crate::step_timings::StepTimings::recording();
-    harness.step_timings = timings.clone();
-    let mut watch = DreamWatch {
-        task: crate::progress_wait::TaskWatch::new(
-            timings,
-            harness.subscribe(),
-            harness.hook_host(),
-        ),
-        memory,
-        files: vec![marker.clone(), survived.clone()],
-    };
-    // Each wait ends on its event; only one silent gap longer than the
-    // fixture's stated step budget fails it. The bound also encloses the
-    // product's own quiesce wait, which the cancelled join runs.
-    let gap = crate::progress_wait::dream_gap_bound(&hook, watch.task.hooks.quiesce_bound());
-    assert!(gap > watch.task.hooks.quiesce_bound());
-    let cancellation = CancellationToken::new();
-    watch
-        .task
-        .timings
-        .mark("setup finished; dream task spawning");
-    let mut running = tokio::spawn({
-        let cancellation = cancellation.clone();
-        async move {
-            let mut harness = harness;
-            let result = harness.dream_controlled(&cancellation).await;
-            (harness, result)
-        }
-    });
-    let waited = crate::progress_wait::until_event(
-        &mut running,
-        || marker.exists(),
-        || watch.progress(),
-        gap,
-    )
-    .await;
-    match waited {
-        crate::progress_wait::Waited::Reached => {}
-        crate::progress_wait::Waited::Finished(joined) => panic!(
-            "the dream finished before its second hook started: {}\n{}",
-            describe_joined_dream(joined),
-            watch.report(gap).await
-        ),
-        crate::progress_wait::Waited::Stalled { progress_changes } => {
-            let report = watch.report(gap).await;
-            cancellation.cancel();
-            panic!(
-                "the dream made no observable progress for {gap:?} before its second hook \
-                 started ({progress_changes} progress changes seen)\n{report}\n{}",
-                settle_stalled_dream(&mut running, gap).await
-            )
-        }
-    }
-    watch.task.timings.mark("second hook started; cancelling");
-    cancellation.cancel();
-    let joined =
-        crate::progress_wait::until_event(&mut running, || false, || watch.progress(), gap).await;
-    let (mut harness, result) = match joined {
-        crate::progress_wait::Waited::Finished(Ok(joined)) => joined,
-        crate::progress_wait::Waited::Finished(Err(error)) => {
-            panic!(
-                "the cancelled dream task panicked: {error}\n{}",
-                watch.report(gap).await
-            )
-        }
-        crate::progress_wait::Waited::Reached => unreachable!("the join waits for no condition"),
-        crate::progress_wait::Waited::Stalled { progress_changes } => {
-            let report = watch.report(gap).await;
-            panic!(
-                "the cancelled dream made no observable progress for {gap:?} \
-                 ({progress_changes} progress changes seen)\n{report}\n{}",
-                settle_stalled_dream(&mut running, gap).await
-            )
-        }
-    };
-    assert!(result.is_err());
-    // The cancelled dream returned only after its owned hook tree was reaped.
-    assert_eq!(harness.hook_host().in_flight_hooks(), 0);
-    assert!(
-        !harness
-            .memory_for(&actor)
-            .await
-            .unwrap()
-            .iter()
-            .any(|message| message.role == "kuru-hook")
-    );
-    // The second hook's backgrounded subshell published the owned group id
-    // (`$$`, the root's pid, which leads its group) once it was running, and
-    // it outlives every bound here, so only the reap can have emptied the
-    // group. Signal zero and a listing only; observation never terminates
-    // anything, and an unclassifiable number is not `none_of_ours`.
-    let group: u32 = std::fs::read_to_string(&marker)
-        .unwrap()
-        .trim()
-        .parse()
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let marker = project.path().join("second-hook-started");
+        let survived = project.path().join("hook-descendant-survived");
+        let script = format!(
+            "request=$(cat); case \"$request\" in *dream-hook-call-1*) printf '%s' '{{\"decision\":\"annotate\",\"annotation\":\"candidate only\"}}';; *) (printf '%s' $$ > '{0}.tmp'; mv '{0}.tmp' '{0}'; sleep 30; printf survived > '{1}') & sleep 30;; esac",
+            marker.display(),
+            survived.display()
+        );
+        let provider = CapturingProvider::new(ReplyPlan::DreamProposal);
+        let hook = shell_hook(&script);
+        let hooks = LifecycleHooks {
+            post_tool: vec![hook.clone()],
+            ..LifecycleHooks::default()
+        };
+        let memory = MemoryStore::temporary().await.unwrap();
+        let mut harness = Harness::new(
+            config(hooks),
+            project.path(),
+            memory.clone(),
+            provider,
+            None,
+        )
+        .await
         .unwrap();
-    let reaped = kuru_platform::unix::observe_group_after_reap(group);
-    assert!(
-        reaped.none_of_ours(),
-        "hook descendant survived dream cancellation: {reaped}; \
+        let actor = harness.topology.parts[0].id.clone();
+        let timings = crate::step_timings::StepTimings::recording();
+        harness.step_timings = timings.clone();
+        let mut watch = DreamWatch {
+            task: crate::progress_wait::TaskWatch::new(
+                timings,
+                harness.subscribe(),
+                harness.hook_host(),
+            ),
+            memory,
+            files: vec![marker.clone(), survived.clone()],
+        };
+        // Each wait ends on its event; only one silent gap longer than the
+        // fixture's stated step budget fails it. The bound also encloses the
+        // product's own quiesce wait, which the cancelled join runs.
+        let gap = crate::progress_wait::dream_gap_bound(&hook, watch.task.hooks.quiesce_bound());
+        assert!(gap > watch.task.hooks.quiesce_bound());
+        let cancellation = CancellationToken::new();
+        watch
+            .task
+            .timings
+            .mark("setup finished; dream task spawning");
+        let mut running = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                let mut harness = harness;
+                let result = harness.dream_controlled(&cancellation).await;
+                (harness, result)
+            }
+        });
+        let waited = crate::progress_wait::until_event(
+            &mut running,
+            || marker.exists(),
+            || watch.progress(),
+            gap,
+        )
+        .await;
+        match waited {
+            crate::progress_wait::Waited::Reached => {}
+            crate::progress_wait::Waited::Finished(joined) => panic!(
+                "the dream finished before its second hook started: {}\n{}",
+                describe_joined_dream(joined),
+                watch.report(gap).await
+            ),
+            crate::progress_wait::Waited::Stalled { progress_changes } => {
+                let report = watch.report(gap).await;
+                cancellation.cancel();
+                panic!(
+                    "the dream made no observable progress for {gap:?} before its second hook \
+                 started ({progress_changes} progress changes seen)\n{report}\n{}",
+                    settle_stalled_dream(&mut running, gap).await
+                )
+            }
+        }
+        watch.task.timings.mark("second hook started; cancelling");
+        cancellation.cancel();
+        let joined =
+            crate::progress_wait::until_event(&mut running, || false, || watch.progress(), gap).await;
+        let (mut harness, result) = match joined {
+            crate::progress_wait::Waited::Finished(Ok(joined)) => joined,
+            crate::progress_wait::Waited::Finished(Err(error)) => {
+                panic!(
+                    "the cancelled dream task panicked: {error}\n{}",
+                    watch.report(gap).await
+                )
+            }
+            crate::progress_wait::Waited::Reached => unreachable!("the join waits for no condition"),
+            crate::progress_wait::Waited::Stalled { progress_changes } => {
+                let report = watch.report(gap).await;
+                panic!(
+                    "the cancelled dream made no observable progress for {gap:?} \
+                 ({progress_changes} progress changes seen)\n{report}\n{}",
+                    settle_stalled_dream(&mut running, gap).await
+                )
+            }
+        };
+        assert!(result.is_err());
+        // The cancelled dream returned only after its owned hook tree was reaped.
+        assert_eq!(harness.hook_host().in_flight_hooks(), 0);
+        assert!(
+            !harness
+                .memory_for(&actor)
+                .await
+                .unwrap()
+                .iter()
+                .any(|message| message.role == "kuru-hook")
+        );
+        // The second hook's backgrounded subshell published the owned group id
+        // (`$$`, the root's pid, which leads its group) once it was running, and
+        // it outlives every bound here, so only the reap can have emptied the
+        // group. Signal zero and a listing only; observation never terminates
+        // anything, and an unclassifiable number is not `none_of_ours`.
+        let group: u32 = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let reaped = kuru_platform::unix::observe_group_after_reap(group);
+        assert!(
+            reaped.none_of_ours(),
+            "hook descendant survived dream cancellation: {reaped}; \
          descendant outlived its 30 s sleep: {}",
-        survived.exists()
-    );
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
+            survived.exists()
+        );
+        harness.shutdown(false).await.unwrap();
+    })
+    .await
 }
 
 type DreamJoin = (Harness, Result<crate::DreamReport>);
@@ -1938,209 +1974,166 @@ async fn settle_stalled_dream(
 
 #[tokio::test]
 async fn pre_turn_denial_malformed_output_and_timeout_refuse_before_provider_dispatch() {
-    for (label, mut hook) in [
-        (
-            "deny",
-            shell_hook("cat >/dev/null; printf '%s' '{\"decision\":\"deny\"}'"),
-        ),
-        (
-            "trailing",
-            shell_hook("cat >/dev/null; printf '%s' '{\"decision\":\"allow\"} trailing'"),
-        ),
-        ("timeout", shell_hook("cat >/dev/null; sleep 30")),
-    ] {
-        if label == "timeout" {
-            hook.timeout_ms = 50;
-        }
-        let project = tempfile::tempdir().unwrap();
-        let provider = CapturingProvider::new(ReplyPlan::Text);
-        let hooks = LifecycleHooks {
-            pre_turn: vec![hook],
-            ..LifecycleHooks::default()
-        };
-        let mut harness = Harness::new(
-            config(hooks),
-            project.path(),
-            MemoryStore::temporary().await.unwrap(),
-            provider.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        let target = harness.topology.parts[0].id.clone();
-        let error = harness
-            .run_for("durable original", Some(&target))
+    kuru_memory::test_support::closing(async {
+        for (label, mut hook) in [
+            (
+                "deny",
+                shell_hook("cat >/dev/null; printf '%s' '{\"decision\":\"deny\"}'"),
+            ),
+            (
+                "trailing",
+                shell_hook("cat >/dev/null; printf '%s' '{\"decision\":\"allow\"} trailing'"),
+            ),
+            ("timeout", shell_hook("cat >/dev/null; sleep 30")),
+        ] {
+            if label == "timeout" {
+                hook.timeout_ms = 50;
+            }
+            let project = tempfile::tempdir().unwrap();
+            let provider = CapturingProvider::new(ReplyPlan::Text);
+            let hooks = LifecycleHooks {
+                pre_turn: vec![hook],
+                ..LifecycleHooks::default()
+            };
+            let mut harness = Harness::new(
+                config(hooks),
+                project.path(),
+                MemoryStore::temporary().await.unwrap(),
+                provider.clone(),
+                None,
+            )
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("hook"), "{label}: {error:#}");
-        assert!(
-            provider.requests.lock().unwrap().is_empty(),
-            "{label} dispatched provider work"
-        );
-        let history = harness.history().await.unwrap();
-        assert_eq!(history[0], Message::text("user", "durable original"));
-        harness.shutdown(false).await.unwrap();
-        crate::tests::close_stores([harness.memory.clone()]).await;
-    }
+            .unwrap();
+            let target = harness.topology.parts[0].id.clone();
+            let error = harness
+                .run_for("durable original", Some(&target))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("hook"), "{label}: {error:#}");
+            assert!(
+                provider.requests.lock().unwrap().is_empty(),
+                "{label} dispatched provider work"
+            );
+            let history = harness.history().await.unwrap();
+            assert_eq!(history[0], Message::text("user", "durable original"));
+            harness.shutdown(false).await.unwrap();
+            crate::tests::close_stores([harness.memory.clone()]).await;
+        }
+    })
+    .await
 }
 
 #[tokio::test]
 async fn denied_pre_tool_hook_reaches_the_model_without_dropping_its_call() {
-    let project = tempfile::tempdir().unwrap();
-    std::fs::write(project.path().join("first.txt"), "unread content").unwrap();
-    let provider = CapturingProvider::new(ReplyPlan::OneRead);
-    let mut harness = Harness::new(
-        config(LifecycleHooks {
-            pre_tool: vec![shell_hook(
-                "cat >/dev/null; printf '%s' '{\"decision\":\"deny\"}'",
-            )],
-            ..LifecycleHooks::default()
-        }),
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    let output = harness
-        .run_for("read with policy", Some(&target))
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("first.txt"), "unread content").unwrap();
+        let provider = CapturingProvider::new(ReplyPlan::OneRead);
+        let mut harness = Harness::new(
+            config(LifecycleHooks {
+                pre_tool: vec![shell_hook(
+                    "cat >/dev/null; printf '%s' '{\"decision\":\"deny\"}'",
+                )],
+                ..LifecycleHooks::default()
+            }),
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            provider.clone(),
+            None,
+        )
         .await
         .unwrap();
-    assert_eq!(output.text, "final answer");
-    {
-        let requests = provider.requests.lock().unwrap();
-        assert!(
-            requests
-                .iter()
-                .any(|request| request.messages.iter().any(|message| {
-                    message.role == "tool"
-                        && message.text_projection().contains("denied")
-                        && !message.text_projection().contains("unread content")
-                }))
-        );
-    }
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
+        let target = harness.topology.parts[0].id.clone();
+        let output = harness
+            .run_for("read with policy", Some(&target))
+            .await
+            .unwrap();
+        assert_eq!(output.text, "final answer");
+        {
+            let requests = provider.requests.lock().unwrap();
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.messages.iter().any(|message| {
+                        message.role == "tool"
+                            && message.text_projection().contains("denied")
+                            && !message.text_projection().contains("unread content")
+                    }))
+            );
+        }
+        harness.shutdown(false).await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn exhausted_post_budget_keeps_answer_and_records_a_separate_failure() {
-    let project = tempfile::tempdir().unwrap();
-    let provider = CapturingProvider::new(ReplyPlan::Text);
-    let hooks = LifecycleHooks {
-        max_invocations: 1,
-        post_turn: vec![
-            shell_hook(
-                "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"first annotation\"}'",
-            ),
-            shell_hook(
-                "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"second annotation\"}'",
-            ),
-        ],
-        ..LifecycleHooks::default()
-    };
-    let mut harness = Harness::new(
-        config(hooks),
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    let mut events = harness.subscribe();
-    let output = harness
-        .run_for("answer despite budget", Some(&target))
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let provider = CapturingProvider::new(ReplyPlan::Text);
+        let hooks = LifecycleHooks {
+            max_invocations: 1,
+            post_turn: vec![
+                shell_hook(
+                    "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"first annotation\"}'",
+                ),
+                shell_hook(
+                    "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"second annotation\"}'",
+                ),
+            ],
+            ..LifecycleHooks::default()
+        };
+        let mut harness = Harness::new(
+            config(hooks),
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            provider.clone(),
+            None,
+        )
         .await
         .unwrap();
-    assert_eq!(output.text, "final answer");
-    assert_eq!(
-        harness.history().await.unwrap(),
-        [
-            Message::text("user", "answer despite budget"),
-            Message::text("assistant", "final answer")
-        ]
-    );
-    assert!(
-        !output
-            .events
-            .iter()
-            .any(|event| is_hook(event, "post_turn", None, None))
-    );
-    assert!(
-        std::iter::from_fn(|| events.try_recv().ok()).any(|event| is_hook(
-            &event,
-            "post_turn",
-            Some("failed"),
-            None
-        ))
-    );
-    assert_eq!(provider.requests.lock().unwrap().len(), 2);
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
+        let target = harness.topology.parts[0].id.clone();
+        let mut events = harness.subscribe();
+        let output = harness
+            .run_for("answer despite budget", Some(&target))
+            .await
+            .unwrap();
+        assert_eq!(output.text, "final answer");
+        assert_eq!(
+            harness.history().await.unwrap(),
+            [
+                Message::text("user", "answer despite budget"),
+                Message::text("assistant", "final answer")
+            ]
+        );
+        assert!(
+            !output
+                .events
+                .iter()
+                .any(|event| is_hook(event, "post_turn", None, None))
+        );
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok()).any(|event| is_hook(
+                &event,
+                "post_turn",
+                Some("failed"),
+                None
+            ))
+        );
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+        harness.shutdown(false).await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn refused_pre_turn_can_retry_exact_identity_without_duplicate_durable_input() {
-    let project = tempfile::tempdir().unwrap();
-    let provider = CapturingProvider::new(ReplyPlan::Text);
-    let hooks = LifecycleHooks {
-        pre_turn: vec![shell_hook(
-            "cat >/dev/null; printf x >> hook-attempts; printf '%s' '{\"decision\":\"deny\"}'",
-        )],
-        ..LifecycleHooks::default()
-    };
-    let mut harness = Harness::new(
-        config(hooks),
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    for _ in 0..2 {
-        let error = harness
-            .run_local_controlled(
-                "original retry input",
-                Some(&target),
-                "pre-refusal",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("hook denied dispatch"));
-    }
-    assert!(provider.requests.lock().unwrap().is_empty());
-    assert_eq!(
-        std::fs::read(project.path().join("hook-attempts")).unwrap(),
-        b"xx"
-    );
-    let history = harness.history().await.unwrap();
-    assert_eq!(
-        history
-            .iter()
-            .filter(|message| message.role == "user")
-            .count(),
-        1
-    );
-    assert_eq!(history[0], Message::text("user", "original retry input"));
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
-}
-
-#[tokio::test]
-async fn rewritten_safe_retry_uses_its_own_public_turn_after_marker_or_later_answer() {
-    for intervening in [false, true] {
+    kuru_memory::test_support::closing(async {
         let project = tempfile::tempdir().unwrap();
         let provider = CapturingProvider::new(ReplyPlan::Text);
         let hooks = LifecycleHooks {
             pre_turn: vec![shell_hook(
-                "cat >/dev/null; if test ! -e denied-once; then : > denied-once; printf '%s' '{\"decision\":\"deny\"}'; else printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"input\":\"effective current input\"}}'; fi",
+                "cat >/dev/null; printf x >> hook-attempts; printf '%s' '{\"decision\":\"deny\"}'",
             )],
             ..LifecycleHooks::default()
         };
@@ -2154,177 +2147,234 @@ async fn rewritten_safe_retry_uses_its_own_public_turn_after_marker_or_later_ans
         .await
         .unwrap();
         let target = harness.topology.parts[0].id.clone();
-        harness
-            .run_local_controlled(
-                "original pending input",
-                Some(&target),
-                "safe-retry",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap_err();
-        assert!(provider.requests.lock().unwrap().is_empty());
-        if intervening {
-            harness
+        for _ in 0..2 {
+            let error = harness
                 .run_local_controlled(
-                    "later settled input",
+                    "original retry input",
                     Some(&target),
-                    "later-turn",
+                    "pre-refusal",
                     &CancellationToken::new(),
                 )
                 .await
-                .unwrap();
+                .unwrap_err();
+            assert!(error.to_string().contains("hook denied dispatch"));
         }
-        let before = provider.requests.lock().unwrap().len();
-        let retried = harness
-            .run_local_controlled(
-                "original pending input",
-                Some(&target),
-                "safe-retry",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(retried.output.text, "final answer");
-        {
-            let requests = provider.requests.lock().unwrap();
-            assert!(requests.len() > before);
-            // The retry's public-transcript context holds this turn's
-            // interrupted primary record; it projects the rewritten input.
-            assert!(requests[before..].iter().all(|request| {
-                let current = &request.messages
-                    [request.messages.len() - request.current_message_count.unwrap()..];
-                !request.instructions.contains("original pending input")
-                    && !current
-                        .iter()
-                        .any(|message| message.text_projection().contains("original pending input"))
-            }));
-            assert!(requests[before..].iter().any(|request| {
-                let current = &request.messages
-                    [request.messages.len() - request.current_message_count.unwrap()..];
-                current.iter().any(|message| {
-                    message
-                        .text_projection()
-                        .contains("effective current input")
-                })
-            }));
-        }
+        assert!(provider.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read(project.path().join("hook-attempts")).unwrap(),
+            b"xx"
+        );
         let history = harness.history().await.unwrap();
         assert_eq!(
             history
                 .iter()
-                .filter(|message| message.role == "user"
-                    && message.plain_text() == Some("original pending input"))
+                .filter(|message| message.role == "user")
                 .count(),
             1
         );
-        assert!(
-            history
-                .iter()
-                .any(|message| message.role == crate::INTERRUPTION_ROLE)
-        );
+        assert_eq!(history[0], Message::text("user", "original retry input"));
         harness.shutdown(false).await.unwrap();
-        crate::tests::close_stores([harness.memory.clone()]).await;
-    }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn rewritten_safe_retry_uses_its_own_public_turn_after_marker_or_later_answer() {
+    kuru_memory::test_support::closing(async {
+        for intervening in [false, true] {
+            let project = tempfile::tempdir().unwrap();
+            let provider = CapturingProvider::new(ReplyPlan::Text);
+            let hooks = LifecycleHooks {
+                pre_turn: vec![shell_hook(
+                    "cat >/dev/null; if test ! -e denied-once; then : > denied-once; printf '%s' '{\"decision\":\"deny\"}'; else printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"input\":\"effective current input\"}}'; fi",
+                )],
+                ..LifecycleHooks::default()
+            };
+            let mut harness = Harness::new(
+                config(hooks),
+                project.path(),
+                MemoryStore::temporary().await.unwrap(),
+                provider.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+            let target = harness.topology.parts[0].id.clone();
+            harness
+                .run_local_controlled(
+                    "original pending input",
+                    Some(&target),
+                    "safe-retry",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(provider.requests.lock().unwrap().is_empty());
+            if intervening {
+                harness
+                    .run_local_controlled(
+                        "later settled input",
+                        Some(&target),
+                        "later-turn",
+                        &CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let before = provider.requests.lock().unwrap().len();
+            let retried = harness
+                .run_local_controlled(
+                    "original pending input",
+                    Some(&target),
+                    "safe-retry",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(retried.output.text, "final answer");
+            {
+                let requests = provider.requests.lock().unwrap();
+                assert!(requests.len() > before);
+                // The retry's public-transcript context holds this turn's
+                // interrupted primary record; it projects the rewritten input.
+                assert!(requests[before..].iter().all(|request| {
+                    let current = &request.messages
+                        [request.messages.len() - request.current_message_count.unwrap()..];
+                    !request.instructions.contains("original pending input")
+                        && !current
+                            .iter()
+                            .any(|message| message.text_projection().contains("original pending input"))
+                }));
+                assert!(requests[before..].iter().any(|request| {
+                    let current = &request.messages
+                        [request.messages.len() - request.current_message_count.unwrap()..];
+                    current.iter().any(|message| {
+                        message
+                            .text_projection()
+                            .contains("effective current input")
+                    })
+                }));
+            }
+            let history = harness.history().await.unwrap();
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|message| message.role == "user"
+                        && message.plain_text() == Some("original pending input"))
+                    .count(),
+                1
+            );
+            assert!(
+                history
+                    .iter()
+                    .any(|message| message.role == crate::INTERRUPTION_ROLE)
+            );
+            harness.shutdown(false).await.unwrap();
+            crate::tests::close_stores([harness.memory.clone()]).await;
+        }
+    })
+    .await
 }
 
 #[tokio::test]
 async fn retry_that_no_longer_rewrites_projects_the_original_input_again() {
-    let project = tempfile::tempdir().unwrap();
-    let provider = CapturingProvider::new(ReplyPlan::Text);
-    // The first attempt is rewritten; every later run allows its input.
-    let hooks = LifecycleHooks {
-        pre_turn: vec![shell_hook(
-            "cat >/dev/null; if test ! -e rewrote-once; then : > rewrote-once; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"input\":\"stale rewrite\"}}'; else printf '%s' '{\"decision\":\"allow\"}'; fi",
-        )],
-        ..LifecycleHooks::default()
-    };
-    let mut harness = Harness::new(
-        config(hooks),
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    // Stop the first attempt after its rewrite is retained but before any
-    // provider dispatch, leaving a retryable turn with a rewrite record.
-    let stop = CancellationToken::new();
-    let mut events = harness.subscribe();
-    let stopper = tokio::spawn({
-        let stop = stop.clone();
-        async move {
-            loop {
-                match events.recv().await {
-                    Ok(event) if is_hook(&event, "pre_turn", Some("rewritten"), None) => {
-                        stop.cancel();
-                        return;
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let provider = CapturingProvider::new(ReplyPlan::Text);
+        // The first attempt is rewritten; every later run allows its input.
+        let hooks = LifecycleHooks {
+            pre_turn: vec![shell_hook(
+                "cat >/dev/null; if test ! -e rewrote-once; then : > rewrote-once; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"input\":\"stale rewrite\"}}'; else printf '%s' '{\"decision\":\"allow\"}'; fi",
+            )],
+            ..LifecycleHooks::default()
+        };
+        let mut harness = Harness::new(
+            config(hooks),
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        // Stop the first attempt after its rewrite is retained but before any
+        // provider dispatch, leaving a retryable turn with a rewrite record.
+        let stop = CancellationToken::new();
+        let mut events = harness.subscribe();
+        let stopper = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                loop {
+                    match events.recv().await {
+                        Ok(event) if is_hook(&event, "pre_turn", Some("rewritten"), None) => {
+                            stop.cancel();
+                            return;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                     }
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
-        }
-    });
-    harness
-        .run_local_controlled("stale original", Some(&target), "stale-retry", &stop)
-        .await
-        .unwrap_err();
-    stopper.await.unwrap();
-    assert!(provider.requests.lock().unwrap().is_empty());
-    let primary = kuru_memory::public_turn_node_id(&harness.session.id, "stale-retry").unwrap();
-    let key = crate::engine::pre_turn_rewrite_key(&harness.scope, &primary);
-    assert_eq!(
-        harness.memory.get(&key).await.unwrap().unwrap()["input"],
-        "stale rewrite"
-    );
+        });
+        harness
+            .run_local_controlled("stale original", Some(&target), "stale-retry", &stop)
+            .await
+            .unwrap_err();
+        stopper.await.unwrap();
+        assert!(provider.requests.lock().unwrap().is_empty());
+        let primary = kuru_memory::public_turn_node_id(&harness.session.id, "stale-retry").unwrap();
+        let key = crate::engine::pre_turn_rewrite_key(&harness.scope, &primary);
+        assert_eq!(
+            harness.memory.get(&key).await.unwrap().unwrap()["input"],
+            "stale rewrite"
+        );
 
-    // The retry is allowed unchanged, so the model receives the original.
-    harness
-        .run_local_controlled(
-            "stale original",
-            Some(&target),
-            "stale-retry",
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        harness.memory.get(&key).await.unwrap().unwrap()["cleared"],
-        true
-    );
-    let later_from = provider.requests.lock().unwrap().len();
-    harness
-        .run_local_controlled(
-            "later input",
-            Some(&target),
-            "after-stale-retry",
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    let requests = provider.requests.lock().unwrap().clone();
-    assert!(requests[..later_from].iter().any(|request| {
-        request
-            .messages
-            .iter()
-            .any(|message| message == &Message::text("user", "stale original"))
-    }));
-    assert!(requests.len() > later_from);
-    // Later projections show what the retried turn's model actually received.
-    assert!(requests[later_from..].iter().all(|request| {
-        request.instructions.contains("stale original")
-            && !request.instructions.contains("stale rewrite")
-    }));
-    assert!(requests.iter().all(|request| {
-        !request.instructions.contains("stale rewrite")
-            && !request
+        // The retry is allowed unchanged, so the model receives the original.
+        harness
+            .run_local_controlled(
+                "stale original",
+                Some(&target),
+                "stale-retry",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            harness.memory.get(&key).await.unwrap().unwrap()["cleared"],
+            true
+        );
+        let later_from = provider.requests.lock().unwrap().len();
+        harness
+            .run_local_controlled(
+                "later input",
+                Some(&target),
+                "after-stale-retry",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let requests = provider.requests.lock().unwrap().clone();
+        assert!(requests[..later_from].iter().any(|request| {
+            request
                 .messages
                 .iter()
-                .any(|message| message.text_projection().contains("stale rewrite"))
-    }));
-    harness.shutdown(false).await.unwrap();
-    crate::tests::close_stores([harness.memory.clone()]).await;
+                .any(|message| message == &Message::text("user", "stale original"))
+        }));
+        assert!(requests.len() > later_from);
+        // Later projections show what the retried turn's model actually received.
+        assert!(requests[later_from..].iter().all(|request| {
+            request.instructions.contains("stale original")
+                && !request.instructions.contains("stale rewrite")
+        }));
+        assert!(requests.iter().all(|request| {
+            !request.instructions.contains("stale rewrite")
+                && !request
+                    .messages
+                    .iter()
+                    .any(|message| message.text_projection().contains("stale rewrite"))
+        }));
+        harness.shutdown(false).await.unwrap();
+    })
+    .await
 }

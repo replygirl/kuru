@@ -92,80 +92,83 @@ impl Provider for TwoStaleFileCalls {
 
 #[tokio::test]
 async fn newly_activated_instructions_settle_stale_parallel_calls_without_effects() -> Result<()> {
-    let project = tempfile::tempdir().unwrap();
-    std::fs::create_dir(project.path().join("src")).unwrap();
-    #[cfg_attr(
-        not(unix),
-        expect(
-            unused_mut,
-            reason = "only the Unix pre-tool hook below mutates the configuration"
-        )
-    )]
-    let mut config = Config {
-        mode: Mode::Freudian,
-        provider: "demo".into(),
-        model: "demo".into(),
-        allow_write: true,
-        max_rounds: 1,
-        dream_every: 0,
-        dream_on_exit: false,
-        ..Config::default()
-    };
-    #[cfg(unix)]
-    config.hooks.pre_tool.push(kuru_core::HookCommand {
-        command: "/bin/sh".into(),
-        args: vec![
-            "-c".into(),
-            "cat >/dev/null; printf x >> pre-tool-hook-ran; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"name\":\"file_write\",\"arguments\":{\"path\":\"src/first.txt\",\"content\":\"hook-rewritten\"}}}'".into(),
-        ],
-        timeout_ms: 5_000,
-        max_output_bytes: 64 * 1024,
-    });
-    let gate = Arc::new(FirstPathInstructions {
-        active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    });
-    let tools = ToolHost::new(project.path(), &config)?.with_instruction_gate(gate);
-    let provider = Arc::new(TwoStaleFileCalls {
-        speaking_requests: Mutex::new(Vec::new()),
-    });
-    let mut harness = Harness::with_tool_host_and_instructions(
-        config,
-        project.path(),
-        String::new(),
-        MemoryStore::temporary().await?,
-        provider.clone(),
-        None,
-        tools,
-    )
-    .await?;
-    let target = harness.topology.parts[0].id.clone();
-    let output = harness
-        .run_controlled(
-            "write after review",
-            Some(&target),
-            "nested-replan",
-            &CancellationToken::new(),
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("src")).unwrap();
+        #[cfg_attr(
+            not(unix),
+            expect(
+                unused_mut,
+                reason = "only the Unix pre-tool hook below mutates the configuration"
+            )
+        )]
+        let mut config = Config {
+            mode: Mode::Freudian,
+            provider: "demo".into(),
+            model: "demo".into(),
+            allow_write: true,
+            max_rounds: 1,
+            dream_every: 0,
+            dream_on_exit: false,
+            ..Config::default()
+        };
+        #[cfg(unix)]
+        config.hooks.pre_tool.push(kuru_core::HookCommand {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "cat >/dev/null; printf x >> pre-tool-hook-ran; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"name\":\"file_write\",\"arguments\":{\"path\":\"src/first.txt\",\"content\":\"hook-rewritten\"}}}'".into(),
+            ],
+            timeout_ms: 5_000,
+            max_output_bytes: 64 * 1024,
+        });
+        let gate = Arc::new(FirstPathInstructions {
+            active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let tools = ToolHost::new(project.path(), &config)?.with_instruction_gate(gate);
+        let provider = Arc::new(TwoStaleFileCalls {
+            speaking_requests: Mutex::new(Vec::new()),
+        });
+        let mut harness = Harness::with_tool_host_and_instructions(
+            config,
+            project.path(),
+            String::new(),
+            MemoryStore::temporary().await?,
+            provider.clone(),
+            None,
+            tools,
         )
         .await?;
-    assert_eq!(output.text, "replanned");
-    assert!(!project.path().join("src/first.txt").exists());
-    assert!(!project.path().join("src/second.txt").exists());
-    #[cfg(unix)]
-    assert_eq!(
-        std::fs::read(project.path().join("pre-tool-hook-ran"))?,
-        b"x"
-    );
-    {
-        let requests = provider.speaking_requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(!requests[0].contains("new path-qualified instruction"));
-        assert!(requests[1].contains("new path-qualified instruction"));
-    }
-    let file_results = output.events.iter().filter(|event| matches!(event, Event::ToolSettled { observation, .. } if observation.name == "file_write")).count();
-    assert_eq!(file_results, 2);
-    harness.shutdown(false).await?;
-    harness.memory.close().await?;
-    Ok(())
+        let target = harness.topology.parts[0].id.clone();
+        let output = harness
+            .run_controlled(
+                "write after review",
+                Some(&target),
+                "nested-replan",
+                &CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(output.text, "replanned");
+        assert!(!project.path().join("src/first.txt").exists());
+        assert!(!project.path().join("src/second.txt").exists());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read(project.path().join("pre-tool-hook-ran"))?,
+            b"x"
+        );
+        {
+            let requests = provider.speaking_requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(!requests[0].contains("new path-qualified instruction"));
+            assert!(requests[1].contains("new path-qualified instruction"));
+        }
+        let file_results = output.events.iter().filter(|event| matches!(event, Event::ToolSettled { observation, .. } if observation.name == "file_write")).count();
+        assert_eq!(file_results, 2);
+        harness.shutdown(false).await?;
+        harness.memory.close().await?;
+        Ok(())
+    })
+    .await
 }
 
 struct OneExternalCall {
@@ -278,203 +281,224 @@ fn settled(output: &crate::TurnOutput) -> Vec<ToolOutcome> {
 
 #[tokio::test]
 async fn outbound_a2a_allow_ask_and_deny_have_real_network_effect_boundaries() {
-    for (action, expected, outcome) in [
-        (PermissionAction::Allow, 1, ToolOutcome::Ok),
-        (PermissionAction::Ask, 0, ToolOutcome::Denied),
-        (PermissionAction::Deny, 0, ToolOutcome::Denied),
-    ] {
-        let (url, hits, server) = peer().await;
-        let (_project, mut harness) = harness(config(url, Some(action)), false).await;
-        let target = harness.topology.parts[0].id.clone();
-        let output = harness
-            .run_controlled(
-                "review once",
-                Some(&target),
-                "one-a2a",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(hits.load(Ordering::SeqCst), expected, "{action:?}");
-        assert_eq!(settled(&output), [outcome], "{action:?}");
-        harness.shutdown(false).await.unwrap();
-        harness.memory.close().await.unwrap();
-        server.abort();
-    }
+    kuru_memory::test_support::closing(async {
+        for (action, expected, outcome) in [
+            (PermissionAction::Allow, 1, ToolOutcome::Ok),
+            (PermissionAction::Ask, 0, ToolOutcome::Denied),
+            (PermissionAction::Deny, 0, ToolOutcome::Denied),
+        ] {
+            let (url, hits, server) = peer().await;
+            let (_project, mut harness) = harness(config(url, Some(action)), false).await;
+            let target = harness.topology.parts[0].id.clone();
+            let output = harness
+                .run_controlled(
+                    "review once",
+                    Some(&target),
+                    "one-a2a",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(hits.load(Ordering::SeqCst), expected, "{action:?}");
+            assert_eq!(settled(&output), [outcome], "{action:?}");
+            harness.shutdown(false).await.unwrap();
+            harness.memory.close().await.unwrap();
+            server.abort();
+        }
+    })
+    .await
 }
 
 #[tokio::test]
 async fn foreground_approval_is_operation_scoped_and_completed_retry_has_no_effect() {
-    let (url, hits, server) = peer().await;
-    let (_project, mut harness) = harness(config(url, Some(PermissionAction::Ask)), false).await;
-    let target = harness.topology.parts[0].id.clone();
-    let (sender, mut receiver) = mpsc::channel::<ApprovalRequest>(1);
-    let decision = tokio::spawn(async move {
-        let request = receiver.recv().await.unwrap();
-        assert_eq!(request.display.scope, "external agent reviewer");
-        request.reply.send(ApprovalAnswer::Once).unwrap();
-    });
-    let first = harness
-        .run_local_controlled_with_approval(
-            "review once",
-            Some(&target),
-            "foreground-a2a",
-            &CancellationToken::new(),
-            ApprovalSender::new(sender),
-        )
-        .await
-        .unwrap();
-    decision.await.unwrap();
-    assert_eq!(settled(&first.output), [ToolOutcome::Ok]);
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
-    let (unused, _receiver) = mpsc::channel(1);
-    let reused = harness
-        .retry_last_with_approval(&CancellationToken::new(), ApprovalSender::new(unused))
-        .await
-        .unwrap();
-    assert!(reused.reused);
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
-    harness.shutdown(false).await.unwrap();
-    harness.memory.close().await.unwrap();
-    server.abort();
+    kuru_memory::test_support::closing(async {
+        let (url, hits, server) = peer().await;
+        let (_project, mut harness) =
+            harness(config(url, Some(PermissionAction::Ask)), false).await;
+        let target = harness.topology.parts[0].id.clone();
+        let (sender, mut receiver) = mpsc::channel::<ApprovalRequest>(1);
+        let decision = tokio::spawn(async move {
+            let request = receiver.recv().await.unwrap();
+            assert_eq!(request.display.scope, "external agent reviewer");
+            request.reply.send(ApprovalAnswer::Once).unwrap();
+        });
+        let first = harness
+            .run_local_controlled_with_approval(
+                "review once",
+                Some(&target),
+                "foreground-a2a",
+                &CancellationToken::new(),
+                ApprovalSender::new(sender),
+            )
+            .await
+            .unwrap();
+        decision.await.unwrap();
+        assert_eq!(settled(&first.output), [ToolOutcome::Ok]);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let (unused, _receiver) = mpsc::channel(1);
+        let reused = harness
+            .retry_last_with_approval(&CancellationToken::new(), ApprovalSender::new(unused))
+            .await
+            .unwrap();
+        assert!(reused.reused);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        harness.shutdown(false).await.unwrap();
+        harness.memory.close().await.unwrap();
+        server.abort();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn deliberation_a2a_is_refused_as_an_unoffered_tool_without_dispatch() {
-    // Deliberation offers only cognition tools; a proposed `a2a_send` is
-    // settled as refused before permission evaluation or network dispatch.
-    let (url, hits, server) = peer().await;
-    let (_project, mut harness) = harness(config(url, Some(PermissionAction::Ask)), true).await;
-    let target = harness.topology.parts[0].id.clone();
-    let output = harness
-        .run_controlled(
-            "deliberate",
-            Some(&target),
-            "internal-a2a",
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(hits.load(Ordering::SeqCst), 0);
-    assert_eq!(settled(&output), [ToolOutcome::Error]);
-    harness.shutdown(false).await.unwrap();
-    harness.memory.close().await.unwrap();
-    server.abort();
+    kuru_memory::test_support::closing(async {
+        // Deliberation offers only cognition tools; a proposed `a2a_send` is
+        // settled as refused before permission evaluation or network dispatch.
+        let (url, hits, server) = peer().await;
+        let (_project, mut harness) = harness(config(url, Some(PermissionAction::Ask)), true).await;
+        let target = harness.topology.parts[0].id.clone();
+        let output = harness
+            .run_controlled(
+                "deliberate",
+                Some(&target),
+                "internal-a2a",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(settled(&output), [ToolOutcome::Error]);
+        harness.shutdown(false).await.unwrap();
+        harness.memory.close().await.unwrap();
+        server.abort();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn closed_foreground_approval_refuses_without_network_dispatch() {
-    let (url, hits, server) = peer().await;
-    let (_project, mut harness) = harness(config(url, Some(PermissionAction::Ask)), false).await;
-    let target = harness.topology.parts[0].id.clone();
-    let (sender, mut receiver) = mpsc::channel::<ApprovalRequest>(1);
-    let close = tokio::spawn(async move {
-        let request = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+    kuru_memory::test_support::closing(async {
+        let (url, hits, server) = peer().await;
+        let (_project, mut harness) =
+            harness(config(url, Some(PermissionAction::Ask)), false).await;
+        let target = harness.topology.parts[0].id.clone();
+        let (sender, mut receiver) = mpsc::channel::<ApprovalRequest>(1);
+        let close = tokio::spawn(async move {
+            let request = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.display.scope, "external agent reviewer");
+            drop(request);
+            drop(receiver);
+        });
+        let result = harness
+            .run_local_controlled_with_approval(
+                "review once",
+                Some(&target),
+                "closed-approval",
+                &CancellationToken::new(),
+                ApprovalSender::new(sender),
+            )
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(request.display.scope, "external agent reviewer");
-        drop(request);
-        drop(receiver);
-    });
-    let result = harness
-        .run_local_controlled_with_approval(
-            "review once",
-            Some(&target),
-            "closed-approval",
-            &CancellationToken::new(),
-            ApprovalSender::new(sender),
-        )
-        .await
-        .unwrap();
-    close.await.unwrap();
-    assert_eq!(settled(&result.output), [ToolOutcome::Denied]);
-    assert_eq!(hits.load(Ordering::SeqCst), 0);
-    harness.shutdown(false).await.unwrap();
-    harness.memory.close().await.unwrap();
-    server.abort();
+        close.await.unwrap();
+        assert_eq!(settled(&result.output), [ToolOutcome::Denied]);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        harness.shutdown(false).await.unwrap();
+        harness.memory.close().await.unwrap();
+        server.abort();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn cancelled_pending_approval_cannot_dispatch_later() {
-    let (url, hits, server) = peer().await;
-    let (_project, mut harness) = harness(config(url, Some(PermissionAction::Ask)), false).await;
-    let target = harness.topology.parts[0].id.clone();
-    let cancellation = CancellationToken::new();
-    let (sender, mut receiver) = mpsc::channel::<ApprovalRequest>(1);
-    let error = {
-        let run = harness.run_local_controlled_with_approval(
-            "review once",
-            Some(&target),
-            "cancelled-approval",
-            &cancellation,
-            ApprovalSender::new(sender),
-        );
-        tokio::pin!(run);
-        let request = tokio::select! {
-            request = tokio::time::timeout(Duration::from_secs(10), receiver.recv()) =>
-                request.unwrap().unwrap(),
-            result = &mut run => panic!("turn settled before asking permission: {result:?}"),
+    kuru_memory::test_support::closing(async {
+        let (url, hits, server) = peer().await;
+        let (_project, mut harness) =
+            harness(config(url, Some(PermissionAction::Ask)), false).await;
+        let target = harness.topology.parts[0].id.clone();
+        let cancellation = CancellationToken::new();
+        let (sender, mut receiver) = mpsc::channel::<ApprovalRequest>(1);
+        let error = {
+            let run = harness.run_local_controlled_with_approval(
+                "review once",
+                Some(&target),
+                "cancelled-approval",
+                &cancellation,
+                ApprovalSender::new(sender),
+            );
+            tokio::pin!(run);
+            let request = tokio::select! {
+                request = tokio::time::timeout(Duration::from_secs(10), receiver.recv()) =>
+                    request.unwrap().unwrap(),
+                result = &mut run => panic!("turn settled before asking permission: {result:?}"),
+            };
+            cancellation.cancel();
+            let error = run.await.unwrap_err();
+            assert!(request.reply.send(ApprovalAnswer::Once).is_err());
+            error
         };
-        cancellation.cancel();
-        let error = run.await.unwrap_err();
-        assert!(request.reply.send(ApprovalAnswer::Once).is_err());
-        error
-    };
-    assert!(error.to_string().contains("turn cancelled"), "{error:#}");
-    assert_eq!(hits.load(Ordering::SeqCst), 0);
-    harness.shutdown(false).await.unwrap();
-    harness.memory.close().await.unwrap();
-    server.abort();
+        assert!(error.to_string().contains("turn cancelled"), "{error:#}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        harness.shutdown(false).await.unwrap();
+        harness.memory.close().await.unwrap();
+        server.abort();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn new_harness_clears_grants_from_a_reused_permission_service() {
-    let project = tempfile::tempdir().unwrap();
-    let config = config("http://127.0.0.1:1/".into(), Some(PermissionAction::Ask));
-    let tools = ToolHost::new(project.path(), &config).unwrap();
-    let service = tools.permission_service();
-    let arguments = json!({"agent":"reviewer","message":"one explicit request"});
-    let invocation = PermissionInvocation::new(
-        PermissionSelector::a2a("reviewer").unwrap(),
-        None,
-        &arguments,
-    )
-    .unwrap();
-    let (sender, mut receiver) = mpsc::channel::<ApprovalRequest>(1);
-    let decision = tokio::spawn(async move {
-        receiver
-            .recv()
-            .await
-            .unwrap()
-            .reply
-            .send(ApprovalAnswer::Session)
-            .unwrap();
-    });
-    assert_eq!(
-        service
-            .authorize(&invocation, Some(&ApprovalSender::new(sender)))
-            .await
-            .unwrap(),
-        PermissionOutcome::SessionAuthorized
-    );
-    decision.await.unwrap();
-    assert_eq!(service.inspect().unwrap().session.len(), 1);
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let config = config("http://127.0.0.1:1/".into(), Some(PermissionAction::Ask));
+        let tools = ToolHost::new(project.path(), &config).unwrap();
+        let service = tools.permission_service();
+        let arguments = json!({"agent":"reviewer","message":"one explicit request"});
+        let invocation = PermissionInvocation::new(
+            PermissionSelector::a2a("reviewer").unwrap(),
+            None,
+            &arguments,
+        )
+        .unwrap();
+        let (sender, mut receiver) = mpsc::channel::<ApprovalRequest>(1);
+        let decision = tokio::spawn(async move {
+            receiver
+                .recv()
+                .await
+                .unwrap()
+                .reply
+                .send(ApprovalAnswer::Session)
+                .unwrap();
+        });
+        assert_eq!(
+            service
+                .authorize(&invocation, Some(&ApprovalSender::new(sender)))
+                .await
+                .unwrap(),
+            PermissionOutcome::SessionAuthorized
+        );
+        decision.await.unwrap();
+        assert_eq!(service.inspect().unwrap().session.len(), 1);
 
-    let mut harness = Harness::with_tool_host(
-        config,
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider(false),
-        None,
-        tools,
-    )
+        let mut harness = Harness::with_tool_host(
+            config,
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            provider(false),
+            None,
+            tools,
+        )
+        .await
+        .unwrap();
+        assert!(service.inspect().unwrap().session.is_empty());
+        assert!(Arc::ptr_eq(&service, &harness.permission_service()));
+        harness.shutdown(false).await.unwrap();
+        harness.memory.close().await.unwrap();
+    })
     .await
-    .unwrap();
-    assert!(service.inspect().unwrap().session.is_empty());
-    assert!(Arc::ptr_eq(&service, &harness.permission_service()));
-    harness.shutdown(false).await.unwrap();
-    harness.memory.close().await.unwrap();
 }
 
 async fn grant_session_for_test(
@@ -507,128 +531,137 @@ async fn grant_session_for_test(
 
 #[tokio::test]
 async fn resume_new_and_fork_clear_session_only_tool_authority() {
-    let project = tempfile::tempdir().unwrap();
-    let config = config("http://127.0.0.1:1/".into(), Some(PermissionAction::Ask));
-    let tools = ToolHost::new(project.path(), &config).unwrap();
-    let service = tools.permission_service();
-    let mut harness = Harness::with_tool_host(
-        config,
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        provider(false),
-        None,
-        tools,
-    )
-    .await
-    .unwrap();
-    let source = harness.session.id.clone();
-    let target = harness.topology.parts[0].id.clone();
-    harness
-        .run_controlled(
-            "one settled fork boundary",
-            Some(&target),
-            "permission-boundary",
-            &CancellationToken::new(),
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let config = config("http://127.0.0.1:1/".into(), Some(PermissionAction::Ask));
+        let tools = ToolHost::new(project.path(), &config).unwrap();
+        let service = tools.permission_service();
+        let mut harness = Harness::with_tool_host(
+            config,
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            provider(false),
+            None,
+            tools,
         )
         .await
         .unwrap();
-    let node = harness
-        .memory
-        .session_catalog_record(&source)
-        .await
-        .unwrap()
-        .unwrap()
-        .head_node_id
+        let source = harness.session.id.clone();
+        let target = harness.topology.parts[0].id.clone();
+        harness
+            .run_controlled(
+                "one settled fork boundary",
+                Some(&target),
+                "permission-boundary",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let node = harness
+            .memory
+            .session_catalog_record(&source)
+            .await
+            .unwrap()
+            .unwrap()
+            .head_node_id
+            .unwrap();
+        let arguments = json!({"agent":"reviewer","message":"one explicit request"});
+        let invocation = PermissionInvocation::new(
+            PermissionSelector::a2a("reviewer").unwrap(),
+            None,
+            &arguments,
+        )
         .unwrap();
-    let arguments = json!({"agent":"reviewer","message":"one explicit request"});
-    let invocation = PermissionInvocation::new(
-        PermissionSelector::a2a("reviewer").unwrap(),
-        None,
-        &arguments,
-    )
-    .unwrap();
 
-    grant_session_for_test(&service, &invocation).await;
-    let fresh = harness.new_session().await.unwrap();
-    assert_ne!(fresh, source);
-    assert_eq!(
-        service.authorize(&invocation, None).await.unwrap(),
-        PermissionOutcome::PermissionRequired
-    );
-    grant_session_for_test(&service, &invocation).await;
-    harness.resume_session(&source).await.unwrap();
-    assert_eq!(
-        service.authorize(&invocation, None).await.unwrap(),
-        PermissionOutcome::PermissionRequired
-    );
-    grant_session_for_test(&service, &invocation).await;
-    let child = harness
-        .fork_session(&source, &node, "permission fork")
-        .await
-        .unwrap();
-    assert_ne!(child, source);
-    assert_eq!(
-        service.authorize(&invocation, None).await.unwrap(),
-        PermissionOutcome::PermissionRequired
-    );
-    harness.shutdown(false).await.unwrap();
-    harness.memory.close().await.unwrap();
+        grant_session_for_test(&service, &invocation).await;
+        let fresh = harness.new_session().await.unwrap();
+        assert_ne!(fresh, source);
+        assert_eq!(
+            service.authorize(&invocation, None).await.unwrap(),
+            PermissionOutcome::PermissionRequired
+        );
+        grant_session_for_test(&service, &invocation).await;
+        harness.resume_session(&source).await.unwrap();
+        assert_eq!(
+            service.authorize(&invocation, None).await.unwrap(),
+            PermissionOutcome::PermissionRequired
+        );
+        grant_session_for_test(&service, &invocation).await;
+        let child = harness
+            .fork_session(&source, &node, "permission fork")
+            .await
+            .unwrap();
+        assert_ne!(child, source);
+        assert_eq!(
+            service.authorize(&invocation, None).await.unwrap(),
+            PermissionOutcome::PermissionRequired
+        );
+        harness.shutdown(false).await.unwrap();
+        harness.memory.close().await.unwrap();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn changed_a2a_endpoint_cannot_reuse_the_frozen_alias_grant() {
-    let (original_url, original_hits, original_server) = peer().await;
-    let (changed_url, changed_hits, changed_server) = peer().await;
-    let original_config = config(original_url, Some(PermissionAction::Allow));
-    let (_project, mut harness) = harness(original_config, false).await;
-    harness
-        .config
-        .external_agents
-        .insert("reviewer".into(), changed_url);
-    let target = harness.topology.parts[0].id.clone();
-    let output = harness
-        .run_controlled(
-            "review once",
-            Some(&target),
-            "changed-route",
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(settled(&output), [ToolOutcome::Error]);
-    assert_eq!(original_hits.load(Ordering::SeqCst), 0);
-    assert_eq!(changed_hits.load(Ordering::SeqCst), 0);
-    harness.shutdown(false).await.unwrap();
-    harness.memory.close().await.unwrap();
-    original_server.abort();
-    changed_server.abort();
+    kuru_memory::test_support::closing(async {
+        let (original_url, original_hits, original_server) = peer().await;
+        let (changed_url, changed_hits, changed_server) = peer().await;
+        let original_config = config(original_url, Some(PermissionAction::Allow));
+        let (_project, mut harness) = harness(original_config, false).await;
+        harness
+            .config
+            .external_agents
+            .insert("reviewer".into(), changed_url);
+        let target = harness.topology.parts[0].id.clone();
+        let output = harness
+            .run_controlled(
+                "review once",
+                Some(&target),
+                "changed-route",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled(&output), [ToolOutcome::Error]);
+        assert_eq!(original_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(changed_hits.load(Ordering::SeqCst), 0);
+        harness.shutdown(false).await.unwrap();
+        harness.memory.close().await.unwrap();
+        original_server.abort();
+        changed_server.abort();
+    })
+    .await
 }
 
 #[tokio::test]
 async fn injected_host_with_a_different_route_is_rejected_at_construction() {
-    let project = tempfile::tempdir().unwrap();
-    let original = config("http://127.0.0.1:1/".into(), Some(PermissionAction::Allow));
-    let changed = config("http://127.0.0.1:2/".into(), Some(PermissionAction::Allow));
-    let tools = ToolHost::new(project.path(), &original).unwrap();
-    let memory = MemoryStore::temporary().await.unwrap();
-    let error = Harness::with_tool_host(
-        changed,
-        project.path(),
-        memory.clone(),
-        provider(false),
-        None,
-        tools,
-    )
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir().unwrap();
+        let original = config("http://127.0.0.1:1/".into(), Some(PermissionAction::Allow));
+        let changed = config("http://127.0.0.1:2/".into(), Some(PermissionAction::Allow));
+        let tools = ToolHost::new(project.path(), &original).unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let error = Harness::with_tool_host(
+            changed,
+            project.path(),
+            memory.clone(),
+            provider(false),
+            None,
+            tools,
+        )
+        .await
+        .err()
+        .expect("mismatched host must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("permission service does not match"),
+            "{error:#}"
+        );
+        memory.close().await.unwrap();
+    })
     .await
-    .err()
-    .expect("mismatched host must be rejected");
-    assert!(
-        error
-            .to_string()
-            .contains("permission service does not match"),
-        "{error:#}"
-    );
-    memory.close().await.unwrap();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -704,91 +737,94 @@ impl Provider for RefusalAwareProvider {
 
 #[tokio::test]
 async fn unattended_provider_receives_typed_refusals_without_gaining_approval_authority() {
-    for action in [PermissionAction::Ask, PermissionAction::Deny] {
-        let (url, hits, server) = peer().await;
-        let mut config = config(url, Some(action));
-        config.max_rounds = 2;
-        config.max_tool_calls = 2;
-        config.permissions.push(PermissionRule {
-            action,
-            selector: PermissionSelector::native(NativeTool::FileWrite),
-            path: None,
-        });
-        let project = tempfile::tempdir().unwrap();
-        let marker = project.path().join("model-approval-must-not-write.txt");
-        let provider = Arc::new(RefusalAwareProvider {
-            speaking_round: AtomicUsize::new(0),
-            receipts: Mutex::new(vec![]),
-        });
-        let mut harness = Harness::new(
-            config,
-            project.path(),
-            MemoryStore::temporary().await.unwrap(),
-            provider.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-        let target = harness.topology.parts[0].id.clone();
-        let output = harness
-            .run_controlled(
-                "try two external operations",
-                Some(&target),
-                "typed-refusal-continuation",
-                &CancellationToken::new(),
+    kuru_memory::test_support::closing(async {
+        for action in [PermissionAction::Ask, PermissionAction::Deny] {
+            let (url, hits, server) = peer().await;
+            let mut config = config(url, Some(action));
+            config.max_rounds = 2;
+            config.max_tool_calls = 2;
+            config.permissions.push(PermissionRule {
+                action,
+                selector: PermissionSelector::native(NativeTool::FileWrite),
+                path: None,
+            });
+            let project = tempfile::tempdir().unwrap();
+            let marker = project.path().join("model-approval-must-not-write.txt");
+            let provider = Arc::new(RefusalAwareProvider {
+                speaking_round: AtomicUsize::new(0),
+                receipts: Mutex::new(vec![]),
+            });
+            let mut harness = Harness::new(
+                config,
+                project.path(),
+                MemoryStore::temporary().await.unwrap(),
+                provider.clone(),
+                None,
             )
             .await
             .unwrap();
-        assert_eq!(
-            provider.speaking_round.load(Ordering::SeqCst),
-            3,
-            "{action:?}"
-        );
-        let receipts = provider.receipts.lock().unwrap().clone();
-        assert_eq!(receipts.len(), 2, "{action:?}: {receipts:?}");
-        let expected = match action {
-            PermissionAction::Ask => "tool permission required",
-            PermissionAction::Deny => "tool permission denied",
-            PermissionAction::Allow => unreachable!(),
-        };
-        for (receipt, call_id) in receipts.iter().zip(["refused-file", "refused-a2a"]) {
-            assert_eq!(receipt.call_id, call_id, "{action:?}");
-            assert!(receipt.is_error, "{action:?}: {receipt:?}");
-            assert!(
-                receipt.output.as_str().unwrap().contains(expected),
-                "{action:?}: {receipt:?}"
+            let target = harness.topology.parts[0].id.clone();
+            let output = harness
+                .run_controlled(
+                    "try two external operations",
+                    Some(&target),
+                    "typed-refusal-continuation",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                provider.speaking_round.load(Ordering::SeqCst),
+                3,
+                "{action:?}"
             );
+            let receipts = provider.receipts.lock().unwrap().clone();
+            assert_eq!(receipts.len(), 2, "{action:?}: {receipts:?}");
+            let expected = match action {
+                PermissionAction::Ask => "tool permission required",
+                PermissionAction::Deny => "tool permission denied",
+                PermissionAction::Allow => unreachable!(),
+            };
+            for (receipt, call_id) in receipts.iter().zip(["refused-file", "refused-a2a"]) {
+                assert_eq!(receipt.call_id, call_id, "{action:?}");
+                assert!(receipt.is_error, "{action:?}: {receipt:?}");
+                assert!(
+                    receipt.output.as_str().unwrap().contains(expected),
+                    "{action:?}: {receipt:?}"
+                );
+            }
+            let outcomes = output
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::ToolSettled { observation, .. }
+                        if matches!(observation.name.as_str(), "file_write" | "a2a_send") =>
+                    {
+                        Some(observation.outcome)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                outcomes,
+                [ToolOutcome::Denied, ToolOutcome::Denied],
+                "{action:?}"
+            );
+            assert!(
+                !marker.exists(),
+                "{action:?}: model-approved file write took effect"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "{action:?}: model-approved HTTP call took effect"
+            );
+            harness.shutdown(false).await.unwrap();
+            harness.memory.close().await.unwrap();
+            server.abort();
         }
-        let outcomes = output
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolSettled { observation, .. }
-                    if matches!(observation.name.as_str(), "file_write" | "a2a_send") =>
-                {
-                    Some(observation.outcome)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            outcomes,
-            [ToolOutcome::Denied, ToolOutcome::Denied],
-            "{action:?}"
-        );
-        assert!(
-            !marker.exists(),
-            "{action:?}: model-approved file write took effect"
-        );
-        assert_eq!(
-            hits.load(Ordering::SeqCst),
-            0,
-            "{action:?}: model-approved HTTP call took effect"
-        );
-        harness.shutdown(false).await.unwrap();
-        harness.memory.close().await.unwrap();
-        server.abort();
-    }
+    })
+    .await
 }
 
 struct DreamExternalCalls;
@@ -823,31 +859,34 @@ impl Provider for DreamExternalCalls {
 
 #[tokio::test]
 async fn dream_proposed_external_calls_never_prompt_or_dispatch() {
-    let (url, hits, server) = peer().await;
-    let project = tempfile::tempdir().unwrap();
-    let marker = project.path().join("dream-must-not-write.txt");
-    let mut harness = Harness::new(
-        config(url, Some(PermissionAction::Ask)),
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        Arc::new(DreamExternalCalls),
-        None,
-    )
+    kuru_memory::test_support::closing(async {
+        let (url, hits, server) = peer().await;
+        let project = tempfile::tempdir().unwrap();
+        let marker = project.path().join("dream-must-not-write.txt");
+        let mut harness = Harness::new(
+            config(url, Some(PermissionAction::Ask)),
+            project.path(),
+            MemoryStore::temporary().await.unwrap(),
+            Arc::new(DreamExternalCalls),
+            None,
+        )
+        .await
+        .unwrap();
+        let report = harness.dream().await.unwrap();
+        assert!(report.accepted.is_empty());
+        assert!(report.rejected.len() >= 2, "{report:?}");
+        assert!(
+            report
+                .rejected
+                .iter()
+                .all(|reason| reason.contains("tool is not offered in this phase")),
+            "{report:?}"
+        );
+        assert!(!marker.exists(), "dream file call took effect");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "dream A2A call took effect");
+        harness.shutdown(false).await.unwrap();
+        harness.memory.close().await.unwrap();
+        server.abort();
+    })
     .await
-    .unwrap();
-    let report = harness.dream().await.unwrap();
-    assert!(report.accepted.is_empty());
-    assert!(report.rejected.len() >= 2, "{report:?}");
-    assert!(
-        report
-            .rejected
-            .iter()
-            .all(|reason| reason.contains("tool is not offered in this phase")),
-        "{report:?}"
-    );
-    assert!(!marker.exists(), "dream file call took effect");
-    assert_eq!(hits.load(Ordering::SeqCst), 0, "dream A2A call took effect");
-    harness.shutdown(false).await.unwrap();
-    harness.memory.close().await.unwrap();
-    server.abort();
 }

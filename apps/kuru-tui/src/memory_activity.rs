@@ -1142,74 +1142,83 @@ mod tests {
 
     #[tokio::test]
     async fn queued_stages_draw_once_and_a_short_wait_keeps_only_its_marker() {
-        let (sender, receiver) = mpsc::channel(16);
-        for stage in [
-            Stage::WaitingForProjectOwnership,
-            Stage::StartingMemoryService,
-            Stage::PreparingDatabase,
-        ] {
-            sender.try_send(stage).unwrap();
-        }
-        let opening = async move {
-            tokio::task::yield_now().await;
-            sender.send(Stage::Ready).await.unwrap();
-            Ok::<_, anyhow::Error>(7)
-        };
-        let (mut output, sentences, stderr) = lines(true);
-        let value = drive(opening, receiver, &mut output, false).await.unwrap();
-        assert_eq!(value, 7);
-        assert_eq!(sentences.text(), format!("{OPENING}\n"));
-        let events: Vec<_> = markers_in(&stderr.text())
-            .into_iter()
-            .map(|(event, _)| event)
-            .collect();
-        assert_eq!(events, ["open-start", "waiting-ownership", "ready"]);
+        kuru_memory::test_support::closing(async {
+            let (sender, receiver) = mpsc::channel(16);
+            for stage in [
+                Stage::WaitingForProjectOwnership,
+                Stage::StartingMemoryService,
+                Stage::PreparingDatabase,
+            ] {
+                sender.try_send(stage).unwrap();
+            }
+            let opening = async move {
+                tokio::task::yield_now().await;
+                sender.send(Stage::Ready).await.unwrap();
+                Ok::<_, anyhow::Error>(7)
+            };
+            let (mut output, sentences, stderr) = lines(true);
+            let value = drive(opening, receiver, &mut output, false).await.unwrap();
+            assert_eq!(value, 7);
+            assert_eq!(sentences.text(), format!("{OPENING}\n"));
+            let events: Vec<_> = markers_in(&stderr.text())
+                .into_iter()
+                .map(|(event, _)| event)
+                .collect();
+            assert_eq!(events, ["open-start", "waiting-ownership", "ready"]);
+        })
+        .await
     }
 
     #[tokio::test]
     async fn stages_reported_during_the_open_are_drawn_and_late_ones_are_not() {
-        let (sender, receiver) = mpsc::channel(16);
-        let opening = async move {
-            sender.send(Stage::ExtractingEmbeddedRuntime).await.unwrap();
-            tokio::task::yield_now().await;
-            sender.send(Stage::CreatingDatabase).await.unwrap();
-            tokio::task::yield_now().await;
-            // Reported with the completed open: finished work.
-            sender.send(Stage::PreparingDatabase).await.unwrap();
-            sender
-                .send(Stage::RetainedUnreceiptedInstallStage)
-                .await
-                .unwrap();
-            sender.send(Stage::Ready).await.unwrap();
-            Ok::<_, anyhow::Error>(())
-        };
-        let (mut output, sentences, stderr) = lines(false);
-        drive(opening, receiver, &mut output, true).await.unwrap();
-        assert_eq!(
-            sentences.text(),
-            format!("{OPENING}\n{GETTING_READY}\n{CREATING}\n")
-        );
-        assert_eq!(stderr.text(), format!("{LEFTOVER_MANUAL_CONFIGURED}\n"));
+        kuru_memory::test_support::closing(async {
+            let (sender, receiver) = mpsc::channel(16);
+            let opening = async move {
+                sender.send(Stage::ExtractingEmbeddedRuntime).await.unwrap();
+                tokio::task::yield_now().await;
+                sender.send(Stage::CreatingDatabase).await.unwrap();
+                tokio::task::yield_now().await;
+                // Reported with the completed open: finished work.
+                sender.send(Stage::PreparingDatabase).await.unwrap();
+                sender
+                    .send(Stage::RetainedUnreceiptedInstallStage)
+                    .await
+                    .unwrap();
+                sender.send(Stage::Ready).await.unwrap();
+                Ok::<_, anyhow::Error>(())
+            };
+            let (mut output, sentences, stderr) = lines(false);
+            drive(opening, receiver, &mut output, true).await.unwrap();
+            assert_eq!(
+                sentences.text(),
+                format!("{OPENING}\n{GETTING_READY}\n{CREATING}\n")
+            );
+            assert_eq!(stderr.text(), format!("{LEFTOVER_MANUAL_CONFIGURED}\n"));
+        })
+        .await
     }
 
     #[tokio::test]
     async fn a_failed_open_returns_its_error_erased_and_without_a_notice() {
-        let (sender, receiver) = mpsc::channel(16);
-        let opening = async move {
-            sender.send(Stage::RetainedInstallStage).await.unwrap();
-            tokio::task::yield_now().await;
-            Err::<(), _>(anyhow::anyhow!("fixture open failure"))
-        };
-        let (mut output, screen) = terminal(Some(120), true);
-        let error = drive(opening, receiver, &mut output, false)
-            .await
-            .unwrap_err();
-        assert_eq!(error.to_string(), "fixture open failure");
-        let text = screen.text();
-        assert!(text.ends_with(&format!("\r{}\r", " ".repeat(OPENING.width_cjk()))));
-        assert!(!text.contains(LEFTOVER_RETRY));
-        let events: Vec<_> = markers_in(&text).into_iter().map(|(e, _)| e).collect();
-        assert_eq!(events, ["open-start"]);
+        kuru_memory::test_support::closing(async {
+            let (sender, receiver) = mpsc::channel(16);
+            let opening = async move {
+                sender.send(Stage::RetainedInstallStage).await.unwrap();
+                tokio::task::yield_now().await;
+                Err::<(), _>(anyhow::anyhow!("fixture open failure"))
+            };
+            let (mut output, screen) = terminal(Some(120), true);
+            let error = drive(opening, receiver, &mut output, false)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "fixture open failure");
+            let text = screen.text();
+            assert!(text.ends_with(&format!("\r{}\r", " ".repeat(OPENING.width_cjk()))));
+            assert!(!text.contains(LEFTOVER_RETRY));
+            let events: Vec<_> = markers_in(&text).into_iter().map(|(e, _)| e).collect();
+            assert_eq!(events, ["open-start"]);
+        })
+        .await
     }
 
     /// Feedback never fails the open: with every sentence, marker and notice
@@ -1217,34 +1226,37 @@ mod tests {
     /// failed sentence sink is not written again.
     #[tokio::test]
     async fn failing_output_never_changes_the_open_result() {
-        let (sender, receiver) = mpsc::channel(16);
-        let opening = async move {
-            sender
-                .send(Stage::WaitingForProjectOwnership)
-                .await
-                .unwrap();
-            tokio::task::yield_now().await;
-            sender.send(Stage::CreatingDatabase).await.unwrap();
-            tokio::task::yield_now().await;
-            sender.send(Stage::RetainedInstallStage).await.unwrap();
-            sender.send(Stage::Ready).await.unwrap();
-            Ok::<_, anyhow::Error>("store")
-        };
-        let sentences = Failing::default();
-        let stderr = Failing::default();
-        let mut output = ActivityOutput::new(
-            Box::new(sentences.clone()),
-            Box::new(stderr.clone()),
-            Layout::Terminal {
-                columns: Box::new(|| Some(80)),
-                shares_line: true,
-            },
-            true,
-        );
-        let value = drive(opening, receiver, &mut output, false).await.unwrap();
-        assert_eq!(value, "store");
-        assert_eq!(sentences.0.load(Ordering::SeqCst), 1);
-        // open-start, waiting-ownership, ready and the notice were each tried.
-        assert_eq!(stderr.0.load(Ordering::SeqCst), 4);
+        kuru_memory::test_support::closing(async {
+            let (sender, receiver) = mpsc::channel(16);
+            let opening = async move {
+                sender
+                    .send(Stage::WaitingForProjectOwnership)
+                    .await
+                    .unwrap();
+                tokio::task::yield_now().await;
+                sender.send(Stage::CreatingDatabase).await.unwrap();
+                tokio::task::yield_now().await;
+                sender.send(Stage::RetainedInstallStage).await.unwrap();
+                sender.send(Stage::Ready).await.unwrap();
+                Ok::<_, anyhow::Error>("store")
+            };
+            let sentences = Failing::default();
+            let stderr = Failing::default();
+            let mut output = ActivityOutput::new(
+                Box::new(sentences.clone()),
+                Box::new(stderr.clone()),
+                Layout::Terminal {
+                    columns: Box::new(|| Some(80)),
+                    shares_line: true,
+                },
+                true,
+            );
+            let value = drive(opening, receiver, &mut output, false).await.unwrap();
+            assert_eq!(value, "store");
+            assert_eq!(sentences.0.load(Ordering::SeqCst), 1);
+            // open-start, waiting-ownership, ready and the notice were each tried.
+            assert_eq!(stderr.0.load(Ordering::SeqCst), 4);
+        })
+        .await
     }
 }

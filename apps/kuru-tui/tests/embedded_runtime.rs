@@ -557,76 +557,85 @@ mod execute_failure_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_names_the_command_and_lists_the_tree_before_and_after_the_kill() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut command = Command::new("/bin/sh");
-        command.current_dir(directory.path()).args([
-            "-c",
-            "/bin/sleep 6 & wait",
-            "kuru-execute-timeout",
-        ]);
-        let error = execute_within(
-            &mut command,
-            Duration::from_secs(2),
-            Duration::from_millis(200),
-        )
+        kuru_memory::test_support::closing(async {
+            let directory = tempfile::tempdir().unwrap();
+            let mut command = Command::new("/bin/sh");
+            command.current_dir(directory.path()).args([
+                "-c",
+                "/bin/sleep 6 & wait",
+                "kuru-execute-timeout",
+            ]);
+            let error = execute_within(
+                &mut command,
+                Duration::from_secs(2),
+                Duration::from_millis(200),
+            )
+            .await
+            .unwrap_err();
+            let error = format!("{error:#}");
+            for required in [
+                "timed out after 2s",
+                r#"command="/bin/sh""#,
+                r#"arguments=["-c", "/bin/sleep 6 & wait", "kuru-execute-timeout"]"#,
+                &format!("directory=Some({:?})", directory.path()),
+                "tree before kill: process tree of ",
+                "kuru-execute-timeout",
+                "/bin/sleep 6",
+                // The sleeping child inherited both pipes, so they stay open.
+                "stdout=Err(Elapsed(()))",
+                "after the 200ms pipe grace: 1 of 2 recorded processes remain listed",
+            ] {
+                assert!(error.contains(required), "missing {required}: {error}");
+            }
+            assert!(!error.contains("installed Kuru"), "{error}");
+            assert!(!error.contains("snapshot unavailable"), "{error}");
+        })
         .await
-        .unwrap_err();
-        let error = format!("{error:#}");
-        for required in [
-            "timed out after 2s",
-            r#"command="/bin/sh""#,
-            r#"arguments=["-c", "/bin/sleep 6 & wait", "kuru-execute-timeout"]"#,
-            &format!("directory=Some({:?})", directory.path()),
-            "tree before kill: process tree of ",
-            "kuru-execute-timeout",
-            "/bin/sleep 6",
-            // The sleeping child inherited both pipes, so they stay open.
-            "stdout=Err(Elapsed(()))",
-            "after the 200ms pipe grace: 1 of 2 recorded processes remain listed",
-        ] {
-            assert!(error.contains(required), "missing {required}: {error}");
-        }
-        assert!(!error.contains("installed Kuru"), "{error}");
-        assert!(!error.contains("snapshot unavailable"), "{error}");
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_failure_names_the_command() {
-        let mut command = Command::new("/nonexistent/kuru-fixture");
-        command.arg("--probe");
-        let error = execute_within(&mut command, Duration::from_secs(2), PIPE_GRACE)
-            .await
-            .unwrap_err();
-        let error = format!("{error:#}");
-        assert!(
-            error.contains(r#"command="/nonexistent/kuru-fixture" arguments=["--probe"]"#),
-            "{error}"
-        );
+        kuru_memory::test_support::closing(async {
+            let mut command = Command::new("/nonexistent/kuru-fixture");
+            command.arg("--probe");
+            let error = execute_within(&mut command, Duration::from_secs(2), PIPE_GRACE)
+                .await
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(
+                error.contains(r#"command="/nonexistent/kuru-fixture" arguments=["--probe"]"#),
+                "{error}"
+            );
+        })
+        .await
     }
 
     #[cfg(windows)]
     #[tokio::test]
     async fn timeout_names_the_command_and_lists_the_job_before_cleanup() {
-        let system = kuru_platform::windows::process::system_directory().unwrap();
-        let mut command = Command::new(system.join("WindowsPowerShell/v1.0/powershell.exe"));
-        command
-            .env("SystemRoot", system.parent().unwrap())
-            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-            .arg("Start-Sleep -Seconds 30");
-        let error = execute_within(&mut command, Duration::from_secs(2))
-            .await
-            .unwrap_err();
-        let error = format!("{error:#}");
-        for required in [
-            "fixture command",
-            "powershell.exe",
-            "Start-Sleep -Seconds 30",
-            "tree before cleanup",
-            "within 2s",
-        ] {
-            assert!(error.contains(required), "missing {required}: {error}");
-        }
+        kuru_memory::test_support::closing(async {
+            let system = kuru_platform::windows::process::system_directory().unwrap();
+            let mut command = Command::new(system.join("WindowsPowerShell/v1.0/powershell.exe"));
+            command
+                .env("SystemRoot", system.parent().unwrap())
+                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+                .arg("Start-Sleep -Seconds 30");
+            let error = execute_within(&mut command, Duration::from_secs(2))
+                .await
+                .unwrap_err();
+            let error = format!("{error:#}");
+            for required in [
+                "fixture command",
+                "powershell.exe",
+                "Start-Sleep -Seconds 30",
+                "tree before cleanup",
+                "within 2s",
+            ] {
+                assert!(error.contains(required), "missing {required}: {error}");
+            }
+        })
+        .await
     }
 }
 
@@ -1895,17 +1904,20 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
 
 #[tokio::test]
 async fn packaged_install_and_update_preserve_complete_offline_memory() {
-    let root = kuru_memory::test_support::TempDir::new("kuru-embedded-acceptance-", None)
-        .unwrap()
-        .with_depth_budget(FIXTURE_DEPTH_BUDGET);
-    let private = Directory::ensure_private(&root.path().join("private")).unwrap();
-    if let Err(error) = packaged_roundtrip(private.path()).await {
-        // Keep private diagnostics on failure; a timeout must never remove a
-        // directory while an owned SQL supervisor may still be completing EOF.
-        let path = root.keep();
-        panic!(
-            "{error:#}\nprivate embedded-runtime fixture retained at {}",
-            path.display()
-        );
-    }
+    kuru_memory::test_support::closing(async {
+        let root = kuru_memory::test_support::TempDir::new("kuru-embedded-acceptance-", None)
+            .unwrap()
+            .with_depth_budget(FIXTURE_DEPTH_BUDGET);
+        let private = Directory::ensure_private(&root.path().join("private")).unwrap();
+        if let Err(error) = packaged_roundtrip(private.path()).await {
+            // Keep private diagnostics on failure; a timeout must never remove a
+            // directory while an owned SQL supervisor may still be completing EOF.
+            let path = root.keep();
+            panic!(
+                "{error:#}\nprivate embedded-runtime fixture retained at {}",
+                path.display()
+            );
+        }
+    })
+    .await
 }

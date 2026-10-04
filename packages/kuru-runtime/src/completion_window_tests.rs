@@ -113,74 +113,83 @@ impl ProviderSink for Recording {
 
 #[tokio::test(start_paused = true)]
 async fn a_stream_delivering_deltas_past_the_previous_flat_bound_completes() {
-    let interval = STREAM_IDLE_TIMEOUT / 2;
-    let deltas = 3;
-    let streaming = interval * deltas;
-    assert!(streaming > PREVIOUS_FLAT_BOUND && streaming < COMPLETION_TIMEOUT);
-    for call in CALLS {
-        let provider = PacedProvider {
-            interval,
-            deltas: Some(deltas.into()),
-        };
-        let mut observer = Recording::default();
-        let start = Instant::now();
-        let completion = bounded_completion(&provider, request(), &mut observer, call)
-            .await
-            .unwrap_or_else(|error| panic!("{call} failed while streaming: {error:#}"));
-        assert_eq!(start.elapsed(), streaming, "{call}");
-        assert_eq!(completion.text_projection(), "answer", "{call}");
-        // The progress adapter forwards every event to the observer unchanged.
-        let mut expected = (0..u64::from(deltas)).map(delta).collect::<Vec<_>>();
-        expected.push(completed());
-        assert_eq!(observer.0, expected, "{call}");
-    }
+    kuru_memory::test_support::closing(async {
+        let interval = STREAM_IDLE_TIMEOUT / 2;
+        let deltas = 3;
+        let streaming = interval * deltas;
+        assert!(streaming > PREVIOUS_FLAT_BOUND && streaming < COMPLETION_TIMEOUT);
+        for call in CALLS {
+            let provider = PacedProvider {
+                interval,
+                deltas: Some(deltas.into()),
+            };
+            let mut observer = Recording::default();
+            let start = Instant::now();
+            let completion = bounded_completion(&provider, request(), &mut observer, call)
+                .await
+                .unwrap_or_else(|error| panic!("{call} failed while streaming: {error:#}"));
+            assert_eq!(start.elapsed(), streaming, "{call}");
+            assert_eq!(completion.text_projection(), "answer", "{call}");
+            // The progress adapter forwards every event to the observer unchanged.
+            let mut expected = (0..u64::from(deltas)).map(delta).collect::<Vec<_>>();
+            expected.push(completed());
+            assert_eq!(observer.0, expected, "{call}");
+        }
+    })
+    .await
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_provider_that_falls_silent_fails_one_window_after_its_last_event() {
-    let pause = STREAM_IDLE_TIMEOUT / 3;
-    for call in CALLS {
-        let provider = FallsSilentProvider { pause };
-        let mut observer = Recording::default();
-        let start = Instant::now();
-        let error = bounded_completion(&provider, request(), &mut observer, call)
-            .await
-            .unwrap_err();
-        // The window re-arms on the second event rather than counting from
-        // the start of the call.
-        assert_eq!(start.elapsed(), pause + STREAM_IDLE_TIMEOUT, "{call}");
-        assert_eq!(
-            format!("{error:#}"),
-            format!(
-                "{call}: no provider progress for {} s",
-                STREAM_IDLE_TIMEOUT.as_secs()
-            )
-        );
-        assert_eq!(observer.0, vec![delta(0), delta(1)], "{call}");
-    }
+    kuru_memory::test_support::closing(async {
+        let pause = STREAM_IDLE_TIMEOUT / 3;
+        for call in CALLS {
+            let provider = FallsSilentProvider { pause };
+            let mut observer = Recording::default();
+            let start = Instant::now();
+            let error = bounded_completion(&provider, request(), &mut observer, call)
+                .await
+                .unwrap_err();
+            // The window re-arms on the second event rather than counting from
+            // the start of the call.
+            assert_eq!(start.elapsed(), pause + STREAM_IDLE_TIMEOUT, "{call}");
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "{call}: no provider progress for {} s",
+                    STREAM_IDLE_TIMEOUT.as_secs()
+                )
+            );
+            assert_eq!(observer.0, vec![delta(0), delta(1)], "{call}");
+        }
+    })
+    .await
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_stream_that_never_settles_fails_at_the_total_completion_budget() {
-    let interval = STREAM_IDLE_TIMEOUT / 2;
-    for call in CALLS {
-        let provider = PacedProvider {
-            interval,
-            deltas: None,
-        };
-        let mut observer = Recording::default();
-        let start = Instant::now();
-        let error = bounded_completion(&provider, request(), &mut observer, call)
-            .await
-            .unwrap_err();
-        assert_eq!(start.elapsed(), COMPLETION_TIMEOUT, "{call}");
-        assert_eq!(
-            format!("{error:#}"),
-            format!(
-                "{call} exceeded the {} s completion budget",
-                COMPLETION_TIMEOUT.as_secs()
-            )
-        );
-        assert!(observer.0.len() > 1, "{call}");
-    }
+    kuru_memory::test_support::closing(async {
+        let interval = STREAM_IDLE_TIMEOUT / 2;
+        for call in CALLS {
+            let provider = PacedProvider {
+                interval,
+                deltas: None,
+            };
+            let mut observer = Recording::default();
+            let start = Instant::now();
+            let error = bounded_completion(&provider, request(), &mut observer, call)
+                .await
+                .unwrap_err();
+            assert_eq!(start.elapsed(), COMPLETION_TIMEOUT, "{call}");
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "{call} exceeded the {} s completion budget",
+                    COMPLETION_TIMEOUT.as_secs()
+                )
+            );
+            assert!(observer.0.len() > 1, "{call}");
+        }
+    })
+    .await
 }

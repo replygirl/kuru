@@ -122,55 +122,58 @@ impl Sandbox {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_post_turn_failure_reports_separately_after_completed_json_answer() -> anyhow::Result<()>
 {
-    use kuru_memory::{MemoryStore, PublicTranscriptEntry, PublicTurnSettlement};
-    use kuru_runtime::project_scope;
+    kuru_memory::test_support::closing(async {
+        use kuru_memory::{MemoryStore, PublicTranscriptEntry, PublicTurnSettlement};
+        use kuru_runtime::project_scope;
 
-    let env = Sandbox::warmed().await;
-    let marker = env.project.join("post-turn-hook-ran");
-    let config_path = env.root.path().join("config/kuru/config.toml");
-    let mut config = std::fs::read_to_string(&config_path)?;
-    config.push_str(&format!(
-        "\n[[hooks.post_turn]]\ncommand = '/bin/sh'\nargs = ['-c', 'cat >/dev/null; printf x > \"$1\"; printf RAW_HOOK_SECRET >&2; printf \"{{\"', 'hook', {}]\n",
-        toml::Value::String(marker.to_string_lossy().into_owned())
-    ));
-    std::fs::write(config_path, config)?;
+        let env = Sandbox::warmed().await;
+        let marker = env.project.join("post-turn-hook-ran");
+        let config_path = env.root.path().join("config/kuru/config.toml");
+        let mut config = std::fs::read_to_string(&config_path)?;
+        config.push_str(&format!(
+            "\n[[hooks.post_turn]]\ncommand = '/bin/sh'\nargs = ['-c', 'cat >/dev/null; printf x > \"$1\"; printf RAW_HOOK_SECRET >&2; printf \"{{\"', 'hook', {}]\n",
+            toml::Value::String(marker.to_string_lossy().into_owned())
+        ));
+        std::fs::write(config_path, config)?;
 
-    // Retain a checked managed attachment across the CLI process boundary so
-    // the completed public record can be read without a second cold start or
-    // a direct local lock that excludes the CLI's own managed attachment.
-    let scope = project_scope(&env.project)?;
-    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope).await?;
-    let (_, opening) = MemoryStore::open_managed_observed(
-        options,
-        std::fs::canonicalize(&env.project)?,
-        PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
-    );
-    let memory = opening.await?;
+        // Retain a checked managed attachment across the CLI process boundary so
+        // the completed public record can be read without a second cold start or
+        // a direct local lock that excludes the CLI's own managed attachment.
+        let scope = project_scope(&env.project)?;
+        let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope).await?;
+        let (_, opening) = MemoryStore::open_managed_observed(
+            options,
+            std::fs::canonicalize(&env.project)?,
+            PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+        );
+        let memory = opening.await?;
 
-    let output = tokio::task::block_in_place(|| {
-        env.run(&["run", "a completed answer survives its post hook", "--json"])
-    });
-    assert!(
-        output.status.success(),
-        "settled answer failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let answer: Value = serde_json::from_slice(&output.stdout)?;
-    assert!(answer["text"].as_str().is_some_and(|text| !text.is_empty()));
-    let session = answer["session"].as_str().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("post-turn hook 1: failed"), "{stderr}");
-    assert!(!stderr.contains("RAW_HOOK_SECRET"), "{stderr}");
-    assert_eq!(std::fs::read(marker)?, b"x");
+        let output = tokio::task::block_in_place(|| {
+            env.run(&["run", "a completed answer survives its post hook", "--json"])
+        });
+        assert!(
+            output.status.success(),
+            "settled answer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let answer: Value = serde_json::from_slice(&output.stdout)?;
+        assert!(answer["text"].as_str().is_some_and(|text| !text.is_empty()));
+        let session = answer["session"].as_str().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("post-turn hook 1: failed"), "{stderr}");
+        assert!(!stderr.contains("RAW_HOOK_SECRET"), "{stderr}");
+        assert_eq!(std::fs::read(marker)?, b"x");
 
-    let page = memory.public_transcript_page(session, None, 8).await?;
-    assert!(page.records.iter().any(|entry| {
-        matches!(entry, PublicTranscriptEntry::Turn { record }
-            if record.origin_session_id == session
-                && record.settlement == PublicTurnSettlement::Completed)
-    }));
-    memory.close().await?;
-    Ok(())
+        let page = memory.public_transcript_page(session, None, 8).await?;
+        assert!(page.records.iter().any(|entry| {
+            matches!(entry, PublicTranscriptEntry::Turn { record }
+                if record.origin_session_id == session
+                    && record.settlement == PublicTurnSettlement::Completed)
+        }));
+        memory.close().await?;
+        Ok(())
+    })
+    .await
 }
 
 #[test]
@@ -434,72 +437,75 @@ client_id = "synthetic-native-client"
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_cli_device_login_status_logout_uses_synthetic_verified_https() {
-    let env = Sandbox::warmed().await;
-    let server = HttpsMcpFixture::start(env.root.path()).await;
-    let config = env.root.path().join("config/kuru/config.toml");
-    let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str(&format!("\n[mcp.secure]\nurl = {:?}\n[mcp.secure.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nscopes = ['mcp.read']\n", format!("{}/mcp", server.base)));
-    std::fs::write(config, text).unwrap();
-    let root = server.ca_path.clone();
-    let run = |args: &'static [&'static str]| {
-        let mut command = env.command();
-        command
-            .env("KURU_TEST_MCP_CA_PEM", &root)
-            .arg("--trust-workspace-once")
-            .args(args);
-        tokio::task::spawn_blocking(move || command.output().unwrap())
-    };
-    let login = run(&["mcp", "login", "secure", "--device"]).await.unwrap();
-    assert!(
-        login.status.success(),
-        "{}",
-        String::from_utf8_lossy(&login.stderr)
-    );
-    assert!(String::from_utf8_lossy(&login.stdout).contains("Signed in to MCP secure"));
-    assert_eq!(server.device_requests.load(Ordering::Relaxed), 1);
-    assert_eq!(server.token_requests.load(Ordering::Relaxed), 1);
-    let status = run(&["mcp", "status", "secure"]).await.unwrap();
-    assert!(
-        status.status.success(),
-        "{}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-    let value: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(value["state"], "authorized");
-    let logout = run(&["mcp", "logout", "secure"]).await.unwrap();
-    assert!(
-        logout.status.success(),
-        "{}",
-        String::from_utf8_lossy(&logout.stderr)
-    );
-    let value: Value = serde_json::from_slice(&logout.stdout).unwrap();
-    assert_eq!(value["local_deleted"], true);
-    assert_eq!(server.revocations.load(Ordering::Relaxed), 1);
-    let status = run(&["mcp", "status", "secure"]).await.unwrap();
-    assert!(
-        status.status.success(),
-        "{}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-    let value: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(value["state"], "login_required");
+    kuru_memory::test_support::closing(async {
+        let env = Sandbox::warmed().await;
+        let server = HttpsMcpFixture::start(env.root.path()).await;
+        let config = env.root.path().join("config/kuru/config.toml");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!("\n[mcp.secure]\nurl = {:?}\n[mcp.secure.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nscopes = ['mcp.read']\n", format!("{}/mcp", server.base)));
+        std::fs::write(config, text).unwrap();
+        let root = server.ca_path.clone();
+        let run = |args: &'static [&'static str]| {
+            let mut command = env.command();
+            command
+                .env("KURU_TEST_MCP_CA_PEM", &root)
+                .arg("--trust-workspace-once")
+                .args(args);
+            tokio::task::spawn_blocking(move || command.output().unwrap())
+        };
+        let login = run(&["mcp", "login", "secure", "--device"]).await.unwrap();
+        assert!(
+            login.status.success(),
+            "{}",
+            String::from_utf8_lossy(&login.stderr)
+        );
+        assert!(String::from_utf8_lossy(&login.stdout).contains("Signed in to MCP secure"));
+        assert_eq!(server.device_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(server.token_requests.load(Ordering::Relaxed), 1);
+        let status = run(&["mcp", "status", "secure"]).await.unwrap();
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(value["state"], "authorized");
+        let logout = run(&["mcp", "logout", "secure"]).await.unwrap();
+        assert!(
+            logout.status.success(),
+            "{}",
+            String::from_utf8_lossy(&logout.stderr)
+        );
+        let value: Value = serde_json::from_slice(&logout.stdout).unwrap();
+        assert_eq!(value["local_deleted"], true);
+        assert_eq!(server.revocations.load(Ordering::Relaxed), 1);
+        let status = run(&["mcp", "status", "secure"]).await.unwrap();
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(value["state"], "login_required");
 
-    // The same synthetic CA must not make a different DNS identity valid.
-    let wrong_host = server.base.replace("localhost", "127.0.0.1");
-    let config = env.root.path().join("config/kuru/config.toml");
-    let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str(&format!("\n[mcp.wrong_host]\nurl = {:?}\n[mcp.wrong_host.oauth]\nenabled = true\nclient_id = 'synthetic-client'\n", format!("{wrong_host}/mcp")));
-    std::fs::write(config, text).unwrap();
-    let rejected = run(&["mcp", "login", "wrong_host", "--device"])
-        .await
-        .unwrap();
-    assert!(!rejected.status.success());
-    let diagnostic = String::from_utf8_lossy(&rejected.stderr);
-    assert!(
-        diagnostic.contains("certificate") || diagnostic.contains("TLS"),
-        "hostname mismatch failed for an unrelated reason: {diagnostic}"
-    );
-    assert_eq!(server.device_requests.load(Ordering::Relaxed), 1);
+        // The same synthetic CA must not make a different DNS identity valid.
+        let wrong_host = server.base.replace("localhost", "127.0.0.1");
+        let config = env.root.path().join("config/kuru/config.toml");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!("\n[mcp.wrong_host]\nurl = {:?}\n[mcp.wrong_host.oauth]\nenabled = true\nclient_id = 'synthetic-client'\n", format!("{wrong_host}/mcp")));
+        std::fs::write(config, text).unwrap();
+        let rejected = run(&["mcp", "login", "wrong_host", "--device"])
+            .await
+            .unwrap();
+        assert!(!rejected.status.success());
+        let diagnostic = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            diagnostic.contains("certificate") || diagnostic.contains("TLS"),
+            "hostname mismatch failed for an unrelated reason: {diagnostic}"
+        );
+        assert_eq!(server.device_requests.load(Ordering::Relaxed), 1);
+    })
+    .await
 }
 
 #[cfg(target_os = "linux")]
@@ -597,261 +603,267 @@ async fn bounded_linux_cli_child(
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_cli_missing_secret_service_refuses_without_fallback_or_static_alias_loss()
 -> anyhow::Result<()> {
-    use anyhow::ensure;
-    let env = Sandbox::warmed().await;
-    let server = HttpsMcpFixture::start(env.root.path()).await;
-    let config = env.root.path().join("config/kuru/config.toml");
-    let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str(&format!(
-        "\n[mcp.secure]\nurl = {:?}\n[mcp.secure.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nscopes = ['mcp.read']\n\n[mcp.static]\nurl = {:?}\n[mcp.static.header_env]\nAuthorization = 'KURU_TEST_STATIC_HEADER'\n",
-        format!("{}/mcp", server.base),
-        format!("{}/static-mcp", server.base)
-    ));
-    std::fs::write(config, text).unwrap();
+    kuru_memory::test_support::closing(async {
+        use anyhow::ensure;
+        let env = Sandbox::warmed().await;
+        let server = HttpsMcpFixture::start(env.root.path()).await;
+        let config = env.root.path().join("config/kuru/config.toml");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!(
+            "\n[mcp.secure]\nurl = {:?}\n[mcp.secure.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nscopes = ['mcp.read']\n\n[mcp.static]\nurl = {:?}\n[mcp.static.header_env]\nAuthorization = 'KURU_TEST_STATIC_HEADER'\n",
+            format!("{}/mcp", server.base),
+            format!("{}/static-mcp", server.base)
+        ));
+        std::fs::write(config, text).unwrap();
 
-    // CI supplies a real owned D-Bus Secret Service. Only these children get
-    // the missing-bus address; the runner's bus and native collection remain.
-    let absent_runtime = env.root.path().join("absent-bus-runtime");
-    kuru_platform::fs::Directory::ensure_private(&absent_runtime).unwrap();
-    let absent_bus = format!(
-        "unix:path={}",
-        absent_runtime.join("missing-session-bus").display()
-    );
-    let run = |args: &'static [&'static str], disconnected: bool, phase: &'static str| {
-        bounded_linux_cli_child(
-            &env,
-            &server.ca_path,
-            disconnected.then_some((absent_bus.as_str(), absent_runtime.as_path())),
-            args,
-            phase,
-        )
-    };
+        // CI supplies a real owned D-Bus Secret Service. Only these children get
+        // the missing-bus address; the runner's bus and native collection remain.
+        let absent_runtime = env.root.path().join("absent-bus-runtime");
+        kuru_platform::fs::Directory::ensure_private(&absent_runtime).unwrap();
+        let absent_bus = format!(
+            "unix:path={}",
+            absent_runtime.join("missing-session-bus").display()
+        );
+        let run = |args: &'static [&'static str], disconnected: bool, phase: &'static str| {
+            bounded_linux_cli_child(
+                &env,
+                &server.ca_path,
+                disconnected.then_some((absent_bus.as_str(), absent_runtime.as_path())),
+                args,
+                phase,
+            )
+        };
 
-    let proof: anyhow::Result<()> = async {
-        let login = run(&["mcp", "login", "secure", "--device"], false, "seed login").await?;
-        ensure!(
-            login.status.success(),
-            "real Secret Service seed failed: {}",
-            String::from_utf8_lossy(&login.stderr)
-        );
-        ensure!(server.device_requests.load(Ordering::Relaxed) == 1);
-        ensure!(server.token_requests.load(Ordering::Relaxed) == 1);
-        let baseline = run(&["mcp", "status", "secure"], false, "baseline status").await?;
-        ensure!(baseline.status.success(), "{baseline:?}");
-        let baseline: Value = serde_json::from_slice(&baseline.stdout)?;
-        ensure!(baseline["state"] == "authorized", "{baseline}");
+        let proof: anyhow::Result<()> = async {
+            let login = run(&["mcp", "login", "secure", "--device"], false, "seed login").await?;
+            ensure!(
+                login.status.success(),
+                "real Secret Service seed failed: {}",
+                String::from_utf8_lossy(&login.stderr)
+            );
+            ensure!(server.device_requests.load(Ordering::Relaxed) == 1);
+            ensure!(server.token_requests.load(Ordering::Relaxed) == 1);
+            let baseline = run(&["mcp", "status", "secure"], false, "baseline status").await?;
+            ensure!(baseline.status.success(), "{baseline:?}");
+            let baseline: Value = serde_json::from_slice(&baseline.stdout)?;
+            ensure!(baseline["state"] == "authorized", "{baseline}");
 
-        let unavailable = run(&["mcp", "status", "secure"], true, "missing-bus status").await?;
-        ensure!(unavailable.status.success(), "{unavailable:?}");
-        let unavailable: Value = serde_json::from_slice(&unavailable.stdout)?;
-        ensure!(
-            unavailable["state"] == "native_store_unavailable",
-            "{unavailable}"
-        );
-        ensure!(
-            unavailable["diagnostic"]
-                .as_str()
-                .is_some_and(|text| !text.is_empty()),
-            "missing bus produced no actionable status: {unavailable}"
-        );
-        let refused = run(
-            &["mcp", "login", "secure", "--device"],
-            true,
-            "missing-bus login",
-        )
-        .await?;
-        ensure!(!refused.status.success(), "missing bus admitted login");
-        let diagnostic = String::from_utf8_lossy(&refused.stderr);
-        ensure!(
-            diagnostic.contains("native") || diagnostic.contains("credential"),
-            "missing bus failed for an unrelated reason: {diagnostic}"
-        );
-        ensure!(server.device_requests.load(Ordering::Relaxed) == 1);
-        ensure!(server.token_requests.load(Ordering::Relaxed) == 1);
-
-        let catalog = run(&["tools"], true, "missing-bus static catalog").await?;
-        ensure!(catalog.status.success(), "{catalog:?}");
-        let catalog: Value = serde_json::from_slice(&catalog.stdout)?;
-        ensure!(catalog["tools"].as_array().is_some_and(|tools| {
-            tools.iter().any(|tool| {
-                tool["description"]
+            let unavailable = run(&["mcp", "status", "secure"], true, "missing-bus status").await?;
+            ensure!(unavailable.status.success(), "{unavailable:?}");
+            let unavailable: Value = serde_json::from_slice(&unavailable.stdout)?;
+            ensure!(
+                unavailable["state"] == "native_store_unavailable",
+                "{unavailable}"
+            );
+            ensure!(
+                unavailable["diagnostic"]
                     .as_str()
-                    .is_some_and(|text| text.contains("MCP static/static-proof"))
-            })
-        }));
-        ensure!(server.static_requests.load(Ordering::Relaxed) > 0);
-        ensure!(server.static_bad_headers.load(Ordering::Relaxed) == 0);
+                    .is_some_and(|text| !text.is_empty()),
+                "missing bus produced no actionable status: {unavailable}"
+            );
+            let refused = run(
+                &["mcp", "login", "secure", "--device"],
+                true,
+                "missing-bus login",
+            )
+            .await?;
+            ensure!(!refused.status.success(), "missing bus admitted login");
+            let diagnostic = String::from_utf8_lossy(&refused.stderr);
+            ensure!(
+                diagnostic.contains("native") || diagnostic.contains("credential"),
+                "missing bus failed for an unrelated reason: {diagnostic}"
+            );
+            ensure!(server.device_requests.load(Ordering::Relaxed) == 1);
+            ensure!(server.token_requests.load(Ordering::Relaxed) == 1);
 
-        // Broken-bus children must not read a fallback or change the record.
-        let restored = run(&["mcp", "status", "secure"], false, "restored status").await?;
-        ensure!(restored.status.success(), "{restored:?}");
-        let restored: Value = serde_json::from_slice(&restored.stdout)?;
-        ensure!(restored["state"] == "authorized", "{restored}");
+            let catalog = run(&["tools"], true, "missing-bus static catalog").await?;
+            ensure!(catalog.status.success(), "{catalog:?}");
+            let catalog: Value = serde_json::from_slice(&catalog.stdout)?;
+            ensure!(catalog["tools"].as_array().is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    tool["description"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("MCP static/static-proof"))
+                })
+            }));
+            ensure!(server.static_requests.load(Ordering::Relaxed) > 0);
+            ensure!(server.static_bad_headers.load(Ordering::Relaxed) == 0);
+
+            // Broken-bus children must not read a fallback or change the record.
+            let restored = run(&["mcp", "status", "secure"], false, "restored status").await?;
+            ensure!(restored.status.success(), "{restored:?}");
+            let restored: Value = serde_json::from_slice(&restored.stdout)?;
+            ensure!(restored["state"] == "authorized", "{restored}");
+            Ok(())
+        }
+        .await;
+
+        // Always attempt exact native cleanup, including when an assertion or a
+        // bounded child fails. A failed cleanup is reported with the proof error.
+        let cleanup = run(&["mcp", "logout", "secure"], false, "native logout").await;
+        if let Err(error) = proof {
+            anyhow::bail!("missing-bus proof failed: {error:#}; native cleanup: {cleanup:?}");
+        }
+        let logout = cleanup?;
+        ensure!(logout.status.success(), "{logout:?}");
+        let logout: Value = serde_json::from_slice(&logout.stdout)?;
+        ensure!(logout["local_deleted"] == true, "{logout}");
         Ok(())
-    }
-    .await;
-
-    // Always attempt exact native cleanup, including when an assertion or a
-    // bounded child fails. A failed cleanup is reported with the proof error.
-    let cleanup = run(&["mcp", "logout", "secure"], false, "native logout").await;
-    if let Err(error) = proof {
-        anyhow::bail!("missing-bus proof failed: {error:#}; native cleanup: {cleanup:?}");
-    }
-    let logout = cleanup?;
-    ensure!(logout.status.success(), "{logout:?}");
-    let logout: Value = serde_json::from_slice(&logout.stdout)?;
-    ensure!(logout["local_deleted"] == true, "{logout}");
-    Ok(())
+    })
+    .await
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_cli_no_browser_prints_local_callback_guidance_and_settles_once() {
-    let env = Sandbox::warmed().await;
-    let server = HttpsMcpFixture::start(env.root.path()).await;
-    let config = env.root.path().join("config/kuru/config.toml");
-    let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str(&format!(
-        "\n[mcp.browser]\nurl = {:?}\n[mcp.browser.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nscopes = ['mcp.read']\n",
-        format!("{}/mcp", server.base)
-    ));
-    std::fs::write(config, text).unwrap();
+    kuru_memory::test_support::closing(async {
+        let env = Sandbox::warmed().await;
+        let server = HttpsMcpFixture::start(env.root.path()).await;
+        let config = env.root.path().join("config/kuru/config.toml");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!(
+            "\n[mcp.browser]\nurl = {:?}\n[mcp.browser.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nscopes = ['mcp.read']\n",
+            format!("{}/mcp", server.base)
+        ));
+        std::fs::write(config, text).unwrap();
 
-    let mut command = env.command();
-    command.env("KURU_TEST_MCP_CA_PEM", &server.ca_path).args([
-        "--trust-workspace-once",
-        "mcp",
-        "login",
-        "browser",
-        "--no-browser",
-    ]);
-    let (url_send, url_receive) = std::sync::mpsc::sync_channel(1);
-    let child = std::thread::spawn(move || -> anyhow::Result<String> {
-        let mut terminal = terminal::Terminal::spawn(command, 24, 120)?;
-        terminal.wait(
-            "no-browser URL and forwarded-loopback guidance",
-            std::time::Duration::from_secs(15),
-            |terminal| {
-                let output = String::from_utf8_lossy(&terminal.output);
-                Ok(output.contains("Sign in to MCP browser:")
-                    && output
-                        .contains("use same-host browsing or forward the printed loopback port"))
-            },
-        )?;
-        let output = String::from_utf8_lossy(&terminal.output);
-        let url = output
-            .split_whitespace()
-            .find(|word| word.starts_with("https://localhost:") && word.contains("/authorize?"))
-            .ok_or_else(|| anyhow::anyhow!("CLI did not print its authorization URL"))?
-            .to_owned();
-        url_send.send(url).unwrap();
-        terminal.wait_exit(std::time::Duration::from_secs(15))?;
-        Ok(String::from_utf8_lossy(&terminal.output).into_owned())
-    });
-    let authorization = tokio::task::spawn_blocking(move || {
-        url_receive.recv_timeout(std::time::Duration::from_secs(20))
-    })
-    .await
-    .unwrap()
-    .unwrap();
-    let authorization = reqwest::Url::parse(&authorization).unwrap();
-    let parameters = authorization
-        .query_pairs()
-        .into_owned()
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let redirect = parameters
-        .get("redirect_uri")
-        .expect("authorization omitted redirect_uri");
-    let state = parameters
-        .get("state")
-        .expect("authorization omitted state");
-    let mut callback = reqwest::Url::parse(redirect).unwrap();
-    callback
-        .query_pairs_mut()
-        .append_pair("code", "synthetic-callback-code")
-        .append_pair("state", state)
-        .append_pair("iss", &format!("{}/", server.base));
-    // Model a browser on another machine through a local TCP forwarder. Keep
-    // the owner's advertised callback authority in the HTTP request itself.
-    let advertised = reqwest::Url::parse(redirect).unwrap();
-    assert_eq!(advertised.scheme(), "http");
-    assert_eq!(advertised.host_str(), Some("127.0.0.1"));
-    assert_eq!(callback.scheme(), advertised.scheme());
-    assert_eq!(callback.host_str(), advertised.host_str());
-    assert_eq!(callback.port(), advertised.port());
-    assert_eq!(callback.path(), advertised.path());
-    let owner_port = advertised.port().unwrap();
-    let forwarder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let forwarded_port = forwarder.local_addr().unwrap().port();
-    assert_ne!(forwarded_port, owner_port);
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let accepted_by_forwarder = Arc::clone(&accepted);
-    let forward_task = tokio::spawn(async move {
-        let (mut browser, _) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), forwarder.accept())
-                .await
-                .unwrap()
-                .unwrap();
-        accepted_by_forwarder.fetch_add(1, Ordering::Relaxed);
-        let mut owner = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::net::TcpStream::connect(("127.0.0.1", owner_port)),
-        )
+        let mut command = env.command();
+        command.env("KURU_TEST_MCP_CA_PEM", &server.ca_path).args([
+            "--trust-workspace-once",
+            "mcp",
+            "login",
+            "browser",
+            "--no-browser",
+        ]);
+        let (url_send, url_receive) = std::sync::mpsc::sync_channel(1);
+        let child = std::thread::spawn(move || -> anyhow::Result<String> {
+            let mut terminal = terminal::Terminal::spawn(command, 24, 120)?;
+            terminal.wait(
+                "no-browser URL and forwarded-loopback guidance",
+                std::time::Duration::from_secs(15),
+                |terminal| {
+                    let output = String::from_utf8_lossy(&terminal.output);
+                    Ok(output.contains("Sign in to MCP browser:")
+                        && output
+                            .contains("use same-host browsing or forward the printed loopback port"))
+                },
+            )?;
+            let output = String::from_utf8_lossy(&terminal.output);
+            let url = output
+                .split_whitespace()
+                .find(|word| word.starts_with("https://localhost:") && word.contains("/authorize?"))
+                .ok_or_else(|| anyhow::anyhow!("CLI did not print its authorization URL"))?
+                .to_owned();
+            url_send.send(url).unwrap();
+            terminal.wait_exit(std::time::Duration::from_secs(15))?;
+            Ok(String::from_utf8_lossy(&terminal.output).into_owned())
+        });
+        let authorization = tokio::task::spawn_blocking(move || {
+            url_receive.recv_timeout(std::time::Duration::from_secs(20))
+        })
         .await
         .unwrap()
         .unwrap();
-        let _ = tokio::io::copy_bidirectional(&mut browser, &mut owner).await;
-    });
-    let mut forwarded = callback.clone();
-    forwarded.set_port(Some(forwarded_port)).unwrap();
-    assert_eq!(forwarded.path(), advertised.path());
-    assert_eq!(forwarded.query(), callback.query());
-    let response = reqwest::Client::new()
-        .get(forwarded)
-        .header(reqwest::header::HOST, format!("127.0.0.1:{owner_port}"))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        response.status().is_success(),
-        "forwarded callback refused: {}",
-        response.status()
-    );
-    let _ = response.bytes().await.unwrap();
-    forward_task.abort();
-    let _ = forward_task.await;
-    assert_eq!(accepted.load(Ordering::Relaxed), 1);
-    let output = child.join().unwrap().unwrap();
-    assert!(output.contains("Signed in to MCP browser."), "{output}");
-    assert_eq!(server.device_requests.load(Ordering::Relaxed), 0);
-    assert_eq!(server.token_requests.load(Ordering::Relaxed), 1);
-    let forms = server.token_forms();
-    assert_eq!(forms.len(), 1);
-    let form = &forms[0];
-    assert_eq!(
-        form.get("grant_type").map(String::as_str),
-        Some("authorization_code")
-    );
-    assert_eq!(
-        form.get("code").map(String::as_str),
-        Some("synthetic-callback-code")
-    );
-    assert_eq!(
-        form.get("redirect_uri").map(String::as_str),
-        Some(redirect.as_str())
-    );
-    assert_eq!(
-        parameters.get("code_challenge_method").map(String::as_str),
-        Some("S256")
-    );
-    let verifier = form
-        .get("code_verifier")
-        .expect("token exchange omitted PKCE verifier");
-    use base64::Engine;
-    use sha2::Digest;
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(sha2::Sha256::digest(verifier.as_bytes()));
-    assert_eq!(parameters.get("code_challenge"), Some(&challenge));
+        let authorization = reqwest::Url::parse(&authorization).unwrap();
+        let parameters = authorization
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let redirect = parameters
+            .get("redirect_uri")
+            .expect("authorization omitted redirect_uri");
+        let state = parameters
+            .get("state")
+            .expect("authorization omitted state");
+        let mut callback = reqwest::Url::parse(redirect).unwrap();
+        callback
+            .query_pairs_mut()
+            .append_pair("code", "synthetic-callback-code")
+            .append_pair("state", state)
+            .append_pair("iss", &format!("{}/", server.base));
+        // Model a browser on another machine through a local TCP forwarder. Keep
+        // the owner's advertised callback authority in the HTTP request itself.
+        let advertised = reqwest::Url::parse(redirect).unwrap();
+        assert_eq!(advertised.scheme(), "http");
+        assert_eq!(advertised.host_str(), Some("127.0.0.1"));
+        assert_eq!(callback.scheme(), advertised.scheme());
+        assert_eq!(callback.host_str(), advertised.host_str());
+        assert_eq!(callback.port(), advertised.port());
+        assert_eq!(callback.path(), advertised.path());
+        let owner_port = advertised.port().unwrap();
+        let forwarder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let forwarded_port = forwarder.local_addr().unwrap().port();
+        assert_ne!(forwarded_port, owner_port);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_by_forwarder = Arc::clone(&accepted);
+        let forward_task = tokio::spawn(async move {
+            let (mut browser, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), forwarder.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            accepted_by_forwarder.fetch_add(1, Ordering::Relaxed);
+            let mut owner = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::net::TcpStream::connect(("127.0.0.1", owner_port)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut browser, &mut owner).await;
+        });
+        let mut forwarded = callback.clone();
+        forwarded.set_port(Some(forwarded_port)).unwrap();
+        assert_eq!(forwarded.path(), advertised.path());
+        assert_eq!(forwarded.query(), callback.query());
+        let response = reqwest::Client::new()
+            .get(forwarded)
+            .header(reqwest::header::HOST, format!("127.0.0.1:{owner_port}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "forwarded callback refused: {}",
+            response.status()
+        );
+        let _ = response.bytes().await.unwrap();
+        forward_task.abort();
+        let _ = forward_task.await;
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+        let output = child.join().unwrap().unwrap();
+        assert!(output.contains("Signed in to MCP browser."), "{output}");
+        assert_eq!(server.device_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(server.token_requests.load(Ordering::Relaxed), 1);
+        let forms = server.token_forms();
+        assert_eq!(forms.len(), 1);
+        let form = &forms[0];
+        assert_eq!(
+            form.get("grant_type").map(String::as_str),
+            Some("authorization_code")
+        );
+        assert_eq!(
+            form.get("code").map(String::as_str),
+            Some("synthetic-callback-code")
+        );
+        assert_eq!(
+            form.get("redirect_uri").map(String::as_str),
+            Some(redirect.as_str())
+        );
+        assert_eq!(
+            parameters.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        let verifier = form
+            .get("code_verifier")
+            .expect("token exchange omitted PKCE verifier");
+        use base64::Engine;
+        use sha2::Digest;
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(verifier.as_bytes()));
+        assert_eq!(parameters.get("code_challenge"), Some(&challenge));
+    })
+    .await
 }
 
 #[test]
@@ -918,29 +930,32 @@ fn failed_service_cleanup_retains_the_fixture_at_its_original_path() {
 /// this process cannot record for itself, before its guarded root drops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn service_cleanup_awaits_a_store_that_exists_only_under_its_staging_name() {
-    let env = Sandbox::warmed().await;
-    env.success(&["run", "Seed a store another process's engine ran in"]);
-    let scope = kuru_runtime::project_scope(&env.project).unwrap();
-    // The CLI's service retires itself when the command exits; wait for its
-    // close. This process neither ran nor recorded its engine, so only an
-    // awaited quiescence can explain the store.
-    tokio::task::block_in_place(|| {
-        memory::await_owner_exit(&kuru_memory::OpenOptions::new(
-            env.data.clone(),
-            scope.clone(),
-        ))
+    kuru_memory::test_support::closing(async {
+        let env = Sandbox::warmed().await;
+        env.success(&["run", "Seed a store another process's engine ran in"]);
+        let scope = kuru_runtime::project_scope(&env.project).unwrap();
+        // The CLI's service retires itself when the command exits; wait for its
+        // close. This process neither ran nor recorded its engine, so only an
+        // awaited quiescence can explain the store.
+        tokio::task::block_in_place(|| {
+            memory::await_owner_exit(&kuru_memory::OpenOptions::new(
+                env.data.clone(),
+                scope.clone(),
+            ))
+        })
+        .unwrap();
+        let hash = scope.strip_prefix("project/").unwrap();
+        let memory = env.data.join("memory");
+        let stage = memory.join(format!("{hash}.staging-{}", uuid::Uuid::new_v4()));
+        std::fs::rename(memory.join(hash), &stage).unwrap();
+        // The cleanup awaits the staged store, and the guard then releases the root.
+        drop(env);
+        assert!(
+            !stage.exists(),
+            "released fixture root still holds its stage"
+        );
     })
-    .unwrap();
-    let hash = scope.strip_prefix("project/").unwrap();
-    let memory = env.data.join("memory");
-    let stage = memory.join(format!("{hash}.staging-{}", uuid::Uuid::new_v4()));
-    std::fs::rename(memory.join(hash), &stage).unwrap();
-    // The cleanup awaits the staged store, and the guard then releases the root.
-    drop(env);
-    assert!(
-        !stage.exists(),
-        "released fixture root still holds its stage"
-    );
+    .await
 }
 
 #[test]
@@ -1160,136 +1175,123 @@ impl Drop for Streaming {
 
 #[tokio::test]
 async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
-    let env = Sandbox::warmed().await;
-    let scope = kuru_runtime::project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope)
-        .await
-        .unwrap();
-    let memory = kuru_memory::test_support::open_fixture(options.clone())
-        .await
-        .unwrap();
-    let candidate = memory
-        .begin_candidate("retained CLI candidate")
-        .await
-        .unwrap();
-    let branch = candidate.branch().to_owned();
-    let base = candidate.base().to_owned();
-    let view = candidate.view();
-    view.append("fixture/candidate", "user", "private CLI value")
-        .await
-        .unwrap();
-    let head = view.revision().await.unwrap();
-    drop(view);
-    drop(candidate);
-    memory.close().await.unwrap();
+    kuru_memory::test_support::closing(async {
+        let env = Sandbox::warmed().await;
+        let scope = kuru_runtime::project_scope(&env.project).unwrap();
+        let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope)
+            .await
+            .unwrap();
+        let memory = kuru_memory::test_support::open_fixture(options.clone())
+            .await
+            .unwrap();
+        let candidate = memory
+            .begin_candidate("retained CLI candidate")
+            .await
+            .unwrap();
+        let branch = candidate.branch().to_owned();
+        let base = candidate.base().to_owned();
+        let view = candidate.view();
+        view.append("fixture/candidate", "user", "private CLI value")
+            .await
+            .unwrap();
+        let head = view.revision().await.unwrap();
+        drop(view);
+        drop(candidate);
+        memory.close().await.unwrap();
 
-    // The controlled refusal comes from the owner this fixture starts: a
-    // request on its own attachment, which is then the sole one, reaches the
-    // store and is refused for a stale head. The command line cannot send that
-    // request itself, since it inspects the exact ref first and stops before
-    // the owner. That owner stays up only until its starter and every command
-    // that attached to it have released.
-    let diagnostic_path = env.data.join("candidate-owner-diagnostic.log");
-    let elected_path = env.data.join("candidate-elected-owner-diagnostic.log");
-    let private = kuru_platform::fs::Directory::open(
-        &env.data,
-        kuru_platform::fs::Privacy::OwnerOnly,
-        kuru_platform::fs::NameRetention::Pinned,
-    )
-    .unwrap();
-    let diagnostic = private
-        .create_new(std::ffi::OsStr::new("candidate-owner-diagnostic.log"))
+        // The controlled refusal comes from the owner this fixture starts: a
+        // request on its own attachment, which is then the sole one, reaches the
+        // store and is refused for a stale head. The command line cannot send that
+        // request itself, since it inspects the exact ref first and stops before
+        // the owner. That owner stays up only until its starter and every command
+        // that attached to it have released.
+        let diagnostic_path = env.data.join("candidate-owner-diagnostic.log");
+        let elected_path = env.data.join("candidate-elected-owner-diagnostic.log");
+        let private = kuru_platform::fs::Directory::open(
+            &env.data,
+            kuru_platform::fs::Privacy::OwnerOnly,
+            kuru_platform::fs::NameRetention::Pinned,
+        )
         .unwrap();
-    drop(
-        private
-            .create_new(std::ffi::OsStr::new(
-                "candidate-elected-owner-diagnostic.log",
+        let diagnostic = private
+            .create_new(std::ffi::OsStr::new("candidate-owner-diagnostic.log"))
+            .unwrap();
+        drop(
+            private
+                .create_new(std::ffi::OsStr::new(
+                    "candidate-elected-owner-diagnostic.log",
+                ))
+                .unwrap(),
+        );
+        let mut owner = kuru_memory::test_support::spawn_logged_owner(
+            &options,
+            &env.project.canonicalize().unwrap(),
+            Path::new(env!("CARGO_BIN_EXE_kuru")),
+            diagnostic,
+        )
+        .await
+        .unwrap();
+        let controlled = owner
+            .attachment()
+            .call(kuru_memory::service::ServiceCall::AbandonCandidateRef {
+                branch: branch.clone(),
+                base: base.clone(),
+                target: base.clone(),
+            })
+            .await;
+
+        // Every command line child gets the hook that sends the stderr of an owner
+        // it elects to a private file the fixture created. A child that finds a
+        // running owner attaches to it and elects nothing.
+        let run = |args: &[&str]| {
+            env.command()
+                .env(
+                    kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+                    &elected_path,
+                )
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let run_json = |args: &[&str]| -> anyhow::Result<Value> {
+            let output = run(args);
+            anyhow::ensure!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(serde_json::from_slice(&output.stdout)?)
+        };
+        // Reads run while the fixture's owner is up: they attach to it, and only
+        // an abandon is refused while another client is attached.
+        let attached = (|| -> anyhow::Result<(Output, Value, Value)> {
+            Ok((
+                run(&[
+                    "memory",
+                    "candidate-abandon",
+                    &branch,
+                    "--base",
+                    &base,
+                    "--head",
+                    &base,
+                ]),
+                run_json(&["memory", "candidates", "--limit", "1"])?,
+                run_json(&["memory", "candidate-status", &branch])?,
             ))
-            .unwrap(),
-    );
-    let mut owner = kuru_memory::test_support::spawn_logged_owner(
-        &options,
-        &env.project.canonicalize().unwrap(),
-        Path::new(env!("CARGO_BIN_EXE_kuru")),
-        diagnostic,
-    )
-    .await
-    .unwrap();
-    let controlled = owner
-        .attachment()
-        .call(kuru_memory::service::ServiceCall::AbandonCandidateRef {
-            branch: branch.clone(),
-            base: base.clone(),
-            target: base.clone(),
-        })
-        .await;
+        })();
+        let owner_exit = owner.wait_for_exit().await;
 
-    // Every command line child gets the hook that sends the stderr of an owner
-    // it elects to a private file the fixture created. A child that finds a
-    // running owner attaches to it and elects nothing.
-    let run = |args: &[&str]| {
-        env.command()
+        // The owner has exited, so this writable child elects one and must open
+        // the hook's file: a path that does not exist fails the election before
+        // any owner starts, which shows the child reads the hook. (A read-only
+        // child attaches to a running owner or opens locally and elects nothing.)
+        let refused_hook = env
+            .command()
             .env(
                 kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
-                &elected_path,
+                env.data.join("no-such-owner-diagnostic.log"),
             )
-            .args(args)
-            .output()
-            .unwrap()
-    };
-    let run_json = |args: &[&str]| -> anyhow::Result<Value> {
-        let output = run(args);
-        anyhow::ensure!(
-            output.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(serde_json::from_slice(&output.stdout)?)
-    };
-    // Reads run while the fixture's owner is up: they attach to it, and only
-    // an abandon is refused while another client is attached.
-    let attached = (|| -> anyhow::Result<(Output, Value, Value)> {
-        Ok((
-            run(&[
-                "memory",
-                "candidate-abandon",
-                &branch,
-                "--base",
-                &base,
-                "--head",
-                &base,
-            ]),
-            run_json(&["memory", "candidates", "--limit", "1"])?,
-            run_json(&["memory", "candidate-status", &branch])?,
-        ))
-    })();
-    let owner_exit = owner.wait_for_exit().await;
-
-    // The owner has exited, so this writable child elects one and must open
-    // the hook's file: a path that does not exist fails the election before
-    // any owner starts, which shows the child reads the hook. (A read-only
-    // child attaches to a running owner or opens locally and elects nothing.)
-    let refused_hook = env
-        .command()
-        .env(
-            kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
-            env.data.join("no-such-owner-diagnostic.log"),
-        )
-        .args([
-            "memory",
-            "candidate-abandon",
-            &branch,
-            "--base",
-            &base,
-            "--head",
-            &head,
-        ])
-        .output()
-        .unwrap();
-    // The abandon needs the sole attachment, so it elects an owner of its own.
-    let elected = (|| -> anyhow::Result<(Value, Value)> {
-        Ok((
-            run_json(&[
+            .args([
                 "memory",
                 "candidate-abandon",
                 &branch,
@@ -1297,79 +1299,95 @@ async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
                 &base,
                 "--head",
                 &head,
-            ])?,
-            run_json(&["memory", "candidate-status", &branch])?,
-        ))
-    })();
-    let ((rejected, inventory, status), (abandoned, missing)) = attached
-        .and_then(|attached| Ok((attached, elected?)))
-        .unwrap_or_else(|error| {
-            panic!(
-                "{error:#}; fixture owner: {}; elected owners: {}",
-                candidate_owner_diagnostic_records(&diagnostic_path),
-                candidate_owner_diagnostic_records(&elected_path)
-            )
-        });
-    owner_exit.unwrap();
-    let controlled_refusal = controlled
-        .err()
-        .as_ref()
-        .and_then(|error| error.downcast_ref::<kuru_memory::CandidateRefRejected>())
-        .map(|rejected| rejected.0);
-    assert!(
-        matches!(
-            controlled_refusal,
-            Some(kuru_memory::CandidateRefRefusal::Changed)
-        ),
-        "the controlled stale-head request did not return a definite changed refusal"
-    );
-    let fixture_owner = candidate_owner_diagnostic_records(&diagnostic_path);
-    assert!(
-        fixture_owner.contains(
-            "candidate_owner stage=ref_inspection class=non_sql sqlstate=none vendor=0 reason=other fault=ref_rejected"
-        ),
-        "the actual owner did not report the controlled changed-head refusal: {fixture_owner}"
-    );
-    assert!(!refused_hook.status.success());
-    let refused_hook = String::from_utf8_lossy(&refused_hook.stderr);
-    assert!(
-        refused_hook.contains("open test owner diagnostic"),
-        "a command line child did not read the owner diagnostic hook: {refused_hook}"
-    );
-    assert!(
-        !env.data.join("no-such-owner-diagnostic.log").exists(),
-        "the owner diagnostic hook created its log"
-    );
-    let elected_owners = candidate_owner_diagnostic_records(&elected_path);
-    assert!(
-        !elected_owners.contains("fault="),
-        "an owner a command elected reported a candidate fault: {elected_owners}"
-    );
+            ])
+            .output()
+            .unwrap();
+        // The abandon needs the sole attachment, so it elects an owner of its own.
+        let elected = (|| -> anyhow::Result<(Value, Value)> {
+            Ok((
+                run_json(&[
+                    "memory",
+                    "candidate-abandon",
+                    &branch,
+                    "--base",
+                    &base,
+                    "--head",
+                    &head,
+                ])?,
+                run_json(&["memory", "candidate-status", &branch])?,
+            ))
+        })();
+        let ((rejected, inventory, status), (abandoned, missing)) = attached
+            .and_then(|attached| Ok((attached, elected?)))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{error:#}; fixture owner: {}; elected owners: {}",
+                    candidate_owner_diagnostic_records(&diagnostic_path),
+                    candidate_owner_diagnostic_records(&elected_path)
+                )
+            });
+        owner_exit.unwrap();
+        let controlled_refusal = controlled
+            .err()
+            .as_ref()
+            .and_then(|error| error.downcast_ref::<kuru_memory::CandidateRefRejected>())
+            .map(|rejected| rejected.0);
+        assert!(
+            matches!(
+                controlled_refusal,
+                Some(kuru_memory::CandidateRefRefusal::Changed)
+            ),
+            "the controlled stale-head request did not return a definite changed refusal"
+        );
+        let fixture_owner = candidate_owner_diagnostic_records(&diagnostic_path);
+        assert!(
+            fixture_owner.contains(
+                "candidate_owner stage=ref_inspection class=non_sql sqlstate=none vendor=0 reason=other fault=ref_rejected"
+            ),
+            "the actual owner did not report the controlled changed-head refusal: {fixture_owner}"
+        );
+        assert!(!refused_hook.status.success());
+        let refused_hook = String::from_utf8_lossy(&refused_hook.stderr);
+        assert!(
+            refused_hook.contains("open test owner diagnostic"),
+            "a command line child did not read the owner diagnostic hook: {refused_hook}"
+        );
+        assert!(
+            !env.data.join("no-such-owner-diagnostic.log").exists(),
+            "the owner diagnostic hook created its log"
+        );
+        let elected_owners = candidate_owner_diagnostic_records(&elected_path);
+        assert!(
+            !elected_owners.contains("fault="),
+            "an owner a command elected reported a candidate fault: {elected_owners}"
+        );
 
-    assert!(!rejected.status.success());
-    let rejection = String::from_utf8(rejected.stderr).unwrap();
-    assert!(
-        rejection.contains("selected candidate ref changed or its outcome is unproved"),
-        "{rejection}"
-    );
-    assert!(!rejection.contains("retained request identity"));
-    assert!(!rejection.contains("outcome recovery"));
-    assert_eq!(inventory["candidates"][0]["branch"], branch);
-    assert_eq!(inventory["candidates"][0]["base"], base);
-    assert_eq!(inventory["candidates"][0]["head"], head);
-    assert_eq!(inventory["candidates"][0]["state"], "open_unchanged");
+        assert!(!rejected.status.success());
+        let rejection = String::from_utf8(rejected.stderr).unwrap();
+        assert!(
+            rejection.contains("selected candidate ref changed or its outcome is unproved"),
+            "{rejection}"
+        );
+        assert!(!rejection.contains("retained request identity"));
+        assert!(!rejection.contains("outcome recovery"));
+        assert_eq!(inventory["candidates"][0]["branch"], branch);
+        assert_eq!(inventory["candidates"][0]["base"], base);
+        assert_eq!(inventory["candidates"][0]["head"], head);
+        assert_eq!(inventory["candidates"][0]["state"], "open_unchanged");
 
-    assert_eq!(status["candidate"]["branch"], branch);
-    assert_eq!(status["candidate"]["base"], base);
-    assert_eq!(status["candidate"]["head"], head);
-    assert_eq!(status["candidate"]["state"], "open_unchanged");
-    assert_eq!(status["operation_outcome"], "not_queried");
+        assert_eq!(status["candidate"]["branch"], branch);
+        assert_eq!(status["candidate"]["base"], base);
+        assert_eq!(status["candidate"]["head"], head);
+        assert_eq!(status["candidate"]["state"], "open_unchanged");
+        assert_eq!(status["operation_outcome"], "not_queried");
 
-    assert_eq!(abandoned["branch"], branch);
-    assert_eq!(abandoned["state"], "abandoned");
+        assert_eq!(abandoned["branch"], branch);
+        assert_eq!(abandoned["state"], "abandoned");
 
-    assert_eq!(missing["candidate"]["state"], "missing");
-    assert_eq!(missing["operation_outcome"], "unproved");
+        assert_eq!(missing["candidate"]["state"], "missing");
+        assert_eq!(missing["operation_outcome"], "unproved");
+    })
+    .await
 }
 
 fn candidate_owner_diagnostic_records(path: &Path) -> String {
@@ -1911,435 +1929,285 @@ fn cli_turn_id_reuses_only_the_exact_request_in_its_session() {
 
 #[tokio::test]
 async fn session_lifecycle_cli_is_provider_free_and_matches_resume_continue_and_export() {
-    use kuru_memory::MemoryStore;
-    use kuru_runtime::project_scope;
+    kuru_memory::test_support::closing(async {
+        use kuru_memory::MemoryStore;
+        use kuru_runtime::project_scope;
 
-    let env = Sandbox::warmed().await;
-    let scope = project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
-        .await
-        .unwrap();
-    let memory = MemoryStore::open(options).await.unwrap();
-    memory
-        .append(
-            &format!("{scope}/ifs/identity/export-private/notes"),
-            "note",
-            "PRIVATE_NOTE_EXCLUDED_FROM_SESSION_EXPORT",
-        )
-        .await
-        .unwrap();
-    memory
-        .put(
-            &format!("{scope}/private/export-probe"),
-            &serde_json::json!({"secret": "PRIVATE_STATE_EXCLUDED_FROM_SESSION_EXPORT"}),
-        )
-        .await
-        .unwrap();
-    memory.close().await.unwrap();
-    let first: Value = serde_json::from_str(&env.success(&[
-        "run",
-        "create one public session boundary",
-        "--json",
-    ]))
-    .unwrap();
-    let source = first["session"].as_str().unwrap().to_owned();
-    let sessions: Value = serde_json::from_str(&env.success(&["sessions"])).unwrap();
-    let source_record = sessions
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|record| record["id"] == source)
-        .unwrap();
-    let source_node = source_record["head_node_id"].as_str().unwrap().to_owned();
-
-    let provider_free = |args: &[&str]| {
-        let output = env
-            .command_for("responses")
-            .env_remove("OPENAI_API_KEY")
-            .args(args)
-            .output()
+        let env = Sandbox::warmed().await;
+        let scope = project_scope(&env.project).unwrap();
+        let options =
+            kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
+                .await
+                .unwrap();
+        let memory = MemoryStore::open(options).await.unwrap();
+        memory
+            .append(
+                &format!("{scope}/ifs/identity/export-private/notes"),
+                "note",
+                "PRIVATE_NOTE_EXCLUDED_FROM_SESSION_EXPORT",
+            )
+            .await
             .unwrap();
-        assert!(
-            output.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        output
-    };
-    let renamed: Value = serde_json::from_slice(
-        &provider_free(&["sessions", "rename", &source, "durable source"]).stdout,
-    )
-    .unwrap();
-    assert_eq!(renamed["session_id"], source);
-    let child = "00000000-0000-4000-8000-000000000011";
-    let forked: Value = serde_json::from_slice(
-        &provider_free(&[
-            "sessions",
-            "fork",
-            &source,
-            &source_node,
-            "--child-id",
-            child,
-            "--label",
-            "durable fork",
-        ])
-        .stdout,
-    )
-    .unwrap();
-    assert_eq!(forked["session_id"], child);
-    let newest: Value = serde_json::from_str(&env.success(&[
-        "run",
-        "create a newer session that will be removed",
-        "--json",
-    ]))
-    .unwrap();
-    let newest_id = newest["session"].as_str().unwrap();
-    let newest_removed: Value =
-        serde_json::from_slice(&provider_free(&["sessions", "remove", newest_id]).stdout).unwrap();
-    assert_eq!(newest_removed["lifecycle_state"], "removed");
-    let removed: Value =
-        serde_json::from_slice(&provider_free(&["sessions", "remove", &source]).stdout).unwrap();
-    assert_eq!(removed["lifecycle_state"], "removed");
-    let active: Value = serde_json::from_slice(&provider_free(&["sessions"]).stdout).unwrap();
-    assert!(
-        active
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["id"] != source)
-    );
-    assert!(
-        active
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["id"] == child)
-    );
-
-    let refused = env.run(&["--resume", &source, "run", "must not dispatch"]);
-    assert!(!refused.status.success());
-    assert!(
-        String::from_utf8_lossy(&refused.stderr)
-            .contains("session is removed; restore it before resuming")
-    );
-    let missing = env.run(&[
-        "--resume",
-        "00000000-0000-4000-8000-000000000099",
-        "run",
-        "must not dispatch a missing session",
-    ]);
-    assert!(!missing.status.success());
-    assert!(
-        String::from_utf8_lossy(&missing.stderr).contains("session is absent"),
-        "{}",
-        String::from_utf8_lossy(&missing.stderr)
-    );
-    let continued: Value = serde_json::from_str(&env.success(&[
-        "--continue",
-        "run",
-        "append only to the latest active fork",
-        "--json",
-    ]))
-    .unwrap();
-    assert_eq!(continued["session"], child);
-
-    let restored: Value =
-        serde_json::from_slice(&provider_free(&["sessions", "restore", &source]).stdout).unwrap();
-    assert_eq!(restored["lifecycle_state"], "active");
-    let exact: Value = serde_json::from_str(&env.success(&[
-        "--resume",
-        &source,
-        "run",
-        "resume the restored exact source",
-        "--json",
-    ]))
-    .unwrap();
-    assert_eq!(exact["session"], source);
-
-    let exported = env.root.path().join("fork.jsonl");
-    std::fs::write(&exported, "selected output sentinel").unwrap();
-    let export_path = exported.to_str().unwrap();
-    let output = provider_free(&[
-        "sessions",
-        "export",
-        child,
-        "--format",
-        "jsonl",
-        "--output",
-        export_path,
-    ]);
-    assert!(output.stdout.is_empty());
-    let lines = std::fs::read_to_string(exported).unwrap();
-    let records = lines
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(records[0]["kind"], "manifest");
-    assert_eq!(records[0]["session"]["session_id"], child);
-    assert!(records.iter().any(|record| {
-        record["kind"] == "turn"
-            && record["record"]["terminal_entries"]
-                .to_string()
-                .contains("demo")
-    }));
-    assert!(lines.contains("create one public session boundary"));
-    assert!(lines.contains("append only to the latest active fork"));
-    assert!(!lines.contains("resume the restored exact source"));
-    assert!(!lines.contains("selected output sentinel"));
-    assert!(!lines.contains("PRIVATE_NOTE_EXCLUDED_FROM_SESSION_EXPORT"));
-    assert!(!lines.contains("PRIVATE_STATE_EXCLUDED_FROM_SESSION_EXPORT"));
-
-    let markdown = env.root.path().join("fork.md");
-    let markdown_path = markdown.to_str().unwrap();
-    let output = provider_free(&[
-        "sessions",
-        "export",
-        child,
-        "--format",
-        "markdown",
-        "--output",
-        markdown_path,
-    ]);
-    assert!(output.stdout.is_empty());
-    let markdown = std::fs::read_to_string(markdown).unwrap();
-    assert!(markdown.contains("# Kuru public session export"));
-    let inherited = markdown.find("create one public session boundary").unwrap();
-    let own = markdown
-        .find("append only to the latest active fork")
+        memory
+            .put(
+                &format!("{scope}/private/export-probe"),
+                &serde_json::json!({"secret": "PRIVATE_STATE_EXCLUDED_FROM_SESSION_EXPORT"}),
+            )
+            .await
+            .unwrap();
+        memory.close().await.unwrap();
+        let first: Value = serde_json::from_str(&env.success(&[
+            "run",
+            "create one public session boundary",
+            "--json",
+        ]))
         .unwrap();
-    assert!(inherited < own, "Markdown transcript was not chronological");
-    assert!(!markdown.contains("resume the restored exact source"));
-    assert!(!markdown.contains("PRIVATE_NOTE_EXCLUDED_FROM_SESSION_EXPORT"));
-    assert!(!markdown.contains("PRIVATE_STATE_EXCLUDED_FROM_SESSION_EXPORT"));
+        let source = first["session"].as_str().unwrap().to_owned();
+        let sessions: Value = serde_json::from_str(&env.success(&["sessions"])).unwrap();
+        let source_record = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["id"] == source)
+            .unwrap();
+        let source_node = source_record["head_node_id"].as_str().unwrap().to_owned();
 
-    let complete_memory = provider_free(&["memory", "export"]);
-    let complete_memory = String::from_utf8(complete_memory.stdout).unwrap();
-    assert!(complete_memory.contains("PRIVATE_NOTE_EXCLUDED_FROM_SESSION_EXPORT"));
-    assert!(complete_memory.contains("PRIVATE_STATE_EXCLUDED_FROM_SESSION_EXPORT"));
+        let provider_free = |args: &[&str]| {
+            let output = env
+                .command_for("responses")
+                .env_remove("OPENAI_API_KEY")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        let renamed: Value = serde_json::from_slice(
+            &provider_free(&["sessions", "rename", &source, "durable source"]).stdout,
+        )
+        .unwrap();
+        assert_eq!(renamed["session_id"], source);
+        let child = "00000000-0000-4000-8000-000000000011";
+        let forked: Value = serde_json::from_slice(
+            &provider_free(&[
+                "sessions",
+                "fork",
+                &source,
+                &source_node,
+                "--child-id",
+                child,
+                "--label",
+                "durable fork",
+            ])
+            .stdout,
+        )
+        .unwrap();
+        assert_eq!(forked["session_id"], child);
+        let newest: Value = serde_json::from_str(&env.success(&[
+            "run",
+            "create a newer session that will be removed",
+            "--json",
+        ]))
+        .unwrap();
+        let newest_id = newest["session"].as_str().unwrap();
+        let newest_removed: Value =
+            serde_json::from_slice(&provider_free(&["sessions", "remove", newest_id]).stdout)
+                .unwrap();
+        assert_eq!(newest_removed["lifecycle_state"], "removed");
+        let removed: Value =
+            serde_json::from_slice(&provider_free(&["sessions", "remove", &source]).stdout)
+                .unwrap();
+        assert_eq!(removed["lifecycle_state"], "removed");
+        let active: Value = serde_json::from_slice(&provider_free(&["sessions"]).stdout).unwrap();
+        assert!(
+            active
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["id"] != source)
+        );
+        assert!(
+            active
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == child)
+        );
+
+        let refused = env.run(&["--resume", &source, "run", "must not dispatch"]);
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("session is removed; restore it before resuming")
+        );
+        let missing = env.run(&[
+            "--resume",
+            "00000000-0000-4000-8000-000000000099",
+            "run",
+            "must not dispatch a missing session",
+        ]);
+        assert!(!missing.status.success());
+        assert!(
+            String::from_utf8_lossy(&missing.stderr).contains("session is absent"),
+            "{}",
+            String::from_utf8_lossy(&missing.stderr)
+        );
+        let continued: Value = serde_json::from_str(&env.success(&[
+            "--continue",
+            "run",
+            "append only to the latest active fork",
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(continued["session"], child);
+
+        let restored: Value =
+            serde_json::from_slice(&provider_free(&["sessions", "restore", &source]).stdout)
+                .unwrap();
+        assert_eq!(restored["lifecycle_state"], "active");
+        let exact: Value = serde_json::from_str(&env.success(&[
+            "--resume",
+            &source,
+            "run",
+            "resume the restored exact source",
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(exact["session"], source);
+
+        let exported = env.root.path().join("fork.jsonl");
+        std::fs::write(&exported, "selected output sentinel").unwrap();
+        let export_path = exported.to_str().unwrap();
+        let output = provider_free(&[
+            "sessions",
+            "export",
+            child,
+            "--format",
+            "jsonl",
+            "--output",
+            export_path,
+        ]);
+        assert!(output.stdout.is_empty());
+        let lines = std::fs::read_to_string(exported).unwrap();
+        let records = lines
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["kind"], "manifest");
+        assert_eq!(records[0]["session"]["session_id"], child);
+        assert!(records.iter().any(|record| {
+            record["kind"] == "turn"
+                && record["record"]["terminal_entries"]
+                    .to_string()
+                    .contains("demo")
+        }));
+        assert!(lines.contains("create one public session boundary"));
+        assert!(lines.contains("append only to the latest active fork"));
+        assert!(!lines.contains("resume the restored exact source"));
+        assert!(!lines.contains("selected output sentinel"));
+        assert!(!lines.contains("PRIVATE_NOTE_EXCLUDED_FROM_SESSION_EXPORT"));
+        assert!(!lines.contains("PRIVATE_STATE_EXCLUDED_FROM_SESSION_EXPORT"));
+
+        let markdown = env.root.path().join("fork.md");
+        let markdown_path = markdown.to_str().unwrap();
+        let output = provider_free(&[
+            "sessions",
+            "export",
+            child,
+            "--format",
+            "markdown",
+            "--output",
+            markdown_path,
+        ]);
+        assert!(output.stdout.is_empty());
+        let markdown = std::fs::read_to_string(markdown).unwrap();
+        assert!(markdown.contains("# Kuru public session export"));
+        let inherited = markdown.find("create one public session boundary").unwrap();
+        let own = markdown
+            .find("append only to the latest active fork")
+            .unwrap();
+        assert!(inherited < own, "Markdown transcript was not chronological");
+        assert!(!markdown.contains("resume the restored exact source"));
+        assert!(!markdown.contains("PRIVATE_NOTE_EXCLUDED_FROM_SESSION_EXPORT"));
+        assert!(!markdown.contains("PRIVATE_STATE_EXCLUDED_FROM_SESSION_EXPORT"));
+
+        let complete_memory = provider_free(&["memory", "export"]);
+        let complete_memory = String::from_utf8(complete_memory.stdout).unwrap();
+        assert!(complete_memory.contains("PRIVATE_NOTE_EXCLUDED_FROM_SESSION_EXPORT"));
+        assert!(complete_memory.contains("PRIVATE_STATE_EXCLUDED_FROM_SESSION_EXPORT"));
+    })
+    .await
 }
 
 #[tokio::test]
 async fn session_export_keeps_legacy_speaker_and_turn_unknown_in_both_formats() {
-    use kuru_core::{Message, Mode};
-    use kuru_memory::{
-        LEGACY_PREFIX_RECORD_FORMAT, LegacyTranscriptPrefix, MemoryStore,
-        SESSION_CATALOG_RECORD_FORMAT, SessionCatalogRecord, SessionLifecycleState,
-    };
-    use kuru_runtime::project_scope;
+    kuru_memory::test_support::closing(async {
+        use kuru_core::{Message, Mode};
+        use kuru_memory::{
+            LEGACY_PREFIX_RECORD_FORMAT, LegacyTranscriptPrefix, MemoryStore,
+            SESSION_CATALOG_RECORD_FORMAT, SessionCatalogRecord, SessionLifecycleState,
+        };
+        use kuru_runtime::project_scope;
 
-    let env = Sandbox::warmed().await;
-    let scope = project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
-        .await
-        .unwrap();
-    let session = "00000000-0000-4000-8000-000000000031";
-    let namespace = format!("{scope}/transcript/{session}");
-    let memory = MemoryStore::open(options.clone()).await.unwrap();
-    memory
-        .append_session_message(
-            &namespace,
-            session,
-            &Message::text("assistant", "legacy public answer"),
-        )
-        .await
-        .unwrap();
-    let window = memory
-        .session_history_window_after(&namespace, session, 0, 16)
-        .await
-        .unwrap();
-    let sequence = window.rows[0].sequence;
-    let prefix = LegacyTranscriptPrefix {
-        namespace,
-        source_session_id: session.into(),
-        source_revision: window.revision,
-        first_sequence: sequence,
-        through_sequence: sequence,
-        row_count: 1,
-        record_format: LEGACY_PREFIX_RECORD_FORMAT.into(),
-    };
-    memory.close().await.unwrap();
-    kuru_memory::test_support::seed_public_session(
-        options,
-        &SessionCatalogRecord {
-            session_id: session.into(),
-            mode: Mode::Ifs,
-            label: "legacy attribution".into(),
-            created_order: 1,
-            updated_order: 1,
-            lifecycle_generation: 0,
-            lifecycle_state: SessionLifecycleState::Active,
-            head_node_id: None,
-            pending_node_id: None,
-            legacy_prefix: Some(prefix),
-            fork_provenance: None,
-            record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
-        },
-        &[],
-    )
-    .await
-    .unwrap();
-
-    for format in ["jsonl", "markdown"] {
-        let path = env.root.path().join(format!("legacy.{format}"));
-        let output = env
-            .command_for("responses")
-            .env_remove("OPENAI_API_KEY")
-            .args([
-                "sessions",
-                "export",
+        let env = Sandbox::warmed().await;
+        let scope = project_scope(&env.project).unwrap();
+        let options =
+            kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
+                .await
+                .unwrap();
+        let session = "00000000-0000-4000-8000-000000000031";
+        let namespace = format!("{scope}/transcript/{session}");
+        let memory = MemoryStore::open(options.clone()).await.unwrap();
+        memory
+            .append_session_message(
+                &namespace,
                 session,
-                "--format",
-                format,
-                "--output",
-                path.to_str().unwrap(),
-            ])
-            .output()
+                &Message::text("assistant", "legacy public answer"),
+            )
+            .await
             .unwrap();
-        assert!(
-            output.status.success(),
-            "{format}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(output.stdout.is_empty());
-        let contents = std::fs::read_to_string(path).unwrap();
-        let records = contents
-            .lines()
-            .filter(|line| line.starts_with('{'))
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(records.len(), 2, "{format}: {contents}");
-        assert_eq!(records[0]["kind"], "manifest");
-        assert_eq!(records[0]["session"]["session_id"], session);
-        assert_eq!(records[0]["total_rows"], 1);
-        assert_eq!(records[1]["kind"], "legacy");
-        assert_eq!(records[1]["sequence"], sequence);
-        assert_eq!(
-            records[1]["message"],
-            serde_json::to_value(Message::text("assistant", "legacy public answer")).unwrap()
-        );
-        assert!(records[1].get("speaker_id").is_none());
-        assert!(records[1].get("turn_id").is_none());
-    }
-}
-
-#[tokio::test]
-async fn normal_cli_exports_large_parent_and_fork_in_complete_chronological_records() {
-    use kuru_core::{Message, Mode};
-    use kuru_memory::{
-        MemoryStore, PUBLIC_TURN_RECORD_FORMAT, PublicTurnKind, PublicTurnRecord,
-        PublicTurnSettlement, SESSION_CATALOG_RECORD_FORMAT, SessionCatalogRecord,
-        SessionLifecycleState, SessionTurnCheckpoint, public_turn_node_id,
-    };
-    use kuru_runtime::project_scope;
-    use std::io::{BufRead, BufReader};
-
-    let env = Sandbox::warmed().await;
-    let scope = project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
-        .await
-        .unwrap();
-    let parent = "00000000-0000-4000-8000-000000000021";
-    let child = "00000000-0000-4000-8000-000000000022";
-    let large_answer = "🪶".repeat(8_192);
-    let mut turns = Vec::with_capacity(1_025);
-    let mut predecessor = None;
-    for index in 0..1_025 {
-        let turn_id = format!("bulk-{index:04}");
-        let node_id = public_turn_node_id(parent, &turn_id).unwrap();
-        turns.push(PublicTurnRecord {
-            node_id: node_id.clone(),
-            origin_session_id: parent.into(),
-            turn_id,
-            kind: PublicTurnKind::Primary,
-            continuation_of_node_id: None,
-            predecessor_node_id: predecessor,
-            settlement: PublicTurnSettlement::Completed,
-            user_entry: Some(Message::text("user", format!("question-{index:04}"))),
-            speaker_id: Some("fixture-speaker".into()),
-            terminal_entries: vec![Message::text(
-                "assistant",
-                format!("answer-{index:04}:{large_answer}"),
-            )],
-            record_format: PUBLIC_TURN_RECORD_FORMAT.into(),
-        });
-        predecessor = Some(node_id);
-    }
-    let catalog = SessionCatalogRecord {
-        session_id: parent.into(),
-        mode: Mode::Ifs,
-        label: "long parent".into(),
-        created_order: 1,
-        updated_order: 1,
-        lifecycle_generation: 0,
-        lifecycle_state: SessionLifecycleState::Active,
-        head_node_id: predecessor,
-        pending_node_id: None,
-        legacy_prefix: None,
-        fork_provenance: None,
-        record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
-    };
-    kuru_memory::test_support::seed_public_session(options.clone(), &catalog, &turns)
-        .await
-        .unwrap();
-    drop(turns);
-
-    let memory = MemoryStore::open(options).await.unwrap();
-    memory
-        .put(
-            &format!("{scope}/private/export-probe"),
-            &serde_json::json!("PRIVATE_STATE_EXCLUDED_FROM_LONG_EXPORT"),
-        )
-        .await
-        .unwrap();
-    memory
-        .append(
-            &format!("{scope}/ifs/identity/private/notes"),
-            "note",
-            "PRIVATE_NOTE_EXCLUDED_FROM_LONG_EXPORT",
-        )
-        .await
-        .unwrap();
-    let fork_node = public_turn_node_id(parent, "bulk-1023").unwrap();
-    memory
-        .fork_session(parent, 0, &fork_node, child, "long fork")
-        .await
-        .unwrap();
-    let child_namespace = format!("{scope}/transcript/{child}");
-    memory
-        .checkpoint_session_turn(
-            &child_namespace,
-            child,
-            &[Message::text("user", "CHILD-OWN-QUESTION")],
-            &[],
-            &SessionTurnCheckpoint::Admit {
-                expected_generation: 0,
-                turn_id: "child-own".into(),
-                label: None,
-                expected_transcript_rows: Some(0),
+        let window = memory
+            .session_history_window_after(&namespace, session, 0, 16)
+            .await
+            .unwrap();
+        let sequence = window.rows[0].sequence;
+        let prefix = LegacyTranscriptPrefix {
+            namespace,
+            source_session_id: session.into(),
+            source_revision: window.revision,
+            first_sequence: sequence,
+            through_sequence: sequence,
+            row_count: 1,
+            record_format: LEGACY_PREFIX_RECORD_FORMAT.into(),
+        };
+        memory.close().await.unwrap();
+        kuru_memory::test_support::seed_public_session(
+            options,
+            &SessionCatalogRecord {
+                session_id: session.into(),
+                mode: Mode::Ifs,
+                label: "legacy attribution".into(),
+                created_order: 1,
+                updated_order: 1,
+                lifecycle_generation: 0,
+                lifecycle_state: SessionLifecycleState::Active,
+                head_node_id: None,
+                pending_node_id: None,
+                legacy_prefix: Some(prefix),
+                fork_provenance: None,
+                record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
             },
-        )
-        .await
-        .unwrap();
-    memory
-        .checkpoint_session_turn(
-            &child_namespace,
-            child,
-            &[Message::text("assistant", "CHILD-OWN-ANSWER")],
             &[],
-            &SessionTurnCheckpoint::Settle {
-                expected_generation: 0,
-                turn_id: "child-own".into(),
-                settlement: PublicTurnSettlement::Completed,
-                speaker_id: "fixture-speaker".into(),
-            },
         )
         .await
         .unwrap();
-    memory.close().await.unwrap();
 
-    for (session, fork) in [(parent, false), (child, true)] {
         for format in ["jsonl", "markdown"] {
-            let path = env.root.path().join(format!("{session}.{format}"));
+            let path = env.root.path().join(format!("legacy.{format}"));
             let output = env
                 .command_for("responses")
                 .env_remove("OPENAI_API_KEY")
@@ -2356,82 +2224,247 @@ async fn normal_cli_exports_large_parent_and_fork_in_complete_chronological_reco
                 .unwrap();
             assert!(
                 output.status.success(),
-                "{session} {format}: {}",
+                "{format}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
             assert!(output.stdout.is_empty());
-            assert!(
-                std::fs::metadata(&path).unwrap().len() > 32 * 1024 * 1024,
-                "{session} {format} export did not exceed the page-memory bound"
+            let contents = std::fs::read_to_string(path).unwrap();
+            let records = contents
+                .lines()
+                .filter(|line| line.starts_with('{'))
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 2, "{format}: {contents}");
+            assert_eq!(records[0]["kind"], "manifest");
+            assert_eq!(records[0]["session"]["session_id"], session);
+            assert_eq!(records[0]["total_rows"], 1);
+            assert_eq!(records[1]["kind"], "legacy");
+            assert_eq!(records[1]["sequence"], sequence);
+            assert_eq!(
+                records[1]["message"],
+                serde_json::to_value(Message::text("assistant", "legacy public answer")).unwrap()
             );
-            let mut manifest = false;
-            let mut rows = 0;
-            for line in BufReader::new(std::fs::File::open(&path).unwrap()).lines() {
-                let line = line.unwrap();
-                assert!(!line.contains("PRIVATE_STATE_EXCLUDED_FROM_LONG_EXPORT"));
-                assert!(!line.contains("PRIVATE_NOTE_EXCLUDED_FROM_LONG_EXPORT"));
-                if !line.starts_with('{') {
-                    continue;
-                }
-                let record: Value = serde_json::from_str(&line).unwrap();
-                match record["kind"].as_str().unwrap() {
-                    "manifest" => {
-                        assert!(!manifest);
-                        assert_eq!(record["session"]["session_id"], session);
-                        assert_eq!(record["total_rows"], 1_025);
-                        if fork {
-                            assert_eq!(
-                                record["session"]["fork_provenance"]["source_session_id"],
-                                parent
-                            );
-                            assert_eq!(
-                                record["session"]["fork_provenance"]["source_node_id"],
-                                fork_node
-                            );
-                        }
-                        manifest = true;
-                    }
-                    "turn" => {
-                        assert!(manifest);
-                        let expected = if fork && rows == 1_024 {
-                            "child-own".to_owned()
-                        } else {
-                            format!("bulk-{rows:04}")
-                        };
-                        assert_eq!(record["record"]["turn_id"], expected);
-                        assert_eq!(record["record"]["speaker_id"], "fixture-speaker");
-                        assert_eq!(record["record"]["settlement"], "completed");
-                        let turn: PublicTurnRecord =
-                            serde_json::from_value(record["record"].clone()).unwrap();
-                        let (question, answer) = if fork && rows == 1_024 {
-                            (
-                                "CHILD-OWN-QUESTION".to_owned(),
-                                "CHILD-OWN-ANSWER".to_owned(),
-                            )
-                        } else {
-                            (
-                                format!("question-{rows:04}"),
-                                format!("answer-{rows:04}:{large_answer}"),
-                            )
-                        };
-                        assert_eq!(turn.user_entry, Some(Message::text("user", question)));
-                        assert_eq!(
-                            turn.terminal_entries,
-                            vec![Message::text("assistant", answer)]
-                        );
-                        assert_eq!(
-                            turn.origin_session_id,
-                            if fork && rows == 1_024 { child } else { parent }
-                        );
-                        rows += 1;
-                    }
-                    kind => panic!("unexpected {format} export record {kind}"),
-                }
-            }
-            assert!(manifest);
-            assert_eq!(rows, 1_025);
+            assert!(records[1].get("speaker_id").is_none());
+            assert!(records[1].get("turn_id").is_none());
         }
-    }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn normal_cli_exports_large_parent_and_fork_in_complete_chronological_records() {
+    kuru_memory::test_support::closing(async {
+        use kuru_core::{Message, Mode};
+        use kuru_memory::{
+            MemoryStore, PUBLIC_TURN_RECORD_FORMAT, PublicTurnKind, PublicTurnRecord,
+            PublicTurnSettlement, SESSION_CATALOG_RECORD_FORMAT, SessionCatalogRecord,
+            SessionLifecycleState, SessionTurnCheckpoint, public_turn_node_id,
+        };
+        use kuru_runtime::project_scope;
+        use std::io::{BufRead, BufReader};
+
+        let env = Sandbox::warmed().await;
+        let scope = project_scope(&env.project).unwrap();
+        let options =
+            kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
+                .await
+                .unwrap();
+        let parent = "00000000-0000-4000-8000-000000000021";
+        let child = "00000000-0000-4000-8000-000000000022";
+        let large_answer = "🪶".repeat(8_192);
+        let mut turns = Vec::with_capacity(1_025);
+        let mut predecessor = None;
+        for index in 0..1_025 {
+            let turn_id = format!("bulk-{index:04}");
+            let node_id = public_turn_node_id(parent, &turn_id).unwrap();
+            turns.push(PublicTurnRecord {
+                node_id: node_id.clone(),
+                origin_session_id: parent.into(),
+                turn_id,
+                kind: PublicTurnKind::Primary,
+                continuation_of_node_id: None,
+                predecessor_node_id: predecessor,
+                settlement: PublicTurnSettlement::Completed,
+                user_entry: Some(Message::text("user", format!("question-{index:04}"))),
+                speaker_id: Some("fixture-speaker".into()),
+                terminal_entries: vec![Message::text(
+                    "assistant",
+                    format!("answer-{index:04}:{large_answer}"),
+                )],
+                record_format: PUBLIC_TURN_RECORD_FORMAT.into(),
+            });
+            predecessor = Some(node_id);
+        }
+        let catalog = SessionCatalogRecord {
+            session_id: parent.into(),
+            mode: Mode::Ifs,
+            label: "long parent".into(),
+            created_order: 1,
+            updated_order: 1,
+            lifecycle_generation: 0,
+            lifecycle_state: SessionLifecycleState::Active,
+            head_node_id: predecessor,
+            pending_node_id: None,
+            legacy_prefix: None,
+            fork_provenance: None,
+            record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+        };
+        kuru_memory::test_support::seed_public_session(options.clone(), &catalog, &turns)
+            .await
+            .unwrap();
+        drop(turns);
+
+        let memory = MemoryStore::open(options).await.unwrap();
+        memory
+            .put(
+                &format!("{scope}/private/export-probe"),
+                &serde_json::json!("PRIVATE_STATE_EXCLUDED_FROM_LONG_EXPORT"),
+            )
+            .await
+            .unwrap();
+        memory
+            .append(
+                &format!("{scope}/ifs/identity/private/notes"),
+                "note",
+                "PRIVATE_NOTE_EXCLUDED_FROM_LONG_EXPORT",
+            )
+            .await
+            .unwrap();
+        let fork_node = public_turn_node_id(parent, "bulk-1023").unwrap();
+        memory
+            .fork_session(parent, 0, &fork_node, child, "long fork")
+            .await
+            .unwrap();
+        let child_namespace = format!("{scope}/transcript/{child}");
+        memory
+            .checkpoint_session_turn(
+                &child_namespace,
+                child,
+                &[Message::text("user", "CHILD-OWN-QUESTION")],
+                &[],
+                &SessionTurnCheckpoint::Admit {
+                    expected_generation: 0,
+                    turn_id: "child-own".into(),
+                    label: None,
+                    expected_transcript_rows: Some(0),
+                },
+            )
+            .await
+            .unwrap();
+        memory
+            .checkpoint_session_turn(
+                &child_namespace,
+                child,
+                &[Message::text("assistant", "CHILD-OWN-ANSWER")],
+                &[],
+                &SessionTurnCheckpoint::Settle {
+                    expected_generation: 0,
+                    turn_id: "child-own".into(),
+                    settlement: PublicTurnSettlement::Completed,
+                    speaker_id: "fixture-speaker".into(),
+                },
+            )
+            .await
+            .unwrap();
+        memory.close().await.unwrap();
+
+        for (session, fork) in [(parent, false), (child, true)] {
+            for format in ["jsonl", "markdown"] {
+                let path = env.root.path().join(format!("{session}.{format}"));
+                let output = env
+                    .command_for("responses")
+                    .env_remove("OPENAI_API_KEY")
+                    .args([
+                        "sessions",
+                        "export",
+                        session,
+                        "--format",
+                        format,
+                        "--output",
+                        path.to_str().unwrap(),
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{session} {format}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(output.stdout.is_empty());
+                assert!(
+                    std::fs::metadata(&path).unwrap().len() > 32 * 1024 * 1024,
+                    "{session} {format} export did not exceed the page-memory bound"
+                );
+                let mut manifest = false;
+                let mut rows = 0;
+                for line in BufReader::new(std::fs::File::open(&path).unwrap()).lines() {
+                    let line = line.unwrap();
+                    assert!(!line.contains("PRIVATE_STATE_EXCLUDED_FROM_LONG_EXPORT"));
+                    assert!(!line.contains("PRIVATE_NOTE_EXCLUDED_FROM_LONG_EXPORT"));
+                    if !line.starts_with('{') {
+                        continue;
+                    }
+                    let record: Value = serde_json::from_str(&line).unwrap();
+                    match record["kind"].as_str().unwrap() {
+                        "manifest" => {
+                            assert!(!manifest);
+                            assert_eq!(record["session"]["session_id"], session);
+                            assert_eq!(record["total_rows"], 1_025);
+                            if fork {
+                                assert_eq!(
+                                    record["session"]["fork_provenance"]["source_session_id"],
+                                    parent
+                                );
+                                assert_eq!(
+                                    record["session"]["fork_provenance"]["source_node_id"],
+                                    fork_node
+                                );
+                            }
+                            manifest = true;
+                        }
+                        "turn" => {
+                            assert!(manifest);
+                            let expected = if fork && rows == 1_024 {
+                                "child-own".to_owned()
+                            } else {
+                                format!("bulk-{rows:04}")
+                            };
+                            assert_eq!(record["record"]["turn_id"], expected);
+                            assert_eq!(record["record"]["speaker_id"], "fixture-speaker");
+                            assert_eq!(record["record"]["settlement"], "completed");
+                            let turn: PublicTurnRecord =
+                                serde_json::from_value(record["record"].clone()).unwrap();
+                            let (question, answer) = if fork && rows == 1_024 {
+                                (
+                                    "CHILD-OWN-QUESTION".to_owned(),
+                                    "CHILD-OWN-ANSWER".to_owned(),
+                                )
+                            } else {
+                                (
+                                    format!("question-{rows:04}"),
+                                    format!("answer-{rows:04}:{large_answer}"),
+                                )
+                            };
+                            assert_eq!(turn.user_entry, Some(Message::text("user", question)));
+                            assert_eq!(
+                                turn.terminal_entries,
+                                vec![Message::text("assistant", answer)]
+                            );
+                            assert_eq!(
+                                turn.origin_session_id,
+                                if fork && rows == 1_024 { child } else { parent }
+                            );
+                            rows += 1;
+                        }
+                        kind => panic!("unexpected {format} export record {kind}"),
+                    }
+                }
+                assert!(manifest);
+                assert_eq!(rows, 1_025);
+            }
+        }
+    })
+    .await
 }
 
 #[test]
@@ -2501,141 +2534,144 @@ fn cli_requires_explicit_project_purge_confirmation_and_removes_its_diagnostics_
 
 #[tokio::test]
 async fn cli_project_purge_preserves_shared_legacy_export_engine_and_other_project() {
-    use kuru_memory::MemoryStore;
-    use std::io::Write;
+    kuru_memory::test_support::closing(async {
+        use kuru_memory::MemoryStore;
+        use std::io::Write;
 
-    let env = Sandbox::warmed().await;
-    let other_project = env.root.path().join("other-project");
-    std::fs::create_dir(&other_project).unwrap();
-    let scope = kuru_runtime::project_scope(&env.project).unwrap();
-    let other_scope = kuru_runtime::project_scope(&other_project).unwrap();
+        let env = Sandbox::warmed().await;
+        let other_project = env.root.path().join("other-project");
+        std::fs::create_dir(&other_project).unwrap();
+        let scope = kuru_runtime::project_scope(&env.project).unwrap();
+        let other_scope = kuru_runtime::project_scope(&other_project).unwrap();
 
-    kuru_platform::fs::Directory::ensure_private(&env.data).unwrap();
-    let legacy_path = env.data.join("memory.sqlite3");
-    let legacy = rusqlite::Connection::open(&legacy_path).unwrap();
-    legacy
-        .execute_batch(
-            "PRAGMA application_id=1263882837;
-             PRAGMA user_version=1;
-             CREATE TABLE messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL);
-             CREATE TABLE state (`key` TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
-        )
-        .unwrap();
-    let selected_key = format!("{scope}/purge-acceptance");
-    let other_key = format!("{other_scope}/purge-acceptance");
-    legacy
-        .execute(
-            "INSERT INTO state VALUES (?1, ?2)",
-            rusqlite::params![selected_key, r#"{"owner":"selected"}"#],
-        )
-        .unwrap();
-    legacy
-        .execute(
-            "INSERT INTO state VALUES (?1, ?2)",
-            rusqlite::params![other_key, r#"{"owner":"other"}"#],
-        )
-        .unwrap();
-    drop(legacy);
-    let legacy_before = std::fs::read(&legacy_path).unwrap();
-
-    let selected_options =
-        kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
-            .await
+        kuru_platform::fs::Directory::ensure_private(&env.data).unwrap();
+        let legacy_path = env.data.join("memory.sqlite3");
+        let legacy = rusqlite::Connection::open(&legacy_path).unwrap();
+        legacy
+            .execute_batch(
+                "PRAGMA application_id=1263882837;
+                 PRAGMA user_version=1;
+                 CREATE TABLE messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL);
+                 CREATE TABLE state (`key` TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
+            )
             .unwrap();
-    let selected = MemoryStore::open(selected_options.clone()).await.unwrap();
-    assert_eq!(
-        selected.get(&selected_key).await.unwrap(),
-        Some(serde_json::json!({"owner":"selected"}))
-    );
-    selected.close().await.unwrap();
-    let other_options =
-        kuru_memory::test_support::warmed_open_options(env.data.clone(), other_scope.clone())
-            .await
+        let selected_key = format!("{scope}/purge-acceptance");
+        let other_key = format!("{other_scope}/purge-acceptance");
+        legacy
+            .execute(
+                "INSERT INTO state VALUES (?1, ?2)",
+                rusqlite::params![selected_key, r#"{"owner":"selected"}"#],
+            )
             .unwrap();
-    let other = MemoryStore::open(other_options.clone()).await.unwrap();
-    assert_eq!(
-        other.get(&other_key).await.unwrap(),
-        Some(serde_json::json!({"owner":"other"}))
-    );
-    other.close().await.unwrap();
+        legacy
+            .execute(
+                "INSERT INTO state VALUES (?1, ?2)",
+                rusqlite::params![other_key, r#"{"owner":"other"}"#],
+            )
+            .unwrap();
+        drop(legacy);
+        let legacy_before = std::fs::read(&legacy_path).unwrap();
 
-    let snapshots = env.data.join("memory/legacy");
-    let mut snapshot_before: Vec<_> = std::fs::read_dir(&snapshots)
-        .unwrap()
-        .map(|entry| {
-            let entry = entry.unwrap();
-            (entry.file_name(), std::fs::read(entry.path()).unwrap())
-        })
-        .collect();
-    snapshot_before.sort_by(|left, right| left.0.cmp(&right.0));
-    assert_eq!(snapshot_before.len(), 1, "legacy import snapshot drifted");
+        let selected_options =
+            kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
+                .await
+                .unwrap();
+        let selected = MemoryStore::open(selected_options.clone()).await.unwrap();
+        assert_eq!(
+            selected.get(&selected_key).await.unwrap(),
+            Some(serde_json::json!({"owner":"selected"}))
+        );
+        selected.close().await.unwrap();
+        let other_options =
+            kuru_memory::test_support::warmed_open_options(env.data.clone(), other_scope.clone())
+                .await
+                .unwrap();
+        let other = MemoryStore::open(other_options.clone()).await.unwrap();
+        assert_eq!(
+            other.get(&other_key).await.unwrap(),
+            Some(serde_json::json!({"owner":"other"}))
+        );
+        other.close().await.unwrap();
 
-    let export_path = env.root.path().join("selected-memory.json");
-    let mut export_command = env.command_for("responses");
-    let export = export_command
-        .env_remove("OPENAI_API_KEY")
-        .args(["memory", "export", "--output", "../selected-memory.json"])
-        .output()
-        .unwrap();
-    assert!(
-        export.status.success(),
-        "{}",
-        String::from_utf8_lossy(&export.stderr)
-    );
-    assert!(export.stdout.is_empty());
-    assert_memory_progress(&String::from_utf8_lossy(&export.stderr));
-    let export_before = std::fs::read(&export_path).unwrap();
+        let snapshots = env.data.join("memory/legacy");
+        let mut snapshot_before: Vec<_> = std::fs::read_dir(&snapshots)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect();
+        snapshot_before.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(snapshot_before.len(), 1, "legacy import snapshot drifted");
 
-    let engine =
-        kuru_platform::fs::Directory::ensure_private(&env.data.join("tools/dolt")).unwrap();
-    engine
-        .create_new(std::ffi::OsStr::new("purge-sentinel"))
-        .unwrap()
-        .write_all(b"shared engine cache survives")
-        .unwrap();
-    drop(engine);
+        let export_path = env.root.path().join("selected-memory.json");
+        let mut export_command = env.command_for("responses");
+        let export = export_command
+            .env_remove("OPENAI_API_KEY")
+            .args(["memory", "export", "--output", "../selected-memory.json"])
+            .output()
+            .unwrap();
+        assert!(
+            export.status.success(),
+            "{}",
+            String::from_utf8_lossy(&export.stderr)
+        );
+        assert!(export.stdout.is_empty());
+        assert_memory_progress(&String::from_utf8_lossy(&export.stderr));
+        let export_before = std::fs::read(&export_path).unwrap();
 
-    let mut purge_command = env.command_for("responses");
-    let output = purge_command
-        .env_remove("OPENAI_API_KEY")
-        .args(["memory", "purge", "--yes"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.stderr.is_empty());
-    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["project"], scope);
-    assert_eq!(result["legacy_import_suppressed"], true);
+        let engine =
+            kuru_platform::fs::Directory::ensure_private(&env.data.join("tools/dolt")).unwrap();
+        engine
+            .create_new(std::ffi::OsStr::new("purge-sentinel"))
+            .unwrap()
+            .write_all(b"shared engine cache survives")
+            .unwrap();
+        drop(engine);
 
-    assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_before);
-    let mut snapshot_after: Vec<_> = std::fs::read_dir(&snapshots)
-        .unwrap()
-        .map(|entry| {
-            let entry = entry.unwrap();
-            (entry.file_name(), std::fs::read(entry.path()).unwrap())
-        })
-        .collect();
-    snapshot_after.sort_by(|left, right| left.0.cmp(&right.0));
-    assert_eq!(snapshot_after, snapshot_before);
-    assert_eq!(std::fs::read(&export_path).unwrap(), export_before);
-    assert_eq!(
-        std::fs::read(env.data.join("tools/dolt/purge-sentinel")).unwrap(),
-        b"shared engine cache survives"
-    );
+        let mut purge_command = env.command_for("responses");
+        let output = purge_command
+            .env_remove("OPENAI_API_KEY")
+            .args(["memory", "purge", "--yes"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["project"], scope);
+        assert_eq!(result["legacy_import_suppressed"], true);
 
-    let other = MemoryStore::open(other_options).await.unwrap();
-    assert_eq!(
-        other.get(&other_key).await.unwrap(),
-        Some(serde_json::json!({"owner":"other"}))
-    );
-    other.close().await.unwrap();
-    let fresh = MemoryStore::open(selected_options).await.unwrap();
-    assert_eq!(fresh.get(&selected_key).await.unwrap(), None);
-    fresh.close().await.unwrap();
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_before);
+        let mut snapshot_after: Vec<_> = std::fs::read_dir(&snapshots)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect();
+        snapshot_after.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(snapshot_after, snapshot_before);
+        assert_eq!(std::fs::read(&export_path).unwrap(), export_before);
+        assert_eq!(
+            std::fs::read(env.data.join("tools/dolt/purge-sentinel")).unwrap(),
+            b"shared engine cache survives"
+        );
+
+        let other = MemoryStore::open(other_options).await.unwrap();
+        assert_eq!(
+            other.get(&other_key).await.unwrap(),
+            Some(serde_json::json!({"owner":"other"}))
+        );
+        other.close().await.unwrap();
+        let fresh = MemoryStore::open(selected_options).await.unwrap();
+        assert_eq!(fresh.get(&selected_key).await.unwrap(), None);
+        fresh.close().await.unwrap();
+    })
+    .await
 }
 
 #[test]
@@ -3008,335 +3044,345 @@ fn fresh_inspection_never_provisions_memory_and_history_is_read_only() {
 
 #[tokio::test]
 async fn memory_export_is_provider_free_and_publishes_one_committed_snapshot() {
-    use kuru_memory::MemoryStore;
-    use kuru_runtime::project_scope;
+    kuru_memory::test_support::closing(async {
+        use kuru_memory::MemoryStore;
+        use kuru_runtime::project_scope;
 
-    let env = Sandbox::warmed().await;
-    let scope = project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope)
-        .await
-        .unwrap();
-    let memory = MemoryStore::open(options).await.unwrap();
-    memory
-        .append(
-            "export/notes",
-            "dream",
-            "literal fence ```\nremains content",
-        )
-        .await
-        .unwrap();
-    memory
-        .put("export/unknown", &serde_json::json!({"future":[true, 7]}))
-        .await
-        .unwrap();
-    let revision = memory.revision().await.unwrap();
-    memory.close().await.unwrap();
+        let env = Sandbox::warmed().await;
+        let scope = project_scope(&env.project).unwrap();
+        let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope)
+            .await
+            .unwrap();
+        let memory = MemoryStore::open(options).await.unwrap();
+        memory
+            .append(
+                "export/notes",
+                "dream",
+                "literal fence ```\nremains content",
+            )
+            .await
+            .unwrap();
+        memory
+            .put("export/unknown", &serde_json::json!({"future":[true, 7]}))
+            .await
+            .unwrap();
+        let revision = memory.revision().await.unwrap();
+        memory.close().await.unwrap();
 
-    let mut json_command = env.command_for("responses");
-    json_command
-        .env_remove("OPENAI_API_KEY")
-        .args(["memory", "export"]);
-    let output = json_command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_memory_progress(&String::from_utf8_lossy(&output.stderr));
-    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["manifest"]["snapshot"], "committed active main");
-    assert_eq!(json["manifest"]["provenance"]["revision"], revision);
-    assert_eq!(
-        json["manifest"]["excludes"],
-        serde_json::json!([
-            "previous revisions",
-            "candidate branches",
-            "uncommitted working rows",
-            "operations and schema tables"
-        ])
-    );
-    let records = json["records"].as_array().unwrap();
-    assert!(records.iter().any(|record| {
-        record["kind"] == "message"
-            && record["role"] == "dream"
-            && record["content"] == "literal fence ```\nremains content"
-    }));
-    assert!(
-        records
-            .iter()
-            .any(|record| { record["kind"] == "state" && record["key"] == "export/unknown" })
-    );
+        let mut json_command = env.command_for("responses");
+        json_command
+            .env_remove("OPENAI_API_KEY")
+            .args(["memory", "export"]);
+        let output = json_command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_memory_progress(&String::from_utf8_lossy(&output.stderr));
+        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["manifest"]["snapshot"], "committed active main");
+        assert_eq!(json["manifest"]["provenance"]["revision"], revision);
+        assert_eq!(
+            json["manifest"]["excludes"],
+            serde_json::json!([
+                "previous revisions",
+                "candidate branches",
+                "uncommitted working rows",
+                "operations and schema tables"
+            ])
+        );
+        let records = json["records"].as_array().unwrap();
+        assert!(records.iter().any(|record| {
+            record["kind"] == "message"
+                && record["role"] == "dream"
+                && record["content"] == "literal fence ```\nremains content"
+        }));
+        assert!(
+            records
+                .iter()
+                .any(|record| { record["kind"] == "state" && record["key"] == "export/unknown" })
+        );
 
-    let output_path = env.root.path().join("committed-memory.md");
-    let mut markdown_command = env.command_for("responses");
-    markdown_command.env_remove("OPENAI_API_KEY").args([
-        "memory",
-        "export",
-        "--format",
-        "markdown",
-        "--output",
-        "../committed-memory.md",
-    ]);
-    let output = markdown_command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.stdout.is_empty());
-    assert_memory_progress(&String::from_utf8_lossy(&output.stderr));
-    let markdown = std::fs::read_to_string(&output_path).unwrap();
-    assert!(markdown.contains("# Kuru committed memory export"));
-    assert!(markdown.contains("committed active main"));
-    let markdown_values: Vec<Value> = markdown
-        .split("```json\n")
-        .skip(1)
-        .map(|block| serde_json::from_str(block.split("\n```").next().unwrap()).unwrap())
-        .collect();
-    assert_eq!(markdown_values[0], json["manifest"]);
-    assert_eq!(&markdown_values[1..], records.as_slice());
-    let original = std::fs::read(&output_path).unwrap();
-    let output = env.run(&[
-        "memory",
-        "export",
-        "--format",
-        "markdown",
-        "--output",
-        "../committed-memory.md",
-    ]);
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Rejected publication"));
-    assert_eq!(std::fs::read(&output_path).unwrap(), original);
+        let output_path = env.root.path().join("committed-memory.md");
+        let mut markdown_command = env.command_for("responses");
+        markdown_command.env_remove("OPENAI_API_KEY").args([
+            "memory",
+            "export",
+            "--format",
+            "markdown",
+            "--output",
+            "../committed-memory.md",
+        ]);
+        let output = markdown_command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        assert_memory_progress(&String::from_utf8_lossy(&output.stderr));
+        let markdown = std::fs::read_to_string(&output_path).unwrap();
+        assert!(markdown.contains("# Kuru committed memory export"));
+        assert!(markdown.contains("committed active main"));
+        let markdown_values: Vec<Value> = markdown
+            .split("```json\n")
+            .skip(1)
+            .map(|block| serde_json::from_str(block.split("\n```").next().unwrap()).unwrap())
+            .collect();
+        assert_eq!(markdown_values[0], json["manifest"]);
+        assert_eq!(&markdown_values[1..], records.as_slice());
+        let original = std::fs::read(&output_path).unwrap();
+        let output = env.run(&[
+            "memory",
+            "export",
+            "--format",
+            "markdown",
+            "--output",
+            "../committed-memory.md",
+        ]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Rejected publication"));
+        assert_eq!(std::fs::read(&output_path).unwrap(), original);
+    })
+    .await
 }
 
 #[tokio::test]
 async fn malformed_export_fails_after_private_staging_without_publishing_a_partial_file() {
-    use kuru_memory::MemoryStore;
-    use kuru_runtime::project_scope;
+    kuru_memory::test_support::closing(async {
+        use kuru_memory::MemoryStore;
+        use kuru_runtime::project_scope;
 
-    let env = Sandbox::warmed().await;
-    let scope = project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope)
-        .await
-        .unwrap();
-    let memory = MemoryStore::open(options).await.unwrap();
-    kuru_memory::test_support::commit_malformed_state(&memory, "export/malformed")
-        .await
-        .unwrap();
-    memory.close().await.unwrap();
+        let env = Sandbox::warmed().await;
+        let scope = project_scope(&env.project).unwrap();
+        let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope)
+            .await
+            .unwrap();
+        let memory = MemoryStore::open(options).await.unwrap();
+        kuru_memory::test_support::commit_malformed_state(&memory, "export/malformed")
+            .await
+            .unwrap();
+        memory.close().await.unwrap();
 
-    let mut before: Vec<_> = std::fs::read_dir(env.root.path())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect();
-    before.sort();
-    let output_path = env.root.path().join("failed-memory.json");
-    let mut command = env.command_for("responses");
-    command.env_remove("OPENAI_API_KEY").args([
-        "memory",
-        "export",
-        "--output",
-        "../failed-memory.json",
-    ]);
-    let output = command.output().unwrap();
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid JSON"));
-    assert!(!output_path.exists());
-    let mut after: Vec<_> = std::fs::read_dir(env.root.path())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect();
-    after.sort();
-    assert_eq!(after, before, "failed export retained a staging directory");
+        let mut before: Vec<_> = std::fs::read_dir(env.root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        before.sort();
+        let output_path = env.root.path().join("failed-memory.json");
+        let mut command = env.command_for("responses");
+        command.env_remove("OPENAI_API_KEY").args([
+            "memory",
+            "export",
+            "--output",
+            "../failed-memory.json",
+        ]);
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid JSON"));
+        assert!(!output_path.exists());
+        let mut after: Vec<_> = std::fs::read_dir(env.root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        after.sort();
+        assert_eq!(after, before, "failed export retained a staging directory");
+    })
+    .await
 }
 
 #[tokio::test]
 async fn notes_cli_reads_existing_modes_without_provider_or_legacy_import() {
-    use kuru_core::{Framework, Mode, ProjectPreferences};
-    use kuru_memory::MemoryStore;
-    use kuru_runtime::{Topology, project_scope};
+    kuru_memory::test_support::closing(async {
+        use kuru_core::{Framework, Mode, ProjectPreferences};
+        use kuru_memory::MemoryStore;
+        use kuru_runtime::{Topology, project_scope};
 
-    let env = Sandbox::warmed().await;
-    let scope = project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
-        .await
-        .unwrap();
-    let memory = MemoryStore::open(options).await.unwrap();
-    let freudian = Topology {
-        parts: Framework::builtin(Mode::Freudian).parts,
-        relationships: vec![],
-        states: Default::default(),
-        focus: None,
-    };
-    let ifs = Topology {
-        parts: Framework::builtin(Mode::Ifs).parts,
-        relationships: vec![],
-        states: Default::default(),
-        focus: None,
-    };
-    let freudian_id = freudian.parts[0].id.clone();
-    let ifs_id = ifs.parts[0].id.clone();
-    memory
-        .put(
-            &format!("{scope}/freudian/topology"),
-            &serde_json::to_value(&freudian).unwrap(),
-        )
-        .await
-        .unwrap();
-    memory
-        .put(
-            &format!("{scope}/ifs/topology"),
-            &serde_json::to_value(&ifs).unwrap(),
-        )
-        .await
-        .unwrap();
-    memory
-        .put(
-            &format!("{scope}/preferences"),
-            &serde_json::to_value(ProjectPreferences {
-                mode: Some(Mode::Freudian),
-                ..ProjectPreferences::default()
-            })
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    memory
-        .append(
-            &format!("{scope}/freudian/identity/{freudian_id}/notes"),
-            "note",
-            "FREUDIAN-NOTE",
-        )
-        .await
-        .unwrap();
-    memory
-        .append(
-            &format!("{scope}/freudian/identity/{freudian_id}/notes"),
-            "dream",
-            "FREUDIAN-DREAM",
-        )
-        .await
-        .unwrap();
-    memory
-        .append(
-            &format!("{scope}/ifs/identity/{ifs_id}/notes"),
-            "note",
-            "IFS-NOTE",
-        )
-        .await
-        .unwrap();
-    memory.close().await.unwrap();
+        let env = Sandbox::warmed().await;
+        let scope = project_scope(&env.project).unwrap();
+        let options =
+            kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
+                .await
+                .unwrap();
+        let memory = MemoryStore::open(options).await.unwrap();
+        let freudian = Topology {
+            parts: Framework::builtin(Mode::Freudian).parts,
+            relationships: vec![],
+            states: Default::default(),
+            focus: None,
+        };
+        let ifs = Topology {
+            parts: Framework::builtin(Mode::Ifs).parts,
+            relationships: vec![],
+            states: Default::default(),
+            focus: None,
+        };
+        let freudian_id = freudian.parts[0].id.clone();
+        let ifs_id = ifs.parts[0].id.clone();
+        memory
+            .put(
+                &format!("{scope}/freudian/topology"),
+                &serde_json::to_value(&freudian).unwrap(),
+            )
+            .await
+            .unwrap();
+        memory
+            .put(
+                &format!("{scope}/ifs/topology"),
+                &serde_json::to_value(&ifs).unwrap(),
+            )
+            .await
+            .unwrap();
+        memory
+            .put(
+                &format!("{scope}/preferences"),
+                &serde_json::to_value(ProjectPreferences {
+                    mode: Some(Mode::Freudian),
+                    ..ProjectPreferences::default()
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        memory
+            .append(
+                &format!("{scope}/freudian/identity/{freudian_id}/notes"),
+                "note",
+                "FREUDIAN-NOTE",
+            )
+            .await
+            .unwrap();
+        memory
+            .append(
+                &format!("{scope}/freudian/identity/{freudian_id}/notes"),
+                "dream",
+                "FREUDIAN-DREAM",
+            )
+            .await
+            .unwrap();
+        memory
+            .append(
+                &format!("{scope}/ifs/identity/{ifs_id}/notes"),
+                "note",
+                "IFS-NOTE",
+            )
+            .await
+            .unwrap();
+        memory.close().await.unwrap();
 
-    let mut saved_command = env.command_for("responses");
-    saved_command
-        .env_remove("OPENAI_API_KEY")
-        .args(["memory", "notes", &freudian_id]);
-    let output = saved_command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let saved: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(saved["mode"], "freudian");
-    assert_eq!(saved["identity"], freudian_id);
-    assert_eq!(saved["requested_limit"], 100);
-    assert_eq!(saved["notes"][0]["content"], "FREUDIAN-NOTE");
-    assert_eq!(saved["notes"][1]["role"], "dream");
-    let dream_sequence = saved["notes"][1]["sequence"].as_i64().unwrap();
+        let mut saved_command = env.command_for("responses");
+        saved_command
+            .env_remove("OPENAI_API_KEY")
+            .args(["memory", "notes", &freudian_id]);
+        let output = saved_command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let saved: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(saved["mode"], "freudian");
+        assert_eq!(saved["identity"], freudian_id);
+        assert_eq!(saved["requested_limit"], 100);
+        assert_eq!(saved["notes"][0]["content"], "FREUDIAN-NOTE");
+        assert_eq!(saved["notes"][1]["role"], "dream");
+        let dream_sequence = saved["notes"][1]["sequence"].as_i64().unwrap();
 
-    let mut forget_command = env.command_for("responses");
-    forget_command.env_remove("OPENAI_API_KEY").args([
-        "memory",
-        "forget",
-        &freudian_id,
-        "--note",
-        &dream_sequence.to_string(),
-    ]);
-    let output = forget_command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let forgotten: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(forgotten["mode"], "freudian");
-    assert_eq!(forgotten["identity"], freudian_id);
-    assert_eq!(forgotten["sequence"], dream_sequence);
-    assert_eq!(forgotten["history_retained"], true);
+        let mut forget_command = env.command_for("responses");
+        forget_command.env_remove("OPENAI_API_KEY").args([
+            "memory",
+            "forget",
+            &freudian_id,
+            "--note",
+            &dream_sequence.to_string(),
+        ]);
+        let output = forget_command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let forgotten: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(forgotten["mode"], "freudian");
+        assert_eq!(forgotten["identity"], freudian_id);
+        assert_eq!(forgotten["sequence"], dream_sequence);
+        assert_eq!(forgotten["history_retained"], true);
 
-    let mut after_command = env.command_for("responses");
-    after_command
-        .env_remove("OPENAI_API_KEY")
-        .args(["memory", "notes", &freudian_id]);
-    let output = after_command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let after: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(after["notes"].as_array().map(Vec::len), Some(1));
-    assert_eq!(after["notes"][0]["content"], "FREUDIAN-NOTE");
+        let mut after_command = env.command_for("responses");
+        after_command
+            .env_remove("OPENAI_API_KEY")
+            .args(["memory", "notes", &freudian_id]);
+        let output = after_command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let after: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(after["notes"].as_array().map(Vec::len), Some(1));
+        assert_eq!(after["notes"][0]["content"], "FREUDIAN-NOTE");
 
-    let mut explicit_command = env.command_for("responses");
-    explicit_command
-        .env_remove("OPENAI_API_KEY")
-        .args(["--mode", "ifs", "memory", "notes", &ifs_id, "--limit", "1"]);
-    let output = explicit_command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let explicit: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(explicit["mode"], "ifs");
-    assert_eq!(explicit["notes"][0]["content"], "IFS-NOTE");
-    let mut max_command = env.command_for("responses");
-    max_command.env_remove("OPENAI_API_KEY").args([
-        "memory",
-        "notes",
-        &freudian_id,
-        "--limit",
-        "1000",
-    ]);
-    let output = max_command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let max: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(max["requested_limit"], 1000);
-    assert_eq!(max["notes"].as_array().map(Vec::len), Some(1));
-    assert_eq!(max["truncated"], false);
-    for limit in ["0", "1001"] {
-        let output = env.run(&["memory", "notes", &freudian_id, "--limit", limit]);
+        let mut explicit_command = env.command_for("responses");
+        explicit_command
+            .env_remove("OPENAI_API_KEY")
+            .args(["--mode", "ifs", "memory", "notes", &ifs_id, "--limit", "1"]);
+        let output = explicit_command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let explicit: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(explicit["mode"], "ifs");
+        assert_eq!(explicit["notes"][0]["content"], "IFS-NOTE");
+        let mut max_command = env.command_for("responses");
+        max_command.env_remove("OPENAI_API_KEY").args([
+            "memory",
+            "notes",
+            &freudian_id,
+            "--limit",
+            "1000",
+        ]);
+        let output = max_command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let max: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(max["requested_limit"], 1000);
+        assert_eq!(max["notes"].as_array().map(Vec::len), Some(1));
+        assert_eq!(max["truncated"], false);
+        for limit in ["0", "1001"] {
+            let output = env.run(&["memory", "notes", &freudian_id, "--limit", limit]);
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("between 1 and 1000"));
+        }
+
+        let legacy = Sandbox::warmed().await;
+        std::fs::create_dir(&legacy.data).unwrap();
+        let original = b"legacy notes must not be imported";
+        let path = legacy.data.join("memory.sqlite3");
+        std::fs::write(&path, original).unwrap();
+        let output = legacy.run(&["memory", "notes", "missing"]);
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("between 1 and 1000"));
-    }
-
-    let legacy = Sandbox::warmed().await;
-    std::fs::create_dir(&legacy.data).unwrap();
-    let original = b"legacy notes must not be imported";
-    let path = legacy.data.join("memory.sqlite3");
-    std::fs::write(&path, original).unwrap();
-    let output = legacy.run(&["memory", "notes", "missing"]);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
-    assert_eq!(std::fs::read(&path).unwrap(), original);
-    assert!(!legacy.data.join("memory").exists());
-    let output = legacy.run(&["memory", "forget", "missing", "--note", "1"]);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
-    assert_eq!(std::fs::read(&path).unwrap(), original);
-    let output = legacy.run(&["memory", "export"]);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
-    assert_eq!(std::fs::read(&path).unwrap(), original);
-    assert!(!legacy.data.join("memory").exists());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!legacy.data.join("memory").exists());
+        let output = legacy.run(&["memory", "forget", "missing", "--note", "1"]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let output = legacy.run(&["memory", "export"]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!legacy.data.join("memory").exists());
+    })
+    .await
 }
 
 #[cfg(unix)]
@@ -3757,72 +3803,76 @@ fn headless_json_remains_machine_readable_when_old_context_is_omitted() {
 
 #[tokio::test]
 async fn cli_undo_dream_shows_one_notice_without_constructing_a_provider() {
-    use kuru_memory::MemoryStore;
+    kuru_memory::test_support::closing(async {
+        use kuru_memory::MemoryStore;
 
-    let env = Sandbox::warmed().await;
-    kuru_platform::fs::Directory::ensure_private(&env.data).unwrap();
-    let scope = kuru_runtime::project_scope(&env.project).unwrap();
-    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
-        .await
-        .unwrap();
-    MemoryStore::open(options.clone())
-        .await
-        .unwrap()
-        .close()
-        .await
-        .unwrap();
-
-    let mut first = env.command_for("responses");
-    let first = first
-        .env_remove("OPENAI_API_KEY")
-        .args(["undo-dream"])
-        .output()
-        .unwrap();
-    assert!(
-        !first.status.success(),
-        "undo without a dream must still fail"
-    );
-    assert!(first.stdout.is_empty());
-    let first_stderr = String::from_utf8_lossy(&first.stderr);
-    assert!(
-        first_stderr.contains("Memory is ready at"),
-        "{first_stderr}"
-    );
-    assert!(
-        !first_stderr.contains("OPENAI_API_KEY"),
-        "undo-dream attempted provider setup: {first_stderr}"
-    );
-
-    let mut observed_options = options.clone();
-    observed_options.read_only = true;
-    let project = env.project.canonicalize().unwrap();
-    let (_, opening) = MemoryStore::open_managed_observed(
-        observed_options,
-        project,
-        PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
-    );
-    let reopened = opening.await.unwrap();
-    assert_eq!(
-        reopened
-            .get(&format!("{scope}/notice/memory-storage"))
+        let env = Sandbox::warmed().await;
+        kuru_platform::fs::Directory::ensure_private(&env.data).unwrap();
+        let scope = kuru_runtime::project_scope(&env.project).unwrap();
+        let options =
+            kuru_memory::test_support::warmed_open_options(env.data.clone(), scope.clone())
+                .await
+                .unwrap();
+        MemoryStore::open(options.clone())
             .await
-            .unwrap(),
-        Some(serde_json::json!({"version": 1}))
-    );
-    reopened.close().await.unwrap();
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
 
-    let mut second = env.command_for("responses");
-    let second = second
-        .env_remove("OPENAI_API_KEY")
-        .args(["undo-dream"])
-        .output()
-        .unwrap();
-    assert!(!second.status.success());
-    assert!(
-        !String::from_utf8_lossy(&second.stderr).contains("Memory is ready at"),
-        "{}",
-        String::from_utf8_lossy(&second.stderr)
-    );
+        let mut first = env.command_for("responses");
+        let first = first
+            .env_remove("OPENAI_API_KEY")
+            .args(["undo-dream"])
+            .output()
+            .unwrap();
+        assert!(
+            !first.status.success(),
+            "undo without a dream must still fail"
+        );
+        assert!(first.stdout.is_empty());
+        let first_stderr = String::from_utf8_lossy(&first.stderr);
+        assert!(
+            first_stderr.contains("Memory is ready at"),
+            "{first_stderr}"
+        );
+        assert!(
+            !first_stderr.contains("OPENAI_API_KEY"),
+            "undo-dream attempted provider setup: {first_stderr}"
+        );
+
+        let mut observed_options = options.clone();
+        observed_options.read_only = true;
+        let project = env.project.canonicalize().unwrap();
+        let (_, opening) = MemoryStore::open_managed_observed(
+            observed_options,
+            project,
+            PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+        );
+        let reopened = opening.await.unwrap();
+        assert_eq!(
+            reopened
+                .get(&format!("{scope}/notice/memory-storage"))
+                .await
+                .unwrap(),
+            Some(serde_json::json!({"version": 1}))
+        );
+        reopened.close().await.unwrap();
+
+        let mut second = env.command_for("responses");
+        let second = second
+            .env_remove("OPENAI_API_KEY")
+            .args(["undo-dream"])
+            .output()
+            .unwrap();
+        assert!(!second.status.success());
+        assert!(
+            !String::from_utf8_lossy(&second.stderr).contains("Memory is ready at"),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+    })
+    .await
 }
 
 #[test]
@@ -3907,93 +3957,97 @@ fn cli_imports_a_real_legacy_wal_without_changing_its_layout() {
 /// asserted.
 #[tokio::test]
 async fn sequential_commands_start_a_fresh_owner_each_time() {
-    let env = Sandbox::warmed().await;
-    let scope = kuru_runtime::project_scope(&env.project).unwrap();
-    let store_path = env
-        .data
-        .join("memory")
-        .join(scope.strip_prefix("project/").unwrap());
-    let stopped = || {
-        assert!(
-            matches!(std::fs::symlink_metadata(store_path.join("endpoint.json")),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound),
-            "the owner released its lock while its endpoint was still published"
-        );
-        #[cfg(unix)]
-        let lifecycle_path = store_path.join("lifecycle.lock");
-        #[cfg(windows)]
-        let lifecycle_path = {
-            use kuru_platform::fs::{Directory, NameRetention, Privacy};
-            let directory =
-                Directory::open(&store_path, Privacy::OwnerOnly, NameRetention::Movable).unwrap();
-            let key: String = directory
-                .identity()
-                .to_bytes()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            env.data
-                .join("memory/lifecycles")
-                .join(format!("{key}.lock"))
+    kuru_memory::test_support::closing(async {
+        let env = Sandbox::warmed().await;
+        let scope = kuru_runtime::project_scope(&env.project).unwrap();
+        let store_path = env
+            .data
+            .join("memory")
+            .join(scope.strip_prefix("project/").unwrap());
+        let stopped = || {
+            assert!(
+                matches!(std::fs::symlink_metadata(store_path.join("endpoint.json")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+                "the owner released its lock while its endpoint was still published"
+            );
+            #[cfg(unix)]
+            let lifecycle_path = store_path.join("lifecycle.lock");
+            #[cfg(windows)]
+            let lifecycle_path = {
+                use kuru_platform::fs::{Directory, NameRetention, Privacy};
+                let directory =
+                    Directory::open(&store_path, Privacy::OwnerOnly, NameRetention::Movable)
+                        .unwrap();
+                let key: String = directory
+                    .identity()
+                    .to_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                env.data
+                    .join("memory/lifecycles")
+                    .join(format!("{key}.lock"))
+            };
+            let lease = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lifecycle_path)
+                .unwrap();
+            lease.try_lock().expect(
+                "the owner released its lock before its supervisor released the lifecycle lease",
+            );
         };
-        let lease = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(lifecycle_path)
+        let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope)
+            .await
             .unwrap();
-        lease.try_lock().expect(
-            "the owner released its lock before its supervisor released the lifecycle lease",
+        // Run one command, then await the exit of the owner it used. Records the
+        // command's wall time and how long that owner took to finish closing after
+        // the command exited. A writable command elects its own owner, so after
+        // the first its wall time is a reopen after a completed close; a read-only
+        // or failing command starts no owner and its close wait returns at once.
+        let mut observed = Vec::new();
+        let mut sequential = |label: &str, args: &[&str]| {
+            let started = std::time::Instant::now();
+            let output = env.run(args);
+            let command = started.elapsed();
+            let close = memory::await_owner_exit(&options)
+                .unwrap_or_else(|error| panic!("{args:?}: {error:#}"));
+            stopped();
+            observed.push(format!("{label}: command={command:?} close={close:?}"));
+            output
+        };
+        let seed = sequential("seed", &["run", "Seed memory for sequential inspection"]);
+        assert!(
+            seed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&seed.stderr)
         );
-    };
-    let options = kuru_memory::test_support::warmed_open_options(env.data.clone(), scope)
-        .await
-        .unwrap();
-    // Run one command, then await the exit of the owner it used. Records the
-    // command's wall time and how long that owner took to finish closing after
-    // the command exited. A writable command elects its own owner, so after
-    // the first its wall time is a reopen after a completed close; a read-only
-    // or failing command starts no owner and its close wait returns at once.
-    let mut observed = Vec::new();
-    let mut sequential = |label: &str, args: &[&str]| {
-        let started = std::time::Instant::now();
-        let output = env.run(args);
-        let command = started.elapsed();
-        let close = memory::await_owner_exit(&options)
-            .unwrap_or_else(|error| panic!("{args:?}: {error:#}"));
-        stopped();
-        observed.push(format!("{label}: command={command:?} close={close:?}"));
-        output
-    };
-    let seed = sequential("seed", &["run", "Seed memory for sequential inspection"]);
-    assert!(
-        seed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&seed.stderr)
-    );
-    let reopened = sequential(
-        "reopen",
-        &["run", "Reopen memory after the last owner closed"],
-    );
-    assert!(
-        reopened.status.success(),
-        "{}",
-        String::from_utf8_lossy(&reopened.stderr)
-    );
-    let status = sequential("status", &["memory", "status"]);
-    assert!(
-        status.status.success(),
-        "{}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-    let failing = sequential("failing", &["memory", "history", "--limit", "0"]);
-    assert!(!failing.status.success());
-    assert!(
-        String::from_utf8_lossy(&failing.stderr).contains("between 1 and 1000"),
-        "{}",
-        String::from_utf8_lossy(&failing.stderr)
-    );
-    eprintln!(
-        "observed isolated CLI memory lifetime: {}; no optimization claim",
-        observed.join("; ")
-    );
+        let reopened = sequential(
+            "reopen",
+            &["run", "Reopen memory after the last owner closed"],
+        );
+        assert!(
+            reopened.status.success(),
+            "{}",
+            String::from_utf8_lossy(&reopened.stderr)
+        );
+        let status = sequential("status", &["memory", "status"]);
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let failing = sequential("failing", &["memory", "history", "--limit", "0"]);
+        assert!(!failing.status.success());
+        assert!(
+            String::from_utf8_lossy(&failing.stderr).contains("between 1 and 1000"),
+            "{}",
+            String::from_utf8_lossy(&failing.stderr)
+        );
+        eprintln!(
+            "observed isolated CLI memory lifetime: {}; no optimization claim",
+            observed.join("; ")
+        );
+    })
+    .await
 }
