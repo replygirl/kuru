@@ -35,7 +35,7 @@ use crate::{
 // JSON can escape a valid 16 MiB typed message by up to six times. Keep the
 // frame bounded while leaving the existing message limit representable.
 const OPERATION_FRAME_LIMIT: usize = 100 * 1024 * 1024;
-const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
+pub(crate) const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
 pub(super) const FRAME_BUDGET_MIB: usize = 128;
 const MIB: usize = 1024 * 1024;
 
