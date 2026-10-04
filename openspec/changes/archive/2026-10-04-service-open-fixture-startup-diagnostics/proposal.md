@@ -11,4 +11,4 @@ A direct `ServiceOwner::open` fixture can fail during Dolt startup without inclu
 
 ## Impact
 
-Only `kuru-memory` tests and this change's Cospec artifacts are affected. The regression adds one real Dolt startup attempt; it does not change runtime behavior or diagnose the hosted exit cause.
+Only `kuru-memory` tests and this change's Cospec artifacts are affected. The regression runs one owner startup attempt through the real supervisor: its configured executable delegates version validation to the real Dolt binary, then emits a controlled fake startup failure. It does not change runtime behavior or diagnose the hosted exit cause.
