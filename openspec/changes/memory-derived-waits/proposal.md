@@ -43,10 +43,16 @@ below 1441 shifts by that amount; re-grep before editing.
 
 Non-test edits (visibility only, no value or behaviour change):
 
-- Exception (b): `OPERATION_TIMEOUT` becomes `pub` in `service/rpc.rs`, and
-  `#[cfg(any(test, feature = "test-support"))] pub use rpc::OPERATION_TIMEOUT;` is
-  added next to the existing `pub use rpc::{..}` in `service.rs` (line 28), so
-  kuru-memory's own tests and kuru-tui's tests (the next PR) derive from it.
+- Exception (b): one new file, `packages/kuru-memory/src/test_budgets.rs`,
+  declared in `lib.rs` as
+  `#[cfg(any(test, feature = "test-support"))] pub mod test_budgets;`. It
+  forwards, unchanged and each with a doc comment naming its product source,
+  only what a site here or in the kuru-tui PR derives from: `OPERATION_TIMEOUT`
+  (`service::rpc`, widened from private to `pub(crate)`), `QUERY_TIMEOUT`
+  (`store`), `close_budget()` and `SUPERVISOR_REAP_ALLOWANCE` (`server`, both
+  already `pub(crate)`). It is the first implementation commit, on its own
+  (`test(memory): expose product budgets to test-support consumers`), so the
+  kuru-tui PR can cherry-pick it. `test_support*` is not touched.
 - Exception (a): an existing product constant or fn may be widened to
   `pub(crate)` for in-crate tests, for example `HANDLER_BUDGET` (rpc.rs:718).
 
@@ -91,13 +97,13 @@ in the matching task.
 | m3#17 | `store/recovery_tests.rs` 1255 (with 1299, 1577) | 80 ms and 50 ms absence windows | an event that reconcile entered the session wait, else deferred |
 | m3#1 | `store/recovery_tests.rs` 25 (40 uses) | `TEST_DEADLINE` 10 s | per use: `QUERY_TIMEOUT`, `close_budget()` or `migration_observation_deadline`; constant deleted |
 | m3#22 | `store/recovery_tests.rs` 2508, 2610, 2745, 2759, 2765, 2904, 3016, 3020 | `TEST_DEADLINE` 10 s | `migration_observation_deadline(&options)` (startup plus `QUERY_TIMEOUT`) |
-| m4#114 | `tests/fixtures/parent/windows.rs` 119 | `timeout` 5 s | `QUERY_TIMEOUT` (30 s); needs the visibility ruling below |
+| m4#114 | `tests/fixtures/parent/windows.rs` 119 | `timeout` 5 s | `test_budgets::QUERY_TIMEOUT` (30 s, the pool acquire ceiling) |
 | m4#88 | `tests/server_lifecycle.rs` 259 | 150 ms absence window | the open observed at its lease wait, or one poll after the reader holds the lease |
 | m4#84 | `tests/server_lifecycle.rs` 40 | `options()` timeout 20 s | the default startup (30 s) via `OpenOptions::new(..).config.startup_timeout_secs` |
 | m4#90 | `tests/server_lifecycle.rs` 542 | `sleep(60 s)` keep-alive | a peer that blocks until released (read on a never-written stdin) |
-| m4#93 | `tests/server_lifecycle.rs` 652, 657 | 5 s for the supervisor to exit | `SUPERVISOR_REAP_ALLOWANCE` (13 s); needs the visibility ruling below |
-| m4#87 | `tests/server_lifecycle.rs` 92, 93 | `timeout` 10 s around `SELECT SLEEP(6)` | `QUERY_TIMEOUT` (30 s), or `options.timeout` once m4#84 sets 30 s; needs the visibility ruling below |
-| m4#103 | `tests/windows_lifecycle.rs` 396, 556, 626, 785 | `child.wait(15 s)` | `close_budget()` (32 s); needs the visibility ruling below. 556 and 626 are recorded in the inventory as not qualifying (frame written after cleanup, `TerminateProcess` exits at once); the implementer decides from code |
+| m4#93 | `tests/server_lifecycle.rs` 652, 657 | 5 s for the supervisor to exit | `test_budgets::SUPERVISOR_REAP_ALLOWANCE` (13 s) |
+| m4#87 | `tests/server_lifecycle.rs` 92, 93 | `timeout` 10 s around `SELECT SLEEP(6)` | `test_budgets::QUERY_TIMEOUT` (the pool acquire ceiling) plus the deliberate `SLEEP` |
+| m4#103 | `tests/windows_lifecycle.rs` 396, 556, 626, 785 | `child.wait(15 s)` | `test_budgets::close_budget()` (32 s). 556 and 626 are recorded in the inventory as not qualifying (frame written after cleanup, `TerminateProcess` exits at once); the implementer decides from code |
 
 Dependents fixed by the same edit as their row: m2#30 and m2#31 (rpc.rs 1023 and
 1179), m3#36 to m3#40, m3#42 and m3#43 (the `TEST_DEADLINE` uses in
@@ -105,20 +111,14 @@ Dependents fixed by the same edit as their row: m2#30 and m2#31 (rpc.rs 1023 and
 m3#26 (the `TEST_DEADLINE` uses in `recovery_tests.rs`), m3#18 (with m3#17) and
 m3#77 to m3#79 (the `DEADLINE` uses in `migration_lifecycle_tests.rs`).
 
-Open scoping finding (recorded, not resolved here): the five integration-test
-sites (m4#84, m4#87, m4#93 in `tests/server_lifecycle.rs`, m4#103 in
-`tests/windows_lifecycle.rs`, m4#114 in `tests/fixtures/parent/windows.rs`) live in
-a separate crate that sees only public items, and the values they are told to
-derive from (`QUERY_TIMEOUT`, `close_budget()`, `SUPERVISOR_REAP_ALLOWANCE`) are
-`pub(crate)`. Exception (a) widens only to `pub(crate)`, which does not reach them,
-and `test_support.rs` is off limits. m4#84 needs nothing: `OpenOptions` is `pub`, so
-`OpenOptions::new(..).config.startup_timeout_secs` reproduces `default_startup()`.
-For the other four the implementer has two legal shapes: (1) a
-`cfg(any(test, feature = "test-support"))` `pub` re-export mirroring exception (b),
-which edits files outside the 14 owned and therefore needs the lead's ruling first;
-or (2) record the site as deferred with this reason. Deriving from an unrelated
+Integration-test sites (ruled after the scope stage): the five sites in separate
+crates that see only public items (m4#84, m4#87, m4#93 in
+`tests/server_lifecycle.rs`, m4#103 in `tests/windows_lifecycle.rs`, m4#114 in
+`tests/fixtures/parent/windows.rs`, all built with the `test-support` feature)
+derive from `kuru_memory::test_budgets::*` (exception (b)), and m4#84 from the
+public `OpenOptions` config `startup_timeout_secs`. Deriving from an unrelated
 public constant that merely exceeds the value (for example `OPERATION_TIMEOUT`
-standing in for `close_budget()`) is not a derivation and is not acceptable.
+standing in for `close_budget()`) is not a derivation and is not used.
 
 Not changed: product behaviour and constant values, `startup_timeout_secs`, any
 remainder row (a remainder fix point on a line being edited may go with it,
@@ -135,10 +135,11 @@ replaces three or more sites. No assertion after a wait changes meaning.
 
 ## Impact
 
-- Owned files only: `packages/kuru-memory/src/facade.rs`, `provision/tests.rs`,
+- Owned files only: the new `packages/kuru-memory/src/test_budgets.rs`, its one
+  declaration line in `src/lib.rs`, `packages/kuru-memory/src/facade.rs`, `provision/tests.rs`,
   `server_tests.rs`, `service.rs` (test module, lines 3411 and above on 327f817c,
-  plus its cfg(test) fixture code), `service/rpc.rs` (cfg(test) code, plus the one
-  visibility edit above), `spawn_gate.rs` (tests), `store.rs` (test module),
+  plus its cfg(test) fixture code), `service/rpc.rs` (cfg(test) code, plus the
+  visibility-only widenings above), `spawn_gate.rs` (tests), `store.rs` (test module),
   `store/migration_lifecycle_tests.rs`, `store/migrations.rs` (tests),
   `store/operational_gc_tests.rs`, `store/recovery_tests.rs`,
   `tests/fixtures/parent/windows.rs`, `tests/server_lifecycle.rs`,
