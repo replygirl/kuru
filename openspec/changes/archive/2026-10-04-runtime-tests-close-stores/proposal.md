@@ -52,10 +52,29 @@ kuru-memory supervisor (inferred, not measured); see verification 1.1.
   `dream.rs` `cancellation_tests`. The trailing `close_stores` calls added by
   #208 are now redundant and are removed. Mid-test closes, such as a close
   before a reopen or a close in a loop iteration, stay.
-- Enforcement: a `kuru-runtime` unit test scans the crate's sources. It fails,
-  naming file, line and test, for any `#[tokio::test]` whose body does not start
-  with `closing(`. A future test that opens and drops a store therefore cannot
-  skip the scope, and the scope reports it by name.
+- `apps/kuru-tui` had the same family on its success path: 13 tests dropped a
+  live in-process store (15 `owner_dropped_live` in a traced full run), namely
+  every store-opening test in `src/ui/runtime_tests.rs`, `tests/ui_runtime.rs`
+  (`runtime_adapter_projects_real_relationship_completion_and_sanitized_route`,
+  whose `fixture()` never closed its temporary store) and `tests/preferences.rs`
+  (`invocation_overrides_resume_and_other_projects_do_not_replace_saved_selections`
+  and `an_explicit_framework_override_is_validated_against_its_own_part_budget`,
+  through `Sandbox::remember`). Every async kuru-tui library test, and every
+  async test in an integration test file that opens a `MemoryStore` in its own
+  process (`cli`, `embedded_runtime`, `preferences`, `terminal`, `trust`,
+  `ui_runtime`), now runs its body in `closing`. Where a store was dropped before
+  its data directory is used again, it is now closed explicitly: the two notice
+  tests that reopen their store, and `Sandbox::remember`, whose CLI commands then
+  elect an owner for the same data directory. Inside the scope a dropped store
+  keeps its Dolt live until the test ends, so a drop there is not enough.
+- Enforcement: the scanner is shared as
+  `kuru_memory::test_support::{tests_outside_closing, rust_sources,
+  assert_async_tests_run_in_closing}`. A `kuru-runtime` unit test scans the
+  crate's sources, and a `kuru-tui` unit test scans its library sources and its
+  store-opening integration test files. Each fails, naming file, line and test,
+  for any `#[tokio::test]` whose body does not start with `closing(`. A future
+  test that opens and drops a store therefore cannot skip the scope, and the
+  scope reports it by name.
 - Test code only. Registration is compiled under
   `cfg(any(test, feature = "test-support"))`, and outside a `closing` scope a
   store behaves exactly as before. Product drop and close behaviour is
@@ -64,12 +83,12 @@ kuru-memory supervisor (inferred, not measured); see verification 1.1.
 Out of scope, with reasons:
 
 - `kuru-connectors` opens no memory store in its tests.
-- `apps/kuru-tui`: `src/ui/runtime_tests.rs`, `src/memory_notice.rs` and
-  `tests/{cli,trust,terminal,preferences,embedded_runtime,ui_runtime}.rs` open
-  stores and close them on their success paths. Their partitions'
-  late-profile writers are mostly `kuru` children spawned through a PTY or a
-  subprocess, which elect out-of-process owners. Adopting `closing` there is a
-  follow-up, and the shared helper is ready for it.
+- Out-of-process owners elected by `kuru` children that kuru-tui tests spawn
+  through a PTY or a subprocess. `closing` sees only stores opened in the test's
+  own process; those children's owners are awaited by the existing fixtures
+  (`ServiceCleanup`, `await_owner_exit`).
+- Synchronous kuru-tui tests: the scan covers `#[tokio::test]` only. A traced
+  full kuru-tui run records no `owner_dropped_live` from any test.
 - Managed (remote) owners are separate processes. Accounting tests await their
   exit with `await_managed_quiescence`, so `closing` registers local stores
   only.
@@ -89,8 +108,12 @@ Out of scope, with reasons:
 - `packages/kuru-runtime/src/**`: every async test body is wrapped. `tests.rs`
   replaces `close_stores` with the scope, its regression tests and the
   source-scan guard.
+- `apps/kuru-tui/src/**` and `apps/kuru-tui/tests/{cli,embedded_runtime,preferences,terminal,trust,ui_runtime}.rs`:
+  every async test body is wrapped; `lib.rs` adds the source-scan guard;
+  `ui/runtime_tests.rs` and `tests/preferences.rs` close stores before their
+  data directories are reused.
 - `docs/development.md`: the coverage-partition section names `closing` as the
-  runtime test teardown.
+  runtime and kuru-tui test teardown and the shared scan.
 
 ## Surfaces
 

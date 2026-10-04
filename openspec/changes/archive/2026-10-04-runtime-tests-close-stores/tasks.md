@@ -10,6 +10,7 @@
 - [x] 2.1 Add `kuru_memory::test_support::closing` and test-support registration of local stores, and verify unit tests for close-on-success, close-on-panic (panic resumed), close-on-error-return and the unawaited assertion
 - [x] 2.2 Wrap every `#[tokio::test]` body in `kuru-runtime` in `closing`, remove the redundant trailing `close_stores` calls, and verify the full package test passes
 - [x] 2.3 Add the source-scan guard and verify that it fails, naming the test, for an unwrapped test
+- [x] 2.4 Trace the whole `apps/kuru-tui` suite, wrap every async library test and every async test in its in-process store-opening integration files in `closing`, close stores explicitly before their data directory is reused, share the scan through `kuru_memory::test_support` with a kuru-tui guard, and verify the traced suite records 0 `owner_dropped_live`
 
 ## 3. Regression evidence
 
