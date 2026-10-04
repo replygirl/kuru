@@ -71,60 +71,84 @@ no line in 174-210.
   at `IO_TIMEOUT`, and one `FRAME_ALLOWANCE`. The child's `memory.close()` on Remote only
   drains its attachments, so the owner's `close_budget()` is not on this path and no
   owner-close term is added.
-- `wait_exit`'s 1 s post-exit drain is not changed: no descendant of the PTY child
-  inherits the slave, so no product budget sits inside the drain. A comment there now
-  says so.
+- `wait_exit`'s post-exit drain spends what remains of the caller's `timeout` (the
+  derived `EXIT_TIMEOUT`, or the bound the caller passed) instead of a flat 1 s, and
+  still ends on the reader's EOF. No descendant of the PTY child inherits the slave, so
+  EOF is already due at the exit; a comment there says so. `LATE_OUTPUT_WINDOW` is a
+  remainder row and unchanged.
 - `tests/support/windows_terminal.rs` derives `READY` with the same expression, and its
   dependents follow. It is linted for the Windows target only; it runs natively in CI.
+- A new shared test module, `tests/support/turn_budget.rs`, restates the runtime's
+  whole-turn budget once: 600 s (kuru-runtime `src/server.rs:190`) plus the 35 s
+  post-cancel settlement (`:197`), as documented in docs/protocols.md. The runtime
+  enforces it on A2A ingress; the TUI and `kuru run` reach the same
+  `run_controlled_inner` through `run_local_controlled`. `server.rs`,
+  `unix_shell_turn.rs` and the in-crate `src/ui/runtime_tests.rs` include it.
 - The CLI and server waits take their bounds from the restated `IO_TIMEOUT`, the staged
-  memory startup budget, the runtime's inline A2A request budget (600 s plus 35 s,
-  restated once in `server.rs`) and two Remote reconciles, each with its derivation at
-  the site or in the constant's comment.
+  memory startup budget, the turn budget (each A2A request) and two Remote reconciles,
+  each with its derivation at the site or in the constant's comment.
+- `unix_shell_turn.rs`'s `CLI_TIMEOUT` becomes `cli_timeout()`: the staged startup
+  budget plus the turn budget plus the shutdown's two Remote reconciles (about 13.6
+  minutes, under the native job's 45-minute timeout). Its dependents follow.
+- `src/ui/runtime_tests.rs`: the provider waits take the turn budget; the outer
+  per-failure-kind loop bound takes the turn budget plus the settlement, strictly above
+  the inner wait; the input-closure join takes the settlement alone (the store is Local,
+  whose shutdown reconciles make no statement); and the notice poll takes the fixture
+  startup budget, restated once there because the Unix-only terminal support is outside
+  that crate's unit tests.
 - The animated halves of the thin windows (t1#43, t2#32) end on the observed repaint
   under the frame-wait bound. The absence windows (t1#43 reduced, t1#44, t2#33) and the
   fork race (t2#9) are deferred: no product event falls due inside them for a barrier to
   be ordered after, and t2#9's helper has no seam for a later deadline.
-- The turn-path waits (`unix_shell_turn.rs` `CLI_TIMEOUT`, t2#16; `runtime_tests.rs`
-  t2#78, t2#79, t2#80, t2#82, t2#83) are deferred. Their enclosed product work is one
-  turn's (or one `kuru run`'s) memory sequence: measured at about 150 statement budgets
-  before the first provider request, and about 130 Remote calls per `kuru run`. A strict
-  count-times-budget bound exceeds the 45-minute native test job timeout, so it could
-  never report, and a progress-gap wait needs a test-support seam in `kuru-memory`.
-  `tasks.md` records the measurements and a candidate derivation for the orchestrator.
 - The one kuru-memory commit that adds `kuru_memory::test_budgets` under `test-support`
   is cherry-picked from PR 1 (`test/memory-derived-waits`) until that PR merges; see
   `blocking-changes.md`.
 
 ## What Does Not Change
 
-- No product code. `apps/kuru-tui/src` is not edited. No change to
-  `startup_timeout_secs`, no retry, and no weakening of isolation, ownership, recovery
-  or the uncertain-write fence.
-- Remainder rows stay as they are. Known ones, recorded so they are not mistaken for
-  oversights: `runtime_tests.rs:884` (the same `timeout(10 s, loop_task)` shape as
-  :1011), `terminal.rs:2637` (the 4100 ms read before the window),
-  `support/terminal.rs` `Drop`'s 1 s `close`, the Windows `EXIT` (30 s, now below both
-  `READY` and the two Remote reconciles its Ctrl-C exit encloses) and
-  `windows_terminal.rs:162-163` (the Windows `startup` arithmetic), `server.rs:155` (the
-  Windows twin's 80 s) and `server.rs:175`, and `cli.rs:791,797` (the 5 s loopback
-  forwarder).
+- No product code. In `apps/kuru-tui/src` only the `#[cfg(test)]` module
+  `src/ui/runtime_tests.rs` changes. No change to `startup_timeout_secs`, no retry, and
+  no weakening of isolation, ownership, recovery or the uncertain-write fence.
+- Remainder rows stay as they are (see Remainder findings).
 - No new helper. No literal without a stated derivation. No visibility change in
   `kuru-memory` beyond PR 1's one commit.
 - The assertions after each wait are byte-identical.
 
+## Remainder findings
+
+Recorded so they are not mistaken for oversights; none is changed here.
+
+- The Windows `EXIT` (30 s, `tests/support/windows_terminal.rs`) now sits below
+  `READY` (35.35 s) and below the two Remote reconciles (70 s) that its Ctrl-C exit
+  (`finish_loop`, `shutdown(false)`) encloses.
+- `startup_timeout` adds one reply deadline (`READY_TIMEOUT`) for the first frame, but
+  the PTY child was measured making about 8 Remote calls before it (`Status`, `Get`
+  twice, `CreateSession`, ledger `MarkNewSession`, `PutMany`, `PublicTranscriptPage`,
+  ledger `Session`; temporary instrumentation, one run). Kept as ruled.
+- `server.rs:155`: the Windows twin of the readiness wait allows 80 s with no
+  derivation; `server.rs:175` likewise.
+- `runtime_tests.rs:884`: the same `timeout(10 s, loop_task)` shape as :1011.
+- `terminal.rs:2637` (the 4100 ms read before the animation check),
+  `support/terminal.rs` `Drop`'s 1 s `close`, `LATE_OUTPUT_WINDOW` (500 ms),
+  `windows_terminal.rs:162-163` (the Windows `startup` arithmetic) and `cli.rs:791,797`
+  (the 5 s loopback forwarder).
+
 ## Impact
 
-- Files: `tests/cli.rs`, `tests/server.rs`, `tests/support/terminal.rs`,
-  `tests/support/windows_terminal.rs`, `tests/terminal.rs` and `tests/windows_terminal.rs`
-  under `apps/kuru-tui`; this change's openspec directory; and PR 1's one cherry-picked
-  commit. `src/ui/runtime_tests.rs`, `tests/embedded_runtime.rs` and
-  `tests/unix_shell_turn.rs` are not edited (their sites are deferred).
-- A hung test now reports after its derived bound instead of 5 to 15 s: about 35 s for a
-  frame wait, about 130 s for an exit after `/quit`, up to about 635 s for one A2A
-  request. Passing runs take the same time.
-- `server.rs` includes `support/terminal.rs` under `#[cfg(unix)]` (with
-  `#[allow(dead_code)]`, as `trust.rs` does) to reach `startup_timeout`; that is a
-  test-module include, not a new helper.
+- Files: `src/ui/runtime_tests.rs`, `tests/cli.rs`, `tests/server.rs`,
+  `tests/support/terminal.rs`, `tests/support/turn_budget.rs` (new),
+  `tests/support/windows_terminal.rs`, `tests/terminal.rs`, `tests/unix_shell_turn.rs`
+  and `tests/windows_terminal.rs` under `apps/kuru-tui`; this change's openspec
+  directory; and PR 1's one cherry-picked commit. `tests/embedded_runtime.rs` is not
+  edited (t2#9 is deferred).
+- A hung test now reports after its derived bound instead of 5 to 45 s: about 35 s for a
+  frame wait, about 130 s for an exit after `/quit`, about 635 s for one A2A request or
+  for a runtime-test turn, and about 13.6 minutes for one `kuru run`. Passing runs take
+  the same time.
+- `server.rs` and `unix_shell_turn.rs` include `support/terminal.rs` (Unix only, with
+  `#[allow(dead_code)]` as `trust.rs` does) to reach `startup_timeout`, and
+  `support/turn_budget.rs`; `src/ui/runtime_tests.rs` includes the latter by path.
+  These are test-module includes, not new helpers.
 - Windows-only files cannot run here. They must pass `mise run
   //apps/kuru-tui:lint:windows`, and run natively in PR CI only.
 - Test only; no runtime, documentation or dependency change.
