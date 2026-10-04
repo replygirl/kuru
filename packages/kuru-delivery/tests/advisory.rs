@@ -1,9 +1,10 @@
 #![cfg(feature = "tooling")]
 
+#[cfg(unix)]
+use std::time::Duration;
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use kuru_delivery::command;
@@ -13,6 +14,8 @@ const FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
 
 #[path = "support/fixture_git.rs"]
 mod fixture_git;
+#[path = "support/launch_budget.rs"]
+mod launch_budget;
 use fixture_git::{FixtureGit, Templates};
 
 async fn git(directory: &Path, arguments: &[&str]) {
@@ -165,7 +168,9 @@ async fn scan_cli(
     if let Some(cargo_home) = cargo_home {
         command.env("CARGO_HOME", cargo_home);
     }
-    command::bounded_output(&mut command, Duration::from_secs(30), 64 * 1024)
+    // The CLI's own bounds (advisory Git 60 s, cargo-audit scan 180 s) are
+    // private to the library; the job deadline exceeds both.
+    command::bounded_output(&mut command, launch_budget::until_job_deadline(), 64 * 1024)
         .await
         .unwrap()
 }
@@ -182,9 +187,10 @@ async fn cli_uses_direct_audit_binary_with_root_lockfile_and_offline_flags() {
         .env("KURU_AUDIT_CAPTURE", &marker)
         .args(["audit", "scan", "--audit-bin"])
         .arg(env!("CARGO_BIN_EXE_kuru-delivery-fixture"));
-    let output = command::bounded_output(&mut command, Duration::from_secs(30), 64 * 1024)
-        .await
-        .unwrap();
+    let output =
+        command::bounded_output(&mut command, launch_budget::until_job_deadline(), 64 * 1024)
+            .await
+            .unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -316,9 +322,10 @@ async fn cli_uses_owned_project_audit_configuration_despite_hostile_cargo_home()
         .env("CARGO_HOME", &hostile_cargo_home)
         .args(["audit", "scan", "--audit-bin"])
         .arg(env!("CARGO_BIN_EXE_kuru-delivery-fixture"));
-    let output = command::bounded_output(&mut command, Duration::from_secs(30), 64 * 1024)
-        .await
-        .unwrap();
+    let output =
+        command::bounded_output(&mut command, launch_budget::until_job_deadline(), 64 * 1024)
+            .await
+            .unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -352,6 +359,17 @@ fn fixture(arguments: &[&str]) -> command::Command {
     let mut command = command::Command::new(env!("CARGO_BIN_EXE_kuru-delivery-fixture"));
     command.args(arguments);
     command
+}
+
+/// Gives `command` a stdin pipe and returns its write end. The fixture's
+/// keep-alive peers (the root and every descendant inherit it) read it to EOF,
+/// so they block until the owned-group cleanup under test stops them, or at
+/// the latest until the caller drops the returned writer.
+#[cfg(unix)]
+fn held_until_released(command: &mut command::Command) -> std::io::PipeWriter {
+    let (reader, writer) = std::io::pipe().unwrap();
+    command.stdin(reader);
+    writer
 }
 
 #[cfg(unix)]
@@ -411,6 +429,7 @@ async fn bounded_output_cleans_silent_descendant_before_reaping_successful_root(
         identity.to_str().expect("fixture identity path is UTF-8"),
         ready.to_str().expect("fixture readiness path is UTF-8"),
     ]);
+    let _release = held_until_released(&mut child);
     let output = command::bounded_output(&mut child, Duration::from_secs(2), 1024)
         .await
         .unwrap();
@@ -438,10 +457,14 @@ async fn bounded_output_times_out_and_reaps_descendant_holding_inherited_output(
         "bounded-timeout-descendant",
         marker.to_str().expect("fixture marker path is UTF-8"),
     ]);
-    let error = command::bounded_output(&mut child, Duration::from_millis(250), 64 * 1024)
-        .await
-        .unwrap_err()
-        .to_string();
+    let _release = held_until_released(&mut child);
+    // The timeout is the stimulus: it must fire after the root has written
+    // its marker, while the released-only descendant holds both pipes.
+    let error =
+        command::bounded_output(&mut child, launch_budget::CHILD_START_ALLOWANCE, 64 * 1024)
+            .await
+            .unwrap_err()
+            .to_string();
     assert!(error.contains("tool timed out"), "{error}");
     assert!(
         error.contains("owned process group stopped and root reaped"),
@@ -471,10 +494,14 @@ async fn bounded_output_timeout_names_the_command_and_its_blocked_root() {
     let tag = tag.to_str().expect("fixture tag path is UTF-8");
     let mut child = fixture(&["bounded-blocking-tree", "block", tag]);
     child.current_dir(root.path());
-    let error = command::bounded_output(&mut child, Duration::from_millis(250), 64 * 1024)
-        .await
-        .unwrap_err()
-        .to_string();
+    let _release = held_until_released(&mut child);
+    // The timeout is the stimulus: it must fire after the root has started,
+    // so the snapshot names its command line while it blocks.
+    let error =
+        command::bounded_output(&mut child, launch_budget::CHILD_START_ALLOWANCE, 64 * 1024)
+            .await
+            .unwrap_err()
+            .to_string();
     for required in [
         "tool timed out",
         "owned process group stopped and root reaped",
@@ -496,7 +523,8 @@ async fn bounded_output_failure_snapshot_lists_the_live_grandchild_before_cleanu
     let tag = root.path().join("overflow-tree");
     let tag = tag.to_str().expect("fixture tag path is UTF-8");
     let mut child = fixture(&["bounded-blocking-tree", "overflow", tag]);
-    let error = command::bounded_output(&mut child, Duration::from_secs(30), 1024)
+    let _release = held_until_released(&mut child);
+    let error = command::bounded_output(&mut child, launch_budget::until_job_deadline(), 1024)
         .await
         .unwrap_err()
         .to_string();
@@ -512,8 +540,23 @@ async fn bounded_output_failure_snapshot_lists_the_live_grandchild_before_cleanu
     }
 }
 
+/// The keep-alive peers end on their release, not a timer: a peer whose
+/// writer is already dropped reads EOF and exits on its own, and the wait is
+/// for that exit. The timeout tests above show the peers block while held.
+#[cfg(unix)]
+#[tokio::test]
+async fn bounded_fixture_keep_alive_ends_on_its_release() {
+    let mut child = fixture(&["bounded-held-output"]);
+    drop(held_until_released(&mut child));
+    let output = command::bounded_output(&mut child, launch_budget::until_job_deadline(), 1024)
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"descendant retained inherited output\n");
+}
+
 // A missing working directory fails the launch at once, so the failure text of
-// each helper is checked without waiting for a 10-second deadline.
+// each helper is checked without waiting for its deadline.
 #[tokio::test]
 async fn git_helpers_name_arguments_directory_and_elapsed_time_when_the_launch_fails() {
     async fn message(task: impl Future<Output = ()> + Send + 'static) -> String {
@@ -562,9 +605,10 @@ async fn fixture_head_advance_names_git_arguments_directory_and_elapsed_time_whe
         .arg(&missing)
         .env("KURU_AUDIT_CAPTURE", root.path().join("capture.json"))
         .env("KURU_AUDIT_ADVANCE_HEAD", "1");
-    let output = command::bounded_output(&mut child, Duration::from_secs(30), 64 * 1024)
-        .await
-        .unwrap();
+    let output =
+        command::bounded_output(&mut child, launch_budget::until_job_deadline(), 64 * 1024)
+            .await
+            .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
     for required in [
@@ -682,7 +726,7 @@ async fn hostile_child(root: &Path) {
             .args(["-c", "core.fsmonitor=false", "-c", "maintenance.auto=false"])
             .args(["-c", "gc.auto=0", "-c", "commit.gpgsign=false"])
             .args(arguments);
-        command::bounded_output(&mut command, fixture_git::BOUND, 64 * 1024)
+        command::bounded_output(&mut command, fixture_git::bound(), 64 * 1024)
             .await
             .unwrap();
     }
@@ -748,12 +792,14 @@ async fn fixture_git_ignores_hostile_inherited_configuration_and_programs() {
         .env("GIT_ASKPASS", programs.join("askpass"))
         .env("SSH_ASKPASS", programs.join("askpass"))
         .env("GIT_TERMINAL_PROMPT", "1");
-    // The re-executed test binary's bound, as for the foreign-repository
-    // child in support/repository_environment.rs; each fixture Git call
-    // inside it keeps its own 10 s bound and Trace2 tail.
-    let output = command::bounded_output(&mut child, Duration::from_secs(60), 256 * 1024)
-        .await
-        .unwrap();
+    // The re-executed test binary has no product budget, as for the
+    // foreign-repository child in support/repository_environment.rs, so it
+    // waits until the job deadline; each fixture Git call inside it keeps
+    // its own bound and Trace2 tail.
+    let output =
+        command::bounded_output(&mut child, launch_budget::until_job_deadline(), 256 * 1024)
+            .await
+            .unwrap();
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

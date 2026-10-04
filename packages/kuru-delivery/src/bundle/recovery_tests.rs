@@ -13,6 +13,18 @@ use tokio::{
 const EXPECTED: &[u8] = b"verified immutable archive";
 const TEST_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(50)];
 const DEADLINE_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
+/// Bound on one production-policy preparation in these tests: every wait it
+/// awaits is product-bounded, the stable cache lock by `LOCK_TIMEOUT` and the
+/// download with its retries and backoffs by `DOWNLOAD_TIMEOUT`; its other
+/// steps are synchronous. A stalled step reports the product's own error first.
+const PRODUCTION_PREPARATION: Duration = LOCK_TIMEOUT.saturating_add(DOWNLOAD_TIMEOUT);
+/// How long a dropped preparation is watched for a detached retry. Such a
+/// retry would reconnect after the deadline policy's first backoff; the window
+/// adds the policy's second backoff as the reconnect's allowance, so it is the
+/// sum of the two. It cannot be causal: the dropped future leaves nothing
+/// ordered after its retry opportunity to observe.
+const DETACHED_RETRY_WINDOW: Duration =
+    DEADLINE_RETRY_DELAYS[0].saturating_add(DEADLINE_RETRY_DELAYS[1]);
 
 enum Reply {
     Bytes(Vec<u8>),
@@ -141,10 +153,12 @@ async fn setup(server: &Server) -> (tempfile::TempDir, PrepareOptions, Asset, Fi
     (root, options, asset, identity)
 }
 
+/// The production client's total bound (`DOWNLOAD_TIMEOUT`) over a local
+/// fixture without a proxy.
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(10))
+        .timeout(DOWNLOAD_TIMEOUT)
         .build()
         .unwrap()
 }
@@ -243,7 +257,7 @@ async fn production_retry_waits_before_repeating_an_identical_get() {
     let (_root, options, asset, identity) = setup(&server).await;
     let started = std::time::Instant::now();
     let published = tokio::time::timeout(
-        Duration::from_secs(12),
+        PRODUCTION_PREPARATION,
         prepare_asset(&options, &asset, Some(&client())),
     )
     .await
@@ -273,8 +287,11 @@ async fn permanent_statuses_and_any_retry_after_are_not_retried() {
     ] {
         let mut server = Server::start(vec![response(status, advice, EXPECTED)]).await;
         let (_root, options, asset, identity) = setup(&server).await;
+        // The request count is the causal retry check: a forbidden retry
+        // would repeat the GET and, given the fixture's valid fallback body,
+        // succeed.
         let result = tokio::time::timeout(
-            Duration::from_secs(4),
+            PRODUCTION_PREPARATION,
             prepare_asset(&options, &asset, Some(&client())),
         )
         .await;
@@ -315,7 +332,8 @@ async fn malformed_response_and_integrity_failures_never_start_another_get() {
     ] {
         let mut server = Server::start(vec![reply]).await;
         let (_root, options, asset, identity) = setup(&server).await;
-        let result = tokio::time::timeout(Duration::from_secs(4), prepare_asset(&options, &asset, Some(&client()))).await;
+        // As above, the request count, not a time, detects a retry.
+        let result = tokio::time::timeout(PRODUCTION_PREPARATION, prepare_asset(&options, &asset, Some(&client()))).await;
         assert_eq!(server.stop().await.len(), 1, "unexpected retry for {label}");
         assert!(result.unwrap().is_err());
         assert_clean(&options.bundle_dir);
@@ -416,7 +434,7 @@ async fn one_download_deadline_covers_all_backoffs_headers_and_body() {
     ] {
         let mut server = Server::start(replies).await;
         let (_root, options, asset, identity) = setup(&server).await;
-        // The client's ten-second per-request timer cannot satisfy this test.
+        // The client's DOWNLOAD_TIMEOUT per-request timer cannot satisfy this test.
         let result = tokio::time::timeout(
             Duration::from_secs(4),
             prepare_asset_with_policy(
@@ -450,7 +468,7 @@ async fn cancellation_after_dropping_error_headers_releases_stage_and_stable_loc
         DOWNLOAD_TIMEOUT,
         &DEADLINE_RETRY_DELAYS,
     ));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(PRODUCTION_PREPARATION, async {
         loop {
             tokio::select! {
                 result = &mut preparation => panic!("preparation completed before cancellation: {result:?}"),
@@ -483,12 +501,29 @@ async fn cancellation_after_dropping_error_headers_releases_stage_and_stable_loc
     drop(preparation);
     assert_clean(&options.bundle_dir);
     retained_lock(&options, identity);
-    // A detached first-backoff retry would reconnect after 250 ms. Keep the
-    // real listener available beyond it and reject any subsequent request.
+    // A detached first-backoff retry would reconnect after the first backoff.
+    // Keep the real listener available beyond it and reject any subsequent
+    // request.
     assert!(
-        tokio::time::timeout(Duration::from_millis(600), server.events.recv())
+        tokio::time::timeout(DETACHED_RETRY_WINDOW, server.events.recv())
             .await
             .is_err()
     );
     identical_gets(&server.stop().await, 1);
+}
+
+/// The bounds above stay the arithmetic written at them: the preparation
+/// bound outlasts each product budget a preparation awaits, and the absence
+/// window outlasts the backoff after which a detached retry would reconnect.
+#[test]
+fn derived_bounds_follow_the_budgets_they_are_written_from() {
+    assert_eq!(PRODUCTION_PREPARATION, LOCK_TIMEOUT + DOWNLOAD_TIMEOUT);
+    assert!(PRODUCTION_PREPARATION > LOCK_TIMEOUT);
+    assert!(PRODUCTION_PREPARATION > DOWNLOAD_TIMEOUT);
+    assert!(DOWNLOAD_TIMEOUT > RETRY_DELAYS[0]);
+    assert_eq!(
+        DETACHED_RETRY_WINDOW,
+        DEADLINE_RETRY_DELAYS[0] + DEADLINE_RETRY_DELAYS[1]
+    );
+    assert!(DETACHED_RETRY_WINDOW > DEADLINE_RETRY_DELAYS[0]);
 }

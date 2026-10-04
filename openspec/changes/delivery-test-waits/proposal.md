@@ -36,8 +36,8 @@ per-pass source tables (d1 for `src`, d2 for `tests`).
   operation can reach (`DOWNLOAD_TIMEOUT`, `RETRY_DELAYS[0]`, ICU download
   budget) or by awaiting the event: d1#63 `bundle.rs` inline test module,
   d1#110 `build_tests.rs`, d1#95, d1#99, d1#101, d1#108 `recovery_tests.rs`;
-  d1#109 (600 ms absence window) derived from `DEADLINE_RETRY_DELAYS[0]` with
-  a written multiple.
+  d1#109 (600 ms absence window) derived from `DEADLINE_RETRY_DELAYS` with
+  the arithmetic written at the constant.
 - HTTP idle races over `paced_http.rs`: d1#87 `archive/tests.rs` and d1#77
   `published.rs` inline test module, replaced by a signal that the fixture
   delivered headers, or a derived multiple.
@@ -56,7 +56,9 @@ per-pass source tables (d1 for `src`, d2 for `tests`).
 
 - No change to product code under `packages/kuru-delivery/src` (PR 3's files
   and all other product code). Edits in `src` are confined to test-only files
-  and to `#[cfg(test)]` modules (`bundle.rs`, `published.rs` inline tests).
+  and to `#[cfg(test)]` modules (`bundle.rs`, `published.rs` inline tests),
+  plus two `cfg(all(test, feature = "tooling"))` lines in `lib.rs` that give
+  the lib's fixture Git include its sibling launch budget.
 - No retry, no raised literal, no change to what any test asserts.
 - No other crate (one crate per PR).
 

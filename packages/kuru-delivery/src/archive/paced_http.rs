@@ -1,6 +1,9 @@
 //! A local HTTP/1.1 fixture whose response pacing is controlled, for release
-//! download timeout tests. Each server answers at most one connection and is
-//! bounded so a wrong client timeout fails the test instead of hanging it.
+//! download timeout tests. Each server answers at most one connection. It has
+//! no timer of its own: it lives until the client abandons the connection or
+//! the owning test drops it, and each test bounds its client's wait. A fixture
+//! timer shorter than a client's idle bound would close a stalled body first,
+//! failing the read in the asserted phase without the client's own timeout.
 
 use std::time::Duration;
 use tokio::{
@@ -11,7 +14,6 @@ use tokio::{
 use url::Url;
 
 pub(crate) const CHUNK: &[u8] = b"paced release bytes\n";
-const FIXTURE_BOUND: Duration = Duration::from_secs(15);
 
 pub(crate) enum Pace {
     /// Send the complete body as `chunks` writes separated by `gap`.
@@ -32,11 +34,7 @@ impl PacedServer {
     pub(crate) async fn start(pace: Pace) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = url(&listener);
-        let task = tokio::spawn(async move {
-            tokio::time::timeout(FIXTURE_BOUND, serve(listener, pace))
-                .await
-                .expect("bounded paced HTTP fixture");
-        });
+        let task = tokio::spawn(serve(listener, pace));
         Self {
             url,
             _held: None,

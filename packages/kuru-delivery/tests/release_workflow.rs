@@ -23,6 +23,8 @@ use std::{
 };
 use tempfile::TempDir;
 
+#[path = "support/launch_budget.rs"]
+mod launch_budget;
 #[path = "support/repository_environment.rs"]
 mod repository_environment;
 

@@ -19,6 +19,8 @@ use std::{
 };
 use tempfile::TempDir;
 
+#[path = "support/launch_budget.rs"]
+mod launch_budget;
 #[path = "support/repository_environment.rs"]
 mod repository_environment;
 
@@ -26,7 +28,13 @@ const FRAMEWORKS: &str = "apps/kuru-docs/concepts/frameworks.md";
 const COMMITTED_FRAMEWORKS: &str = "# Frameworks\nCommitted IFS default: seven persistent peers.\n";
 const NOTES_BODY: &str = "Persistent peer conversations are now available.";
 const NOTES_HEADING: &str = "# v0.1.0: Kuru 0.1.0\n\n";
-const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Communique-backed notes runs and the release CLI wait for their event
+/// until the job deadline: their own bounds (the 600 s Communique run, each
+/// 180 s Git or `cog` step) are private to the library, and the job deadline
+/// exceeds them (`launch_budget.rs`).
+fn test_timeout() -> Duration {
+    launch_budget::until_job_deadline()
+}
 fn version(input: &str) -> Version {
     input.parse().unwrap()
 }
@@ -105,7 +113,7 @@ impl Fixture {
     }
     async fn generate(&self, api: &Api, output: &Path) -> anyhow::Result<()> {
         tokio::time::timeout(
-            TEST_TIMEOUT,
+            test_timeout(),
             notes::generate(
                 self.path(),
                 &self.head().await,
@@ -401,7 +409,7 @@ async fn real_release_cli_generates_notes_and_reports_invalid_sha() {
     .unwrap();
     let head = repo.commit("test: local notes endpoint").await;
     let result = tokio::time::timeout(
-        TEST_TIMEOUT,
+        test_timeout(),
         kuru_delivery::command::Command::new(env!("CARGO_BIN_EXE_kuru-release"))
             .arg("--root")
             .arg(repo.path())
@@ -427,7 +435,7 @@ async fn real_release_cli_generates_notes_and_reports_invalid_sha() {
             .contains("Persistent peer conversations")
     );
     let result = tokio::time::timeout(
-        TEST_TIMEOUT,
+        test_timeout(),
         kuru_delivery::command::Command::new(env!("CARGO_BIN_EXE_kuru-release"))
             .arg("--root")
             .arg(repo.path())
@@ -502,7 +510,7 @@ async fn actual_native_anthropic_adapter_accepts_claude_five_thinking() {
     // 1.4.0 replays signed thinking blocks; 1.3.5 rejected this response shape.
     // Release configuration still selects the compatibility route.
     let result = tokio::time::timeout(
-        TEST_TIMEOUT,
+        test_timeout(),
         release::rooted_command(repo.path(), "communique")
             .arg("--config")
             .arg(repo.path().join("communique.toml"))

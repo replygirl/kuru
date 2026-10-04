@@ -13,6 +13,8 @@ use std::{
 #[path = "support/files.rs"]
 mod files;
 use files::{identity, mode, symlink};
+#[path = "support/launch_budget.rs"]
+mod launch_budget;
 
 const TARGET: &str = "aarch64-apple-darwin";
 const OTHER: &str = "x86_64-unknown-linux-gnu";
@@ -88,8 +90,12 @@ fn asset(target: &str, bytes: &[u8]) -> Value {
 fn error(result: anyhow::Result<PathBuf>) -> String {
     format!("{:#}", result.unwrap_err())
 }
+/// Runs one bundle CLI child until it exits and both pipes close. Its own
+/// bounds (the 180 s cache lock a concurrent run waits on, the 120 s download)
+/// are private to the library; the job deadline exceeds both
+/// (`launch_budget.rs`).
 async fn output(command: &mut Command) -> std::process::Output {
-    kuru_delivery::command::output(command, std::time::Duration::from_secs(15))
+    kuru_delivery::command::output(command, launch_budget::until_job_deadline())
         .await
         .expect("bundle CLI exceeded fixture deadline or failed to execute")
 }
