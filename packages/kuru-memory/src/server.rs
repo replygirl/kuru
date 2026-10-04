@@ -3295,6 +3295,22 @@ impl std::fmt::Display for DoltPrematureExit {
 
 impl std::error::Error for DoltPrematureExit {}
 
+/// The server that accepted the authenticated startup probe serves another
+/// data directory. Nothing was written to it. Template copies share their
+/// credentials, so a sibling's Dolt that bound this store's freshly selected
+/// port first authenticates the probe; the owned Dolt is then still starting
+/// and will report the taken port itself.
+#[derive(Debug)]
+struct ForeignDataDirectory;
+
+impl std::fmt::Display for ForeignDataDirectory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Dolt bootstrap data directory mismatch")
+    }
+}
+
+impl std::error::Error for ForeignDataDirectory {}
+
 async fn start_database(
     child: &mut Child,
     directory: &Path,
@@ -3302,14 +3318,26 @@ async fn start_database(
     endpoint: &Endpoint,
     deadline: Instant,
 ) -> Result<()> {
+    // A foreign server that answered the probe: retained only for the error.
+    let mut foreign: Option<anyhow::Error> = None;
     loop {
         if let Some(status) = child.try_wait()? {
-            return Err(DoltPrematureExit(status).into());
+            let exit = anyhow::Error::new(DoltPrematureExit(status));
+            return Err(match foreign {
+                Some(_) => exit.context(format!(
+                    "{ForeignDataDirectory}: another server answered on port {}",
+                    endpoint.port
+                )),
+                None => exit,
+            });
         }
-        ensure!(
-            Instant::now() < deadline,
-            "authenticated Dolt startup deadline exceeded"
-        );
+        if Instant::now() >= deadline {
+            let exceeded = "authenticated Dolt startup deadline exceeded";
+            return Err(match foreign {
+                Some(error) => error.context(exceeded),
+                None => anyhow!(exceeded),
+            });
+        }
         let options = MySqlConnectOptions::new()
             .host("127.0.0.1")
             .port(endpoint.port)
@@ -3333,11 +3361,20 @@ async fn start_database(
             )
             .await;
             pool.close().await;
-            return initialized
-                .with_context(|| {
-                    format!("Dolt database bootstrap deadline exceeded while {phase}")
-                })?
-                .with_context(|| format!("Dolt database bootstrap failed while {phase}"));
+            match initialized {
+                // Not this store's server: keep observing the owned Dolt,
+                // whose own exit reports the taken port to the bounded retry.
+                Ok(Err(error)) if error.downcast_ref::<ForeignDataDirectory>().is_some() => {
+                    foreign = Some(error);
+                }
+                initialized => {
+                    return initialized
+                        .with_context(|| {
+                            format!("Dolt database bootstrap deadline exceeded while {phase}")
+                        })?
+                        .with_context(|| format!("Dolt database bootstrap failed while {phase}"));
+                }
+            }
         }
         sleep(Duration::from_millis(25)).await;
     }
@@ -3355,7 +3392,7 @@ async fn initialize_database(
     ensure!(
         same_directory(Path::new(&datadir), &directory.join("data"))
             .with_context(|| format!("resolve Dolt bootstrap datadir {datadir:?}"))?,
-        "Dolt bootstrap data directory mismatch"
+        ForeignDataDirectory
     );
     // A pending template identity names the key it was created under. Only
     // while the store is uninitialized is that key compared, before any
