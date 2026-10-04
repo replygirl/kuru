@@ -1983,7 +1983,7 @@ impl GroupProcess {
     /// `TimedOut`, as the wait would, so the caller's stall cleanup applies,
     /// and the step it was in stays in the stall sample.
     async fn settle(&mut self, deadline: tokio::time::Instant) -> std::io::Result<ExitStatus> {
-        use kuru_platform::unix::{GroupPresence, Reap, Termination};
+        use kuru_platform::unix::{GroupPresence, PreReap, Reap, Termination};
 
         let limit = deadline;
         let mut expired = |what: &str| {
@@ -2006,13 +2006,24 @@ impl GroupProcess {
             tokio::time::sleep(GROUP_POLL).await;
         }
         let status = loop {
-            match self.owner.reap_if_exited() {
-                Reap::Reaped(status) => break status,
-                Reap::NotExited | Reap::Interrupted => {}
-                Reap::Disarmed(reason) => return Err(disarmed(reason)),
-                Reap::InvalidPhase => {
+            match self.owner.pre_reap_step(limit.into_std()) {
+                PreReap::Ready | PreReap::Reaped | PreReap::Expired => {
+                    match self.owner.reap_if_exited() {
+                        Reap::Reaped(status) => break status,
+                        Reap::NotExited | Reap::Interrupted => {}
+                        Reap::Disarmed(reason) => return Err(disarmed(reason)),
+                        Reap::InvalidPhase => {
+                            return Err(std::io::Error::other(
+                                "owned test process reap preceded its transition",
+                            ));
+                        }
+                    }
+                }
+                PreReap::Pending | PreReap::ExpiredPending | PreReap::Unobserved(_) => {}
+                PreReap::Disarmed(reason) => return Err(disarmed(reason)),
+                PreReap::InvalidPhase => {
                     return Err(std::io::Error::other(
-                        "owned test process reap preceded its transition",
+                        "owned test process pre-reap preceded its transition",
                     ));
                 }
             }

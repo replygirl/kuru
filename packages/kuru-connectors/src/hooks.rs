@@ -18,7 +18,9 @@ use tokio::{
 use crate::redaction;
 
 #[cfg(unix)]
-use kuru_platform::unix::{GroupPresence, OwnedProcessGroup, Reap, RootState, Termination};
+use kuru_platform::unix::{
+    GroupPresence, OwnedProcessGroup, PreReap, Reap, RootState, Termination,
+};
 #[cfg(windows)]
 use kuru_platform::windows::process::{NativeChild, Stdio as NativeStdio};
 
@@ -1158,14 +1160,10 @@ async fn reap_after_exit(owner: &mut HookOwner, limit: Instant) -> Result<bool> 
         tokio::time::sleep(POLL).await;
     }
     let status = loop {
-        match owner.reap_if_exited() {
-            Reap::Reaped(status) => break status.success(),
-            Reap::NotExited | Reap::Interrupted => {}
-            Reap::Disarmed(_) | Reap::InvalidPhase => {
-                bail!("lifecycle hook ownership was lost")
-            }
+        let step = owner.pre_reap_step(limit);
+        if let Some(status) = hook_reap_step(owner, limit, step)? {
+            break status.success();
         }
-        ensure!(Instant::now() < limit, "lifecycle hook cleanup timed out");
         tokio::time::sleep(POLL).await;
     };
     ensure_group_absent(owner, limit).await?;
@@ -1211,20 +1209,39 @@ async fn cleanup_owned(owner: &mut HookOwner, deadline: Instant) -> Result<()> {
         tokio::time::sleep(POLL).await;
     }
     loop {
-        match owner.reap_if_exited() {
-            Reap::Reaped(_) => break,
-            Reap::NotExited | Reap::Interrupted => {}
-            Reap::Disarmed(_) | Reap::InvalidPhase => {
-                bail!("lifecycle hook ownership was lost")
-            }
+        let step = owner.pre_reap_step(deadline);
+        if hook_reap_step(owner, deadline, step)?.is_some() {
+            break;
         }
-        ensure!(
-            Instant::now() < deadline,
-            "lifecycle hook cleanup timed out"
-        );
         tokio::time::sleep(POLL).await;
     }
     ensure_group_absent(owner, deadline).await
+}
+
+#[cfg(unix)]
+fn hook_reap_step(
+    owner: &mut HookOwner,
+    deadline: Instant,
+    step: PreReap,
+) -> Result<Option<std::process::ExitStatus>> {
+    match step {
+        PreReap::Ready | PreReap::Reaped | PreReap::Expired => match owner.reap_if_exited() {
+            Reap::Reaped(status) => return Ok(Some(status)),
+            Reap::NotExited | Reap::Interrupted => {}
+            Reap::Disarmed(_) | Reap::InvalidPhase => bail!("lifecycle hook ownership was lost"),
+        },
+        PreReap::Pending | PreReap::ExpiredPending | PreReap::Unobserved(_) => {}
+        PreReap::Disarmed(_) | PreReap::InvalidPhase => bail!("lifecycle hook ownership was lost"),
+    }
+    if Instant::now() >= deadline {
+        // Membership starts only after root exit. Reap that exact root before
+        // this hook owner is released, without waiting for the read-only
+        // helper or claiming its cleanup finished. A still-running root is
+        // observed nonblockingly, as in the existing expiry fallback.
+        let _ = owner.reap_if_exited();
+        bail!("lifecycle hook cleanup timed out");
+    }
+    Ok(None)
 }
 
 #[cfg(unix)]
@@ -1262,6 +1279,52 @@ mod tests {
     use super::*;
     use kuru_core::HookCommand;
     use kuru_platform::fs::{NameRetention, Privacy};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_membership_expiry_reaps_root_and_reports_unconfirmed() {
+        for step in [PreReap::Pending, PreReap::ExpiredPending] {
+            let root = tempfile::tempdir().unwrap();
+            let marker = root.path().join("root-id");
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .args(["-c", "printf '%s' \"$$\" > \"$1\"", "kuru-hook-expiry"])
+                .arg(&marker);
+            let mut owner = OwnedProcessGroup::spawn(
+                command,
+                kuru_platform::unix::StdioPlan::new(
+                    kuru_platform::unix::StdioSlot::Null,
+                    kuru_platform::unix::StdioSlot::Null,
+                    kuru_platform::unix::StdioSlot::Null,
+                ),
+            )
+            .unwrap();
+            let limit = Instant::now() + CLEANUP;
+            while !matches!(owner.root_state(), RootState::Exited) && Instant::now() < limit {
+                tokio::time::sleep(POLL).await;
+            }
+            let exited = matches!(owner.root_state(), RootState::Exited);
+            if !exited {
+                let _ = cleanup_owned(&mut owner, Instant::now() + CLEANUP).await;
+            }
+            assert!(exited, "hook fixture did not exit");
+            owner.terminate_before_reap();
+            let result = hook_reap_step(&mut owner, Instant::now(), step);
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "lifecycle hook cleanup timed out"
+            );
+            assert!(matches!(owner.root_state(), RootState::Reaped(_)));
+            let id: u32 = std::fs::read_to_string(marker).unwrap().parse().unwrap();
+            assert!(
+                !kuru_platform::unix::snapshot::processes()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.pid == id && row.ppid == std::process::id()),
+                "expired hook root remained unreaped"
+            );
+        }
+    }
 
     fn host(root: &std::path::Path, event: HookEvent, command: HookCommand) -> HookHost {
         let mut hooks = LifecycleHooks::default();

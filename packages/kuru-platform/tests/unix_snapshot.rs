@@ -34,12 +34,28 @@ fn snapshot_lists_a_blocked_root_its_child_and_grandchild() {
     assert_eq!(line, "ready\n");
     let id = root.id();
     let rows = snapshot::tree(id);
+    let membership = snapshot::group_members_until_with(
+        Path::new(snapshot::PS),
+        id,
+        std::time::Instant::now() + snapshot::SNAPSHOT_TIMEOUT,
+    );
     let text = snapshot::describe(id);
     // The unreaped root still anchors its group for this owned cleanup.
     kill_process_group(Pid::from_raw(id as i32).unwrap(), Signal::KILL).unwrap();
     root.wait().unwrap();
 
     let rows = rows.unwrap();
+    let membership = membership.unwrap();
+    assert_eq!(
+        membership.iter().map(|row| row.pid).collect::<Vec<_>>(),
+        rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
+        "minimal membership disagreed with the blocked tree: {membership:?} {text}"
+    );
+    assert!(
+        membership
+            .iter()
+            .all(|row| row.pgid == id && !row.state.is_empty())
+    );
     assert!(rows.iter().any(|row| row.pid == id), "{text}");
     let child = rows
         .iter()
@@ -91,6 +107,77 @@ fn write_executable_from_child(path: &Path, script: &str) {
     assert!(status.success(), "stand-in creation exited with {status}");
 }
 
+#[test]
+fn membership_selector_is_exact_under_an_inherited_legacy_environment() {
+    const CHILD: &str = "KURU_PS_SELECTOR_FIXTURE";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "membership_selector_is_exact_under_an_inherited_legacy_environment",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("COMMAND_MODE", "legacy")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child selector check failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    assert_eq!(std::env::var("COMMAND_MODE").unwrap(), "legacy");
+    let root = tempfile::tempdir().unwrap();
+    let program = root.path().join("selector-ps");
+    #[cfg(target_os = "macos")]
+    let selection = "test \"$COMMAND_MODE\" = unix2003 && test \"$#\" = 5 && test \"$1\" = -g && test \"$2\" = 20 && test \"$3\" = -x && test \"$4\" = -o && test \"$5\" = 'pid=,pgid=,stat='";
+    #[cfg(not(target_os = "macos"))]
+    let selection = "test \"$#\" = 3 && test \"$1\" = -A && test \"$2\" = -o && test \"$3\" = 'pid=,pgid=,stat='";
+    write_executable_from_child(
+        &program,
+        &format!(
+            "#!/bin/sh\n{selection} && test \"$LC_ALL\" = C || exit 23\nprintf '20 20 Z\\n21 20 S\\n22 99 R\\n'\n"
+        ),
+    );
+    let members = snapshot::group_members_until_with(
+        &program,
+        20,
+        std::time::Instant::now() + snapshot::SNAPSHOT_TIMEOUT,
+    )
+    .unwrap();
+    assert_eq!(
+        members.iter().map(|row| row.pid).collect::<Vec<_>>(),
+        [20, 21]
+    );
+    assert!(members[0].state.starts_with('Z'));
+}
+
+#[test]
+fn membership_rejects_success_status_with_stderr_while_diagnostics_keep_it() {
+    let root = tempfile::tempdir().unwrap();
+    let program = root.path().join("failed-sysctl-ps");
+    write_executable_from_child(
+        &program,
+        "#!/bin/sh\nprintf 'Failure calling sysctl\\n' >&2\nexit 0\n",
+    );
+    let error = snapshot::group_members_until_with(
+        &program,
+        20,
+        std::time::Instant::now() + snapshot::SNAPSHOT_TIMEOUT,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("reported an inspection error: Failure calling sysctl"),
+        "{error}"
+    );
+    assert!(snapshot::tree_with(&program, 20).unwrap().is_empty());
+}
+
 /// Descriptors of this process that refer to the file at `path`, found by device
 /// and inode so symlinked temporary directories do not hide a match. Linux only:
 /// `/proc/self/fd` resolves each entry to the open file, and Linux is the kernel
@@ -138,6 +225,51 @@ fn snapshot_helper_is_bounded_when_ps_does_not_finish() {
         elapsed < snapshot::SNAPSHOT_TIMEOUT + std::time::Duration::from_secs(3),
         "{elapsed:?}"
     );
+}
+
+#[test]
+fn absolute_snapshot_deadline_reaps_its_stalled_helper() {
+    let root = tempfile::tempdir().unwrap();
+    let stalled = root.path().join("deadline-ps");
+    let marker = root.path().join("helper-id");
+    write_executable_from_child(
+        &stalled,
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec /bin/sleep 30\n",
+            marker.display()
+        ),
+    );
+    let start = std::time::Instant::now();
+    let result = snapshot::group_members_until_with(
+        &stalled,
+        std::process::id(),
+        start + std::time::Duration::from_millis(100),
+    );
+    let elapsed = start.elapsed();
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+    let helper: u32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    let rows: Vec<_> = snapshot::processes()
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.pid == helper && row.ppid == std::process::id())
+        .collect();
+    assert!(
+        rows.is_empty(),
+        "helper remained owned after listing: {rows:?}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+}
+
+#[test]
+fn expired_absolute_snapshot_admission_does_not_spawn() {
+    let error = snapshot::group_members_until_with(
+        Path::new("/nonexistent/kuru-late-ps"),
+        std::process::id(),
+        std::time::Instant::now(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
 }
 
 #[cfg(target_os = "linux")]
@@ -233,6 +365,7 @@ fn an_unreaped_child_is_listed_under_its_parent_but_not_as_its_recorded_row() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .unwrap();
     let id = child.id();
@@ -255,8 +388,17 @@ fn an_unreaped_child_is_listed_under_its_parent_but_not_as_its_recorded_row() {
             .collect()
     };
     let unreaped = ours(snapshot::processes().unwrap());
+    let membership = snapshot::group_members_until_with(
+        Path::new(snapshot::PS),
+        id,
+        std::time::Instant::now() + snapshot::SNAPSHOT_TIMEOUT,
+    );
     let by_recorded_row = snapshot::still_listed(&recorded).unwrap();
     child.wait().unwrap();
+    let membership = membership.unwrap();
+    assert_eq!(membership.len(), 1, "{membership:?}");
+    assert_eq!(membership[0].pid, id);
+    assert!(membership[0].state.starts_with('Z'), "{membership:?}");
     let reaped = ours(snapshot::processes().unwrap());
     assert_eq!(recorded.len(), 1, "{recorded:?}");
     assert_eq!(unreaped.len(), 1, "{unreaped:?}");

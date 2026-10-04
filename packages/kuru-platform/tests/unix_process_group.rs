@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use kuru_platform::unix::{
-    GroupPresence, OwnedProcessGroup, Reap, RootState, StdioPlan, StdioSlot, Termination,
+    GroupPresence, OwnedProcessGroup, PreReap, Reap, RootState, StdioPlan, StdioSlot, Termination,
 };
 use std::{
     fs,
@@ -216,6 +216,14 @@ impl NativeFixture {
         };
         let reap = if transition.is_ok() {
             loop {
+                match live.owner.pre_reap_step(deadline) {
+                    PreReap::Ready | PreReap::Reaped => {}
+                    PreReap::Pending | PreReap::Unobserved(_) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    result => break Err(format!("pre_reap={result:?}")),
+                }
                 match live.owner.reap_if_exited() {
                     Reap::Reaped(status) => break Ok(status),
                     Reap::NotExited | Reap::Interrupted if Instant::now() < deadline => {
@@ -421,6 +429,14 @@ fn settle(owner: &mut OwnedProcessGroup) -> Result<(), String> {
         }
     }
     loop {
+        match owner.pre_reap_step(deadline) {
+            PreReap::Ready | PreReap::Reaped => {}
+            PreReap::Pending | PreReap::Unobserved(_) if Instant::now() < deadline => {
+                thread::yield_now();
+                continue;
+            }
+            result => return Err(format!("pre_reap={result:?}")),
+        }
         match owner.reap_if_exited() {
             Reap::Reaped(_) => break,
             Reap::NotExited | Reap::Interrupted if Instant::now() < deadline => {
@@ -440,6 +456,27 @@ fn settle(owner: &mut OwnedProcessGroup) -> Result<(), String> {
             }
             result => return Err(format!("group_presence={result:?}")),
         }
+    }
+}
+
+#[test]
+fn finite_native_fork_pressure_settles_before_reap() {
+    // Empirical supplement: every forker has a finite count and each leaf a
+    // short natural lifetime. The deterministic omitted sweep is a unit test
+    // because its private per-owner seam must never become a public API.
+    for _ in 0..8 {
+        let script = r#"
+            for worker in 1 2 3 4; do
+                (i=0; while [ "$i" -lt 24 ]; do /bin/sleep 1 & i=$((i + 1)); done; wait) &
+            done
+            printf ready > "$1"
+            wait
+        "#;
+        let (mut fixture, root_ready) = NativeFixture::shell(script, &[]).unwrap();
+        let readiness = ready(&root_ready);
+        let cleanup = fixture.cleanup();
+        assert!(cleanup.confirmed, "finite fork cleanup: {}", cleanup.detail);
+        readiness.unwrap();
     }
 }
 

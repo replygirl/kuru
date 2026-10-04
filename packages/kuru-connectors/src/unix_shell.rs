@@ -21,8 +21,8 @@ use anyhow::{Context, Result, bail, ensure};
 use kuru_platform::{
     fs::{Directory, NameRetention, Privacy},
     unix::{
-        GroupPresence, OwnedProcessGroup, PermissionListing, Reap, RootState, StdioPlan, StdioSlot,
-        Termination,
+        GroupPresence, OwnedProcessGroup, PermissionListing, PreReap, Reap, RootState, StdioPlan,
+        StdioSlot, Termination,
     },
 };
 use serde_json::json;
@@ -227,6 +227,7 @@ enum TestPoint {
     PostSpawnPanic = 5,
     PipeReadFailure = 6,
     CleanupPanic = 7,
+    GroupPending = 8,
 }
 
 #[cfg(test)]
@@ -1106,6 +1107,7 @@ fn finish_with_cleanup(
     match cleanup_until(
         group,
         cleanup_deadline,
+        false,
         #[cfg(test)]
         test_hooks,
     ) {
@@ -1143,8 +1145,8 @@ fn retain_until_confirmed(
     #[cfg(test)] test_hooks: &TestHooks,
 ) {
     // Once the caller receives its bounded result the worker remains the owner.
-    // A post-signal platform value cannot signal again; an anchored value may
-    // still make its one initial transition after a later non-interrupted poll.
+    // Retained pre-reap rounds can freshly authorize another sweep. Reaped
+    // owners continue only read-only observation, under the existing backoff.
     #[cfg(test)]
     let (mut retry_interval, maximum_retry_interval) = test_hooks.retained_backoff();
     #[cfg(not(test))]
@@ -1157,13 +1159,15 @@ fn retain_until_confirmed(
         test_hooks.await_retained_cleanup();
         #[cfg(test)]
         test_hooks.record_retained_observation();
-        // Each retained round may list once, within the interval it would
-        // otherwise sleep, and only after EPERM.
-        let mut listing = group.permission_listing(Instant::now() + retry_interval);
-        if let Ok(Ok(Some(_))) = catch_unwind(AssertUnwindSafe(|| {
-            cleanup_once(
+        // Drive the existing cleanup loop within this retained round's
+        // allowance. A single poll followed by sleeping the whole allowance
+        // would make every completed membership result expire before use.
+        let deadline = Instant::now() + retry_interval;
+        if let Ok(Ok(_)) = catch_unwind(AssertUnwindSafe(|| {
+            cleanup_until(
                 group,
-                &mut listing,
+                deadline,
+                true,
                 #[cfg(test)]
                 test_hooks,
             )
@@ -1171,7 +1175,7 @@ fn retain_until_confirmed(
             finish.confirm();
             return;
         }
-        thread::sleep(retry_interval);
+        thread::sleep(deadline.saturating_duration_since(Instant::now()));
         retry_interval = retry_interval
             .checked_mul(2)
             .unwrap_or(maximum_retry_interval)
@@ -1204,6 +1208,7 @@ fn before_launch(
 fn cleanup_until(
     group: &mut OwnedProcessGroup,
     deadline: Instant,
+    retained_round: bool,
     #[cfg(test)] test_hooks: &TestHooks,
 ) -> Result<ExitStatus> {
     let mut listing = group.permission_listing(deadline);
@@ -1211,10 +1216,16 @@ fn cleanup_until(
         if let Some(status) = cleanup_once(
             group,
             &mut listing,
+            deadline,
             #[cfg(test)]
             test_hooks,
         )? {
             return Ok(status);
+        }
+        if retained_round && matches!(group.root_state(), RootState::Reaped(_)) {
+            // Once reaped, this round made its one read-only absence check.
+            // Retain the existing backoff instead of polling it every 10ms.
+            bail!("retained group cleanup remains unconfirmed");
         }
         if Instant::now() >= deadline {
             bail!("cleanup confirmation timed out")
@@ -1226,6 +1237,7 @@ fn cleanup_until(
 fn cleanup_once(
     group: &mut OwnedProcessGroup,
     listing: &mut PermissionListing,
+    deadline: Instant,
     #[cfg(test)] test_hooks: &TestHooks,
 ) -> Result<Option<ExitStatus>> {
     #[cfg(test)]
@@ -1245,17 +1257,29 @@ fn cleanup_once(
         Termination::Interrupted => return Ok(None),
         Termination::Disarmed(reason) => bail!("shell ownership lost: {reason:?}"),
     }
+    match group.pre_reap_step(deadline) {
+        PreReap::Pending | PreReap::ExpiredPending | PreReap::Unobserved(_) => return Ok(None),
+        PreReap::Disarmed(reason) => bail!("shell ownership lost: {reason:?}"),
+        PreReap::InvalidPhase => bail!("shell root cleanup phase is invalid"),
+        PreReap::Ready | PreReap::Reaped | PreReap::Expired => {}
+    }
     match group.reap_if_exited() {
-        Reap::Reaped(status) => match listing.resolve_blocking(group.presence_after_reap()) {
-            GroupPresence::Absent | GroupPresence::Recycled => Ok(Some(status)),
-            GroupPresence::Present | GroupPresence::PermissionDenied => Ok(None),
-            GroupPresence::ObservationError(kind) => {
-                bail!("shell group observation failed: {kind}")
+        Reap::Reaped(status) => {
+            #[cfg(test)]
+            if test_hooks.take(TestPoint::GroupPending) {
+                return Ok(None);
             }
-            GroupPresence::InvalidPhase => {
-                bail!("shell group observation occurred before reap")
+            match listing.resolve_blocking(group.presence_after_reap()) {
+                GroupPresence::Absent | GroupPresence::Recycled => Ok(Some(status)),
+                GroupPresence::Present | GroupPresence::PermissionDenied => Ok(None),
+                GroupPresence::ObservationError(kind) => {
+                    bail!("shell group observation failed: {kind}")
+                }
+                GroupPresence::InvalidPhase => {
+                    bail!("shell group observation occurred before reap")
+                }
             }
-        },
+        }
         Reap::NotExited | Reap::Interrupted => Ok(None),
         Reap::Disarmed(reason) => bail!("shell ownership lost: {reason:?}"),
         Reap::InvalidPhase => bail!("shell root cleanup phase is invalid"),
@@ -1285,6 +1309,36 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[test]
+    fn retained_reaped_round_does_not_repeat_an_unconfirmed_observation() {
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        let mut group = OwnedProcessGroup::spawn(
+            command,
+            kuru_platform::unix::StdioPlan::new(
+                kuru_platform::unix::StdioSlot::Null,
+                kuru_platform::unix::StdioSlot::Null,
+                kuru_platform::unix::StdioSlot::Null,
+            ),
+        )
+        .unwrap();
+        group.terminate_before_reap();
+        let limit = Instant::now() + CLEANUP_ALLOWANCE;
+        while !matches!(group.root_state(), RootState::Exited) && Instant::now() < limit {
+            thread::sleep(OBSERVE_INTERVAL);
+        }
+        assert!(matches!(group.reap_if_exited(), Reap::Reaped(_)));
+        let hooks = TestHooks::new();
+        hooks.set_point(TestPoint::GroupPending);
+        let first = cleanup_until(&mut group, limit, true, &hooks).unwrap_err();
+        assert_eq!(
+            first.to_string(),
+            "retained group cleanup remains unconfirmed"
+        );
+        // The next retained round may independently observe actual absence.
+        assert!(cleanup_until(&mut group, limit, true, &hooks).is_ok());
+    }
 
     fn retained_root(path: &Path) -> Arc<Directory> {
         Arc::new(Directory::open(path, Privacy::Inherited, NameRetention::Pinned).unwrap())
