@@ -50,6 +50,9 @@
   outside this change's scope and untouched; there is none in lines 3573 to
   3673 (the test and its failure helper), and no "5 s" text remains in the
   file. The test passed 10 of 10 times alone (2.2).
+  Review follow-up: both failure arms now print `watch.report()` (steps,
+  in-flight hook workers, observed events); a re-forced stall (2.1) showed it
+  and the test then passed 3 of 3 alone.
 
 ## 2. Negative check and local evidence
 

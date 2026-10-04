@@ -3605,10 +3605,10 @@ async fn abandoned_dream_keeps_usage_after_reopen_without_advancing_main() {
         result
     });
     // The provider's first usage observation (a stored `Notify` permit, kept
-    // if it arrives before this wait polls) or the dream task ending first
-    // ends this wait. Every step mark, harness event or hook-worker change
-    // re-arms `gap`, the memory startup budget (`unhooked_gap_bound`); only a
-    // whole silent gap is a stall.
+    // whether `notify_one` lands before the first poll, between polls or in a
+    // poll's register-then-drop window) or the dream task ending first ends
+    // this wait. Every step mark or harness event re-arms `gap`, the memory
+    // startup budget (`unhooked_gap_bound`); only a whole silent gap is a stall.
     let waited = crate::progress_wait::until_event(
         &mut running,
         || futures::FutureExt::now_or_never(observed.notified()).is_some(),
@@ -3619,14 +3619,19 @@ async fn abandoned_dream_keeps_usage_after_reopen_without_advancing_main() {
     match waited {
         crate::progress_wait::Waited::Reached => {}
         crate::progress_wait::Waited::Finished(joined) => panic!(
-            "the dream task finished before its provider call: {}\n\
-             steps completed before the report (time since the test created its recorder):\n{}",
+            "the dream task finished before its provider call: {}\n{}",
             describe_dream_outcome(joined),
-            timings.render()
+            watch.report()
         ),
         crate::progress_wait::Waited::Stalled { progress_changes } => {
-            explain_expired_dream_wait(&mut running, &cancellation, &timings, gap, progress_changes)
-                .await
+            explain_expired_dream_wait(
+                &mut running,
+                &cancellation,
+                &mut watch,
+                gap,
+                progress_changes,
+            )
+            .await
         }
     }
     timings.mark("first usage observed; cancelling the dream");
@@ -3667,18 +3672,19 @@ async fn abandoned_dream_keeps_usage_after_reopen_without_advancing_main() {
 /// Fail `abandoned_dream_keeps_usage_after_reopen_without_advancing_main` when
 /// its wait for the provider's first usage observation stalls: no progress
 /// signal changed for one whole derived `gap` and the provider call was not
-/// reached. Timings are read before anything cancels the task, then the task is
+/// reached. The watch's report (steps, in-flight hook workers and observed
+/// events) is read before anything cancels the task, then the task is
 /// cancelled and awaited under the same gap so the report separates an early
 /// error from a slow prelude.
 async fn explain_expired_dream_wait(
     running: &mut tokio::task::JoinHandle<Result<crate::DreamReport>>,
     cancellation: &CancellationToken,
-    timings: &crate::step_timings::StepTimings,
+    watch: &mut crate::progress_wait::TaskWatch,
     gap: std::time::Duration,
     progress_changes: usize,
 ) -> ! {
-    let last = timings.last();
-    let steps = timings.render();
+    let last = watch.timings.last();
+    let report = watch.report();
     let outcome = if running.is_finished() {
         format!(
             "the dream task had already finished: {}",
@@ -3694,8 +3700,7 @@ async fn explain_expired_dream_wait(
     panic!(
         "the dream provider call was not reached: the dream made no observable progress \
          for {gap:?} ({progress_changes} progress changes seen while waiting); \
-         last completed step: {last}\n{outcome}\n\
-         steps completed before the report (time since the test created its recorder):\n{steps}"
+         last completed step: {last}\n{outcome}\n{report}"
     );
 }
 
