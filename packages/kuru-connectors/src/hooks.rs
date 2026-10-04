@@ -1001,7 +1001,8 @@ async fn spawn(
     root: &Arc<Directory>,
     hook: &HookCommand,
 ) -> Result<(HookOwner, HookInput, HookOutput, HookError)> {
-    use std::process::{Command, Stdio};
+    use kuru_platform::unix::{StdioPlan, StdioSlot};
+    use std::process::Command;
 
     let mut command = Command::new(&hook.command);
     command
@@ -1009,13 +1010,12 @@ async fn spawn(
         .env_clear()
         .envs(crate::tools::unix_shell_environment(std::env::vars_os()))
         .env(HOOK_ORIGIN_ENV, "1")
-        .current_dir(root.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .current_dir(root.path());
     root.revalidate()
         .context("workspace changed before lifecycle hook launch")?;
-    let mut owner = OwnedProcessGroup::spawn(command).context("cannot start lifecycle hook")?;
+    let piped = StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Pipe);
+    let mut owner =
+        OwnedProcessGroup::spawn(command, piped).context("cannot start lifecycle hook")?;
     let pipes = (|| -> Result<_> {
         let input = HookInput::from_std(owner.take_stdin()?)?;
         let output = HookOutput::from_std(owner.take_stdout()?)?;

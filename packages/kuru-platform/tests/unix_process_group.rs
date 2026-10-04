@@ -1,11 +1,13 @@
 #![cfg(unix)]
 
-use kuru_platform::unix::{GroupPresence, OwnedProcessGroup, Reap, RootState, Termination};
+use kuru_platform::unix::{
+    GroupPresence, OwnedProcessGroup, Reap, RootState, StdioPlan, StdioSlot, Termination,
+};
 use std::{
     fs,
     io::{self, BufReader, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::mpsc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -147,14 +149,12 @@ impl NativeFixture {
             .arg(&ready)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
-            .current_dir(root.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .current_dir(root.path());
         if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
             command.env("LLVM_PROFILE_FILE", profile);
         }
-        let mut owner = OwnedProcessGroup::spawn(command)?;
+        let plan = StdioPlan::new(StdioSlot::Null, StdioSlot::Null, StdioSlot::Pipe);
+        let mut owner = OwnedProcessGroup::spawn(command, plan)?;
         let stderr = match owner.take_stderr() {
             Ok(stderr) => StderrCapture::spawn(stderr),
             Err(error) => StderrCapture::unavailable(error),

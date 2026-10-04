@@ -8,7 +8,7 @@ use std::{
     collections::BTreeMap,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
-    process::{Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus},
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -20,7 +20,10 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use kuru_platform::{
     fs::{Directory, NameRetention, Privacy},
-    unix::{GroupPresence, OwnedProcessGroup, PermissionListing, Reap, RootState, Termination},
+    unix::{
+        GroupPresence, OwnedProcessGroup, PermissionListing, Reap, RootState, StdioPlan, StdioSlot,
+        Termination,
+    },
 };
 use serde_json::json;
 use tokio::{
@@ -824,10 +827,7 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
         .arg(command)
         .env_clear()
         .envs(environment)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .current_dir(root);
     if let Some(error) = before_launch(
         &control,
         deadline,
@@ -843,7 +843,8 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
     }
     #[cfg(test)]
     test_hooks.panic_if_armed(TestPoint::PreSpawnPanic);
-    let mut group = match OwnedProcessGroup::spawn(process).context("cannot start shell") {
+    let stdio = StdioPlan::new(StdioSlot::Null, StdioSlot::Pipe, StdioSlot::Pipe);
+    let mut group = match OwnedProcessGroup::spawn(process, stdio).context("cannot start shell") {
         Ok(group) => group,
         Err(error) => {
             finish.complete(Err(error));

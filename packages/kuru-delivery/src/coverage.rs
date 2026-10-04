@@ -14,6 +14,8 @@ pub mod spawns;
 
 use crate::{archive, command};
 use anyhow::{Context, Result, bail, ensure};
+#[cfg(unix)]
+use kuru_platform::unix::{StdioPlan, StdioSlot};
 use partition::PartitionScheme;
 use plan::{InvocationRecord, RunnerRecord};
 use serde::{Deserialize, Serialize};
@@ -1491,12 +1493,10 @@ impl Launcher for SystemLauncher {
             let mut command = std::process::Command::new(executable);
             command
                 .args(args.iter())
-                .env(spawns::SPAWN_LEDGER_ENV, ledger)
-                .stdin(std::process::Stdio::inherit())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit());
+                .env(spawns::SPAWN_LEDGER_ENV, ledger);
             supervise_group(
                 command,
+                StdioPlan::new(StdioSlot::Inherit, StdioSlot::Pipe, StdioSlot::Inherit),
                 tokio::io::stdout(),
                 log.clone(),
                 *remaining,
@@ -1889,9 +1889,13 @@ struct GroupProcess {
 
 #[cfg(unix)]
 impl GroupProcess {
-    fn spawn(command: std::process::Command, settle_bound: Duration) -> std::io::Result<Self> {
+    fn spawn(
+        command: std::process::Command,
+        stdio: StdioPlan,
+        settle_bound: Duration,
+    ) -> std::io::Result<Self> {
         Ok(Self {
-            owner: kuru_platform::unix::OwnedProcessGroup::spawn(command)?,
+            owner: kuru_platform::unix::OwnedProcessGroup::spawn(command, stdio)?,
             observed: "not observed".to_owned(),
             presence: None,
             settle_bound,
@@ -1976,7 +1980,7 @@ impl GroupProcess {
 }
 
 /// Start one test command in a fresh owned process group and supervise it.
-/// The command's stdout must be piped; everything else is the caller's.
+/// `stdio` must pipe stdout; everything else is the caller's.
 ///
 /// `interrupt` resolves when the runner itself is asked to stop. Supervision is
 /// then abandoned (its wait is cancellation-safe) and the group is terminated,
@@ -1984,6 +1988,7 @@ impl GroupProcess {
 #[cfg(unix)]
 async fn supervise_group<W, S>(
     command: std::process::Command,
+    stdio: StdioPlan,
     relay: W,
     log: PathBuf,
     remaining: Duration,
@@ -1994,7 +1999,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     S: std::future::Future<Output = RunnerSignal>,
 {
-    let mut child = GroupProcess::spawn(command, cleanup_bound)?;
+    let mut child = GroupProcess::spawn(command, stdio, cleanup_bound)?;
     let output = match child.take_stdout() {
         Ok(output) => output,
         Err(error) => {
@@ -3151,14 +3156,14 @@ mod tests {
     fn group_command(script: &str) -> std::process::Command {
         // The environment, including LLVM_PROFILE_FILE, is inherited unchanged.
         let mut command = std::process::Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg(script)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
+        command.arg("-c").arg(script);
         command
     }
+
+    /// Stdout piped for the relay; stdin closed; stderr shown.
+    #[cfg(unix)]
+    const GROUP_STDIO: StdioPlan =
+        StdioPlan::new(StdioSlot::Null, StdioSlot::Pipe, StdioSlot::Inherit);
 
     #[cfg(unix)]
     const GROUP_BOUND: Duration = Duration::from_secs(20);
@@ -3174,6 +3179,7 @@ mod tests {
         // Only the post-exit group signal lets the relay reach end of file.
         let supervision = supervise_group(
             group_command("sleep 300 & printf 'test one ... ok\\n'; exit 3"),
+            GROUP_STDIO,
             relay,
             log.clone(),
             GROUP_BOUND,
@@ -3202,7 +3208,8 @@ mod tests {
     #[tokio::test]
     async fn unix_group_observes_presence_only_after_reaping_its_root() {
         let mut process =
-            GroupProcess::spawn(group_command("sleep 300 & wait"), GROUP_BOUND).unwrap();
+            GroupProcess::spawn(group_command("sleep 300 & wait"), GROUP_STDIO, GROUP_BOUND)
+                .unwrap();
         let _output = process.take_stdout().unwrap();
         let error = process.wait(Duration::from_millis(100)).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
@@ -3224,17 +3231,18 @@ mod tests {
         assert!(process.sample().unwrap().starts_with("root_state=Reaped("));
 
         // An ordinary exit without any remaining member settles the same way.
-        let mut quick = GroupProcess::spawn(group_command("exit 0"), GROUP_BOUND).unwrap();
+        let mut quick =
+            GroupProcess::spawn(group_command("exit 0"), GROUP_STDIO, GROUP_BOUND).unwrap();
         let _output = quick.take_stdout().unwrap();
         assert!(quick.wait(GROUP_BOUND).await.unwrap().success());
         assert_eq!(quick.presence_after_reap().as_deref(), Some("Absent"));
 
         // A missing stdout pipe is refused after the group is cleaned up.
-        let mut unpiped = group_command("sleep 300");
-        unpiped.stdout(std::process::Stdio::null());
+        let unpiped = group_command("sleep 300");
         let temp = TempDir::new().unwrap();
         let error = supervise_group(
             unpiped,
+            StdioPlan::new(StdioSlot::Null, StdioSlot::Null, StdioSlot::Inherit),
             tokio::io::sink(),
             temp.path().join("unpiped.stdout.log"),
             GROUP_BOUND,
@@ -3259,6 +3267,7 @@ mod tests {
             sleep 300 & wait";
         let supervision = supervise_group(
             group_command(script),
+            GROUP_STDIO,
             tokio::io::sink(),
             log.clone(),
             Duration::from_millis(750),
@@ -3307,6 +3316,7 @@ mod tests {
         let interrupt = runner_signals().unwrap();
         let supervision = supervise_group(
             group_command("sleep 300 & printf 'ready %s\\n' $$; wait"),
+            GROUP_STDIO,
             tokio::io::stdout(),
             PathBuf::from(directory).join("signal.stdout.log"),
             GROUP_BOUND * 3,
@@ -4353,13 +4363,10 @@ mod tests {
         #[cfg(unix)]
         {
             let mut command = std::process::Command::new(&executable);
-            command
-                .args(args)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit());
+            command.args(args);
             supervise_group(
                 command,
+                StdioPlan::new(StdioSlot::Null, StdioSlot::Pipe, StdioSlot::Inherit),
                 tokio::io::sink(),
                 log,
                 Duration::from_secs(120),
@@ -4447,9 +4454,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_group_settle_is_bounded_by_the_wait_deadline() {
-        let mut command = group_command("sleep 30 & exit 0");
-        command.stdout(std::process::Stdio::null());
-        let mut child = GroupProcess::spawn(command, Duration::from_secs(60)).unwrap();
+        let command = group_command("sleep 30 & exit 0");
+        let unpiped = StdioPlan::new(StdioSlot::Null, StdioSlot::Null, StdioSlot::Inherit);
+        let mut child = GroupProcess::spawn(command, unpiped, Duration::from_secs(60)).unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         let started = std::time::Instant::now();
         match child.wait(Duration::ZERO).await {
