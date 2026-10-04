@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::MAX_BYTES;
 
 const DIAGNOSTIC_BYTES: usize = 8 * 1024;
-const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Operation {

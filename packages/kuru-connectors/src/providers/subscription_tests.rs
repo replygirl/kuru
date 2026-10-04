@@ -1115,13 +1115,16 @@ async fn cancelled_partial_stream_closes_socket_and_releases_same_actor() {
         async move { provider.complete(request()).await }
     });
     let _first_abort = AbortOnDrop(first.abort_handle());
-    tokio::time::timeout(Duration::from_secs(5), started)
+    // The server signals after the product's POST, which is sent inside the
+    // stream's total timer, `completion_timeout` (`COMPLETION_TIMEOUT` for the
+    // subscription route, providers.rs:545-551,1110-1117).
+    tokio::time::timeout(provider.completion_timeout, started)
         .await
         .unwrap()
         .unwrap();
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
-    let result = tokio::time::timeout(Duration::from_secs(5), provider.complete(request()))
+    let result = tokio::time::timeout(provider.completion_timeout, provider.complete(request()))
         .await
         .unwrap()
         .unwrap();
@@ -1187,8 +1190,10 @@ async fn raw_subscription_stream_with_chunks(
     let content_type = content_type
         .map(|value| format!("Content-Type: {value}\r\n"))
         .unwrap_or_default();
+    // The client paces this fixture inside its stream timer and drops the
+    // connection by `COMPLETION_TIMEOUT` (providers.rs:545-551,1110-1117).
     let task = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(COMPLETION_TIMEOUT, async {
             let (mut socket, _) = listener.accept().await.unwrap();
             read_request(&mut socket).await;
             let headers = format!(
@@ -1221,8 +1226,11 @@ async fn raw_subscription_stream_paused_after_delta(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (release, released) = oneshot::channel();
+    // The client paces each phase inside its stream timer and drops the
+    // connection by `COMPLETION_TIMEOUT` (providers.rs:545-551,1110-1117).
+    // The hold between the phases is the test's own and ends on its release.
     let task = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let mut socket = tokio::time::timeout(COMPLETION_TIMEOUT, async {
             let (mut socket, _) = listener.accept().await.unwrap();
             read_request(&mut socket).await;
             socket
@@ -1240,7 +1248,12 @@ async fn raw_subscription_stream_paused_after_delta(
                 socket.write_all(b"\r\n").await.unwrap();
                 socket.flush().await.unwrap();
             }
-            released.await.unwrap();
+            socket
+        })
+        .await
+        .expect("paused raw subscription fixture exceeded its bound before the release");
+        released.await.unwrap();
+        tokio::time::timeout(COMPLETION_TIMEOUT, async {
             for chunk in terminal.as_bytes().chunks(1) {
                 socket
                     .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
@@ -1252,7 +1265,7 @@ async fn raw_subscription_stream_paused_after_delta(
             socket.write_all(b"0\r\n\r\n").await.unwrap();
         })
         .await
-        .expect("paused raw subscription fixture exceeded its bound");
+        .expect("paused raw subscription fixture exceeded its bound after the release");
     });
     (base, release, task)
 }
@@ -1268,8 +1281,12 @@ async fn subscription_sse_delta_reaches_observer_before_delayed_terminal() {
     provider.base = base;
     let (sender, mut observed) = mpsc::channel(8);
     let mut sink = EventSink(sender);
+    // Both events are emitted inside the stream's total timer,
+    // `completion_timeout` (providers.rs:1110-1117), which encloses the chunk
+    // waits under `STREAM_IDLE_TIMEOUT` (providers.rs:1235-1237).
+    let completion_timeout = provider.completion_timeout;
     let mut stream = Box::pin(provider.stream(request(), &mut sink));
-    let first = tokio::time::timeout(Duration::from_secs(2), async {
+    let first = tokio::time::timeout(completion_timeout, async {
         tokio::select! {
             event = observed.recv() => event,
             result = &mut stream => panic!("stream settled before a delta: {result:?}"),
@@ -1278,7 +1295,7 @@ async fn subscription_sse_delta_reaches_observer_before_delayed_terminal() {
     .await
     .unwrap();
     assert!(matches!(first, Some(ProviderEvent::ContextMeasured(_))));
-    let delta = tokio::time::timeout(Duration::from_secs(2), async {
+    let delta = tokio::time::timeout(completion_timeout, async {
         tokio::select! {
             event = observed.recv() => event,
             result = &mut stream => panic!("stream settled before a delta: {result:?}"),
@@ -1310,7 +1327,7 @@ async fn fragmented_discarded_subscription_sse_does_not_exhaust_retained_output_
     let (base, server) = raw_subscription_stream_with_chunks(body, None, 1024).await;
     let _abort = AbortOnDrop(server.abort_handle());
     provider.base = base;
-    let result = tokio::time::timeout(Duration::from_secs(5), provider.complete(request()))
+    let result = tokio::time::timeout(provider.completion_timeout, provider.complete(request()))
         .await
         .unwrap()
         .unwrap();
@@ -1333,7 +1350,7 @@ async fn missing_content_type_accepts_fragmented_subscription_sse() {
     let (base, server) = raw_subscription_stream(body, None).await;
     let _abort = AbortOnDrop(server.abort_handle());
     provider.base = base;
-    let result = tokio::time::timeout(Duration::from_secs(5), provider.complete(request()))
+    let result = tokio::time::timeout(provider.completion_timeout, provider.complete(request()))
         .await
         .unwrap()
         .unwrap();
@@ -1382,7 +1399,7 @@ async fn missing_content_type_still_rejects_malformed_and_truncated_streams() {
         let (base, server) = raw_subscription_stream(body, content_type).await;
         let _abort = AbortOnDrop(server.abort_handle());
         provider.base = base;
-        let error = tokio::time::timeout(Duration::from_secs(5), provider.complete(request()))
+        let error = tokio::time::timeout(provider.completion_timeout, provider.complete(request()))
             .await
             .unwrap()
             .unwrap_err();
