@@ -35,6 +35,7 @@ use super::{
 };
 use crate::memory_notice::MemoryNotice;
 
+// Defined once for unit and integration tests; moving tests/support breaks `cargo test --lib`.
 #[path = "../../tests/support/turn_budget.rs"]
 mod turn_budget;
 use turn_budget::{TURN_BUDGET, TURN_SETTLEMENT};

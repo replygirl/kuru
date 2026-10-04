@@ -611,16 +611,26 @@ impl Terminal {
         let deadline = Instant::now() + timeout;
         let status = loop {
             self.read_for(TICK)?;
-            if let Some(status) = self.child.try_wait()? {
-                break status;
-            }
+            // Read the clock after the observation: an exit seen past the
+            // deadline fails here as a late exit, so the drain below starts
+            // only after a timely exit, with part of the budget left.
+            let status = self.child.try_wait()?;
             ensure!(
                 Instant::now() < deadline,
-                "process exits: timed out after {timeout:?}; process {} is still running\n{}\n{}",
+                "process exits: timed out after {timeout:?}; process {} {}\n{}\n{}",
                 self.child_id()?,
+                match &status {
+                    Some(status) => format!(
+                        "did not exit within {timeout:?}: its exit ({status:?}) was seen after the deadline"
+                    ),
+                    None => "is still running".to_owned(),
+                },
                 self.diagnostics(),
                 self.report()
             );
+            if let Some(status) = status {
+                break status;
+            }
         };
         // Process exit closes the final slave descriptor. Drain until the
         // reader observes that close so no queued final frame or large payload
@@ -633,8 +643,9 @@ impl Terminal {
         // stdio servers get pipes). EOF is therefore already due when the exit
         // is seen, and only this process's reader thread stands between them.
         // The drain spends what remains of the caller's `timeout`, not a flat
-        // window a descheduled reader could miss; reaching it reports a leaked
-        // holder.
+        // window a descheduled reader could miss. The loop above admits only
+        // an exit seen before the deadline, so reaching it here reports output
+        // still open after a timely exit: a leaked holder.
         loop {
             match self.receive_output(TICK)? {
                 Ok(Ok(bytes)) => {
