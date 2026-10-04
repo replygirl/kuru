@@ -71,9 +71,10 @@ pub const WRITE_FAILURE_ENV: &str = "KURU_TEST_MEMORY_ACTIVITY_WRITE_FAILURE";
 /// milliseconds with optional surrounding whitespace. That budget is at
 /// least the longest wait that ends in the file's removal, derived at the
 /// test from the product budgets that wait encloses, never a literal. An
-/// empty file keeps the bound `memory.startup_timeout_secs`. Any other
-/// content fails the hold, which the owner logs before its open proceeds.
-/// Write the file, with its content, before spawning the owner.
+/// empty or whitespace-only file keeps the bound
+/// `memory.startup_timeout_secs`. Any other content fails the hold, which the
+/// owner logs before its open proceeds. Write the file, with its content,
+/// before spawning the owner.
 #[cfg(any(test, feature = "test-support"))]
 pub const OPEN_HOLD_DIR_ENV: &str = "KURU_TEST_MEMORY_OPEN_HOLD_DIR";
 
@@ -917,7 +918,8 @@ async fn hold(
                     .and_then(|millis| start.checked_add(Duration::from_millis(millis)))
                     .with_context(|| {
                         format!(
-                            "the budget in open hold marker {} overflows the clock",
+                            "the budget in open hold marker {} exceeds u64 milliseconds \
+                             or overflows the clock",
                             marker.display()
                         )
                     })?;
@@ -1561,6 +1563,8 @@ mod tests {
         };
         // Stands in for a small `startup_timeout_secs`.
         let limit = Duration::from_secs(1);
+        // The checks need a budget beyond the `2 * limit` window plus one
+        // 10 ms marker poll; 60 limits clears that with margin.
         let budget = 60 * limit;
         let marker = root.path().join("CreatingDatabase.hold");
         ensure!(feed.push(CreatingDatabase));
@@ -1578,19 +1582,27 @@ mod tests {
         held.await?;
         let released = start.elapsed();
         ensure!(
-            released > 2 * limit && released < budget,
+            released >= 2 * limit && released < budget,
             "the hold was released at {released:?}"
         );
 
         // Content that is not a budget fails at once, naming the marker and
-        // the content's class; it never falls back to the limit.
+        // the content's class; it never falls back to the limit. Non-UTF-8
+        // content drives the read failure. A marker removed after it was
+        // found needs a second thread, so that arm is not driven here.
         let beyond = "9".repeat(30);
-        for (content, class) in [
-            ("soon", "other than decimal milliseconds"),
-            ("+60000", "other than decimal milliseconds"),
-            ("60s", "other than decimal milliseconds"),
-            (beyond.as_str(), "overflows the clock"),
-        ] {
+        let rejected: [(&[u8], &str); 5] = [
+            (b"soon", "other than decimal milliseconds"),
+            (b"+60000", "other than decimal milliseconds"),
+            (b"60s", "other than decimal milliseconds"),
+            (
+                beyond.as_bytes(),
+                "exceeds u64 milliseconds or overflows the clock",
+            ),
+            (b"\xff", "could not be read"),
+        ];
+        for (content, class) in rejected {
+            let content_text = content.escape_ascii().to_string();
             std::fs::write(&marker, content)?;
             let start = tokio::time::Instant::now();
             let text = format!(
@@ -1598,13 +1610,13 @@ mod tests {
                 hold(&hooks, CreatingDatabase, &feed, limit)
                     .await
                     .err()
-                    .with_context(|| format!("a marker holding {content:?} held"))?
+                    .with_context(|| format!("a marker holding \"{content_text}\" held"))?
             );
             ensure!(
                 text.contains("CreatingDatabase.hold")
                     && text.contains(class)
                     && start.elapsed().is_zero(),
-                "{content:?}: {text}"
+                "\"{content_text}\": {text}"
             );
         }
 
