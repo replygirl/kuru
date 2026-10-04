@@ -38,10 +38,10 @@ its event under a budget derived from a product value.
   instead of a timeout. If one whole gap elapses with no progress and neither
   event, it fails with the existing step-recorder report
   (`explain_expired_dream_wait`, adapted to name the gap rather than "5 s").
-- Shared runtime test support in `packages/kuru-runtime/src/progress_wait.rs`
-  gains the notification-versus-task wait (or the call site composes the
-  existing `until_event`), with paused-clock regression tests next to the
-  existing ones.
+- The call site composes the existing shared test support in
+  `packages/kuru-runtime/src/progress_wait.rs` (`until_event`, `Waited`,
+  `TaskWatch::progress`, `settle`), whose paused-clock tests already cover each
+  outcome; `progress_wait.rs` itself is unchanged.
 - Non-goals: other flat waits (another PR sweeps them), product code, any longer
   literal, retry, the step recorder's content.
 

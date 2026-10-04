@@ -3604,11 +3604,30 @@ async fn abandoned_dream_keeps_usage_after_reopen_without_advancing_main() {
         harness.shutdown(false).await.unwrap();
         result
     });
-    if tokio::time::timeout(std::time::Duration::from_secs(5), observed.notified())
-        .await
-        .is_err()
-    {
-        explain_expired_dream_wait(&mut running, &cancellation, &timings, gap).await;
+    // The provider's first usage observation (a stored `Notify` permit, kept
+    // if it arrives before this wait polls) or the dream task ending first
+    // ends this wait. Every step mark, harness event or hook-worker change
+    // re-arms `gap`, the memory startup budget (`unhooked_gap_bound`); only a
+    // whole silent gap is a stall.
+    let waited = crate::progress_wait::until_event(
+        &mut running,
+        || futures::FutureExt::now_or_never(observed.notified()).is_some(),
+        || watch.progress(),
+        gap,
+    )
+    .await;
+    match waited {
+        crate::progress_wait::Waited::Reached => {}
+        crate::progress_wait::Waited::Finished(joined) => panic!(
+            "the dream task finished before its provider call: {}\n\
+             steps completed before the report (time since the test created its recorder):\n{}",
+            describe_dream_outcome(joined),
+            timings.render()
+        ),
+        crate::progress_wait::Waited::Stalled { progress_changes } => {
+            explain_expired_dream_wait(&mut running, &cancellation, &timings, gap, progress_changes)
+                .await
+        }
     }
     timings.mark("first usage observed; cancelling the dream");
     cancellation.cancel();
@@ -3646,17 +3665,19 @@ async fn abandoned_dream_keeps_usage_after_reopen_without_advancing_main() {
 }
 
 /// Fail `abandoned_dream_keeps_usage_after_reopen_without_advancing_main` when
-/// its 5 s wait for the provider's first usage observation expires, saying what
-/// the dream task did instead. The bound itself is unchanged. Timings are read
-/// before anything cancels the task, then the task is cancelled and awaited
-/// under the fixture's derived gap so the report separates an early error from
-/// a slow prelude.
+/// its wait for the provider's first usage observation stalls: no progress
+/// signal changed for one whole derived `gap` and the provider call was not
+/// reached. Timings are read before anything cancels the task, then the task is
+/// cancelled and awaited under the same gap so the report separates an early
+/// error from a slow prelude.
 async fn explain_expired_dream_wait(
     running: &mut tokio::task::JoinHandle<Result<crate::DreamReport>>,
     cancellation: &CancellationToken,
     timings: &crate::step_timings::StepTimings,
     gap: std::time::Duration,
+    progress_changes: usize,
 ) -> ! {
+    let last = timings.last();
     let steps = timings.render();
     let outcome = if running.is_finished() {
         format!(
@@ -3668,10 +3689,12 @@ async fn explain_expired_dream_wait(
         let settled =
             crate::progress_wait::settle(running, gap, |result| describe_dream_outcome(Ok(result)))
                 .await;
-        format!("the dream task was still running at the deadline; after cancellation {settled}")
+        format!("the dream task was still running at the stall; after cancellation {settled}")
     };
     panic!(
-        "the dream provider call was not reached within 5 s\n{outcome}\n\
+        "the dream provider call was not reached: the dream made no observable progress \
+         for {gap:?} ({progress_changes} progress changes seen while waiting); \
+         last completed step: {last}\n{outcome}\n\
          steps completed before the report (time since the test created its recorder):\n{steps}"
     );
 }
