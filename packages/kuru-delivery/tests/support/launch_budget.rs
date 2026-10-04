@@ -16,14 +16,81 @@
 //! - The previous release's updater (`previous_updater.rs`, also the candidate
 //!   support generator in `previous_release_update.rs`) runs in the `install`
 //!   and `verify-staged` jobs, which record no job start, so it takes the
-//!   product's composed handoff budget, `kuru_delivery::update_budget::handoff`.
+//!   Windows updating parent's serial waits on its trusted helper,
+//!   [`update_handoff`], composed from the product's
+//!   `kuru_delivery::update_budget` constants.
 //! - Native mise launches (`mise_acceptance.rs`) take mise's stalled-request
 //!   budget, [`mise_stalled_request`], plus the memory package's backstop for
 //!   one Kuru lifecycle that creates its store.
+//!
+//! Trade at the job deadline: a launch bounded by [`until_job_deadline`] that
+//! stalls ends at the same deadline the coverage orchestrator enforces on the
+//! test process. Both convert it from whole seconds against the truncated
+//! current second, each ending up to a second after it, so which fires first
+//! is not determined, and the launch's own stall diagnostics are not assured.
+//! When the orchestrator fires first it terminates the test process tree; its
+//! stall report names the unfinished test and carries that test's output so
+//! far, but its process sample covers only the test process root (Unix root
+//! state, Windows CPU times and working set), not the wrapper subtree that
+//! `bounded_output` would have described. The stall also takes the partition's
+//! remaining time, so that attempt leaves the rest of the binary's tests
+//! unrun. Both follow from having no launch budget to take a shorter bound
+//! from; a recorded wrapper budget would replace them.
+//!
+//! Follow-on: the `install` and `verify-staged` jobs, and the release
+//! workflow's ordinary `tests` job, record no job start. Recording
+//! `KURU_COVERAGE_JOB_STARTED` and `KURU_COVERAGE_JOB_MINUTES` on the steps
+//! that run these binaries would let the previous updater's launches with no
+//! product budget (`--version`, completions, man-page generation and the Unix
+//! update) and the release job's wrapper launches take [`until_job_deadline`]
+//! instead of the handoff budget or the local window.
 
 #![allow(dead_code)] // Each includer uses a subset.
 
+use kuru_delivery::update_budget::{CLEANUP, PUBLICATION, STARTUP};
 use std::{sync::LazyLock, time::Duration};
+
+/// The Windows updating parent's waits on its trusted helper, in series, each
+/// with the wait it bounds as it reads in `src/update.rs` with whitespace
+/// removed (the pin test requires each there exactly once). On a failed
+/// handoff the parent has waited for the connection, the request and the
+/// publication acknowledgment (its frame deadline is clamped inside it), and
+/// the pipe close; it then waits for the helper's exit, and after an observed
+/// exit drains the helper's diagnostics to EOF before stopping the drain, whose
+/// pipe close cancels the in-flight read under its own bound. A successful
+/// handoff skips the exit wait and the drain. Verification before the handoff
+/// and the synchronous check of the acknowledged image have no bound of their
+/// own. The series and its constants are unchanged since v0.9.0.
+pub const UPDATE_HANDOFF_WAITS: [(&str, Duration); 7] = [
+    ("listener.accept(&child,STARTUP)", STARTUP),
+    (
+        "tokio::time::timeout(STARTUP,async{pipe.write_all(",
+        STARTUP,
+    ),
+    (
+        "receive_publication(&mutpipe,PUBLICATION,STARTUP)",
+        PUBLICATION,
+    ),
+    ("pipe.close(STARTUP).await?;", STARTUP),
+    (
+        "Some(child.wait(STARTUP+CLEANUP).await)",
+        STARTUP.saturating_add(CLEANUP),
+    ),
+    ("tokio::time::timeout(CLEANUP,&muttask)", CLEANUP),
+    ("letclosed=pipe.close(CLEANUP).await;", CLEANUP),
+];
+
+/// The longest the Windows updating parent waits on its trusted helper: the
+/// sum of [`UPDATE_HANDOFF_WAITS`].
+pub const fn update_handoff() -> Duration {
+    let mut total = Duration::ZERO;
+    let mut index = 0;
+    while index < UPDATE_HANDOFF_WAITS.len() {
+        total = total.saturating_add(UPDATE_HANDOFF_WAITS[index].1);
+        index += 1;
+    }
+    total
+}
 
 /// The mise release whose documented HTTP settings these constants cite; the
 /// pin test requires it to be the release the workflows install.

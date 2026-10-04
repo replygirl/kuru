@@ -406,7 +406,8 @@ fn coverage_tasks_run_the_rust_orchestrator_without_shell_metacharacters() {
 /// job's inner test deadline: their mise, `cmd.exe` and PowerShell 7 startup
 /// has no product or vendor budget, and that deadline is the one the coverage
 /// orchestrator enforces on this process. The siblings name their own
-/// sources, and every workflow job limit still places that deadline through
+/// sources, the previous updater's handoff series matches the updater's wait
+/// sites, and every workflow job limit still places that deadline through
 /// `coverage::shard_deadline`.
 #[test]
 fn launch_bounds_take_their_recorded_derivations() {
@@ -449,16 +450,19 @@ fn launch_bounds_take_their_recorded_derivations() {
         (
             "tests/support/previous_updater.rs",
             &[(
-                "pubconstDEADLINE:Duration=kuru_delivery::update_budget::handoff();",
+                "pubconstDEADLINE:Duration=super::launch_budget::update_handoff();",
                 1,
             )][..],
         ),
         (
             "tests/previous_release_update.rs",
-            &[(
-                "command::output(&mutgenerator,previous_updater::DEADLINE)",
-                1,
-            )][..],
+            &[
+                (include, 1),
+                (
+                    "command::output(&mutgenerator,previous_updater::DEADLINE)",
+                    1,
+                ),
+            ][..],
         ),
         (
             "tests/support/mise_acceptance.rs",
@@ -479,6 +483,44 @@ fn launch_bounds_take_their_recorded_derivations() {
                 "{file} no longer takes its bound from {derivation}"
             );
         }
+    }
+
+    // Every use of the handoff budgets in the updater is either a wait in the
+    // parent's handoff series or one of the uses named here, each present
+    // exactly once, so a new wait, or a series that omits one, fails.
+    let updater = compact(&std::fs::read_to_string(package.join("src/update.rs")).unwrap());
+    let other_uses = [
+        "usecrate::update_budget::{CLEANUP,PUBLICATION,STARTUP};",
+        // The helper's own frame receive, connect, acknowledged close and
+        // wait for the parent's exit.
+        "tokio::time::timeout(STARTUP,async{letfirst",
+        "pipe::connect(&start.pipe.context(\"missinghelperchannel\")?,STARTUP)",
+        "pipe.close(STARTUP).await.context(\"closeacknowledgedupdatechannel\")",
+        "wait_process_handle(&parent_handle,CLEANUP)",
+        // The native diagnostic fixture's helper exit.
+        "letexit=child.wait(STARTUP+CLEANUP).await;",
+    ];
+    let sites: Vec<&str> = launch_budget::UPDATE_HANDOFF_WAITS
+        .iter()
+        .map(|(site, _)| *site)
+        .chain(other_uses)
+        .collect();
+    for site in &sites {
+        assert_eq!(
+            updater.matches(site).count(),
+            1,
+            "the updater's wait {site} changed; re-derive the handoff series"
+        );
+    }
+    for budget in ["STARTUP", "PUBLICATION", "CLEANUP"] {
+        assert_eq!(
+            updater.matches(budget).count(),
+            sites
+                .iter()
+                .map(|site| site.matches(budget).count())
+                .sum::<usize>(),
+            "the updater uses {budget} outside the named sites; re-derive the handoff series"
+        );
     }
 
     // No launch bound in this package's tests is a bare three-minute literal.

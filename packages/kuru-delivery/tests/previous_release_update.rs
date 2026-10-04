@@ -10,6 +10,8 @@
 //! single-threaded: the helper writes an executable and then runs it, and a
 //! concurrent spawn could inherit that descriptor (Linux ETXTBSY).
 
+#[path = "support/launch_budget.rs"]
+mod launch_budget;
 #[path = "support/previous_updater.rs"]
 mod previous_updater;
 
