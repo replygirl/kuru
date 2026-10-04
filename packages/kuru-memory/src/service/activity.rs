@@ -2179,18 +2179,18 @@ mod tests {
 
     /// A served owner that keeps refusing retirement because a client stays
     /// attached never shows it is closing, so the fixture keeps asking until
-    /// one deadline carried across its refusal retries: the retirement's own
-    /// `memory.startup_timeout_secs` from its first request, not a flat
-    /// fixture bound. Its expiry names that deadline, the time since the
-    /// first request, a published owner, its busy replies and the refusals.
-    /// Only the retirement's options carry a 1 s startup timeout (the owner
-    /// keeps the default for its engine start); the refusals are real socket
-    /// replies, so this runs on the real clock, bounded by that configured
-    /// second, rather than auto-advancing paused time past an owner's reply.
-    /// Dropping the client then lets the owner retire by itself.
+    /// one deadline carried across its refusal retries: the product's own
+    /// maintenance request budget, not a fixture-chosen bound. Its expiry names
+    /// the asking phase and that budget, the time since the first request, a
+    /// published owner, its busy replies and the refusals. Only the
+    /// retirement's options carry a 1 s startup timeout (the owner keeps the
+    /// default for its engine start), which the budget outlasts: the budget is
+    /// the owner's close budget. The refusals are real socket replies obtained
+    /// before the clock is paused; paused time then elapses the budget.
+    /// Dropping the client afterwards lets the owner retire by itself.
     #[tokio::test]
-    async fn an_elapsed_retirement_behind_an_attached_client_names_its_startup_deadline()
-    -> Result<()> {
+    async fn an_elapsed_retirement_behind_an_attached_client_names_its_request_budget() -> Result<()>
+    {
         warm_runtime_cache().await?;
         let deadline = fixture_deadline(1, 0);
         tokio::time::timeout(deadline, async {
@@ -2210,7 +2210,9 @@ mod tests {
             let client = attach_raw(&data, &options.project_scope, None).await?;
             let mut asking = options.clone();
             asking.config.startup_timeout_secs = 1;
+            tokio::time::pause();
             let elapsed = crate::test_support::retire_idle_service(&asking).await;
+            tokio::time::resume();
             drop(client);
             served.await??;
             let text = format!(
@@ -2219,14 +2221,10 @@ mod tests {
                     .err()
                     .context("retirement completed while a client was attached")?
             );
-            crate::test_support::ensure_asking_deadline_expiry(
-                &text,
-                Duration::from_secs(1),
-                "owner published",
-            )?;
+            crate::test_support::ensure_asking_phase_expiry(&text, &asking, "owner published")?;
             ensure!(
                 !text.contains("busy replies=0;") && !text.contains("within 10 seconds"),
-                "the asking deadline's expiry did not name its busy replies: {text}"
+                "the asking phase's expiry did not name its busy replies: {text}"
             );
             ensure!(owner_lock_free(&options)?);
             crate::test_support::retire_idle_service(&options).await
@@ -2235,13 +2233,69 @@ mod tests {
         .with_context(|| format!("attached client fixture exceeded its {deadline:?} deadline"))?
     }
 
+    /// The asking phase is bounded by the product's maintenance request
+    /// budget, not by `memory.startup_timeout_secs`: with a 1 s startup
+    /// timeout and an owner that never answers (its lock held by an open
+    /// still in progress, no endpoint published), the retirement keeps asking
+    /// past that second and expires only at `maintenance_deadline`, the
+    /// owner's close budget here, naming the asking phase and that budget.
+    /// Paused time elapses it; there is no live owner, so nothing waits on a
+    /// clock or a socket.
+    #[tokio::test(start_paused = true)]
+    async fn the_asking_phase_outlives_the_startup_timeout_when_the_close_budget_is_larger()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let scope = format!("project/{}", "b".repeat(64));
+        let data = root.path().join("private");
+        let mut options = crate::test_support::open_options(data.clone(), scope.clone())?;
+        options.config.startup_timeout_secs = 1;
+        let startup = Duration::from_secs(options.config.startup_timeout_secs);
+        let budget = crate::service::maintenance_deadline(&options);
+        ensure!(
+            budget == crate::server::close_budget() && budget > startup,
+            "the fixture's close budget ({budget:?}) does not exceed its startup timeout"
+        );
+        let owner = ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?
+            .context("a fresh fixture's owner lock was busy")?;
+        write_progress_record(
+            &data,
+            &scope,
+            &activity_tag(&Uuid::new_v4()),
+            &[PreparingDatabase],
+            0,
+        )?;
+        let started = tokio::time::Instant::now();
+        let (retired, waiter) =
+            crate::test_support::retire_idle_service_keeping_waiter(&options).await;
+        let elapsed = started.elapsed();
+        owner.release()?;
+        ensure!(waiter.is_none(), "an opening owner read as closing");
+        let text = format!(
+            "{:#}",
+            retired
+                .err()
+                .context("retirement completed while the owner held its lock")?
+        );
+        crate::test_support::ensure_asking_phase_expiry(
+            &text,
+            &options,
+            "owner still opening; last stage = PreparingDatabase; no endpoint record present",
+        )?;
+        ensure!(
+            elapsed >= budget && !text.contains("memory.startup_timeout_secs"),
+            "the asking phase expired at {elapsed:?}, before its {budget:?} budget, or named \
+             the startup timeout: {text}"
+        );
+        Ok(())
+    }
+
     /// A fixture's retirement bound that elapses behind an owner held in its
     /// open before it published an endpoint names an opening owner and its
     /// last stage, not an idle owner that did not retire. Its requests find
     /// no live endpoint while the owner's open-activity record shows it still
     /// opening, which is not a closing reading, so the fixture keeps asking
-    /// and the bound is its asking deadline, `memory.startup_timeout_secs`
-    /// from the first request. Paused time elapses it while the open waits at
+    /// and the bound is its asking phase's maintenance request budget from
+    /// the first request. Paused time elapses it while the open waits at
     /// its hold; time resumes before the hold is released and the owner opens
     /// and closes.
     #[tokio::test]
@@ -2293,9 +2347,9 @@ mod tests {
                     .err()
                     .context("retirement completed while the owner held its lock")?
             );
-            crate::test_support::ensure_asking_deadline_expiry(
+            crate::test_support::ensure_asking_phase_expiry(
                 &text,
-                Duration::from_secs(options.config.startup_timeout_secs),
+                &options,
                 "owner still opening; last stage = PreparingDatabase; no endpoint record present",
             )?;
             ensure!(

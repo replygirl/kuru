@@ -797,14 +797,16 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
 ///
 /// It asks through the maintenance acquisition, retrying while the owner
 /// refuses with attached clients, until one deadline carried across those
-/// retries: `memory.startup_timeout_secs` from the first attempt, no longer
-/// than the deadline that attempt itself enforces on its start-lock wait,
-/// owner response and owner-lock wait (the longer of that timeout and the
-/// owner's close budget). That covers an owner that has not shown it is closing (a
-/// client still attached, the start lock held, or no reply yet), including
+/// retries: the product's own maintenance request budget,
+/// `service::maintenance_deadline` (the longer of the owner's close budget and
+/// `memory.startup_timeout_secs`), from the first attempt. That is the budget
+/// each attempt itself enforces on its start-lock wait, owner response and
+/// owner-lock wait, so the fixture chooses no bound of its own. The asking
+/// phase covers an owner that has not shown it is closing (a client still
+/// attached, the start lock held, or no reply yet), including
 /// one still opening: a request that finds no live endpoint while the
 /// owner's records show its open in progress is not a closing reading, since
-/// that owner will publish and must then be asked, so the deadline also bounds
+/// that owner will publish and must then be asked, so the budget also bounds
 /// the open itself. Once a request finds the owner closing (no live endpoint
 /// with the owner not opening, a connection the owner closed unanswered, or
 /// an accepted retirement), it stops asking and
@@ -818,7 +820,7 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
 /// The opening reading comes from the owner's best-effort records (see
 /// [`owner_state`]), so two cases are read imperfectly. A served owner whose
 /// close stalls between its endpoint and activity record retirements reads
-/// as opening: it is asked until the asking deadline, which then names it
+/// as opening: it is asked until the maintenance request budget, which then names it
 /// still opening. An owner with no record, because it was started without a
 /// starter token (only in-process test owners) or its record write failed,
 /// reads as closing while it opens; if it then publishes and stays idle,
@@ -885,7 +887,7 @@ pub(crate) async fn retire_idle_service_traced(
         Closing(crate::service::ClosingReading),
     }
     let mut refusals: u32 = 0;
-    let asking = Duration::from_secs(options.config.startup_timeout_secs);
+    let asking = crate::service::maintenance_deadline(options);
     let started = tokio::time::Instant::now();
     let asking_deadline = started + asking;
     let asked = tokio::time::timeout_at(asking_deadline, async {
@@ -917,9 +919,9 @@ pub(crate) async fn retire_idle_service_traced(
     // reported alike.
     let expired = |error: Error| {
         error.context(format!(
-            "managed owner retirement did not complete within memory.startup_timeout_secs \
-             ({asking:?}; {}ms since the first request), and no request found the owner \
-             closing; {}; {trace}; active-client refusals={refusals}",
+            "managed owner retirement asking phase: no request found the owner closing within \
+             the maintenance request budget ({asking:?}; {}ms since the first request); {}; \
+             {trace}; active-client refusals={refusals}",
             started.elapsed().as_millis(),
             owner_state(options)
         ))
@@ -1050,32 +1052,33 @@ pub(crate) fn ensure_close_budget_expiry(text: &str, reading: &str, state: &str)
     Ok(())
 }
 
-/// Check that `text` is the expiry of a fixture retirement's asking deadline,
-/// `asking` (`memory.startup_timeout_secs`): it names that deadline, the time
-/// since the first request (at least that deadline), that no request found
-/// the owner closing and the owner `state`, and not the close budget's
-/// expiry.
+/// Check that `text` is the expiry of a fixture retirement's asking phase
+/// under the maintenance request budget the product enforces for `options`
+/// (`service::maintenance_deadline`, never the fixture's own figure): it names
+/// the phase and that budget, the time since the first request (at least that
+/// budget), that no request found the owner closing and the owner `state`,
+/// and not the close budget's expiry.
 #[cfg(test)]
-pub(crate) fn ensure_asking_deadline_expiry(
+pub(crate) fn ensure_asking_phase_expiry(
     text: &str,
-    asking: Duration,
+    options: &OpenOptions,
     state: &str,
 ) -> Result<()> {
+    let budget = crate::service::maintenance_deadline(options);
     let prefix = format!(
-        "managed owner retirement did not complete within memory.startup_timeout_secs \
-         ({asking:?}; "
+        "managed owner retirement asking phase: no request found the owner closing within the \
+         maintenance request budget ({budget:?}; "
     );
     let since = text
         .split_once(&prefix)
         .and_then(|(_, rest)| rest.split_once("ms since the first request)"))
         .and_then(|(milliseconds, _)| milliseconds.parse::<u128>().ok());
     ensure!(
-        since.is_some_and(|milliseconds| milliseconds >= asking.as_millis())
-            && text.contains("no request found the owner closing")
+        since.is_some_and(|milliseconds| milliseconds >= budget.as_millis())
             && text.contains(state)
             && !text.contains("within its close budget"),
-        "the asking deadline's expiry did not name the startup timeout ({asking:?}), the time \
-         since the first request and the owner state ({state}): {text}"
+        "the asking phase's expiry did not name the maintenance request budget ({budget:?}), the \
+         time since the first request and the owner state ({state}): {text}"
     );
     Ok(())
 }
@@ -1182,7 +1185,7 @@ pub fn hold_owner_lock(options: &OpenOptions) -> Result<HeldOwnerLock> {
 /// closes asynchronously, so closing every client does not mean its engine is
 /// already reaped. Call this after every client handle for `options` has
 /// closed (an attached client makes [`retire_idle_service`] fail at its
-/// `memory.startup_timeout_secs` asking deadline, naming its active-client
+/// maintenance request budget in its asking phase, naming its active-client
 /// refusals). It waits behind the owner's own close, or retires an owner that
 /// is still running, either of which releases the owner lock only after its
 /// Dolt is reaped, then awaits [`await_store_quiescence`] for the project
