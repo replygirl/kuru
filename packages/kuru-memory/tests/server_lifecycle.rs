@@ -94,16 +94,17 @@ async fn configured_startup_budget_is_not_preempted_by_a_shorter_query_timer() -
     // Dolt uses the listener read timeout while executing a result iterator,
     // including bootstrap DDL. A valid query inside the configured startup
     // budget must not inherit an unrelated five-second server cancellation
-    // timer, so the statement sleeps past that timer. Keep the two equal.
+    // timer, so the statement sleeps past that timer; its SQL text is built
+    // from `SLEEP`.
     const SLEEP: Duration = Duration::from_secs(6);
-    const SLEEP_QUERY: &str = "SELECT SLEEP(6)";
+    let sleep_query = format!("SELECT SLEEP({})", SLEEP.as_secs());
     // The statement's own budget: the pool acquire ceiling (`QUERY_TIMEOUT`)
     // and then its deliberate sleep.
     let statement_within = test_budgets::QUERY_TIMEOUT.saturating_add(SLEEP);
     let started = Instant::now();
     let result = tokio::time::timeout(
         statement_within,
-        sqlx::query_scalar::<_, i64>(SLEEP_QUERY).fetch_one(pool.as_ref()),
+        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sleep_query)).fetch_one(pool.as_ref()),
     )
     .await;
     let elapsed = started.elapsed();

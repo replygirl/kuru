@@ -245,9 +245,17 @@ async fn cleanup_observation_error_keeps_actual_lifecycle_lease_until_child_exit
     tokio::time::timeout(Duration::from_secs(3), observation).await??;
     // The observer's next query of the child, not a window, shows it kept
     // the lease past the failure. Had it returned on the failure, the task
-    // would end without sending and this receive would fail.
+    // would end without sending and this receive would fail. That query is
+    // one 20 ms poll of `observe_dolt` after the failure. `observe_dolt`
+    // itself is unbounded by design (it keeps the lease until the child
+    // exits); it runs in the supervisor's stop path, which the parent's
+    // `finish_owner` allows `SUPERVISOR_REAP_ALLOWANCE` to report, so an
+    // observer that stopped polling fails within that instead of hanging.
+    let continued = tokio::time::timeout(SUPERVISOR_REAP_ALLOWANCE, continuation)
+        .await
+        .context("the observer stopped querying a live child after a query failure")?;
     assert!(
-        continuation.await.is_ok(),
+        continued.is_ok(),
         "query failure ended the observation of a live child"
     );
     // The child is still blocked on its release, so the observer still holds
