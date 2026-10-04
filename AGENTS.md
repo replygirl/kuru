@@ -169,6 +169,15 @@ explicit handle list protects each child, but an unrelated legacy spawn can stil
 inherit temporarily inheritable handles; Rust's private spawn lock cannot be
 coordinated by this library. Audit new process-launching dependencies and consumer
 call sites instead of claiming isolation across arbitrary spawn mechanisms.
+Owned Unix spawns create their stdio pipes close-on-exec and start the child
+under one platform spawn lock, so a concurrent owned child cannot inherit
+another's pipe ends (std's macOS pipes set close-on-exec in a second step).
+Unrelated legacy spawns and other non-atomic descriptor creation can still
+inherit, or leak into owned children; concurrent callers requiring isolation must
+use the platform consistently. On std's fork path a legacy spawn that inherits an
+owned spawn's exec-error pipe stalls it, and every later owned spawn including the
+cleanup snapshot, until the legacy child exits; the remedy is moving those legacy
+spawns behind the platform, not a timeout.
 
 Use current available dependency and tool releases, verify compatibility, and
 commit exact pins with the affected Cargo, npm and mise lockfiles. Pin workflow
