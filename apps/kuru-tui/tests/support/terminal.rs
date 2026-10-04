@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use kuru_memory::test_budgets::OPERATION_TIMEOUT;
 use nix::{
     sys::signal::{Signal, kill},
     unistd::Pid,
@@ -16,7 +17,31 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use rustix::process::{Pid as RustixPid, WaitId, WaitIdOptions, waitid};
 
 const TICK: Duration = Duration::from_millis(20);
-pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// The longest a due frame trails the event that makes it due: the idle
+/// ambient interval (250 ms, `View::advance_animation` in src/ui.rs; "capped
+/// at 4 FPS" in docs/interface.md) plus the idle animation wake (100 ms, the
+/// `Wake::Animation` arm of the UI loop). Input, completion and activity wakes
+/// mark the view dirty and draw on the next loop pass.
+pub const FRAME_ALLOWANCE: Duration = Duration::from_millis(250 + 100);
+/// Default bound for a frame or input wait. The PTY child opens memory on the
+/// managed Remote backend (src/cli.rs `open_memory`), so the frame after a
+/// memory command (`/memory-candidates`, compact, abandon, export, fork) or
+/// after the first-run notice record (`notice.record()` in the UI loop) waits
+/// on one Remote reply, bounded by the client's reply deadline
+/// `OPERATION_TIMEOUT` (kuru-memory src/service/rpc.rs:38, applied by
+/// `ReplyBudget::deadline` and `exchange_attached_with_id`). That reply is the
+/// longest product step a frame wait encloses, and its frame trails it by at
+/// most `FRAME_ALLOWANCE`. Every use is event-driven, so a passing run is
+/// unchanged and only a real hang takes longer to report. `startup_timeout`
+/// adds this bound, and trust.rs follows through this module.
+pub const READY_TIMEOUT: Duration = OPERATION_TIMEOUT.saturating_add(FRAME_ALLOWANCE);
+const _: () = assert!(READY_TIMEOUT.as_nanos() > OPERATION_TIMEOUT.as_nanos());
+/// kuru-connectors `IO_TIMEOUT` (60 s, `pub(crate)` at src/lib.rs:74): the
+/// per-request bound of `http::client()` (src/http.rs:9) and of the MCP host's
+/// shutdown join (`McpHosts::shutdown`, src/mcp.rs:1203). Documented in
+/// docs/protocols.md (model catalog requests "bounded to 60 seconds", MCP calls
+/// "bounded to 60 seconds"). Restated once here because it is not public.
+pub const IO_TIMEOUT: Duration = Duration::from_secs(60);
 type RestorationCheck = dyn Fn(&dyn MasterPty) -> Result<bool>;
 const OUTPUT_QUEUE: usize = 8;
 // Escaped PTY output shown whole in an unexpected-end report, and the bound on
@@ -599,7 +624,15 @@ impl Terminal {
         };
         // Process exit closes the final slave descriptor. Drain until the
         // reader observes that close so no queued final frame or large payload
-        // is lost merely because waitpid won the race.
+        // is lost merely because waitpid won the race. No product wait sits
+        // inside this drain: the kernel closes an exiting process's
+        // descriptors before its exit can be waited for, and no descendant of
+        // the child inherits the slave (the memory owner and the browser
+        // opener get null stdio, kuru-memory `spawn_service` and
+        // src/authentication.rs `open_browser`; tool shells, hooks and MCP
+        // stdio servers get pipes). EOF is therefore already due when the exit
+        // is seen, and this bound reports a leaked holder; it encloses no
+        // product budget to derive from.
         let drain_deadline = Instant::now() + Duration::from_secs(1);
         loop {
             match self.receive_output(TICK)? {

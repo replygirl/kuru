@@ -42,10 +42,36 @@ mod mcp_oauth_https;
 mod memory;
 #[path = "support/terminal.rs"]
 mod terminal;
+use kuru_memory::test_budgets::OPERATION_TIMEOUT;
 use mcp_oauth_https::HttpsMcpFixture;
-use terminal::{READY_TIMEOUT, Terminal, startup_timeout};
+use terminal::{FRAME_ALLOWANCE, IO_TIMEOUT, READY_TIMEOUT, Terminal, startup_timeout};
 
-const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound for a PTY child to exit after `/quit` (or after a fixture's own last
+/// step). `/quit` runs the runtime's `shutdown(true)` (src/ui.rs; kuru-runtime
+/// `Harness::shutdown` in src/engine.rs), on the managed Remote backend
+/// (src/cli.rs `open_memory`). Its sequential waits:
+/// - `reconcile()` before and after the actors stop, two calls, each one
+///   Remote `ViewOperation::Reconcile` (kuru-memory `MemoryStore::reconcile`,
+///   src/facade.rs) under the reply deadline `OPERATION_TIMEOUT`. With no
+///   candidate or uncertain write pending, the recovery steps around it
+///   (`reopen_after_checked_recovery`, `recover_candidate_begin` and
+///   `recover_candidate_unit`) return without a call;
+/// - no exit dream: `Sandbox::command` passes `--no-dream`, which sets
+///   `dream_on_exit = false` (kuru-core `apply_overrides`);
+/// - `tools.shutdown()`, whose MCP join is bounded by `IO_TIMEOUT`
+///   (kuru-connectors src/mcp.rs:1203) and dominates the concurrent shell
+///   cleanup (5 s, src/unix_shell.rs `CLEANUP_ALLOWANCE`) and hook quiesce
+///   (10 s, src/hooks.rs `QUIESCE`); four tests below configure MCP.
+///
+/// The CLI then calls `memory.close()`, which on Remote only drains the
+/// client's attachments (`RemoteSession::close`, kuru-memory src/facade.rs)
+/// and does not wait for the owner's retirement, so the owner's
+/// `close_budget()` is not on this path. The `/quit` keystroke and the
+/// closing frame add one `FRAME_ALLOWANCE`.
+const EXIT_TIMEOUT: Duration = OPERATION_TIMEOUT
+    .saturating_mul(2)
+    .saturating_add(IO_TIMEOUT)
+    .saturating_add(FRAME_ALLOWANCE);
 
 #[test]
 fn real_pty_file_checkpoint_inspect_and_selected_undo() -> Result<()> {
