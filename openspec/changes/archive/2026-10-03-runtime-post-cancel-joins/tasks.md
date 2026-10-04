@@ -37,4 +37,5 @@
   - The same set at the base commit 48d8aca9, without this change, passed 85 of 85 runs (20 through mise, then 65 as direct binary runs, 20 of them interleaved with this change's binary, which passed all 20).
   - Inference, not established: the failure is in #201's reap observation, not in the join this change touches. The hook test's join, its wait condition and its timing are unchanged; only `DreamWatch`'s internals moved. Even so, 2 of 44 against 0 of 85 is not conclusive in either direction.
   - Local runs do not reproduce the loaded CI runner.
-- [ ] 4.2 Validate with `mise run cospec -- validate runtime-post-cancel-joins --strict`, apply gate clear, and archive before the final commit
+- [x] 4.2 Validate with `mise run cospec -- validate runtime-post-cancel-joins --strict`, apply gate clear, and archive before the final commit
+  Evidence: `validate runtime-post-cancel-joins --strict` exited 0 with 0 errors and 0 warnings. `apply runtime-post-cancel-joins --json` exited 0 with gate state `clear`, no hard blockers and 6 of 7 tasks complete before this tick. The archive follows in the final branch commit.
