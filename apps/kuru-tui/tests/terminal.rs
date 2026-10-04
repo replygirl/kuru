@@ -2618,7 +2618,9 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
     }
     if expect_notice {
         std::fs::create_dir(&holds)?;
-        std::fs::write(&hold, b"")?;
+        // The marker carries the budget of the wait that ends in its removal,
+        // the creating-sentence wait below (kuru-memory `OPEN_HOLD_DIR_ENV`).
+        std::fs::write(&hold, sandbox.startup_timeout.as_millis().to_string())?;
         command.env(kuru_memory::test_support::OPEN_HOLD_DIR_ENV, &holds);
     } else {
         // A reopen that landed while the previous owner still closed would
@@ -2920,7 +2922,9 @@ fn real_pty_first_launch_shows_the_creating_sentence_while_the_template_builds()
     let holds = sandbox.root.path().join("holds");
     let hold = holds.join("CreatingDatabase.hold");
     std::fs::create_dir(&holds)?;
-    std::fs::write(&hold, b"")?;
+    // The marker carries the budget of the wait that ends in its removal, the
+    // creating-sentence wait below (kuru-memory `OPEN_HOLD_DIR_ENV`).
+    std::fs::write(&hold, sandbox.startup_timeout.as_millis().to_string())?;
     let mut command = sandbox.command("demo");
     command.env(kuru_memory::test_support::OPEN_HOLD_DIR_ENV, &holds);
     let mut terminal = Terminal::spawn(command, 35, 120)?;

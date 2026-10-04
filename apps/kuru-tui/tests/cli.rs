@@ -3592,8 +3592,15 @@ fn cli_new_project_shows_engine_preparation_then_creation_and_keeps_json_on_stdo
     std::fs::create_dir(&holds).unwrap();
     let extracting = holds.join("ExtractingEmbeddedRuntime.hold");
     let creating = holds.join("CreatingDatabase.hold");
-    std::fs::write(&extracting, b"").unwrap();
-    std::fs::write(&creating, b"").unwrap();
+    // Each marker carries the budget of the wait that ends in its removal
+    // (kuru-memory `OPEN_HOLD_DIR_ENV`): the `until` before it, which starts
+    // its own `WAIT` before the owner can reach the stage it holds. The
+    // extracting wait starts at spawn; the creating one when the extracting
+    // marker goes, with the extraction and the stages after it still ahead
+    // of the owner.
+    let budget = Streaming::WAIT.as_millis().to_string();
+    std::fs::write(&extracting, &budget).unwrap();
+    std::fs::write(&creating, &budget).unwrap();
 
     let mut run = Streaming::spawn(env.command().env(OPEN_HOLD_DIR_ENV, &holds).args([
         "run",
