@@ -784,8 +784,16 @@ explicit forwarding), let tests follow events instead of sleeping:
 `KURU_TEST_MEMORY_ACTIVITY_WRITE_FAILURE=1` makes every record write fail, and
 `KURU_TEST_MEMORY_OPEN_HOLD_DIR=<dir>` holds the owner's open at stage `X`
 while `<dir>/X.hold` exists, once a record holding `X` has been written, until
-that file is removed. Tests set them on the command-line child, never on the
-runner's own environment (`test_support::{WRITE_FAILURE_ENV,
+that file is removed. The file's content, read once when the stage begins,
+bounds the hold: the holding test's observation budget for that stage, as
+ASCII decimal milliseconds with optional surrounding whitespace. The budget is
+at least the longest wait that ends in the file's removal, derived at the test
+from the product budgets that wait encloses, never a literal; a test holding
+two stages writes each marker's own budget. An empty file keeps the bound
+`memory.startup_timeout_secs`, and any other content fails the hold, which the
+owner logs before its open proceeds. Tests write each marker, with its content,
+before spawning the owner, set the hooks on the command-line child, never on
+the runner's own environment (`test_support::{WRITE_FAILURE_ENV,
 OPEN_HOLD_DIR_ENV}`), and remove a hold once the sentence for that stage is
 visible. `test_support::hold_owner_lock` takes a project's owner lock, so a
 child that elects an owner finds it busy and shows the waiting sentence until

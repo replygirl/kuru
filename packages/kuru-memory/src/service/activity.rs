@@ -65,6 +65,15 @@ pub const WRITE_FAILURE_ENV: &str = "KURU_TEST_MEMORY_ACTIVITY_WRITE_FAILURE";
 /// Test-support hook: names a directory. When an owner's open begins stage
 /// `X` and `<dir>/X.hold` exists, the owner waits until a record holding `X`
 /// was written, then stops advancing its open until that file is removed.
+///
+/// The file's content, read once when the stage begins, bounds both waits:
+/// the holding test's observation budget for the stage, as ASCII decimal
+/// milliseconds with optional surrounding whitespace. That budget is at
+/// least the longest wait that ends in the file's removal, derived at the
+/// test from the product budgets that wait encloses, never a literal. An
+/// empty file keeps the bound `memory.startup_timeout_secs`. Any other
+/// content fails the hold, which the owner logs before its open proceeds.
+/// Write the file, with its content, before spawning the owner.
 #[cfg(any(test, feature = "test-support"))]
 pub const OPEN_HOLD_DIR_ENV: &str = "KURU_TEST_MEMORY_OPEN_HOLD_DIR";
 
@@ -889,7 +898,40 @@ async fn hold(
     if marker.is_none() && barrier.is_none() {
         return Ok(());
     }
-    let deadline = tokio::time::Instant::now() + limit;
+    let start = tokio::time::Instant::now();
+    let mut deadline = start + limit;
+    // The marker's content, read once at the stage's start, is its holder's
+    // observation budget in place of `limit`; empty content supplies none.
+    if let Some(marker) = &marker {
+        match std::fs::read_to_string(marker) {
+            Ok(text) if !text.trim_ascii().is_empty() => {
+                let text = text.trim_ascii();
+                ensure!(
+                    text.bytes().all(|byte| byte.is_ascii_digit()),
+                    "open hold marker {} holds content other than decimal milliseconds",
+                    marker.display()
+                );
+                deadline = text
+                    .parse()
+                    .ok()
+                    .and_then(|millis| start.checked_add(Duration::from_millis(millis)))
+                    .with_context(|| {
+                        format!(
+                            "the budget in open hold marker {} overflows the clock",
+                            marker.display()
+                        )
+                    })?;
+            }
+            Ok(_) => {}
+            // Removed since it was found: the wait below finds it released.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("open hold marker {} could not be read", marker.display())
+                });
+            }
+        }
+    }
     if !hooks.writes.fail {
         let published = feed.stages.len();
         tokio::time::timeout_at(
@@ -1503,6 +1545,87 @@ mod tests {
         publisher.join().await?;
         ticks.advance();
         ensure!(log.borrow().len() == 1, "{:?}", log.borrow());
+        Ok(())
+    }
+
+    /// A test-support hold lasts for the budget its marker carries, the
+    /// holding test's own, not the owner's startup timeout, and ends when
+    /// the marker is removed; an empty marker keeps the startup timeout.
+    /// Paused time elapses every window; no engine or process runs.
+    #[tokio::test(start_paused = true)]
+    async fn an_open_hold_lasts_for_its_markers_budget_not_the_startup_timeout() -> Result<()> {
+        let (mut feed, _ticks, log, root) = logged_feed(Vec::new())?;
+        let hooks = OwnerHooks {
+            hold_dir: Some(root.path().to_owned()),
+            ..OwnerHooks::default()
+        };
+        // Stands in for a small `startup_timeout_secs`.
+        let limit = Duration::from_secs(1);
+        let budget = 60 * limit;
+        let marker = root.path().join("CreatingDatabase.hold");
+        ensure!(feed.push(CreatingDatabase));
+
+        // A budget above the limit holds past it, until the marker goes.
+        std::fs::write(&marker, format!("{}\n", budget.as_millis()))?;
+        let start = tokio::time::Instant::now();
+        let mut held = Box::pin(hold(&hooks, CreatingDatabase, &feed, limit));
+        if let Ok(ended) = tokio::time::timeout(2 * limit, held.as_mut()).await {
+            let ended = ended.map_or_else(|error| format!("{error:#}"), |()| "released".into());
+            bail!("the hold ended within the {limit:?} startup limit: {ended}");
+        }
+        ensure!(log.borrow().len() == 1, "{:?}", log.borrow());
+        std::fs::remove_file(&marker)?;
+        held.await?;
+        let released = start.elapsed();
+        ensure!(
+            released > 2 * limit && released < budget,
+            "the hold was released at {released:?}"
+        );
+
+        // Content that is not a budget fails at once, naming the marker and
+        // the content's class; it never falls back to the limit.
+        let beyond = "9".repeat(30);
+        for (content, class) in [
+            ("soon", "other than decimal milliseconds"),
+            ("+60000", "other than decimal milliseconds"),
+            ("60s", "other than decimal milliseconds"),
+            (beyond.as_str(), "overflows the clock"),
+        ] {
+            std::fs::write(&marker, content)?;
+            let start = tokio::time::Instant::now();
+            let text = format!(
+                "{:#}",
+                hold(&hooks, CreatingDatabase, &feed, limit)
+                    .await
+                    .err()
+                    .with_context(|| format!("a marker holding {content:?} held"))?
+            );
+            ensure!(
+                text.contains("CreatingDatabase.hold")
+                    && text.contains(class)
+                    && start.elapsed().is_zero(),
+                "{content:?}: {text}"
+            );
+        }
+
+        // An empty marker keeps the limit: the hold expires while it exists.
+        std::fs::write(&marker, b"")?;
+        let start = tokio::time::Instant::now();
+        let text = format!(
+            "{:#}",
+            hold(&hooks, CreatingDatabase, &feed, limit)
+                .await
+                .err()
+                .context("an empty marker held past its limit")?
+        );
+        let expired = start.elapsed();
+        ensure!(
+            text.contains("open hold on CreatingDatabase was not released")
+                && expired >= limit
+                && expired < 2 * limit
+                && marker.exists(),
+            "expired at {expired:?}: {text}"
+        );
         Ok(())
     }
 
