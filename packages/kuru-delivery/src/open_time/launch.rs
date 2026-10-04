@@ -89,6 +89,22 @@ async fn drain(stream: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
     }
 }
 
+/// Read both pipes to EOF alongside the child's wait, then stamp the exit. The
+/// exit is stamped only after the drain, so every line stamped by [`lines`]
+/// precedes it by construction; a child reaped before the reader consumed its
+/// last lines cannot yield an exit earlier than those lines.
+#[cfg(unix)]
+async fn until_drained<W>(
+    stderr: impl AsyncRead + Unpin,
+    stdout: impl AsyncRead + Unpin,
+    wait: impl std::future::Future<Output = W>,
+    epoch: Instant,
+    kept: &Mutex<Vec<Line>>,
+) -> (std::io::Result<()>, std::io::Result<Vec<u8>>, W, f64) {
+    let (read, stdout, status) = tokio::join!(lines(stderr, epoch, kept), drain(stdout), wait);
+    (read, stdout, status, millis(epoch.elapsed()))
+}
+
 /// Run to completion within `bound`. Past the bound the command's own tree is
 /// terminated through its retained child handle and the run is marked
 /// `timed_out`; the memory services it started are left to retire.
@@ -112,15 +128,13 @@ pub async fn run(launch: &Launch, epoch: Instant, bound: Duration) -> Result<Fin
     let stdout = child.stdout.take().context("missing stdout pipe")?;
     let stderr = child.stderr.take().context("missing stderr pipe")?;
     let kept = Mutex::new(Vec::new());
-    let completed = tokio::time::timeout(bound, async {
-        tokio::join!(lines(stderr, epoch, &kept), drain(stdout), async {
-            let status = child.wait().await;
-            (status, millis(epoch.elapsed()))
-        })
-    })
+    let completed = tokio::time::timeout(
+        bound,
+        until_drained(stderr, stdout, child.wait(), epoch, &kept),
+    )
     .await;
     match completed {
-        Ok((read, stdout, (status, exit_ms))) => {
+        Ok((read, stdout, status, exit_ms)) => {
             let status = status.context("wait for the measured command")?;
             read.context("read stderr")?;
             Ok(Finished {
@@ -204,5 +218,40 @@ pub async fn run(launch: &Launch, epoch: Instant, bound: Duration) -> Result<Fin
                 ..Finished::default()
             })
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+
+    /// The child is reaped at once while its last stderr line reaches the
+    /// reader later: the exit must still be stamped at or after that line.
+    #[tokio::test]
+    async fn the_exit_is_stamped_after_the_last_line_is_read() {
+        let (mut writer, stderr) = tokio::io::duplex(64);
+        let (closed, stdout) = tokio::io::duplex(64);
+        drop(closed);
+        let late = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            writer.write_all(b"kuru-open-marker v1 ready\n").await
+        });
+        let epoch = Instant::now();
+        let kept = Mutex::new(Vec::new());
+        let (read, stdout, status, exit_ms) =
+            until_drained(stderr, stdout, std::future::ready(7), epoch, &kept).await;
+        late.await.unwrap().unwrap();
+        read.unwrap();
+        assert!(stdout.unwrap().is_empty());
+        assert_eq!(status, 7);
+        let lines = taken(kept);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].t_ms >= 50.0 && lines[0].t_ms <= exit_ms,
+            "line {} exit {exit_ms}",
+            lines[0].t_ms
+        );
     }
 }
