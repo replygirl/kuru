@@ -7,13 +7,17 @@
 //! whole gap bound, which a fixture derives from the stated budgets of the
 //! steps between its progress signals ([`dream_gap_bound`]).
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use kuru_core::HookCommand;
+use kuru_connectors::HookHost;
+use kuru_core::{HookCommand, HookEvent};
 use tokio::{
+    sync::broadcast,
     task::{JoinError, JoinHandle},
     time::Instant,
 };
+
+use crate::{Event, step_timings::StepTimings};
 
 /// How often the condition and progress are re-read. Cadence only: it never
 /// decides an outcome.
@@ -83,6 +87,182 @@ pub(crate) fn dream_gap_bound(hook: &HookCommand, quiesce: Duration) -> Duration
     let memory = crate::tests::turn_admission_deadline();
     let hook = Duration::from_millis(hook.timeout_ms).saturating_add(quiesce);
     memory.max(hook)
+}
+
+/// The longest silence a fixture without lifecycle hooks accepts between
+/// progress signals while its task settles: one memory operation's stated
+/// budget, [`crate::tests::turn_admission_deadline`], the memory startup
+/// budget from which the Dolt listener derives its statement read timeout.
+///
+/// That statement bound equals this gap rather than lying below it, as for the
+/// memory term of [`dream_gap_bound`]: a statement that exhausts it fails the
+/// fixture either way, and only the diagnostic differs. The gap is strictly
+/// greater than the hook host's quiesce bound, so an enclosed quiesce with no
+/// worker in flight stays inside it. Fails when the host has hooks
+/// configured; such a fixture derives its bound with [`dream_gap_bound`].
+pub(crate) fn unhooked_gap_bound(hooks: &HookHost) -> Duration {
+    let configured = [
+        HookEvent::PreTurn,
+        HookEvent::PostTurn,
+        HookEvent::PreTool,
+        HookEvent::PostTool,
+        HookEvent::SpeakerSelected,
+    ]
+    .into_iter()
+    .filter(|event| hooks.configured(*event))
+    .map(HookEvent::label)
+    .collect::<Vec<_>>();
+    assert!(
+        configured.is_empty(),
+        "fixture configures {configured:?} hooks; derive its gap with dream_gap_bound"
+    );
+    crate::tests::turn_admission_deadline()
+}
+
+/// What a fixture can observe of a task that owns its moved harness: step
+/// marks, harness events and the hook host's in-flight workers are its
+/// progress; the rendered steps and events are failure context.
+pub(crate) struct TaskWatch {
+    pub(crate) timings: StepTimings,
+    events: broadcast::Receiver<Event>,
+    seen: Vec<String>,
+    pub(crate) hooks: Arc<HookHost>,
+}
+
+impl TaskWatch {
+    pub(crate) fn new(
+        timings: StepTimings,
+        events: broadcast::Receiver<Event>,
+        hooks: Arc<HookHost>,
+    ) -> Self {
+        Self {
+            timings,
+            events,
+            seen: vec![],
+            hooks,
+        }
+    }
+
+    /// Install a recording step timer on `harness` before it moves into its
+    /// task, and watch its events and hook workers.
+    pub(crate) fn attach(harness: &mut crate::Harness) -> Self {
+        let timings = StepTimings::recording();
+        harness.step_timings = timings.clone();
+        Self::new(timings, harness.subscribe(), harness.hook_host())
+    }
+
+    pub(crate) fn progress(&mut self) -> (usize, usize, usize) {
+        use tokio::sync::broadcast::error::TryRecvError;
+        loop {
+            match self.events.try_recv() {
+                Ok(event) => self
+                    .seen
+                    .push(format!("{event:?}").chars().take(240).collect()),
+                Err(TryRecvError::Lagged(skipped)) => {
+                    self.seen.push(format!("({skipped} events skipped)"));
+                }
+                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+            }
+        }
+        (
+            self.timings.completed(),
+            self.seen.len(),
+            self.hooks.in_flight_hooks(),
+        )
+    }
+
+    /// Step timings, in-flight hook workers and every observed event.
+    pub(crate) fn report(&mut self) -> String {
+        self.progress();
+        let events = if self.seen.is_empty() {
+            "(none)".into()
+        } else {
+            self.seen.join("\n  ")
+        };
+        format!(
+            "steps (time since the test created its recorder):\n{}\n\
+             in-flight hook workers: {}\nevents observed:\n  {events}",
+            self.timings.render(),
+            self.hooks.in_flight_hooks(),
+        )
+    }
+}
+
+/// `Ok` or the error and whether it was a cancellation, for a joined task's
+/// failure report.
+pub(crate) fn describe_result<T>(result: &anyhow::Result<T>) -> String {
+    match result {
+        Ok(_) => "Ok".into(),
+        Err(error) => format!(
+            "Err({error:#}); cancelled: {}",
+            crate::turn_was_cancelled(error)
+        ),
+    }
+}
+
+/// Join a task the fixture no longer drives (after cancelling it, or after
+/// releasing its last pause) on the event of it finishing. Every observed
+/// progress signal re-arms `gap`; panics with the [`try_join_on_progress`]
+/// report when the task panics or stays silent for one whole gap.
+pub(crate) async fn join_on_progress<T>(
+    task: &mut JoinHandle<T>,
+    watch: &mut TaskWatch,
+    gap: Duration,
+    what: &str,
+    show: impl FnOnce(T) -> String,
+) -> T {
+    match try_join_on_progress(task, watch, gap, what, show).await {
+        Ok(output) => output,
+        Err(report) => panic!("{report}"),
+    }
+}
+
+/// [`join_on_progress`] without the panic. On a stall the report is read
+/// before anything else happens, names the last completed step, and then the
+/// task is awaited once more under the same gap and aborted if it still has
+/// not finished, so the report separates a slow finish from a hang.
+pub(crate) async fn try_join_on_progress<T>(
+    task: &mut JoinHandle<T>,
+    watch: &mut TaskWatch,
+    gap: Duration,
+    what: &str,
+    show: impl FnOnce(T) -> String,
+) -> Result<T, String> {
+    match until_event(task, || false, || watch.progress(), gap).await {
+        Waited::Finished(Ok(output)) => Ok(output),
+        Waited::Finished(Err(error)) => Err(format!(
+            "the {what} task panicked or was aborted: {error}\n{}",
+            watch.report()
+        )),
+        Waited::Reached => unreachable!("a join waits for no condition"),
+        Waited::Stalled { progress_changes } => {
+            let last = watch.timings.last();
+            let report = watch.report();
+            Err(format!(
+                "the {what} made no observable progress for {gap:?} while settling \
+                 ({progress_changes} progress changes seen during the join); \
+                 last completed step: {last}\n{report}\nafter the stall, {}",
+                settle(task, gap, show).await
+            ))
+        }
+    }
+}
+
+/// Await a task that has already been reported once more under `gap`,
+/// aborting it if it still does not finish.
+pub(crate) async fn settle<T>(
+    task: &mut JoinHandle<T>,
+    gap: Duration,
+    show: impl FnOnce(T) -> String,
+) -> String {
+    match tokio::time::timeout(gap, &mut *task).await {
+        Ok(Ok(output)) => format!("it finished: {}", show(output)),
+        Ok(Err(error)) => format!("it panicked or was aborted: {error}"),
+        Err(_) => {
+            task.abort();
+            format!("it did not finish within a further {gap:?}; it was aborted")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +368,153 @@ mod tests {
         let waited = until_event(&mut task, exists(&marker), || 0, gap()).await;
         assert!(matches!(waited, Waited::Finished(Ok(7))));
         assert!(started.elapsed() < gap());
+    }
+
+    fn hook_host(root: &Path, hooks: kuru_core::LifecycleHooks) -> Arc<HookHost> {
+        use kuru_platform::fs::{Directory, NameRetention, Privacy};
+        let directory =
+            Arc::new(Directory::open(root, Privacy::Inherited, NameRetention::Pinned).unwrap());
+        Arc::new(HookHost::new(directory, hooks))
+    }
+
+    /// A watch with no harness: its own recorder, an event channel whose
+    /// sender the caller keeps, and a hook host with nothing configured.
+    fn detached_watch(root: &Path) -> (TaskWatch, broadcast::Sender<Event>) {
+        let (events, receiver) = broadcast::channel(16);
+        let hooks = hook_host(root, kuru_core::LifecycleHooks::default());
+        (
+            TaskWatch::new(StepTimings::recording(), receiver, hooks),
+            events,
+        )
+    }
+
+    /// A cancelled task's teardown: mark `steps` steps `interval` apart, then
+    /// finish with `7`.
+    fn tearing_down(timings: StepTimings, steps: usize, interval: Duration) -> JoinHandle<u8> {
+        tokio::spawn(async move {
+            for step in 0..steps {
+                tokio::time::sleep(interval).await;
+                timings.mark(format!("teardown step {step}"));
+            }
+            7
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_teardown_progressing_beyond_a_flat_ten_seconds_is_joined() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut watch, _events) = detached_watch(directory.path());
+        let gap = unhooked_gap_bound(&watch.hooks);
+        let interval = gap * 2 / 3;
+        assert!(interval * 3 > Duration::from_secs(10));
+        // The old shape: one flat 10 s join fails a teardown that never
+        // stops progressing.
+        let mut old = tearing_down(StepTimings::recording(), 3, interval);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), &mut old)
+                .await
+                .is_err()
+        );
+        old.abort();
+        // The progress-aware join ends on the task finishing.
+        let started = Instant::now();
+        let mut task = tearing_down(watch.timings.clone(), 3, interval);
+        let joined =
+            try_join_on_progress(&mut task, &mut watch, gap, "teardown", |n| n.to_string()).await;
+        assert_eq!(joined, Ok(7));
+        assert!(started.elapsed() >= interval * 3);
+        assert_eq!(watch.timings.completed(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_teardown_is_reported_with_its_last_step_and_aborted() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut watch, events) = detached_watch(directory.path());
+        let gap = unhooked_gap_bound(&watch.hooks);
+        let mut task = tokio::spawn({
+            let timings = watch.timings.clone();
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                timings.mark("teardown step before the silence");
+                let _ = events.send(Event::Error {
+                    actor: "pool".into(),
+                    detail: "observed teardown event".into(),
+                });
+                std::future::pending::<u8>().await
+            }
+        });
+        let started = Instant::now();
+        let report =
+            try_join_on_progress(&mut task, &mut watch, gap, "teardown", |n| n.to_string())
+                .await
+                .unwrap_err();
+        assert!(
+            report.contains(&format!("no observable progress for {gap:?}")),
+            "{report}"
+        );
+        // One step mark and one event, observed in the same poll.
+        assert!(report.contains("(1 progress changes seen"), "{report}");
+        assert!(
+            report.contains("last completed step: teardown step before the silence at +"),
+            "{report}"
+        );
+        assert!(report.contains("in-flight hook workers: 0"), "{report}");
+        assert!(report.contains("observed teardown event"), "{report}");
+        assert!(report.contains("it was aborted"), "{report}");
+        // Silence is measured from the last progress, then the task gets one
+        // more gap before it is aborted.
+        assert!(started.elapsed() >= Duration::from_secs(1) + gap * 2);
+        assert!((&mut task).await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn panicking_teardown_is_reported_without_waiting_a_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut watch, _events) = detached_watch(directory.path());
+        let gap = unhooked_gap_bound(&watch.hooks);
+        let mut task = tokio::spawn(async { panic!("teardown failed") });
+        let started = Instant::now();
+        let report =
+            try_join_on_progress(&mut task, &mut watch, gap, "teardown", |()| String::new())
+                .await
+                .unwrap_err();
+        assert!(
+            report.contains("the teardown task panicked or was aborted"),
+            "{report}"
+        );
+        assert!(started.elapsed() < gap);
+    }
+
+    #[test]
+    fn unhooked_gap_bound_is_the_memory_budget_strictly_above_quiesce() {
+        let directory = tempfile::tempdir().unwrap();
+        let hooks = hook_host(directory.path(), kuru_core::LifecycleHooks::default());
+        let gap = unhooked_gap_bound(&hooks);
+        assert_eq!(gap, crate::tests::turn_admission_deadline());
+        assert!(gap > hooks.quiesce_bound());
+    }
+
+    #[test]
+    #[should_panic(expected = "derive its gap with dream_gap_bound")]
+    fn unhooked_gap_bound_refuses_a_fixture_with_hooks() {
+        let directory = tempfile::tempdir().unwrap();
+        let hooks = kuru_core::LifecycleHooks {
+            post_tool: vec![HookCommand {
+                command: "hook".into(),
+                args: vec![],
+                timeout_ms: 1,
+                max_output_bytes: 1,
+            }],
+            ..kuru_core::LifecycleHooks::default()
+        };
+        unhooked_gap_bound(&hook_host(directory.path(), hooks));
+    }
+
+    #[test]
+    fn describe_result_names_a_cancellation() {
+        assert_eq!(describe_result(&anyhow::Ok(())), "Ok");
+        let failed = describe_result::<()>(&Err(anyhow::anyhow!("plain failure")));
+        assert_eq!(failed, "Err(plain failure); cancelled: false");
     }
 
     #[test]

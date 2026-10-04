@@ -1752,20 +1752,24 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
     let timings = crate::step_timings::StepTimings::recording();
     harness.step_timings = timings.clone();
     let mut watch = DreamWatch {
-        timings,
-        events: harness.subscribe(),
-        seen: vec![],
-        hooks: harness.hook_host(),
+        task: crate::progress_wait::TaskWatch::new(
+            timings,
+            harness.subscribe(),
+            harness.hook_host(),
+        ),
         memory,
         files: vec![marker.clone(), survived.clone()],
     };
     // Each wait ends on its event; only one silent gap longer than the
     // fixture's stated step budget fails it. The bound also encloses the
     // product's own quiesce wait, which the cancelled join runs.
-    let gap = crate::progress_wait::dream_gap_bound(&hook, watch.hooks.quiesce_bound());
-    assert!(gap > watch.hooks.quiesce_bound());
+    let gap = crate::progress_wait::dream_gap_bound(&hook, watch.task.hooks.quiesce_bound());
+    assert!(gap > watch.task.hooks.quiesce_bound());
     let cancellation = CancellationToken::new();
-    watch.timings.mark("setup finished; dream task spawning");
+    watch
+        .task
+        .timings
+        .mark("setup finished; dream task spawning");
     let mut running = tokio::spawn({
         let cancellation = cancellation.clone();
         async move {
@@ -1798,7 +1802,7 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
             )
         }
     }
-    watch.timings.mark("second hook started; cancelling");
+    watch.task.timings.mark("second hook started; cancelling");
     cancellation.cancel();
     let joined =
         crate::progress_wait::until_event(&mut running, || false, || watch.progress(), gap).await;
@@ -1854,43 +1858,24 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
 type DreamJoin = (Harness, Result<crate::DreamReport>);
 
 /// What the cancelled-dream fixture can observe of its running dream without
-/// touching the moved harness: step-timing marks, harness events and the hook
-/// host's in-flight workers are its progress; the rest is failure context.
+/// touching the moved harness: the shared task watch's step-timing marks,
+/// harness events and in-flight hook workers are its progress; the files and
+/// candidate inventory are added failure context.
 struct DreamWatch {
-    timings: crate::step_timings::StepTimings,
-    events: tokio::sync::broadcast::Receiver<crate::Event>,
-    seen: Vec<String>,
-    hooks: Arc<kuru_connectors::HookHost>,
+    task: crate::progress_wait::TaskWatch,
     memory: MemoryStore,
     files: Vec<std::path::PathBuf>,
 }
 
 impl DreamWatch {
     fn progress(&mut self) -> (usize, usize, usize) {
-        use tokio::sync::broadcast::error::TryRecvError;
-        loop {
-            match self.events.try_recv() {
-                Ok(event) => self
-                    .seen
-                    .push(format!("{event:?}").chars().take(240).collect()),
-                Err(TryRecvError::Lagged(skipped)) => {
-                    self.seen.push(format!("({skipped} events skipped)"));
-                }
-                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
-            }
-        }
-        (
-            self.timings.completed(),
-            self.seen.len(),
-            self.hooks.in_flight_hooks(),
-        )
+        self.task.progress()
     }
 
     /// Read before anything cancels the dream. The candidate inventory is a
     /// memory query, so it gets the same step budget and may be unavailable.
     async fn report(&mut self, gap: std::time::Duration) -> String {
-        self.progress();
-        let steps = self.timings.render();
+        let task = self.task.report();
         let files = self
             .files
             .iter()
@@ -1903,13 +1888,7 @@ impl DreamWatch {
                 Ok(Err(error)) => format!("unavailable: {error:#}"),
                 Err(_) => format!("unavailable: no reply within {gap:?}"),
             };
-        format!(
-            "steps (time since the test created its recorder):\n{steps}\n\
-             in-flight hook workers: {}\nfiles:\n{files}\ncandidates: {candidates}\n\
-             events observed:\n  {}",
-            self.hooks.in_flight_hooks(),
-            self.seen.join("\n  ")
-        )
+        format!("{task}\nfiles:\n{files}\ncandidates: {candidates}")
     }
 }
 
