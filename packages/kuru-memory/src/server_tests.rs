@@ -1129,6 +1129,24 @@ async fn authenticated_foreign_dolt_on_selected_port_retries_without_touching_it
 /// mismatch in the error, publishing no Ready response or endpoint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistent_foreign_dolt_fails_closed_with_the_mismatch() -> Result<()> {
+    persistent_foreign_dolt_case(None).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_foreign_dolt_retains_the_mismatch_when_a_later_probe_times_out() -> Result<()> {
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    persistent_foreign_dolt_case(Some(bootstrap_fault::Fault::RepeatedForeignProbe(
+        entered.clone(),
+    )))
+    .await?;
+    ensure!(
+        entered.load(std::sync::atomic::Ordering::SeqCst),
+        "the probe never stalled after a confirmed foreign mismatch"
+    );
+    Ok(())
+}
+
+async fn persistent_foreign_dolt_case(fault: Option<bootstrap_fault::Fault>) -> Result<()> {
     let root = fixture()?;
     let dolt = actual_dolt_for_collision().await?;
     // Never binds and never exits on its own: only the foreign server answers.
@@ -1149,43 +1167,122 @@ async fn persistent_foreign_dolt_fails_closed_with_the_mismatch() -> Result<()> 
     let result = {
         // Held across the real Dolt and stand-in spawns; see `crate::spawn_gate`.
         let _gate = crate::spawn_gate::spawning().await;
-        supervise_with_port_hook(request, &mut input, &mut output, |port| {
+        let supervise = supervise_with_port_hook(request, &mut input, &mut output, |port| {
             attempts += 1;
             let started =
                 foreign_on_selected_port(&dolt, &hook_directory, &foreign_directory, port)?;
             *observed.lock().unwrap() = Some(started);
             Ok(())
-        })
-        .await
+        });
+        match fault {
+            Some(fault) => bootstrap_fault::FAULT.scope(fault, supervise).await,
+            None => supervise.await,
+        }
     };
     let foreign = foreign
         .lock()
         .unwrap()
         .take()
         .context("the foreign Dolt was never started")?;
-    let error = match result {
-        Ok(()) => bail!("the supervisor became ready on a foreign server"),
-        Err(error) => format!("{error:#}"),
-    };
-    assert_eq!(attempts, 1);
-    assert!(
-        error.contains("authenticated Dolt startup deadline exceeded")
-            && error.contains("Dolt bootstrap data directory mismatch"),
-        "{error}"
-    );
-    assert!(
-        output.is_empty(),
-        "a foreign server's start published Ready"
-    );
-    assert!(!directory.join("endpoint.json").exists());
-    let identity = load_identity(&directory, "project/selected-port-collision")?
-        .context("the supervisor's identity is missing")?;
-    assert!(
-        !identity.initialized,
-        "a foreign server initialized this store"
-    );
-    foreign.assert_untouched().await?;
-    foreign.stop().await
+    let assertions = async {
+        let error = match result {
+            Ok(()) => bail!("the supervisor became ready on a foreign server"),
+            Err(error) => format!("{error:#}"),
+        };
+        ensure!(attempts == 1, "expected one attempt, observed {attempts}");
+        ensure!(
+            error.contains("authenticated Dolt startup deadline exceeded")
+                && error.contains("Dolt bootstrap data directory mismatch"),
+            "{error}"
+        );
+        ensure!(
+            output.is_empty(),
+            "a foreign server's start published Ready"
+        );
+        ensure!(
+            !directory.join("endpoint.json").exists(),
+            "an endpoint was published"
+        );
+        let identity = load_identity(&directory, "project/selected-port-collision")?
+            .context("the supervisor's identity is missing")?;
+        ensure!(
+            !identity.initialized,
+            "a foreign server initialized this store"
+        );
+        foreign.assert_untouched().await
+    }
+    .await;
+    let stopped = foreign.stop().await;
+    assertions?;
+    stopped
+}
+
+#[tokio::test]
+async fn an_own_server_bootstrap_timeout_clears_a_prior_foreign_mismatch() -> Result<()> {
+    let root = fixture()?;
+    let dolt = actual_dolt_for_collision().await?;
+    let directory = fs::canonicalize(root.path())?.join("own-memory");
+    let mut identity = identity();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    let _gate = crate::spawn_gate::spawning().await;
+    let own = ForeignDolt::start(&dolt, &directory, port, identity.password.clone()).await?;
+    let assertions = async {
+        let pool = own.connect().await?;
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut prior = Some(anyhow::Error::new(ForeignDataDirectory));
+        // The real directory query gets the configured product startup budget.
+        // The injected stall pauses time only once that query has succeeded.
+        let startup = Duration::from_secs(kuru_core::MemoryConfig::default().startup_timeout_secs);
+        let result = bootstrap_fault::FAULT
+            .scope(
+                bootstrap_fault::Fault::ProjectCreate(entered.clone()),
+                bootstrap_database(
+                    &pool,
+                    &directory,
+                    &mut identity,
+                    Instant::now() + startup,
+                    &mut prior,
+                ),
+            )
+            .await;
+        if entered.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::resume();
+        }
+        pool.close().await;
+        ensure!(
+            entered.load(std::sync::atomic::Ordering::SeqCst),
+            "the own-server bootstrap did not reach project creation"
+        );
+        ensure!(
+            prior.is_none(),
+            "the confirmed own directory retained stale foreign evidence"
+        );
+        let error = match result {
+            Err(error) => format!("{error:#}"),
+            Ok(_) => bail!("the stalled own-server bootstrap unexpectedly succeeded"),
+        };
+        ensure!(
+            error.contains(
+                "Dolt database bootstrap deadline exceeded while creating the project database"
+            ),
+            "{error}"
+        );
+        ensure!(
+            !error.contains("Dolt bootstrap data directory mismatch"),
+            "{error}"
+        );
+        ensure!(
+            !identity.initialized,
+            "the stalled bootstrap initialized the identity"
+        );
+        own.assert_untouched().await
+    }
+    .await;
+    let stopped = own.stop().await;
+    assertions?;
+    stopped
 }
 
 // A failure reason recorded for a starter never carries either connection
