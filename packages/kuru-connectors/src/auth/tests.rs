@@ -1,3 +1,4 @@
+use super::login::CALLBACK_TIMEOUT;
 use super::*;
 use axum::{
     Router,
@@ -90,8 +91,12 @@ impl Fixture {
             manager,
         }
     }
+    /// A refresh sends its token POST inside its allowance, `http_timeout`
+    /// (auth.rs:244-245,293-297; reqwest timeout http.rs:98). A browser login
+    /// sends it after reading the callback under `CALLBACK_TIMEOUT`
+    /// (login.rs:52,75); the bound covers that longer chain.
     async fn arrived(&self, count: usize) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(CALLBACK_TIMEOUT + self.manager.inner.http_timeout, async {
             loop {
                 let notified = self.state.arrived.notified();
                 if self.state.requests.lock().unwrap().len() >= count {
@@ -157,6 +162,12 @@ fn callback(login: &BrowserLogin) -> (u16, String, HashMap<String, String>) {
     let redirect = url::Url::parse(&query["redirect_uri"]).unwrap();
     (redirect.port().unwrap(), query["state"].clone(), query)
 }
+/// The callback socket closes when `BrowserLogin::run` drops it. For a valid
+/// callback that is after the request read (`CALLBACK_TIMEOUT`, login.rs:52),
+/// the token exchange (`http_timeout`, http.rs:98), the reply write
+/// (`CALLBACK_TIMEOUT`, login.rs:235) and `activate`'s lease (`http_timeout`,
+/// auth.rs:521-526). `test_issuer` keeps `http_timeout = IO_TIMEOUT`
+/// (auth.rs:119). Invalid callbacks close after the read and the write alone.
 async fn callback_request(port: u16, target: &str, method: &str, host: &str) -> String {
     let mut socket = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
         .await
@@ -169,7 +180,8 @@ async fn callback_request(port: u16, target: &str, method: &str, host: &str) -> 
         .await
         .unwrap();
     let mut response = String::new();
-    tokio::time::timeout(Duration::from_secs(5), socket.read_to_string(&mut response))
+    let reply = 2 * CALLBACK_TIMEOUT + 2 * crate::IO_TIMEOUT;
+    tokio::time::timeout(reply, socket.read_to_string(&mut response))
         .await
         .unwrap()
         .unwrap();
@@ -699,7 +711,9 @@ async fn caller_loss_during_proved_unsent_backoff_rolls_back_before_lease_releas
         let manager = manager.clone();
         tokio::spawn(async move { manager.refresh_rejected(&observed).await })
     };
-    if tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
+    // The gate is reached inside the refresh allowance, `http_timeout`
+    // (auth.rs:244-245,293-297), or the refresh has already failed.
+    if tokio::time::timeout(manager.inner.http_timeout, gate.reached.notified())
         .await
         .is_err()
     {
@@ -745,7 +759,9 @@ async fn owned_refresh_gate_retries_once_after_safe_refusal_and_publishes() {
         let manager = manager.clone();
         tokio::spawn(async move { manager.refresh_rejected(&observed).await })
     };
-    if tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
+    // The gate is reached inside the refresh allowance, `http_timeout`
+    // (auth.rs:244-245,293-297), or the refresh has already failed.
+    if tokio::time::timeout(manager.inner.http_timeout, gate.reached.notified())
         .await
         .is_err()
     {
@@ -796,7 +812,10 @@ async fn owned_refresh_gate_retries_once_after_safe_refusal_and_publishes() {
         bytes
     });
     gate.release.notify_one();
-    let refresh_result = match tokio::time::timeout(Duration::from_secs(15), &mut refresh).await {
+    // `refresh_rejected` returns by its allowance deadline, `http_timeout`
+    // from its start (auth.rs:244-245,293-297), so this wait ends no later.
+    let refresh_result = match tokio::time::timeout(manager.inner.http_timeout, &mut refresh).await
+    {
         Ok(result) => result,
         Err(_) => {
             server.abort();
@@ -869,7 +888,10 @@ async fn owner_gate_caller_loss_and_expired_grant_stop_before_first_post() {
             let manager = manager.clone();
             tokio::spawn(async move { manager.refresh_rejected(&observed).await })
         };
-        tokio::time::timeout(Duration::from_secs(5), gate.reached.notified())
+        // The gate is reached inside the refresh allowance, `http_timeout`
+        // (auth.rs:244-245,293-297). With `expire` the allowance is 2 s: this
+        // wait then ties with the product deadline and fails the same way.
+        tokio::time::timeout(manager.inner.http_timeout, gate.reached.notified())
             .await
             .unwrap();
         if expire {

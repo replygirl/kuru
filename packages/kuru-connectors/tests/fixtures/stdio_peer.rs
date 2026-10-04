@@ -10,7 +10,7 @@ use std::{
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
     process, thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn main() -> io::Result<()> {
@@ -142,6 +142,32 @@ fn run(executable: &Path) -> io::Result<()> {
                 thread::sleep(Duration::from_millis(
                     argument.parse().expect("milliseconds"),
                 ));
+            }
+            "park" => {
+                // Hold until the product closes stdin. Drained input is not
+                // part of the transcript, so a parked peer records nothing.
+                io::copy(&mut input, &mut io::sink())?;
+            }
+            "await-release" => {
+                // The owning test creates this file once the peer may go on.
+                // The interval is only the check cadence. The plan's bound is
+                // the product's budget for the request this peer holds, so a
+                // release after it serves nothing; the peer then fails rather
+                // than outlive an owner that was killed before its cleanup.
+                let (name, milliseconds) =
+                    argument.split_once(' ').expect("release name and bound");
+                let bound = Duration::from_millis(milliseconds.parse().expect("release bound"));
+                let deadline = Instant::now() + bound;
+                let release = directory.join(format!("{name}.release"));
+                while !release.try_exists()? {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("{name} was not released within {milliseconds} ms"),
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
             }
             other => {
                 return Err(io::Error::other(format!(

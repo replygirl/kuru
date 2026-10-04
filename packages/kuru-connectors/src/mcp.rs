@@ -3557,10 +3557,18 @@ mod tests {
             let hosts = hosts.clone();
             async move { hosts.oauth_logout("auth").await }
         });
-        tokio::time::timeout(Duration::from_secs(5), revocation_observed.changed())
-            .await
-            .unwrap()
-            .unwrap();
+        // The detached settlement reaches `/revoke` after the credential lease
+        // (`LOCK_DEADLINE`, mcp.rs:656, mcp_credentials.rs:86-91) and two
+        // metadata GETs (mcp.rs:736-745, each answered on its first candidate
+        // by this fixture), each under `http::client`'s `IO_TIMEOUT`
+        // (http.rs:9). The POST then arrives inside its own `IO_TIMEOUT`.
+        tokio::time::timeout(
+            crate::mcp_credentials::LOCK_DEADLINE + 3 * IO_TIMEOUT,
+            revocation_observed.changed(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(*revocation_observed.borrow());
         caller.abort();
         let _ = caller.await;
@@ -3568,7 +3576,11 @@ mod tests {
         assert!(hosts.execute(&route, json!({})).await.is_err());
         assert_eq!(tool_calls.load(Ordering::Relaxed), 2);
         revocation_release.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // The released revocation answers inside its POST's `IO_TIMEOUT`
+        // (http.rs:9) before the settlement deletes the credential under its
+        // lease; each `acquire` below waits for that lease within
+        // `LOCK_DEADLINE` (mcp_credentials.rs:86-91).
+        tokio::time::timeout(IO_TIMEOUT + crate::mcp_credentials::LOCK_DEADLINE, async {
             loop {
                 if credentials.acquire("auth").await?.get().await?.is_none() {
                     break Ok::<_, anyhow::Error>(());
@@ -4413,7 +4425,12 @@ mod tests {
         let mut child = child.spawn().unwrap();
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
-        let result = timeout(Duration::from_secs(15), async {
+        // The child's MCP work is `initialize` and `tools/list`, each an
+        // `IO_TIMEOUT` request (mcp.rs:1565,1609,1948), then the shutdown join
+        // under `IO_TIMEOUT` (mcp.rs:1203). The child's one rustc compile of
+        // the peer (`test_support::fixture_binary`) has no product budget;
+        // that this bound also covers it is an inference.
+        let result = timeout(3 * IO_TIMEOUT, async {
             let mut out = Vec::new();
             let mut err = Vec::new();
             let (stdout_truncated, stderr_truncated, status) = tokio::join!(
@@ -4863,7 +4880,7 @@ mod tests {
             Step::Read,
             Step::Write(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[tool("mutate")]}})),
             Step::Read,
-            Step::Sleep(5_000),
+            Step::Park,
         ]);
         let hosts = Arc::new(
             McpHosts::new(
@@ -5135,7 +5152,7 @@ mod tests {
                 json!({"jsonrpc":"2.0","id":3,"result":{"tools":[tool("target")],"nextCursor":"p2"}}),
             ),
             Step::Read,
-            Step::Sleep(400),
+            Step::AwaitRelease("page-2"),
             Step::Write(json!({"jsonrpc":"2.0","id":4,"result":{"tools":[tool("extra")]}})),
             Step::Read,
             Step::Write(
@@ -5207,17 +5224,20 @@ mod tests {
         let other_alias =
             tokio::spawn(async move { other_hosts.execute(&independent_name, json!({})).await });
 
-        let McpExecution::Success(other) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), other_alias)
-                .await
-                .expect("independent alias was blocked by another alias")
-                .unwrap()
-                .unwrap()
+        // The slow peer holds its second page until the release below, so the
+        // independent call must finish while the slow alias is still busy. Its
+        // one request is bounded by `IO_TIMEOUT` (mcp.rs:1678,1609,1948).
+        let McpExecution::Success(other) = tokio::time::timeout(IO_TIMEOUT, other_alias)
+            .await
+            .expect("independent alias was blocked by another alias")
+            .unwrap()
+            .unwrap()
         else {
             panic!("expected independent MCP success");
         };
         assert_eq!(other["content"][0]["text"], "other done");
         assert!(!same_alias.is_finished());
+        slow.release("page-2");
         assert_eq!(catalog.await.unwrap().unwrap().tools.len(), 3);
         let McpExecution::Success(slow_result) = same_alias.await.unwrap().unwrap() else {
             panic!("expected serialized MCP success");
@@ -5299,7 +5319,7 @@ mod tests {
             Step::Read,
             Step::Write(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[tool("slow")]}})),
             Step::Read,
-            Step::Sleep(5_000),
+            Step::Park,
         ]);
         let hosts = Arc::new(
             McpHosts::new(
@@ -5397,7 +5417,10 @@ mod tests {
         let catalog_hosts = hosts.clone();
         let pending = tokio::spawn(async move { catalog_hosts.catalog().await });
         launched.await;
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // No product budget encloses a peer's process start. `IO_TIMEOUT`
+        // names the bound the first `initialize` request would wait on it
+        // (mcp.rs:1565,1609); using it here is an inference.
+        tokio::time::timeout(IO_TIMEOUT, async {
             while script.conversations() != vec![Vec::<Value>::new()] {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }

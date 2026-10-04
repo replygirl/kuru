@@ -2410,6 +2410,40 @@ mod tests {
     use crate::test_support::{StdioFixture, Step};
     use kuru_core::{McpConfig, PermissionAction, PermissionRule};
 
+    /// The shell's cleanup allowance, restated from `CLEANUP_ALLOWANCE`
+    /// (unix_shell.rs:36 on 449dca9e): `execute` returns by its timeout plus
+    /// this allowance (unix_shell.rs:475-477,560), and `shutdown` by this
+    /// deadline (unix_shell.rs:590). Reference the constant once PR #207, which
+    /// edits unix_shell.rs, has merged.
+    #[cfg(unix)]
+    const SHELL_CLEANUP_ALLOWANCE: Duration = Duration::from_secs(5);
+    /// The shell registry's re-check interval, restated from `OBSERVE_INTERVAL`
+    /// (unix_shell.rs:37 on 449dca9e) until PR #207 has merged.
+    #[cfg(unix)]
+    const SHELL_OBSERVE_INTERVAL: Duration = Duration::from_millis(10);
+    /// `ShellRegistry::shutdown` re-checks for an empty registry, then for its
+    /// deadline, every interval (unix_shell.rs:590-607). Its last check, after
+    /// a sleep begun just before its deadline, is due by that deadline plus one
+    /// interval. A timer around `ToolHost::shutdown` fixes its own deadline when
+    /// it is constructed; the registry's deadline is set during the first poll
+    /// after that (unix_shell.rs:577-590), through `join!`, which polls the
+    /// shell branch first (tools.rs:1683-1687). One more interval is the
+    /// written allowance for that ordering. When both are due on the same
+    /// timer tick, `Timeout` polls the shutdown before its own deadline, so
+    /// only their due times matter. Without MCP aliases or hooks, the other
+    /// branches return at once.
+    #[cfg(unix)]
+    const SHELL_SHUTDOWN: Duration =
+        SHELL_CLEANUP_ALLOWANCE.saturating_add(SHELL_OBSERVE_INTERVAL.saturating_mul(2));
+    /// The shell tool's default `timeout_ms`, restated from tools.rs:1344.
+    #[cfg(unix)]
+    const SHELL_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+    /// The shell tool's largest accepted `timeout_ms`, restated from
+    /// tools.rs:1346-1347. A shell given it writes its readiness marker before
+    /// that deadline or not at all (unix_shell.rs:475).
+    #[cfg(unix)]
+    const SHELL_MAX_TIMEOUT_MS: u64 = 120_000;
+
     fn with_test_checkpoints(host: ToolHost, private: &tempfile::TempDir) -> ToolHost {
         let root = host.root_guard.clone();
         host.with_checkpoint_store(Arc::new(
@@ -4782,7 +4816,11 @@ mod tests {
             },
         )
         .unwrap();
-        let command = format!("printf '%s' '{SECRET}' >&2; : > timeout-ready; exec sleep 5");
+        // The shell blocks opening a FIFO nobody writes, so only the product's
+        // 3 s timeout ends it.
+        let command = format!(
+            "printf '%s' '{SECRET}' >&2; mkfifo timeout-hold; : > timeout-ready; exec cat timeout-hold"
+        );
         let (ready_result, call_result) = tokio::join!(
             timeout(Duration::from_secs(5), async {
                 while !ready.exists() {
@@ -4800,7 +4838,7 @@ mod tests {
                 ),
             )
         );
-        let shutdown_result = timeout(Duration::from_secs(6), host.shutdown()).await;
+        let shutdown_result = timeout(SHELL_SHUTDOWN, host.shutdown()).await;
 
         assert!(
             matches!(shutdown_result, Ok(Ok(()))),
@@ -4848,8 +4886,10 @@ mod tests {
             },
         )
         .unwrap();
+        // The shell blocks opening a FIFO nobody writes, so only the product's
+        // 3 s timeout ends it.
         let command = format!(
-            "printf 'useful {SECRET} detail' >&2; exec 2>&-; : > stderr-closed; exec sleep 5"
+            "printf 'useful {SECRET} detail' >&2; mkfifo stderr-hold; exec 2>&-; : > stderr-closed; exec cat stderr-hold"
         );
         let (ready_result, call_result) = tokio::join!(
             timeout(Duration::from_secs(5), async {
@@ -4862,7 +4902,7 @@ mod tests {
                 host.execute("shell", json!({"command": command, "timeout_ms": 3_000}),),
             )
         );
-        let shutdown_result = timeout(Duration::from_secs(6), host.shutdown()).await;
+        let shutdown_result = timeout(SHELL_SHUTDOWN, host.shutdown()).await;
 
         ready_result.expect("shell did not close stderr before timeout");
         assert!(matches!(shutdown_result, Ok(Ok(()))), "{shutdown_result:?}");
@@ -5079,12 +5119,12 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
             async move {
                 host.execute(
                     "shell",
-                    json!({"command":": > caller-ready; exec sleep 5", "timeout_ms":120_000}),
+                    json!({"command":": > caller-ready; exec sleep 5", "timeout_ms":SHELL_MAX_TIMEOUT_MS}),
                 )
                 .await
             }
         });
-        timeout(Duration::from_secs(2), async {
+        timeout(Duration::from_millis(SHELL_MAX_TIMEOUT_MS), async {
             while !ready.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -5093,7 +5133,7 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
         .expect("shell caller did not reach readiness");
         call.abort();
         assert!(call.await.unwrap_err().is_cancelled());
-        timeout(Duration::from_secs(6), host.shutdown())
+        timeout(SHELL_SHUTDOWN, host.shutdown())
             .await
             .expect("registered shell owner did not finish bounded shutdown")
             .unwrap();
@@ -5148,19 +5188,21 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
             async move {
                 host.execute(
                     "shell",
-                    json!({"command":": > started-after-shutdown", "timeout_ms":120_000}),
+                    json!({"command":": > started-after-shutdown", "timeout_ms":SHELL_MAX_TIMEOUT_MS}),
                 )
                 .await
             }
         });
-        timeout(Duration::from_secs(1), async {
+        // Registration and the start gate both precede the starting shell's
+        // first deadline check (unix_shell.rs:475,754).
+        timeout(Duration::from_millis(SHELL_MAX_TIMEOUT_MS), async {
             while host.test_shells().test_owner_count() != 1 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("starting shell was not registered");
-        timeout(Duration::from_secs(1), async {
+        timeout(Duration::from_millis(SHELL_MAX_TIMEOUT_MS), async {
             while !starting_gate.entered() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -5172,12 +5214,12 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
             async move {
                 host.execute(
                     "shell",
-                    json!({"command":": > active-ready; exec sleep 5", "timeout_ms":120_000}),
+                    json!({"command":": > active-ready; exec sleep 5", "timeout_ms":SHELL_MAX_TIMEOUT_MS}),
                 )
                 .await
             }
         });
-        let active_ready_result = timeout(Duration::from_secs(2), async {
+        let active_ready_result = timeout(Duration::from_millis(SHELL_MAX_TIMEOUT_MS), async {
             while !active_ready.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -5193,7 +5235,10 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
             let host = host.clone();
             async move { host.shutdown().await }
         });
-        timeout(Duration::from_secs(1), async {
+        // Closing is set as the shutdown starts (unix_shell.rs:577-586), inside
+        // a shutdown whose largest branch, the MCP join, is bounded by
+        // `IO_TIMEOUT` (mcp.rs:1203).
+        timeout(crate::IO_TIMEOUT, async {
             while !host.test_shells().test_is_closing() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -5209,7 +5254,10 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
             "tool execution failed: shell operation failed; stderr: <pending EOF>"
         );
         starting_gate.release();
-        timeout(Duration::from_secs(6), shutdown)
+        // The MCP branch's join is the larger bound of the shutdown, at
+        // `IO_TIMEOUT` (mcp.rs:1203); it encloses `Rpc::close` and the shell
+        // branch's `SHELL_SHUTDOWN`.
+        timeout(crate::IO_TIMEOUT, shutdown)
             .await
             .expect("combined shell/MCP shutdown did not finish")
             .unwrap()
@@ -5262,12 +5310,12 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
                     async move {
                         host.execute(
                             "shell",
-                            json!({"command":": > worker-ready; exec sleep 5", "timeout_ms":120_000}),
+                            json!({"command":": > worker-ready; exec sleep 5", "timeout_ms":SHELL_MAX_TIMEOUT_MS}),
                         )
                         .await
                     }
                 });
-                timeout(Duration::from_secs(2), async {
+                timeout(Duration::from_millis(SHELL_MAX_TIMEOUT_MS), async {
                     while !root.join("worker-ready").exists() {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
@@ -5282,7 +5330,7 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
             .build()
             .unwrap();
         runtime.block_on(async {
-            timeout(Duration::from_secs(6), host.shutdown())
+            timeout(SHELL_SHUTDOWN, host.shutdown())
                 .await
                 .expect("retained worker did not finish after parent runtime destruction")
                 .unwrap();
@@ -5764,7 +5812,12 @@ if ($failed.Count -eq 0) {{
         let mut child = command.spawn().unwrap();
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
-        let result = timeout(Duration::from_secs(10), async {
+        // The child's one shell call uses the default timeout and returns by
+        // it plus the cleanup allowance (unix_shell.rs:475-477,560). The
+        // child test harness's own start has no product budget; that this
+        // bound covers it is an inference.
+        let bound = Duration::from_millis(SHELL_DEFAULT_TIMEOUT_MS) + SHELL_CLEANUP_ALLOWANCE;
+        let result = timeout(bound, async {
             let mut out = Vec::new();
             let mut err = Vec::new();
             let (stdout_truncated, stderr_truncated, status) = tokio::join!(

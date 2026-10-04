@@ -1797,8 +1797,12 @@ mod tests {
         let provider = ResponsesProvider::new(&base, "").unwrap();
         let (sender, mut observed) = tokio::sync::mpsc::channel(8);
         let mut sink = ChannelEvents(sender);
+        // Both events are emitted inside the stream's total timer,
+        // `COMPLETION_TIMEOUT` (providers.rs:1110-1117), which encloses the
+        // connect, the POST and the chunk waits under `STREAM_IDLE_TIMEOUT`
+        // (providers.rs:1235-1237).
         let mut stream = Box::pin(provider.stream(request(), &mut sink));
-        let first = tokio::time::timeout(Duration::from_secs(2), async {
+        let first = tokio::time::timeout(COMPLETION_TIMEOUT, async {
             tokio::select! {
                 event = observed.recv() => event,
                 result = &mut stream => panic!("stream settled before a delta: {result:?}"),
@@ -1807,7 +1811,7 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(first, Some(ProviderEvent::ContextMeasured(_))));
-        let delta = tokio::time::timeout(Duration::from_secs(2), async {
+        let delta = tokio::time::timeout(COMPLETION_TIMEOUT, async {
             tokio::select! {
                 event = observed.recv() => event,
                 result = &mut stream => panic!("stream settled before a delta: {result:?}"),
@@ -2244,11 +2248,14 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let (held, holding) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
             assert_ne!(socket.read(&mut request).await.unwrap(), 0);
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            held.send(()).unwrap();
+            released.await.unwrap();
             let body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fixture\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"later\"}]}]}}\n\n";
             socket
                 .write_all(
@@ -2269,7 +2276,26 @@ mod tests {
             .build()
             .unwrap();
         provider.completion_timeout = Duration::from_secs(2);
-        let completion = tokio::time::timeout(Duration::from_secs(3), provider.complete(request()))
+        let completion = provider.complete(request());
+        tokio::pin!(completion);
+        tokio::select! {
+            holding = holding => holding.unwrap(),
+            result = &mut completion => panic!("completion settled before the server held it: {result:?}"),
+        }
+        // A probe sent later on the same generic client times out first, so
+        // the generic deadline has elapsed for the held completion as well.
+        // A missing override would already have failed it: reqwest checks
+        // the total timeout before the response on every poll.
+        let probe = provider
+            .client
+            .get(format!("{url}/probe"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(probe.is_timeout(), "{probe:?}");
+        release.send(()).unwrap();
+        // The completion settles by its own total deadline (providers.rs:1110-1117).
+        let completion = tokio::time::timeout(provider.completion_timeout, completion)
             .await
             .unwrap()
             .unwrap();
@@ -2286,11 +2312,14 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let (held, holding) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
             assert_ne!(socket.read(&mut request).await.unwrap(), 0);
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            held.send(()).unwrap();
+            released.await.unwrap();
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 32\r\nConnection: close\r\n\r\n{\"data\":[{\"id\":\"future-model\"}]}",
@@ -2300,7 +2329,23 @@ mod tests {
         });
         let mut provider = ResponsesProvider::new(&url, "").unwrap();
         provider.completion_timeout = Duration::from_millis(80);
-        let models = tokio::time::timeout(Duration::from_secs(1), provider.models())
+        let models = provider.models();
+        tokio::pin!(models);
+        tokio::select! {
+            holding = holding => holding.unwrap(),
+            result = &mut models => panic!("catalog settled before the server held it: {result:?}"),
+        }
+        // A completion started later on the same provider exhausts its 80 ms
+        // deadline, so that deadline has elapsed for the held catalog too.
+        let probe = format!("{:#}", provider.complete(request()).await.unwrap_err());
+        assert!(
+            probe.contains("transport timed out")
+                || probe.contains("Responses request exceeded 600-second total limit"),
+            "{probe}"
+        );
+        release.send(()).unwrap();
+        // The catalog keeps its own `IO_TIMEOUT` (providers.rs:1061,1069).
+        let models = tokio::time::timeout(crate::IO_TIMEOUT, models)
             .await
             .unwrap()
             .unwrap();
@@ -2738,6 +2783,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
@@ -2748,22 +2794,24 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            // The body never ends while the provider reads it.
+            released.await.unwrap();
         });
         let provider = ResponsesProvider::new(&url, "").unwrap();
-        let started = std::time::Instant::now();
+        // The body is held open until after `complete` returns, so returning
+        // at all proves its `DIAGNOSTIC_TIMEOUT` read bound fired
+        // (providers/diagnostics.rs:280). Without that bound this fails at
+        // the stream's `COMPLETION_TIMEOUT`.
         let error = provider.complete(request()).await.unwrap_err();
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "diagnostic body read exceeded its bounded fallback"
-        );
+        // A server that already panicked has dropped its receiver; the join
+        // below reports that panic.
+        let _ = release.send(());
         let diagnostic = format!("{error:#}");
         assert!(
             diagnostic.contains("service failed (HTTP 502)"),
             "{diagnostic}"
         );
-        server.abort();
-        let _ = server.await;
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -2772,6 +2820,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let (release, mut released) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
@@ -2782,29 +2831,35 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            for _ in 0..4 {
+            // A chunk lands more than once per `DIAGNOSTIC_TIMEOUT`, so a
+            // deadline restarted per chunk would never fire.
+            let cadence = diagnostics::DIAGNOSTIC_TIMEOUT / 3;
+            loop {
                 if socket.write_all(b"1\r\n{\r\n").await.is_err() {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(700)).await;
+                tokio::select! {
+                    _ = &mut released => return,
+                    () = tokio::time::sleep(cadence) => {}
+                }
             }
         });
-        let started = std::time::Instant::now();
+        // The body dribbles until after `complete` returns, so returning at
+        // all proves one total diagnostic deadline fired
+        // (providers/diagnostics.rs:280). A per-chunk deadline fails at the
+        // stream's `COMPLETION_TIMEOUT` instead.
         let error = ResponsesProvider::new(&url, "")
             .unwrap()
             .complete(request())
             .await
             .unwrap_err();
-        assert!(
-            started.elapsed() < Duration::from_millis(2600),
-            "diagnostic deadline restarted after a body chunk"
-        );
+        // The server may already have stopped on the closed connection.
+        let _ = release.send(());
         assert!(
             format!("{error:#}").contains("service failed (HTTP 502)"),
             "{error:#}"
         );
-        server.abort();
-        let _ = server.await;
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -3029,7 +3084,9 @@ mod tests {
             let continuation = continuation.clone();
             tokio::spawn(async move { provider.complete(continuation).await })
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
+        // The second request (the 503 attempt) is sent inside the stream's
+        // `COMPLETION_TIMEOUT` (providers.rs:1110-1117,612-634).
+        tokio::time::timeout(COMPLETION_TIMEOUT, async {
             loop {
                 if peer.requests.lock().await.len() == 2 {
                     break;
@@ -3041,6 +3098,10 @@ mod tests {
         .unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
+        // A detached replay of the cancelled attempt would be sent after its
+        // first retry delay: equal jitter on a 500 ms base, so at most 500 ms
+        // (src/retry.rs:127-138,258-270), since a fixture `Reply` sends no
+        // `Retry-After`. This 1 s exceeds that, so the count below shows none.
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(peer.requests.lock().await.len(), 2);
         provider.complete(continuation).await.unwrap();

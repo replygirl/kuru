@@ -266,7 +266,13 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(1);
+    /// A fixture serves one fetch, which the client paces and abandons by the
+    /// budget the test passes (`fetch_with_resolver`, at most 2 s here). The
+    /// product's own fetch budget, `FETCH_TIMEOUT`, encloses every such budget.
+    const FIXTURE_TIMEOUT: Duration = FETCH_TIMEOUT;
+    /// The longest `delay` a fixture sleeps before its reply, outside its
+    /// `FIXTURE_TIMEOUT` deadline. `serve_once_inner` checks every caller.
+    const MAX_FIXTURE_DELAY: Duration = Duration::from_millis(200);
     const MAX_FIXTURE_REQUEST_BYTES: usize = 16 * 1024;
 
     #[derive(Default)]
@@ -335,6 +341,10 @@ mod tests {
         delay: Duration,
         request_ready: Option<tokio::sync::oneshot::Sender<std::result::Result<(), &'static str>>>,
     ) -> (SocketAddr, tokio::task::JoinHandle<String>) {
+        assert!(
+            delay <= MAX_FIXTURE_DELAY,
+            "fixture delay exceeds its bound"
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -377,8 +387,10 @@ mod tests {
         (address, task)
     }
 
+    /// The fixture's deadline started when it first ran, before this wait;
+    /// only its pre-reply `delay` falls outside that deadline.
     async fn received(mut task: tokio::task::JoinHandle<String>) -> String {
-        match timeout(FIXTURE_TIMEOUT + Duration::from_secs(1), &mut task).await {
+        match timeout(FIXTURE_TIMEOUT + MAX_FIXTURE_DELAY, &mut task).await {
             Ok(result) => result.expect("web fetch fixture task panicked"),
             Err(_) => {
                 task.abort();
@@ -434,8 +446,10 @@ mod tests {
         (address, task)
     }
 
+    /// Every step of the redirect fixture runs under its own deadline, which
+    /// started when it first ran, before this wait.
     async fn received_many(mut task: tokio::task::JoinHandle<Vec<String>>) -> Vec<String> {
-        match timeout(FIXTURE_TIMEOUT + Duration::from_secs(1), &mut task).await {
+        match timeout(FIXTURE_TIMEOUT, &mut task).await {
             Ok(result) => result.expect("redirect fixture task panicked"),
             Err(_) => {
                 task.abort();

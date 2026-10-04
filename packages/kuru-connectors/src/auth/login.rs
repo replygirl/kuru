@@ -14,7 +14,7 @@ use tokio::{
 };
 
 const CALLBACK_BYTES: usize = 8192;
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Owns the callback socket. Dropping this handle or `finish` closes it.
 /// PKCE verifier and state intentionally have no Debug/serialization surface.
