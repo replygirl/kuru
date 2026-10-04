@@ -49,10 +49,10 @@ const CHILD_START: Duration = Duration::from_secs(5);
 const LIMIT: Duration = NATIVE_BOUND.saturating_add(CHILD_START);
 const SHORT: Duration = Duration::from_millis(80);
 
-/// The bound of an outer wait over `limits` inner waits each bounded by
-/// [`LIMIT`] and `shorts` inner waits each bounded by [`SHORT`], run one after
-/// another, so the outer wait ends only after every inner one has had its own
-/// bound. Each caller counts one more `LIMIT` for what no inner wait bounds.
+/// The bound of an outer wait over `limits` inner waits bounded by [`LIMIT`]
+/// and `shorts` bounded by [`SHORT`], run in series, so each inner wait has its
+/// own bound first. A caller whose span has a step no inner wait bounds (child
+/// creation, runtime construction or shutdown) adds one `LIMIT` for it.
 fn series(limits: u32, shorts: u32) -> Duration {
     LIMIT * limits + SHORT * shorts
 }
