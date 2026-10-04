@@ -3339,7 +3339,6 @@ mod tests {
     /// stopped test tree. Group members that must outlive the root are
     /// `tail -f /dev/null`, which blocks until the group signal ends it, so
     /// no member's lifetime races a bound.
-    #[cfg(unix)]
     const GROUP_BOUND: Duration = RUNNER_CLEANUP_TIMEOUT;
 
     #[cfg(unix)]
