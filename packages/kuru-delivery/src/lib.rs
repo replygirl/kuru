@@ -35,3 +35,9 @@ mod staging;
 pub mod targets;
 #[cfg(windows)]
 pub mod update;
+// The Windows handoff's waits; public only to the maintainer fixtures that
+// bound a previous updater's launch by them.
+#[cfg(feature = "tooling")]
+pub mod update_budget;
+#[cfg(all(windows, not(feature = "tooling")))]
+mod update_budget;

@@ -2,6 +2,7 @@
 //! owns publication and its durable receipt; downloaded bytes are never run.
 
 use crate::lease::HeldLock;
+use crate::update_budget::{CLEANUP, PUBLICATION, STARTUP};
 use anyhow::{Context, Result, ensure};
 use kuru_platform::fs::{
     Directory, NameRetention, Privacy, Publication, regular_file_info, seal_private,
@@ -28,12 +29,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const STATE: &str = ".kuru-update";
 const RECEIPT: &str = "receipt.json";
 const LOCK: &str = "install.lock";
-const STARTUP: Duration = Duration::from_secs(10);
-// The authenticated helper verifies and durably copies full embedded images
-// before acknowledging publication. That work has its own finite allowance;
-// connection establishment and a frame already in flight keep their short limit.
-const PUBLICATION: Duration = Duration::from_secs(120);
-const CLEANUP: Duration = Duration::from_secs(10);
 const JSON_LIMIT: usize = 64 * 1024;
 
 // Ordinary callers supply a no-op. Maintainer fixtures observe completed

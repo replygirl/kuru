@@ -29,12 +29,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "launch_budget.rs"]
+mod launch_budget;
 #[path = "../../src/mise_isolation.rs"]
 mod mise_isolation;
 #[path = "previous_updater.rs"]
 mod previous_updater;
 
-const DEADLINE: Duration = Duration::from_secs(180);
+/// Bound for each native mise launch: one mise request stalled through every
+/// retry, then one launched Kuru lifecycle that creates its store, under the
+/// memory package's single-stall backstop (the engine cache is warmed first, so
+/// no runtime install or cache-lock wait is charged). A reopen, an attach, the
+/// Kuru commands that open no memory and the mise commands that launch no Kuru
+/// are each a subset. See `launch_budget.rs`.
+static DEADLINE: LazyLock<Duration> = LazyLock::new(|| {
+    launch_budget::mise_stalled_request() + kuru_memory::test_support::fixture_deadline(1, 0)
+});
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Fixture route for mise's own release index (its update notification).
 const MISE_RELEASE_INDEX: &str = "/mise-releases.tsv";
@@ -479,7 +489,7 @@ impl Installation {
         command
     }
     async fn output(&self, args: &[&str]) -> Result<Output> {
-        command::output(self.command().args(args), DEADLINE)
+        command::output(self.command().args(args), *DEADLINE)
             .await
             .context("native mise command")
     }
@@ -549,7 +559,7 @@ impl Installation {
         for (name, value) in env {
             command.env(name, value);
         }
-        let output = command::output(&mut command, DEADLINE).await?;
+        let output = command::output(&mut command, *DEADLINE).await?;
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         ensure!(
             output.status.success(),
@@ -566,7 +576,7 @@ impl Installation {
             .arg("--data-dir")
             .arg(&self.kuru_data)
             .args(["memory", "purge", "--yes"]);
-        let output = command::output(&mut command, DEADLINE).await?;
+        let output = command::output(&mut command, *DEADLINE).await?;
         ensure!(
             output.status.success(),
             "installed Kuru refused isolated memory purge: {}",
@@ -930,7 +940,7 @@ async fn run_archive(
                 missing_extensions
                     .env_remove("PATHEXT")
                     .args(["exec", "--", "kuru", "--version"]);
-                let rejected = command::output(&mut missing_extensions, DEADLINE).await?;
+                let rejected = command::output(&mut missing_extensions, *DEADLINE).await?;
                 ensure!(
                     !rejected.status.success()
                         && String::from_utf8_lossy(&rejected.stderr)

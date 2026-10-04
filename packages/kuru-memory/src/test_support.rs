@@ -557,14 +557,14 @@ pub(crate) fn server_start_budget() -> std::time::Duration {
 /// How a fresh store open (`MemoryStore::open_inner` with no active
 /// directory) creates its store, by its engine starts and the owned closes
 /// before it is ready.
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FreshOpen {
     /// A copy of a published store template: the stage's one start
     /// (adoption, validation, ready marker) and the active start.
     Template,
     /// The first open for a template key: the template build's start, then
-    /// the copy's stage start and the active start.
+    /// the copy's stage start and the active start. Fixtures never take it.
+    #[cfg(test)]
     FirstProject,
     /// The cold staged build (a legacy import, a configured engine binary,
     /// `Creation::Cold`, or any fallback from the template): the stage's one
@@ -573,18 +573,19 @@ pub(crate) enum FreshOpen {
     Cold,
 }
 
-#[cfg(test)]
 impl FreshOpen {
     /// Engine starts, as the engine ledger counts them.
     pub(crate) const fn starts(self) -> u32 {
         match self {
             Self::Template => 2,
+            #[cfg(test)]
             Self::FirstProject => 3,
             Self::Cold => 2,
         }
     }
 
     /// Owned server closes before the store is ready.
+    #[cfg(test)]
     pub(crate) const fn closes(self) -> u32 {
         self.starts() - 1
     }
@@ -646,8 +647,9 @@ pub(crate) fn fresh_open_budget() -> std::time::Duration {
 /// verification, legacy import preparation and activation reads, rely on this
 /// backstop alone. Fixtures call [`warm_runtime_cache`] first, so no cold
 /// runtime install is charged here, and keep the `OpenOptions::new` budgets.
-#[cfg(test)]
-pub(crate) fn fixture_deadline(fresh: u32, reopened: u32) -> std::time::Duration {
+/// Maintainer fixtures in other packages that launch a real Kuru executable
+/// bound each launch by it too.
+pub fn fixture_deadline(fresh: u32, reopened: u32) -> std::time::Duration {
     let fresh_starts = FreshOpen::Template.starts().max(FreshOpen::Cold.starts());
     let starts = fresh.saturating_mul(fresh_starts).saturating_add(reopened);
     let single_stall = crate::server::close_budget()

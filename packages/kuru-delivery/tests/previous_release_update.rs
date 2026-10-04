@@ -10,6 +10,8 @@
 //! single-threaded: the helper writes an executable and then runs it, and a
 //! concurrent spawn could inherit that descriptor (Linux ETXTBSY).
 
+#[path = "support/launch_budget.rs"]
+mod launch_budget;
 #[path = "support/previous_updater.rs"]
 mod previous_updater;
 
@@ -19,7 +21,7 @@ use kuru_delivery::{
     command::{self, Command},
     published, release, shell_support,
 };
-use std::{fs, path::PathBuf, time::Duration};
+use std::{fs, path::PathBuf};
 
 const WORKSPACE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -78,7 +80,7 @@ async fn run() -> Result<()> {
         for (key, value) in &environment {
             generator.env(key, value);
         }
-        let output = command::output(&mut generator, Duration::from_secs(180)).await?;
+        let output = command::output(&mut generator, previous_updater::DEADLINE).await?;
         ensure!(
             output.status.success(),
             "candidate binary could not generate {name}: {}",

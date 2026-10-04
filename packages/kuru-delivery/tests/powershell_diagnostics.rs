@@ -1,5 +1,7 @@
 #![cfg(feature = "tooling")]
 
+#[path = "support/launch_budget.rs"]
+mod launch_budget;
 #[path = "support/powershell_diagnostic.rs"]
 mod powershell_diagnostic;
 #[path = "support/stock_powershell.rs"]
@@ -397,123 +399,168 @@ fn coverage_tasks_run_the_rust_orchestrator_without_shell_metacharacters() {
     assert!(manifest.contains("[tasks.\"coverage:workspace\"]"));
 }
 
-/// Bound for one wrapper launch these tests wait on, from spawn to both pipes'
-/// EOF and the process tree's exit; the wait itself ends on that event.
+/// Every launch bound in the delivery fixtures takes its recorded derivation
+/// (`support/launch_budget.rs`) instead of a flat literal.
 ///
-/// The longest launch shape here is the published-Windows task: mise starting
-/// and resolving `verify:published-windows`, its `cmd.exe /d /s /c` inline
-/// shell, then `pwsh.exe` (PowerShell 7, `-NoProfile`) running
-/// `support/verify-published-windows.ps1`, which has no module prelude and
-/// throws on the missing release variables before it reaches `Get-Command` or
-/// `cargo`. The orchestrator shape (`cmd.exe` or nothing, then the delivery
-/// binary) is a strict subset, so both call sites share one bound. Every launch
-/// may run instrumented on a busy coverage runner.
-///
-/// The value is a package convention, not a measured derivation. The delivery
-/// package already bounds each of its mise and PowerShell fixture launches with
-/// the same 180 s literal (`DEADLINE` in `support/mise_acceptance.rs` and
-/// `support/previous_updater.rs`, `TIMEOUT` in `bootstrap_windows.rs`); none of
-/// those states its own derivation either. This adopts that one number instead
-/// of adding a different guess, and the pin test below keeps them equal so that
-/// changing any of them for a stated reason forces this bound to be revisited.
-/// What the value must satisfy is stated and checked there: this binary's
-/// launches fit inside the coverage shard's inner test deadline.
-///
-/// Measured (main run 37036793207, job 110937162182): the former flat 15 s
-/// expired at 15013 ms with neither pipe at EOF, the tree `mise.exe`
-/// cpu=328ms, `cmd.exe`, `pwsh.exe` cpu=671ms. Inference: about one CPU second
-/// in fifteen wall seconds is a starved start, not a hang.
-///
-/// A launch that really stalls still fails with `bounded_output`'s tree
-/// diagnostics when this budget expires; each test unwraps its first expiry.
-const WRAPPER_LAUNCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
-
-/// Every wrapper launch this binary can make on Windows: each orchestrator task
-/// once directly and once through `cmd.exe`, plus the published-Windows task
-/// (Unix makes only the direct launches, a subset). The pin test requires
-/// exactly these call sites, so a new launch updates this.
-const WRAPPER_LAUNCHES: u64 = 2 * MISSING_INPUTS.len() as u64 + 1;
-
-/// Every wrapper wait in this file takes the stated budget rather than a flat
-/// literal, that budget stays the package's one launch convention, and this
-/// binary's launches fit inside every coverage shard's inner test deadline.
-///
-/// The deadline check is a sanity bound for this binary alone, not a
-/// guarantee: it charges every launch a full budget in series (the worst case
-/// where each nearly expires yet succeeds; a stall ends its test at the first
-/// expiry instead), but the shard deadline is shared with every other test
-/// binary in the partition, which this file cannot see.
+/// The wrapper waits in this file take the time left before the coverage
+/// job's inner test deadline: their mise, `cmd.exe` and PowerShell 7 startup
+/// has no product or vendor budget, and that deadline is the one the coverage
+/// orchestrator enforces on this process. The siblings name their own
+/// sources, the previous updater's handoff series matches the updater's wait
+/// sites, and every workflow job limit still places that deadline through
+/// `coverage::shard_deadline`.
 #[test]
-fn wrapper_waits_take_the_package_launch_budget_inside_the_shard_deadline() {
+fn launch_bounds_take_their_recorded_derivations() {
     let package = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let compact = |text: &str| -> String { text.split_whitespace().collect() };
     // Split so this test's own needles are not counted as call sites.
     let call = ["bounded_", "output("].concat();
-    let budgeted = format!("{call}&mutchild,{},", "WRAPPER_LAUNCH_BUDGET");
+    let budgeted = format!("{call}&mutchild,{},", "launch_budget::until_job_deadline()");
     let orchestrator = ["orchestrator_", "without_inputs(task,"].concat();
-    let source: String = include_str!("powershell_diagnostics.rs")
-        .split_whitespace()
-        .collect();
+    let source = compact(include_str!("powershell_diagnostics.rs"));
     assert_eq!(
         source.matches(&call).count(),
         2,
-        "the wrapper waits changed; update WRAPPER_LAUNCHES"
+        "the wrapper waits changed; give each new one its derivation"
     );
     assert_eq!(
         source.matches(&budgeted).count(),
         2,
-        "a wrapper wait no longer takes WRAPPER_LAUNCH_BUDGET"
+        "a wrapper wait no longer waits until the job deadline"
     );
     assert_eq!(
         source.matches(&orchestrator).count(),
         2,
-        "the orchestrator launch callers changed; update WRAPPER_LAUNCHES"
+        "the orchestrator launch callers changed"
     );
 
-    for (file, name) in [
-        ("tests/support/mise_acceptance.rs", "DEADLINE"),
-        ("tests/support/previous_updater.rs", "DEADLINE"),
-        ("tests/bootstrap_windows.rs", "TIMEOUT"),
+    let include = "#[path=\"support/launch_budget.rs\"]modlaunch_budget;";
+    for (file, derivations) in [
+        (
+            "tests/bootstrap_windows.rs",
+            &[
+                (include, 1),
+                ("output(command,launch_budget::until_job_deadline())", 1),
+                (
+                    "tokio::time::timeout(launch_budget::until_job_deadline(),",
+                    1,
+                ),
+            ][..],
+        ),
+        (
+            "tests/support/previous_updater.rs",
+            &[(
+                "pubconstDEADLINE:Duration=super::launch_budget::update_handoff();",
+                1,
+            )][..],
+        ),
+        (
+            "tests/previous_release_update.rs",
+            &[
+                (include, 1),
+                (
+                    "command::output(&mutgenerator,previous_updater::DEADLINE)",
+                    1,
+                ),
+            ][..],
+        ),
+        (
+            "tests/support/mise_acceptance.rs",
+            &[
+                ("#[path=\"launch_budget.rs\"]modlaunch_budget;", 1),
+                (
+                    "launch_budget::mise_stalled_request()+kuru_memory::test_support::fixture_deadline(1,0)",
+                    1,
+                ),
+            ][..],
+        ),
     ] {
-        let text = std::fs::read_to_string(package.join(file)).unwrap();
-        let prefix = format!("const {name}: Duration = Duration::from_secs(");
-        let seconds: Vec<u64> = text
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix(prefix.as_str()))
-            .map(|rest| {
-                rest.strip_suffix(");")
-                    .and_then(|seconds| seconds.parse().ok())
-                    .unwrap_or_else(|| {
-                        panic!("{file} {name} is no longer a whole-second budget: {rest}")
-                    })
-            })
-            .collect();
+        let text = compact(&std::fs::read_to_string(package.join(file)).unwrap());
+        for (derivation, count) in derivations {
+            assert_eq!(
+                text.matches(derivation).count(),
+                *count,
+                "{file} no longer takes its bound from {derivation}"
+            );
+        }
+    }
+
+    // Every use of the handoff budgets in the updater is either a wait in the
+    // parent's handoff series or one of the uses named here, each present
+    // exactly once, so a new wait, or a series that omits one, fails.
+    let updater = compact(&std::fs::read_to_string(package.join("src/update.rs")).unwrap());
+    let other_uses = [
+        "usecrate::update_budget::{CLEANUP,PUBLICATION,STARTUP};",
+        // The helper's own frame receive, connect, acknowledged close and
+        // wait for the parent's exit.
+        "tokio::time::timeout(STARTUP,async{letfirst",
+        "pipe::connect(&start.pipe.context(\"missinghelperchannel\")?,STARTUP)",
+        "pipe.close(STARTUP).await.context(\"closeacknowledgedupdatechannel\")",
+        "wait_process_handle(&parent_handle,CLEANUP)",
+        // The native diagnostic fixture's helper exit.
+        "letexit=child.wait(STARTUP+CLEANUP).await;",
+    ];
+    let sites: Vec<&str> = launch_budget::UPDATE_HANDOFF_WAITS
+        .iter()
+        .map(|(site, _)| *site)
+        .chain(other_uses)
+        .collect();
+    for site in &sites {
         assert_eq!(
-            seconds,
-            [WRAPPER_LAUNCH_BUDGET.as_secs()],
-            "{file} {name} no longer matches the package launch convention"
+            updater.matches(site).count(),
+            1,
+            "the updater's wait {site} changed; re-derive the handoff series"
+        );
+    }
+    for budget in ["STARTUP", "PUBLICATION", "CLEANUP"] {
+        assert_eq!(
+            updater.matches(budget).count(),
+            sites
+                .iter()
+                .map(|site| site.matches(budget).count())
+                .sum::<usize>(),
+            "the updater uses {budget} outside the named sites; re-derive the handoff series"
         );
     }
 
-    let mut limits = Vec::new();
-    for workflow in ["ci.yml", "native-tests.yml"] {
-        let text = std::fs::read_to_string(package.join("../../.github/workflows").join(workflow))
-            .unwrap();
-        limits.extend(
-            text.lines()
-                .filter_map(|line| line.trim().strip_prefix("KURU_COVERAGE_JOB_MINUTES: \""))
-                .map(|value| value.strip_suffix('"').unwrap().parse::<u64>().unwrap()),
-        );
+    // No launch bound in this package's tests is a bare three-minute literal.
+    let literal = ["from_secs(", "180)"].concat();
+    let mut pending = vec![package.join("tests")];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let text = compact(&std::fs::read_to_string(&path).unwrap());
+                assert!(
+                    !text.contains(&literal),
+                    "{} bounds a wait by an underived literal",
+                    path.display()
+                );
+            }
+        }
     }
-    assert!(!limits.is_empty(), "no coverage job limit found");
-    let serial = WRAPPER_LAUNCHES * WRAPPER_LAUNCH_BUDGET.as_secs();
-    for minutes in limits {
-        let window = kuru_delivery::coverage::shard_deadline(0, minutes).unwrap();
-        assert!(
-            serial < window,
-            "a {minutes}-minute coverage job leaves {window} s, within this binary's \
-             {WRAPPER_LAUNCHES} serial launch budgets ({serial} s)"
+
+    // mise's cited settings are the installed release's, and the fixture's
+    // isolated environment overrides none of them.
+    assert_eq!(
+        launch_budget::MISE_VERSION,
+        kuru_delivery::published_windows::WORKFLOW_MISE_VERSION
+    );
+    let isolation = std::fs::read_to_string(package.join("src/mise_isolation.rs")).unwrap();
+    assert!(!isolation.contains("MISE_HTTP_"), "{isolation}");
+
+    for minutes in launch_budget::workflow_job_minutes() {
+        let deadline = kuru_delivery::coverage::shard_deadline(1_000, minutes).unwrap();
+        assert_eq!(
+            launch_budget::remaining_at((1_000, minutes), 1_000),
+            Ok(std::time::Duration::from_secs(deadline - 1_000))
         );
+        let passed = launch_budget::remaining_at((1_000, minutes), deadline).unwrap_err();
+        assert!(passed.contains(&deadline.to_string()), "{passed}");
     }
+    assert!(!launch_budget::until_job_deadline().is_zero());
 }
 
 /// Launch the orchestrator's delivery binary exactly as a coverage task does,
@@ -540,10 +587,13 @@ async fn orchestrator_without_inputs(task: &str, through_cmd: bool) -> (bool, St
             child.env_remove(&variable);
         }
     }
-    let output =
-        kuru_delivery::command::bounded_output(&mut child, WRAPPER_LAUNCH_BUDGET, 16 * 1024)
-            .await
-            .unwrap();
+    let output = kuru_delivery::command::bounded_output(
+        &mut child,
+        launch_budget::until_job_deadline(),
+        16 * 1024,
+    )
+    .await
+    .unwrap();
     (
         output.status.success(),
         format!(
@@ -606,10 +656,13 @@ async fn cmd_mise_launches_published_windows_task_wrapper_before_cargo() {
     ] {
         child.env_remove(variable);
     }
-    let output =
-        kuru_delivery::command::bounded_output(&mut child, WRAPPER_LAUNCH_BUDGET, 16 * 1024)
-            .await
-            .unwrap();
+    let output = kuru_delivery::command::bounded_output(
+        &mut child,
+        launch_budget::until_job_deadline(),
+        16 * 1024,
+    )
+    .await
+    .unwrap();
     assert!(!output.status.success());
     let diagnostic = format!(
         "{}{}",

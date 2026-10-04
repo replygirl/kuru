@@ -1400,8 +1400,13 @@ write them (see below); an older binary ignores it.
 
 ### What the observer sees
 
-The harness timestamps each stderr progress line as it is read, and exit. It
-reads readiness from either of two signals. With `KURU_OPEN_MARKERS=1` set, a
+The harness timestamps each stderr progress line as it is read. It stamps the
+exit only after both output pipes have closed and the command has been reaped,
+on Unix as on Windows, so no progress line is stamped after it. A descendant
+that still holds an output pipe therefore delays the exit stamp; the exit and
+turn-and-exit times are reported, not gated, and
+[the gate](#the-gate-and-its-budgets) budgets the time to ready. It reads
+readiness from either of two signals. With `KURU_OPEN_MARKERS=1` set, a
 binary that supports it writes `kuru-open-marker v1 <event> <monotonic_ns>`
 lines on stderr: `open-start` before the client's first attach attempt,
 `waiting-ownership` only when it waits for project ownership, and `ready`
