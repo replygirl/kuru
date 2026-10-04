@@ -60,7 +60,7 @@ confirms it against the code and records what was done.
 | p1#6 | `dream.rs:1043`, `:1053` (managed Remote) | `timeout(20 s, ..)` barrier and sibling poll | `OPERATION_TIMEOUT` |
 | p1#6 | `dream.rs:1150` (Local) | `timeout(20 s, ..)` staged select | `turn_admission_deadline()` |
 | p1#3 | `dream.rs:879` | `timeout(30 s, whole fixture)` | `kuru_memory::test_support::fixture_deadline(1, 0)`: one fresh store lifecycle, its single-stall term (an owned close) and one statement |
-| p1#68 | `engine.rs:6838`, `:6883` | `timeout(10 s, reached)` | `QUERY_TIMEOUT`: one catalog statement before the pause (engine.rs:4887-4888) |
+| p1#68 | `engine.rs:6838`, `:6883` | `timeout(10 s, reached)` | `turn_admission_deadline()`: one `session_catalog_page` before the pause (engine.rs:4887-4888), a transaction under the store write lock running `DOLT_HASHOF('HEAD')`, `COUNT(*)` and the page query (kuru-memory store.rs:2669-2759) |
 | p1#68 | `engine.rs:6786` | `timeout(10 s, reached)` | `turn_admission_deadline()`: `resume_session` reads before its pause (engine.rs:1183-1222) |
 | p1#26 | `hook_tests.rs:1005` | `timeout(20 s, barrier.wait_sent())` | `OPERATION_TIMEOUT` |
 | p1#26 | `hook_tests.rs:1028` | `timeout(20 s, turn)` join | `join_on_progress` under a gap of at least `OPERATION_TIMEOUT` |
@@ -71,7 +71,7 @@ confirms it against the code and records what was done.
 | p1#59 | `progress_tests.rs:501` | `timeout(20 s, run)` join | `join_on_progress` under `unhooked_gap_bound` |
 | p1#37 | `review_tests.rs:1286`, `:1292` | `timeout(10 s, notified)` | `turn_admission_deadline()` |
 | p1#44 | `review_tests.rs:2501`, `:2508` | `timeout(10 s, yield_now spin)` | `turn_admission_deadline()` |
-| p1#45 | `review_tests.rs:2528` | `timeout(2 s, abort, await, acquire_many(2))` | `QUERY_TIMEOUT`: the actors' `ledger.settle` write before each releases its permit |
+| p1#45 | `review_tests.rs:2528` | `timeout(2 s, abort, await, acquire_many(2))` | `QUERY_TIMEOUT` × `max_parallel` (2): each permit holder's `ledger.settle` write precedes its permit release, and the settles run one after the other on the store write lock, each under its own write budget (kuru-memory usage_ledger.rs:381, :386) |
 | p1#35 | `review_tests.rs:512`, `:574`, `:702`, `:1173`, `:1380` | `timeout(30 s, event)` | `turn_admission_deadline()` |
 | p1#35 | `review_tests.rs:1014` | `timeout(30 s, call_seen)` | the whole-turn budget: the HTTP MCP catalog build precedes the call, each RPC under connectors `IO_TIMEOUT` |
 | p1#36 | `review_tests.rs:518`, `:600`, `:709`, `:823`, `:1019`, `:1178`, `:1295`, `:1385` | `timeout(10 s, task)` join | `join_on_progress`; `unhooked_gap_bound`, or `dream_gap_bound` where the fixture configures `cancelled_post_tool_hook()` (:709, :823, :1178) |

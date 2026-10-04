@@ -2641,9 +2641,10 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
             entered: Mutex::new(Some(entered)),
             dropped: Mutex::new(Some(dropped)),
         });
+    let max_parallel = 2;
         let (_dir, harness) = fixture(
             Config {
-                max_parallel: 2,
+            max_parallel,
                 ..config(Mode::Freudian)
             },
             provider.clone(),
@@ -2711,6 +2712,11 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
     })
     .await
     .expect("two parallel providers must enter while another peer remains queued");
+    // The permit waiter's Work is sent in the same round-0 `join_all`
+    // (engine.rs:3879) as the two providers' Work, after only the model
+    // catalog their entry already initialised (:3184) and a channel send
+    // (:3277), with no memory statement of its own: the admission budget that
+    // enclosed the providers' entry encloses it.
     tokio::time::timeout(crate::tests::turn_admission_deadline(), async {
         while started_work
             .iter()
@@ -2731,11 +2737,26 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
 
     // Both parallel providers must drop; the queued third peer must never
     // begin the cancelled invocation before the next turn is admitted. This is
-    // an eventual drain, not a promptness check: each actor settles its usage
-    // ledger entry (actor.rs:700), a write under one `QUERY_TIMEOUT` write
-    // budget, before it releases its permit, so the drain is bounded by that
-    // budget rather than by a guessed 2 s.
-    let permit = tokio::time::timeout(kuru_memory::test_budgets::QUERY_TIMEOUT, async {
+    // an eventual drain, not a promptness check.
+    // - Each of the `max_parallel` permit holders settles its usage ledger
+    //   entry (actor.rs:700) before its permit drops (actor.rs:383). On this
+    //   reply-closed path the settle's result is discarded (actor.rs:776-778),
+    //   so a settle that spends its whole budget does not fail this test; it
+    //   only frees the permit later.
+    // - The settles run one after the other on the store's write lock
+    //   (kuru-memory usage_ledger.rs:381), and each starts its own
+    //   `QUERY_TIMEOUT` write budget only once it holds that lock (:386).
+    // - The queued peer settles nothing: the turn's cancellation, which its
+    //   permit wait observes first (actor.rs:383-386, engine.rs:278-283), ends
+    //   its run before it admits an invocation (actor.rs:640). So the drain is
+    //   bounded by `max_parallel` write budgets, not by `initial_peers`.
+    // - Not counted: after an expired write, the holder resolves its uncertain
+    //   write under its own `QUERY_TIMEOUT` (kuru-memory store.rs:3885-3895)
+    //   before it releases the lock. Spending that budget too would be a
+    //   second stall on one path, outside the single-stall model
+    //   `fixture_deadline` documents.
+    let drain = kuru_memory::test_budgets::QUERY_TIMEOUT * u32::try_from(max_parallel).unwrap();
+    let permit = tokio::time::timeout(drain, async {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         cancellation
@@ -2747,7 +2768,7 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
             .expect("actor pool remains open")
     })
     .await
-    .expect("cancellation must drop parallel provider work and release both permits within one QUERY_TIMEOUT");
+    .expect("cancellation must drop parallel provider work and release both permits within max_parallel QUERY_TIMEOUT write budgets");
     assert_eq!(provider.active.load(Ordering::SeqCst), 0);
     drop(permit);
 

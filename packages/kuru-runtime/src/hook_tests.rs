@@ -1795,11 +1795,13 @@ async fn dream_tool_rewrites_stay_within_dream_validation_and_annotations_promot
 #[tokio::test]
 async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_descendants() {
     kuru_memory::test_support::closing(async {
-        /// Opens the hold FIFO for writing when the fixture ends, on every path,
-        /// so a descendant that a failed reap left blocked on it reads end of
-        /// file and exits instead of outliving the test. Nothing signals a
-        /// numeric group. With no reader left the non-blocking open fails with
-        /// ENXIO, and there is nothing to release.
+        /// Opens the hold FIFO for writing when the fixture ends, on normal return
+        /// or an unwinding panic, so a descendant that a failed reap left blocked
+        /// on it reads end of file and exits instead of outliving the test. A test
+        /// binary killed by a signal never runs this drop and leaves such a reader
+        /// blocked on the FIFO. Nothing signals a numeric group. With no reader
+        /// left the non-blocking open fails with ENXIO, and there is nothing to
+        /// release.
         struct ReleaseHold(std::path::PathBuf);
         impl Drop for ReleaseHold {
             fn drop(&mut self) {

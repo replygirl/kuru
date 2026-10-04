@@ -6875,8 +6875,13 @@ mod publication_tests {
                     .await
                 }
             });
-        // One session-catalog statement precedes the pause (engine.rs:4887-4888).
-        tokio::time::timeout(kuru_memory::test_budgets::QUERY_TIMEOUT, reached)
+        // The listing reads one `session_catalog_page` before its pause
+        // (engine.rs:4887-4888; kuru-memory store.rs:2669-2759): under the store
+        // write lock, one transaction runs `DOLT_HASHOF('HEAD')`, `COUNT(*)` and
+        // the page query's row fetches, each under `QUERY_TIMEOUT`, then
+        // commits: memory statements under the budget `turn_admission_deadline`
+        // follows.
+        tokio::time::timeout(crate::tests::turn_admission_deadline(), reached)
                 .await
                 .unwrap()
                 .unwrap();
@@ -6924,8 +6929,13 @@ mod publication_tests {
                     .await
                 }
             });
-        // One session-catalog statement precedes the pause (engine.rs:4887-4888).
-        tokio::time::timeout(kuru_memory::test_budgets::QUERY_TIMEOUT, reached)
+        // The listing reads one `session_catalog_page` before its pause
+        // (engine.rs:4887-4888; kuru-memory store.rs:2669-2759): under the store
+        // write lock, one transaction runs `DOLT_HASHOF('HEAD')`, `COUNT(*)` and
+        // the page query's row fetches, each under `QUERY_TIMEOUT`, then
+        // commits: memory statements under the budget `turn_admission_deadline`
+        // follows.
+        tokio::time::timeout(crate::tests::turn_admission_deadline(), reached)
                 .await
                 .unwrap()
                 .unwrap();
