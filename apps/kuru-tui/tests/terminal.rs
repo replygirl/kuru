@@ -2696,7 +2696,17 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
     );
     terminal.read_for(Duration::from_millis(4100))?;
     let settled = terminal.output.len();
-    terminal.read_for(Duration::from_millis(700))?;
+    if reduced {
+        // An absence window, kept: no product event falls due inside it that
+        // a probe frame could be ordered after, so no barrier can replace it.
+        terminal.read_for(Duration::from_millis(700))?;
+    } else {
+        // The next ambient frame is due within `FRAME_ALLOWANCE`, unless the
+        // loop is still recording the first-run notice (one Remote reply).
+        terminal.wait("an ambient animation repaint", READY_TIMEOUT, |terminal| {
+            Ok(terminal.output.len() > settled)
+        })?;
+    }
     assert_eq!(terminal.output.len() == settled, reduced);
 
     // Observe the complete draft frame after focus loss, including its cursor
