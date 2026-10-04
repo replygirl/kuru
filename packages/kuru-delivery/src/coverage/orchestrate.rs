@@ -1051,6 +1051,7 @@ async fn run_shard<H: Host>(
                 root_text,
                 &env,
                 &target,
+                &ledger_path,
                 &profiles,
                 &partition,
                 &mut phases,
@@ -1100,7 +1101,7 @@ async fn run_shard<H: Host>(
     .await
     .context("coverage partition receipt failed")?;
     if llvm_cov.is_some() {
-        profiles.require_unchanged(&target, "after its receipt was written")?;
+        profiles.require_unchanged(&target, &ledger_path, "after its receipt was written")?;
     }
 
     // Export after the receipt, so it can never affect evidence. A failed
@@ -1195,6 +1196,7 @@ async fn export_lines<H: Host>(
     root_text: &str,
     env: &[(OsString, OsString)],
     target: &Path,
+    ledger: &Path,
     profiles: &ProfileSet,
     partition: &PartitionScheme,
     phases: &mut Phases,
@@ -1216,7 +1218,7 @@ async fn export_lines<H: Host>(
     )
     .await
     .context("partition coverage summary failed")?;
-    profiles.require_unchanged(target, "while its coverage was exported")?;
+    profiles.require_unchanged(target, ledger, "while its coverage was exported")?;
     let export = lines::LlvmExport::read(&full)?.partition_line_export(root_text)?;
     let reported = lines::LlvmExport::read(&summary)?.summary_figures(root_text)?;
     let derived = export.figures()?;
@@ -1276,32 +1278,44 @@ impl ProfileSet {
     }
 
     /// Require the target's profiles to be exactly this set still, naming
-    /// every new, changed and removed profile otherwise.
-    fn require_unchanged(&self, target: &Path, when: &str) -> Result<()> {
+    /// every new, changed and removed profile otherwise, and the process and
+    /// test behind each one shown, from the runner `ledger`'s spawn rows.
+    fn require_unchanged(&self, target: &Path, ledger: &Path, when: &str) -> Result<()> {
         let now = profile_set(target)?;
         if &now == self {
             return Ok(());
         }
-        let mut changes = Vec::new();
+        let mut changes: Vec<(&str, &str)> = Vec::new();
         for (name, stamp) in &now.0 {
             match self.0.get(name) {
-                None => changes.push(format!("new {name}")),
-                Some(before) if before != stamp => changes.push(format!("changed {name}")),
+                None => changes.push(("new", name)),
+                Some(before) if before != stamp => changes.push(("changed", name)),
                 Some(_) => {}
             }
         }
         for name in self.0.keys() {
             if !now.0.contains_key(name) {
-                changes.push(format!("removed {name}"));
+                changes.push(("removed", name));
             }
         }
         let shown = changes.len().min(PROFILE_CHANGE_REPORT_LIMIT);
+        let names: Vec<&str> = now.0.keys().map(String::as_str).collect();
+        let writers = match super::plan::read_spawns(ledger) {
+            Ok(spawns) => {
+                super::spawns::attribute(&changes[..shown], &names, &spawns, target).join("; ")
+            }
+            Err(error) => format!("the runner ledger's spawn rows are unreadable: {error:#}"),
+        };
         bail!(
             "coverage partition raw profiles changed {when} ({} profiles; first {shown}: {}); an \
              instrumented process outlived the partition's tests, so its exports and receipt \
-             would not describe one profile set",
+             would not describe one profile set. Writers: {writers}",
             changes.len(),
-            changes[..shown].join(", ")
+            changes[..shown]
+                .iter()
+                .map(|(change, name)| format!("{change} {name}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     }
 }
@@ -2732,16 +2746,17 @@ mod tests {
         }
         fs::write(target.join("other.json"), b"ignored").unwrap();
         let before = profile_set(target).unwrap();
+        let ledger = target.join("runner-ledger.jsonl");
         assert_eq!(before.totals(), (3, 9));
-        before.require_unchanged(target, "now").unwrap();
+        before.require_unchanged(target, &ledger, "now").unwrap();
         fs::write(target.join("other.json"), b"still ignored").unwrap();
-        before.require_unchanged(target, "now").unwrap();
+        before.require_unchanged(target, &ledger, "now").unwrap();
         // A `%m` pool file merged in place keeps its name.
         fs::write(target.join("b.profraw"), b"one and two").unwrap();
         fs::remove_file(target.join("c.profraw")).unwrap();
         fs::write(target.join("d.profraw"), b"late").unwrap();
         let error = before
-            .require_unchanged(target, "during the test")
+            .require_unchanged(target, &ledger, "during the test")
             .unwrap_err()
             .to_string();
         assert!(
@@ -2751,6 +2766,71 @@ mod tests {
             ),
             "{error}"
         );
+        assert!(
+            error.contains("Writers: the runner ledger's spawn rows are unreadable"),
+            "{error}"
+        );
+    }
+
+    /// The CI shape: a supervisor a test dropped live writes its profile
+    /// during the export. Its spawn row names the test, and the listing row
+    /// of the executable that shares its signature names the binary.
+    #[test]
+    fn a_late_profile_names_the_test_that_started_its_process() {
+        use super::super::spawns::{SpawnRecord, TEST_EXECUTABLE};
+
+        let temp = TempDir::new().unwrap();
+        let target = temp.path();
+        let supervisor = target.join("debug/kuru-memory");
+        for name in ["kuru-10-111_0.profraw", "kuru-11-222_0.profraw"] {
+            fs::write(target.join(name), b"tests").unwrap();
+        }
+        let ledger = target.join("runner-ledger.jsonl");
+        let rows = [
+            SpawnRecord::new(
+                10,
+                TEST_EXECUTABLE,
+                &target.join("debug/deps/kuru_runtime-1").to_string_lossy(),
+                "kuru-runtime/lib/kuru_runtime",
+                1,
+            ),
+            SpawnRecord::new(
+                11,
+                "dolt-supervisor",
+                &supervisor.to_string_lossy(),
+                "tests::a",
+                2,
+            ),
+            SpawnRecord::new(
+                12,
+                "dolt-supervisor",
+                &supervisor.to_string_lossy(),
+                "tests::b",
+                3,
+            ),
+        ];
+        let text: String = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap() + "\n")
+            .collect();
+        fs::write(&ledger, text).unwrap();
+        let before = profile_set(target).unwrap();
+        fs::write(target.join("kuru-12-222_0.profraw"), b"late").unwrap();
+        let error = before
+            .require_unchanged(target, &ledger, "while its coverage was exported")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "Writers: new kuru-12-222_0.profraw: pid 12 is the dolt-supervisor \
+                 debug/kuru-memory started by test tests::b (parent pid {}); signature 222 is \
+                 debug/kuru-memory",
+                std::process::id()
+            )),
+            "{error}"
+        );
+        assert!(plan::read_ledger(&ledger).unwrap().is_empty());
+        assert_eq!(plan::read_spawns(&ledger).unwrap().len(), 3);
     }
 
     #[tokio::test]

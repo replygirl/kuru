@@ -174,6 +174,11 @@ impl Terminal {
                 builder.env_remove(name);
             }
         }
+        // The child's own detached spawns name this test in a coverage
+        // partition's spawn rows.
+        for (name, value) in kuru_memory::test_support::spawn_ledger::forwarded() {
+            builder.env(name, value);
+        }
         let launch = format!(
             "program={:?} arguments={:?} directory={:?} LLVM_PROFILE_FILE={}",
             command.get_program(),
@@ -192,6 +197,16 @@ impl Terminal {
             .slave
             .spawn_command(builder)
             .context("spawn terminal child")?;
+        // The child leads its own session, beyond the coverage runner's
+        // group cleanup: record it so a partition names this test if the
+        // child's profile appears after the tests.
+        if let Some(pid) = child.process_id() {
+            kuru_memory::test_support::spawn_ledger::record(
+                pid,
+                std::path::Path::new(command.get_program()),
+                kuru_memory::test_support::spawn_ledger::TERMINAL_CHILD,
+            );
+        }
         drop(pair.slave);
         // Start the pump only after spawn succeeds. A bounded queue applies
         // backpressure without allowing an unbounded collection of owned Vecs.

@@ -2144,6 +2144,7 @@ async fn dream_additions_persist_the_equal_peer_preamble() {
 
 #[tokio::test]
 async fn provider_free_undo_preserves_sessions_and_archives_added_identities() {
+    let supervisors = kuru_memory::test_support::supervisor_mark();
     let (_directory, mut harness) = fixture(Mode::Ifs, Fake::new(|_| answer("Summary"))).await;
     let config = harness.config.clone();
     let scope = harness.scope.clone();
@@ -2195,6 +2196,15 @@ async fn provider_free_undo_preserves_sessions_and_archives_added_identities() {
             .find(|part| part.id == added)
             .unwrap()
             .active
+    );
+    // Close, rather than drop, the last handle: a dropped store's supervisor
+    // stops Dolt and exits on its own after the test returns, and as the last
+    // test of a coverage run it outlived the test process.
+    memory.close().await.unwrap();
+    assert_eq!(
+        kuru_memory::test_support::unawaited_supervisors(&supervisors),
+        Vec::<String>::new(),
+        "the test must await its memory supervisor's exit before it returns"
     );
 }
 

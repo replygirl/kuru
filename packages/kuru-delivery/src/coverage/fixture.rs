@@ -351,7 +351,8 @@ impl ScriptedLauncher {
         if let Some(directory) = &self.profiles {
             self.written += 1;
             fs::write(
-                directory.join(format!("kuru-{}.profraw", self.written)),
+                // `%p-%m`: the count stands in for the process ID.
+                directory.join(format!("kuru-{}-7_0.profraw", self.written)),
                 b"profile",
             )?;
         }

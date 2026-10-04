@@ -163,9 +163,20 @@ struct TemplateRecord {
     label: String,
 }
 
+/// A supervisor whose `Owner` was dropped live: its reaper thread, not a
+/// close, observes its exit, so it can outlive the test that dropped it.
+struct DroppedOwner {
+    id: u64,
+    directory: PathBuf,
+    /// The test that started the supervisor.
+    label: String,
+}
+
 #[derive(Default)]
 pub(crate) struct Ledger {
     live: HashMap<u64, LiveOwner>,
+    /// Every owner this process dropped live, in drop order.
+    dropped: Vec<DroppedOwner>,
     records: HashMap<Key, Record>,
     template_events: Vec<TemplateRecord>,
     /// Supervisors this process started, per store directory, with the
@@ -372,6 +383,39 @@ impl Ledger {
             .sum()
     }
 
+    /// Supervisors registered at or after `first` by the test labelled
+    /// `label` that this process has not reaped, or whose `Owner` was dropped
+    /// live, so that no close awaited their exit.
+    pub(crate) fn unawaited_since(&self, first: u64, label: &str) -> Vec<String> {
+        let mut owners = self
+            .live
+            .iter()
+            .filter(|(id, owner)| **id >= first && owner.label == label && owner.reaper.is_none())
+            .map(|(id, owner)| (*id, &owner.directory, "has not been reaped"))
+            .chain(
+                self.dropped
+                    .iter()
+                    .filter(|owner| owner.id >= first && owner.label == label)
+                    .map(|owner| {
+                        (
+                            owner.id,
+                            &owner.directory,
+                            "was dropped without a close, so its reaper thread, not the test, \
+                             awaited its exit",
+                        )
+                    }),
+            )
+            .map(|(id, directory, state)| {
+                format!(
+                    "Dolt supervisor {id} for store {} {state}",
+                    directory.display()
+                )
+            })
+            .collect::<Vec<_>>();
+        owners.sort();
+        owners
+    }
+
     /// Live owners whose store lies beneath `root` (canonical), for a failure
     /// message.
     pub(crate) fn live_under(&self, root: &Path) -> Vec<String> {
@@ -397,6 +441,13 @@ impl Ledger {
 /// this process observed the supervisor's exit; dropping records quiescence.
 pub(crate) struct LiveEngine {
     id: u64,
+}
+
+/// The identity the next registered supervisor receives: a mark taken
+/// before a test opens memory bounds [`Ledger::unawaited_since`] to that
+/// test's supervisors.
+pub(crate) fn next_id() -> u64 {
+    NEXT.load(Ordering::Relaxed)
 }
 
 /// Register a supervisor this process just spawned for `directory`
@@ -470,9 +521,17 @@ impl Reaper {
                 std::mem::forget(live);
                 let origin = super::lifecycle_trace::label();
                 with(|ledger| {
-                    ledger.live.get_mut(&id).map(|owner| {
+                    let directory = ledger.live.get_mut(&id).map(|owner| {
                         owner.reaper = Some((receiver, origin));
-                        owner.directory.clone()
+                        (owner.directory.clone(), owner.label.clone())
+                    });
+                    directory.map(|(directory, label)| {
+                        ledger.dropped.push(DroppedOwner {
+                            id,
+                            directory: directory.clone(),
+                            label,
+                        });
+                        directory
                     })
                 })
             })
@@ -585,6 +644,59 @@ mod tests {
             "the reap, not the read, is recorded"
         );
         record(&store);
+        drop(root);
+    }
+
+    /// A test's own supervisors are unawaited until it reaps them; one whose
+    /// owner was dropped live stays unawaited after its reaper's report, since
+    /// the test did not await that exit. Earlier marks and other tests'
+    /// supervisors are not charged to it.
+    #[test]
+    fn only_a_close_awaits_a_marked_tests_supervisors() {
+        let root = TempDir::new("kuru-engine-ledger-", None).unwrap();
+        let label = super::super::lifecycle_trace::label();
+        let store = stopped_store(root.path());
+        let before = register(&store);
+        let first = next_id();
+        let unawaited = || with(|ledger| ledger.unawaited_since(first, &label));
+        assert_eq!(unawaited(), Vec::<String>::new());
+
+        let closed = register(&store);
+        assert_eq!(unawaited().len(), 1, "a live supervisor is unawaited");
+        drop(closed);
+        assert_eq!(unawaited(), Vec::<String>::new(), "a reaped one is awaited");
+
+        let reaper = Reaper::handoff(Some(register(&store)));
+        let dropped = unawaited();
+        assert_eq!(dropped.len(), 1);
+        assert!(
+            dropped[0].contains("dropped without a close"),
+            "{dropped:?}"
+        );
+        reaper.report();
+        assert_eq!(
+            unawaited(),
+            dropped,
+            "the reaper's report does not excuse it"
+        );
+
+        let other = std::thread::Builder::new()
+            .name("another::test".into())
+            .spawn({
+                let store = store.clone();
+                move || Reaper::handoff(Some(register(&store)))
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(
+            unawaited(),
+            dropped,
+            "another test's supervisor is not charged"
+        );
+        other.report();
+        drop(before);
+        with(|ledger| ledger.forget_under(&fs::canonicalize(root.path()).unwrap()));
         drop(root);
     }
 
