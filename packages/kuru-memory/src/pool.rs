@@ -628,9 +628,11 @@ impl PooledSession {
 
 impl Drop for PooledSession {
     /// Without an explicit release or close (an error or cancellation path),
-    /// SQLx's own spawned release returns or closes the connection.
+    /// SQLx closes the connection under its existing close-on-drop bound,
+    /// retaining the pool permit instead of draining a pending query to reuse it.
     fn drop(&mut self) {
-        if self.connection.take().is_some() {
+        if let Some(mut connection) = self.connection.take() {
+            connection.close_on_drop();
             self.checked_out.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -655,8 +657,8 @@ impl DerefMut for PooledSession {
 }
 
 /// A transaction on one pooled session. Commit and rollback release the
-/// session inline; dropping it queues SQLx's rollback, which the spawned
-/// release flushes before the connection is idle again.
+/// session inline; dropping it queues SQLx's rollback and closes the owned
+/// connection without waiting for an unfinished query's response.
 pub struct MemoryTransaction {
     session: Option<PooledSession>,
 }
@@ -937,6 +939,9 @@ pub fn pool_acquire_timeout(error: &anyhow::Error) -> Option<&PoolAcquireTimedOu
         io.get_ref()?.downcast_ref::<PoolAcquireTimedOut>()
     })
 }
+
+#[cfg(test)]
+mod cancellation_tests;
 
 #[cfg(test)]
 mod tests {
