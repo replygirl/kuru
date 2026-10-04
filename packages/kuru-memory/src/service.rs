@@ -1529,7 +1529,9 @@ impl FixtureLoggedOwner {
     /// Release the starter's attachment, then await the owner's own exit.
     pub async fn wait_for_exit(mut self) -> Result<()> {
         self.attachment.close();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        // Its last attachment gone, the owner closes its store and exits; the
+        // product bounds that close by `server::close_budget()`.
+        let deadline = tokio::time::Instant::now() + crate::server::close_budget();
         loop {
             if let Some(status) = self.process.try_wait()? {
                 self.process.0.take();
@@ -3416,6 +3418,13 @@ mod tests {
     use tokio::io::duplex;
 
     const FIXTURE_DIAGNOSTIC_TAIL_BYTES: u64 = 4 * 1024;
+
+    /// An owner-side step of one write request that a test awaits: its
+    /// receipt registration precedes its write, its settlement pause follows
+    /// it, and its serving task ends after it (or at once on an abort or a
+    /// departed client). The write spends at most its write budget
+    /// (`QUERY_TIMEOUT`, taken by `write_deadline`).
+    const OWNER_STEP_WITHIN: Duration = crate::store::QUERY_TIMEOUT;
 
     /// A failed start hands its owner's stderr, collected privately for its
     /// stages, to the test's owner diagnostic: appended whole from the start,
@@ -5479,12 +5488,14 @@ mod tests {
                             .await?
                             .context("fixture owner did not accept a client")?;
 
+                        // The purge's permit acquisition answers within the
+                        // product's maintenance deadline.
                         let refused = tokio::time::timeout(
-                            Duration::from_secs(5),
+                            maintenance_deadline(&options),
                             crate::MemoryStore::purge(options.clone()),
                         )
                         .await
-                        .context("busy owner maintenance refusal exceeded five seconds")?
+                        .context("busy owner maintenance refusal exceeded its maintenance deadline")?
                         .expect_err("maintenance admitted another live client");
                         ensure!(
                             format!("{refused:#}").contains("active clients"),
@@ -5506,12 +5517,16 @@ mod tests {
                         );
                         client.close();
 
+                        // The permit waits out the idle owner's close within the
+                        // product's maintenance deadline.
                         let permit = tokio::time::timeout(
-                            Duration::from_secs(20),
+                            maintenance_deadline(&options),
                             acquire_maintenance_permit(&options),
                         )
                         .await
-                        .context("maintenance did not retire the idle owner within 20 seconds")??;
+                        .context(
+                            "maintenance did not retire the idle owner within its maintenance deadline",
+                        )??;
                         ensure!(
                             ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?
                                 .is_none(),
@@ -5541,7 +5556,7 @@ mod tests {
                     served
                         .retire(
                             &options,
-                            Some(Duration::from_secs(20)),
+                            Some(maintenance_deadline(&options)),
                             Duration::from_secs(5),
                             "retired owner did not finish reaping",
                         )
@@ -6673,12 +6688,11 @@ mod tests {
                 "registered in-flight write was not reported as in flight"
             );
             pause.release.notify_one();
-            let (write_result, server_result) =
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    tokio::join!(&mut writer, &mut served)
-                })
-                .await
-                .context("registered write did not settle after release")?;
+            let (write_result, server_result) = tokio::time::timeout(OWNER_STEP_WITHIN, async {
+                tokio::join!(&mut writer, &mut served)
+            })
+            .await
+            .context("registered write did not settle after release")?;
             ensure!(matches!(write_result??, ServiceValue::Unit));
             server_result??;
             ensure!(
@@ -6700,7 +6714,7 @@ mod tests {
             served.abort();
             let _ = tokio::time::timeout(Duration::from_secs(5), &mut served).await;
         }
-        let closed = tokio::time::timeout(Duration::from_secs(10), owner.close())
+        let closed = tokio::time::timeout(crate::server::close_budget(), owner.close())
             .await
             .context("in-flight outcome fixture owner did not reap")?;
         tested.context("in-flight outcome fixture exceeded 40 seconds")??;
@@ -6732,8 +6746,11 @@ mod tests {
             self.client.is_finished() || self.server.is_finished()
         }
 
+        /// One request round trip, which its client bounds by its reply
+        /// deadline (`OPERATION_TIMEOUT`): a write's budget and an outcome
+        /// handler's budget both fit inside it.
         async fn finish(mut self) -> Result<rpc::ServiceResponse> {
-            let (client, server) = tokio::time::timeout(Duration::from_secs(20), async {
+            let (client, server) = tokio::time::timeout(rpc::OPERATION_TIMEOUT, async {
                 tokio::join!(&mut self.client, &mut self.server)
             })
             .await
@@ -6852,7 +6869,7 @@ mod tests {
         }
 
         async fn close(self) -> Result<()> {
-            tokio::time::timeout(Duration::from_secs(20), self.owner.close())
+            tokio::time::timeout(crate::server::close_budget(), self.owner.close())
                 .await
                 .context("settlement fixture owner did not reap")?
         }
@@ -6884,12 +6901,15 @@ mod tests {
         }
     }
 
+    /// Settlement wait events come from an outcome handler, which answers
+    /// within its handler budget of its entry, so every event precedes its
+    /// client's reply deadline (`OPERATION_TIMEOUT`).
     async fn next_wait_event(
         events: &mut tokio::sync::mpsc::UnboundedReceiver<rpc::WaitEvent>,
     ) -> Result<rpc::WaitEvent> {
-        tokio::time::timeout(Duration::from_secs(10), events.recv())
+        tokio::time::timeout(rpc::OPERATION_TIMEOUT, events.recv())
             .await
-            .context("no settlement wait event within 10 seconds")?
+            .context("no settlement wait event within the reply deadline")?
             .context("settlement wait events closed")
     }
 
@@ -6922,7 +6942,7 @@ mod tests {
             let write = append("published before settlement");
             let outcome = unit_outcome(&fx.authority, id, &write)?;
             let writer = fx.spawn_one(id, write).await?;
-            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+            tokio::time::timeout(OWNER_STEP_WITHIN, pause.entered.notified())
                 .await
                 .context("write did not reach settlement")?;
             let reported = outcome_status(fx.call(outcome()).await?)?;
@@ -6961,7 +6981,7 @@ mod tests {
             let write = append("published after the query");
             let outcome = unit_outcome(&fx.authority, id, &write)?;
             let writer = fx.spawn_one(id, write).await?;
-            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+            tokio::time::timeout(OWNER_STEP_WITHIN, pause.entered.notified())
                 .await
                 .context("write did not register")?;
             let query = fx.spawn_one(uuid::Uuid::new_v4(), outcome()).await?;
@@ -7002,7 +7022,7 @@ mod tests {
             };
             let outcome = unit_outcome(&fx.authority, id, &write)?;
             let writer = fx.spawn_one(id, write).await?;
-            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+            tokio::time::timeout(OWNER_STEP_WITHIN, pause.entered.notified())
                 .await
                 .context("write did not register")?;
             fx.progress.set_settlement_wait(Some(Duration::ZERO));
@@ -7075,7 +7095,7 @@ mod tests {
             fx.progress.pause_settlement_next(settlement.clone());
             let id = uuid::Uuid::new_v4();
             let writer = fx.spawn_one(id, admit("visible")).await?;
-            tokio::time::timeout(Duration::from_secs(10), settlement.entered.notified())
+            tokio::time::timeout(OWNER_STEP_WITHIN, settlement.entered.notified())
                 .await
                 .context("usage write did not reach settlement")?;
             let reported = outcome_status(fx.call(query(fx, id, "visible")?).await?)?;
@@ -7094,7 +7114,7 @@ mod tests {
             fx.progress.pause_next(registered.clone());
             let id = uuid::Uuid::new_v4();
             let writer = fx.spawn_one(id, admit("waited")).await?;
-            tokio::time::timeout(Duration::from_secs(10), registered.entered.notified())
+            tokio::time::timeout(OWNER_STEP_WITHIN, registered.entered.notified())
                 .await
                 .context("usage write did not register")?;
             let waiting = fx
@@ -7165,7 +7185,7 @@ mod tests {
                 rpc::exchange_attached_with_id(&mut client, &authority, id, call).await
             });
             let observed = async {
-                tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+                tokio::time::timeout(OWNER_STEP_WITHIN, pause.entered.notified())
                     .await
                     .context("transition did not reach settlement")?;
                 fx.progress.set_settlement_wait(Some(Duration::ZERO));
@@ -7290,7 +7310,7 @@ mod tests {
                         );
                     }
                 }
-                tokio::time::timeout(Duration::from_secs(10), served)
+                tokio::time::timeout(OWNER_STEP_WITHIN, served)
                     .await
                     .context("transition attachment did not end")???;
             }
@@ -7332,7 +7352,7 @@ mod tests {
                 matches!(answered, CandidateTransitionResult::Abandoned),
                 "settled selected abandonment reported {answered:?}"
             );
-            tokio::time::timeout(Duration::from_secs(10), served)
+            tokio::time::timeout(OWNER_STEP_WITHIN, served)
                 .await
                 .context("selected abandonment attachment did not end")???;
             Ok(())
@@ -7356,7 +7376,7 @@ mod tests {
                     },
                 )
                 .await?;
-            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+            tokio::time::timeout(OWNER_STEP_WITHIN, pause.entered.notified())
                 .await
                 .context("candidate creation did not reach settlement")?;
             let query = fx
@@ -7403,11 +7423,11 @@ mod tests {
             let write = append("dropped before dispatch");
             let outcome = unit_outcome(&fx.authority, id, &write)?;
             let mut writer = fx.spawn_one(id, write).await?;
-            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+            tokio::time::timeout(OWNER_STEP_WITHIN, pause.entered.notified())
                 .await
                 .context("write did not register")?;
             writer.server.abort();
-            let aborted = tokio::time::timeout(Duration::from_secs(10), &mut writer.server)
+            let aborted = tokio::time::timeout(OWNER_STEP_WITHIN, &mut writer.server)
                 .await
                 .context("aborted serve task did not end")?;
             ensure!(aborted.is_err_and(|error| error.is_cancelled()));
@@ -7432,7 +7452,7 @@ mod tests {
             let write = append("the original arguments");
             let conflicting = unit_outcome(&fx.authority, id, &append("different arguments"))?;
             let writer = fx.spawn_one(id, write).await?;
-            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+            tokio::time::timeout(OWNER_STEP_WITHIN, pause.entered.notified())
                 .await
                 .context("write did not reach settlement")?;
             let response = fx.call(conflicting()).await?;
@@ -7465,7 +7485,7 @@ mod tests {
             let write = append("paused writer");
             let outcome = unit_outcome(&fx.authority, id, &write)?;
             let writer = fx.spawn_one(id, write).await?;
-            tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+            tokio::time::timeout(OWNER_STEP_WITHIN, pause.entered.notified())
                 .await
                 .context("write did not register")?;
             let query = fx.spawn_one(uuid::Uuid::new_v4(), outcome()).await?;
@@ -7523,7 +7543,7 @@ mod tests {
                 });
                 let outcome = unit_outcome(&fx.authority, id, &write)?;
                 let writer = fx.spawn_one(id, write).await?;
-                tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+                tokio::time::timeout(OWNER_STEP_WITHIN, pause.entered.notified())
                     .await
                     .context("write did not register")?;
                 ensure!(retirement.active_for_test() == 0);
@@ -7543,7 +7563,7 @@ mod tests {
                     });
                     ensure!(next_wait_event(&mut events).await? == rpc::WaitEvent::Entered);
                     call.abort();
-                    let cancelled = tokio::time::timeout(Duration::from_secs(10), call)
+                    let cancelled = tokio::time::timeout(OWNER_STEP_WITHIN, call)
                         .await
                         .context("cancelled client call did not end")?;
                     ensure!(cancelled.is_err_and(|error| error.is_cancelled()));
@@ -7568,7 +7588,7 @@ mod tests {
                     !writer.is_finished(),
                     "writer settled before the client left"
                 );
-                let ended = tokio::time::timeout(Duration::from_secs(10), served)
+                let ended = tokio::time::timeout(OWNER_STEP_WITHIN, served)
                     .await
                     .context("query attachment did not end")??;
                 if let Err(error) = ended {
@@ -7789,7 +7809,9 @@ mod tests {
                 .await;
             };
             ensure!(sibling.generation() == generation);
-            tokio::time::timeout(Duration::from_secs(10), async {
+            // The owner commits the accepted write within its write budget
+            // (`QUERY_TIMEOUT`, taken by `write_deadline`).
+            tokio::time::timeout(crate::store::QUERY_TIMEOUT, async {
                 loop {
                     let ServiceValue::HistoryWindow(window) = sibling
                         .call(ServiceCall::HistoryWindow {
@@ -8258,7 +8280,11 @@ mod tests {
                     transition: CandidateTransitionKind::Promote,
                     branch: branch.clone(), base: base.clone(), target: target.clone(),
                 };
-                tokio::time::timeout(Duration::from_secs(10), async {
+                // No inner bound: each query answers within its handler budget,
+                // but an accepted promotion is a multi-step candidate operation
+                // with no single product budget and may answer `InFlight` more
+                // than once, so the enclosing `FixtureDeadline` bounds the poll.
+                async {
                     loop {
                         let mut observer = attach_existing(&options, &project).await?
                             .context("owner disappeared before promotion proof")?;
@@ -8271,7 +8297,7 @@ mod tests {
                             other => bail!("candidate promotion returned unexpected outcome: {other:?}"),
                         }
                     }
-                }).await.context("accepted promotion proof deadline")??;
+                }.await.context("accepted promotion proof")?;
                 let mut sibling = attach_existing(&options, &project).await?
                     .context("missing service for sibling write")?;
                 ensure!(matches!(sibling.call(ServiceCall::PutMany {
@@ -8320,7 +8346,8 @@ mod tests {
                 }).await.context("candidate abandonment frame send deadline")??;
                 drop(stream);
                 drop(abandoner);
-                tokio::time::timeout(Duration::from_secs(10), async {
+                // No inner bound, as for the promotion proof above.
+                async {
                     loop {
                         let mut observer = attach_existing(&options, &project).await?
                             .context("owner disappeared before abandonment proof")?;
@@ -8340,7 +8367,7 @@ mod tests {
                             other => bail!("candidate abandonment returned unexpected outcome: {other:?}"),
                         }
                     }
-                }).await.context("accepted abandonment proof deadline")??;
+                }.await.context("accepted abandonment proof")?;
                 let _gate = served.restart(_gate, &options, &project, Duration::from_secs(10), "promotion fixture owner did not reap").await?;
                 let mut observer = attach_existing(&options, &project).await?
                     .context("successor did not publish its endpoint")?;

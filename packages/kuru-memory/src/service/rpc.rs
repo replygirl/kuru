@@ -763,6 +763,13 @@ struct ProgressSeams {
     waiters: AtomicUsize,
 }
 
+/// How long an owner-local test pause waits for its release. The paused
+/// request's client gives up on its reply at its reply deadline
+/// (`OPERATION_TIMEOUT`), so a test that held the pause longer could not
+/// observe that reply anyway.
+#[cfg(test)]
+const TEST_PAUSE_RELEASE_WITHIN: std::time::Duration = OPERATION_TIMEOUT;
+
 /// One owner-local test barrier after a mutating request has registered its
 /// receipt key and before it can reach Dolt. Outcome requests remain unpaused.
 #[cfg(test)]
@@ -1003,9 +1010,9 @@ impl ReceiptProgress {
             .take();
         if let Some(pause) = pause {
             pause.entered.notify_one();
-            tokio::time::timeout(std::time::Duration::from_secs(10), pause.release.notified())
+            tokio::time::timeout(TEST_PAUSE_RELEASE_WITHIN, pause.release.notified())
                 .await
-                .context("registered receipt test pause exceeded 10 seconds")?;
+                .context("registered receipt test pause exceeded the reply deadline")?;
         }
         Ok(())
     }
@@ -1020,9 +1027,9 @@ impl ReceiptProgress {
             .take();
         if let Some(pause) = pause {
             pause.entered.notify_one();
-            tokio::time::timeout(std::time::Duration::from_secs(10), pause.release.notified())
+            tokio::time::timeout(TEST_PAUSE_RELEASE_WITHIN, pause.release.notified())
                 .await
-                .context("settlement test pause exceeded 10 seconds")?;
+                .context("settlement test pause exceeded the reply deadline")?;
         }
         Ok(())
     }
@@ -1176,9 +1183,9 @@ impl Retirement {
             .take();
         if let Some(pause) = pause {
             pause.entered.notify_one();
-            tokio::time::timeout(std::time::Duration::from_secs(10), pause.release.notified())
+            tokio::time::timeout(TEST_PAUSE_RELEASE_WITHIN, pause.release.notified())
                 .await
-                .context("dispatch test pause exceeded 10 seconds")?;
+                .context("dispatch test pause exceeded the reply deadline")?;
         }
         Ok(())
     }
