@@ -7,6 +7,10 @@ use std::{fs, path::Path, time::Duration};
 use kuru_delivery::open_time::{self, Options};
 use serde_json::Value;
 
+#[cfg(unix)]
+#[path = "support/launch_budget.rs"]
+mod launch_budget;
+
 fn options(root: &Path, iterations: usize, prompt: &str) -> Options {
     let mut options = Options::new(
         env!("CARGO_BIN_EXE_kuru-delivery-fixture").into(),
@@ -190,7 +194,21 @@ async fn a_process_still_running_from_the_root_is_a_bounded_failure() {
     let root_path = root.path().canonicalize().unwrap();
     let binary = root_path.join("bin/kuru");
     fs::create_dir_all(binary.parent().unwrap()).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_kuru-delivery-fixture"), &binary).unwrap();
+    // A sibling's fork can inherit a writable copy descriptor until exec,
+    // even with CLOEXEC, making Linux refuse this executable with ETXTBSY.
+    // Only the copying child opens the destination for writing; awaiting its
+    // exit leaves no such descriptor in the test parent for siblings to copy.
+    let mut copy = kuru_delivery::command::Command::new("/bin/cp");
+    copy.arg(env!("CARGO_BIN_EXE_kuru-delivery-fixture"))
+        .arg(&binary);
+    let copied = kuru_delivery::command::output(&mut copy, launch_budget::until_job_deadline())
+        .await
+        .expect("fixture executable copy failed to start or finish");
+    assert!(
+        copied.status.success(),
+        "fixture executable copy failed: {}",
+        String::from_utf8_lossy(&copied.stderr)
+    );
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
     // The fixture's copy mode runs until its input closes.
     let mut child = tokio::process::Command::new(&binary)
