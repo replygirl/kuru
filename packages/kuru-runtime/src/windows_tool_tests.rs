@@ -97,259 +97,262 @@ fn call(id: &str, name: &str, arguments: Value) -> ToolCall {
 
 #[tokio::test]
 async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts() -> Result<()> {
-    let temporary = tempfile::tempdir()?;
-    let project = temporary.path().join("project 日本語");
-    std::fs::create_dir(&project)?;
-    let project = project.canonicalize()?;
-    let checkpoint_data = tempfile::tempdir()?;
-    let outside = temporary.path().join("outside.txt");
-    std::fs::write(&outside, b"outside bytes must survive")?;
-    std::fs::hard_link(&outside, project.join("alias"))?;
-    std::fs::write(project.join(".env"), b"private fixture value")?;
-    std::fs::write(project.join("ordinary"), b"ordinary bytes")?;
-    let token = "sk-proj-abcdefghijklmnop0123456789";
-    let marker = "[REDACTED:recognized-secret]";
-    let projection_control = "projection-control-remains-exact";
-    let projection_source = format!("openai_api_key={token}\n{projection_control}");
-    let projected_file_output = format!("openai_api_key={marker}\n{projection_control}");
-    let projection_path = project.join("projection.txt");
-    std::fs::write(&projection_path, &projection_source)?;
-    let literal_path = "literal & name.txt";
-    let literal = "$(Set-Content escaped.txt changed) & | %PATH% ! 日本語";
-    let shell_control = "literal & | < > ^ %PATH% ! 日本語";
-    let shell_stdout = format!("{shell_control}; openai_api_key={token}");
-    let projected_shell_stdout = format!("{shell_control}; openai_api_key={marker}");
-    let mut calls = vec![
-        call(
-            "create",
-            "file_write",
-            json!({"path":literal_path,"content":literal}),
-        ),
-        call("read", "file_read", json!({"path":literal_path})),
-        call(
-            "redacted-read",
-            "file_read",
-            json!({"path":"projection.txt"}),
-        ),
-        call("list", "file_list", json!({"path":"."})),
-        call(
-            "shell",
-            "shell",
-            json!({
-                "command":format!("[Console]::Out.Write('{shell_stdout}'); [Console]::Error.Write('native stderr'); [IO.File]::WriteAllText([IO.Path]::Combine((Get-Location).Path,'shell-created.txt'),'shell bytes'); exit 7")
-            }),
-        ),
-        call(
-            "shell-read",
-            "file_read",
-            json!({"path":"shell-created.txt"}),
-        ),
-        call("delete", "file_delete", json!({"path":literal_path})),
-        call(
-            "shell-delete",
-            "file_delete",
-            json!({"path":"shell-created.txt"}),
-        ),
-    ];
-    for (id, path) in [
-        ("traversal", "..\\outside.txt"),
-        ("trailing", ".env "),
-        ("stream", "ordinary:stream"),
-        ("device", "NUL"),
-        ("hardlink", "alias"),
-        ("metachar", "literal | Set-Content escaped.txt"),
-    ] {
+    kuru_memory::test_support::closing(async {
+        let temporary = tempfile::tempdir()?;
+        let project = temporary.path().join("project 日本語");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let checkpoint_data = tempfile::tempdir()?;
+        let outside = temporary.path().join("outside.txt");
+        std::fs::write(&outside, b"outside bytes must survive")?;
+        std::fs::hard_link(&outside, project.join("alias"))?;
+        std::fs::write(project.join(".env"), b"private fixture value")?;
+        std::fs::write(project.join("ordinary"), b"ordinary bytes")?;
+        let token = "sk-proj-abcdefghijklmnop0123456789";
+        let marker = "[REDACTED:recognized-secret]";
+        let projection_control = "projection-control-remains-exact";
+        let projection_source = format!("openai_api_key={token}\n{projection_control}");
+        let projected_file_output = format!("openai_api_key={marker}\n{projection_control}");
+        let projection_path = project.join("projection.txt");
+        std::fs::write(&projection_path, &projection_source)?;
+        let literal_path = "literal & name.txt";
+        let literal = "$(Set-Content escaped.txt changed) & | %PATH% ! 日本語";
+        let shell_control = "literal & | < > ^ %PATH% ! 日本語";
+        let shell_stdout = format!("{shell_control}; openai_api_key={token}");
+        let projected_shell_stdout = format!("{shell_control}; openai_api_key={marker}");
+        let mut calls = vec![
+            call(
+                "create",
+                "file_write",
+                json!({"path":literal_path,"content":literal}),
+            ),
+            call("read", "file_read", json!({"path":literal_path})),
+            call(
+                "redacted-read",
+                "file_read",
+                json!({"path":"projection.txt"}),
+            ),
+            call("list", "file_list", json!({"path":"."})),
+            call(
+                "shell",
+                "shell",
+                json!({
+                    "command":format!("[Console]::Out.Write('{shell_stdout}'); [Console]::Error.Write('native stderr'); [IO.File]::WriteAllText([IO.Path]::Combine((Get-Location).Path,'shell-created.txt'),'shell bytes'); exit 7")
+                }),
+            ),
+            call(
+                "shell-read",
+                "file_read",
+                json!({"path":"shell-created.txt"}),
+            ),
+            call("delete", "file_delete", json!({"path":literal_path})),
+            call(
+                "shell-delete",
+                "file_delete",
+                json!({"path":"shell-created.txt"}),
+            ),
+        ];
+        for (id, path) in [
+            ("traversal", "..\\outside.txt"),
+            ("trailing", ".env "),
+            ("stream", "ordinary:stream"),
+            ("device", "NUL"),
+            ("hardlink", "alias"),
+            ("metachar", "literal | Set-Content escaped.txt"),
+        ] {
+            calls.push(call(
+                id,
+                "file_write",
+                json!({"path":path,"content":"unauthorized change"}),
+            ));
+        }
+        calls.push(call("private-read", "file_read", json!({"path":".env."})));
+        calls.push(call("hardlink-read", "file_read", json!({"path":"alias"})));
         calls.push(call(
-            id,
-            "file_write",
-            json!({"path":path,"content":"unauthorized change"}),
+            "hardlink-delete",
+            "file_delete",
+            json!({"path":"alias"}),
         ));
-    }
-    calls.push(call("private-read", "file_read", json!({"path":".env."})));
-    calls.push(call("hardlink-read", "file_read", json!({"path":"alias"})));
-    calls.push(call(
-        "hardlink-delete",
-        "file_delete",
-        json!({"path":"alias"}),
-    ));
-    let replay = Arc::new(Replay {
-        calls,
-        observed: Mutex::new(Observed::default()),
-    });
-    let config = Config {
-        mode: Mode::Freudian,
-        provider: "demo".into(),
-        model: "native-replay".into(),
-        max_rounds: 1,
-        max_tool_calls: replay.calls.len() + 1,
-        allow_write: true,
-        allow_shell: true,
-        dream_every: 0,
-        dream_on_exit: false,
-        ..Config::default()
-    };
-    let root = Arc::new(Directory::open(
-        &project,
-        Privacy::Inherited,
-        NameRetention::Movable,
-    )?);
-    let tools =
-        ToolHost::with_retained_root(root.clone(), &config)?.with_checkpoint_store(Arc::new(
-            CheckpointStore::new(&checkpoint_data.path().join("checkpoints"), root)?,
-        ))?;
-    let mut harness = Harness::with_tool_host(
-        config,
-        &project,
-        MemoryStore::temporary().await?,
-        replay.clone(),
-        None,
-        tools,
-    )
-    .await?;
-    let result = tokio::time::timeout(
-        Duration::from_secs(90),
-        harness.run("Exercise the scripted native file and shell requests"),
-    )
+        let replay = Arc::new(Replay {
+            calls,
+            observed: Mutex::new(Observed::default()),
+        });
+        let config = Config {
+            mode: Mode::Freudian,
+            provider: "demo".into(),
+            model: "native-replay".into(),
+            max_rounds: 1,
+            max_tool_calls: replay.calls.len() + 1,
+            allow_write: true,
+            allow_shell: true,
+            dream_every: 0,
+            dream_on_exit: false,
+            ..Config::default()
+        };
+        let root = Arc::new(Directory::open(
+            &project,
+            Privacy::Inherited,
+            NameRetention::Movable,
+        )?);
+        let tools =
+            ToolHost::with_retained_root(root.clone(), &config)?.with_checkpoint_store(Arc::new(
+                CheckpointStore::new(&checkpoint_data.path().join("checkpoints"), root)?,
+            ))?;
+        let mut harness = Harness::with_tool_host(
+            config,
+            &project,
+            MemoryStore::temporary().await?,
+            replay.clone(),
+            None,
+            tools,
+        )
+        .await?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(90),
+            harness.run("Exercise the scripted native file and shell requests"),
+        )
+        .await
+        .context("native model tool replay exceeded its deadline");
+        let closed = harness.shutdown(false).await;
+        let output = result??;
+        closed?;
+        ensure!(
+            output.text == "Native tool replay complete",
+            "replay did not finish: {output:?}"
+        );
+        ensure!(
+            output
+                .events
+                .iter()
+                .filter(|event| event.kind() == "tool")
+                .count()
+                == replay.calls.len(),
+            "not every model request reached the actual tool dispatcher"
+        );
+        let observed = replay.observed.lock().unwrap();
+        ensure!(
+            observed.next == replay.calls.len(),
+            "script did not issue all requests"
+        );
+        ensure!(
+            observed.receipts.len() == replay.calls.len(),
+            "model did not receive every receipt"
+        );
+        ensure!(
+            observed.recipients.len() == 1,
+            "private receipts reached another speaking identity"
+        );
+        for call in &replay.calls {
+            ensure!(
+                observed.receipts.contains_key(&call.id),
+                "missing receipt for {}",
+                call.id
+            );
+        }
+        let receipts = &observed.receipts;
+        for (id, tool) in [
+            ("create", "file_write"),
+            ("delete", "file_delete"),
+            ("shell-delete", "file_delete"),
+        ] {
+            let prefix = format!("{tool} completed; checkpoint file-");
+            let checkpoint = receipts[id]
+                .strip_prefix(&prefix)
+                .with_context(|| format!("{id} receipt omitted its durable checkpoint"))?;
+            ensure!(
+                checkpoint.len() == 64 && checkpoint.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "{id} receipt contained an invalid checkpoint ID"
+            );
+        }
+        ensure!(
+            receipts["read"] == literal,
+            "file argument data was interpreted"
+        );
+        ensure!(
+            receipts["redacted-read"] == projected_file_output,
+            "file result was not projected: {}",
+            receipts["redacted-read"]
+        );
+        let listed: Value = serde_json::from_str(&receipts["list"])
+            .with_context(|| format!("file-list receipt was not JSON: {}", receipts["list"]))?;
+        ensure!(
+            listed[literal_path] == "file" && listed.get(".env").is_none(),
+            "unexpected listing: {listed}"
+        );
+        let shell: Value = serde_json::from_str(&receipts["shell"])
+            .with_context(|| {
+                format!(
+                    "shell receipt was not JSON: {}; shell-read-has-written-bytes={}; shell-delete-succeeded={}",
+                    receipts["shell"],
+                    receipts["shell-read"] == "shell bytes",
+                    receipts["shell-delete"].starts_with("file_delete completed; checkpoint file-")
+                )
+            })?;
+        ensure!(
+            shell["exit_code"] == 7 && shell["success"] == false,
+            "wrong native status: {shell}"
+        );
+        let stdout = shell["stdout"].as_str().context("native stdout")?;
+        ensure!(
+            stdout == projected_shell_stdout,
+            "wrong projected native stdout: {shell}"
+        );
+        ensure!(
+            shell["stderr"] == "native stderr",
+            "wrong native output: {shell}"
+        );
+        ensure!(
+            receipts["shell-read"] == "shell bytes",
+            "shell did not perform its authorized write"
+        );
+        for id in [
+            "traversal",
+            "trailing",
+            "stream",
+            "device",
+            "hardlink",
+            "metachar",
+            "private-read",
+            "hardlink-read",
+            "hardlink-delete",
+        ] {
+            ensure!(
+                receipts[id].starts_with("ERROR: "),
+                "{id} did not reach the model as an error: {}",
+                receipts[id]
+            );
+        }
+        ensure!(
+            std::fs::read(&outside)? == b"outside bytes must survive",
+            "outside file changed"
+        );
+        ensure!(
+            std::fs::read(project.join("alias"))? == b"outside bytes must survive",
+            "hardlink was changed or removed"
+        );
+        ensure!(
+            std::fs::read(project.join(".env"))? == b"private fixture value",
+            "protected file changed"
+        );
+        ensure!(
+            std::fs::read(project.join("ordinary"))? == b"ordinary bytes",
+            "stream base changed"
+        );
+        ensure!(
+            std::fs::read_to_string(&projection_path)? == projection_source,
+            "projected file source was changed"
+        );
+        ensure!(
+            !project.join("ordinary:stream").exists(),
+            "alternate stream was created"
+        );
+        for absent in [literal_path, "shell-created.txt", "escaped.txt"] {
+            ensure!(
+                !project.join(absent).exists(),
+                "unexpected side effect at {absent}"
+            );
+        }
+        Ok(())
+    })
     .await
-    .context("native model tool replay exceeded its deadline");
-    let closed = harness.shutdown(false).await;
-    let output = result??;
-    closed?;
-    ensure!(
-        output.text == "Native tool replay complete",
-        "replay did not finish: {output:?}"
-    );
-    ensure!(
-        output
-            .events
-            .iter()
-            .filter(|event| event.kind() == "tool")
-            .count()
-            == replay.calls.len(),
-        "not every model request reached the actual tool dispatcher"
-    );
-    let observed = replay.observed.lock().unwrap();
-    ensure!(
-        observed.next == replay.calls.len(),
-        "script did not issue all requests"
-    );
-    ensure!(
-        observed.receipts.len() == replay.calls.len(),
-        "model did not receive every receipt"
-    );
-    ensure!(
-        observed.recipients.len() == 1,
-        "private receipts reached another speaking identity"
-    );
-    for call in &replay.calls {
-        ensure!(
-            observed.receipts.contains_key(&call.id),
-            "missing receipt for {}",
-            call.id
-        );
-    }
-    let receipts = &observed.receipts;
-    for (id, tool) in [
-        ("create", "file_write"),
-        ("delete", "file_delete"),
-        ("shell-delete", "file_delete"),
-    ] {
-        let prefix = format!("{tool} completed; checkpoint file-");
-        let checkpoint = receipts[id]
-            .strip_prefix(&prefix)
-            .with_context(|| format!("{id} receipt omitted its durable checkpoint"))?;
-        ensure!(
-            checkpoint.len() == 64 && checkpoint.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "{id} receipt contained an invalid checkpoint ID"
-        );
-    }
-    ensure!(
-        receipts["read"] == literal,
-        "file argument data was interpreted"
-    );
-    ensure!(
-        receipts["redacted-read"] == projected_file_output,
-        "file result was not projected: {}",
-        receipts["redacted-read"]
-    );
-    let listed: Value = serde_json::from_str(&receipts["list"])
-        .with_context(|| format!("file-list receipt was not JSON: {}", receipts["list"]))?;
-    ensure!(
-        listed[literal_path] == "file" && listed.get(".env").is_none(),
-        "unexpected listing: {listed}"
-    );
-    let shell: Value = serde_json::from_str(&receipts["shell"])
-        .with_context(|| {
-            format!(
-                "shell receipt was not JSON: {}; shell-read-has-written-bytes={}; shell-delete-succeeded={}",
-                receipts["shell"],
-                receipts["shell-read"] == "shell bytes",
-                receipts["shell-delete"].starts_with("file_delete completed; checkpoint file-")
-            )
-        })?;
-    ensure!(
-        shell["exit_code"] == 7 && shell["success"] == false,
-        "wrong native status: {shell}"
-    );
-    let stdout = shell["stdout"].as_str().context("native stdout")?;
-    ensure!(
-        stdout == projected_shell_stdout,
-        "wrong projected native stdout: {shell}"
-    );
-    ensure!(
-        shell["stderr"] == "native stderr",
-        "wrong native output: {shell}"
-    );
-    ensure!(
-        receipts["shell-read"] == "shell bytes",
-        "shell did not perform its authorized write"
-    );
-    for id in [
-        "traversal",
-        "trailing",
-        "stream",
-        "device",
-        "hardlink",
-        "metachar",
-        "private-read",
-        "hardlink-read",
-        "hardlink-delete",
-    ] {
-        ensure!(
-            receipts[id].starts_with("ERROR: "),
-            "{id} did not reach the model as an error: {}",
-            receipts[id]
-        );
-    }
-    ensure!(
-        std::fs::read(&outside)? == b"outside bytes must survive",
-        "outside file changed"
-    );
-    ensure!(
-        std::fs::read(project.join("alias"))? == b"outside bytes must survive",
-        "hardlink was changed or removed"
-    );
-    ensure!(
-        std::fs::read(project.join(".env"))? == b"private fixture value",
-        "protected file changed"
-    );
-    ensure!(
-        std::fs::read(project.join("ordinary"))? == b"ordinary bytes",
-        "stream base changed"
-    );
-    ensure!(
-        std::fs::read_to_string(&projection_path)? == projection_source,
-        "projected file source was changed"
-    );
-    ensure!(
-        !project.join("ordinary:stream").exists(),
-        "alternate stream was created"
-    );
-    for absent in [literal_path, "shell-created.txt", "escaped.txt"] {
-        ensure!(
-            !project.join(absent).exists(),
-            "unexpected side effect at {absent}"
-        );
-    }
-    Ok(())
 }

@@ -279,35 +279,38 @@ mod tests {
 
     #[tokio::test]
     async fn selected_preview_uses_streaming_text_but_ignores_settled_records() {
-        let (sender, mut receiver) = watch::channel(None);
-        let _turn = ProgressTurn::new(sender, "turn".into());
-        let mut observer = _turn.round(1).observer();
-        observer
-            .emit(ProviderEvent::ReasoningSummaryDelta {
-                item_id: "stream-item".into(),
-                output_index: 7,
-                summary_index: 3,
-                text: "selected preview".into(),
-            })
-            .await
-            .unwrap();
-        let preview = receiver.borrow_and_update().clone().unwrap();
-        assert_eq!(preview.summary_tail, "selected preview");
+        kuru_memory::test_support::closing(async {
+            let (sender, mut receiver) = watch::channel(None);
+            let _turn = ProgressTurn::new(sender, "turn".into());
+            let mut observer = _turn.round(1).observer();
+            observer
+                .emit(ProviderEvent::ReasoningSummaryDelta {
+                    item_id: "stream-item".into(),
+                    output_index: 7,
+                    summary_index: 3,
+                    text: "selected preview".into(),
+                })
+                .await
+                .unwrap();
+            let preview = receiver.borrow_and_update().clone().unwrap();
+            assert_eq!(preview.summary_tail, "selected preview");
 
-        observer
-            .emit(ProviderEvent::SettledReasoningSummaries(vec![
-                ProviderReasoningSummary {
-                    item_id: Some("settled-item".into()),
-                    output_index: Some(11),
-                    summary_index: 5,
-                    text: "private settled record".into(),
-                },
-            ]))
-            .await
-            .unwrap();
-        assert!(
-            !receiver.has_changed().unwrap(),
-            "settled record must not republish public progress"
-        );
+            observer
+                .emit(ProviderEvent::SettledReasoningSummaries(vec![
+                    ProviderReasoningSummary {
+                        item_id: Some("settled-item".into()),
+                        output_index: Some(11),
+                        summary_index: 5,
+                        text: "private settled record".into(),
+                    },
+                ]))
+                .await
+                .unwrap();
+            assert!(
+                !receiver.has_changed().unwrap(),
+                "settled record must not republish public progress"
+            );
+        })
+        .await
     }
 }

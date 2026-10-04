@@ -233,12 +233,222 @@ fn preview(receiver: &watch::Receiver<Option<FacingProgress>>) -> FacingProgress
 
 #[tokio::test]
 async fn selected_part_and_relationship_only_preview_their_speaking_requests() {
-    for relationship in [false, true] {
+    kuru_memory::test_support::closing(async {
+        for relationship in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let (provider, mut stages) = StagedProvider::new(false);
+            let mut harness = Harness::new(
+                config(),
+                directory.path(),
+                memory.clone(),
+                provider.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+            let ids = harness
+                .topology
+                .parts
+                .iter()
+                .take(2)
+                .map(|part| part.id.clone())
+                .collect::<Vec<_>>();
+            let target = if relationship {
+                harness
+                    .relate(RelationshipKind::Alliance, ids)
+                    .await
+                    .unwrap()
+                    .id
+            } else {
+                ids[0].clone()
+            };
+            let mut progress = harness.subscribe_progress();
+            let run_target = target.clone();
+            let run = tokio::spawn(async move {
+                let result = harness
+                    .run_local_controlled(
+                        "preview request",
+                        Some(&run_target),
+                        "preview-turn",
+                        &CancellationToken::new(),
+                    )
+                    .await;
+                (harness, result)
+            });
+            stage(&mut stages, 1).await;
+            assert!(progress.borrow().is_none(), "private deliberation leaked");
+            provider.release();
+            stage(&mut stages, 2).await;
+            let visible = preview(&progress);
+            assert_eq!(visible.turn_id, "preview-turn");
+            assert_eq!(visible.request_round, 1);
+            assert_eq!(visible.text_tail, "provisional-1");
+            assert_eq!(visible.summary_tail, "VISIBLE-SUMMARY");
+            assert!(!visible.text_tail.contains("PRIVATE"));
+            provider.release();
+            let (mut harness, result) = run.await.unwrap();
+            let result = result.unwrap();
+            assert!(!result.reused);
+            assert_eq!(result.output.speaker, target);
+            assert_eq!(result.output.text, "settled-one");
+            assert!(progress.borrow_and_update().is_none());
+            let history = harness.history().await.unwrap();
+            assert_eq!(history.len(), 2);
+            assert_eq!(history[1].text_projection(), "settled-one");
+            assert!(!history[1].text_projection().contains("VISIBLE-SUMMARY"));
+            let calls = provider.request_count();
+            let replay = harness
+                .run_local_controlled(
+                    "preview request",
+                    Some(&target),
+                    "preview-turn",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(replay.reused);
+            assert_eq!(provider.request_count(), calls);
+            assert!(
+                progress.borrow().is_none(),
+                "exact retry replayed a preview"
+            );
+            harness.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn tool_loop_replaces_preview_and_partial_call_has_no_authority() {
+    kuru_memory::test_support::closing(async {
+        let directory = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let (provider, mut stages) = StagedProvider::new(true);
+        let mut harness = Harness::new(
+            config(),
+            directory.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        let mut progress = harness.subscribe_progress();
+        let mut events = harness.subscribe();
+        let run_target = target.clone();
+        let run = tokio::spawn(async move {
+            let result = harness
+                .run_local_controlled(
+                    "tool request",
+                    Some(&run_target),
+                    "tool-turn",
+                    &CancellationToken::new(),
+                )
+                .await;
+            (harness, result)
+        });
+        stage(&mut stages, 1).await;
+        provider.release();
+        stage(&mut stages, 2).await;
+        let first = preview(&progress);
+        assert_eq!(first.text_tail, "provisional-1");
+        assert_eq!(first.summary_tail, "VISIBLE-SUMMARY");
+        // The streaming tool call is observed, not dropped: the activity leaves
+        // "Responding" without ever carrying the partial argument fragment.
+        assert_eq!(first.activity, "Calling tool");
+        assert!(!first.activity.contains("activation"));
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, Event::ToolSettled { .. }));
+        }
+        provider.release();
+        stage(&mut stages, 3).await;
+        let second = preview(&progress);
+        assert_eq!(second.request_round, 2);
+        assert!(second.seq > first.seq);
+        assert_eq!(second.text_tail, "provisional-2");
+        assert_eq!(second.summary_tail, "");
+        // A fresh round starts back at plain responding.
+        assert_eq!(second.activity, "Responding");
+        provider.release();
+        let (mut harness, result) = run.await.unwrap();
+        assert_eq!(result.unwrap().output.text, "settled-two");
+        assert!(progress.borrow_and_update().is_none());
+        assert!(
+            harness
+                .topology
+                .states
+                .get(&target)
+                .is_some_and(|state| state.note == "bounded preview")
+        );
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    })
+    .await
+}
+
+#[tokio::test]
+async fn tool_call_followed_by_text_in_same_round_returns_to_responding() {
+    kuru_memory::test_support::closing(async {
+        let directory = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let (provider, mut stages) = StagedProvider::new(true);
+        provider.resume_with_text_after_tool();
+        let mut harness = Harness::new(
+            config(),
+            directory.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        let progress = harness.subscribe_progress();
+        let run_target = target.clone();
+        let run = tokio::spawn(async move {
+            let result = harness
+                .run_local_controlled(
+                    "tool request",
+                    Some(&run_target),
+                    "tool-turn",
+                    &CancellationToken::new(),
+                )
+                .await;
+            (harness, result)
+        });
+        stage(&mut stages, 1).await;
+        provider.release();
+        stage(&mut stages, 2).await;
+        let after_text = preview(&progress);
+        // A round can carry a function-call item followed by a message item:
+        // once facing text resumes streaming after the tool call, the label
+        // must leave "Calling tool" rather than staying stuck on it.
+        assert_eq!(after_text.text_tail, "provisional-1-AFTER-TOOL");
+        assert_eq!(after_text.activity, "Responding");
+        provider.release();
+        stage(&mut stages, 3).await;
+        provider.release();
+        let (mut harness, result) = run.await.unwrap();
+        assert_eq!(result.unwrap().output.text, "settled-two");
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    })
+    .await
+}
+
+#[tokio::test]
+async fn relationship_consultation_and_dream_never_publish_private_streams() {
+    kuru_memory::test_support::closing(async {
         let directory = tempfile::tempdir().unwrap();
         let memory = MemoryStore::temporary().await.unwrap();
         let (provider, mut stages) = StagedProvider::new(false);
+        let mut dream_config = config();
+        dream_config.dream_every = 1;
         let mut harness = Harness::new(
-            config(),
+            dream_config,
             directory.path(),
             memory.clone(),
             provider.clone(),
@@ -253,333 +463,138 @@ async fn selected_part_and_relationship_only_preview_their_speaking_requests() {
             .take(2)
             .map(|part| part.id.clone())
             .collect::<Vec<_>>();
-        let target = if relationship {
-            harness
-                .relate(RelationshipKind::Alliance, ids)
-                .await
-                .unwrap()
-                .id
-        } else {
-            ids[0].clone()
-        };
+        let relation = harness
+            .relate(RelationshipKind::Alliance, ids.clone())
+            .await
+            .unwrap();
+        provider.consult(relation.id);
+        let active_parts = harness.topology.parts.len();
         let mut progress = harness.subscribe_progress();
-        let run_target = target.clone();
+        let run_target = ids[0].clone();
         let run = tokio::spawn(async move {
             let result = harness
                 .run_local_controlled(
-                    "preview request",
+                    "consult then dream",
                     Some(&run_target),
-                    "preview-turn",
+                    "private-stream-turn",
                     &CancellationToken::new(),
                 )
                 .await;
             (harness, result)
         });
         stage(&mut stages, 1).await;
-        assert!(progress.borrow().is_none(), "private deliberation leaked");
+        assert!(progress.borrow().is_none());
         provider.release();
         stage(&mut stages, 2).await;
-        let visible = preview(&progress);
-        assert_eq!(visible.turn_id, "preview-turn");
-        assert_eq!(visible.request_round, 1);
-        assert_eq!(visible.text_tail, "provisional-1");
-        assert_eq!(visible.summary_tail, "VISIBLE-SUMMARY");
-        assert!(!visible.text_tail.contains("PRIVATE"));
+        assert_eq!(preview(&progress).text_tail, "provisional-1");
         provider.release();
-        let (mut harness, result) = run.await.unwrap();
-        let result = result.unwrap();
-        assert!(!result.reused);
-        assert_eq!(result.output.speaker, target);
-        assert_eq!(result.output.text, "settled-one");
-        assert!(progress.borrow_and_update().is_none());
-        let history = harness.history().await.unwrap();
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[1].text_projection(), "settled-one");
-        assert!(!history[1].text_projection().contains("VISIBLE-SUMMARY"));
-        let calls = provider.request_count();
-        let replay = harness
-            .run_local_controlled(
-                "preview request",
-                Some(&target),
-                "preview-turn",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(replay.reused);
-        assert_eq!(provider.request_count(), calls);
+        stage(&mut stages, 3).await;
+        let while_consulting = preview(&progress);
+        assert!(!while_consulting.text_tail.contains("PRIVATE-CONSULTATION"));
         assert!(
-            progress.borrow().is_none(),
-            "exact retry replayed a preview"
+            !while_consulting
+                .summary_tail
+                .contains("PRIVATE-CONSULTATION")
+        );
+        provider.release();
+        stage(&mut stages, 4).await;
+        assert_eq!(preview(&progress).text_tail, "provisional-2");
+        provider.release();
+        stage(&mut stages, 5).await;
+        assert!(
+            progress.borrow_and_update().is_none(),
+            "dream leaked into preview"
+        );
+        for _ in 0..active_parts {
+            provider.release();
+        }
+        let (mut harness, result) = tokio::time::timeout(std::time::Duration::from_secs(20), run)
+            .await
+            .expect("dream did not finish")
+            .unwrap();
+        assert_eq!(result.unwrap().output.text, "settled-two");
+        assert!(
+            harness
+                .history()
+                .await
+                .unwrap()
+                .iter()
+                .all(|message| !message.text_projection().contains("PRIVATE-"))
         );
         harness.shutdown(false).await.unwrap();
         memory.close().await.unwrap();
-    }
-}
-
-#[tokio::test]
-async fn tool_loop_replaces_preview_and_partial_call_has_no_authority() {
-    let directory = tempfile::tempdir().unwrap();
-    let memory = MemoryStore::temporary().await.unwrap();
-    let (provider, mut stages) = StagedProvider::new(true);
-    let mut harness = Harness::new(
-        config(),
-        directory.path(),
-        memory.clone(),
-        provider.clone(),
-        None,
-    )
+    })
     .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    let mut progress = harness.subscribe_progress();
-    let mut events = harness.subscribe();
-    let run_target = target.clone();
-    let run = tokio::spawn(async move {
-        let result = harness
-            .run_local_controlled(
-                "tool request",
-                Some(&run_target),
-                "tool-turn",
-                &CancellationToken::new(),
-            )
-            .await;
-        (harness, result)
-    });
-    stage(&mut stages, 1).await;
-    provider.release();
-    stage(&mut stages, 2).await;
-    let first = preview(&progress);
-    assert_eq!(first.text_tail, "provisional-1");
-    assert_eq!(first.summary_tail, "VISIBLE-SUMMARY");
-    // The streaming tool call is observed, not dropped: the activity leaves
-    // "Responding" without ever carrying the partial argument fragment.
-    assert_eq!(first.activity, "Calling tool");
-    assert!(!first.activity.contains("activation"));
-    while let Ok(event) = events.try_recv() {
-        assert!(!matches!(event, Event::ToolSettled { .. }));
-    }
-    provider.release();
-    stage(&mut stages, 3).await;
-    let second = preview(&progress);
-    assert_eq!(second.request_round, 2);
-    assert!(second.seq > first.seq);
-    assert_eq!(second.text_tail, "provisional-2");
-    assert_eq!(second.summary_tail, "");
-    // A fresh round starts back at plain responding.
-    assert_eq!(second.activity, "Responding");
-    provider.release();
-    let (mut harness, result) = run.await.unwrap();
-    assert_eq!(result.unwrap().output.text, "settled-two");
-    assert!(progress.borrow_and_update().is_none());
-    assert!(
-        harness
-            .topology
-            .states
-            .get(&target)
-            .is_some_and(|state| state.note == "bounded preview")
-    );
-    harness.shutdown(false).await.unwrap();
-    memory.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn tool_call_followed_by_text_in_same_round_returns_to_responding() {
-    let directory = tempfile::tempdir().unwrap();
-    let memory = MemoryStore::temporary().await.unwrap();
-    let (provider, mut stages) = StagedProvider::new(true);
-    provider.resume_with_text_after_tool();
-    let mut harness = Harness::new(
-        config(),
-        directory.path(),
-        memory.clone(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let target = harness.topology.parts[0].id.clone();
-    let progress = harness.subscribe_progress();
-    let run_target = target.clone();
-    let run = tokio::spawn(async move {
-        let result = harness
-            .run_local_controlled(
-                "tool request",
-                Some(&run_target),
-                "tool-turn",
-                &CancellationToken::new(),
-            )
-            .await;
-        (harness, result)
-    });
-    stage(&mut stages, 1).await;
-    provider.release();
-    stage(&mut stages, 2).await;
-    let after_text = preview(&progress);
-    // A round can carry a function-call item followed by a message item:
-    // once facing text resumes streaming after the tool call, the label
-    // must leave "Calling tool" rather than staying stuck on it.
-    assert_eq!(after_text.text_tail, "provisional-1-AFTER-TOOL");
-    assert_eq!(after_text.activity, "Responding");
-    provider.release();
-    stage(&mut stages, 3).await;
-    provider.release();
-    let (mut harness, result) = run.await.unwrap();
-    assert_eq!(result.unwrap().output.text, "settled-two");
-    harness.shutdown(false).await.unwrap();
-    memory.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn relationship_consultation_and_dream_never_publish_private_streams() {
-    let directory = tempfile::tempdir().unwrap();
-    let memory = MemoryStore::temporary().await.unwrap();
-    let (provider, mut stages) = StagedProvider::new(false);
-    let mut dream_config = config();
-    dream_config.dream_every = 1;
-    let mut harness = Harness::new(
-        dream_config,
-        directory.path(),
-        memory.clone(),
-        provider.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let ids = harness
-        .topology
-        .parts
-        .iter()
-        .take(2)
-        .map(|part| part.id.clone())
-        .collect::<Vec<_>>();
-    let relation = harness
-        .relate(RelationshipKind::Alliance, ids.clone())
-        .await
-        .unwrap();
-    provider.consult(relation.id);
-    let active_parts = harness.topology.parts.len();
-    let mut progress = harness.subscribe_progress();
-    let run_target = ids[0].clone();
-    let run = tokio::spawn(async move {
-        let result = harness
-            .run_local_controlled(
-                "consult then dream",
-                Some(&run_target),
-                "private-stream-turn",
-                &CancellationToken::new(),
-            )
-            .await;
-        (harness, result)
-    });
-    stage(&mut stages, 1).await;
-    assert!(progress.borrow().is_none());
-    provider.release();
-    stage(&mut stages, 2).await;
-    assert_eq!(preview(&progress).text_tail, "provisional-1");
-    provider.release();
-    stage(&mut stages, 3).await;
-    let while_consulting = preview(&progress);
-    assert!(!while_consulting.text_tail.contains("PRIVATE-CONSULTATION"));
-    assert!(
-        !while_consulting
-            .summary_tail
-            .contains("PRIVATE-CONSULTATION")
-    );
-    provider.release();
-    stage(&mut stages, 4).await;
-    assert_eq!(preview(&progress).text_tail, "provisional-2");
-    provider.release();
-    stage(&mut stages, 5).await;
-    assert!(
-        progress.borrow_and_update().is_none(),
-        "dream leaked into preview"
-    );
-    for _ in 0..active_parts {
-        provider.release();
-    }
-    let (mut harness, result) = tokio::time::timeout(std::time::Duration::from_secs(20), run)
-        .await
-        .expect("dream did not finish")
-        .unwrap();
-    assert_eq!(result.unwrap().output.text, "settled-two");
-    assert!(
-        harness
-            .history()
-            .await
-            .unwrap()
-            .iter()
-            .all(|message| !message.text_projection().contains("PRIVATE-"))
-    );
-    harness.shutdown(false).await.unwrap();
-    memory.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn cancellation_discards_preview_and_resume_keeps_only_durable_marker() {
-    let directory = tempfile::tempdir().unwrap();
-    let memory = MemoryStore::temporary().await.unwrap();
-    let (provider, mut stages) = StagedProvider::new(false);
-    let mut harness = Harness::new(
-        config(),
-        directory.path(),
-        memory.clone(),
-        provider.clone(),
-        None,
-    )
+    kuru_memory::test_support::closing(async {
+        let directory = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let (provider, mut stages) = StagedProvider::new(false);
+        let mut harness = Harness::new(
+            config(),
+            directory.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = harness.session.id.clone();
+        let target = harness.topology.parts[0].id.clone();
+        let mut progress = harness.subscribe_progress();
+        let cancellation = CancellationToken::new();
+        let run_cancel = cancellation.clone();
+        let run_target = target.clone();
+        let run = tokio::spawn(async move {
+            let result = harness
+                .run_local_controlled(
+                    "cancel request",
+                    Some(&run_target),
+                    "cancel-turn",
+                    &run_cancel,
+                )
+                .await;
+            (harness, result)
+        });
+        stage(&mut stages, 1).await;
+        provider.release();
+        stage(&mut stages, 2).await;
+        assert_eq!(preview(&progress).text_tail, "provisional-1");
+        cancellation.cancel();
+        let (mut harness, result) = run.await.unwrap();
+        assert!(result.is_err());
+        assert!(progress.borrow_and_update().is_none());
+        let history = harness.history().await.unwrap();
+        assert!(
+            history
+                .iter()
+                .all(|message| !message.text_projection().contains("provisional-1"))
+        );
+        assert!(harness.retry_last(&CancellationToken::new()).await.is_err());
+        harness.shutdown(false).await.unwrap();
+        let mut resumed = Harness::new(
+            config(),
+            directory.path(),
+            memory.clone(),
+            provider,
+            Some(&session),
+        )
+        .await
+        .unwrap();
+        assert!(
+            resumed
+                .history()
+                .await
+                .unwrap()
+                .iter()
+                .all(|message| !message.text_projection().contains("provisional-1"))
+        );
+        assert!(resumed.subscribe_progress().borrow().is_none());
+        resumed.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    })
     .await
-    .unwrap();
-    let session = harness.session.id.clone();
-    let target = harness.topology.parts[0].id.clone();
-    let mut progress = harness.subscribe_progress();
-    let cancellation = CancellationToken::new();
-    let run_cancel = cancellation.clone();
-    let run_target = target.clone();
-    let run = tokio::spawn(async move {
-        let result = harness
-            .run_local_controlled(
-                "cancel request",
-                Some(&run_target),
-                "cancel-turn",
-                &run_cancel,
-            )
-            .await;
-        (harness, result)
-    });
-    stage(&mut stages, 1).await;
-    provider.release();
-    stage(&mut stages, 2).await;
-    assert_eq!(preview(&progress).text_tail, "provisional-1");
-    cancellation.cancel();
-    let (mut harness, result) = run.await.unwrap();
-    assert!(result.is_err());
-    assert!(progress.borrow_and_update().is_none());
-    let history = harness.history().await.unwrap();
-    assert!(
-        history
-            .iter()
-            .all(|message| !message.text_projection().contains("provisional-1"))
-    );
-    assert!(harness.retry_last(&CancellationToken::new()).await.is_err());
-    harness.shutdown(false).await.unwrap();
-    let mut resumed = Harness::new(
-        config(),
-        directory.path(),
-        memory.clone(),
-        provider,
-        Some(&session),
-    )
-    .await
-    .unwrap();
-    assert!(
-        resumed
-            .history()
-            .await
-            .unwrap()
-            .iter()
-            .all(|message| !message.text_projection().contains("provisional-1"))
-    );
-    assert!(resumed.subscribe_progress().borrow().is_none());
-    resumed.shutdown(false).await.unwrap();
-    memory.close().await.unwrap();
 }

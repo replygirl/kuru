@@ -311,63 +311,74 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn progressing_operation_beyond_a_flat_ten_seconds_reaches_its_event() {
-        let interval = gap() * 2 / 3;
-        assert!(interval * 3 > Duration::from_secs(10));
-        // The old flat wait fails an operation that never stops progressing.
-        let directory = tempfile::tempdir().unwrap();
-        let marker = directory.path().join("old-shape");
-        let mut old = progressing(StepTimings::recording(), 3, interval, marker.clone());
-        assert!(!flat_ten_seconds(&marker).await);
-        old.abort();
-        assert!((&mut old).await.unwrap_err().is_cancelled());
-        // The progress-aware wait accepts it: no silent gap reaches the bound.
-        let marker = directory.path().join("new-shape");
-        let timings = StepTimings::recording();
-        let started = Instant::now();
-        let mut task = progressing(timings.clone(), 3, interval, marker.clone());
-        let waited = until_event(&mut task, exists(&marker), || timings.completed(), gap()).await;
-        assert!(matches!(waited, Waited::Reached));
-        assert!(started.elapsed() >= interval * 3);
-        assert_eq!(timings.completed(), 3);
-        task.abort();
+        kuru_memory::test_support::closing(async {
+            let interval = gap() * 2 / 3;
+            assert!(interval * 3 > Duration::from_secs(10));
+            // The old flat wait fails an operation that never stops progressing.
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("old-shape");
+            let mut old = progressing(StepTimings::recording(), 3, interval, marker.clone());
+            assert!(!flat_ten_seconds(&marker).await);
+            old.abort();
+            assert!((&mut old).await.unwrap_err().is_cancelled());
+            // The progress-aware wait accepts it: no silent gap reaches the bound.
+            let marker = directory.path().join("new-shape");
+            let timings = StepTimings::recording();
+            let started = Instant::now();
+            let mut task = progressing(timings.clone(), 3, interval, marker.clone());
+            let waited =
+                until_event(&mut task, exists(&marker), || timings.completed(), gap()).await;
+            assert!(matches!(waited, Waited::Reached));
+            assert!(started.elapsed() >= interval * 3);
+            assert_eq!(timings.completed(), 3);
+            task.abort();
+        })
+        .await
     }
 
     #[tokio::test(start_paused = true)]
     async fn silent_operation_stalls_after_one_gap_and_names_its_last_step() {
-        let directory = tempfile::tempdir().unwrap();
-        let marker = directory.path().join("never");
-        let timings = StepTimings::recording();
-        let mut task = tokio::spawn({
-            let timings = timings.clone();
-            async move {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                timings.mark("last completed step");
-                std::future::pending::<()>().await
-            }
-        });
-        let started = Instant::now();
-        let waited = until_event(&mut task, exists(&marker), || timings.completed(), gap()).await;
-        assert!(matches!(
-            waited,
-            Waited::Stalled {
-                progress_changes: 1
-            }
-        ));
-        // Silence is measured from the last progress, not from the start.
-        assert!(started.elapsed() >= Duration::from_secs(1) + gap());
-        assert!(timings.render().contains("last completed step"));
-        task.abort();
+        kuru_memory::test_support::closing(async {
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("never");
+            let timings = StepTimings::recording();
+            let mut task = tokio::spawn({
+                let timings = timings.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    timings.mark("last completed step");
+                    std::future::pending::<()>().await
+                }
+            });
+            let started = Instant::now();
+            let waited =
+                until_event(&mut task, exists(&marker), || timings.completed(), gap()).await;
+            assert!(matches!(
+                waited,
+                Waited::Stalled {
+                    progress_changes: 1
+                }
+            ));
+            // Silence is measured from the last progress, not from the start.
+            assert!(started.elapsed() >= Duration::from_secs(1) + gap());
+            assert!(timings.render().contains("last completed step"));
+            task.abort();
+        })
+        .await
     }
 
     #[tokio::test(start_paused = true)]
     async fn operation_that_finishes_first_returns_its_outcome_without_waiting_a_bound() {
-        let directory = tempfile::tempdir().unwrap();
-        let marker = directory.path().join("never");
-        let mut task = tokio::spawn(async { 7 });
-        let started = Instant::now();
-        let waited = until_event(&mut task, exists(&marker), || 0, gap()).await;
-        assert!(matches!(waited, Waited::Finished(Ok(7))));
-        assert!(started.elapsed() < gap());
+        kuru_memory::test_support::closing(async {
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("never");
+            let mut task = tokio::spawn(async { 7 });
+            let started = Instant::now();
+            let waited = until_event(&mut task, exists(&marker), || 0, gap()).await;
+            assert!(matches!(waited, Waited::Finished(Ok(7))));
+            assert!(started.elapsed() < gap());
+        })
+        .await
     }
 
     fn hook_host(root: &Path, hooks: kuru_core::LifecycleHooks) -> Arc<HookHost> {
@@ -402,87 +413,97 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancelled_teardown_progressing_beyond_a_flat_ten_seconds_is_joined() {
-        let directory = tempfile::tempdir().unwrap();
-        let (mut watch, _events) = detached_watch(directory.path());
-        let gap = unhooked_gap_bound(&watch.hooks);
-        let interval = gap * 2 / 3;
-        assert!(interval * 3 > Duration::from_secs(10));
-        // The old shape: one flat 10 s join fails a teardown that never
-        // stops progressing.
-        let mut old = tearing_down(StepTimings::recording(), 3, interval);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(10), &mut old)
-                .await
-                .is_err()
-        );
-        old.abort();
-        // The progress-aware join ends on the task finishing.
-        let started = Instant::now();
-        let mut task = tearing_down(watch.timings.clone(), 3, interval);
-        let joined =
-            try_join_on_progress(&mut task, &mut watch, gap, "teardown", |n| n.to_string()).await;
-        assert_eq!(joined, Ok(7));
-        assert!(started.elapsed() >= interval * 3);
-        assert_eq!(watch.timings.completed(), 3);
+        kuru_memory::test_support::closing(async {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut watch, _events) = detached_watch(directory.path());
+            let gap = unhooked_gap_bound(&watch.hooks);
+            let interval = gap * 2 / 3;
+            assert!(interval * 3 > Duration::from_secs(10));
+            // The old shape: one flat 10 s join fails a teardown that never
+            // stops progressing.
+            let mut old = tearing_down(StepTimings::recording(), 3, interval);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(10), &mut old)
+                    .await
+                    .is_err()
+            );
+            old.abort();
+            // The progress-aware join ends on the task finishing.
+            let started = Instant::now();
+            let mut task = tearing_down(watch.timings.clone(), 3, interval);
+            let joined =
+                try_join_on_progress(&mut task, &mut watch, gap, "teardown", |n| n.to_string())
+                    .await;
+            assert_eq!(joined, Ok(7));
+            assert!(started.elapsed() >= interval * 3);
+            assert_eq!(watch.timings.completed(), 3);
+        })
+        .await
     }
 
     #[tokio::test(start_paused = true)]
     async fn silent_teardown_is_reported_with_its_last_step_and_aborted() {
-        let directory = tempfile::tempdir().unwrap();
-        let (mut watch, events) = detached_watch(directory.path());
-        let gap = unhooked_gap_bound(&watch.hooks);
-        let mut task = tokio::spawn({
-            let timings = watch.timings.clone();
-            async move {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                timings.mark("teardown step before the silence");
-                let _ = events.send(Event::Error {
-                    actor: "pool".into(),
-                    detail: "observed teardown event".into(),
-                });
-                std::future::pending::<u8>().await
-            }
-        });
-        let started = Instant::now();
-        let report =
-            try_join_on_progress(&mut task, &mut watch, gap, "teardown", |n| n.to_string())
-                .await
-                .unwrap_err();
-        assert!(
-            report.contains(&format!("no observable progress for {gap:?}")),
-            "{report}"
-        );
-        // One step mark and one event, observed in the same poll.
-        assert!(report.contains("(1 progress changes seen"), "{report}");
-        assert!(
-            report.contains("last completed step: teardown step before the silence at +"),
-            "{report}"
-        );
-        assert!(report.contains("in-flight hook workers: 0"), "{report}");
-        assert!(report.contains("observed teardown event"), "{report}");
-        assert!(report.contains("it was aborted"), "{report}");
-        // Silence is measured from the last progress, then the task gets one
-        // more gap before it is aborted.
-        assert!(started.elapsed() >= Duration::from_secs(1) + gap * 2);
-        assert!((&mut task).await.unwrap_err().is_cancelled());
+        kuru_memory::test_support::closing(async {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut watch, events) = detached_watch(directory.path());
+            let gap = unhooked_gap_bound(&watch.hooks);
+            let mut task = tokio::spawn({
+                let timings = watch.timings.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    timings.mark("teardown step before the silence");
+                    let _ = events.send(Event::Error {
+                        actor: "pool".into(),
+                        detail: "observed teardown event".into(),
+                    });
+                    std::future::pending::<u8>().await
+                }
+            });
+            let started = Instant::now();
+            let report =
+                try_join_on_progress(&mut task, &mut watch, gap, "teardown", |n| n.to_string())
+                    .await
+                    .unwrap_err();
+            assert!(
+                report.contains(&format!("no observable progress for {gap:?}")),
+                "{report}"
+            );
+            // One step mark and one event, observed in the same poll.
+            assert!(report.contains("(1 progress changes seen"), "{report}");
+            assert!(
+                report.contains("last completed step: teardown step before the silence at +"),
+                "{report}"
+            );
+            assert!(report.contains("in-flight hook workers: 0"), "{report}");
+            assert!(report.contains("observed teardown event"), "{report}");
+            assert!(report.contains("it was aborted"), "{report}");
+            // Silence is measured from the last progress, then the task gets one
+            // more gap before it is aborted.
+            assert!(started.elapsed() >= Duration::from_secs(1) + gap * 2);
+            assert!((&mut task).await.unwrap_err().is_cancelled());
+        })
+        .await
     }
 
     #[tokio::test(start_paused = true)]
     async fn panicking_teardown_is_reported_without_waiting_a_gap() {
-        let directory = tempfile::tempdir().unwrap();
-        let (mut watch, _events) = detached_watch(directory.path());
-        let gap = unhooked_gap_bound(&watch.hooks);
-        let mut task = tokio::spawn(async { panic!("teardown failed") });
-        let started = Instant::now();
-        let report =
-            try_join_on_progress(&mut task, &mut watch, gap, "teardown", |()| String::new())
-                .await
-                .unwrap_err();
-        assert!(
-            report.contains("the teardown task panicked or was aborted"),
-            "{report}"
-        );
-        assert!(started.elapsed() < gap);
+        kuru_memory::test_support::closing(async {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut watch, _events) = detached_watch(directory.path());
+            let gap = unhooked_gap_bound(&watch.hooks);
+            let mut task = tokio::spawn(async { panic!("teardown failed") });
+            let started = Instant::now();
+            let report =
+                try_join_on_progress(&mut task, &mut watch, gap, "teardown", |()| String::new())
+                    .await
+                    .unwrap_err();
+            assert!(
+                report.contains("the teardown task panicked or was aborted"),
+                "{report}"
+            );
+            assert!(started.elapsed() < gap);
+        })
+        .await
     }
 
     #[test]
