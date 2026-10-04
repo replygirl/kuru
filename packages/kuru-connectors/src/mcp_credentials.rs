@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::mcp_cache::ensure_outside_root;
 
-const LOCK_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const LOCK_DEADLINE: Duration = Duration::from_secs(30);
 const LOCK_POLL: Duration = Duration::from_millis(25);
 const LOGICAL_CREDENTIAL_BYTES: usize = 67_899;
 const MAX_CHUNKS: usize = 27;
@@ -1531,14 +1531,14 @@ mod tests {
         let held = store.acquire("first").await.unwrap();
         let other_alias = store.acquire("second").await.unwrap();
         drop(other_alias);
-        let contender = tokio::spawn({
-            let store = store.clone();
-            async move { store.acquire("first").await }
-        });
-        tokio::time::sleep(Duration::from_millis(75)).await;
-        assert!(!contender.is_finished());
+        // One poll runs the contender to its first `try_lock`; it can only be
+        // pending there because `held` owns the same alias lock. After the
+        // release it acquires within `LOCK_DEADLINE`, its own bound.
+        let contender = store.acquire("first");
+        tokio::pin!(contender);
+        assert!(futures::poll!(contender.as_mut()).is_pending());
         drop(held);
-        let acquired = contender.await.unwrap().unwrap();
+        let acquired = contender.await.unwrap();
         drop(acquired);
 
         let lock_directory = data.path().join(&store.directory_name);
