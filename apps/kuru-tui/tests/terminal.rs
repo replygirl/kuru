@@ -649,6 +649,11 @@ fn terminal_timeouts_report_the_launch_and_a_process_tree_snapshot() -> Result<(
 }
 
 #[test]
+fn terminal_exit_drain_rejects_queued_bytes_and_completion_after_its_deadline() -> Result<()> {
+    terminal::exit_drain_deadline_probe()
+}
+
+#[test]
 fn terminal_wait_drains_the_line_written_just_before_exit() -> Result<()> {
     // The child writes LATE and exits at once. A wait that sees the exit must
     // not drop that last line from what the caller observes afterwards.

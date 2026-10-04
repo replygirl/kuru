@@ -14,9 +14,19 @@ Integration update (2026-10-04): PR #210 merged as `2d4b5b8e`; its memory
 budget exports now come from main, and the duplicate `93b8b35c` cherry-pick
 was dropped. PR #208 is also on main. PR #221 merged as `22e1ee60`; the TUI
 wait changes were rebased onto it, retaining the closing wrappers, explicit
-store closes and every prior source change. PR #214 and PR #215 remain the
-unmerged prerequisites in the sequencing below. The earlier coordination
-record follows for provenance.
+store closes and every prior source change. PR #214 merged as `a110b77b`,
+and PR #215 merged as `75966b93` after a110b77b's main CI passed. The final
+rebase onto exact `75966b9309f86fbca78d26d22cb932c57f1369ed` was conflict-free:
+all 15 retained commits are patch-equivalent and every owned TUI source file
+at rebased checkpoint `d304b89d` is byte-identical to `8d64ec1d`. The later
+review correction under task 2.3 changes only the drain loop and its control;
+it does not alter the preserved waits, markers or store closes. The marker budgets
+now reach PR #214's consuming seam. Local final whole-run results and the
+separate comment-only guard correction/pass are recorded under tasks 8.2/8.6;
+fresh exact-head hosted CI is still required. No behavioral acceptance is
+inferred from the rebase. The earlier coordination record follows for provenance.
+
+## Earlier coordination (historical)
 
 No item below is a change slug that exists on this branch, so cospec cannot ledger it (a dangling slug fails `cospec validate --strict`: `blockers/dangling-ref`, observed when `memory-derived-waits` was tried under `Soft-blocked by`). Each is tracked here instead, and in `tasks.md` (task 1.2 for PR 1, task 7.1 for PR #214).
 

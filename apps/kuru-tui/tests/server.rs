@@ -28,7 +28,7 @@ mod turn_budget;
 /// the CLI runs `harness.shutdown(false)` (src/cli.rs `Command::Serve`). As for
 /// `EXIT_TIMEOUT` in tests/terminal.rs, its waits are two `reconcile()` calls,
 /// each one Remote `ViewOperation::Reconcile` under the memory client's reply
-/// deadline `OPERATION_TIMEOUT` (kuru-memory `MemoryStore::reconcile`), and
+/// deadline `OPERATION_TIMEOUT` (kuru-memory src/facade.rs `reconcile`), and
 /// `memory.close()` only drains the client's attachments. `--no-dream` leaves
 /// no exit dream, and this server configures no MCP alias, shell or hook, so
 /// `tools.shutdown()` has nothing to join.

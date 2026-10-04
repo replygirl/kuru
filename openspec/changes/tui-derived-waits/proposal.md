@@ -148,7 +148,10 @@ the content; the adoption is inert, and this change alone does not fix the failu
   `src/ui/runtime_tests.rs` changes. No change to `startup_timeout_secs`, no retry, and
   no weakening of isolation, ownership, recovery or the uncertain-write fence.
 - Remainder rows stay as they are (see Remainder findings).
-- No new helper. No literal without a stated derivation. No visibility change in
+- No new helper except the small test-only extraction of the existing exit-drain
+  loop for queued-channel deadline controls. It checks the same absolute caller
+  deadline before and after each receive, including bytes and completion, and
+  admits no new allowance. No literal without a stated derivation. No visibility change in
   `kuru-memory` beyond PR 1's one commit.
 - The assertions after each wait are byte-identical.
 
@@ -177,13 +180,14 @@ Recorded so they are not mistaken for oversights; none is changed here.
   `tests/support/terminal.rs`, `tests/support/turn_budget.rs` (new),
   `tests/support/windows_terminal.rs`, `tests/terminal.rs`, `tests/unix_shell_turn.rs`
   and `tests/windows_terminal.rs` under `apps/kuru-tui`; this change's openspec
-  directory; and PR 1's one cherry-picked commit. `tests/embedded_runtime.rs` is not
+  directory. PR 1's budget exports now come from merged main; its duplicate
+  cherry-pick was dropped. `tests/embedded_runtime.rs` is not
   edited (t2#9 is deferred).
 - A hung test now reports after its derived bound instead of 5 to 45 s: about 35 s for a
   frame wait, about 130 s for an exit after `/quit`, about 635 s for one A2A request or
   for a runtime-test turn, and about 13.6 minutes for one `kuru run`. Passing runs take
   the same time.
-- Once #214 merges, an open hold lasts up to its test's wait (about 112 s in the
+- With merged #214, an open hold lasts up to its test's wait (about 112 s in the
   terminal tests, 180 s per CLI stage) instead of 30 s; the marker's removal still
   ends it, so a passing run takes the same time.
 - `server.rs` and `unix_shell_turn.rs` include `support/terminal.rs` (Unix only, with

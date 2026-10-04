@@ -50,6 +50,77 @@ const REPORT_OUTPUT_LIMIT: usize = 16 * 1024;
 const LATE_OUTPUT_WINDOW: Duration = Duration::from_millis(500);
 type OutputReceiver = mpsc::Receiver<std::io::Result<Vec<u8>>>;
 
+fn drain_exit_output(
+    receive: &OutputReceiver,
+    parser: &mut vt100::Parser,
+    output: &mut Vec<u8>,
+    deadline: Instant,
+) -> Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), "PTY output drain deadline expired");
+        let message = receive.recv_timeout(remaining.min(TICK));
+        // A receive can finish after its requested wait if this thread was
+        // descheduled. Bytes and EOF/EIO must obey the same deadline as a
+        // timeout; the next iteration also bounds processing of queued data.
+        ensure!(
+            Instant::now() < deadline,
+            "PTY output drain deadline expired"
+        );
+        match message {
+            Ok(Ok(bytes)) => {
+                parser.process(&bytes);
+                output.extend(bytes);
+            }
+            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+pub fn exit_drain_deadline_probe() -> Result<()> {
+    for eio in [false, true] {
+        let queued = || -> Result<OutputReceiver> {
+            let (send, receive) = mpsc::sync_channel(OUTPUT_QUEUE);
+            send.send(Ok(b"QUEUED\r\n".to_vec()))?;
+            send.send(Ok(b"FINAL".to_vec()))?;
+            if eio {
+                send.send(Err(std::io::Error::from_raw_os_error(nix::libc::EIO)))?;
+            }
+            // With no EIO message, dropping the sender is the EOF/disconnect.
+            drop(send);
+            Ok(receive)
+        };
+        let receive = queued()?;
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        let mut output = Vec::new();
+        // The complete queued sequence exists before the already-expired
+        // deadline is supplied. No scheduler delay or positive sleep decides
+        // whether bytes/completion can wrongly win over expiry.
+        let error = drain_exit_output(&receive, &mut parser, &mut output, Instant::now())
+            .expect_err("expired drain accepted queued output and completion");
+        ensure!(error.to_string().contains("deadline expired"), "{error}");
+        ensure!(output.is_empty(), "expired drain consumed queued output");
+
+        let receive = queued()?;
+        drain_exit_output(
+            &receive,
+            &mut parser,
+            &mut output,
+            Instant::now() + READY_TIMEOUT,
+        )?;
+        ensure!(
+            output == b"QUEUED\r\nFINAL",
+            "timely drain lost byte ordering"
+        );
+        ensure!(
+            parser.screen().contents().contains("FINAL"),
+            "timely drain did not update the terminal screen"
+        );
+    }
+    Ok(())
+}
+
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
 ) -> (OutputReceiver, mpsc::Receiver<()>, JoinHandle<()>) {
@@ -646,22 +717,18 @@ impl Terminal {
         // window a descheduled reader could miss. The loop above admits only
         // an exit seen before the deadline, so reaching it here reports output
         // still open after a timely exit: a leaked holder.
-        loop {
-            match self.receive_output(TICK)? {
-                Ok(Ok(bytes)) => {
-                    self.parser.process(&bytes);
-                    self.output.extend(bytes);
-                }
-                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    ensure!(
-                        Instant::now() < deadline,
-                        "PTY output did not close after process exit within the {timeout:?} wait\n{}",
-                        self.diagnostics()
-                    );
-                }
-            }
-        }
+        drain_exit_output(
+            self.receive.as_ref().context("terminal output is closed")?,
+            &mut self.parser,
+            &mut self.output,
+            deadline,
+        )
+        .with_context(|| {
+            format!(
+                "PTY output did not close after process exit within the {timeout:?} wait\n{}",
+                self.diagnostics()
+            )
+        })?;
         ensure!(
             status.success(),
             "child failed: {status:?}\n{}\n{}",
