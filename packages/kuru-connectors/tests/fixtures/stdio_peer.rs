@@ -143,6 +143,20 @@ fn run(executable: &Path) -> io::Result<()> {
                     argument.parse().expect("milliseconds"),
                 ));
             }
+            "park" => {
+                // Hold until the product closes stdin. Drained input is not
+                // part of the transcript, so a parked peer records nothing.
+                io::copy(&mut input, &mut io::sink())?;
+            }
+            "await-release" => {
+                // The owning test creates this file once the peer may go on.
+                // The interval is only the check cadence; the test bounds the
+                // wait, and a never-released peer is reaped with its owner.
+                let release = directory.join(format!("{argument}.release"));
+                while !release.try_exists()? {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
             other => {
                 return Err(io::Error::other(format!(
                     "unknown fixture operation {other}"

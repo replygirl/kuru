@@ -170,6 +170,11 @@ pub enum Step {
     StderrInvalid,
     HoldStderr(u64),
     Sleep(u64),
+    /// Hold the peer, without recording, until the product closes its stdin.
+    Park,
+    /// Hold the peer until the test calls [`StdioFixture::release`] with this
+    /// name. The name is one plan word: it must not contain whitespace.
+    AwaitRelease(&'static str),
     Eof,
 }
 
@@ -214,6 +219,14 @@ impl StdioFixture {
                 Step::StderrInvalid => "stderr-invalid\n".into(),
                 Step::HoldStderr(milliseconds) => format!("hold-stderr {milliseconds}\n"),
                 Step::Sleep(milliseconds) => format!("sleep {milliseconds}\n"),
+                Step::Park => "park\n".into(),
+                Step::AwaitRelease(name) => {
+                    assert!(
+                        !name.is_empty() && !name.contains(char::is_whitespace),
+                        "release name must be one plan word"
+                    );
+                    format!("await-release {name}\n")
+                }
                 Step::Eof => "eof\n".into(),
             })
             .collect();
@@ -226,6 +239,11 @@ impl StdioFixture {
     }
     pub fn command(&self) -> &str {
         self.path.to_str().unwrap()
+    }
+
+    /// Let every peer held at [`Step::AwaitRelease`] with this name go on.
+    pub fn release(&self, name: &str) {
+        std::fs::write(self.directory.path().join(format!("{name}.release")), b"").unwrap();
     }
 
     pub fn conversations(&self) -> Vec<Vec<Value>> {
@@ -247,8 +265,13 @@ impl StdioFixture {
             .collect()
     }
 
+    /// Each awaited request is sent under the product's MCP request bound,
+    /// `crate::IO_TIMEOUT`: `Rpc::request` times the write and the reply
+    /// together (`rpc.rs:545,555`; `Transport::request` passes `IO_TIMEOUT`,
+    /// `mcp.rs:1948`, as does the `rpc.rs:1068-1071` caller). A request the
+    /// peer has not recorded by then has failed in the product as well.
     pub async fn wait_for_requests(&self, count: usize) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(crate::IO_TIMEOUT, async {
             loop {
                 if self.conversations().iter().map(Vec::len).sum::<usize>() >= count {
                     return;
