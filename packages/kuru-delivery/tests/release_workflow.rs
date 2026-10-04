@@ -1495,9 +1495,10 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
     // derives from the same limit the host enforces.
     assert!(steps[0].starts_with("name: Record the job start for the inner test deadline\n"));
     assert!(steps[0].contains("KURU_COVERAGE_JOB_STARTED=%s"));
+    // The job's own limit, at job indentation; a step's bound is not the job's.
     let timeout: Vec<_> = shards
         .lines()
-        .filter_map(|line| line.trim().strip_prefix("timeout-minutes: "))
+        .filter_map(|line| line.strip_prefix("    timeout-minutes: "))
         .collect();
     assert_eq!(timeout, ["45"]);
     let deadlines: Vec<_> = shards

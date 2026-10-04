@@ -35,6 +35,14 @@ must be external to apt.
   every configured apt source" error naming that command. The validator
   (`packages/kuru-delivery/src/repo/workflows.rs`, apt rule) must still see both
   fetches in the new shape; no new validator rule.
+- `packages/kuru-delivery/tests/release_workflow.rs` (found during
+  implementation): `native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed`
+  collected every line of the native `shard` job that trims to
+  `timeout-minutes: ` and required exactly `["45"]`, so the new step-level
+  bound would fail it. Its filter now reads only the job-level key at job
+  indentation (`    timeout-minutes: `); the assertion it guards
+  (`KURU_COVERAGE_JOB_MINUTES` equals the job's limit) is unchanged. The only
+  way to keep the diff to two files would be to drop the step-level backstop.
 - Non-goals: `release.yml` has an identical step and is left unchanged (reported
   as a follow-on); no other workflow step or file, no new workflow, no retry of
   tests. This is the single sanctioned retry shape here: vendor-side (Ubuntu
@@ -100,6 +108,23 @@ source: these are per-wait and per-item bounds, with no documented total cap for
 an `apt-get` process, which is consistent with the 42-minute stall surviving
 them). Hence the external `timeout` wrapper; `Acquire::Retries` is not raised
 or stacked.
+
+Added by the implementer (2026-10-03, read from the same tag 2.8.3 sources):
+`apt-pkg/acquire-worker.cc` `pkgAcquire::Worker::HandleFailure` (lines
+644-648) delays each transient-failure retry when `Acquire::Retries::Delay`
+is true (default `true`) by `min(1 << Iter, Acquire::Retries::Delay::Maximum)`
+seconds (maximum default 30), where `Iter` is 0, 1, 2 for the three default
+retries: 1 + 2 + 4 = 7 s. So one item whose every attempt stalls on a single
+wait is ended by apt itself after at most (1 + 3) x 30 s + 7 s = 127 s
+(inference from the source: `Timeout`, `ConnectionTimedOut` and
+`ConnectionRefused` are among the transient reasons it retries). The hang
+log's fallback, measured: mirror list `Get:1` at 15:53:11.557Z, first Azure
+`Ign:` at 15:53:26.879Z (15.3 s), first fallback `Hit:2` from
+`https://archive.ubuntu.com` at 15:53:28.569Z (17.0 s). The step's per-fetch
+budget is 127 s + 17 s + 43 s (the healthy whole-step maximum above, a
+conservative allowance for one fetch, including the ~26 s dpkg phase) =
+187 s, and its `timeout-minutes` is 2 attempts x 2 fetches x 187 s = 748 s,
+rounded up to 13 minutes.
 
 ## Surfaces
 
