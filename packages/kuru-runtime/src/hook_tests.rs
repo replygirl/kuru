@@ -989,10 +989,11 @@ async fn lost_annotation_reply_reconciles_the_exact_session_without_replaying_ef
         let memory = open().await.unwrap();
         let sibling = open().await.unwrap();
         let provider = CapturingProvider::new(ReplyPlan::Remember);
-        let hooks = LifecycleHooks {
-            post_tool: vec![shell_hook(
+    let hook = shell_hook(
                 "cat >/dev/null; printf x >> post-hook-ran; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"accepted note\"}'",
-            )],
+    );
+    let hooks = LifecycleHooks {
+        post_tool: vec![hook.clone()],
             ..LifecycleHooks::default()
         };
         let mut harness = Harness::new(
@@ -1011,7 +1012,14 @@ async fn lost_annotation_reply_reconciles_the_exact_session_without_replaying_ef
         let (lose_reply, cancelled_reply) = tokio::sync::oneshot::channel();
         *harness.annotation_reply_pause.lock().unwrap() = Some((barrier.clone(), cancelled_reply));
         let driven = target.clone();
-        let turn = tokio::spawn(async move {
+    let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
+    // One silent gap holds one product-bounded step: a managed reply under
+    // `OPERATION_TIMEOUT`, or the post-tool hook's run and the host's quiesce
+    // bound (`dream_gap_bound`, whose memory term is a Local statement budget).
+    let gap = kuru_memory::test_budgets::OPERATION_TIMEOUT.max(
+        crate::progress_wait::dream_gap_bound(&hook, watch.hooks.quiesce_bound()),
+    );
+    let mut turn = tokio::spawn(async move {
             let result = harness
                 .run_local_controlled(
                     "remember once",
@@ -1022,10 +1030,20 @@ async fn lost_annotation_reply_reconciles_the_exact_session_without_replaying_ef
                 .await;
             (harness, result)
         });
-        tokio::time::timeout(std::time::Duration::from_secs(20), barrier.wait_sent())
+    // Admission, the actor's reads, the tool and its post-tool hook (under its
+    // 5 s timeout) run before the annotation write whose reply is paused; each
+    // memory step is a managed reply under `OPERATION_TIMEOUT`
+    // (`open_managed_observed` above).
+    tokio::time::timeout(
+        kuru_memory::test_budgets::OPERATION_TIMEOUT,
+        barrier.wait_sent(),
+    )
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    // Each sibling read is a managed reply under `OPERATION_TIMEOUT`, and the
+    // owner commits the paused annotation write inside its own statement
+    // budget, below it.
+    tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, async {
             loop {
                 let recent = sibling
                     .session_history_window(&namespace, &session_id, 32)
@@ -1045,10 +1063,14 @@ async fn lost_annotation_reply_reconciles_the_exact_session_without_replaying_ef
     // The sibling's read proves the commit and therefore the registered
     // request; the owner answers the engine's one reconcile definitively.
     lose_reply.send(()).unwrap();
-    let (mut harness, first) = tokio::time::timeout(std::time::Duration::from_secs(20), turn)
-        .await
-        .unwrap()
-        .unwrap();
+    let (mut harness, first) = crate::progress_wait::join_on_progress(
+        &mut turn,
+        &mut watch,
+        gap,
+        "turn after the lost annotation reply",
+        |(_, result)| crate::progress_wait::describe_result(&result),
+    )
+    .await;
     let first = first.unwrap();
     assert!(!first.reused);
     assert_eq!(first.output.text, "final answer");
@@ -1773,13 +1795,36 @@ async fn dream_tool_rewrites_stay_within_dream_validation_and_annotations_promot
 #[tokio::test]
 async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_descendants() {
     kuru_memory::test_support::closing(async {
+        /// Opens the hold FIFO for writing when the fixture ends, on normal return
+        /// or an unwinding panic, so a descendant that a failed reap left blocked
+        /// on it reads end of file and exits instead of outliving the test. A test
+        /// binary killed by a signal never runs this drop and leaves such a reader
+        /// blocked on the FIFO. Nothing signals a numeric group. With no reader
+        /// left the non-blocking open fails with ENXIO, and there is nothing to
+        /// release.
+        struct ReleaseHold(std::path::PathBuf);
+        impl Drop for ReleaseHold {
+            fn drop(&mut self) {
+                use std::os::unix::fs::OpenOptionsExt;
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+                    .open(&self.0);
+            }
+        }
+
         let project = tempfile::tempdir().unwrap();
         let marker = project.path().join("second-hook-started");
-        let survived = project.path().join("hook-descendant-survived");
+        // The second hook and its backgrounded descendant each block opening this
+        // FIFO, which nobody writes, so neither can exit on its own however long
+        // the cancelled join takes. Released before `project` removes it.
+        let hold = project.path().join("descendant-hold");
+        nix::unistd::mkfifo(&hold, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let _release = ReleaseHold(hold.clone());
         let script = format!(
-            "request=$(cat); case \"$request\" in *dream-hook-call-1*) printf '%s' '{{\"decision\":\"annotate\",\"annotation\":\"candidate only\"}}';; *) (printf '%s' $$ > '{0}.tmp'; mv '{0}.tmp' '{0}'; sleep 30; printf survived > '{1}') & sleep 30;; esac",
+        "request=$(cat); case \"$request\" in *dream-hook-call-1*) printf '%s' '{{\"decision\":\"annotate\",\"annotation\":\"candidate only\"}}';; *) (printf '%s' $$ > '{0}.tmp'; mv '{0}.tmp' '{0}'; cat '{1}') & cat '{1}';; esac",
             marker.display(),
-            survived.display()
+            hold.display()
         );
         let provider = CapturingProvider::new(ReplyPlan::DreamProposal);
         let hook = shell_hook(&script);
@@ -1807,7 +1852,7 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
                 harness.hook_host(),
             ),
             memory,
-            files: vec![marker.clone(), survived.clone()],
+            files: vec![marker.clone()],
         };
         // Each wait ends on its event; only one silent gap longer than the
         // fixture's stated step budget fails it. The bound also encloses the
@@ -1886,9 +1931,9 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
         );
         // The second hook's backgrounded subshell published the owned group id
         // (`$$`, the root's pid, which leads its group) once it was running, and
-        // it outlives every bound here, so only the reap can have emptied the
-        // group. Signal zero and a listing only; observation never terminates
-        // anything, and an unclassifiable number is not `none_of_ours`.
+        // it blocks on the hold FIFO until released, so only the reap can have
+        // emptied the group. Signal zero and a listing only; observation never
+        // terminates anything, and an unclassifiable number is not `none_of_ours`.
         let group: u32 = std::fs::read_to_string(&marker)
             .unwrap()
             .trim()
@@ -1898,8 +1943,7 @@ async fn cancelled_dream_abandons_candidate_hook_annotations_and_reaps_hook_desc
         assert!(
             reaped.none_of_ours(),
             "hook descendant survived dream cancellation: {reaped}; \
-         descendant outlived its 30 s sleep: {}",
-            survived.exists()
+         it cannot exit on its own while blocked on the hold FIFO"
         );
         harness.shutdown(false).await.unwrap();
     })

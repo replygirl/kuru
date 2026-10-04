@@ -886,7 +886,13 @@ mod cancellation_tests {
     #[tokio::test]
     async fn cancelled_selected_abandon_before_dispatch_keeps_exact_ref_selectable() -> Result<()> {
         kuru_memory::test_support::closing(async {
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            // One fresh store lifecycle (`MemoryStore::temporary()`, a template
+            // copy's engine starts), whose single-stall term covers the owned
+            // `memory.close()` under `close_budget()`, plus one statement. Every
+            // other step is a statement under `QUERY_TIMEOUT`; the shutdown has no
+            // MCP client, shell or hook to clean up.
+            let deadline = kuru_memory::test_support::fixture_deadline(1, 0);
+            tokio::time::timeout(deadline, async {
                 let project = tempfile::tempdir()?;
                 let memory = MemoryStore::temporary().await?;
                 let mut harness = Harness::new(
@@ -936,10 +942,14 @@ mod cancellation_tests {
                 ensure!(memory.revision().await? == live);
                 harness.shutdown(false).await?;
                 memory.close().await
-        })
-        .await
-        .context("selected no-send cancellation fixture exceeded 30 seconds")??;
-        Ok(())
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "selected no-send cancellation fixture exceeded fixture_deadline(1, 0) = {deadline:?}"
+                )
+            })??;
+            Ok(())
         })
         .await
     }
@@ -1056,7 +1066,11 @@ mod cancellation_tests {
                     role,
                     instruction: "Publish only from typed transition proof".into(),
                 }]));
-                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            // Every step before the paused frame (reconcile, the uncontended
+            // dream lease, candidate creation and writes, dream.rs:251-298) is
+            // a managed reply under the client's `OPERATION_TIMEOUT`
+            // (`open_managed_observed` above).
+            tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, async {
                     tokio::select! {
                         () = barrier.wait_sent() => Ok::<(), anyhow::Error>(()),
                         result = &mut dream => anyhow::bail!("dream returned before paused promotion: {result:?}"),
@@ -1066,7 +1080,10 @@ mod cancellation_tests {
                     barrier.promotion_sent(),
                     "managed fixture paused a preparatory call instead of PromoteCandidate"
                 );
-                let accepted = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            // Each sibling read is a managed reply under `OPERATION_TIMEOUT`;
+            // the owner accepts the paused promotion inside its own statement
+            // budget, below it.
+            let accepted = tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, async {
                     loop {
                         let revision = sibling.revision().await?;
                         if revision != before {
@@ -1166,7 +1183,11 @@ mod cancellation_tests {
                     role,
                     instruction: "Remain private until explicit resolution".into(),
                 }]));
-                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            // Reconcile, the uncontended dream lease, candidate creation and
+            // the candidate's writes precede the pause (dream.rs:251-298):
+            // memory statements under the budget `turn_admission_deadline`
+            // follows.
+            tokio::time::timeout(crate::tests::turn_admission_deadline(), async {
                     tokio::select! {
                         ready = staged => ready.context("prepromotion observer disappeared"),
                         result = &mut dream => anyhow::bail!("dream returned before prepromotion pause: {result:?}"),
