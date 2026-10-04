@@ -16,8 +16,9 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use kuru_memory::{
+    OpenOptions,
     server::{Server, ServerOptions},
-    test_support,
+    test_budgets, test_support,
 };
 use sqlx::Row;
 use tokio::{
@@ -37,7 +38,12 @@ fn options(root: &Path, binary: PathBuf) -> ServerOptions {
         directory: root.join("project café"),
         project_scope: "project/server-fixture".into(),
         supervisor: PathBuf::from(env!("CARGO_BIN_EXE_kuru-memory")),
-        timeout: Duration::from_secs(20),
+        // The product's default startup timeout, as `OpenOptions` sets it.
+        timeout: Duration::from_secs(
+            OpenOptions::new(PathBuf::new(), String::new())
+                .config
+                .startup_timeout_secs,
+        ),
         read_only: false,
         retained: None,
         lifecycle_root: if cfg!(windows) {
@@ -86,12 +92,19 @@ async fn configured_startup_budget_is_not_preempted_by_a_shorter_query_timer() -
         "pinned Dolt server did not enable automatic GC from generated configuration"
     );
     // Dolt uses the listener read timeout while executing a result iterator,
-    // including bootstrap DDL. A valid query inside our 20-second budget must
-    // not inherit an unrelated five-second server cancellation timer.
+    // including bootstrap DDL. A valid query inside the configured startup
+    // budget must not inherit an unrelated five-second server cancellation
+    // timer, so the statement sleeps past that timer; its SQL text is built
+    // from `SLEEP`.
+    const SLEEP: Duration = Duration::from_secs(6);
+    let sleep_query = format!("SELECT SLEEP({})", SLEEP.as_secs());
+    // The statement's own budget: the pool acquire ceiling (`QUERY_TIMEOUT`)
+    // and then its deliberate sleep.
+    let statement_within = test_budgets::QUERY_TIMEOUT.saturating_add(SLEEP);
     let started = Instant::now();
     let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        sqlx::query_scalar::<_, i64>("SELECT SLEEP(6)").fetch_one(pool.as_ref()),
+        statement_within,
+        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sleep_query)).fetch_one(pool.as_ref()),
     )
     .await;
     let elapsed = started.elapsed();
@@ -100,7 +113,7 @@ async fn configured_startup_budget_is_not_preempted_by_a_shorter_query_timer() -
     stopped?;
     assert_eq!(
         result
-            .context("controlled query exceeded its outer ten-second bound")?
+            .with_context(|| format!("controlled query exceeded its {statement_within:?} bound"))?
             .with_context(|| format!("query failed after {elapsed:?}"))?,
         0
     );
@@ -539,7 +552,9 @@ fn server_crash_parent_helper() -> Result<()> {
         let _server = open(options(Path::new(&root), binary.into())).await?;
         println!("KURU_SERVER_PARENT_READY");
         std::io::stdout().flush()?;
-        sleep(Duration::from_secs(60)).await;
+        // Stay alive until the test kills this process: the test holds this
+        // stdin open and never writes it, so it ends only with the test.
+        tokio::task::spawn_blocking(|| std::io::stdin().read_to_end(&mut Vec::new())).await??;
         Ok(())
     })
 }
@@ -560,10 +575,15 @@ async fn parent_sigkill_closes_lifetime_pipe_and_allows_a_new_owner() -> Result<
         ])
         .env("KURU_SERVER_FIXTURE_ROOT", root.path())
         .env("KURU_SERVER_FIXTURE_BINARY", &binary)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(fs::File::create(&log)?)
         .spawn()?;
+    // The helper blocks reading this until it is killed; never written.
+    let keep_alive = parent
+        .stdin
+        .take()
+        .context("fixture parent stdin missing")?;
     let output = parent
         .stdout
         .take()
@@ -585,6 +605,7 @@ async fn parent_sigkill_closes_lifetime_pipe_and_allows_a_new_owner() -> Result<
     // Kill/reap our fixture child before any assertion can unwind its tempdir.
     parent.kill()?;
     parent.wait()?;
+    drop(keep_alive);
     let _ = reader.join();
     ready.with_context(|| {
         format!(
@@ -649,7 +670,9 @@ async fn supervisor_sigterm_reaps_and_exits_while_the_parent_pipe_is_open() -> R
             nix::sys::signal::Signal::SIGTERM,
         )?;
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // After SIGTERM the supervisor stops Dolt and exits; the product allows
+    // it `SUPERVISOR_REAP_ALLOWANCE` for that.
+    let deadline = Instant::now() + test_budgets::SUPERVISOR_REAP_ALLOWANCE;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break Some(status);

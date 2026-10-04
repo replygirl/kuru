@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, ensure};
 use kuru_memory::{
     server::{Server, ServerOptions},
-    test_support,
+    test_budgets, test_support,
 };
 use kuru_platform::{
     fs::{Directory, NameRetention, Privacy},
@@ -389,11 +389,13 @@ async fn marker_interruption(after_marker: bool, kill_creator: bool) -> Result<(
             .close(Duration::from_secs(3))
             .await?;
     }
+    // The interrupted creator ends in its owned server close, which the
+    // product bounds by `close_budget()`.
     let status = owner
         .child
         .as_mut()
         .unwrap()
-        .wait(Duration::from_secs(15))
+        .wait(test_budgets::close_budget())
         .await?;
     assert!(
         !status.success(),
@@ -778,11 +780,13 @@ async fn normal_headless_dolt_close_reaps_the_supervisor_and_reopens_accepted_sq
     .await?;
     owner.channel.as_mut().unwrap().write_all(b"C").await?;
     owner.channel.as_mut().unwrap().flush().await?;
+    // The creator's normal close of its real Dolt server, which the product
+    // bounds by `close_budget()`.
     let status = owner
         .child
         .as_mut()
         .unwrap()
-        .wait(Duration::from_secs(15))
+        .wait(test_budgets::close_budget())
         .await?;
     assert!(
         status.success(),

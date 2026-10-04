@@ -45,7 +45,11 @@ fn assert_no_staging_directory(options: &OpenOptions) -> Result<()> {
 #[tokio::test]
 async fn interrupted_migration_close_handoff_retains_guard_until_supervisor_quiesces() -> Result<()>
 {
-    const DEADLINE: Duration = Duration::from_secs(10);
+    // Each wait below is on a step of the interrupted close: the pool
+    // shutdown, the orphaned supervisor's stop and reap of Dolt, and the
+    // startup guard's release after it. The product bounds that close by
+    // `server::close_budget()`.
+    let close_budget = crate::server::close_budget();
 
     let root = Arc::new(tempfile::tempdir()?);
     let data = root.path().join("data");
@@ -108,7 +112,7 @@ async fn interrupted_migration_close_handoff_retains_guard_until_supervisor_quie
     let pool = server.pool("main").await?;
     let mut held = pool.acquire().await?;
     let closing = tokio::spawn(close_migration_worker(server, pool.clone()));
-    tokio::time::timeout(DEADLINE, async {
+    tokio::time::timeout(close_budget, async {
         while !pool.is_closed() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -128,14 +132,14 @@ async fn interrupted_migration_close_handoff_retains_guard_until_supervisor_quie
     // not itself keep a terminated supervisor alive. Observe either the still
     // responsive real Dolt while its original startup guard remains held, or
     // the observer's already-confirmed guard release followed by quiescence.
-    let retained_while_live = tokio::time::timeout(DEADLINE, async {
+    let retained_while_live = tokio::time::timeout(close_budget, async {
         loop {
             match contender.try_lock() {
                 Ok(()) => {
                     let mut quiescence = Box::pin(Server::quiescence_at(
                         &directory,
                         lifecycle_root.as_deref(),
-                        DEADLINE,
+                        close_budget,
                     ));
                     let lease = std::future::poll_fn(|context| {
                         std::task::Poll::Ready(
@@ -174,14 +178,14 @@ async fn interrupted_migration_close_handoff_retains_guard_until_supervisor_quie
     drop(pool);
 
     if retained_while_live {
-        tokio::time::timeout(DEADLINE, async {
+        tokio::time::timeout(close_budget, async {
             loop {
                 match contender.try_lock() {
                     Ok(()) => {
                         let mut quiescence = Box::pin(Server::quiescence_at(
                             &directory,
                             lifecycle_root.as_deref(),
-                            DEADLINE,
+                            close_budget,
                         ));
                         let lease = std::future::poll_fn(|context| {
                             std::task::Poll::Ready(
@@ -210,7 +214,7 @@ async fn interrupted_migration_close_handoff_retains_guard_until_supervisor_quie
         .await
         .context("reaper did not release the original startup guard")??;
     }
-    let lease = Server::quiescence_at(&directory, lifecycle_root.as_deref(), DEADLINE).await?;
+    let lease = Server::quiescence_at(&directory, lifecycle_root.as_deref(), close_budget).await?;
     drop(lease);
     Ok(())
 }
@@ -253,8 +257,14 @@ async fn inspection_owned_old_schema_blocks_writer_without_mutation() -> Result<
 
     options.config.startup_timeout_secs = 1;
     options.config.validate()?;
+    // The refused start ends within the configured startup timeout plus the
+    // supervisor-transport allowance (`Server::open`), then `finish_owner`
+    // reaps the refusing supervisor within `SUPERVISOR_REAP_ALLOWANCE`.
+    let refused_within = Duration::from_secs(options.config.startup_timeout_secs)
+        .saturating_add(crate::server::SUPERVISOR_TRANSPORT_ALLOWANCE)
+        .saturating_add(crate::server::SUPERVISOR_REAP_ALLOWANCE);
     let error = tokio::time::timeout(
-        Duration::from_secs(6),
+        refused_within,
         crate::test_support::spawn_gated_open(options.clone()),
     )
     .await

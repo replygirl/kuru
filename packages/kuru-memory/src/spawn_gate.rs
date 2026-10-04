@@ -273,6 +273,10 @@ mod creation {
         state: Mutex<State>,
         drained: Condvar,
         changed: Notify,
+        /// Observation for this module's tests: [`Self::drain`] found a child
+        /// creation in flight and is about to wait for it. `notify_one` keeps
+        /// a permit, so an observer may register before or after the signal.
+        pub(super) parked: Notify,
     }
 
     /// One child creation in flight; dropping it ends the creation.
@@ -303,6 +307,7 @@ mod creation {
                 }),
                 drained: Condvar::new(),
                 changed: Notify::const_new(),
+                parked: Notify::const_new(),
             }
         }
 
@@ -330,6 +335,7 @@ mod creation {
                 if self.state().in_flight == 0 {
                     return;
                 }
+                self.parked.notify_one();
                 changed.await;
             }
         }
@@ -486,10 +492,27 @@ mod tests {
                     drop(exclusive);
                 });
         });
-        let early =
-            tokio::time::timeout(std::time::Duration::from_millis(200), &mut acquired_seen).await;
+        // Wait, without a window, until the taker's drain parks on the
+        // creation this test holds. The drain signals `parked` only after it
+        // has found that creation in flight, just before it waits, and on
+        // this private gate nothing ends that wait until `creation` drops, so
+        // a taker whose drain signalled cannot have acquired. A drain that
+        // returned without waiting never signals: its taker acquires and
+        // sends, so the second arm fails the test on every run. A taker that
+        // ended without sending fails that arm too, through the closed
+        // channel.
+        tokio::select! {
+            biased;
+            () = GATE.creations.parked.notified() => {}
+            acquired = &mut acquired_seen => panic!(
+                "the lock taker did not wait for a child creation in flight: {acquired:?}"
+            ),
+        }
         assert!(
-            early.is_err(),
+            matches!(
+                acquired_seen.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
             "the lock taker overlapped a child creation in flight"
         );
         drop(creation);

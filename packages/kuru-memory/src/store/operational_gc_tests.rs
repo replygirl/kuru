@@ -1,7 +1,12 @@
 use super::*;
 use serde_json::json;
 
-const TEST_DEADLINE: Duration = Duration::from_secs(10);
+// The bounded waits in this file end on a candidate operation, a statement,
+// a write, a server-session end or a join of one of them once its blocker is
+// gone. Each waits on a step the product bounds by one statement or write
+// budget, `QUERY_TIMEOUT`: the session-end and branch-session waits that
+// reconciliation and candidate transitions use, and `write_deadline`. The
+// two reopens use the fixture budget for one reopened lifecycle.
 
 #[test]
 fn candidate_failure_record_exposes_only_fixed_stage_and_sql_class() {
@@ -119,7 +124,7 @@ async fn lost_receipt_reply_settles_and_remains_indexed_after_later_write() -> R
         1
     );
     drop(connection);
-    tokio::time::timeout(TEST_DEADLINE, next).await???;
+    tokio::time::timeout(QUERY_TIMEOUT, next).await???;
     let third_revision = store.revision().await?;
 
     let receipts: Vec<String> = sqlx::query_scalar("SELECT id FROM operations")
@@ -210,7 +215,7 @@ async fn live_transition_session_blocks_abandon_until_exact_teardown() -> Result
     );
 
     drop(connection);
-    tokio::time::timeout(TEST_DEADLINE, abandoning).await???;
+    tokio::time::timeout(QUERY_TIMEOUT, abandoning).await???;
     assert!(candidate_heads(&store.pool, &names).await?.is_empty());
     store.put("after abandonment", &json!(true)).await?;
     store.close().await
@@ -377,10 +382,10 @@ async fn held_candidate_view_delays_explicit_abandonment_without_losing_history(
         )
         .await
     });
-    tokio::time::timeout(TEST_DEADLINE, wait_started)
+    tokio::time::timeout(QUERY_TIMEOUT, wait_started)
         .await
         .context("held source session was not observed by the retirement wait")??;
-    let error = tokio::time::timeout(TEST_DEADLINE, waiting)
+    let error = tokio::time::timeout(QUERY_TIMEOUT, waiting)
         .await??
         .expect_err("live candidate session permitted status rename");
     assert!(
@@ -417,9 +422,9 @@ async fn held_candidate_view_delays_explicit_abandonment_without_losing_history(
     .await?;
     assert_eq!(exact_session, 1, "held source session ended before refusal");
     drop(held);
-    await_session_end(&store.pool, held_id, TEST_DEADLINE).await?;
+    await_session_end(&store.pool, held_id, QUERY_TIMEOUT).await?;
     drop(source_pool);
-    tokio::time::timeout(TEST_DEADLINE, candidate.abandon()).await??;
+    tokio::time::timeout(QUERY_TIMEOUT, candidate.abandon()).await??;
     assert!(candidate_heads(&store.pool, &names).await?.is_empty());
     store.put("after held view", &json!(true)).await?;
     store.close().await
@@ -462,7 +467,7 @@ async fn candidate_source_admission_waits_for_server_session_before_status_renam
     let mut transition = tokio::spawn(async move {
         transition_candidate(&transition_store, &source, &status, &expected).await
     });
-    tokio::time::timeout(TEST_DEADLINE, wait_started)
+    tokio::time::timeout(QUERY_TIMEOUT, wait_started)
         .await
         .context("candidate pool was not retired before the server-session wait")??;
     assert!(
@@ -516,7 +521,7 @@ async fn candidate_source_admission_waits_for_server_session_before_status_renam
         let _ = attempted.send(());
         server.pool(&blocked_source).await
     });
-    tokio::time::timeout(TEST_DEADLINE, attempt_started).await??;
+    tokio::time::timeout(QUERY_TIMEOUT, attempt_started).await??;
     assert!(
         tokio::time::timeout(Duration::from_millis(80), &mut source_acquisition)
             .await
@@ -524,14 +529,14 @@ async fn candidate_source_admission_waits_for_server_session_before_status_renam
         "a new source pool crossed the status-transition fence"
     );
     let unrelated =
-        tokio::time::timeout(TEST_DEADLINE, store.shared.server.pool(&store.branch)).await??;
+        tokio::time::timeout(QUERY_TIMEOUT, store.shared.server.pool(&store.branch)).await??;
     drop(unrelated);
 
     drop(held);
-    await_session_end(&store.pool, id, TEST_DEADLINE).await?;
-    tokio::time::timeout(TEST_DEADLINE, transition).await???;
+    await_session_end(&store.pool, id, QUERY_TIMEOUT).await?;
+    tokio::time::timeout(QUERY_TIMEOUT, transition).await???;
     assert!(
-        tokio::time::timeout(TEST_DEADLINE, source_acquisition)
+        tokio::time::timeout(QUERY_TIMEOUT, source_acquisition)
             .await??
             .is_err(),
         "the retired source branch became available again after status rename"
@@ -841,7 +846,13 @@ async fn cancelled_startup_recovery_reaps_before_handoff_and_preserves_pending_i
         resume: resume.clone(),
     }));
     let opening = tokio::spawn(crate::test_support::spawn_gated_open(interrupted));
-    let _permit = tokio::time::timeout(TEST_DEADLINE, reached.acquire()).await??;
+    // One reopened lifecycle reaches its candidate recovery inside the
+    // single-stall fixture budget for it.
+    let _permit = tokio::time::timeout(
+        crate::test_support::fixture_deadline(0, 1),
+        reached.acquire(),
+    )
+    .await??;
     opening.abort();
     assert!(
         opening
@@ -851,8 +862,11 @@ async fn cancelled_startup_recovery_reaps_before_handoff_and_preserves_pending_i
     );
     resume.add_permits(1);
 
+    // The reopen waits out the cancelled worker's reap (an owned close) and
+    // then starts its own server: one reopened lifecycle with one stalled
+    // step, the fixture budget for it.
     let reopened = tokio::time::timeout(
-        TEST_DEADLINE,
+        crate::test_support::fixture_deadline(0, 1),
         crate::test_support::spawn_gated_open(options),
     )
     .await??;
@@ -908,7 +922,7 @@ async fn full_gc_preserves_live_candidate_historical_and_export_views() -> Resul
     assert_eq!(auto_gc_enabled, 1);
 
     tokio::time::timeout(
-        TEST_DEADLINE,
+        QUERY_TIMEOUT,
         sqlx::query("CALL DOLT_GC('--full')").fetch_all(store.pool.as_ref()),
     )
     .await??;
@@ -971,8 +985,8 @@ async fn lingering_session(store: &MemoryStore, branch: &str) -> Result<Lingerin
 impl LingeringSession {
     async fn end(self, store: &MemoryStore) -> Result<()> {
         let _ = self.release.send(());
-        tokio::time::timeout(TEST_DEADLINE, self.closed).await???;
-        await_session_end(&store.pool, self.id, TEST_DEADLINE).await
+        tokio::time::timeout(QUERY_TIMEOUT, self.closed).await???;
+        await_session_end(&store.pool, self.id, QUERY_TIMEOUT).await
     }
 }
 
@@ -1028,7 +1042,7 @@ async fn await_session_wait<T: std::fmt::Debug>(
 ) -> Result<()> {
     tokio::select! {
         biased;
-        observed = tokio::time::timeout(TEST_DEADLINE, wait_started) => {
+        observed = tokio::time::timeout(QUERY_TIMEOUT, wait_started) => {
             observed.with_context(|| format!("{path} did not observe its lingering session"))??;
             Ok(())
         }
@@ -1088,7 +1102,7 @@ async fn promoted_cleanup_deletes_status_ref_only_after_its_lingering_session_en
     );
 
     session.end(&store).await?;
-    let promoted = tokio::time::timeout(TEST_DEADLINE, promotion).await???;
+    let promoted = tokio::time::timeout(QUERY_TIMEOUT, promotion).await???;
     assert_eq!(promoted, target);
     assert!(candidate_heads(&store.pool, &names).await?.is_empty());
     assert_eq!(store.revision().await?, target);
@@ -1143,7 +1157,7 @@ async fn abandoned_cleanup_probes_and_deletes_only_after_its_lingering_session_e
     );
 
     session.end(&store).await?;
-    tokio::time::timeout(TEST_DEADLINE, abandonment).await???;
+    tokio::time::timeout(QUERY_TIMEOUT, abandonment).await???;
     assert!(candidate_heads(&store.pool, &names).await?.is_empty());
     assert_eq!(store.revision().await?, base);
     assert_eq!(store.get("abandoned cleanup linger").await?, None);
@@ -1190,7 +1204,7 @@ async fn candidate_deletion_refuses_a_session_that_outlives_retirement() -> Resu
     ] {
         let session = lingering_session(&store, branch).await?;
         let error = tokio::time::timeout(
-            TEST_DEADLINE,
+            QUERY_TIMEOUT,
             delete_candidate_ref(&store, branch, target, force, Duration::from_millis(500)),
         )
         .await?
@@ -1232,10 +1246,10 @@ async fn candidate_deletion_refuses_a_session_that_outlives_retirement() -> Resu
 
     // Nothing was lost: once the sessions end, the ordinary product paths finish.
     assert_eq!(
-        tokio::time::timeout(TEST_DEADLINE, promoted.promote()).await??,
+        tokio::time::timeout(QUERY_TIMEOUT, promoted.promote()).await??,
         promoted_target
     );
-    tokio::time::timeout(TEST_DEADLINE, abandoned.abandon()).await??;
+    tokio::time::timeout(QUERY_TIMEOUT, abandoned.abandon()).await??;
     assert!(
         candidate_heads(&store.pool, &promoted_names)
             .await?
@@ -1376,7 +1390,7 @@ async fn slow_30s_managed_abandon_cleanup_bound_fences_client_and_keeps_status_r
                     let started = Instant::now();
                     let (abandoned, released) =
                         tokio::join!(candidate.abandon_exact(&target), async {
-                            tokio::time::timeout(TEST_DEADLINE, wait_started)
+                            tokio::time::timeout(QUERY_TIMEOUT, wait_started)
                                 .await
                                 .context("the owner did not observe the lingering session")?
                                 .context("the owner's session-wait observer was dropped")?;

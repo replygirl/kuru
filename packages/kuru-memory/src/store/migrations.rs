@@ -4991,7 +4991,9 @@ mod tests {
                 })
                 .await
                 .context("migrated safe-journal resume frame was not flushed")??;
-                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                // The owner commits the accepted resume within its write
+                // budget (`QUERY_TIMEOUT`, taken by `write_deadline`).
+                tokio::time::timeout(QUERY_TIMEOUT, async {
                     loop {
                         let page = sibling
                             .public_transcript_page("legacy-session", None, 16)

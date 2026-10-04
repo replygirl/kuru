@@ -22,7 +22,12 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
-const TEST_DEADLINE: Duration = Duration::from_secs(10);
+// The bounded waits in this file are derived from the product step each one
+// waits on: a statement, a write, a reconciliation or a server-session end
+// waits within `QUERY_TIMEOUT`, the bound of the product's own statement,
+// write and session-end waits; an owned close within `close_budget()`; the
+// orphaned supervisor of a killed creator within `SUPERVISOR_REAP_ALLOWANCE`;
+// and an open or migration stage within `migration_observation_deadline`.
 const FRAME_LIMIT: usize = 128 * 1024;
 
 struct AbortUpgradeOnDrop(JoinHandle<Result<()>>);
@@ -313,9 +318,14 @@ impl ProcessLossChild {
             .quiescence_directory
             .clone()
             .context("process-loss cleanup target was not identified")?;
-        let lease =
-            Server::quiescence_at(&directory, self.lifecycle_root.as_deref(), TEST_DEADLINE)
-                .await?;
+        // The killed creator's orphaned supervisor stops Dolt and releases the
+        // lifecycle lease within `SUPERVISOR_REAP_ALLOWANCE`.
+        let lease = Server::quiescence_at(
+            &directory,
+            self.lifecycle_root.as_deref(),
+            crate::server::SUPERVISOR_REAP_ALLOWANCE,
+        )
+        .await?;
         self.descendants_quiescent = self.child.is_none();
         Ok(lease)
     }
@@ -357,6 +367,10 @@ impl ProcessLossChild {
     }
 
     async fn stop_and_reap(&mut self) -> Result<Vec<u8>> {
+        // The killed creator exits at once. A Windows child reports its exit
+        // only once its Job's last process is gone, which can be its orphaned
+        // supervisor; that supervisor stops Dolt and exits within
+        // `SUPERVISOR_REAP_ALLOWANCE`, and the creator's output ends with it.
         let child_cleanup = async {
             let child = self.child.as_mut().context("process-loss child missing")?;
             #[cfg(unix)]
@@ -364,9 +378,10 @@ impl ProcessLossChild {
                 if child.try_wait()?.is_none() {
                     let _ = child.start_kill();
                 }
-                let waited = tokio::time::timeout(TEST_DEADLINE, child.wait())
-                    .await
-                    .context("process-loss child did not exit by the cleanup deadline")?;
+                let waited =
+                    tokio::time::timeout(crate::server::SUPERVISOR_REAP_ALLOWANCE, child.wait())
+                        .await
+                        .context("process-loss child did not exit by the cleanup deadline")?;
                 waited.context("wait for process-loss child")?;
             }
             #[cfg(windows)]
@@ -375,7 +390,7 @@ impl ProcessLossChild {
                     let _ = child.terminate();
                 }
                 child
-                    .wait(TEST_DEADLINE)
+                    .wait(crate::server::SUPERVISOR_REAP_ALLOWANCE)
                     .await
                     .context("process-loss child did not exit by the cleanup deadline")?;
             }
@@ -387,18 +402,22 @@ impl ProcessLossChild {
         }
 
         let reader_cleanup = match self.reader.take() {
-            Some(mut reader) => match tokio::time::timeout(TEST_DEADLINE, &mut reader).await {
-                Ok(result) => result
-                    .context("process-loss stdout reader task failed")
-                    .and_then(|result| result),
-                Err(_) => {
-                    reader.abort();
-                    let _ = reader.await;
-                    Err(anyhow::anyhow!(
-                        "process-loss stdout reader did not exit by the cleanup deadline"
-                    ))
+            Some(mut reader) => {
+                match tokio::time::timeout(crate::server::SUPERVISOR_REAP_ALLOWANCE, &mut reader)
+                    .await
+                {
+                    Ok(result) => result
+                        .context("process-loss stdout reader task failed")
+                        .and_then(|result| result),
+                    Err(_) => {
+                        reader.abort();
+                        let _ = reader.await;
+                        Err(anyhow::anyhow!(
+                            "process-loss stdout reader did not exit by the cleanup deadline"
+                        ))
+                    }
                 }
-            },
+            }
             None => Err(anyhow::anyhow!("process-loss stdout reader missing")),
         };
         match (child_cleanup, reader_cleanup) {
@@ -524,7 +543,7 @@ async fn observe_process_loss_ddl(
         return Ok(());
     };
 
-    let cleanup = match tokio::time::timeout(TEST_DEADLINE, store.close()).await {
+    let cleanup = match tokio::time::timeout(crate::server::close_budget(), store.close()).await {
         Ok(Ok(())) => "confirmed".to_owned(),
         Ok(Err(error)) => format!("failed: {error:#}"),
         Err(_) => "timed out".to_owned(),
@@ -546,9 +565,10 @@ async fn process_loss_observer_surfaces_open_error_before_ddl_deadline() -> Resu
     let (hooks, control) =
         migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::AfterDdl);
     options.migration_hooks = Some(Arc::new(hooks));
+    let observation_deadline = migration_observation_deadline(&options);
     let mut opening = tokio::spawn(crate::test_support::spawn_gated_open(options));
 
-    let error = observe_process_loss_ddl(&mut opening, &control, TEST_DEADLINE)
+    let error = observe_process_loss_ddl(&mut opening, &control, observation_deadline)
         .await
         .expect_err("invalid open must fail before reaching accepted DDL");
     let rendered = format!("{error:#}");
@@ -1177,15 +1197,34 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
         assert!(opening.await.unwrap_err().is_cancelled());
         assert_startup_lock_held(&options)?;
 
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(80),
-                crate::test_support::spawn_gated_open(options.clone())
-            )
+        // The competing opener's report that it waits for project ownership,
+        // not a window, shows it has not taken writer authority. Dropping it
+        // there cancels its lock wait.
+        {
+            let _gate = crate::spawn_gate::spawning().await;
+            let (mut progress, competing) = MemoryStore::open_observed(options.clone());
+            let mut competing = Box::pin(competing);
+            tokio::time::timeout(completion_deadline, async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        stage = progress.recv() => match stage {
+                            Some(MemoryOpenStage::WaitingForProjectOwnership) => {
+                                break Ok::<(), anyhow::Error>(());
+                            }
+                            Some(_) => {}
+                            None => bail!("the competing opener stopped reporting before its ownership wait"),
+                        },
+                        opened = &mut competing => bail!(
+                            "a competing opener acquired writer authority before the accepted worker reaped: {:?}",
+                            opened.map(|_| ())
+                        ),
+                    }
+                }
+            })
             .await
-            .is_err(),
-            "a competing opener acquired writer authority before the accepted worker reaped"
-        );
+            .context("the competing opener did not reach its ownership wait")??;
+        }
         control.resume();
         let store = tokio::time::timeout(
             completion_deadline,
@@ -1263,7 +1302,7 @@ async fn live_original_session_blocks_receipt_reconciliation_even_after_commit()
             .is_err()
     );
     drop(connection);
-    tokio::time::timeout(TEST_DEADLINE, store.reconcile())
+    tokio::time::timeout(QUERY_TIMEOUT, store.reconcile())
         .await
         .unwrap()
         .unwrap();
@@ -1303,7 +1342,7 @@ async fn dropped_uncommitted_session_resolves_absent_receipt_only_after_teardown
     assert!(store.shared.uncertain.lock().unwrap().is_some());
     drop(connection);
     assert_eq!(
-        tokio::time::timeout(TEST_DEADLINE, store.resolve_uncertain())
+        tokio::time::timeout(QUERY_TIMEOUT, store.resolve_uncertain())
             .await
             .unwrap()
             .unwrap(),
@@ -1326,7 +1365,7 @@ async fn in_flight_disconnect_waits_for_real_query_and_session_teardown() -> Res
             .execute(&mut connection)
             .await;
     });
-    tokio::time::timeout(TEST_DEADLINE, async {
+    tokio::time::timeout(QUERY_TIMEOUT, async {
         loop {
             let query: Option<String> =
                 sqlx::query_scalar("SELECT INFO FROM information_schema.processlist WHERE ID = ?")
@@ -1349,7 +1388,7 @@ async fn in_flight_disconnect_waits_for_real_query_and_session_teardown() -> Res
     );
     running.abort();
     assert!(running.await.unwrap_err().is_cancelled());
-    await_session_end(&store.pool, id, TEST_DEADLINE)
+    await_session_end(&store.pool, id, QUERY_TIMEOUT)
         .await
         .unwrap();
     // Independent authenticated readers must survive this owned socket close.
@@ -1472,7 +1511,7 @@ async fn lost_commit_reply_recovers_one_durable_update_and_reopens_without_repla
     .await;
     let affected = proxy.view(&store).await;
     tokio::time::timeout(
-        TEST_DEADLINE,
+        QUERY_TIMEOUT,
         affected.append("conversation", "user", "exactly once"),
     )
     .await
@@ -1533,7 +1572,7 @@ async fn lost_promotion_reply_reconciles_target_once_and_keeps_later_writes() {
         promoted: Arc::new(StdMutex::new(None)),
     };
     assert_eq!(
-        tokio::time::timeout(TEST_DEADLINE, candidate.promote())
+        tokio::time::timeout(QUERY_TIMEOUT, candidate.promote())
             .await
             .unwrap()
             .unwrap(),
@@ -1705,7 +1744,7 @@ async fn lost_usage_write_reply_after_commit_advances_the_validated_state() -> R
     .await;
     let view = routed_usage_view(&proxy, &usage).await?;
     tokio::time::timeout(
-        TEST_DEADLINE,
+        QUERY_TIMEOUT,
         UsageLedger::new(view.clone()).mark_new_session("lost-reply"),
     )
     .await
@@ -1765,7 +1804,7 @@ async fn absent_usage_write_keeps_the_validated_state_and_retries() -> Result<()
     );
     let view = routed_usage_view(&proxy, &usage).await?;
     let error = tokio::time::timeout(
-        TEST_DEADLINE,
+        QUERY_TIMEOUT,
         UsageLedger::new(view.clone()).mark_new_session("absent"),
     )
     .await
@@ -1779,7 +1818,7 @@ async fn absent_usage_write_keeps_the_validated_state_and_retries() -> Result<()
         proxy.discarded.load(Ordering::Acquire),
         "fixture must discard the usage DOLT_COMMIT request"
     );
-    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
+    await_flag(&proxy.session_ended, QUERY_TIMEOUT).await?;
     ensure!(!usage_pending(&store), "the settled write stayed pending");
     assert_eq!(revision(&usage.pool).await?, base);
     assert_eq!(usage_ledger::live_state_hash(&usage.pool).await?, before);
@@ -1857,14 +1896,14 @@ async fn usage_validation_record_fixture(committed: bool) -> Result<()> {
         )
     };
     let view = routed_usage_view(&proxy, &usage).await?;
-    tokio::time::timeout(TEST_DEADLINE, usage_ledger::record_unrecorded_head(&view))
+    tokio::time::timeout(QUERY_TIMEOUT, usage_ledger::record_unrecorded_head(&view))
         .await
         .context("the uncertain record commit did not settle")??;
     ensure!(
         proxy.discarded.load(Ordering::Acquire),
         "fixture must discard the selected record commit packet"
     );
-    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
+    await_flag(&proxy.session_ended, QUERY_TIMEOUT).await?;
     ensure!(!usage_pending(&store), "the settled record stayed pending");
     assert_eq!(usage_ledger::live_state_hash(&usage.pool).await?, live);
     let head = revision(&usage.pool).await?;
@@ -2220,7 +2259,7 @@ async fn manual_dolt_commit_atomically_publishes_ddl_version_and_receipt() {
         .await
         .unwrap();
     drop(connection);
-    await_session_end(&store.pool, id, TEST_DEADLINE)
+    await_session_end(&store.pool, id, QUERY_TIMEOUT)
         .await
         .unwrap();
     assert_committed_schema(&store, &before, &source_history, &candidate, &receipt).await;
@@ -2245,7 +2284,7 @@ async fn dropping_precommit_ddl_session_retains_dirty_working_ddl_outside_head()
         .await
         .unwrap();
     drop(connection);
-    await_session_end(&store.pool, id, TEST_DEADLINE)
+    await_session_end(&store.pool, id, QUERY_TIMEOUT)
         .await
         .unwrap();
     let observation = PrecommitObservation {
@@ -2464,7 +2503,7 @@ async fn lost_manual_dolt_commit_reply_reconciles_one_clean_schema_commit() {
         "fixture must discard an actual durable DOLT_COMMIT reply: {error:#}"
     );
     drop(connection);
-    await_session_end(&store.pool, id, TEST_DEADLINE)
+    await_session_end(&store.pool, id, QUERY_TIMEOUT)
         .await
         .unwrap();
     assert_committed_schema(&store, &before, &source_history, &candidate, &receipt).await;
@@ -2505,7 +2544,7 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
         DurableObservation::RevisionAdvanced { base: base.clone() },
     );
     control.resume_route();
-    tokio::time::timeout(TEST_DEADLINE, control.reached())
+    tokio::time::timeout(migration_observation_deadline(&options), control.reached())
         .await
         .context("production migration did not reach the commit boundary")??;
     control.resume();
@@ -2523,7 +2562,7 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
         proxy.discarded.load(Ordering::Acquire),
         "fixture must discard the durable production migration DOLT_COMMIT reply"
     );
-    await_flag(&proxy.session_ended, TEST_DEADLINE)
+    await_flag(&proxy.session_ended, QUERY_TIMEOUT)
         .await
         .context(
             "the proxy must observe the original routed SQL session end before reconciliation",
@@ -2607,7 +2646,7 @@ async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creatio
         },
     );
     control.resume_route();
-    tokio::time::timeout(TEST_DEADLINE, control.reached())
+    tokio::time::timeout(migration_observation_deadline(&options), control.reached())
         .await
         .context("production migration did not reach branch boundary")??;
     control.resume();
@@ -2616,7 +2655,7 @@ async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creatio
         .await
         .context("production migration did not reconcile lost branch reply")???;
     assert!(proxy.discarded.load(Ordering::Acquire));
-    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
+    await_flag(&proxy.session_ended, QUERY_TIMEOUT).await?;
     assert_eq!(
         store.get("branch-reply-source").await?,
         Some(json!("retained"))
@@ -2742,9 +2781,12 @@ async fn usage_upgrade_publication_fixture(accepted: bool) -> Result<()> {
     let mut upgrading = AbortUpgradeOnDrop(tokio::spawn(async move {
         migrations::upgrade_usage_with_hooks(&migrating_server, &migrating_usage, &hooks).await
     }));
-    let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
-        .await
-        .context("usage upgrade did not expose publication route")??;
+    let source = tokio::time::timeout(
+        migration_observation_deadline(&options),
+        control.route_source(),
+    )
+    .await
+    .context("usage upgrade did not expose publication route")??;
     let target = control.publication_target()?;
     let attempt = control.branch_name()?;
     let observation = DurableObservation::MainAtTarget {
@@ -2756,15 +2798,16 @@ async fn usage_upgrade_publication_fixture(accepted: bool) -> Result<()> {
         reserved.start_absent(source, observation)
     };
     control.resume_route();
-    tokio::time::timeout(TEST_DEADLINE, control.reached())
+    tokio::time::timeout(migration_observation_deadline(&options), control.reached())
         .await
         .context("usage upgrade did not reach publication boundary")??;
     assert_eq!(revision(&usage).await?, prior_usage_head);
     assert_eq!(migrations::version(&usage).await?, 3);
     control.resume();
-    let upgrade_result = tokio::time::timeout(TEST_DEADLINE, &mut upgrading.0)
-        .await
-        .context("usage upgrade did not settle its publication attempt")??;
+    let upgrade_result =
+        tokio::time::timeout(migration_observation_deadline(&options), &mut upgrading.0)
+            .await
+            .context("usage upgrade did not settle its publication attempt")??;
     if accepted {
         upgrade_result?;
     } else {
@@ -2778,7 +2821,7 @@ async fn usage_upgrade_publication_fixture(accepted: bool) -> Result<()> {
         proxy.discarded.load(Ordering::Acquire),
         "usage fixture did not discard the selected publication packet"
     );
-    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
+    await_flag(&proxy.session_ended, QUERY_TIMEOUT).await?;
     let observed_usage_head = revision(&usage).await?;
     assert_eq!(
         observed_usage_head,
@@ -2901,7 +2944,7 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
         },
     );
     control.resume_route();
-    tokio::time::timeout(TEST_DEADLINE, control.reached())
+    tokio::time::timeout(migration_observation_deadline(&options), control.reached())
         .await
         .context("production migration did not reach publish boundary")??;
     control.resume();
@@ -2910,7 +2953,7 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
         .await
         .context("production migration did not reconcile lost fast-forward reply")???;
     assert!(proxy.discarded.load(Ordering::Acquire));
-    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
+    await_flag(&proxy.session_ended, QUERY_TIMEOUT).await?;
     let completed = store.revision().await?;
     let published_ancestor: String = sqlx::query_scalar("SELECT DOLT_MERGE_BASE(?, ?)")
         .bind(&target)
@@ -3013,11 +3056,11 @@ async fn absent_fast_forward_keeps_the_same_ready_attempt_for_next_open() -> Res
         },
     );
     control.resume_route();
-    tokio::time::timeout(TEST_DEADLINE, control.reached())
+    tokio::time::timeout(migration_observation_deadline(&options), control.reached())
         .await
         .context("production migration did not reach absent publish boundary")??;
     control.resume();
-    let error = tokio::time::timeout(TEST_DEADLINE, opening)
+    let error = tokio::time::timeout(migration_observation_deadline(&options), opening)
         .await
         .context("absent fast-forward did not resolve")?
         .expect("missing fast-forward must not be treated as published")
@@ -3026,7 +3069,7 @@ async fn absent_fast_forward_keeps_the_same_ready_attempt_for_next_open() -> Res
         proxy.discarded.load(Ordering::Acquire),
         "fixture must drop the merge request before dispatch: {error:#}"
     );
-    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
+    await_flag(&proxy.session_ended, QUERY_TIMEOUT).await?;
     proxy.close().await;
     options.migration_hooks = None;
 
@@ -3119,7 +3162,7 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
         .await
         .unwrap();
     drop(failed_connection);
-    await_session_end(&store.pool, failed_id, TEST_DEADLINE)
+    await_session_end(&store.pool, failed_id, QUERY_TIMEOUT)
         .await
         .unwrap();
 
@@ -3149,7 +3192,7 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
         .await
         .unwrap();
     drop(fresh_connection);
-    await_session_end(&store.pool, fresh_id, TEST_DEADLINE)
+    await_session_end(&store.pool, fresh_id, QUERY_TIMEOUT)
         .await
         .unwrap();
     assert_schema_commit(&fresh.view, &base, &source_history, &receipt).await;
@@ -3199,7 +3242,7 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
         "fixture must discard an actual durable DOLT_MERGE fast-forward reply: {merge_error:#}"
     );
     drop(merge_connection);
-    await_session_end(&store.pool, merge_id, TEST_DEADLINE)
+    await_session_end(&store.pool, merge_id, QUERY_TIMEOUT)
         .await
         .unwrap();
     assert_eq!(affected.resolve_uncertain().await.unwrap(), Some(true));
@@ -3507,7 +3550,7 @@ async fn proxy_connection(client: TcpStream, server: TcpStream, fault: Arc<Fault
                 server_write.shutdown().await?;
                 let id =
                     session_id.context("fixture did not observe the routed MySQL session id")?;
-                await_session_end(&request_fault.observer, id, TEST_DEADLINE)
+                await_session_end(&request_fault.observer, id, QUERY_TIMEOUT)
                     .await
                     .context("routed SQL session remained after the absent request")?;
                 request_fault.session_ended.store(true, Ordering::Release);
@@ -3554,7 +3597,7 @@ async fn proxy_connection(client: TcpStream, server: TcpStream, fault: Arc<Fault
                 // Receiving a packet alone may only mean result metadata is
                 // ready. Observe the durable branch revision directly before
                 // discarding the reply, so the injected fault is a lost ack.
-                tokio::time::timeout(TEST_DEADLINE, async {
+                tokio::time::timeout(QUERY_TIMEOUT, async {
                     loop {
                         if durable_observation(&fault.observer, &fault.observation).await? {
                             break;
@@ -3568,7 +3611,7 @@ async fn proxy_connection(client: TcpStream, server: TcpStream, fault: Arc<Fault
                 client_write.shutdown().await?;
                 let id =
                     session_id.context("fixture did not observe the routed MySQL session id")?;
-                await_session_end(&fault.observer, id, TEST_DEADLINE)
+                await_session_end(&fault.observer, id, QUERY_TIMEOUT)
                     .await
                     .context("routed SQL session remained after the lost reply")?;
                 fault.session_ended.store(true, Ordering::Release);

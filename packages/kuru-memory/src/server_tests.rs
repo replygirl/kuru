@@ -220,14 +220,20 @@ async fn cleanup_observation_error_keeps_actual_lifecycle_lease_until_child_exit
         crate::engine::spawn(&script, &home, root.path(), Vec::new(), Vec::new(), true).await?
     };
     let (observed, observation) = tokio::sync::oneshot::channel();
+    let (continued, continuation) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let mut observed = Some(observed);
+        let mut continued = Some(continued);
         observe_dolt(&mut child, |child| {
             if let Some(observed) = observed.take() {
                 observed.send(()).unwrap();
                 return Err(std::io::Error::other(
                     "controlled retained-child query failure",
                 ));
+            }
+            // The observation went on past the failure.
+            if let Some(continued) = continued.take() {
+                let _ = continued.send(());
             }
             child.try_wait()
         })
@@ -237,6 +243,23 @@ async fn cleanup_observation_error_keeps_actual_lifecycle_lease_until_child_exit
         drop(lease);
     });
     tokio::time::timeout(Duration::from_secs(3), observation).await??;
+    // The observer's next query of the child, not a window, shows it kept
+    // the lease past the failure. Had it returned on the failure, the task
+    // would end without sending and this receive would fail. That query is
+    // one 20 ms poll of `observe_dolt` after the failure. `observe_dolt`
+    // itself is unbounded by design (it keeps the lease until the child
+    // exits); it runs in the supervisor's stop path, which the parent's
+    // `finish_owner` allows `SUPERVISOR_REAP_ALLOWANCE` to report, so an
+    // observer that stopped polling fails within that instead of hanging.
+    let continued = tokio::time::timeout(SUPERVISOR_REAP_ALLOWANCE, continuation)
+        .await
+        .context("the observer stopped querying a live child after a query failure")?;
+    assert!(
+        continued.is_ok(),
+        "query failure ended the observation of a live child"
+    );
+    // The child is still blocked on its release, so the observer still holds
+    // the lease; this one bounded try checks it is the actual lease.
     assert!(
         Server::quiescence(&store, Duration::from_millis(30))
             .await
@@ -729,7 +752,10 @@ async fn selected_port_takeover_retries_actual_dolt_without_touching_holder() ->
     assert_eq!(count, 1);
     pool.close().await;
     drop(parent);
-    tokio::time::timeout(Duration::from_secs(10), supervisor).await???;
+    // The supervisor stops Dolt (`CLOSE_GRACE` + `KILL_GRACE`) and drains its
+    // output once the parent closes; the product allows it
+    // `SUPERVISOR_REAP_ALLOWANCE` for that.
+    tokio::time::timeout(SUPERVISOR_REAP_ALLOWANCE, supervisor).await???;
     assert!(!directory.join("endpoint.json").exists());
     assert!(holder.lock().unwrap().is_some());
     Ok(())
@@ -847,7 +873,9 @@ async fn parent_close_during_selected_port_takeover_never_retries() -> Result<()
     });
     tokio::time::timeout(Duration::from_secs(5), chosen).await??;
     drop(parent);
-    let error = tokio::time::timeout(Duration::from_secs(10), supervisor)
+    // As above: the product allows the supervisor `SUPERVISOR_REAP_ALLOWANCE`
+    // to stop Dolt and report once its parent closes.
+    let error = tokio::time::timeout(SUPERVISOR_REAP_ALLOWANCE, supervisor)
         .await??
         .unwrap_err();
     assert!(format!("{error:#}").contains("parent closed"), "{error:#}");
