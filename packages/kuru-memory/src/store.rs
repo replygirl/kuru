@@ -12795,29 +12795,26 @@ mod tests {
         let written = message.clone();
         let mut writer =
             tokio::spawn(async move { view.append_message("publication", &written).await });
+        // The write reaches each pause point inside its one write budget, and
+        // the lock-free probe runs its receipt read under its own statement
+        // budget: both are `QUERY_TIMEOUT`.
         let tested = async {
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                pause.receipt_inserted.reached.notified(),
-            )
-            .await
-            .context("write did not reach its receipt insert")?;
+            tokio::time::timeout(QUERY_TIMEOUT, pause.receipt_inserted.reached.notified())
+                .await
+                .context("write did not reach its receipt insert")?;
             let hidden = tokio::time::timeout(
-                Duration::from_secs(10),
+                QUERY_TIMEOUT,
                 store.probe_logical_receipt(id, "append_message", &digest),
             )
             .await
             .context("probe blocked before DOLT_COMMIT")??;
             ensure!(!hidden, "receipt was visible before DOLT_COMMIT");
             pause.receipt_inserted.resume.notify_one();
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                pause.dolt_committed.reached.notified(),
-            )
-            .await
-            .context("write did not reach DOLT_COMMIT")?;
+            tokio::time::timeout(QUERY_TIMEOUT, pause.dolt_committed.reached.notified())
+                .await
+                .context("write did not reach DOLT_COMMIT")?;
             let published = tokio::time::timeout(
-                Duration::from_secs(10),
+                QUERY_TIMEOUT,
                 store.probe_logical_receipt(id, "append_message", &digest),
             )
             .await
