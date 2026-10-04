@@ -857,6 +857,337 @@ async fn parent_close_during_selected_port_takeover_never_retries() -> Result<()
     Ok(())
 }
 
+/// A real Dolt serving its own directory on a chosen port with a given root
+/// password: the shape of a sibling template copy (copies share their
+/// credentials) whose Dolt bound this store's freshly selected port first.
+struct ForeignDolt {
+    child: Child,
+    port: u16,
+    password: String,
+    log: Arc<Mutex<Vec<u8>>>,
+    drains: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl ForeignDolt {
+    async fn start(binary: &Path, directory: &Path, port: u16, password: String) -> Result<Self> {
+        for name in ["", "data", "config"] {
+            private_directory(&directory.join(name))?;
+        }
+        crate::provision::prepare_private_home(&directory.join("home"))?;
+        let config = directory.join("server.yaml");
+        write_private(
+            &config,
+            server_yaml(directory, port, Duration::from_secs(20))?.as_bytes(),
+        )?;
+        let mut child = crate::engine::spawn(
+            binary,
+            &directory.join("home"),
+            directory,
+            vec!["sql-server".into(), "--config".into(), config.into()],
+            vec![
+                ("DOLT_ROOT_PASSWORD".into(), password.clone().into()),
+                ("DOLT_ROOT_HOST".into(), "localhost".into()),
+            ],
+            true,
+        )
+        .await?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let drains = vec![
+            tokio::spawn(drain(
+                child.stdout().context("foreign Dolt stdout missing")?,
+                log.clone(),
+                None,
+            )),
+            tokio::spawn(drain(
+                child.stderr().context("foreign Dolt stderr missing")?,
+                log.clone(),
+                None,
+            )),
+        ];
+        let mut foreign = Self {
+            child,
+            port,
+            password,
+            log,
+            drains,
+        };
+        // Bounded: serving its own directory to the shared credential, or a
+        // failure naming the foreign server's own output.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = foreign.child.try_wait()? {
+                bail!(
+                    "foreign Dolt exited ({status}) before serving port {port}: {}",
+                    foreign.log_text().await
+                );
+            }
+            if let Ok(Ok(pool)) = timeout(Duration::from_millis(400), foreign.connect()).await {
+                let datadir: String = sqlx::query_scalar("SELECT @@datadir")
+                    .fetch_one(&pool)
+                    .await?;
+                pool.close().await;
+                ensure!(
+                    same_directory(Path::new(&datadir), &directory.join("data"))?,
+                    "the server on port {port} is not the foreign Dolt"
+                );
+                return Ok(foreign);
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "foreign Dolt did not serve port {port} within 30 s: {}",
+                    foreign.log_text().await
+                );
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn connect(&self) -> sqlx::Result<MySqlPool> {
+        MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                MySqlConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(self.port)
+                    .username("root")
+                    .password(&self.password)
+                    .ssl_mode(MySqlSslMode::Disabled),
+            )
+            .await
+    }
+
+    async fn log_text(&self) -> String {
+        String::from_utf8_lossy(&self.log.lock().await).replace(&self.password, "[redacted]")
+    }
+
+    /// Still serving, and holding nothing a store bootstrap would write.
+    async fn assert_untouched(&self) -> Result<()> {
+        let pool = timeout(Duration::from_secs(5), self.connect())
+            .await
+            .context("foreign Dolt stopped answering")??;
+        let databases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'kuru'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let readers: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM mysql.user WHERE user = 'kuru_reader'")
+                .fetch_one(&pool)
+                .await?;
+        pool.close().await;
+        ensure!(
+            databases == 0 && readers == 0,
+            "the supervisor wrote to the foreign Dolt ({databases} kuru databases, \
+             {readers} reader accounts)"
+        );
+        Ok(())
+    }
+
+    async fn stop(mut self) -> Result<()> {
+        self.child.stop(CLOSE_GRACE, KILL_GRACE).await?;
+        for drain in self.drains {
+            timeout(Duration::from_secs(5), drain).await??;
+        }
+        Ok(())
+    }
+}
+
+/// The actual Dolt behind a one-second delay: the owned engine is reliably
+/// still starting when the startup probe first reaches the selected port.
+fn delayed_dolt(root: &Path, dolt: &Path) -> Result<PathBuf> {
+    let dolt = dolt.to_str().context("Dolt path is not UTF-8")?;
+    ensure!(!dolt.contains('\''), "Dolt path needs quoting");
+    let wrapper = root.join("delayed-dolt");
+    fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nsleep 1\nexec '{dolt}' \"$@\"\n"),
+    )?;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))?;
+    Ok(wrapper)
+}
+
+/// Start a foreign Dolt on `port` under this store's own root credential,
+/// from the synchronous port hook, before the owned engine is spawned.
+fn foreign_on_selected_port(
+    dolt: &Path,
+    store: &Path,
+    foreign: &Path,
+    port: u16,
+) -> Result<ForeignDolt> {
+    let password = load_identity(store, "project/selected-port-collision")?
+        .context("the supervisor wrote no identity before selecting a port")?
+        .password;
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(ForeignDolt::start(dolt, foreign, port, password))
+    })
+}
+
+/// A sibling's Dolt that took the selected port and accepts this store's
+/// credential answers the startup probe with its own data directory. That is
+/// a taken port, not a failed bootstrap: nothing is written to it, the owned
+/// Dolt reports the taken port itself, and the bounded retry reselects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_foreign_dolt_on_selected_port_retries_without_touching_it() -> Result<()> {
+    let root = fixture()?;
+    let dolt = actual_dolt_for_collision().await?;
+    let mut request = collision_request(root.path(), delayed_dolt(root.path(), &dolt)?)?;
+    request.timeout_millis = 60_000;
+    let directory = request.directory.clone();
+    let foreign_directory = fs::canonicalize(root.path())?.join("foreign-memory");
+    let foreign = Arc::new(StdMutex::new(None::<ForeignDolt>));
+    let chosen = Arc::new(StdMutex::new(Vec::<u16>::new()));
+    let (observed_foreign, observed_chosen) = (foreign.clone(), chosen.clone());
+    let hook_directory = directory.clone();
+    let (parent, mut input) = tokio::io::duplex(1024);
+    let (mut output, mut response) = tokio::io::duplex(4096);
+    let supervisor = tokio::spawn(async move {
+        // Held across the real Dolt spawns; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning().await;
+        supervise_with_port_hook(request, &mut input, &mut output, move |port| {
+            let first = {
+                let mut chosen = observed_chosen.lock().unwrap();
+                chosen.push(port);
+                chosen.len() == 1
+            };
+            if first {
+                let started =
+                    foreign_on_selected_port(&dolt, &hook_directory, &foreign_directory, port)?;
+                *observed_foreign.lock().unwrap() = Some(started);
+            }
+            Ok(())
+        })
+        .await
+    });
+    let ready = tokio::time::timeout(
+        Duration::from_secs(90),
+        read_frame::<_, Response>(&mut response),
+    )
+    .await?;
+    let endpoint = match ready {
+        Ok(Response::Ready { endpoint, owned }) => {
+            assert!(
+                owned,
+                "foreign-listener recovery borrowed an unrelated lifetime"
+            );
+            endpoint
+        }
+        Ok(Response::Failed(message) | Response::TemplateRejected(message)) => {
+            bail!("actual Dolt did not recover: {message}")
+        }
+        Err(error) => {
+            let outcome = tokio::time::timeout(Duration::from_secs(30), supervisor).await??;
+            let foreign = foreign.lock().unwrap().take();
+            if let Some(foreign) = foreign {
+                foreign.stop().await?;
+            }
+            bail!("supervisor ended before Ready ({error:#}): {outcome:?}")
+        }
+    };
+    let ports = chosen.lock().unwrap().clone();
+    assert_eq!(
+        ports.len(),
+        2,
+        "exactly one foreign-listener retry: {ports:?}"
+    );
+    assert_ne!(ports[0], ports[1]);
+    assert_eq!(endpoint.port, ports[1]);
+    let identity = load_identity(&directory, "project/selected-port-collision")?
+        .context("ready Dolt did not publish its identity")?;
+    assert!(identity.initialized);
+    let pool = connect_pool_with_timeout(
+        &identity,
+        &endpoint,
+        &directory,
+        "main",
+        false,
+        1,
+        PoolAttemptOptions::ordinary(),
+    )
+    .await?
+    .0;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kuru_instance")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 1);
+    pool.close().await;
+    drop(parent);
+    tokio::time::timeout(Duration::from_secs(30), supervisor).await???;
+    assert!(!directory.join("endpoint.json").exists());
+    let foreign = foreign
+        .lock()
+        .unwrap()
+        .take()
+        .context("the foreign Dolt was never started")?;
+    assert_eq!(foreign.port, ports[0]);
+    foreign.assert_untouched().await?;
+    foreign.stop().await
+}
+
+/// While the answering server stays foreign and the owned engine neither
+/// becomes ready nor exits, the start fails closed at its deadline with the
+/// mismatch in the error, publishing no Ready response or endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_foreign_dolt_fails_closed_with_the_mismatch() -> Result<()> {
+    let root = fixture()?;
+    let dolt = actual_dolt_for_collision().await?;
+    // Never binds and never exits on its own: only the foreign server answers.
+    let silent = root.path().join("silent-engine");
+    fs::write(&silent, b"#!/bin/sh\nexec sleep 600\n")?;
+    fs::set_permissions(&silent, fs::Permissions::from_mode(0o700))?;
+    let mut request = collision_request(root.path(), silent)?;
+    // The hook's foreign start runs inside this deadline.
+    request.timeout_millis = 15_000;
+    let directory = request.directory.clone();
+    let foreign_directory = fs::canonicalize(root.path())?.join("foreign-memory");
+    let foreign = Arc::new(StdMutex::new(None::<ForeignDolt>));
+    let observed = foreign.clone();
+    let hook_directory = directory.clone();
+    let mut attempts = 0;
+    let (_parent, mut input) = tokio::io::duplex(1024);
+    let mut output = Vec::new();
+    let result = {
+        // Held across the real Dolt and stand-in spawns; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning().await;
+        supervise_with_port_hook(request, &mut input, &mut output, |port| {
+            attempts += 1;
+            let started =
+                foreign_on_selected_port(&dolt, &hook_directory, &foreign_directory, port)?;
+            *observed.lock().unwrap() = Some(started);
+            Ok(())
+        })
+        .await
+    };
+    let foreign = foreign
+        .lock()
+        .unwrap()
+        .take()
+        .context("the foreign Dolt was never started")?;
+    let error = match result {
+        Ok(()) => bail!("the supervisor became ready on a foreign server"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert_eq!(attempts, 1);
+    assert!(
+        error.contains("authenticated Dolt startup deadline exceeded")
+            && error.contains("Dolt bootstrap data directory mismatch"),
+        "{error}"
+    );
+    assert!(
+        output.is_empty(),
+        "a foreign server's start published Ready"
+    );
+    assert!(!directory.join("endpoint.json").exists());
+    let identity = load_identity(&directory, "project/selected-port-collision")?
+        .context("the supervisor's identity is missing")?;
+    assert!(
+        !identity.initialized,
+        "a foreign server initialized this store"
+    );
+    foreign.assert_untouched().await?;
+    foreign.stop().await
+}
+
 // A failure reason recorded for a starter never carries either connection
 // secret of the store's identity.
 #[test]
