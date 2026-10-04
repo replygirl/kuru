@@ -8,9 +8,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(unix)]
-use std::process::Stdio;
-
 use anyhow::{Context, Result, ensure};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde_json::{Value, json};
@@ -22,7 +19,9 @@ use tokio::{
 use crate::{MAX_BYTES, http::rpc_result, mcp::Admission, redaction::Scanner};
 
 #[cfg(unix)]
-use kuru_platform::unix::{GroupPresence, OwnedProcessGroup, Reap, RootState, Termination};
+use kuru_platform::unix::{
+    GroupPresence, OwnedProcessGroup, Reap, RootState, StdioPlan, StdioSlot, Termination,
+};
 #[cfg(unix)]
 type Input = tokio::process::ChildStdin;
 #[cfg(unix)]
@@ -389,20 +388,15 @@ impl Session {
         #[cfg(unix)]
         let (owner, input, output, error) = {
             let mut command = std::process::Command::new(program);
-            command
-                .args(args)
-                .envs(env)
-                .current_dir(&cwd)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+            command.args(args).envs(env).current_dir(&cwd);
             if root_guard.revalidate().is_err() {
                 return Startup::Rejected;
             }
             if admission.enter().is_err() {
                 return Startup::Rejected;
             }
-            let mut owner = match OwnedProcessGroup::spawn(command) {
+            let piped = StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Pipe);
+            let mut owner = match OwnedProcessGroup::spawn(command, piped) {
                 Ok(owner) => owner,
                 Err(_) => return Startup::Rejected,
             };

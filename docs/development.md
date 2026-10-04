@@ -277,6 +277,20 @@ payload policies and use those shared primitives. The PowerShell bootstrap
 lives in delivery support and uses stock .NET facilities for its small native
 bridge before any downloaded application can be trusted.
 
+Owned Unix children (`kuru_platform::unix::OwnedProcessGroup`) declare their
+standard streams as a `StdioPlan`; the platform creates each pipe close-on-exec
+and starts the child under one platform spawn lock, so a concurrent owned child
+cannot inherit another's pipe ends (std's macOS pipes set close-on-exec in a
+second step). The bounded `ps` snapshot spawns under the same lock. Unrelated
+legacy spawns (the memory supervisor, Dolt engine and service, delivery
+runners, the TUI's git, updater and browser opener) and other non-atomic
+descriptor creation can still inherit, or leak into owned children; concurrent
+callers requiring isolation must use the platform consistently. On std's fork
+path a legacy spawn that inherits an owned spawn's exec-error pipe stalls that
+spawn until the legacy child exits, and every later owned spawn, including the
+cleanup snapshot, waits behind it; the remedy is moving those legacy spawns
+behind the platform, not a timeout.
+
 ## Commands
 
 | Command | What it checks or runs |

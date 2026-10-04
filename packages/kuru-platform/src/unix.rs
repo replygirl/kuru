@@ -5,6 +5,19 @@
 //! neither a PID nor the child, so callers cannot reap the root and later
 //! signal a recycled numeric group. This is process authority, not sandboxing:
 //! processes that leave the fresh group are outside this boundary.
+//!
+//! Owned spawns create their stdio pipes close-on-exec and start the child
+//! under one platform spawn lock, so a concurrent owned child cannot inherit
+//! another's pipe ends (std's macOS pipes set close-on-exec in a second step,
+//! and posix_spawn and fork copy the descriptor table as it is). The bounded
+//! process snapshot spawns under the same lock. Unrelated legacy spawns and
+//! other non-atomic descriptor creation can still inherit, or leak into owned
+//! children; concurrent callers requiring isolation must use the platform
+//! consistently. On std's fork path, a legacy spawn that inherits an owned
+//! spawn's exec-error pipe stalls that spawn until the legacy child exits, and
+//! every later owned spawn, including the cleanup snapshot, waits behind it;
+//! the remedy is moving those legacy spawns behind the platform, not a
+//! timeout.
 
 use rustix::{
     io::Errno,
@@ -14,16 +27,33 @@ use rustix::{
     },
 };
 #[cfg(test)]
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::{
     fmt, io,
-    os::unix::process::CommandExt,
-    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus},
-    sync::Arc,
+    os::{fd::OwnedFd, unix::process::CommandExt},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError},
     time::{Duration, Instant},
 };
 
 pub mod snapshot;
+
+/// Orders every platform spawn's descriptor creation against every other
+/// platform spawn's descriptor-table copy. Guards no data.
+static SPAWN: Mutex<()> = Mutex::new(());
+
+/// Hold the platform spawn lock across pipe creation and child creation only.
+/// No caller code, waiting or child I/O runs under it in product builds.
+fn spawn_lock() -> MutexGuard<'static, ()> {
+    match SPAWN.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            blocked_seam();
+            SPAWN.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+}
 
 const MAX_EINTR_ATTEMPTS: usize = 8;
 
@@ -112,6 +142,39 @@ pub enum GroupPresence {
     InvalidPhase,
 }
 
+/// How one standard stream of an owned child is connected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StdioSlot {
+    /// A pipe the platform creates close-on-exec; the parent end is taken once
+    /// through the owner.
+    Pipe,
+    /// `/dev/null`.
+    Null,
+    /// The parent's own descriptor.
+    Inherit,
+}
+
+/// The declared standard streams of one owned child.
+///
+/// [`OwnedProcessGroup::spawn`] applies this plan to the `Command`, replacing
+/// any standard stream the caller configured there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StdioPlan {
+    pub stdin: StdioSlot,
+    pub stdout: StdioSlot,
+    pub stderr: StdioSlot,
+}
+
+impl StdioPlan {
+    pub const fn new(stdin: StdioSlot, stdout: StdioSlot, stderr: StdioSlot) -> Self {
+        Self {
+            stdin,
+            stdout,
+            stderr,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Phase {
     Anchored,
@@ -128,6 +191,9 @@ enum Phase {
 /// and then use only [`Self::presence_after_reap`].
 pub struct OwnedProcessGroup {
     child: Child,
+    stdin: Option<OwnedFd>,
+    stdout: Option<OwnedFd>,
+    stderr: Option<OwnedFd>,
     group: Pid,
     phase: Phase,
     observed_exit: bool,
@@ -137,15 +203,29 @@ pub struct OwnedProcessGroup {
 
 impl OwnedProcessGroup {
     /// Spawn a standard child in a fresh process group led by that child.
-    pub fn spawn(mut command: Command) -> io::Result<Self> {
+    ///
+    /// `stdio` replaces any standard stream configured on `command`. The
+    /// platform creates every declared pipe close-on-exec and hands std only
+    /// the child's ends, so std creates no stdio pipe of its own.
+    pub fn spawn(mut command: Command, stdio: StdioPlan) -> io::Result<Self> {
         command.process_group(0);
-        let child = command.spawn()?;
+        let spawning = spawn_lock();
+        let started = launch(&mut command, stdio);
+        // The Command owns the child's pipe ends. Close them before returning:
+        // a parent copy of its own child's stdout write end would keep that
+        // pipe from ever reaching end of file.
+        drop(command);
+        drop(spawning);
+        let (child, [stdin, stdout, stderr]) = started?;
         // rustix reads the standard Child's native identity infallibly. Keep
         // this immediately after spawn: an error return must never drop a
         // newly-created child before it is represented by this owner.
         let group = Pid::from_child(&child);
         Ok(Self {
             child,
+            stdin,
+            stdout,
+            stderr,
             group,
             phase: Phase::Anchored,
             observed_exit: false,
@@ -156,25 +236,25 @@ impl OwnedProcessGroup {
 
     /// Take the owned standard-input pipe once.
     pub fn take_stdin(&mut self) -> io::Result<ChildStdin> {
-        self.child
-            .stdin
+        self.stdin
             .take()
+            .map(ChildStdin::from)
             .ok_or_else(|| io::Error::other("owned child stdin was not piped"))
     }
 
     /// Take the owned standard-output pipe once.
     pub fn take_stdout(&mut self) -> io::Result<ChildStdout> {
-        self.child
-            .stdout
+        self.stdout
             .take()
+            .map(ChildStdout::from)
             .ok_or_else(|| io::Error::other("owned child stdout was not piped"))
     }
 
     /// Take the owned standard-error pipe once.
     pub fn take_stderr(&mut self) -> io::Result<ChildStderr> {
-        self.child
-            .stderr
+        self.stderr
             .take()
+            .map(ChildStderr::from)
             .ok_or_else(|| io::Error::other("owned child stderr was not piped"))
     }
 
@@ -314,6 +394,103 @@ impl Drop for OwnedProcessGroup {
         }
     }
 }
+
+/// Create the declared streams and start the child. Returns the parent ends
+/// in stdin, stdout, stderr order.
+fn launch(command: &mut Command, plan: StdioPlan) -> io::Result<(Child, [Option<OwnedFd>; 3])> {
+    let stdin = prepare(plan.stdin, Stream::Input)?;
+    let stdout = prepare(plan.stdout, Stream::Output)?;
+    let stderr = prepare(plan.stderr, Stream::Output)?;
+    command
+        .stdin(stdin.child)
+        .stdout(stdout.child)
+        .stderr(stderr.child);
+    let child = command.spawn()?;
+    Ok((child, [stdin.parent, stdout.parent, stderr.parent]))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Stream {
+    /// The child reads it (standard input).
+    Input,
+    /// The child writes it (standard output or error).
+    Output,
+}
+
+struct Prepared {
+    parent: Option<OwnedFd>,
+    child: Stdio,
+}
+
+fn prepare(slot: StdioSlot, stream: Stream) -> io::Result<Prepared> {
+    let (parent, child) = match slot {
+        StdioSlot::Null => (None, Stdio::null()),
+        StdioSlot::Inherit => (None, Stdio::inherit()),
+        StdioSlot::Pipe => {
+            let (read, write) = cloexec_pipe(stream)?;
+            match stream {
+                Stream::Input => (Some(write), Stdio::from(read)),
+                Stream::Output => (Some(read), Stdio::from(write)),
+            }
+        }
+    };
+    Ok(Prepared { parent, child })
+}
+
+/// A pipe whose ends are both close-on-exec before any platform spawn can
+/// copy them: the caller holds the platform spawn lock.
+#[cfg(not(target_vendor = "apple"))]
+fn cloexec_pipe(stream: Stream) -> io::Result<(OwnedFd, OwnedFd)> {
+    let ends = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+    window_seam(stream);
+    Ok(ends)
+}
+
+/// Apple has no `pipe2`: create the pipe, then mark each end close-on-exec as
+/// std does. The two steps are not atomic against a concurrent spawn.
+#[cfg(target_vendor = "apple")]
+fn cloexec_pipe(stream: Stream) -> io::Result<(OwnedFd, OwnedFd)> {
+    let (read, write) = rustix::pipe::pipe()?;
+    window_seam(stream);
+    rustix::io::ioctl_fioclex(&read)?;
+    rustix::io::ioctl_fioclex(&write)?;
+    Ok((read, write))
+}
+
+#[cfg(test)]
+type Seam = Option<Box<dyn FnOnce()>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Fired once, on this thread, while creating a standard-input pipe: on
+    /// Apple between `pipe()` and close-on-exec.
+    static WINDOW: RefCell<Seam> = const { RefCell::new(None) };
+    /// Fired once, on this thread, when the platform spawn lock is already
+    /// held, before waiting for it.
+    static BLOCKED: RefCell<Seam> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn window_seam(stream: Stream) {
+    if stream == Stream::Input
+        && let Some(seam) = WINDOW.with(|window| window.borrow_mut().take())
+    {
+        seam();
+    }
+}
+
+#[cfg(not(test))]
+fn window_seam(_: Stream) {}
+
+#[cfg(test)]
+fn blocked_seam() {
+    if let Some(seam) = BLOCKED.with(|blocked| blocked.borrow_mut().take()) {
+        seam();
+    }
+}
+
+#[cfg(not(test))]
+fn blocked_seam() {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Observation {
@@ -729,6 +906,37 @@ fn presence(result: rustix::io::Result<()>) -> GroupPresence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read as _;
+
+    const INHERITED: StdioPlan =
+        StdioPlan::new(StdioSlot::Inherit, StdioSlot::Inherit, StdioSlot::Inherit);
+
+    fn close_on_exec(fd: &OwnedFd) -> bool {
+        rustix::io::fcntl_getfd(fd)
+            .unwrap()
+            .contains(rustix::io::FdFlags::CLOEXEC)
+    }
+
+    #[test]
+    fn platform_pipes_are_close_on_exec() {
+        for stream in [Stream::Input, Stream::Output] {
+            let (read, write) = cloexec_pipe(stream).unwrap();
+            assert!(close_on_exec(&read), "{stream:?} read end");
+            assert!(close_on_exec(&write), "{stream:?} write end");
+        }
+        let mut command = Command::new("/bin/cat");
+        command.env_clear();
+        let plan = StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Null);
+        let mut owner = OwnedProcessGroup::spawn(command, plan).unwrap();
+        let held =
+            [owner.stdin.as_ref(), owner.stdout.as_ref()].map(|end| end.is_some_and(close_on_exec));
+        assert!(owner.stderr.is_none());
+        assert!(owner.take_stderr().is_err(), "a null stream is not piped");
+        drop(owner.take_stdin().unwrap());
+        let finished = finish_test_owner(&mut owner);
+        assert_eq!(held, [true, true], "parent ends carry close-on-exec");
+        finished.unwrap();
+    }
 
     #[test]
     fn signal_and_post_reap_presence_keep_absence_and_permission_distinct() {
@@ -1011,7 +1219,7 @@ mod tests {
     fn owned_listing_uses_the_real_listing_for_its_own_group() {
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
-        let mut owner = OwnedProcessGroup::spawn(command).unwrap();
+        let mut owner = OwnedProcessGroup::spawn(command, INHERITED).unwrap();
         let mut listing = owner.permission_listing(Instant::now() + Duration::from_secs(5));
         // Before EPERM nothing is listed; the real lister then finds no member
         // of a group whose only member was reaped.
@@ -1165,7 +1373,7 @@ mod tests {
         if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
             command.env("LLVM_PROFILE_FILE", profile);
         }
-        let mut owner = OwnedProcessGroup::spawn(command).unwrap();
+        let mut owner = OwnedProcessGroup::spawn(command, INHERITED).unwrap();
         let observation = (|| -> Result<(usize, usize), String> {
             if !matches!(owner.terminate_before_reap(), Termination::Signalled(_)) {
                 return Err("first transition was not accepted".to_owned());
@@ -1258,15 +1466,13 @@ mod tests {
         command
             .arg("-c")
             .arg("cat >/dev/null")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
             .env_clear()
             .env("PATH", "/usr/bin:/bin");
         if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
             command.env("LLVM_PROFILE_FILE", profile);
         }
-        let mut owner = OwnedProcessGroup::spawn(command).unwrap();
+        let plan = StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Pipe);
+        let mut owner = OwnedProcessGroup::spawn(command, plan).unwrap();
         let input = owner.take_stdin().unwrap();
         let output = owner.take_stdout().unwrap();
         let error = owner.take_stderr().unwrap();
@@ -1275,6 +1481,133 @@ mod tests {
         assert!(owner.take_stderr().is_err());
         drop((input, output, error));
         finish_test_owner(&mut owner).unwrap();
+    }
+
+    /// What the second spawn did first while the first was in its window.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Second {
+        Blocked,
+        Spawned,
+        Failed,
+    }
+
+    #[test]
+    fn concurrent_owned_spawn_cannot_copy_a_pipe_in_its_window() {
+        // The sibling owner tests' bound; nothing here sleeps.
+        let bound = Duration::from_secs(5);
+        let cat = || {
+            let mut command = Command::new("/bin/cat");
+            command.env_clear();
+            command
+        };
+        let (entered, in_window) = std::sync::mpsc::channel::<()>();
+        let (event, events) = std::sync::mpsc::channel::<Second>();
+        let (seen, first_seen) = std::sync::mpsc::channel();
+        // A pauses after creating its stdin pipe (on Apple before either end
+        // is close-on-exec) until B reports what it did first. It never waits
+        // for B's spawn alone, so a serialised B cannot deadlock it.
+        let first = std::thread::spawn(move || {
+            WINDOW.with(|window| {
+                *window.borrow_mut() = Some(Box::new(move || {
+                    let _ = entered.send(());
+                    let _ = seen.send(events.recv_timeout(bound));
+                }));
+            });
+            let plan = StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Null);
+            OwnedProcessGroup::spawn(cat(), plan)
+        });
+        let second = std::thread::spawn(move || {
+            in_window.recv_timeout(bound).map_err(|error| {
+                io::Error::other(format!("A never reached its window: {error}"))
+            })?;
+            let blocked = event.clone();
+            BLOCKED.with(|seam| {
+                *seam.borrow_mut() = Some(Box::new(move || {
+                    let _ = blocked.send(Second::Blocked);
+                }));
+            });
+            let plan = StdioPlan::new(StdioSlot::Pipe, StdioSlot::Null, StdioSlot::Null);
+            let spawned = OwnedProcessGroup::spawn(cat(), plan);
+            BLOCKED.with(|seam| seam.borrow_mut().take());
+            let _ = event.send(if spawned.is_ok() {
+                Second::Spawned
+            } else {
+                Second::Failed
+            });
+            spawned
+        });
+        let (first, second) = (first.join().unwrap(), second.join().unwrap());
+        let (mut first, mut second) = (first.unwrap(), second.unwrap());
+        let first_event = first_seen.try_recv();
+        let (first_input, first_output) = (first.take_stdin(), first.take_stdout());
+        let second_input = second.take_stdin();
+        // B's input stays open: a copy of A's input write end inherited by B's
+        // cat would keep A's cat from reaching end of file.
+        drop(first_input);
+        let (finished, eof) = std::sync::mpsc::channel();
+        let reader = first_output.map(|mut output| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = finished.send(output.read_to_end(&mut bytes).map(|_| bytes.len()));
+            })
+        });
+        let first_eof = eof.recv_timeout(bound);
+        drop(second_input);
+        let settled = [
+            settle_without_sleep(&mut first, bound),
+            settle_without_sleep(&mut second, bound),
+        ];
+        // Join the reader only once it has reported; after both groups are
+        // gone nothing else holds A's output write end.
+        if (first_eof.is_ok() || eof.recv_timeout(bound).is_ok())
+            && let Ok(reader) = reader
+        {
+            reader.join().unwrap();
+        }
+        assert!(
+            matches!(first_eof, Ok(Ok(0))),
+            "A's cat did not reach end of file within {bound:?} while B ran: {first_eof:?} \
+             (B's first event: {first_event:?})"
+        );
+        assert_eq!(
+            first_event,
+            Ok(Ok(Second::Blocked)),
+            "B must wait for the platform spawn lock while A is in its window"
+        );
+        for result in settled {
+            result.unwrap();
+        }
+    }
+
+    /// [`finish_test_owner`] without sleeping between bounded polls.
+    fn settle_without_sleep(owner: &mut OwnedProcessGroup, bound: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + bound;
+        loop {
+            match owner.terminate_before_reap() {
+                Termination::Signalled(_) | Termination::InvalidPhase => break,
+                Termination::Interrupted if Instant::now() < deadline => {}
+                result => return Err(format!("test transition cleanup: {result:?}")),
+            }
+            std::thread::yield_now();
+        }
+        loop {
+            match owner.reap_if_exited() {
+                Reap::Reaped(_) => break,
+                Reap::NotExited | Reap::Interrupted if Instant::now() < deadline => {}
+                result => return Err(format!("test root reap cleanup: {result:?}")),
+            }
+            std::thread::yield_now();
+        }
+        let mut listing = owner.permission_listing(deadline);
+        loop {
+            match listing.resolve_blocking(owner.presence_after_reap()) {
+                GroupPresence::Absent | GroupPresence::Recycled => return Ok(()),
+                GroupPresence::Present | GroupPresence::PermissionDenied
+                    if Instant::now() < deadline => {}
+                result => return Err(format!("test group cleanup: {result:?}")),
+            }
+            std::thread::yield_now();
+        }
     }
 
     fn finish_test_owner(owner: &mut OwnedProcessGroup) -> Result<(), String> {
