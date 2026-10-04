@@ -16,6 +16,17 @@ without a derivation; no retry; no change to `startup_timeout_secs`; no product 
   Status at scoping (superseded by the outcome below): that branch (63942438, 2026-10-03 23:06) held only its `chore(cospec): scope memory-derived-waits` commit, and the exposure commit was expected as a `kuru_memory::service::OPERATION_TIMEOUT` re-export. Do tasks 2.2 (its non-`OPERATION_TIMEOUT` part), 2.3, 3.x, 4.x and 5.x first and leave every `OPERATION_TIMEOUT` expression for last. After PR 1 merges the orchestrator rebases and the duplicate drops out.
   Outcome (2026-10-03): the exposure commit landed as `3fa5318e` (`test(memory): expose product budgets to test-support consumers`). It adds `kuru_memory::test_budgets` under `test-support` (forwarding `OPERATION_TIMEOUT`, `QUERY_TIMEOUT`, `close_budget()` and `SUPERVISOR_REAP_ALLOWANCE` unchanged), not the `kuru_memory::service::OPERATION_TIMEOUT` re-export this task assumed at scoping; every derivation here imports `kuru_memory::test_budgets::OPERATION_TIMEOUT`. Cherry-picked unchanged as `93b8b35c`; its sha is recorded in `blocking-changes.md`. Evidence: `git log --oneline origin/main..HEAD` lists it as the only commit touching `packages/kuru-memory` (`lib.rs`, `src/service/rpc.rs`, `src/test_budgets.rs`); the source branch still held `3fa5318e` when this branch's last commit was made.
 
+Integration update (2026-10-04): PR #210 merged as `2d4b5b8e`, so the
+`93b8b35c` exposure cherry-pick was dropped during rebase. All 14 remaining
+commits were patch-equivalent. The subsequent rebase onto PR #221's merged
+`22e1ee60` resolved one CLI and three runtime-test conflicts by preserving
+closing wrappers and explicit store closes, then applying the original wait
+changes inside them. A comparison of all nine TUI files' added/removed text
+matched after leading-indentation normalization. The four unpublished review
+and open-hold follow-ups are preserved. `mise run format:code` passed after
+integration. These comparisons and formatting are not behavioral acceptance;
+PR #214/#215 integration and the final relevant checks are still required.
+
 ## 2. Shared terminal constants (`tests/support/terminal.rs`, `tests/terminal.rs`)
 
 - [x] 2.1 t1#2: derive `READY_TIMEOUT` once, at `tests/support/terminal.rs:19`, as `OPERATION_TIMEOUT` plus a frame allowance, with the derivation in a comment there, and verify that no `from_secs(10)` literal defines it and that a const assertion keeps it strictly above `OPERATION_TIMEOUT`

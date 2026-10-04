@@ -10,6 +10,14 @@ None.
 
 ## Coordination, not a block
 
+Integration update (2026-10-04): PR #210 merged as `2d4b5b8e`; its memory
+budget exports now come from main, and the duplicate `93b8b35c` cherry-pick
+was dropped. PR #208 is also on main. PR #221 merged as `22e1ee60`; the TUI
+wait changes were rebased onto it, retaining the closing wrappers, explicit
+store closes and every prior source change. PR #214 and PR #215 remain the
+unmerged prerequisites in the sequencing below. The earlier coordination
+record follows for provenance.
+
 No item below is a change slug that exists on this branch, so cospec cannot ledger it (a dangling slug fails `cospec validate --strict`: `blockers/dangling-ref`, observed when `memory-derived-waits` was tried under `Soft-blocked by`). Each is tracked here instead, and in `tasks.md` (task 1.2 for PR 1, task 7.1 for PR #214).
 
 - PR 1, branch `test/memory-derived-waits` (change `memory-derived-waits`, kuru-memory test waits): its first commit, `test(memory): expose product budgets to test-support consumers`, adds `kuru_memory::test_budgets` under `test-support`, forwarding `OPERATION_TIMEOUT`, `QUERY_TIMEOUT`, `close_budget()` and `SUPERVISOR_REAP_ALLOWANCE` unchanged (no value change). Every `OPERATION_TIMEOUT` derivation in this change imports `kuru_memory::test_budgets::OPERATION_TIMEOUT`. Until PR 1 merges, exactly that one commit is cherry-picked onto this branch; after PR 1 merges, the orchestrator rebases onto main and the duplicate drops out.
