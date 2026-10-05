@@ -42,7 +42,7 @@ The build job has `contents: read` and `pages: read`; only the deploy job receiv
 `pages: write` and `id-token: write`. There is no standalone Pages workflow.
 
 Release notes run on Ubuntu with the delivery package's task-scoped Cocogitto
-7.0.0 and Communiqué 1.4.2 pins. Native archive build jobs use only the Rust
+7.0.0 and Communiqué 1.5.0 pins. Native archive build jobs use only the Rust
 packaging task and do not need the notes toolchain. Full maintainer tests and notes generation run on
 Linux, Apple Silicon macOS or Windows x86_64. App installation does not require these tools.
 
@@ -381,7 +381,7 @@ gets no new "protocol is incompatible" refusal.
 ## Notes model and configuration
 
 `communique.toml` uses top-level `context` and `system_extra` plus `[defaults]`.
-The pinned tool is Communiqué 1.4.2. It uses `claude-sonnet-5` through
+The pinned tool is Communiqué 1.5.0. It uses `claude-sonnet-5` through
 Anthropic's official OpenAI-compatible endpoint. `provider = "openai"` selects
 the wire format; requests go directly to `https://api.anthropic.com/v1`, and the
 model and credentials remain Anthropic's. Only the notes step maps the existing
@@ -414,8 +414,8 @@ the selected source, including defaults, provider identities and configuration
 persistence. A successful notes job is not evidence that every claim is accurate.
 
 Upstream contracts: [Cocogitto versioning](https://docs.cocogitto.io/guide/bump.html),
-[Communiqué configuration](https://github.com/jdx/communique/blob/v1.4.2/src/config.rs),
-[Communiqué OpenAI adapter](https://github.com/jdx/communique/blob/v1.4.2/src/providers/openai.rs),
+[Communiqué configuration](https://github.com/jdx/communique/blob/v1.5.0/src/config.rs),
+[Communiqué OpenAI adapter](https://github.com/jdx/communique/blob/v1.5.0/src/providers/openai.rs),
 [Anthropic API compatibility](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk),
 [Claude Sonnet 5 response changes](https://platform.claude.com/docs/en/models/sonnet-5/whats-new-sonnet-5).
 

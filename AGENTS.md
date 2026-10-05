@@ -256,9 +256,9 @@ need no additional permission when part of an authorized change.
 ## Cospec workflow
 
 Invoke cospec through `mise run cospec -- ...` (or `mise run //:cospec -- ...`
-from a package). The task supplies required compatibility configuration for the
-standalone binary; bare `cospec` and `mise exec -- cospec` omit it. See
-[development](docs/development.md) for the upstream issue and removal condition.
+from a package). The task selects the pinned standalone binary. Do not invoke
+bare `cospec`, `mise exec -- cospec`, or OpenSpec directly. See
+[development](docs/development.md).
 
 1. Start each substantive change with `mise run cospec -- new <type> <slug>`.
 2. Read `mise run cospec -- instructions <artifact> --change <slug>` and author

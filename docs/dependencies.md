@@ -1,6 +1,6 @@
 # Dependency audit
 
-Releases were checked on 2026-09-26 against the official crates.io sparse registry, npm registry, upstream GitHub releases and mise release metadata. Direct dependencies are exactly pinned; lockfiles resolve their compatible transitive dependencies. Rust dependencies use stable releases. The docs app follows cospec's VitePress 2 preview architecture and pins the latest available alpha explicitly.
+Releases were checked on 2026-10-05 against the official crates.io sparse registry, npm registry, upstream GitHub releases and mise release metadata. Direct dependencies are exactly pinned; lockfiles resolve their compatible transitive dependencies. Rust dependencies use stable releases. The docs app follows cospec's VitePress 2 preview architecture and pins the latest available alpha explicitly.
 
 The Dolt change checked SQLx 0.9.0, UUID 1.26.1 and full Dolt 2.3.3 on
 2026-09-10. The memory package's catalog records the measured native archive,
@@ -41,10 +41,10 @@ license. The connector package carries the crate and asset MIT attributions in
 | `serde_json` | `1.0.151` | [sparse index](https://index.crates.io/se/rd/serde_json) |
 | `toml` | `1.1.6+spec-1.1.0` | [sparse index](https://index.crates.io/to/ml/toml) |
 | `rusqlite` | `0.40.2` | [sparse index](https://index.crates.io/ru/sq/rusqlite) |
-| `uuid` | `1.26.1` | [sparse index](https://index.crates.io/uu/id/uuid) |
+| `uuid` | `1.27.0` | [sparse index](https://index.crates.io/uu/id/uuid) |
 | `sqlx` | `0.9.0` | [sparse index](https://index.crates.io/sq/lx/sqlx) |
 | `sha2` | `0.11.0` | [sparse index](https://index.crates.io/sh/a2/sha2) |
-| `tokio` | `1.53.1` | [sparse index](https://index.crates.io/to/ki/tokio) |
+| `tokio` | `1.53.2` | [sparse index](https://index.crates.io/to/ki/tokio) |
 | `reqwest` | `0.13.5` | [sparse index](https://index.crates.io/re/qw/reqwest) |
 | `tiktoken-rs` | `0.12.1` | [sparse index](https://index.crates.io/ti/kt/tiktoken-rs) |
 | `futures` | `0.3.34` | [sparse index](https://index.crates.io/fu/tu/futures) |
@@ -65,40 +65,39 @@ license. The connector package carries the crate and asset MIT attributions in
 | `tar` | `0.4.46` | [sparse index](https://index.crates.io/3/t/tar) |
 | `flate2` | `1.1.10` | [sparse index](https://index.crates.io/fl/at/flate2) |
 | `zip` | `8.6.0` | [sparse index](https://index.crates.io/3/z/zip) |
-| `crc32fast` | `1.5.1` | [sparse index](https://index.crates.io/cr/c3/crc32fast) |
+| `crc32fast` | `1.5.2` | [sparse index](https://index.crates.io/cr/c3/crc32fast) |
 | `windows-sys` | `0.61.2` | [sparse index](https://index.crates.io/wi/nd/windows-sys) |
 | `portable-pty` (Windows terminal tests) | `0.9.0` | [sparse index](https://index.crates.io/po/rt/portable-pty) |
 | `scraper` | `0.27.0` | [sparse index](https://index.crates.io/sc/ra/scraper) |
 | `roxmltree` | `0.21.1` | [sparse index](https://index.crates.io/ro/xm/roxmltree) |
-| `jsonschema` (core schema tests) | `0.58.0` | [sparse index](https://index.crates.io/js/on/jsonschema) |
+| `jsonschema` (core schema tests) | `0.58.5` | [sparse index](https://index.crates.io/js/on/jsonschema) |
 
 ## Development tools
 
 | Tool | Stable pin |
 | --- | --- |
-| `rust` | `1.98.1` |
-| `github:aligned-team/cospec` | `0.8.2` |
-| `aqua:jdx/hk` | `2.2.0` |
+| `rust` | `1.99.0` |
+| `github:aligned-team/cospec` | `0.8.3` |
+| `aqua:jdx/hk` | `2.5.0` |
 | `aqua:tamasfe/taplo` | `0.10.0` |
 | `aqua:koalaman/shellcheck` | `0.11.0` |
 | `aqua:rhysd/actionlint` | `1.7.12` |
 | `aqua:taiki-e/cargo-llvm-cov` | `0.9.1` |
-| `mr-boxington` | `1.18.0` |
+| `mr-boxington` | `1.22.0` |
 | `cargo:cargo-audit` (delivery package) | `0.22.2` |
 | Node (docs app only) | `26.10.0` |
-| npm (docs app only) | `12.1.0` |
+| npm (docs app only) | `12.2.0` |
 | VitePress (docs app) | `2.0.0-alpha.20` |
 | `vitepress-plugin-llms` (docs app) | `1.14.0` |
 | `oxfmt` (docs app) | `0.70.0` |
 | `oxlint` (docs app) | `1.85.0` |
 | Cocogitto (delivery package) | `7.0.0` |
-| Communiqué (delivery package) | `1.4.2` |
+| Communiqué (delivery package) | `1.5.0` |
 | mise (CI; root `min_version` soft) | `2026.9.18` |
 
 mr-boxington's exact pin and signed lock entries cover every supported platform.
 
-Every workflow installs exactly mise `2026.9.18`, the current release
-(2026-09-30). Root `min_version` is `{ hard = "2026.9.13", soft = "2026.9.18" }`:
+Mise is excluded from this update. Every workflow continues to install mise `2026.9.18` (2026-09-30). Root `min_version` is `{ hard = "2026.9.13", soft = "2026.9.18" }`:
 Homebrew's `mise` formula was 2026.9.15 on 2026-10-01, so a hard 2026.9.18
 floor would reject a package-manager installation, and lockfile behavior was
 measured identical from 2026.9.13 through 2026.9.18. The locks stay at lockfile
@@ -114,7 +113,7 @@ quality, native-tests and release workflows; `WORKFLOW_MISE_VERSION` in
 documented refresh; and the minimum mise version stated in development and
 installation docs.
 
-Cospec is `0.8.2`, confirmed by its [GitHub release](https://github.com/aligned-team/cospec/releases/tag/v0.8.2). Its standalone executable embeds its supported OpenSpec version, 1.13.1 for this release. No project OpenSpec, Bun or Python dependency is required. The task-scoped compatibility preload remains necessary; see [development](development.md).
+Cospec is `0.8.3`, confirmed by its [GitHub release](https://github.com/aligned-team/cospec/releases/tag/v0.8.3). Its standalone executable embeds its supported OpenSpec version, 1.13.1 for this release. No project OpenSpec, Bun or Python dependency is required. The obsolete compatibility preload is removed after the standalone contract passed without it; see [development](development.md).
 
 `cargo-audit` is scoped to delivery's advisory quality tasks. It scans only the
 current workspace root `Cargo.lock` against an explicitly refreshed RustSec database;
@@ -148,12 +147,12 @@ revision older than 90 days; refresh it again rather than bypassing the
 freshness check. The database is public advisory data, never a project or user
 credential store.
 
-The docs app selects npm `12.1.0` separately because Node `26.10.0` bundles
+The docs app selects npm `12.2.0` separately because Node `26.10.0` bundles
 npm `11.19.1`. Its app-owned mise alias retains npm's PATH priority over Node's
 bundled copy, and the tool option pins the official tarball's SHA-512 digest.
 The npm backend does not supply per-platform archive URLs or attestations in
 mise.lock; its exact version and explicit checksum remain authoritative.
-[npm's declared Node range](https://registry.npmjs.org/npm/12.1.0) includes
+[npm's declared Node range](https://registry.npmjs.org/npm/12.2.0) includes
 26.10.0. A clean locked installation selects these versions; dependency lifecycle
 scripts retain npm 12's default-deny policy, including optional `fsevents`.
 
@@ -169,7 +168,7 @@ All actions are pinned to the immutable commit for the latest stable release.
 | `actions/download-artifact` | [`v8.0.1`](https://github.com/actions/download-artifact/releases/tag/v8.0.1) | `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c` |
 | `Swatinem/rust-cache` | [`v2.9.2`](https://github.com/Swatinem/rust-cache/releases/tag/v2.9.2) | `6323deb102c322ba6fcbdcafc7e3dddab59af2b6` |
 
-The reqwest 0.13 upgrade changes its TLS feature name to `rustls`; the capability filesystem crates move together to 4.0.3. Rust 1.98.1 is shared by mise and rust-toolchain.toml. Re-run format, lint, protocol tests and coverage after future updates instead of assuming minor version changes are compatible.
+The reqwest 0.13 upgrade changes its TLS feature name to `rustls`; the capability filesystem crates move together to 4.0.3. Rust 1.99.0 is shared by mise and rust-toolchain.toml. Re-run format, lint, protocol tests and coverage after future updates instead of assuming minor version changes are compatible.
 
 ## Upstream transitive constraints
 

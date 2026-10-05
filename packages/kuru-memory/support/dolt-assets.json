@@ -74,7 +74,10 @@
         "host": "linux-x64",
         "goos": "windows",
         "goarch": "arm64",
-        "tags": ["icu_static", "timetzdata"],
+        "tags": [
+          "icu_static",
+          "timetzdata"
+        ],
         "sources": {
           "dolt": {
             "module": "github.com/dolthub/dolt/go",
@@ -90,9 +93,9 @@
         },
         "toolchain": {
           "go": {
-            "version": "go1.26.2",
-            "url": "https://dl.google.com/go/go1.26.2.linux-amd64.tar.gz",
-            "sha256": "990e6b4bbba816dc3ee129eaeaf4b42f17c2800b88a2166c265ac1a200262282"
+            "version": "go1.27.1",
+            "url": "https://dl.google.com/go/go1.27.1.linux-amd64.tar.gz",
+            "sha256": "63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445"
           },
           "llvm_mingw": {
             "version": "20260922",
@@ -103,11 +106,11 @@
           }
         }
       },
-      "compressed_bytes": 40777701,
-      "archive_sha256": "8fc1b7516358f71e4473c42bf058e3db189aef028539b128ea31239a637344f3",
-      "expanded_bytes": 119567473,
-      "executable_bytes": 118299648,
-      "executable_sha256": "6b9c19db6ab936af82d3770e3a0c976cee5ff9dd5a9376ebb4643d5750c85fb3",
+      "compressed_bytes": 40535327,
+      "archive_sha256": "079d8f340d320433ed33e103f3884be86aafafe271083607a1f37d429cfc866b",
+      "expanded_bytes": 117576305,
+      "executable_bytes": 116308480,
+      "executable_sha256": "e53a760b9790e9c9a48cad068e3ca48a2ae24fcbf8c43bdfa8559bd9909647e8",
       "license_bytes": 1212811,
       "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386",
       "notices": [

@@ -149,7 +149,7 @@ struct RetainedHandlePermit {
 impl RetainedHandlePermit {
     fn acquire(usage: Arc<std::sync::atomic::AtomicUsize>, count: usize) -> Option<Self> {
         usage
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(count)
                     .filter(|total| *total <= MAX_PREPARED_READ_HANDLES)

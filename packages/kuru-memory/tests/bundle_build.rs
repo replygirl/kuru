@@ -405,7 +405,7 @@ fn committed_manifest_is_schema_two_with_one_pinned_built_entry() {
     let build = asset.build.as_ref().unwrap();
     assert_eq!(build.host, "linux-x64");
     assert_eq!(build.sources.icu.version, "78.3");
-    assert_eq!(build.toolchain.go.version, "go1.26.2");
+    assert_eq!(build.toolchain.go.version, "go1.27.1");
     assert_eq!(build.toolchain.llvm_mingw.version, "20260922");
     let names: Vec<_> = asset.notices().iter().map(|notice| &*notice.name).collect();
     assert_eq!(
@@ -424,16 +424,16 @@ fn committed_manifest_is_schema_two_with_one_pinned_built_entry() {
     );
     // The Dolt 2.3.5 pins observed by the reproducible linux-x64 CI build.
     let pins = asset.pins().unwrap();
-    assert_eq!(pins.compressed_bytes, 40_777_701);
+    assert_eq!(pins.compressed_bytes, 40_535_327);
     assert_eq!(
         pins.archive_sha256,
-        "8fc1b7516358f71e4473c42bf058e3db189aef028539b128ea31239a637344f3"
+        "079d8f340d320433ed33e103f3884be86aafafe271083607a1f37d429cfc866b"
     );
-    assert_eq!(asset.expanded_bytes, Some(119_567_473));
-    assert_eq!(asset.executable_bytes, Some(118_299_648));
+    assert_eq!(asset.expanded_bytes, Some(117_576_305));
+    assert_eq!(asset.executable_bytes, Some(116_308_480));
     assert_eq!(
         asset.executable_sha256,
-        "6b9c19db6ab936af82d3770e3a0c976cee5ff9dd5a9376ebb4643d5750c85fb3"
+        "e53a760b9790e9c9a48cad068e3ca48a2ae24fcbf8c43bdfa8559bd9909647e8"
     );
     assert!(asset.notices().iter().all(|notice| notice.bytes.is_some()));
     let generated = manifest.catalog("aarch64-pc-windows-msvc").unwrap();
@@ -605,7 +605,7 @@ fn schema_two_provenance_build_and_notice_rules_fail_closed() {
             with(
                 &valid,
                 "/assets/4/build/toolchain/go/version",
-                json!("1.26.2"),
+                json!("1.27.1"),
             ),
             "invalid Go toolchain pin",
         ),

@@ -217,7 +217,7 @@ impl Runner for FakeRunner {
                     behavior
                         .go_version
                         .clone()
-                        .unwrap_or_else(|| "go version go1.26.2 linux/amd64\n".into()),
+                        .unwrap_or_else(|| "go version go1.27.1 linux/amd64\n".into()),
                 ),
                 "clang version" => success(behavior.clang.clone().unwrap_or_else(|| {
                     "clang version 23.1.2 (https://github.com/llvm/llvm-project abc)\nTarget: aarch64-w64-windows-gnu\n".into()
@@ -424,7 +424,7 @@ async fn unpinned_build_reports_pins_and_writes_the_exact_manifest_layout() {
     assert!(!report.verified);
     assert!(report.pins.authoritative);
     assert!(summary(&report).contains("unpinned: pin verification not yet possible"));
-    assert_eq!(report.pins.go_version, "go version go1.26.2 linux/amd64");
+    assert_eq!(report.pins.go_version, "go version go1.27.1 linux/amd64");
     assert_eq!(
         report.pins.imports,
         [
@@ -699,7 +699,7 @@ async fn unpinned_asset_requires_print_pins_and_override_is_non_authoritative() 
     options.host = MACOS;
     options.host_override = true;
     let behavior = Behavior {
-        go_version: Some("go version go1.26.2 darwin/arm64\n".into()),
+        go_version: Some("go version go1.27.1 darwin/arm64\n".into()),
         ..Behavior::default()
     };
     let report = fixture.run(&options, behavior.clone()).await.unwrap();
@@ -708,7 +708,7 @@ async fn unpinned_asset_requires_print_pins_and_override_is_non_authoritative() 
     assert!(summary(&report).contains("non-authoritative host override"));
     // The authoritative host requires the exact linux/amd64 toolchain.
     let message = error(fixture.run(&fixture.options("exact"), behavior).await);
-    assert!(message.contains("the recipe pins go1.26.2"), "{message}");
+    assert!(message.contains("the recipe pins go1.27.1"), "{message}");
     // A pre-existing work directory is never reused.
     let message = error(
         fixture
@@ -730,7 +730,7 @@ async fn tampered_or_mismatched_inputs_fail_closed() {
                 go_version: Some("go version go1.27.0 linux/amd64".into()),
                 ..Behavior::default()
             },
-            "the recipe pins go1.26.2",
+            "the recipe pins go1.27.1",
         ),
         (
             "clang",

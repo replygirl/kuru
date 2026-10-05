@@ -1210,7 +1210,7 @@ fn release_tool_derivation_rejects_conditional_installs_and_unmodelled_configura
         findings(
             "notes",
             test_tools,
-            "          GITHUB_TOKEN: ${{ github.token }}\n        run: mise install aqua:cocogitto/cocogitto@7.0.0 github:jdx/communique@1.4.2\n"
+            "          GITHUB_TOKEN: ${{ github.token }}\n        run: mise install aqua:cocogitto/cocogitto@7.0.0 github:jdx/communique@1.5.0\n"
         ),
         Vec::<String>::new()
     );
@@ -1218,7 +1218,7 @@ fn release_tool_derivation_rejects_conditional_installs_and_unmodelled_configura
         findings(
             "build-docs",
             docs_tools,
-            "        run: mise install node@24.0.0 npm@12.1.0\n"
+            "        run: mise install node@24.0.0 npm@12.2.0\n"
         ),
         [
             missing(
@@ -2314,7 +2314,7 @@ fn windows_only_rust_is_linted_by_a_required_static_job() {
     assert!(steps[linted].ends_with("run: mise run lint:windows"));
     assert!(
         named_step(&steps, "Install the Windows standard library and Clippy")
-            .contains("rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1\n")
+            .contains("rustup target add x86_64-pc-windows-msvc --toolchain 1.99.0\n")
     );
     assert!(ci.contains(
         "needs: [bundle-inputs, quality, windows-lint, native-tests, native-build, native-memory, native-memory-merge, native-platform, usage-scan-scaling, open-time]"

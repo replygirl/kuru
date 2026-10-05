@@ -1,22 +1,14 @@
 # Development
 
-Install pinned tooling with `mise install`, then run `mise run setup`. Rust 1.98.1
+Install pinned tooling with `mise install`, then run `mise run setup`. Rust 1.99.0
 is declared in both mise and rust-toolchain.toml. Cargo.lock pins runtime
 transitives. The [dependency audit](dependencies.md) records latest stable
 versions and the exact upstream constraints on transitive updates. mise.lock contains platform-specific tool URLs and checksums.
 Cospec is a standalone executable with embedded OpenSpec. Its validate/apply
 JSON and managed-file checks run without a project OpenSpec dependency. The
-pinned 0.8.2 release still needs the compatibility fix for its embedded
-OpenSpec 1.13.1 bundle: duplicate entrypoint execution makes the unpatched
-instructions command fail to return one JSON document. The cospec mise task scopes a small
-[compatibility preload](../packages/kuru-delivery/support/cospec-preload.cjs) to
-that exact bundle hash using cospec's own runtime. It preserves command arguments
-and the original gate; standalone contract tests cover clear, hard-blocked,
-soft-blocked and missing-artifact outcomes. Remove the preload only after an
-upstream release fixes vendoring and passes those tests without it. The 0.8.x
-OpenSpec 1.13.1 update and archive-gate corrections do not satisfy that removal
-condition; without the preload, 0.8.2's apply gate cannot parse the embedded
-instructions output.
+pinned 0.8.3 release fixes duplicate execution of its embedded OpenSpec 1.13.1
+entrypoint. The standalone clear, hard-blocked, soft-blocked and missing-artifact
+contract passes without the former compatibility preload.
 
 The architecture follows this order: apps/ and packages/ ownership, mise
 monorepo tasks, Rust, then other tools. Every app/package owns a mise.toml;
@@ -39,7 +31,7 @@ repair only that cache with `mise -C apps/kuru-docs install --force npm`.
 The delivery package activates Cocogitto and Communiqué only for its tests,
 combined coverage and release tasks. Its `setup` task preinstalls those tools
 with mise's `--include-task-tools` option; lean CI jobs use `setup:test-tools`
-to install only those two exact package-owned pins. Communiqué 1.4.2 provides Linux x86_64
+to install only those two exact package-owned pins. Communiqué 1.5.0 provides Linux x86_64
 and arm64, macOS arm64 and Windows x86_64 and arm64 binaries, which cover every supported
 platform for the full maintainer gate.
 
@@ -96,8 +88,7 @@ mapped and the most covered lines of any of its instantiations. Summed profiles
 cannot be recombined from per-file LCOV, so each partition also writes
 `coverage-lines.json`: every instantiation's source file, name, group location
 and mapped and covered lines, derived from its full `llvm-cov export` JSON with
-a port of llvm-cov's line statistics (LLVM 22.1.8, the pinned toolchain's
-`llvm-tools`). Before its receipt is written the partition runs
+a port of llvm-cov's line statistics (originally LLVM 22.1.8; the Rust 1.99 toolchain supplies LLVM 23.1.1). Before its receipt is written the partition runs
 cargo-llvm-cov's `--json --summary-only` report over the same profiles and
 requires the export to reproduce it exactly, per file and in total; a mismatch
 fails the partition, names the first mismatching files and keeps the summary in
@@ -262,8 +253,8 @@ and completeness on Ubuntu without LCOV or a threshold. Their receipts record
 gate, which x64, macOS and Ubuntu keep enforcing. Instrumented Windows on Arm
 partitions are held until a pinned Rust toolchain carries the fix for
 [rust-lang/rust#150123](https://github.com/rust-lang/rust/issues/150123), whose
-`llvm-profdata merge` failure on `aarch64-pc-windows-msvc` the pinned 1.98.1
-reproduces; `coverage::PARTITIONS` rejects an instrumented `windows-11-arm` set.
+`llvm-profdata merge` failure on `aarch64-pc-windows-msvc` the previous 1.98.1 toolchain
+reproduced; `coverage::PARTITIONS` rejects an instrumented `windows-11-arm` set.
 `native-platform` is a two-leg matrix: the x64 leg keeps
 `//packages/kuru-platform:coverage` and its 90% gate, and the arm64 leg,
 `Native platform behavior (aarch64-pc-windows-msvc)`, runs
@@ -1287,9 +1278,9 @@ separate from deterministic fixture tests and must be reported accurately.
 ## Lint configuration and Windows-target lint
 
 The root `clippy.toml` is the workspace's only Clippy configuration. Clippy
-1.98.1 searches `CLIPPY_CONF_DIR`, else the package directory, and walks up to
+1.99.0 searches `CLIPPY_CONF_DIR`, else the package directory, and walks up to
 the first directory holding `clippy.toml` or `.clippy.toml`
-([Clippy 1.98.1 configuration](https://github.com/rust-lang/rust/blob/1.98.1/src/tools/clippy/book/src/configuration.md)).
+([Clippy 1.99.0 configuration](https://github.com/rust-lang/rust/blob/1.99.0/src/tools/clippy/book/src/configuration.md)).
 A package-level file would therefore replace the root file and drop its bans.
 
 The file bans methods through
@@ -1344,7 +1335,7 @@ never sees them. Every package with such code owns a `lint:windows` task. It
 runs Clippy for `x86_64-pc-windows-msvc` with warnings as errors, and the root
 `lint:windows` aggregates those tasks. Install the target first with
 `mise run setup`, or with
-`rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1`.
+`rustup target add x86_64-pc-windows-msvc --toolchain 1.99.0`.
 
 Off Windows, the tasks point `CC_x86_64_pc_windows_msvc` and
 `AR_x86_64_pc_windows_msvc` at stand-ins in `packages/kuru-delivery/support`.

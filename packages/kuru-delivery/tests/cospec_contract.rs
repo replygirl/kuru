@@ -91,8 +91,8 @@ async fn cospec(root: &Path, label: &str, args: &[&str]) -> Call {
     command
         .args(args)
         .current_dir(root)
-        .env("BUN_OPTIONS", "--preload=cospec-preload.cjs")
-        .env("NODE_PATH", root.join("support with spaces"))
+        .env_remove("BUN_OPTIONS")
+        .env_remove("NODE_PATH")
         .env_remove("BUN_BE_BUN")
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_CACHE_HOME", root.join("cache"))
@@ -135,12 +135,6 @@ async fn a_call_that_cannot_finish_names_its_label_in_the_failure() {
 async fn standalone_cospec_emits_one_document_and_preserves_every_gate() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
-    fs::create_dir(root.join("support with spaces")).unwrap();
-    fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("support/cospec-preload.cjs"),
-        root.join("support with spaces/cospec-preload.cjs"),
-    )
-    .unwrap();
     cospec(
         root,
         "init",

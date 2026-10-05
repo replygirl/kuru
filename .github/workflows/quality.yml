@@ -47,7 +47,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Install required Rust component
-        run: rustup component add rustfmt --toolchain 1.98.1
+        run: rustup component add rustfmt --toolchain 1.99.0
       - run: mise run format:code
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
@@ -70,7 +70,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Install required Rust component
-        run: rustup component add clippy --toolchain 1.98.1
+        run: rustup component add clippy --toolchain 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
