@@ -2993,6 +2993,7 @@ fn cli_configuration_errors_and_nonterminal_start_are_actionable() {
 #[cfg(unix)]
 #[tokio::test]
 async fn tui_config_inspects_captured_redacted_configuration_in_a_synchronized_pty_frame() {
+    kuru_memory::test_support::closing(async {
     let env = Sandbox::warmed().await;
     let config_dir = env.project.join(".kuru");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -3097,6 +3098,8 @@ async fn tui_config_inspects_captured_redacted_configuration_in_a_synchronized_p
 
     terminal.submit("/quit").unwrap();
     terminal.wait_exit(terminal::READY_TIMEOUT).unwrap();
+    })
+    .await;
 }
 
 #[test]
