@@ -407,6 +407,46 @@ impl std::fmt::Display for SafeSource {
     }
 }
 
+/// One bounded, redacted leaf in a captured configuration inspection view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDisplayRow {
+    pub path: String,
+    pub value: String,
+    pub source: String,
+}
+
+/// A read-only projection of the configuration snapshot already captured at
+/// launch. It contains no authority and never resolves environment references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDisplayProjection {
+    pub layers: Vec<String>,
+    pub omitted_layers: usize,
+    pub rows: Vec<ConfigDisplayRow>,
+    pub omitted_rows: usize,
+    pub truncated_values: usize,
+    pub truncated_sources: usize,
+}
+
+/// Bounds for a terminal-facing configuration projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigDisplayBounds {
+    pub max_layers: usize,
+    pub max_rows: usize,
+    pub max_value_bytes: usize,
+    pub max_total_bytes: usize,
+}
+
+impl Default for ConfigDisplayBounds {
+    fn default() -> Self {
+        Self {
+            max_layers: 32,
+            max_rows: 512,
+            max_value_bytes: 1024,
+            max_total_bytes: 48 * 1024,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SafeClaimDisplay(String);
 
@@ -557,25 +597,30 @@ impl ProjectPreferences {
         merged: &mut toml::Value,
         provider: &str,
         explicit_model: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         self.validate()?;
+        let mut applied = Vec::new();
         if let Some(mode) = self.mode {
             merged["mode"] = toml::Value::try_from(mode)?;
+            applied.push("mode".to_owned());
         }
         if let Some(choice) = self.providers.get(provider)
             && explicit_model.is_none_or(|model| model == choice.model)
         {
             merged["model"] = choice.model.clone().into();
+            applied.push("model".to_owned());
             let table = merged
                 .as_table_mut()
                 .context("configuration is not a table")?;
             if let Some(effort) = &choice.effort {
                 table.insert("effort".into(), effort.clone().into());
+                applied.push("effort".to_owned());
             } else {
                 table.remove("effort");
+                applied.push("effort".to_owned());
             }
         }
-        Ok(())
+        Ok(applied)
     }
 }
 
@@ -699,6 +744,7 @@ pub struct ConfigSnapshot {
     workspace: PathBuf,
     merged: toml::Value,
     origins: BTreeMap<String, LayerOrigin>,
+    captured_config_sources: Vec<SafeSource>,
     local: Option<toml::Value>,
     local_origins: BTreeMap<String, LayerOrigin>,
     discovered_local: Option<toml::Value>,
@@ -719,6 +765,177 @@ pub struct ConfigSnapshot {
     prompt_catalog: PromptCatalog,
     selected_material: Vec<PromptMaterial>,
     user_prompt_root: Option<PathBuf>,
+}
+
+fn flatten_display_value(
+    value: &toml::Value,
+    path: &mut Vec<String>,
+    output: &mut Vec<(Vec<String>, String)>,
+) {
+    match value {
+        toml::Value::Table(table) => {
+            if table.is_empty() {
+                output.push((path.clone(), "{}".into()));
+                return;
+            }
+            for (key, value) in table {
+                path.push(key.clone());
+                flatten_display_value(value, path, output);
+                path.pop();
+            }
+        }
+        toml::Value::Array(array) => {
+            if array.is_empty() {
+                output.push((path.clone(), "[]".into()));
+                return;
+            }
+            for (index, value) in array.iter().enumerate() {
+                path.push(index.to_string());
+                flatten_display_value(value, path, output);
+                path.pop();
+            }
+        }
+        toml::Value::String(value) => output.push((path.clone(), value.clone())),
+        _ => output.push((path.clone(), value.to_string())),
+    }
+}
+
+fn is_redacted_config_path(path: &[String]) -> bool {
+    if path.len() >= 4 && path[0] == "mcp" && path[2] == "env" {
+        return true;
+    }
+    if path.len() >= 4 && path[0] == "mcp" && path[2] == "headers" {
+        return true;
+    }
+    // These fields name environment variables; the variable values are never
+    // read into the snapshot and the names are useful routing information.
+    if path.last().is_some_and(|leaf| leaf.ends_with("_env"))
+        || (path.len() >= 3 && path[0] == "mcp" && path[2] == "header_env")
+    {
+        return false;
+    }
+    let Some(leaf) = path.last() else {
+        return false;
+    };
+    let normalized = leaf
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "password"
+            | "secret"
+            | "clientsecret"
+            | "token"
+            | "accesstoken"
+            | "refreshtoken"
+            | "credential"
+            | "credentials"
+            | "authorization"
+            | "apikey"
+    )
+}
+
+fn is_url_config_path(path: &[String]) -> bool {
+    matches!(
+        path.last().map(String::as_str),
+        Some("api_base" | "url" | "client_metadata_url")
+    ) || (path.len() >= 2 && path[0] == "external_agents")
+}
+
+fn nearest_leaf_origin<'a>(
+    origins: &'a BTreeMap<String, LayerOrigin>,
+    path: &str,
+) -> Option<&'a LayerOrigin> {
+    let mut end = path.len();
+    loop {
+        if let Some(origin) = origins.get(&path[..end]) {
+            return Some(origin);
+        }
+        let separator = path[..end].rfind('.')?;
+        end = separator;
+    }
+}
+
+fn redact_snapshot_value(value: &mut toml::Value, path: &mut Vec<String>) {
+    if is_redacted_config_path(path) {
+        *value = toml::Value::String("[redacted]".into());
+        return;
+    }
+    if is_url_config_path(path) {
+        if let toml::Value::String(url) = value {
+            *url = redact_url_value(url);
+        }
+        return;
+    }
+    match value {
+        toml::Value::Table(table) => {
+            for (key, value) in table {
+                path.push(key.clone());
+                redact_snapshot_value(value, path);
+                path.pop();
+            }
+        }
+        toml::Value::Array(array) => {
+            for (index, value) in array.iter_mut().enumerate() {
+                path.push(index.to_string());
+                redact_snapshot_value(value, path);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_url_value(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return value.to_owned();
+    };
+    let has_userinfo = !url.username().is_empty() || url.password().is_some();
+    if has_userinfo {
+        let _ = url.set_username("[redacted]");
+        let _ = url.set_password(None);
+    }
+    if let Some(query) = url.query() {
+        let redacted = url::form_urlencoded::parse(query.as_bytes())
+            .map(|(key, value)| {
+                let normalized = key
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
+                let secret = matches!(
+                    normalized.as_str(),
+                    "key"
+                        | "apikey"
+                        | "token"
+                        | "accesstoken"
+                        | "refreshtoken"
+                        | "secret"
+                        | "clientsecret"
+                        | "password"
+                        | "credential"
+                        | "credentials"
+                        | "authorization"
+                );
+                (
+                    key.into_owned(),
+                    if secret {
+                        "[redacted]".into()
+                    } else {
+                        value.into_owned()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        url.set_query(None);
+        url.query_pairs_mut().extend_pairs(redacted);
+    }
+    if url.fragment().is_some() {
+        url.set_fragment(Some("[redacted]"));
+    }
+    url.to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -836,6 +1053,7 @@ impl ConfigSnapshot {
         let mut merged =
             toml::Value::try_from(Config::default()).expect("default config serializes");
         let mut origins = BTreeMap::new();
+        let mut captured_config_sources = Vec::new();
         let mut total_bytes: usize = 0;
         let mut layers = Vec::new();
         let constraints = if let Some(path) = managed {
@@ -848,6 +1066,7 @@ impl ConfigSnapshot {
             );
             let source = read_config_bounded(&canonical, true)?
                 .ok_or_else(|| config_error("read", &canonical))?;
+            captured_config_sources.push(safe_source(&canonical));
             total_bytes = total_bytes
                 .checked_add(source.len())
                 .ok_or_else(|| config_error("read", &canonical))?;
@@ -892,6 +1111,7 @@ impl ConfigSnapshot {
             let Some(source) = read_config_bounded(&path, required)? else {
                 continue;
             };
+            captured_config_sources.push(safe_source(&path));
             total_bytes = total_bytes
                 .checked_add(source.len())
                 .ok_or_else(|| config_error("read", &path))?;
@@ -912,9 +1132,13 @@ impl ConfigSnapshot {
                 .try_into()
                 .map_err(|error| config_type_error(&path, &error))?;
         }
+        if let Some((path, _)) = discovered_local {
+            captured_config_sources.push(safe_source(path));
+        }
         let (discovered_local, discovered_local_origins) =
             parse_captured_patch(discovered_local, &merged, &mut total_bytes)?;
         let (local, local_origins) = if let Some(path) = local {
+            captured_config_sources.push(safe_source(path));
             let source =
                 read_config_bounded(path, true)?.ok_or_else(|| config_error("read", path))?;
             total_bytes = total_bytes
@@ -941,6 +1165,7 @@ impl ConfigSnapshot {
             workspace,
             merged,
             origins,
+            captured_config_sources,
             local,
             local_origins,
             discovered_local,
@@ -1300,17 +1525,147 @@ impl ConfigSnapshot {
     /// Parseable effective TOML before saved project preferences are loaded.
     pub fn snapshot_toml(&self) -> Result<String> {
         let (mut value, _) = self.value_with_preferences(&ProjectPreferences::default())?;
-        if let Some(mcp) = value.get_mut("mcp").and_then(toml::Value::as_table_mut) {
-            for server in mcp.iter_mut().map(|(_, server)| server) {
-                if let Some(environment) = server.get_mut("env").and_then(toml::Value::as_table_mut)
-                {
-                    for value in environment.iter_mut().map(|(_, value)| value) {
-                        *value = "[redacted]".into();
-                    }
-                }
+        redact_snapshot_value(&mut value, &mut Vec::new());
+        toml::to_string_pretty(&value).map_err(|_| config_error("type", self.workspace()))
+    }
+
+    /// Capture a bounded, redacted display view from this already-parsed
+    /// snapshot and the preferences already loaded by the caller.
+    pub fn display_projection(
+        &self,
+        preferences: &ProjectPreferences,
+        bounds: ConfigDisplayBounds,
+    ) -> Result<ConfigDisplayProjection> {
+        let (value, origins) = self.value_with_preferences(preferences)?;
+        let mut leaves = Vec::new();
+        flatten_display_value(&value, &mut Vec::new(), &mut leaves);
+        let mut rows = Vec::new();
+        let mut truncated_values = 0;
+        let mut truncated_sources = 0;
+        let mut used_bytes = 0usize;
+        let row_budget = bounds
+            .max_total_bytes
+            .saturating_sub(bounds.max_layers.saturating_mul(195));
+        let mut omitted_rows = 0usize;
+        for (path, mut value) in leaves {
+            if is_redacted_config_path(&path) {
+                value = "[redacted]".to_owned();
+            } else if is_url_config_path(&path) {
+                value = redact_url_value(&value);
+            }
+            value = safe_text(&value, bounds.max_value_bytes.saturating_add(1));
+            let mut value_was_truncated = false;
+            if value.len() > bounds.max_value_bytes {
+                let marker = if bounds.max_value_bytes >= '…'.len_utf8() {
+                    "…"
+                } else {
+                    "."
+                };
+                let allowed = bounds.max_value_bytes.saturating_sub(marker.len());
+                let boundary = value
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .take_while(|index| *index <= allowed)
+                    .last()
+                    .unwrap_or(0);
+                value.truncate(boundary);
+                value.push_str(&marker[..marker.len().min(bounds.max_value_bytes)]);
+                value_was_truncated = true;
+            }
+            let dotted_path = path.join(".");
+            let mut display_path = safe_text(&dotted_path, 257);
+            if truncate_display_field(&mut display_path, 256) {
+                truncated_sources += 1;
+            }
+            let mut source = nearest_leaf_origin(&origins, &dotted_path)
+                .map(|origin| origin.source.as_str().to_owned())
+                .unwrap_or_else(|| "Kuru defaults".to_owned());
+            if truncate_display_field(&mut source, 192) {
+                truncated_sources += 1;
+            }
+            let row_bytes = display_path
+                .len()
+                .saturating_add(value.len())
+                .saturating_add(source.len())
+                .saturating_add(8);
+            if rows.len() >= bounds.max_rows || used_bytes.saturating_add(row_bytes) > row_budget {
+                omitted_rows += 1;
+                continue;
+            }
+            used_bytes += row_bytes;
+            truncated_values += usize::from(value_was_truncated);
+            rows.push(ConfigDisplayRow {
+                path: display_path,
+                value,
+                source,
+            });
+        }
+        if value.get("effort").is_none() && rows.iter().all(|row| row.path != "effort") {
+            let source = origins
+                .get("effort")
+                .map(|origin| origin.source.as_str())
+                .unwrap_or("provider default (no saved override)");
+            let row = ConfigDisplayRow {
+                path: "effort".into(),
+                value: "<provider default>".into(),
+                source: source.into(),
+            };
+            let cost = row.path.len() + row.value.len() + row.source.len() + 8;
+            if rows.len() < bounds.max_rows && used_bytes.saturating_add(cost) <= row_budget {
+                used_bytes += cost;
+                rows.push(row);
+            } else {
+                omitted_rows += 1;
             }
         }
-        toml::to_string_pretty(&value).map_err(|_| config_error("type", self.workspace()))
+        rows.sort_by(|left, right| left.path.cmp(&right.path));
+        let mut layers = vec!["Kuru defaults".to_owned()];
+        layers.extend(
+            self.captured_config_sources
+                .iter()
+                .map(|source| source.as_str().to_owned()),
+        );
+        if !self.overrides.typed_config.is_empty()
+            || self.overrides.mode.is_some()
+            || self.overrides.provider.is_some()
+            || self.overrides.model.is_some()
+            || self.overrides.effort.is_some()
+            || self.overrides.allow_write
+            || self.overrides.allow_shell
+            || self.overrides.no_dream
+        {
+            layers.push("command-line overrides".into());
+        }
+        if origins
+            .values()
+            .any(|origin| origin.source.as_str() == "saved project preferences")
+        {
+            layers.push("saved project preferences".into());
+        }
+        layers.dedup();
+        let mut omitted_layers = layers.len().saturating_sub(bounds.max_layers);
+        layers.truncate(bounds.max_layers);
+        let mut bounded_layers = Vec::new();
+        for mut layer in layers {
+            if truncate_display_field(&mut layer, 192) {
+                truncated_sources += 1;
+            }
+            let cost = layer.len().saturating_add(3);
+            if used_bytes.saturating_add(cost) > bounds.max_total_bytes {
+                omitted_layers += 1;
+                continue;
+            }
+            used_bytes += cost;
+            bounded_layers.push(layer);
+        }
+        Ok(ConfigDisplayProjection {
+            layers: bounded_layers,
+            omitted_layers,
+            rows,
+            omitted_rows,
+            truncated_values,
+            truncated_sources,
+        })
     }
 
     pub fn finalize(&self, preferences: &ProjectPreferences) -> Result<Config> {
@@ -1372,9 +1727,17 @@ impl ConfigSnapshot {
             .or_else(|| self.local.as_ref()?.get("model")?.as_str())
             .or_else(|| self.discovered_local.as_ref()?.get("model")?.as_str())
             .map(str::to_owned);
-        preferences
+        let preference_paths = preferences
             .overlay(&mut value, &provider, explicit_model.as_deref())
             .map_err(|_| config_error("validation", self.workspace()))?;
+        let preference_origin = LayerOrigin {
+            source: SafeSource("saved project preferences".into()),
+            source_digest: source_digest(b"saved project preferences"),
+            automatic: false,
+        };
+        for path in preference_paths {
+            origins.insert(path, preference_origin.clone());
+        }
         if let Some(local) = &self.discovered_local {
             merge_with_origins(
                 &mut value,
@@ -2534,6 +2897,31 @@ fn safe_text(value: &str, max: usize) -> String {
         .collect()
 }
 
+fn truncate_display_field(value: &mut String, max_bytes: usize) -> bool {
+    if value.len() <= max_bytes {
+        return false;
+    }
+    if max_bytes == 0 {
+        value.clear();
+        return true;
+    }
+    let marker = if max_bytes >= '…'.len_utf8() {
+        "…"
+    } else {
+        "."
+    };
+    let allowed = max_bytes.saturating_sub(marker.len());
+    let boundary = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= allowed)
+        .last()
+        .unwrap_or(0);
+    value.truncate(boundary);
+    value.push_str(&marker[..marker.len().min(max_bytes)]);
+    true
+}
+
 fn ancestor_directories(project: &Path) -> Result<Vec<PathBuf>> {
     let project = project
         .canonicalize()
@@ -3061,5 +3449,348 @@ mod memory_tests {
         let memory = Config::load_memory(Some(&user), &project, Some(&local)).unwrap();
         assert!(!memory.offline);
         assert_eq!(memory.startup_timeout_secs, 300);
+    }
+}
+
+#[cfg(test)]
+mod config_display_projection_tests {
+    use super::*;
+
+    fn projection_snapshot() -> (tempfile::TempDir, ConfigSnapshot) {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let user = directory.path().join("user.toml");
+        std::fs::write(
+            &user,
+            "provider = 'codex'\nmodel = 'base-model'\nmode = 'ifs'\napi_key_env = 'KURU_FAKE_API_KEY'\napi_base = 'https://user:pass@example.test/v1?token=query-secret&region=west'\n[mcp.fake]\nurl = 'https://url-user:url-pass@example.test/mcp?api_key=url-query-secret&tenant=public'\n[mcp.fake.env]\nPASSWORD = 'env-secret'\n[mcp.fake.header_env]\nAuthorization = 'KURU_FAKE_HEADER'\n",
+        )
+        .unwrap();
+        let snapshot = ConfigSnapshot::parse(
+            Some(&user),
+            &workspace,
+            None,
+            InvocationOverrides::default(),
+        )
+        .unwrap();
+        (directory, snapshot)
+    }
+
+    #[test]
+    fn cli_snapshot_toml_redacts_secret_values_and_preserves_parseable_shape() {
+        let (_directory, mut snapshot) = projection_snapshot();
+        let server = snapshot.merged["mcp"]["fake"].as_table_mut().unwrap();
+        server.insert(
+            "headers".to_owned(),
+            toml::Value::try_from(BTreeMap::from([(
+                "Authorization".to_owned(),
+                "header-snapshot-secret".to_owned(),
+            )]))
+            .unwrap(),
+        );
+        let output = snapshot.snapshot_toml().unwrap();
+        for secret in [
+            "pass@example.test",
+            "query-secret",
+            "url-user",
+            "url-pass",
+            "url-query-secret",
+            "env-secret",
+            "header-snapshot-secret",
+        ] {
+            assert!(!output.contains(secret), "{secret} leaked in {output}");
+        }
+        assert!(output.contains("api_key_env = \"KURU_FAKE_API_KEY\""));
+        let parsed: toml::Value = toml::from_str(&output).unwrap();
+        assert_eq!(
+            parsed["api_base"].as_str(),
+            Some("https://%5Bredacted%5D@example.test/v1?token=%5Bredacted%5D&region=west")
+        );
+        assert_eq!(
+            parsed["mcp"]["fake"]["env"]["PASSWORD"].as_str(),
+            Some("[redacted]")
+        );
+        assert_eq!(
+            parsed["mcp"]["fake"]["header_env"]["Authorization"].as_str(),
+            Some("KURU_FAKE_HEADER")
+        );
+        assert_eq!(
+            parsed["mcp"]["fake"]["headers"]["Authorization"].as_str(),
+            Some("[redacted]")
+        );
+    }
+
+    #[test]
+    fn display_projection_redacts_values_preserves_named_references_and_preferences() {
+        let (_directory, mut snapshot) = projection_snapshot();
+        // Exercise defensive handling of a future static-header representation
+        // without adding that unsupported key to the current configuration schema.
+        let server = snapshot.merged["mcp"]
+            .as_table_mut()
+            .unwrap()
+            .entry("fake")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .unwrap();
+        server.insert(
+            "headers".to_owned(),
+            toml::Value::try_from(BTreeMap::from([(
+                "Authorization".to_owned(),
+                "header-secret".to_owned(),
+            )]))
+            .unwrap(),
+        );
+        server.insert(
+            "capabilities".to_owned(),
+            toml::Value::Array(vec![toml::Value::String("vision".into())]),
+        );
+        let preferences = ProjectPreferences {
+            mode: Some(Mode::Freudian),
+            providers: BTreeMap::from([(
+                "codex".into(),
+                ModelPreference {
+                    model: "saved-model".into(),
+                    effort: None,
+                },
+            )]),
+        };
+        let projection = snapshot
+            .display_projection(&preferences, ConfigDisplayBounds::default())
+            .unwrap();
+        let text = format!("{:?}", projection.rows);
+        for secret in [
+            "pass",
+            "query-secret",
+            "url-pass",
+            "url-query-secret",
+            "env-secret",
+            "header-secret",
+        ] {
+            assert!(!text.contains(secret), "projection leaked {secret}");
+        }
+        let row = |path: &str| projection.rows.iter().find(|row| row.path == path).unwrap();
+        assert_eq!(row("api_key_env").value, "KURU_FAKE_API_KEY");
+        assert_eq!(
+            row("mcp.fake.header_env.Authorization").value,
+            "KURU_FAKE_HEADER"
+        );
+        assert_eq!(row("model").value, "saved-model");
+        assert_eq!(row("model").source, "saved project preferences");
+        assert_eq!(row("mode").source, "saved project preferences");
+        assert_eq!(row("effort").value, "<provider default>");
+        assert_eq!(row("effort").source, "saved project preferences");
+        assert_eq!(row("mcp.fake.capabilities.0").value, "vision");
+    }
+
+    #[test]
+    fn display_projection_keeps_later_explicit_precedence_and_source() {
+        let (directory, _snapshot) = projection_snapshot();
+        let workspace = directory.path().join("workspace");
+        let local = workspace.join("config.toml");
+        std::fs::write(&local, "model = 'local-model'\n").unwrap();
+        let snapshot = ConfigSnapshot::parse(
+            None,
+            &workspace,
+            Some(&local),
+            InvocationOverrides::default(),
+        )
+        .unwrap();
+        let preferences = ProjectPreferences {
+            providers: BTreeMap::from([(
+                "codex".into(),
+                ModelPreference {
+                    model: "saved-model".into(),
+                    effort: Some("high".into()),
+                },
+            )]),
+            ..ProjectPreferences::default()
+        };
+        let projection = snapshot
+            .display_projection(&preferences, ConfigDisplayBounds::default())
+            .unwrap();
+        let model = projection
+            .rows
+            .iter()
+            .find(|row| row.path == "model")
+            .unwrap();
+        assert_eq!(model.value, "local-model");
+        assert_eq!(model.source, local.to_string_lossy());
+        assert!(
+            !projection
+                .layers
+                .iter()
+                .any(|source| source == "saved project preferences")
+        );
+    }
+
+    #[test]
+    fn display_projection_stays_bound_to_the_captured_source_bytes() {
+        let (directory, snapshot) = projection_snapshot();
+        std::fs::write(
+            directory.path().join("user.toml"),
+            "model = 'later-model'\n",
+        )
+        .unwrap();
+        let projection = snapshot
+            .display_projection(
+                &ProjectPreferences::default(),
+                ConfigDisplayBounds::default(),
+            )
+            .unwrap();
+        let model = projection
+            .rows
+            .iter()
+            .find(|row| row.path == "model")
+            .unwrap();
+        assert_eq!(model.value, "base-model");
+        assert!(!format!("{:?}", projection).contains("later-model"));
+    }
+
+    #[test]
+    fn display_projection_keeps_empty_effective_containers_visible() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot =
+            ConfigSnapshot::parse(None, directory.path(), None, InvocationOverrides::default())
+                .unwrap();
+        let projection = snapshot
+            .display_projection(
+                &ProjectPreferences::default(),
+                ConfigDisplayBounds::default(),
+            )
+            .unwrap();
+        let row = |path: &str| projection.rows.iter().find(|row| row.path == path).unwrap();
+        assert_eq!(row("mcp").value, "{}");
+        assert_eq!(row("permissions").value, "[]");
+    }
+
+    #[test]
+    fn display_projection_redacts_typed_command_line_secret_values() {
+        let (directory, _snapshot) = projection_snapshot();
+        let workspace = directory.path().join("workspace");
+        let user = directory.path().join("user.toml");
+        let snapshot = ConfigSnapshot::parse(
+            Some(&user),
+            &workspace,
+            None,
+            InvocationOverrides {
+                typed_config: vec![
+                    "api_base='https://typed.test/?client_secret=typed-query-secret'".into(),
+                    "mcp.fake.env.PASSWORD='typed-env-secret'".into(),
+                ],
+                ..InvocationOverrides::default()
+            },
+        )
+        .unwrap();
+        let projection = snapshot
+            .display_projection(
+                &ProjectPreferences::default(),
+                ConfigDisplayBounds::default(),
+            )
+            .unwrap();
+        let text = format!("{:?}", projection);
+        assert!(!text.contains("typed-query-secret"));
+        assert!(!text.contains("typed-env-secret"));
+        assert!(text.contains("command line"));
+        assert!(text.contains("api_key_env"));
+    }
+
+    #[test]
+    fn display_projection_typed_and_dedicated_cli_selections_win_over_saved_choices() {
+        let (directory, _snapshot) = projection_snapshot();
+        let workspace = directory.path().join("workspace");
+        let user = directory.path().join("user.toml");
+        let snapshot = ConfigSnapshot::parse(
+            Some(&user),
+            &workspace,
+            None,
+            InvocationOverrides {
+                typed_config: vec!["model='typed-model'".into()],
+                mode: Some(Mode::Jungian),
+                effort: Some("high".into()),
+                ..InvocationOverrides::default()
+            },
+        )
+        .unwrap();
+        let preferences = ProjectPreferences {
+            mode: Some(Mode::Freudian),
+            providers: BTreeMap::from([(
+                "codex".into(),
+                ModelPreference {
+                    model: "saved-model".into(),
+                    effort: Some("low".into()),
+                },
+            )]),
+        };
+        let projection = snapshot
+            .display_projection(&preferences, ConfigDisplayBounds::default())
+            .unwrap();
+        let row = |path: &str| projection.rows.iter().find(|row| row.path == path).unwrap();
+        assert_eq!(row("model").value, "typed-model");
+        assert_eq!(row("mode").value, "jungian");
+        assert_eq!(row("effort").value, "high");
+        assert_eq!(row("model").source, "command line");
+        assert_eq!(row("mode").source, "command line");
+        assert_eq!(row("effort").source, "command line");
+        assert!(
+            !projection
+                .layers
+                .iter()
+                .any(|source| source == "saved project preferences")
+        );
+    }
+
+    #[test]
+    fn display_projection_bounds_rows_and_values_with_counts() {
+        let (_directory, snapshot) = projection_snapshot();
+        let projection = snapshot
+            .display_projection(
+                &ProjectPreferences::default(),
+                ConfigDisplayBounds {
+                    max_layers: 1,
+                    max_rows: 20,
+                    max_value_bytes: 4,
+                    max_total_bytes: 4096,
+                },
+            )
+            .unwrap();
+        assert_eq!(projection.rows.len(), 20);
+        assert_eq!(projection.layers.len(), 1);
+        assert!(projection.omitted_layers > 0);
+        assert!(projection.omitted_rows > 0);
+        assert!(projection.truncated_values > 0);
+        assert!(projection.rows.iter().all(|row| row.value.len() <= 4));
+        let projected_bytes = projection
+            .rows
+            .iter()
+            .map(|row| row.path.len() + row.value.len() + row.source.len() + 8)
+            .sum::<usize>()
+            + projection
+                .layers
+                .iter()
+                .map(|layer| layer.len() + 3)
+                .sum::<usize>();
+        assert!(projected_bytes <= 4096);
+    }
+
+    #[test]
+    fn display_projection_counts_escaped_long_leaf_paths() {
+        let (_directory, mut snapshot) = projection_snapshot();
+        let server = snapshot.merged["mcp"]["fake"].as_table_mut().unwrap();
+        let environment = server
+            .entry("env")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .unwrap();
+        environment.insert("A".repeat(256), "value".into());
+
+        let projection = snapshot
+            .display_projection(
+                &ProjectPreferences::default(),
+                ConfigDisplayBounds::default(),
+            )
+            .unwrap();
+
+        assert!(projection.truncated_sources > 0);
+        assert!(projection.rows.iter().all(|row| row.path.len() <= 256));
     }
 }

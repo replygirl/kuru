@@ -23,7 +23,8 @@ use kuru_connectors::{
     project_text,
 };
 use kuru_core::{
-    Mode, ModelInfo, NativeTool, PermissionSelector, Relationship, SessionUsage, UsagePhase,
+    ConfigDisplayProjection, Mode, ModelInfo, NativeTool, PermissionSelector, Relationship,
+    SessionUsage, UsagePhase,
 };
 use kuru_memory::{PublicTranscriptEntry, PublicTranscriptPage, SessionLifecycleState};
 use kuru_runtime::{
@@ -212,6 +213,7 @@ pub struct View {
     pub mode: String,
     pub model: String,
     pub effort: String,
+    pub config_projection: Option<ConfigDisplayProjection>,
     pub session: String,
     pub parts: Vec<(String, String)>,
     pub activity: Vec<String>,
@@ -287,6 +289,7 @@ impl View {
             mode: runtime.mode,
             model: runtime.model,
             effort: runtime.effort,
+            config_projection: None,
             session,
             parts: runtime.parts,
             activity: vec![],
@@ -1436,6 +1439,52 @@ fn omission_notice(context: &RequestContext) -> Option<String> {
     })
 }
 
+fn format_config_inspection(view: &View) -> String {
+    let mut lines = vec![
+        "Captured effective configuration · read only".to_owned(),
+        "Values and sources are from the launch snapshot; secret values are redacted and named environment references are not resolved.".to_owned(),
+    ];
+    if let Some(projection) = &view.config_projection {
+        lines.extend(
+            projection
+                .rows
+                .iter()
+                .map(|row| format!("{} = {}  ·  {}", row.path, row.value, row.source)),
+        );
+        if projection.omitted_layers > 0
+            || projection.omitted_rows > 0
+            || projection.truncated_values > 0
+            || projection.truncated_sources > 0
+        {
+            lines.push(format!(
+                "Display bounded: {} source layer(s) and {} value row(s) omitted; {} value(s) and {} path/source field(s) shortened.",
+                projection.omitted_layers,
+                projection.omitted_rows,
+                projection.truncated_values,
+                projection.truncated_sources
+            ));
+        }
+    } else {
+        lines.push("Captured configuration projection is unavailable.".into());
+    }
+    lines.push(String::new());
+    if let Some(projection) = &view.config_projection {
+        lines.push(format!(
+            "Captured sources: {}",
+            projection.layers.join(", ")
+        ));
+    }
+    lines.push("Current live runtime selection · updated after successful changes".into());
+    lines.push(format!("mode = {}", safe_terminal_value(&view.mode)));
+    lines.push(format!("model = {}", safe_terminal_value(&view.model)));
+    lines.push(format!("effort = {}", safe_terminal_value(&view.effort)));
+    lines.join("\n")
+}
+
+fn safe_terminal_value(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
+}
+
 async fn append_missing_interruption_markers(harness: &Harness, view: &mut View) -> Result<()> {
     let displayed = view
         .transcript
@@ -1620,6 +1669,16 @@ pub(crate) async fn run_with_notice_and_commands(
     notice: Option<MemoryNotice>,
     registry: commands::Registry,
 ) -> Result<()> {
+    run_with_notice_commands_and_config(harness, models, notice, registry, None).await
+}
+
+pub(crate) async fn run_with_notice_commands_and_config(
+    harness: Harness,
+    models: Vec<ModelInfo>,
+    notice: Option<MemoryNotice>,
+    registry: commands::Registry,
+    config_projection: Option<ConfigDisplayProjection>,
+) -> Result<()> {
     ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "interactive mode requires a terminal; use kuru run PROMPT"
@@ -1633,6 +1692,7 @@ pub(crate) async fn run_with_notice_and_commands(
         EventStream::new(),
         notice,
         registry,
+        config_projection,
     )
     .await;
     // Ratatui's Drop may show its cursor. Finish that while terminal output
@@ -2142,6 +2202,7 @@ where
         input,
         None,
         commands::Registry::default(),
+        None,
     )
     .await
 }
@@ -2153,6 +2214,7 @@ async fn run_loop_with_stream_and_notice<B, S>(
     mut input: S,
     mut notice: Option<MemoryNotice>,
     registry: commands::Registry,
+    config_projection: Option<ConfigDisplayProjection>,
 ) -> Result<()>
 where
     B: Backend,
@@ -2161,6 +2223,7 @@ where
 {
     let initial = project_initial_view(&harness).await?;
     let mut view = View::from_initial(initial, models).with_command_registry(registry);
+    view.config_projection = config_projection;
     let permission_service = harness.permission_service();
     refresh_permission_state(&permission_service, &mut view)?;
     if let Some(notice) = &notice {
@@ -2390,11 +2453,16 @@ where
                             view.transcript.push(("status".into(), view.current_session_status()));
                             view.show_scene = false;
                             view.scroll = 0;
+                        } else if command_id == Some(CommandId::Config) && no_args && !view.busy {
+                            view.transcript.push(("config".into(), format_config_inspection(&view)));
+                            view.show_scene = false;
+                            view.scroll = 0;
                         } else if !no_args
                             && matches!(
                                 command_id,
                                 Some(
                                     CommandId::Clear
+                                        | CommandId::Config
                                         | CommandId::Help
                                         | CommandId::Permissions
                                         | CommandId::Quit
@@ -2669,6 +2737,7 @@ async fn dispatch_controlled(
     }
     let args = registered.map_or("", |request| request.args);
     let feedback = match registered.map(|request| request.id) {
+        Some(CommandId::Config) => anyhow::bail!("/config is a local read-only TUI command"),
         Some(CommandId::Parts) => serde_json::to_string_pretty(&harness.topology)?,
         Some(CommandId::Mode) => {
             harness.set_mode(args.parse::<Mode>()?).await?;
@@ -3467,6 +3536,55 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn config_command_frame_shows_captured_sources_and_live_selection_safely() {
+        let mut view = fixture();
+        view.config_projection = Some(ConfigDisplayProjection {
+            layers: vec!["Kuru defaults".into(), "project.toml".into()],
+            omitted_layers: 0,
+            rows: vec![
+                kuru_core::ConfigDisplayRow {
+                    path: "mcp.fake.env.PASSWORD".into(),
+                    value: "[redacted]".into(),
+                    source: "project.toml".into(),
+                },
+                kuru_core::ConfigDisplayRow {
+                    path: "model".into(),
+                    value: "saved-model".into(),
+                    source: "saved project preferences".into(),
+                },
+            ],
+            omitted_rows: 2,
+            truncated_values: 1,
+            truncated_sources: 0,
+        });
+        view.transcript
+            .push(("config".into(), format_config_inspection(&view)));
+        view.show_scene = false;
+        let saved_frame = rendered(&view);
+        assert!(saved_frame.contains("Captured effective configuration"));
+        assert!(saved_frame.contains("saved-model"));
+        assert!(saved_frame.contains("saved project preferences"));
+        assert!(saved_frame.contains("[redacted]"));
+        assert!(saved_frame.contains("Display bounded:"));
+        assert!(saved_frame.contains("2 value row(s) omitted"));
+        assert!(!saved_frame.contains("secret-sentinel"));
+
+        let mut live = runtime_snapshot();
+        live.model = "live-switched".into();
+        live.mode = "polyvagal".into();
+        live.effort = "high".into();
+        view.apply_runtime(live);
+        let successful_frame = rendered(&View {
+            transcript: vec![("config".into(), format_config_inspection(&view))],
+            show_scene: false,
+            ..view.clone()
+        });
+        assert!(successful_frame.contains("live-switched"));
+        assert!(successful_frame.contains("mode = polyvagal"));
+        assert!(successful_frame.contains("effort = high"));
     }
 
     #[test]

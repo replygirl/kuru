@@ -14,8 +14,8 @@ use kuru_connectors::{
     ToolHost, provider,
 };
 use kuru_core::{
-    AuthorityClaimCategory, Config, ConfigSnapshot, InvocationOverrides, Mode, ModelInfo,
-    ProjectPreferences, SafeManifest,
+    AuthorityClaimCategory, Config, ConfigDisplayBounds, ConfigSnapshot, InvocationOverrides, Mode,
+    ModelInfo, ProjectPreferences, SafeManifest,
 };
 use kuru_memory::{
     CandidateRefRejected, CandidateRefState, MemoryStore, OpenOptions as MemoryOptions,
@@ -1591,7 +1591,23 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             }
             None => {
                 let registry = crate::commands::Registry::from_catalog(snapshot.prompt_catalog());
-                crate::ui::run_with_notice_and_commands(harness, models, notice, registry).await?
+                let config_projection = snapshot.display_projection(
+                    &preferences,
+                    ConfigDisplayBounds {
+                        max_layers: 32,
+                        max_rows: 64,
+                        max_value_bytes: 384,
+                        max_total_bytes: 48 * 1024,
+                    },
+                )?;
+                crate::ui::run_with_notice_commands_and_config(
+                    harness,
+                    models,
+                    notice,
+                    registry,
+                    Some(config_projection),
+                )
+                .await?
             }
             Some(Command::Mcp { .. }) => unreachable!("MCP command returned before memory setup"),
             _ => unreachable!("early-return commands handled above"),

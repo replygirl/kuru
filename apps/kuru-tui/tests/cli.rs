@@ -2990,6 +2990,115 @@ fn cli_configuration_errors_and_nonterminal_start_are_actionable() {
     assert!(text.contains("effort = \"medium\""));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn tui_config_inspects_captured_redacted_configuration_in_a_synchronized_pty_frame() {
+    let env = Sandbox::warmed().await;
+    let config_dir = env.project.join(".kuru");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        "mode='ifs'\nmodel='demo'\napi_base='https://example.test/v1?token=query-sentinel&password=password-sentinel&region=west'\napi_key_env='KURU_FAKE_KEY'\n",
+    )
+    .unwrap();
+    let mut command = env.command();
+    command.arg("--trust-workspace-once");
+    command.env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = terminal::Terminal::spawn(command, 28, 120).unwrap();
+    terminal.wait_idle().unwrap();
+
+    // The TUI must remain bound to startup bytes; this mutation occurs after
+    // its first stable PTY frame and before the inspection command.
+    std::fs::write(&config_path, "model='changed-after-launch'\n").unwrap();
+    terminal.submit("/config").unwrap();
+    terminal
+        .wait(
+            "captured /config results in the rendered frame",
+            terminal::READY_TIMEOUT,
+            |t| {
+                let screen = t.screen();
+                Ok(screen.contains("Captured sources:")
+                    && screen.contains("model = demo")
+                    && screen.contains("mode = ifs")
+                    && screen.contains("Current live runtime selection"))
+            },
+        )
+        .unwrap();
+    terminal
+        .wait_composer_frame(
+            &["Captured sources:", "Current live runtime selection"],
+            terminal::READY_TIMEOUT,
+        )
+        .unwrap();
+    let navigation_deadline = std::time::Instant::now() + terminal::READY_TIMEOUT;
+    let mut saw_heading = terminal
+        .screen()
+        .contains("Captured effective configuration");
+    let mut saw_env_reference = terminal.screen().contains("api_key_env = KURU_FAKE_KEY");
+    let mut saw_redacted_url =
+        terminal.screen().contains("api_base") && terminal.screen().contains("%5Bredacted%5D");
+    while !(saw_heading && saw_env_reference && saw_redacted_url) {
+        let before_page_up = terminal.screen();
+        let output_len = terminal.output.len();
+        terminal.send(b"\x1b[5~").unwrap();
+        let remaining = navigation_deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "PageUp did not reveal all captured config observations\n{}",
+            terminal.screen()
+        );
+        terminal
+            .wait(
+                "PageUp completes a frame revealing captured configuration rows",
+                remaining,
+                |t| Ok(t.screen() != before_page_up && t.completed_frame_after(output_len)),
+            )
+            .unwrap();
+        let screen = terminal.screen();
+        saw_heading |= screen.contains("Captured effective configuration");
+        saw_env_reference |= screen.contains("api_key_env = KURU_FAKE_KEY");
+        saw_redacted_url |= screen.contains("api_base") && screen.contains("%5Bredacted%5D");
+    }
+    let screen = terminal.screen();
+    let output = String::from_utf8_lossy(&terminal.output);
+    assert!(!output.contains("password-sentinel"), "{screen}");
+    assert!(!output.contains("query-sentinel"), "{screen}");
+    assert!(!output.contains("changed-after-launch"), "{screen}");
+    assert!(output.contains("api_base"), "{screen}");
+    assert!(output.contains("%5Bredacted%5D"), "{screen}");
+    assert!(output.contains("KURU_FAKE_KEY"), "{screen}");
+
+    terminal.submit("/mode freudian").unwrap();
+    terminal
+        .wait_composer_frame(
+            &["Mode: freudian · saved for this project"],
+            terminal::READY_TIMEOUT,
+        )
+        .unwrap();
+    terminal.submit("/config").unwrap();
+    terminal
+        .wait_composer_frame(
+            &["Current live runtime selection", "mode = freudian"],
+            terminal::READY_TIMEOUT,
+        )
+        .unwrap();
+    terminal.submit("/mode unknown").unwrap();
+    terminal
+        .wait_text(&["Failed · details in conversation"], &[])
+        .unwrap();
+    terminal.submit("/config").unwrap();
+    terminal
+        .wait_composer_frame(
+            &["Current live runtime selection", "mode = freudian"],
+            terminal::READY_TIMEOUT,
+        )
+        .unwrap();
+
+    terminal.submit("/quit").unwrap();
+    terminal.wait_exit(terminal::READY_TIMEOUT).unwrap();
+}
+
 #[test]
 fn fresh_inspection_never_provisions_memory_and_history_is_read_only() {
     let env = Sandbox::new();
