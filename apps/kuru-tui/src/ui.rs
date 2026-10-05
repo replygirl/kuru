@@ -2427,7 +2427,9 @@ async fn apply_completion(
     view.busy = false;
     *job = None;
     if quit_pending {
-        present_settled_compactions(events, view, notices);
+        if !notices.is_empty() {
+            present_settled_compactions(events, view, notices);
+        }
         view.settle();
         message?;
         return Ok(CompletionState::Settled {
@@ -2526,7 +2528,9 @@ async fn apply_completion(
             view.completion_locked = true;
         }
     }
-    present_settled_compactions(events, view, notices);
+    if !notices.is_empty() {
+        present_settled_compactions(events, view, notices);
+    }
     if let Some((input, cursor, chips)) = view.saved_input.take() {
         view.input = input;
         view.cursor = cursor;
@@ -5382,8 +5386,9 @@ mod tests {
         view.key(key(KeyCode::Char('b')));
         assert_eq!(view.input, "a\nb");
         view.key(key(KeyCode::Home));
+        assert_eq!(view.cursor, 2);
         view.key(key(KeyCode::Right));
-        assert_eq!(view.cursor, 1);
+        assert_eq!(view.cursor, 3);
         view.key(key(KeyCode::End));
         assert_eq!(view.cursor, 3);
         assert_eq!(view.key(key(KeyCode::Enter)).unwrap(), "a\nb");

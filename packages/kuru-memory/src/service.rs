@@ -10646,9 +10646,12 @@ mod tests {
         ensure!(parse_service_arguments(invalid).is_err());
 
         let hello = authority().hello();
+        let expected = format!(
+            r#"{{"version":{{"major":{},"minor":{}}},"project_path":[47,112,114,105,118,97,116,101,47,112,114,111,106,101,99,116],"project_scope":"scope","store_instance":"store","service_generation":"generation","connection_secret":"test-secret","schema_version":4}}"#,
+            PROTOCOL_MAJOR, PROTOCOL_MINOR
+        );
         ensure!(
-            serde_json::to_string(&hello)?
-                == r#"{"version":{"major":1,"minor":9},"project_path":[47,112,114,105,118,97,116,101,47,112,114,111,106,101,99,116],"project_scope":"scope","store_instance":"store","service_generation":"generation","connection_secret":"test-secret","schema_version":4}"#,
+            serde_json::to_string(&hello)? == expected,
             "a hello without a starter token changed its wire form"
         );
         let mut presented = hello;
