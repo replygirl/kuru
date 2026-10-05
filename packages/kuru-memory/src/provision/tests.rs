@@ -418,6 +418,99 @@ async fn failing_exact_version_probe_never_activates_and_releases_installation_a
 }
 
 #[tokio::test]
+async fn cold_probe_diagnostic_child() {
+    if std::env::var_os("KURU_TEST_COLD_PROBE_CHILD").is_none() {
+        return;
+    }
+    let root = crate::test_support::tempdir().unwrap();
+    let binary = root.path().join("dolt");
+    executable(
+        &binary,
+        b"#!/bin/sh\nprintf 'private-body-fixture'\nprintf 'private-body-fixture' >&2\nexit 3\n",
+    );
+    let error = verify_version(&binary, &root.path().join("home"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Dolt version probe failed");
+}
+
+#[tokio::test]
+async fn cold_probe_gated_refusal_observes_real_child_without_output_bodies() {
+    for gate in ["1", "0", "unexpected"] {
+        let root = crate::test_support::tempdir().unwrap();
+        prepare_private_home(root.path()).unwrap();
+        let mut environment = vec![
+            ("KURU_TEST_COLD_PROBE_CHILD".into(), "1".into()),
+            ("KURU_TEST_MEMORY_STARTUP_STAGES".into(), gate.into()),
+        ];
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            environment.push(("LLVM_PROFILE_FILE".into(), profile));
+        }
+        let mut child = crate::engine::spawn(
+            &std::env::current_exe().unwrap(),
+            root.path(),
+            root.path(),
+            vec![
+                "--exact".into(),
+                "provision::tests::cold_probe_diagnostic_child".into(),
+                "--nocapture".into(),
+            ],
+            environment,
+            false,
+        )
+        .await
+        .unwrap();
+        let stdout = child.stdout().unwrap();
+        let stderr = child.stderr().unwrap();
+        let stdout_facts = PipeFacts::default();
+        let stderr_facts = PipeFacts::default();
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::try_join!(
+                async { Ok::<_, anyhow::Error>(child.wait().await?) },
+                bounded_output(stdout, &stdout_facts),
+                bounded_output(stderr, &stderr_facts),
+            )
+        })
+        .await;
+        if !matches!(&result, Ok(Ok(_))) {
+            let _ = child.kill();
+            child.wait().await.unwrap();
+        }
+        let (status, stdout, stderr) = result.unwrap().unwrap();
+        assert!(status.success());
+        assert!(!String::from_utf8_lossy(&stdout).contains("memory cold-probe"));
+        let observations = String::from_utf8(stderr).unwrap();
+        assert!(!observations.contains("private-body-fixture"));
+        assert!(!observations.contains(&root.path().display().to_string()));
+        if gate == "1" {
+            for phase in [
+                "private-home-ready",
+                "native-create-returned",
+                "refused",
+                "cleanup-enter",
+                "cleanup-reaped",
+            ] {
+                assert!(
+                    observations.contains(&format!("phase={phase}")),
+                    "{observations}"
+                );
+            }
+            assert!(
+                observations.contains(
+                    "timed-out=false stdout=[bytes=20 eof=true] stderr=[bytes=20 eof=true]"
+                ),
+                "{observations}"
+            );
+        } else {
+            assert!(
+                !observations.contains("memory cold-probe"),
+                "{observations}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn stable_lock_waits_times_out_and_does_not_delete_a_held_inode() {
     let temporary = crate::test_support::tempdir().unwrap();
     let first = cache_lock(temporary.path(), Duration::from_secs(1))
