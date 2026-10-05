@@ -15,6 +15,17 @@
 
 ## 3. Acceptance and archival
 
-- [ ] 3.1 Remeasure before/after normal hook/shell cleanup latency and concurrent batch snapshot cost after completion wakes; record median, p95 and helper count, remove temporary probes, and obtain explicit cost disposition.
+- [x] 3.1 Remeasure before/after normal hook/shell cleanup latency and concurrent batch snapshot cost after completion wakes; record median, p95 and helper count, remove temporary probes, and record the accepted correctness/latency tradeoff.
 - [x] 3.2 Run scoped static checks and native macOS caller/runtime acceptance, recording hosted Linux checks honestly as unrun where unavailable.
-- [ ] 3.3 Complete the evidence ledger, strictly validate and archive the change before the final branch commit through normal hooks.
+- [x] 3.3 Integrate exact accepted main, verify reviewed source and commit equivalence, and run the scoped static/documentation checks justified by that integration.
+- [x] 3.4 Complete the evidence ledger and actual strict/apply gates for archive readiness, retaining required fresh native PR CI before merge as explicitly unrun.
+
+Actual closeout: normal Cospec archive exited 0 and confirmed
+`openspec/changes/archive/2026-10-05-unix-retained-root-resignal/`, active-directory
+removal and one modified native-platform requirement applied and verified.
+Post-archive strict living-spec validation and managed checks passed. The final
+branch commit through normal hooks remains mandatory before publication handoff;
+its actual result is reported in that handoff rather than claimed in advance.
+Root owns publication, required fresh native/instrumented PR CI and merge.
+Hosted acceptance must pass before merge; the actual archive gate accepted the
+explicit local-host deferral without force or skipped validation.
