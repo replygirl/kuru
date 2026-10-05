@@ -1,6 +1,6 @@
 # Dependency audit
 
-Cargo and mise-declared tool releases were checked on 2026-10-05 against the official crates.io sparse registry, npm registry, upstream GitHub releases and mise release metadata. Direct dependencies are exactly pinned; lockfiles resolve their compatible transitive dependencies. Rust dependencies use stable releases. The docs app follows cospec's VitePress 2 preview architecture and pins the latest available alpha explicitly.
+Releases were checked on 2026-10-05 against the official crates.io sparse registry, npm registry, upstream GitHub releases and mise release metadata. Direct dependencies are exactly pinned; lockfiles resolve their compatible transitive dependencies. Rust dependencies use stable releases. The docs app follows cospec's VitePress 2 preview architecture and pins the latest available alpha explicitly.
 
 The Dolt change checked SQLx 0.9.0, UUID 1.26.1 and full Dolt 2.3.3 on
 2026-09-10. The memory package's catalog records the measured native archive,
@@ -33,90 +33,71 @@ license. The connector package carries the crate and asset MIT attributions in
 
 ## Rust dependencies
 
-| Dependency           | Latest stable pin  | Registry                                                         |
-| -------------------- | ------------------ | ---------------------------------------------------------------- |
-| `anyhow`             | `1.0.104`          | [sparse index](https://index.crates.io/an/yh/anyhow)             |
-| `async-trait`        | `0.1.92`           | [sparse index](https://index.crates.io/as/yn/async-trait)        |
-| `axum`               | `0.8.9`            | [sparse index](https://index.crates.io/ax/um/axum)               |
-| `base64`             | `0.23.1`           | [sparse index](https://index.crates.io/ba/se/base64)             |
-| `cap-fs-ext`         | `4.0.3`            | [sparse index](https://index.crates.io/ca/p-/cap-fs-ext)         |
-| `cap-std`            | `4.0.3`            | [sparse index](https://index.crates.io/ca/p-/cap-std)            |
-| `clap`               | `4.6.7`            | [sparse index](https://index.crates.io/cl/ap/clap)               |
-| `crc32fast`          | `1.5.2`            | [sparse index](https://index.crates.io/cr/c3/crc32fast)          |
-| `crossterm`          | `0.29.0`           | [sparse index](https://index.crates.io/cr/os/crossterm)          |
-| `flate2`             | `1.1.10`           | [sparse index](https://index.crates.io/fl/at/flate2)             |
-| `futures`            | `0.3.34`           | [sparse index](https://index.crates.io/fu/tu/futures)            |
-| `getrandom`          | `0.4.3`            | [sparse index](https://index.crates.io/ge/tr/getrandom)          |
-| `grep-matcher`       | `0.1.9`            | [sparse index](https://index.crates.io/gr/ep/grep-matcher)       |
-| `grep-regex`         | `0.1.14`           | [sparse index](https://index.crates.io/gr/ep/grep-regex)         |
-| `grep-searcher`      | `0.1.17`           | [sparse index](https://index.crates.io/gr/ep/grep-searcher)      |
-| `httpdate`           | `1.0.3`            | [sparse index](https://index.crates.io/ht/tp/httpdate)           |
-| `ignore`             | `0.4.33`           | [sparse index](https://index.crates.io/ig/no/ignore)             |
-| `jsonschema`         | `0.58.5`           | [sparse index](https://index.crates.io/js/on/jsonschema)         |
-| `keyring`            | `4.2.0`            | [sparse index](https://index.crates.io/ke/yr/keyring)            |
-| `nix`                | `0.31.3`           | [sparse index](https://index.crates.io/3/n/nix)                  |
-| `portable-pty`       | `0.9.0`            | [sparse index](https://index.crates.io/po/rt/portable-pty)       |
-| `ratatui`            | `0.30.2`           | [sparse index](https://index.crates.io/ra/ta/ratatui)            |
-| `rcgen`              | `0.14.10`          | [sparse index](https://index.crates.io/rc/ge/rcgen)              |
-| `reqwest`            | `0.13.5`           | [sparse index](https://index.crates.io/re/qw/reqwest)            |
-| `roxmltree`          | `0.21.1`           | [sparse index](https://index.crates.io/ro/xm/roxmltree)          |
-| `rusqlite`           | `0.40.2`           | [sparse index](https://index.crates.io/ru/sq/rusqlite)           |
-| `rustix`             | `1.1.5`            | [sparse index](https://index.crates.io/ru/st/rustix)             |
-| `scraper`            | `0.27.0`           | [sparse index](https://index.crates.io/sc/ra/scraper)            |
-| `serde`              | `1.0.229`          | [sparse index](https://index.crates.io/se/rd/serde)              |
-| `serde_json`         | `1.0.151`          | [sparse index](https://index.crates.io/se/rd/serde_json)         |
-| `serde_yaml_ng`      | `0.10.0`           | [sparse index](https://index.crates.io/se/rd/serde_yaml_ng)      |
-| `sha2`               | `0.11.0`           | [sparse index](https://index.crates.io/sh/a2/sha2)               |
-| `sqlx`               | `0.9.0`            | [sparse index](https://index.crates.io/sq/lx/sqlx)               |
-| `sqlx-core`          | `0.9.0`            | [sparse index](https://index.crates.io/sq/lx/sqlx-core)          |
-| `sysinfo`            | `0.39.6`           | [sparse index](https://index.crates.io/sy/si/sysinfo)            |
-| `tar`                | `0.4.46`           | [sparse index](https://index.crates.io/3/t/tar)                  |
-| `tempfile`           | `3.27.0`           | [sparse index](https://index.crates.io/te/mp/tempfile)           |
-| `tiktoken-rs`        | `0.12.1`           | [sparse index](https://index.crates.io/ti/kt/tiktoken-rs)        |
-| `tokio`              | `1.53.2`           | [sparse index](https://index.crates.io/to/ki/tokio)              |
-| `tokio-rustls`       | `0.26.6`           | [sparse index](https://index.crates.io/to/ki/tokio-rustls)       |
-| `toml`               | `1.1.6+spec-1.1.0` | [sparse index](https://index.crates.io/to/ml/toml)               |
-| `tower`              | `0.5.3`            | [sparse index](https://index.crates.io/to/we/tower)              |
-| `tracing`            | `0.1.44`           | [sparse index](https://index.crates.io/tr/ac/tracing)            |
-| `tracing-subscriber` | `0.3.23`           | [sparse index](https://index.crates.io/tr/ac/tracing-subscriber) |
-| `unicode-width`      | `0.2.2`            | [sparse index](https://index.crates.io/un/ic/unicode-width)      |
-| `url`                | `2.5.8`            | [sparse index](https://index.crates.io/3/u/url)                  |
-| `usage-argv`         | `6.12.0`           | [sparse index](https://index.crates.io/us/ag/usage-argv)         |
-| `usage-cli`          | `6.12.0`           | [sparse index](https://index.crates.io/us/ag/usage-cli)          |
-| `usage-lib`          | `6.12.0`           | [sparse index](https://index.crates.io/us/ag/usage-lib)          |
-| `uuid`               | `1.27.0`           | [sparse index](https://index.crates.io/uu/id/uuid)               |
-| `vt100`              | `0.16.2`           | [sparse index](https://index.crates.io/vt/10/vt100)              |
-| `windows-sys`        | `0.61.2`           | [sparse index](https://index.crates.io/wi/nd/windows-sys)        |
-| `zip`                | `8.6.0`            | [sparse index](https://index.crates.io/3/z/zip)                  |
+| Dependency | Latest stable pin | Registry |
+| --- | --- | --- |
+| `anyhow` | `1.0.104` | [sparse index](https://index.crates.io/an/yh/anyhow) |
+| `async-trait` | `0.1.92` | [sparse index](https://index.crates.io/as/yn/async-trait) |
+| `serde` | `1.0.229` | [sparse index](https://index.crates.io/se/rd/serde) |
+| `serde_json` | `1.0.151` | [sparse index](https://index.crates.io/se/rd/serde_json) |
+| `toml` | `1.1.6+spec-1.1.0` | [sparse index](https://index.crates.io/to/ml/toml) |
+| `rusqlite` | `0.40.2` | [sparse index](https://index.crates.io/ru/sq/rusqlite) |
+| `uuid` | `1.27.0` | [sparse index](https://index.crates.io/uu/id/uuid) |
+| `sqlx` | `0.9.0` | [sparse index](https://index.crates.io/sq/lx/sqlx) |
+| `sha2` | `0.11.0` | [sparse index](https://index.crates.io/sh/a2/sha2) |
+| `tokio` | `1.53.2` | [sparse index](https://index.crates.io/to/ki/tokio) |
+| `reqwest` | `0.13.5` | [sparse index](https://index.crates.io/re/qw/reqwest) |
+| `tiktoken-rs` | `0.12.1` | [sparse index](https://index.crates.io/ti/kt/tiktoken-rs) |
+| `futures` | `0.3.34` | [sparse index](https://index.crates.io/fu/tu/futures) |
+| `axum` | `0.8.9` | [sparse index](https://index.crates.io/ax/um/axum) |
+| `tower` | `0.5.3` | [sparse index](https://index.crates.io/to/we/tower) |
+| `ratatui` | `0.30.2` | [sparse index](https://index.crates.io/ra/ta/ratatui) |
+| `crossterm` | `0.29.0` | [sparse index](https://index.crates.io/cr/os/crossterm) |
+| `clap` | `4.6.7` | [sparse index](https://index.crates.io/cl/ap/clap) |
+| `tempfile` | `3.27.0` | [sparse index](https://index.crates.io/te/mp/tempfile) |
+| `unicode-width` | `0.2.2` | [sparse index](https://index.crates.io/un/ic/unicode-width) |
+| `url` | `2.5.8` | [sparse index](https://index.crates.io/3/u/url) |
+| `cap-std` | `4.0.3` | [sparse index](https://index.crates.io/ca/p-/cap-std) |
+| `cap-fs-ext` | `4.0.3` | [sparse index](https://index.crates.io/ca/p-/cap-fs-ext) |
+| `nix` | `0.31.3` | [sparse index](https://index.crates.io/3/n/nix) |
+| `base64` | `0.23.1` | [sparse index](https://index.crates.io/ba/se/base64) |
+| `rustix` | `1.1.5` | [sparse index](https://index.crates.io/ru/st/rustix) |
+| `vt100` | `0.16.2` | [sparse index](https://index.crates.io/vt/10/vt100) |
+| `tar` | `0.4.46` | [sparse index](https://index.crates.io/3/t/tar) |
+| `flate2` | `1.1.10` | [sparse index](https://index.crates.io/fl/at/flate2) |
+| `zip` | `8.6.0` | [sparse index](https://index.crates.io/3/z/zip) |
+| `crc32fast` | `1.5.2` | [sparse index](https://index.crates.io/cr/c3/crc32fast) |
+| `windows-sys` | `0.61.2` | [sparse index](https://index.crates.io/wi/nd/windows-sys) |
+| `portable-pty` (Windows terminal tests) | `0.9.0` | [sparse index](https://index.crates.io/po/rt/portable-pty) |
+| `scraper` | `0.27.0` | [sparse index](https://index.crates.io/sc/ra/scraper) |
+| `roxmltree` | `0.21.1` | [sparse index](https://index.crates.io/ro/xm/roxmltree) |
+| `jsonschema` (core schema tests) | `0.58.5` | [sparse index](https://index.crates.io/js/on/jsonschema) |
 
 ## Development tools
 
-| Tool                                       | Stable pin       |
-| ------------------------------------------ | ---------------- |
-| `rust`                                     | `1.99.0`         |
-| `github:aligned-team/cospec`               | `0.8.3`          |
-| `aqua:jdx/hk`                              | `2.5.0`          |
-| `aqua:tamasfe/taplo`                       | `0.10.0`         |
-| `aqua:koalaman/shellcheck`                 | `0.11.0`         |
-| `aqua:rhysd/actionlint`                    | `1.7.12`         |
-| `aqua:taiki-e/cargo-llvm-cov`              | `0.9.1`          |
-| `mr-boxington`                             | `1.22.0`         |
-| `cargo:cargo-audit` (delivery package)     | `0.22.2`         |
-| Node (docs app only)                       | `26.10.0`        |
-| npm (docs app only)                        | `12.2.0`         |
-| VitePress (docs app)                       | `2.0.0-alpha.20` |
-| `vitepress-plugin-llms` (docs app)         | `1.14.0`         |
-| `oxfmt` (docs app)                         | `0.70.0`         |
-| `oxlint` (docs app)                        | `1.85.0`         |
-| Cocogitto (delivery package)               | `7.0.0`          |
-| Communiqué (delivery package)              | `1.5.0`          |
-| Go (memory source-build task only)         | `1.27.1`         |
-| llvm-mingw (memory source-build task only) | `20260922`       |
-| mise (CI; root `min_version` soft)         | `2026.9.18`      |
+| Tool | Stable pin |
+| --- | --- |
+| `rust` | `1.99.0` |
+| `github:aligned-team/cospec` | `0.8.3` |
+| `aqua:jdx/hk` | `2.5.0` |
+| `aqua:tamasfe/taplo` | `0.10.0` |
+| `aqua:koalaman/shellcheck` | `0.11.0` |
+| `aqua:rhysd/actionlint` | `1.7.12` |
+| `aqua:taiki-e/cargo-llvm-cov` | `0.9.1` |
+| `mr-boxington` | `1.22.0` |
+| `cargo:cargo-audit` (delivery package) | `0.22.2` |
+| Node (docs app only) | `26.10.0` |
+| npm (docs app only) | `12.2.0` |
+| VitePress (docs app) | `2.0.0-alpha.20` |
+| `vitepress-plugin-llms` (docs app) | `1.14.0` |
+| `oxfmt` (docs app) | `0.70.0` |
+| `oxlint` (docs app) | `1.85.0` |
+| Cocogitto (delivery package) | `7.0.0` |
+| Communiqué (delivery package) | `1.5.0` |
+| mise (CI; root `min_version` soft) | `2026.9.18` |
 
 mr-boxington's exact pin and signed lock entries cover every supported platform.
 
-Mise itself is explicitly excluded from this dependency refresh. Every workflow continues to install exactly mise `2026.9.18` (2026-09-30). Root `min_version` is `{ hard = "2026.9.13", soft = "2026.9.18" }`:
+Mise is excluded from this update. Every workflow continues to install mise `2026.9.18` (2026-09-30). Root `min_version` is `{ hard = "2026.9.13", soft = "2026.9.18" }`:
 Homebrew's `mise` formula was 2026.9.15 on 2026-10-01, so a hard 2026.9.18
 floor would reject a package-manager installation, and lockfile behavior was
 measured identical from 2026.9.13 through 2026.9.18. The locks stay at lockfile
@@ -132,7 +113,7 @@ quality, native-tests and release workflows; `WORKFLOW_MISE_VERSION` in
 documented refresh; and the minimum mise version stated in development and
 installation docs.
 
-Cospec is `0.8.3`, confirmed by its [GitHub release](https://github.com/aligned-team/cospec/releases/tag/v0.8.3). Its standalone executable embeds its supported OpenSpec version, 1.13.1 for this release. No project OpenSpec, Bun or Python dependency is required. The standalone gate contract passes without the former compatibility preload, which has been removed; see [development](development.md).
+Cospec is `0.8.3`, confirmed by its [GitHub release](https://github.com/aligned-team/cospec/releases/tag/v0.8.3). Its standalone executable embeds its supported OpenSpec version, 1.13.1 for this release. No project OpenSpec, Bun or Python dependency is required. The obsolete compatibility preload is removed after the standalone contract passed without it; see [development](development.md).
 
 `cargo-audit` is scoped to delivery's advisory quality tasks. It scans only the
 current workspace root `Cargo.lock` against an explicitly refreshed RustSec database;
@@ -177,15 +158,15 @@ scripts retain npm 12's default-deny policy, including optional `fsevents`.
 
 ## CI actions
 
-Actions retain their previously reviewed immutable release commits; this refresh audits Cargo and mise-declared dependencies.
+All actions are pinned to the immutable commit for the latest stable release.
 
-| Action                      | Release                                                                      | Commit                                     |
-| --------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------ |
-| `actions/checkout`          | [`v7.0.1`](https://github.com/actions/checkout/releases/tag/v7.0.1)          | `3d3c42e5aac5ba805825da76410c181273ba90b1` |
-| `jdx/mise-action`           | [`v4.3.0`](https://github.com/jdx/mise-action/releases/tag/v4.3.0)           | `c2a87611a18de5b3828c5652fe268e992400cb5c` |
-| `actions/upload-artifact`   | [`v7.0.1`](https://github.com/actions/upload-artifact/releases/tag/v7.0.1)   | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` |
+| Action | Release | Commit |
+| --- | --- | --- |
+| `actions/checkout` | [`v7.0.1`](https://github.com/actions/checkout/releases/tag/v7.0.1) | `3d3c42e5aac5ba805825da76410c181273ba90b1` |
+| `jdx/mise-action` | [`v4.3.0`](https://github.com/jdx/mise-action/releases/tag/v4.3.0) | `c2a87611a18de5b3828c5652fe268e992400cb5c` |
+| `actions/upload-artifact` | [`v7.0.1`](https://github.com/actions/upload-artifact/releases/tag/v7.0.1) | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` |
 | `actions/download-artifact` | [`v8.0.1`](https://github.com/actions/download-artifact/releases/tag/v8.0.1) | `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c` |
-| `Swatinem/rust-cache`       | [`v2.9.2`](https://github.com/Swatinem/rust-cache/releases/tag/v2.9.2)       | `6323deb102c322ba6fcbdcafc7e3dddab59af2b6` |
+| `Swatinem/rust-cache` | [`v2.9.2`](https://github.com/Swatinem/rust-cache/releases/tag/v2.9.2) | `6323deb102c322ba6fcbdcafc7e3dddab59af2b6` |
 
 The reqwest 0.13 upgrade changes its TLS feature name to `rustls`; the capability filesystem crates move together to 4.0.3. Rust 1.99.0 is shared by mise and rust-toolchain.toml. Re-run format, lint, protocol tests and coverage after future updates instead of assuming minor version changes are compatible.
 

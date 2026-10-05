@@ -18,6 +18,6 @@ Builds, installation helpers, native test fixtures, docs tooling and CI use the 
 ## Surfaces
 
 - [ ] interactive
-- [x] deploy
-- [x] integration
+- [ ] deploy
+- [ ] integration
 - [ ] agent-behavior

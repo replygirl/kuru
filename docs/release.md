@@ -16,11 +16,11 @@ write** and the automatically included **Metadata: read** permission. Disable
 webhooks, request no organization or account permissions, and install the app
 only on `replygirl/kuru`. Configure these repository Actions values:
 
-| Name                           | Kind     | Purpose                                                 |
-| ------------------------------ | -------- | ------------------------------------------------------- |
-| `RELEASE_APP_ID`               | Variable | Numeric ID of the dedicated app                         |
-| `RELEASE_APP_PRIVATE_KEY`      | Secret   | App key used to mint a short-lived installation token   |
-| `ANTHROPIC_API_KEY_COMMUNIQUE` | Secret   | Dedicated API key used only by release-notes generation |
+| Name | Kind | Purpose |
+| --- | --- | --- |
+| `RELEASE_APP_ID` | Variable | Numeric ID of the dedicated app |
+| `RELEASE_APP_PRIVATE_KEY` | Secret | App key used to mint a short-lived installation token |
+| `ANTHROPIC_API_KEY_COMMUNIQUE` | Secret | Dedicated API key used only by release-notes generation |
 
 The notes step exposes the scoped Anthropic secret to Communiqué as
 `OPENAI_API_KEY` for its OpenAI-compatible wire adapter, which calls Anthropic.
@@ -51,12 +51,12 @@ Linux, Apple Silicon macOS or Windows x86_64. App installation does not require 
 After the change is reviewed, merged, and main's checks are green, open Actions →
 Release → Run workflow, select `main`, and choose:
 
-| Bump    | Behavior                                                            |
-| ------- | ------------------------------------------------------------------- |
-| `auto`  | Derive the version from conventional commits since the last release |
-| `major` | Explicitly advance the major version                                |
-| `minor` | Advance the minor version                                           |
-| `patch` | Advance the patch version                                           |
+| Bump | Behavior |
+| --- | --- |
+| `auto` | Derive the version from conventional commits since the last release |
+| `major` | Explicitly advance the major version |
+| `minor` | Advance the minor version |
+| `patch` | Advance the patch version |
 
 The repository's `cog.toml` makes `feat` a minor bump and other recognized
 conventional types a patch bump. Breaking changes advance the major version
@@ -374,7 +374,7 @@ gets no new "protocol is incompatible" refusal.
   executable from before that change (a downgrade under a running client)
   rejects its format 1 record, so it never sees progress and gives up one
   `startup_timeout_secs` after spawn with `memory service readiness deadline
-exceeded`. It still reports an owner exit at once, but it cannot observe that
+  exceeded`. It still reports an owner exit at once, but it cannot observe that
   owner's retirement or a failing open, so those end only at the owner's exit
   or the timeout.
 

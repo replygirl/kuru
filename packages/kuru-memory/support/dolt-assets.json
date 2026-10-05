@@ -106,11 +106,11 @@
           }
         }
       },
-      "compressed_bytes": null,
-      "archive_sha256": "unpinned",
-      "expanded_bytes": null,
-      "executable_bytes": null,
-      "executable_sha256": "unpinned",
+      "compressed_bytes": 40535327,
+      "archive_sha256": "079d8f340d320433ed33e103f3884be86aafafe271083607a1f37d429cfc866b",
+      "expanded_bytes": 117576305,
+      "executable_bytes": 116308480,
+      "executable_sha256": "e53a760b9790e9c9a48cad068e3ca48a2ae24fcbf8c43bdfa8559bd9909647e8",
       "license_bytes": 1212811,
       "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386",
       "notices": [
