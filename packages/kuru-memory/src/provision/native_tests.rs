@@ -11,6 +11,61 @@ use std::{io, thread, time::Instant};
 const EXE: &[u8] = b"MZ fixture bytes, deliberately never executed";
 const NOTICES: &[u8] = b"exact upstream notice fixture";
 
+#[test]
+fn cold_probe_checked_copy_counts_only_completed_byte_work() {
+    let bytes = vec![b'X'; (crate::progress::BYTES_PER_ADVANCE + 123) as usize];
+    let digest = hex_digest(&Sha256::digest(&bytes));
+    let mut asset = BUNDLED_ASSET;
+    asset.executable_bytes = bytes.len() as u64;
+    asset.executable_sha256 = &digest;
+    let root = crate::test_support::tempdir().unwrap();
+    let candidate = root.path().join("candidate");
+    private_directory(&candidate).unwrap();
+    let directory = files::directory(&candidate).unwrap();
+    let file = directory
+        .create_new(std::ffi::OsStr::new(asset.executable_name))
+        .unwrap();
+    std::io::Write::write_all(&mut &file, &bytes).unwrap();
+    seal_private(&file, true).unwrap();
+    drop(file);
+    let (ticks, advances) = OpenTicks::new();
+    let (entered, entry) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let root = &root;
+        let ticks = &ticks;
+        let probe = scope.spawn(move || {
+            prepare_cold_probe_with(
+                &candidate,
+                &root.path().join("probe"),
+                asset,
+                Some(ticks),
+                |_| {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap()
+        });
+        entry.recv_timeout(Duration::from_secs(10)).unwrap();
+        let before = advances.borrow().count;
+        // The barrier holds after accepted writes and before destination hashing.
+        let after = advances.borrow().count;
+        release.send(()).unwrap();
+        let probe = probe.join().unwrap();
+        assert_eq!(before, 2, "source hashing and accepted copy bytes");
+        assert_eq!(after, before, "blocked observer must not count as progress");
+        assert_eq!(
+            advances.borrow().count,
+            3,
+            "destination hashing adds one unit"
+        );
+        assert_eq!(fs::read(&probe.binary).unwrap(), bytes);
+        probe.revalidate().unwrap();
+    });
+}
+
 /// [`cache_lock`], serialised against this lib's own spawning fixtures; see
 /// `crate::spawn_gate`. A single choke point so every real-cache-lock test
 /// below is covered without gating each call site by hand.
