@@ -1218,7 +1218,7 @@ fn release_tool_derivation_rejects_conditional_installs_and_unmodelled_configura
         findings(
             "build-docs",
             docs_tools,
-            "        run: mise install node@24.0.0 npm@12.1.0\n"
+            "        run: mise install node@24.0.0 npm@12.2.0\n"
         ),
         [
             missing(
