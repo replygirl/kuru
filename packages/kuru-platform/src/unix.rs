@@ -1,7 +1,7 @@
 //! Safe ownership of one standard Unix child and its fresh process group.
 //!
 //! [`OwnedProcessGroup`] keeps the child's wait identity until it has consumed
-//! its one group-then-root destructive transition. It deliberately exposes
+//! its initial group-then-root transition and bounded pre-reap settlement. It exposes
 //! neither a PID nor the child, so callers cannot reap the root and later
 //! signal a recycled numeric group. This is process authority, not sandboxing:
 //! processes that leave the fresh group are outside this boundary.
@@ -15,7 +15,8 @@
 //! children; concurrent callers requiring isolation must use the platform
 //! consistently. On std's fork path, a legacy spawn that inherits an owned
 //! spawn's exec-error pipe stalls that spawn until the legacy child exits, and
-//! every later owned spawn, including the cleanup snapshot, waits behind it;
+//! later ordinary owned spawns wait behind it; pre-reap snapshots instead
+//! use bounded lock admission and return unobserved when it is busy;
 //! the remedy is moving those legacy spawns behind the platform, not a
 //! timeout.
 
@@ -32,7 +33,11 @@ use std::{
     fmt, io,
     os::{fd::OwnedFd, unix::process::CommandExt},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError, TryLockError,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -121,6 +126,33 @@ pub enum Reap {
     InvalidPhase,
 }
 
+/// One nonblocking pre-reap cleanup poll, never overall cleanup success.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreReap {
+    Pending,
+    /// A completed listing contained no member except the retained root.
+    Ready,
+    /// The root was already reaped; continue through read-only final checks.
+    Reaped,
+    /// No new observation or repeated signal is admitted at this deadline.
+    Expired,
+    /// The deadline expired and the cancelled read-only helper still owns
+    /// cleanup. Retain the owner and report unconfirmed at the caller's limit.
+    ExpiredPending,
+    /// Listing failed or could not enter the spawn lock; a later poll may retry.
+    Unobserved(io::ErrorKind),
+    Disarmed(DisarmReason),
+    /// The immediate initial termination transition is still required.
+    InvalidPhase,
+}
+
+struct MembershipJob {
+    worker: JoinHandle<io::Result<Vec<snapshot::GroupMember>>>,
+    completion: Option<tokio::sync::oneshot::Receiver<()>>,
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
 /// A read-only process-group presence observation after root reap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GroupPresence {
@@ -187,7 +219,8 @@ enum Phase {
 ///
 /// This value is intentionally non-`Clone` and does not expose its numeric
 /// identity or child handle. Callers retain it through pipe capture, make the
-/// one transition with [`Self::terminate_before_reap`], reap the exact root,
+/// initial transition with [`Self::terminate_before_reap`], drive
+/// [`Self::pre_reap_step`] under their existing deadline, reap the exact root,
 /// and then use only [`Self::presence_after_reap`].
 pub struct OwnedProcessGroup {
     child: Child,
@@ -197,8 +230,15 @@ pub struct OwnedProcessGroup {
     group: Pid,
     phase: Phase,
     observed_exit: bool,
+    membership: Option<MembershipJob>,
     #[cfg(test)]
     syscalls: Cell<usize>,
+    #[cfg(test)]
+    omit_initial_group: bool,
+    #[cfg(test)]
+    suppress_repeat: bool,
+    #[cfg(test)]
+    membership_jobs: usize,
 }
 
 impl OwnedProcessGroup {
@@ -229,8 +269,15 @@ impl OwnedProcessGroup {
             group,
             phase: Phase::Anchored,
             observed_exit: false,
+            membership: None,
             #[cfg(test)]
             syscalls: Cell::new(0),
+            #[cfg(test)]
+            omit_initial_group: false,
+            #[cfg(test)]
+            suppress_repeat: false,
+            #[cfg(test)]
+            membership_jobs: 0,
         })
     }
 
@@ -287,16 +334,222 @@ impl OwnedProcessGroup {
         }
         let observation = self.observe();
         let group = self.group;
+        #[cfg(test)]
+        let omit_group = self.omit_initial_group;
         let transition = take_transition(
             &mut self.phase,
             observation,
-            || signal_group(group),
+            || {
+                #[cfg(test)]
+                if omit_group {
+                    return SignalOutcome::AlreadyAbsent;
+                }
+                signal_group(group)
+            },
             || signal_root(group),
         );
         if matches!(transition, Termination::Signalled(_)) {
             self.record_syscalls(2);
         }
         transition
+    }
+
+    /// Advance cleanup without sleeping, root reap, or blocking worker joins.
+    ///
+    /// The caller drives this inside its existing loop and allowance. Membership
+    /// is readiness evidence only: final post-reap absence and pipe checks are
+    /// still required. Expiry permits the caller's existing reap fallback, not
+    /// another cleanup allowance. A cancelled caller retains this same worker.
+    pub fn pre_reap_step(&mut self, deadline: Instant) -> PreReap {
+        match self.phase {
+            Phase::Anchored => return PreReap::InvalidPhase,
+            Phase::Reaped(_) => {
+                self.cancel_membership();
+                return if self.membership.is_some() {
+                    PreReap::Pending
+                } else {
+                    PreReap::Reaped
+                };
+            }
+            Phase::Disarmed(reason) => {
+                self.cancel_membership();
+                return PreReap::Disarmed(reason);
+            }
+            Phase::PostSignal => {}
+        }
+        if Instant::now() >= deadline {
+            self.cancel_membership();
+            return if self.membership.is_some() {
+                PreReap::ExpiredPending
+            } else {
+                PreReap::Expired
+            };
+        }
+        // Fresh observation also disarms an owner whose wait identity was
+        // lost during a pending read-only job. A running root never starts ps.
+        match self.observe() {
+            Observation::Running | Observation::Interrupted => return PreReap::Pending,
+            Observation::Disarmed(reason) => {
+                self.cancel_membership();
+                return PreReap::Disarmed(reason);
+            }
+            Observation::Exited => {}
+        }
+        if let Some(job) = &self.membership {
+            if !job.worker.is_finished() {
+                return PreReap::Pending;
+            }
+            let job = self
+                .membership
+                .take()
+                .expect("finished membership job is retained");
+            let result = join_membership(job);
+            if Instant::now() >= deadline {
+                return PreReap::Expired;
+            }
+            let members = match result {
+                Ok(members) => members,
+                Err(error) => return PreReap::Unobserved(error.kind()),
+            };
+            let root = self.group.as_raw_nonzero().get().unsigned_abs();
+            match membership_state(&members, root) {
+                Membership::Empty => return PreReap::Ready,
+                Membership::Live => return self.resignal_before_reap(deadline),
+                Membership::Zombies => {}
+            }
+            // Descendant zombies remain members until their real parent/init
+            // reaps them. Another destructive signal cannot advance that.
+            return PreReap::Pending;
+        }
+        if Instant::now() >= deadline {
+            return PreReap::Expired;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::clone(&cancelled);
+        let group = self.group.as_raw_nonzero().get().unsigned_abs();
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        let started = thread::Builder::new()
+            .name("kuru-group-membership".into())
+            .spawn(move || {
+                let result = snapshot::group_members_until(
+                    std::path::Path::new(snapshot::PS),
+                    group,
+                    deadline,
+                    &cancellation,
+                );
+                // The wake follows helper reap and both reader joins. Result
+                // classification and the finished-thread join stay in the owner.
+                let _ = completed.send(());
+                result
+            });
+        match started {
+            Ok(worker) => {
+                self.membership = Some(MembershipJob {
+                    worker,
+                    completion: Some(completion),
+                    cancelled,
+                    deadline,
+                });
+                #[cfg(test)]
+                {
+                    self.membership_jobs += 1;
+                }
+                PreReap::Pending
+            }
+            Err(error) => PreReap::Unobserved(error.kind()),
+        }
+    }
+
+    /// Wait for the retained worker or the caller's next poll, without taking
+    /// its result, joining it, or granting signal authority.
+    ///
+    /// Cancellation retains the receiver. Completion is only a wake hint;
+    /// [`Self::pre_reap_step`] still checks deadlines and joins finished work.
+    pub async fn wait_pre_reap(&mut self, poll: Duration, deadline: Instant) {
+        let limit = Instant::now()
+            .checked_add(poll)
+            .map_or(deadline, |next| next.min(deadline));
+        if Instant::now() >= limit {
+            return;
+        }
+        let Some(job) = &mut self.membership else {
+            tokio::time::sleep_until(limit.into()).await;
+            return;
+        };
+        if job.worker.is_finished() {
+            return;
+        }
+        if let Some(completion) = &mut job.completion {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(limit.into()) => return,
+                _ = completion => job.completion = None,
+            }
+        }
+        // Sending the wake precedes the native thread's finished flag. Yield
+        // through that small exit gap within the same poll/deadline, never
+        // blocking on a join or turning the wake into readiness.
+        while !job.worker.is_finished() && Instant::now() < limit {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn cancel_membership(&mut self) {
+        if let Some(job) = &self.membership {
+            job.cancelled.store(true, Ordering::Release);
+            if job.worker.is_finished() {
+                let _ =
+                    join_membership(self.membership.take().expect("membership job is retained"));
+            }
+        }
+    }
+
+    fn resignal_before_reap(&mut self, deadline: Instant) -> PreReap {
+        if !matches!(self.phase, Phase::PostSignal) {
+            return PreReap::InvalidPhase;
+        }
+        if Instant::now() >= deadline {
+            return PreReap::Expired;
+        }
+        // A snapshot, or even observed_exit, never substitutes for this fresh
+        // exact wait identity check immediately before repeated destruction.
+        let observation = self.observe();
+        match observation {
+            Observation::Running | Observation::Exited => {}
+            Observation::Interrupted => return PreReap::Pending,
+            Observation::Disarmed(reason) => return PreReap::Disarmed(reason),
+        }
+        if Instant::now() >= deadline {
+            return PreReap::Expired;
+        }
+        #[cfg(test)]
+        if self.suppress_repeat {
+            return PreReap::Pending;
+        }
+        let group = self.group;
+        match repeat_transition(
+            &mut self.phase,
+            observation,
+            || signal_group(group),
+            || signal_root(group),
+        ) {
+            Termination::Signalled(report) => {
+                self.record_syscalls(2);
+                match (report.group, report.root) {
+                    (SignalOutcome::PermissionDenied, _) | (_, SignalOutcome::PermissionDenied) => {
+                        PreReap::Unobserved(io::ErrorKind::PermissionDenied)
+                    }
+                    (SignalOutcome::Failed(kind), _) | (_, SignalOutcome::Failed(kind)) => {
+                        PreReap::Unobserved(kind)
+                    }
+                    // Even ESRCH is not readiness; require a later listing.
+                    _ => PreReap::Pending,
+                }
+            }
+            Termination::Interrupted => PreReap::Pending,
+            Termination::Disarmed(reason) => PreReap::Disarmed(reason),
+            Termination::InvalidPhase => PreReap::InvalidPhase,
+        }
     }
 
     /// Reap only after the destructive transition and an observed root exit.
@@ -357,6 +610,7 @@ impl OwnedProcessGroup {
         match self.child.wait() {
             Ok(status) => {
                 self.phase = Phase::Reaped(status);
+                self.cancel_membership();
                 Reap::Reaped(status)
             }
             Err(error) => {
@@ -392,7 +646,49 @@ impl Drop for OwnedProcessGroup {
         if matches!(self.phase, Phase::Anchored) {
             let _ = self.terminate_before_reap();
         }
+        if let Some(job) = &self.membership {
+            // Never join even a finished worker in emergency Drop. The worker
+            // retains its helper and drains through cleanup on its own thread.
+            job.cancelled.store(true, Ordering::Release);
+        }
     }
+}
+
+fn join_membership(job: MembershipJob) -> io::Result<Vec<snapshot::GroupMember>> {
+    let MembershipJob {
+        worker,
+        cancelled,
+        deadline,
+        ..
+    } = job;
+    let result = worker
+        .join()
+        .map_err(|_| io::Error::other("membership worker panicked"))?;
+    if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "membership observation expired",
+        ));
+    }
+    result
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum Membership {
+    Empty,
+    Live,
+    Zombies,
+}
+
+fn membership_state(members: &[snapshot::GroupMember], root: u32) -> Membership {
+    let mut state = Membership::Empty;
+    for row in members.iter().filter(|row| row.pid != root) {
+        if !row.state.starts_with('Z') {
+            return Membership::Live;
+        }
+        state = Membership::Zombies;
+    }
+    state
 }
 
 /// Create the declared streams and start the child. Returns the parent ends
@@ -533,9 +829,8 @@ fn take_transition(
         Phase::PostSignal | Phase::Reaped(_) => Termination::InvalidPhase,
         Phase::Anchored => match observation {
             Observation::Running | Observation::Exited => {
-                // Consume authority before the first destructive syscall. A
-                // failed group signal must not leave a later call able to
-                // target a recycled numeric group.
+                // Consume this initial operation before its first syscall.
+                // A later private sweep must obtain fresh wait authority.
                 *phase = Phase::PostSignal;
                 Termination::Signalled(TerminationReport {
                     group: group(),
@@ -548,6 +843,31 @@ fn take_transition(
                 Termination::Disarmed(reason)
             }
         },
+    }
+}
+
+fn repeat_transition(
+    phase: &mut Phase,
+    observation: Observation,
+    group: impl FnOnce() -> SignalOutcome,
+    root: impl FnOnce() -> SignalOutcome,
+) -> Termination {
+    if let Phase::Disarmed(reason) = phase {
+        return Termination::Disarmed(*reason);
+    }
+    if !matches!(phase, Phase::PostSignal) {
+        return Termination::InvalidPhase;
+    }
+    match observation {
+        Observation::Running | Observation::Exited => Termination::Signalled(TerminationReport {
+            group: group(),
+            root: root(),
+        }),
+        Observation::Interrupted => Termination::Interrupted,
+        Observation::Disarmed(reason) => {
+            *phase = Phase::Disarmed(reason);
+            Termination::Disarmed(reason)
+        }
     }
 }
 
@@ -910,6 +1230,688 @@ mod tests {
 
     const INHERITED: StdioPlan =
         StdioPlan::new(StdioSlot::Inherit, StdioSlot::Inherit, StdioSlot::Inherit);
+    // The existing native owner fixture allowance, shared by new positive waits.
+    pub(super) const TEST_BOUND: Duration = Duration::from_secs(5);
+
+    fn pre_reap_until_ready(
+        owner: &mut OwnedProcessGroup,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        loop {
+            match owner.pre_reap_step(deadline) {
+                PreReap::Ready | PreReap::Reaped => return Ok(()),
+                PreReap::Pending | PreReap::Unobserved(_) => {}
+                result => return Err(format!("pre-reap readiness: {result:?}")),
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn test_row(pid: u32, root: u32, zombie: bool) -> snapshot::GroupMember {
+        snapshot::GroupMember {
+            pid,
+            pgid: root,
+            state: if zombie { "Z" } else { "S" }.into(),
+        }
+    }
+
+    struct WakeFixture {
+        owner: OwnedProcessGroup,
+        release: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl WakeFixture {
+        fn new() -> Self {
+            let mut command = Command::new("/bin/sleep");
+            command.arg("30");
+            let mut owner = OwnedProcessGroup::spawn(command, INHERITED).unwrap();
+            owner.terminate_before_reap();
+            let limit = Instant::now() + TEST_BOUND;
+            while !matches!(owner.root_state(), RootState::Exited) && Instant::now() < limit {
+                thread::yield_now();
+            }
+            let exited = matches!(owner.root_state(), RootState::Exited);
+            if !exited {
+                finish_test_owner(&mut owner).unwrap();
+            }
+            assert!(exited, "wake fixture root did not exit");
+            Self {
+                owner,
+                release: None,
+            }
+        }
+
+        fn install(
+            &mut self,
+            work: impl FnOnce(
+                tokio::sync::oneshot::Sender<()>,
+            ) -> io::Result<Vec<snapshot::GroupMember>>
+            + Send
+            + 'static,
+        ) {
+            let (completed, completion) = tokio::sync::oneshot::channel();
+            self.owner.membership = Some(MembershipJob {
+                worker: thread::spawn(move || work(completed)),
+                completion: Some(completion),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                deadline: Instant::now() + TEST_BOUND,
+            });
+        }
+    }
+
+    impl Drop for WakeFixture {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            // Every fixture root was already observed exited. Recover it even
+            // if an assertion fails while the read-only worker is gated.
+            let _ = self.owner.reap_if_exited();
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_before_wait_is_not_lost_or_consumed_as_readiness() {
+        use std::{future::Future, task::Context};
+
+        let mut fixture = WakeFixture::new();
+        fixture.install(|completed| {
+            completed.send(()).unwrap();
+            Ok(Vec::new())
+        });
+        let limit = Instant::now() + TEST_BOUND;
+        while !fixture
+            .owner
+            .membership
+            .as_ref()
+            .unwrap()
+            .worker
+            .is_finished()
+            && Instant::now() < limit
+        {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .worker
+                .is_finished()
+        );
+        let mut waiting = Box::pin(fixture.owner.wait_pre_reap(TEST_BOUND, limit));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_ready()
+        );
+        drop(waiting);
+        // Waiting never takes the result or reaps the retained root.
+        assert!(fixture.owner.membership.is_some());
+        assert!(matches!(fixture.owner.root_state(), RootState::Exited));
+        assert_eq!(fixture.owner.pre_reap_step(limit), PreReap::Ready);
+    }
+
+    #[tokio::test]
+    async fn cancelled_completion_wait_retains_the_same_receiver_and_job() {
+        use std::{future::Future, task::Context};
+
+        let mut fixture = WakeFixture::new();
+        let (release, gate) = std::sync::mpsc::channel();
+        fixture.release = Some(release);
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        fixture.install(move |completed| {
+            entered.send(()).unwrap();
+            gate.recv().unwrap();
+            completed.send(()).unwrap();
+            Ok(Vec::new())
+        });
+        tokio::time::timeout(TEST_BOUND, entry)
+            .await
+            .unwrap()
+            .unwrap();
+        let limit = Instant::now() + TEST_BOUND;
+        let mut waiting = Box::pin(fixture.owner.wait_pre_reap(TEST_BOUND, limit));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        drop(waiting);
+        assert!(
+            fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .completion
+                .is_some()
+        );
+        fixture.release.take().unwrap().send(()).unwrap();
+        tokio::time::timeout(TEST_BOUND, fixture.owner.wait_pre_reap(TEST_BOUND, limit))
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.owner.membership_jobs, 0,
+            "resumption admitted another worker"
+        );
+        assert!(
+            fixture.owner.membership.is_some(),
+            "wait consumed the listing result"
+        );
+        assert_eq!(fixture.owner.pre_reap_step(limit), PreReap::Ready);
+    }
+
+    #[tokio::test]
+    async fn completion_exit_gap_and_expired_event_do_not_join_or_signal() {
+        use std::{future::Future, task::Context};
+
+        let mut fixture = WakeFixture::new();
+        let (release, gate) = std::sync::mpsc::channel();
+        fixture.release = Some(release);
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        fixture.install(move |completed| {
+            // Model the real publication-to-thread-exit gap causally.
+            completed.send(()).unwrap();
+            entered.send(()).unwrap();
+            gate.recv().unwrap();
+            Ok(Vec::new())
+        });
+        tokio::time::timeout(TEST_BOUND, entry)
+            .await
+            .unwrap()
+            .unwrap();
+        // An already-published wake cannot outrun an expired caller limit.
+        fixture
+            .owner
+            .wait_pre_reap(TEST_BOUND, Instant::now())
+            .await;
+        assert!(
+            fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .completion
+                .is_some()
+        );
+        let limit = Instant::now() + TEST_BOUND;
+        let mut waiting = Box::pin(fixture.owner.wait_pre_reap(TEST_BOUND, limit));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        drop(waiting);
+        assert!(
+            fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .completion
+                .is_none()
+        );
+        assert!(
+            !fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .worker
+                .is_finished()
+        );
+        let calls = fixture.owner.syscall_count();
+        assert_eq!(fixture.owner.pre_reap_step(limit), PreReap::Pending);
+        assert_eq!(
+            fixture.owner.syscall_count(),
+            calls + 1,
+            "completion signalled or reaped the root"
+        );
+        // Completion and expiry are both visible: expiry wins and cancels,
+        // while an unfinished join remains forbidden.
+        let expired = Instant::now();
+        fixture.owner.wait_pre_reap(TEST_BOUND, expired).await;
+        let calls = fixture.owner.syscall_count();
+        assert_eq!(
+            fixture.owner.pre_reap_step(expired),
+            PreReap::ExpiredPending
+        );
+        assert_eq!(fixture.owner.syscall_count(), calls);
+        assert!(
+            fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .cancelled
+                .load(Ordering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnected_completion_wait_exposes_worker_panic_without_readiness() {
+        let mut fixture = WakeFixture::new();
+        fixture.install(|_completed| panic!("injected membership worker panic"));
+        let limit = Instant::now() + TEST_BOUND;
+        tokio::time::timeout(TEST_BOUND, fixture.owner.wait_pre_reap(TEST_BOUND, limit))
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .owner
+                .membership
+                .as_ref()
+                .unwrap()
+                .worker
+                .is_finished()
+        );
+        assert_eq!(
+            fixture.owner.pre_reap_step(limit),
+            PreReap::Unobserved(io::ErrorKind::Other)
+        );
+        assert!(matches!(fixture.owner.root_state(), RootState::Exited));
+    }
+
+    #[test]
+    fn real_second_sweep_removes_omitted_descendant_before_root_reap() {
+        for suppress in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let ready = root.path().join("descendant-ready");
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "(printf ready > \"$1\"; exec /bin/sleep 30) & wait",
+                    "kuru-second-sweep",
+                ])
+                .arg(&ready);
+            let mut owner = OwnedProcessGroup::spawn(
+                command,
+                StdioPlan::new(StdioSlot::Null, StdioSlot::Null, StdioSlot::Null),
+            )
+            .unwrap();
+            let observation = (|| -> Result<(), String> {
+                let limit = Instant::now() + TEST_BOUND;
+                while !ready.exists() {
+                    if Instant::now() >= limit {
+                        return Err("descendant did not publish readiness".into());
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                owner.omit_initial_group = true;
+                owner.suppress_repeat = suppress;
+                if !matches!(owner.terminate_before_reap(), Termination::Signalled(_)) {
+                    return Err("initial root signal missing".into());
+                }
+                while !matches!(owner.root_state(), RootState::Exited) {
+                    if Instant::now() >= limit {
+                        return Err("root did not exit".into());
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                let group = owner.group.as_raw_nonzero().get().unsigned_abs();
+                let remaining = || {
+                    snapshot::group_members(group)
+                        .map(|rows| {
+                            rows.into_iter()
+                                .filter(|row| row.pid != group && !row.state.starts_with('Z'))
+                                .collect::<Vec<_>>()
+                        })
+                        .map_err(|error| error.to_string())
+                };
+                if remaining()?.is_empty() {
+                    return Err("omitted descendant was not alive after first sweep".into());
+                }
+                let allowance = if suppress {
+                    Duration::from_millis(100)
+                } else {
+                    TEST_BOUND
+                };
+                let result = pre_reap_until_ready(&mut owner, Instant::now() + allowance);
+                // Both controls use this same physical assertion while the
+                // root's exact wait identity is still retained.
+                if !remaining()?.is_empty() {
+                    return Err("live descendant survived pre-reap settlement".into());
+                }
+                result?;
+                if !matches!(owner.phase, Phase::PostSignal) {
+                    return Err("root reaped before the second sweep settled".into());
+                }
+                Ok(())
+            })();
+            // Restore the real path before any assertion, including negative
+            // control failure. Never rescue through recorded numeric rows.
+            owner.suppress_repeat = false;
+            let cleanup = finish_test_owner(&mut owner);
+            if let Err(error) = cleanup {
+                thread::spawn(move || {
+                    while finish_test_owner(&mut owner).is_err() {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                });
+                panic!("second sweep fixture cleanup: {error}");
+            }
+            if suppress {
+                assert_eq!(
+                    observation.unwrap_err(),
+                    "live descendant survived pre-reap settlement"
+                );
+                eprintln!(
+                    "negative control: live descendant survived suppressed second sweep; real cleanup restored before assertion"
+                );
+            } else {
+                observation.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn membership_excludes_only_root_and_keeps_all_other_members_and_zombies() {
+        let root = test_row(40, 40, true);
+        assert_eq!(
+            membership_state(std::slice::from_ref(&root), 40),
+            Membership::Empty
+        );
+        let zombie = test_row(41, 40, true);
+        assert_eq!(
+            membership_state(&[root.clone(), zombie.clone()], 40),
+            Membership::Zombies
+        );
+        let live = test_row(42, 40, false);
+        assert_eq!(
+            membership_state(&[root, zombie, live], 40),
+            Membership::Live
+        );
+    }
+
+    #[test]
+    fn completed_jobs_do_not_cache_readiness_or_treat_zombies_and_failures_as_ready() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut owner = OwnedProcessGroup::spawn(command, INHERITED).unwrap();
+        let observed = (|| -> Result<(), String> {
+            owner.terminate_before_reap();
+            let limit = Instant::now() + TEST_BOUND;
+            while !matches!(owner.root_state(), RootState::Exited) && Instant::now() < limit {
+                thread::yield_now();
+            }
+            let group = owner.group.as_raw_nonzero().get().unsigned_abs();
+            let completed = [
+                (
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed listing",
+                    )),
+                    PreReap::Unobserved(io::ErrorKind::InvalidData),
+                    1,
+                ),
+                (
+                    Ok(vec![test_row(group + 1, group, true)]),
+                    PreReap::Pending,
+                    1,
+                ),
+                (Ok(Vec::new()), PreReap::Ready, 1),
+                // A member in the next observation after empty readiness must
+                // cause a new fresh sweep rather than use an empty cache.
+                (
+                    Ok(vec![test_row(group + 2, group, false)]),
+                    PreReap::Pending,
+                    4,
+                ),
+            ];
+            for (rows, expected, expected_calls) in completed {
+                let worker = thread::spawn(move || rows);
+                while !worker.is_finished() && Instant::now() < limit {
+                    thread::yield_now();
+                }
+                owner.membership = Some(MembershipJob {
+                    worker,
+                    completion: None,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    deadline: limit,
+                });
+                let before = owner.syscall_count();
+                let state = owner.pre_reap_step(limit);
+                // macOS can refuse a signal to the retained root zombie with
+                // EPERM. That remains unobserved, never readiness.
+                if state != expected
+                    && !(expected_calls == 4
+                        && state == PreReap::Unobserved(io::ErrorKind::PermissionDenied))
+                {
+                    return Err(format!(
+                        "completed job expected {expected:?}, got {state:?}"
+                    ));
+                }
+                let calls = owner.syscall_count() - before;
+                if calls != expected_calls {
+                    return Err(format!("unexpected job syscall count: {calls}"));
+                }
+            }
+            Ok(())
+        })();
+        finish_test_owner(&mut owner).unwrap();
+        observed.unwrap();
+    }
+
+    #[test]
+    fn repeated_sweep_checks_fresh_errors_and_never_rearms_disarm() {
+        for errno in [Errno::CHILD, Errno::IO] {
+            let mut phase = Phase::PostSignal;
+            let observation = observe_root_with_count(|| Err(errno)).0;
+            assert!(matches!(
+                repeat_transition(
+                    &mut phase,
+                    observation,
+                    || panic!("group signal after ownership loss"),
+                    || panic!("root signal after ownership loss")
+                ),
+                Termination::Disarmed(_)
+            ));
+            assert!(matches!(
+                repeat_transition(
+                    &mut phase,
+                    Observation::Exited,
+                    || panic!("group rearmed"),
+                    || panic!("root rearmed")
+                ),
+                Termination::Disarmed(_)
+            ));
+        }
+        let mut phase = Phase::PostSignal;
+        let (observation, calls) = observe_root_with_count(|| Err(Errno::INTR));
+        assert_eq!(calls, MAX_EINTR_ATTEMPTS);
+        assert_eq!(
+            repeat_transition(
+                &mut phase,
+                observation,
+                || panic!("group after EINTR"),
+                || panic!("root after EINTR")
+            ),
+            Termination::Interrupted
+        );
+        assert_eq!(
+            repeat_transition(
+                &mut phase,
+                Observation::Exited,
+                || SignalOutcome::PermissionDenied,
+                || SignalOutcome::Sent
+            ),
+            Termination::Signalled(TerminationReport {
+                group: SignalOutcome::PermissionDenied,
+                root: SignalOutcome::Sent
+            })
+        );
+        let mut phase = Phase::Anchored;
+        assert_eq!(
+            repeat_transition(
+                &mut phase,
+                Observation::Exited,
+                || unreachable!(),
+                || unreachable!()
+            ),
+            Termination::InvalidPhase
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_reap_spawn_lock_contention_keeps_timers_and_deadline_responsive() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut owner = OwnedProcessGroup::spawn(command, INHERITED).unwrap();
+        assert!(matches!(
+            owner.terminate_before_reap(),
+            Termination::Signalled(_)
+        ));
+        let (held, holding) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let locker = thread::spawn(move || {
+            let guard = spawn_lock();
+            let _ = held.send(());
+            let _ = wait.recv_timeout(TEST_BOUND);
+            drop(guard);
+        });
+        let held = tokio::time::timeout(TEST_BOUND, holding).await;
+        let admission_limit = Instant::now() + TEST_BOUND;
+        // First prove busy admission causally, under the normal fixture bound.
+        let mut unobserved = false;
+        let mut ticks = 0;
+        loop {
+            match owner.pre_reap_step(admission_limit) {
+                PreReap::Expired => break,
+                PreReap::Unobserved(io::ErrorKind::WouldBlock) => {
+                    unobserved = true;
+                    break;
+                }
+                PreReap::Pending => {}
+                other => panic!("unexpected lock contention state: {other:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            ticks += 1;
+        }
+        // This is a short expiry stimulus, not a positive scheduler allowance.
+        let deadline = Instant::now() + Duration::from_millis(20);
+        while owner.pre_reap_step(deadline) != PreReap::Expired && Instant::now() < admission_limit
+        {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            ticks += 1;
+        }
+        let _ = release.send(());
+        locker.join().unwrap();
+        let jobs = owner.membership_jobs;
+        assert!(matches!(
+            owner.pre_reap_step(deadline),
+            PreReap::Expired | PreReap::ExpiredPending
+        ));
+        assert_eq!(owner.membership_jobs, jobs, "expiry admitted a late helper");
+        finish_test_owner(&mut owner).unwrap();
+        assert!(
+            matches!(held, Ok(Ok(()))),
+            "lock admission fixture failed: {held:?}"
+        );
+        assert!(
+            unobserved && ticks > 0,
+            "unobserved={unobserved}, ticks={ticks}"
+        );
+    }
+
+    #[test]
+    fn pending_job_is_retained_on_resume_and_late_result_cannot_signal() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut owner = OwnedProcessGroup::spawn(command, INHERITED).unwrap();
+        assert!(matches!(
+            owner.terminate_before_reap(),
+            Termination::Signalled(_)
+        ));
+        let root_limit = Instant::now() + TEST_BOUND;
+        while !matches!(owner.root_state(), RootState::Exited) && Instant::now() < root_limit {
+            thread::yield_now();
+        }
+        let exited = matches!(owner.root_state(), RootState::Exited);
+        if !exited {
+            finish_test_owner(&mut owner).unwrap();
+        }
+        assert!(exited, "root did not exit within the fixture allowance");
+        let (release, wait) = std::sync::mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let group = owner.group.as_raw_nonzero().get().unsigned_abs();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        owner.membership = Some(MembershipJob {
+            worker: thread::spawn(move || {
+                wait.recv().unwrap();
+                Ok(vec![test_row(group + 1, group, false)])
+            }),
+            completion: None,
+            cancelled: cancelled.clone(),
+            deadline,
+        });
+        let jobs = owner.membership_jobs;
+        for _ in 0..4 {
+            assert_eq!(owner.pre_reap_step(deadline), PreReap::Pending);
+        }
+        assert_eq!(
+            owner.membership_jobs, jobs,
+            "resumption duplicated a pending job"
+        );
+        while Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(owner.pre_reap_step(deadline), PreReap::ExpiredPending);
+        assert!(cancelled.load(Ordering::Acquire));
+        let before_reap = owner.syscall_count();
+        assert_eq!(owner.resignal_before_reap(deadline), PreReap::Expired);
+        assert_eq!(
+            owner.syscall_count(),
+            before_reap,
+            "expiry admitted another destructive attempt"
+        );
+        assert!(matches!(owner.reap_if_exited(), Reap::Reaped(_)));
+        let after_reap = owner.syscall_count();
+        assert_eq!(after_reap, before_reap + 1);
+        release.send(()).unwrap();
+        let limit = Instant::now() + TEST_BOUND;
+        while owner
+            .membership
+            .as_ref()
+            .is_some_and(|job| !job.worker.is_finished())
+            && Instant::now() < limit
+        {
+            thread::yield_now();
+        }
+        assert_eq!(owner.pre_reap_step(limit), PreReap::Reaped);
+        assert_eq!(
+            owner.syscall_count(),
+            after_reap,
+            "late result issued a product-tree syscall"
+        );
+        assert!(owner.membership.is_none());
+        finish_test_owner(&mut owner).unwrap();
+    }
+
+    #[test]
+    fn simple_exited_root_uses_one_job_and_running_root_uses_none() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut owner = OwnedProcessGroup::spawn(command, INHERITED).unwrap();
+        assert_eq!(owner.pre_reap_step(Instant::now()), PreReap::InvalidPhase);
+        // Represents a failed initial attempt against a still-running root.
+        owner.phase = Phase::PostSignal;
+        let limit = Instant::now() + TEST_BOUND;
+        assert_eq!(owner.pre_reap_step(limit), PreReap::Pending);
+        assert_eq!(owner.membership_jobs, 0);
+        owner.resignal_before_reap(limit);
+        pre_reap_until_ready(&mut owner, limit).unwrap();
+        assert_eq!(owner.membership_jobs, 1);
+        // Readiness is consumed, not cached if a caller pauses before reap.
+        assert_eq!(owner.pre_reap_step(limit), PreReap::Pending);
+        assert_eq!(owner.membership_jobs, 2);
+        finish_test_owner(&mut owner).unwrap();
+    }
 
     fn close_on_exec(fd: &OwnedFd) -> bool {
         rustix::io::fcntl_getfd(fd)
@@ -1401,6 +2403,7 @@ mod tests {
             if !matches!(owner.root_state(), RootState::Reaped(_))
                 || !matches!(owner.reap_if_exited(), Reap::Reaped(_))
                 || !matches!(owner.terminate_before_reap(), Termination::InvalidPhase)
+                || owner.pre_reap_step(deadline) != PreReap::Reaped
             {
                 return Err("cached reaped phase changed unexpectedly".to_owned());
             }
@@ -1448,6 +2451,10 @@ mod tests {
             owner.terminate_before_reap(),
             Termination::Disarmed(DisarmReason::OwnershipLost)
         ));
+        assert_eq!(
+            owner.pre_reap_step(Instant::now() + TEST_BOUND),
+            PreReap::Disarmed(DisarmReason::OwnershipLost)
+        );
         assert_eq!(
             owner.syscall_count(),
             after_cleanup,
@@ -1591,6 +2598,14 @@ mod tests {
             std::thread::yield_now();
         }
         loop {
+            match owner.pre_reap_step(deadline) {
+                PreReap::Ready | PreReap::Reaped => {}
+                PreReap::Pending | PreReap::Unobserved(_) if Instant::now() < deadline => {
+                    thread::yield_now();
+                    continue;
+                }
+                other => return Err(format!("test pre-reap cleanup: {other:?}")),
+            }
             match owner.reap_if_exited() {
                 Reap::Reaped(_) => break,
                 Reap::NotExited | Reap::Interrupted if Instant::now() < deadline => {}
@@ -1621,6 +2636,14 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         loop {
+            match owner.pre_reap_step(deadline) {
+                PreReap::Ready | PreReap::Reaped => {}
+                PreReap::Pending | PreReap::Unobserved(_) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                other => return Err(format!("test pre-reap cleanup: {other:?}")),
+            }
             match owner.reap_if_exited() {
                 Reap::Reaped(_) => break,
                 Reap::NotExited | Reap::Interrupted if std::time::Instant::now() < deadline => {}

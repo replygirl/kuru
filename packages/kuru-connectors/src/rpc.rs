@@ -20,7 +20,7 @@ use crate::{MAX_BYTES, http::rpc_result, mcp::Admission, redaction::Scanner};
 
 #[cfg(unix)]
 use kuru_platform::unix::{
-    GroupPresence, OwnedProcessGroup, Reap, RootState, StdioPlan, StdioSlot, Termination,
+    GroupPresence, OwnedProcessGroup, PreReap, Reap, RootState, StdioPlan, StdioSlot, Termination,
 };
 #[cfg(unix)]
 type Input = tokio::process::ChildStdin;
@@ -812,15 +812,21 @@ async fn cleanup_owner(owner: &mut Owner, graceful: bool, deadline: Instant) -> 
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     loop {
-        match owner.reap_if_exited() {
-            Reap::Reaped(_) => break,
-            Reap::NotExited | Reap::Interrupted => {}
-            Reap::Disarmed(_) | Reap::InvalidPhase => return false,
+        match owner.pre_reap_step(deadline) {
+            PreReap::Ready | PreReap::Reaped | PreReap::Expired => match owner.reap_if_exited() {
+                Reap::Reaped(_) => break,
+                Reap::NotExited | Reap::Interrupted => {}
+                Reap::Disarmed(_) | Reap::InvalidPhase => return false,
+            },
+            PreReap::Pending | PreReap::ExpiredPending | PreReap::Unobserved(_) => {}
+            PreReap::Disarmed(_) | PreReap::InvalidPhase => return false,
         }
         if Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        owner
+            .wait_pre_reap(Duration::from_millis(10), deadline)
+            .await;
     }
     let mut listing = owner.permission_listing(deadline);
     loop {

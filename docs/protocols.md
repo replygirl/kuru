@@ -179,7 +179,10 @@ execution defaults to a 30-second timeout; an optional `timeout_ms` argument
 accepts 1–120000 milliseconds. On Unix,
 a registered owner retains the standard root, its fresh process group,
 both pipes, and the checked workspace capability through cleanup. It signals the
-remaining original group before reaping that root, then confirms group absence
+remaining original group before reaping that root. While the root remains
+unreaped, cleanup can inspect original-group membership and repeat a signal
+after a fresh ownership check under the same cleanup deadline. After root
+reap, observation is read-only. It then confirms group absence
 before reporting normal completion. A timeout, cancellation, pipe/output
 failure, or shutdown keeps its primary error; if bounded confirmation remains
 unavailable, Kuru reports that state while the owner remains retained for later
