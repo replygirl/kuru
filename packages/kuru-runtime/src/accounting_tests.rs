@@ -406,6 +406,7 @@ enum InvalidCompactKind {
     Empty,
     Refusal,
     ToolOutput,
+    Failure,
 }
 
 struct InvalidCompactProvider {
@@ -476,6 +477,7 @@ impl Provider for InvalidCompactProvider {
                 )))
                 .await
             }
+            InvalidCompactKind::Failure => anyhow::bail!("fixture compaction provider failure"),
         }
     }
 }
@@ -997,6 +999,28 @@ async fn automatic_compaction_observes_below_exact_and_hard_overflow_boundaries_
                 .await
                 .unwrap();
             assert_eq!(cursor.is_some(), expected_compactions == 1, "{label}");
+            let notices = harness.take_compaction_notices();
+            assert_eq!(
+                notices.len(),
+                expected_compactions,
+                "{label} accepted notice count"
+            );
+            if let Some(crate::Event::Compaction {
+                actor: noticed_actor,
+                notice,
+            }) = notices.first()
+            {
+                assert_eq!(noticed_actor, &actor);
+                assert_eq!(notice.summary_id, cursor.as_ref().unwrap().summary_id);
+                assert_eq!(notice.after_sequence, 0);
+                assert_eq!(notice.through_sequence, 1);
+                assert!(
+                    !notice
+                        .text(noticed_actor)
+                        .contains("threshold rolling summary")
+                );
+            }
+            assert!(harness.take_compaction_notices().is_empty());
 
             harness.shutdown(false).await.unwrap();
             memory.close().await.unwrap();
@@ -1012,6 +1036,7 @@ async fn empty_refusal_and_tool_compaction_outputs_keep_the_prior_summary_usable
             ("empty", InvalidCompactKind::Empty),
             ("refusal", InvalidCompactKind::Refusal),
             ("tool-output", InvalidCompactKind::ToolOutput),
+            ("provider-failure", InvalidCompactKind::Failure),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let memory = MemoryStore::temporary().await.unwrap();
@@ -1077,10 +1102,21 @@ async fn empty_refusal_and_tool_compaction_outputs_keep_the_prior_summary_usable
 
             let notices = harness
                 .compact_controlled(Some(&actor), &CancellationToken::new())
-                .await
-                .unwrap();
-            assert_eq!(notices.len(), 1);
-            assert!(notices[0].starts_with("No eligible uncompacted history for "));
+                .await;
+            if matches!(kind, InvalidCompactKind::Failure) {
+                assert!(
+                    format!("{:#}", notices.unwrap_err())
+                        .contains("fixture compaction provider failure")
+                );
+            } else {
+                let notices = notices.unwrap();
+                assert_eq!(notices.len(), 1);
+                assert!(notices[0].starts_with("No eligible uncompacted history for "));
+            }
+            assert!(
+                harness.take_compaction_notices().is_empty(),
+                "{label} emitted a successful checkpoint notice"
+            );
             let cursor = memory
                 .context_summary_cursor(&namespace, &harness.session.id, &namespace)
                 .await
@@ -1273,6 +1309,10 @@ async fn manual_compact_visits_active_parts_then_relationships_in_topology_order
             .await
             .unwrap();
         assert_eq!(notices.len(), identities.len());
+        assert!(
+            harness.take_compaction_notices().is_empty(),
+            "successful manual notices were duplicated in settlement"
+        );
         for ((notice, identity), through) in notices.iter().zip(&identities).zip(&expected_through)
         {
             assert!(
@@ -1854,6 +1894,15 @@ async fn cancellation_after_compact_settlement_drains_the_atomic_checkpoint() {
             checkpoint_barrier.release();
             let error = running.await.unwrap_err();
             assert!(crate::turn_was_cancelled(&error), "{error:#}");
+            let notices = harness.take_compaction_notices();
+            assert_eq!(notices.len(), 1, "accepted cancellation lost its notice");
+            let crate::Event::Compaction { actor: noticed_actor, notice } = &notices[0] else { panic!("wrong notice event"); };
+            assert_eq!(noticed_actor, &actor);
+            assert_eq!(notice.summary_id, cursor.summary_id);
+            let visible = notice.text(noticed_actor);
+            assert!(!visible.contains("private compact sidecar"));
+            assert!(!visible.contains(&accepted_record.summary));
+            assert!(harness.take_compaction_notices().is_empty());
             assert_eq!(provider.compact_streams.load(Ordering::SeqCst), 1);
             assert_eq!(provider.ordinary_streams.load(Ordering::SeqCst), 0);
             harness.shutdown(false).await.unwrap();
@@ -2128,6 +2177,7 @@ async fn stale_compact_checkpoint_keeps_the_competing_cursor_and_writes_no_sidec
         assert_eq!(usage.invocation_count, 1);
         assert_eq!(usage.known_usage.input_tokens, Some(7));
         assert_eq!(usage.known_usage.output_tokens, Some(3));
+        assert!(harness.take_compaction_notices().is_empty(), "stale checkpoint emitted a successful notice");
 
         harness.shutdown(false).await.unwrap();
         sibling.close().await.unwrap();
@@ -2241,6 +2291,13 @@ async fn accepted_compact_checkpoint_lost_reply_reconciles_on_a_successor_withou
 
             harness.reconcile().await.unwrap();
             let mut stopped = harness.actors.remove(&actor).unwrap();
+            let notices = harness.take_compaction_notices();
+            assert_eq!(notices.len(), 1, "exact lost-reply recovery lost its notice");
+            let crate::Event::Compaction { actor: noticed_actor, notice } = &notices[0] else { panic!("wrong notice event"); };
+            assert_eq!(noticed_actor, &actor);
+            assert_eq!(notice.summary_id, accepted.summary_id);
+            assert!(!notice.text(noticed_actor).contains("private compact sidecar"));
+            assert!(harness.take_compaction_notices().is_empty());
             stopped.wait().await;
             harness.actors.insert(
                 actor.clone(),
@@ -2834,6 +2891,21 @@ async fn candidate_compaction_stays_isolated_and_conflicts_without_losing_main_h
             .unwrap()
             .unwrap();
         assert_eq!(candidate_cursor.through_sequence, 1);
+        let notices = harness.take_compaction_notices();
+        assert_eq!(notices.len(), 1);
+        let crate::Event::Compaction {
+            actor: noticed_actor,
+            notice,
+        } = &notices[0]
+        else {
+            panic!("wrong notice event");
+        };
+        assert_eq!(notice.summary_id, candidate_cursor.summary_id);
+        assert!(
+            notice
+                .text(noticed_actor)
+                .starts_with("Candidate checkpoint: ")
+        );
         assert!(
             memory
                 .context_summary_cursor(&namespace, &harness.session.id, &namespace)

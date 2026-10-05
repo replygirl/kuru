@@ -429,6 +429,9 @@ pub enum ViewOperation {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         private_reasoning: Vec<crate::ReasoningSummaryRecord>,
     },
+    ContextSummaryConfirmation {
+        summary_id: String,
+    },
     ContextSummaryCursor {
         actor_namespace: String,
         session_id: String,
@@ -507,6 +510,7 @@ impl ViewOperation {
             Self::CheckpointContextSummary { .. } => {
                 C::write(Receipt::Unit("view.checkpoint_context_summary"))
             }
+            Self::ContextSummaryConfirmation { .. } => C::READ,
             Self::ContextSummaryCursor { .. } => C::READ,
             Self::ContextSummaryWindow { .. } => C::READ,
             Self::Notes { .. } => C::READ,
@@ -631,6 +635,7 @@ pub enum ServiceValue {
     SessionLifecycleOutcome(crate::SessionLifecycleOutcome),
     PublicTranscriptPage(crate::PublicTranscriptPage),
     SessionSourceSnapshot(crate::SessionSourceSnapshot),
+    ContextSummaryConfirmation(Option<crate::ContextSummaryConfirmation>),
     ContextSummaryCursor(Option<crate::ContextSummaryCursor>),
     ContextSummaryWindow(crate::ContextSummaryWindow),
     Notes(Vec<StoredNote>),
@@ -2861,6 +2866,11 @@ async fn dispatch_view(store: &MemoryStore, operation: ViewOperation) -> Result<
             validate_context_summary_checkpoint_request(&checkpoint)?;
             store.checkpoint_context_summary(&checkpoint).await?;
             ServiceValue::Unit
+        }
+        ViewOperation::ContextSummaryConfirmation { summary_id } => {
+            ServiceValue::ContextSummaryConfirmation(
+                store.context_summary_confirmation(&summary_id).await?,
+            )
         }
         ViewOperation::ContextSummaryCursor {
             actor_namespace,

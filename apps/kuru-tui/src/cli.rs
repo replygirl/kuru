@@ -1495,10 +1495,26 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 let mut events = harness.subscribe();
                 let turn_id = turn_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 let cancellation = CancellationToken::new();
-                let result = harness
-                    .run_local_controlled(&prompt, None, &turn_id, &cancellation)
-                    .await
-                    .map(|result| result.output);
+                let result = {
+                    let operation =
+                        harness.run_local_controlled(&prompt, None, &turn_id, &cancellation);
+                    tokio::pin!(operation);
+                    tokio::select! {
+                        biased;
+                        result = &mut operation => result,
+                        signal = ctrl_c_cancellation() => {
+                            cancellation.cancel();
+                            // Await the same admitted operation, including any
+                            // accepted checkpoint, before releasing its lease.
+                            let result = operation.await;
+                            match signal {
+                                Ok(()) => result,
+                                Err(error) => result.context(format!("Run cancellation listener failed: {error:#}")),
+                            }
+                        }
+                    }
+                }
+                .map(|result| result.output);
                 let succeeded = result.is_ok();
                 if let Ok(result) = &result {
                     if json {
@@ -1508,6 +1524,12 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                     }
                 }
                 let cleanup = harness.shutdown(succeeded).await;
+                for event in harness.take_compaction_notices() {
+                    if let Event::Compaction { actor, notice } = event {
+                        // Context maintenance never changes stdout's answer/JSON.
+                        let _ = writeln!(io::stderr().lock(), "{}", notice.text(&actor));
+                    }
+                }
                 if succeeded {
                     let mut reports = std::collections::BTreeSet::new();
                     loop {
@@ -1710,7 +1732,7 @@ async fn run_mcp_command(host: &ToolHost, command: &McpCommand) -> Result<()> {
 async fn ctrl_c_cancellation() -> Result<()> {
     tokio::signal::ctrl_c()
         .await
-        .context("listen for MCP login cancellation")
+        .context("listen for Ctrl-C cancellation")
 }
 
 fn report_mcp_statuses(statuses: &[McpStatus]) {

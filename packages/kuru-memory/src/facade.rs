@@ -2261,6 +2261,33 @@ impl MemoryStore {
         }
     }
 
+    pub async fn context_summary_confirmation(
+        &self,
+        summary_id: &str,
+    ) -> Result<Option<store::ContextSummaryConfirmation>> {
+        store::validate_context_summary_id(summary_id)?;
+        let confirmation = match &self.backend {
+            Backend::Local(store) => store.context_summary_confirmation(summary_id).await?,
+            Backend::Remote(remote) => match remote
+                .call(ViewOperation::ContextSummaryConfirmation {
+                    summary_id: summary_id.into(),
+                })
+                .await?
+            {
+                ServiceValue::ContextSummaryConfirmation(value) => value,
+                _ => bail!("memory service returned the wrong context confirmation response"),
+            },
+        };
+        if let Some(value) = &confirmation {
+            store::validate_context_summary_confirmation(value)?;
+            ensure!(
+                value.summary_id == summary_id,
+                "context summary identity mismatch"
+            );
+        }
+        Ok(confirmation)
+    }
+
     pub async fn context_summary_cursor(
         &self,
         actor_namespace: &str,
@@ -5686,6 +5713,15 @@ mod tests {
                         && summaries.records[0].record == record,
                     "managed summary projection did not return the cursor-selected record"
                 );
+                let confirmed = store::ContextSummaryConfirmation::from_record(&record)?;
+                let before_confirmation = inspector.revision().await?;
+                ensure!(
+                    inspector.context_summary_confirmation(&confirmed.summary_id).await? == Some(confirmed.clone()),
+                    "managed exact summary confirmation lost accepted provenance"
+                );
+                ensure!(!serde_json::to_string(&confirmed)?.contains(&record.summary), "confirmation disclosed private summary");
+                ensure!(inspector.context_summary_confirmation("invalid").await.is_err());
+                ensure!(inspector.revision().await? == before_confirmation, "confirmation changed revision");
                 ensure!(
                     inspector.get(&private_key).await? == Some(serde_json::to_value(&private)?),
                     "managed checkpoint did not atomically retain its private sidecar"
@@ -5725,6 +5761,47 @@ mod tests {
                         .iter()
                         .any(|row| row.message.plain_text() == Some("candidate only")),
                     "candidate-pinned source snapshot omitted its private row"
+                );
+                let candidate_record = store::ContextSummaryRecord {
+                    source_view: candidate_page.view.clone(),
+                    source_revision: candidate_page.revision.clone(),
+                    after_sequence: candidate_page.after_exclusive,
+                    through_sequence: candidate_page
+                        .through_inclusive
+                        .context("candidate snapshot omitted its source boundary")?,
+                    operation_id: Some("compact-candidate".into()),
+                    invocation_id: "invocation-candidate".into(),
+                    summary: "private candidate summary sentinel".into(),
+                    ..record.clone()
+                };
+                candidate
+                    .view()
+                    .checkpoint_context_summary(&store::ContextSummaryCheckpoint {
+                        record: candidate_record.clone(),
+                        private_reasoning: vec![],
+                    })
+                    .await?;
+                let candidate_confirmation =
+                    store::ContextSummaryConfirmation::from_record(&candidate_record)?;
+                ensure!(
+                    candidate
+                        .view()
+                        .context_summary_confirmation(&candidate_confirmation.summary_id)
+                        .await?
+                        == Some(candidate_confirmation.clone()),
+                    "managed candidate exact confirmation lost its selected view"
+                );
+                ensure!(
+                    inspector
+                        .context_summary_confirmation(&candidate_confirmation.summary_id)
+                        .await?
+                        .is_none(),
+                    "unpromoted candidate summary confirmation leaked into main"
+                );
+                ensure!(
+                    !serde_json::to_string(&candidate_confirmation)?
+                        .contains(&candidate_record.summary),
+                    "managed candidate confirmation disclosed its summary body"
                 );
                 let candidate_suffix = candidate
                     .view()

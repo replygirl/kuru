@@ -527,6 +527,37 @@ pub struct ContextSummaryCursor {
     pub source_revision: String,
 }
 
+/// Exact retained checkpoint provenance, without its private summary body.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSummaryConfirmation {
+    pub summary_id: String,
+    pub actor_namespace: String,
+    pub session_id: String,
+    pub source_namespace: String,
+    pub summary_namespace: String,
+    pub source_view: String,
+    pub source_revision: String,
+    pub after_sequence: i64,
+    pub through_sequence: i64,
+}
+
+impl ContextSummaryConfirmation {
+    pub fn from_record(record: &ContextSummaryRecord) -> Result<Self> {
+        Ok(Self {
+            summary_id: context_summary_id(record)?,
+            actor_namespace: record.actor_namespace.clone(),
+            session_id: record.session_id.clone(),
+            source_namespace: record.source_namespace.clone(),
+            summary_namespace: record.summary_namespace.clone(),
+            source_view: record.source_view.clone(),
+            source_revision: record.source_revision.clone(),
+            after_sequence: record.after_sequence,
+            through_sequence: record.through_sequence,
+        })
+    }
+}
+
 /// One current cursor-selected summary and its durable identity.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContextSummaryItem {
@@ -3363,6 +3394,52 @@ impl MemoryStore {
             },
         )
         .await
+    }
+
+    /// Confirm an exact retained checkpoint on this selected view, even after
+    /// its current cursor advanced. Never select its private summary body.
+    pub async fn context_summary_confirmation(
+        &self,
+        summary_id: &str,
+    ) -> Result<Option<ContextSummaryConfirmation>> {
+        self.readable()?;
+        validate_context_summary_id(summary_id)?;
+        ensure!(
+            self.schema_version().await? >= 5,
+            "context summaries require an upgraded memory view"
+        );
+        let row = crate::pool::within(
+            QUERY_TIMEOUT,
+            sqlx::query("SELECT summary_id, actor_namespace, session_id, source_namespace, summary_namespace, source_view, source_revision, after_sequence, through_sequence FROM context_summaries WHERE summary_id = ?")
+                .bind(summary_id)
+                .fetch_optional(self.pool.as_ref()),
+        )
+        .await
+        .context("context summary confirmation deadline exceeded")??;
+        row.map(|row| {
+            let utf8 = |column| -> Result<String> {
+                String::from_utf8(row.try_get(column)?)
+                    .with_context(|| format!("context summary {column} is not UTF-8"))
+            };
+            let confirmation = ContextSummaryConfirmation {
+                summary_id: row.try_get("summary_id")?,
+                actor_namespace: utf8("actor_namespace")?,
+                session_id: utf8("session_id")?,
+                source_namespace: utf8("source_namespace")?,
+                summary_namespace: utf8("summary_namespace")?,
+                source_view: row.try_get("source_view")?,
+                source_revision: row.try_get("source_revision")?,
+                after_sequence: row.try_get("after_sequence")?,
+                through_sequence: row.try_get("through_sequence")?,
+            };
+            validate_context_summary_confirmation(&confirmation)?;
+            ensure!(
+                confirmation.summary_id == summary_id,
+                "context summary identity mismatch"
+            );
+            Ok(confirmation)
+        })
+        .transpose()
     }
 
     /// Read the current typed compaction cursor for an authorized source.
@@ -7281,13 +7358,33 @@ pub(crate) fn validate_context_summary_window_request(
     Ok(())
 }
 
-fn validate_context_summary_id(summary_id: &str) -> Result<()> {
+pub(crate) fn validate_context_summary_id(summary_id: &str) -> Result<()> {
     ensure!(
         summary_id.len() == 64
             && summary_id
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
         "context summary identity is malformed"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_context_summary_confirmation(
+    value: &ContextSummaryConfirmation,
+) -> Result<()> {
+    validate_context_summary_cursor(&ContextSummaryCursor {
+        actor_namespace: value.actor_namespace.clone(),
+        session_id: value.session_id.clone(),
+        source_namespace: value.source_namespace.clone(),
+        through_sequence: value.through_sequence,
+        summary_id: value.summary_id.clone(),
+        source_view: value.source_view.clone(),
+        source_revision: value.source_revision.clone(),
+    })?;
+    identifier("summary namespace", &value.summary_namespace, 1024)?;
+    ensure!(
+        value.after_sequence >= 0 && value.through_sequence > value.after_sequence,
+        "context summary source range is invalid"
     );
     Ok(())
 }
@@ -12180,6 +12277,28 @@ mod tests {
         assert_eq!(current.records.len(), 1);
         assert_eq!(current.records[0].summary_id, current_cursor.summary_id);
         assert_eq!(current.records[0].record, current_record);
+        let confirmation_revision = store.revision().await?;
+        let retained = ContextSummaryConfirmation::from_record(&record)?;
+        assert_eq!(
+            store
+                .context_summary_confirmation(&retained.summary_id)
+                .await?,
+            Some(retained.clone())
+        );
+        assert!(!serde_json::to_string(&retained)?.contains(&record.summary));
+        assert!(
+            store
+                .context_summary_confirmation(&"f".repeat(64))
+                .await?
+                .is_none()
+        );
+        assert!(
+            store
+                .context_summary_confirmation("malformed")
+                .await
+                .is_err()
+        );
+        assert_eq!(store.revision().await?, confirmation_revision);
         assert!(
             candidate
                 .view()
@@ -12604,6 +12723,25 @@ mod tests {
             .context_summary_cursor(actor, session, actor)
             .await?;
         assert!(candidate_cursor.is_some());
+        let candidate_confirmation =
+            ContextSummaryConfirmation::from_record(&candidate_checkpoint.record)?;
+        assert_eq!(
+            candidate
+                .view()
+                .context_summary_confirmation(&candidate_confirmation.summary_id)
+                .await?,
+            Some(candidate_confirmation.clone())
+        );
+        assert!(
+            store
+                .context_summary_confirmation(&candidate_confirmation.summary_id)
+                .await?
+                .is_none()
+        );
+        assert!(
+            !serde_json::to_string(&candidate_confirmation)?
+                .contains(&candidate_checkpoint.record.summary)
+        );
         assert!(
             store
                 .context_summary_cursor(actor, session, actor)

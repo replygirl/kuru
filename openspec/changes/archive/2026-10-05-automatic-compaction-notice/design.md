@@ -1,0 +1,38 @@
+# Design
+
+## Context
+
+`actor.rs` computes an exact `context_summary_id` before its existing receipted checkpoint, but the automatic path discards `CompactionOutcome`. The final cancellation check follows acceptance and can hide that outcome. `FacingProgress` is a replaceable watch value, while the activity broadcast can lag; neither alone guarantees a visible settled notice. Current summary-window reads join only cursor-selected records, although accepted historical summaries remain in `context_summaries`.
+
+The existing facade already retains exact unit-write receipt fingerprints and fences mutation after an aborted/lost reply. Its public reconciliation result is a generic boolean, so runtime notice metadata cannot infer which compaction accepted from that value. B's integrated runtime/candidate publication and U3's stable TUI state are required before implementation.
+
+## Goals / Non-Goals
+
+**Goals:** Use the existing checkpoint identity, exact recovery and selected-view ownership to confirm notices; retain only current-Harness metadata; deliver through existing events and settlement presentation with no private body disclosure.
+
+**Non-Goals:** New durable notice state, checkpoint/receipt/journal/TurnOutput schema changes, a generic notification subsystem, inference replay, policy/retention changes, provider routing, a graph limit or owner-lifetime extension for unused notice state.
+
+## Decisions
+
+1. Register compaction attempt metadata immediately before the checkpoint call. Keep actor/session/source identity, operation/invocation identity, sequence range, summary ID and selected view, never the summary text or reasoning records. On a definite acknowledged checkpoint, mark acceptance and publish before the post-checkpoint cancellation check. Remove definitely refused/stale/absent attempts. Reject storing notice bodies in memory or deriving success from the ordinary provider completion, because neither establishes accepted durable context maintenance.
+2. Extend the existing memory boundary with one read-only exact summary-ID metadata confirmation. Select retained records directly instead of joining current cursors, validate the request and bounded returned metadata, and bind notice confirmation to its captured identity/provenance and selected live/candidate view. Existing exact receipt recovery runs first; an unresolved fence leaves the attempt unresolved. Reject using generic reconciliation booleans or the latest cursor alone, because they can name unrelated operations or omit an earlier accepted summary.
+3. Keep a compaction-only pending/accepted collection owned by the current Harness and shared narrowly with its Work values. Drain accepted metadata through an existing typed event and the existing operation-settlement paths; deduplicate by exact summary identity plus selected view. The same collection survives an actor reply failure or caller abort until existing recovery settles it. Successful live event observation and final settlement must not show two notices. Reject a durable outbox or journal expansion: these notices describe current operation maintenance and the accepted summary record already supplies durable proof.
+4. Preserve candidate boundaries. Resolve pending candidate receipts through the existing typed candidate recovery, confirm against the exact recovered selected view, and settle notices while that existing candidate authority is available before promotion/abandonment. A displayed candidate notice explicitly states candidate checkpoint acceptance and does not imply live promotion. Do not retain a new read cut, transport or memory handle solely to extend an unused owner's lifetime.
+5. Present metadata in the existing TUI flow and drain it on success, failure and cancellation settlement, so an activity receiver's lag cannot suppress it. Headless delivery writes metadata only to stderr after the owned operation/recovery settles; stdout remains the existing answer or JSON. Reuse manual notice wording/formatting and preserve `compact_controlled`'s existing ordered `Vec<String>` contract and no-op/refusal lines. Automatic acknowledgment may emit immediately; manual acknowledgment remains retained until the complete successful manual operation returns its ordered notices, then collector-side consumption prevents duplication. A failed/cancelled manual operation instead drains its already confirmed metadata once. Reject new public or app-private result APIs solely to carry IDs, and reject `FacingProgress` as the sole channel because it is replaceable and cleared at turn end.
+6. Headless Run currently creates a cancellation token without registering Ctrl-C. Register the existing signal future alongside that same controlled run, prefer a ready completed result, and on interruption cancel its token and await the original future before ordinary shutdown and notice draining. A rejected signal registration cancels/drains the owned work rather than dropping it. Preserve current answer/JSON and error classification; add no command grammar, exit-code table, control framework or signal policy for unrelated commands. Real subprocess acceptance must distinguish stdout from stderr and deliver Ctrl-C only after an accepted checkpoint is causally observed.
+
+## Risks / Trade-offs
+
+- A lost reply may remain uncertain → preserve only the unresolved metadata and existing fence, emit no success until exact recovery and selected-view confirmation succeed, and never replay the summarization request.
+- A later cursor can hide an earlier accepted checkpoint → confirm retained identity metadata directly, without reading or exposing the private summary body.
+- Live events and settlement can both deliver → deduplicate by exact identity/view and exercise receiver lag plus cancellation after acceptance through observable fixtures.
+- Candidate handles can be retired during recovery → use the existing typed recovered view and settle notice confirmation before its existing transition cleanup, without transferring write authority or extending owner lifetime.
+- Shared runtime/TUI files are active in B/U3 → integrate their final commits normally before implementation and coordinate source ownership; keep this change's current work artifact-only until that integration is complete.
+
+## Operational surface
+
+This slice adds one read-only operation to the existing checked private project service and one metadata event/presentation path in the existing local TUI/headless process. It adds no listener, credentials, provider call, installation requirement or native process mechanism. Memory owns request validation, wire compatibility and real-Dolt fixtures; runtime owns acceptance/recovery metadata, and the app owns completed-frame and stdout/stderr evidence.
+
+## Integration contract
+
+The memory package owns the private service operation, facade and selected-view SQL read. Its request uses the existing validated exact summary identity, and its bounded response contains only stored identity/provenance metadata or absence. It does not introduce a provider route, public HTTP endpoint or mutable candidate capability. Runtime compares the response with its captured attempt metadata after existing exact fence recovery; TUI/headless adapters receive only the safe notice projection. Owning fixtures exercise actual local/managed Dolt and candidate isolation, while app PTYs use an isolated deterministic HTTP provider fixture solely to trigger and observe the real compaction/checkpoint/presentation flow; that fixture establishes no paid live-model claim. The existing private wire compatibility/pin gate remains authoritative for the additive read operation.

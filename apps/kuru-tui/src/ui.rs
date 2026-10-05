@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{self, IsTerminal},
     sync::Arc,
     time::{Duration, Instant},
@@ -224,6 +224,7 @@ pub struct InitialViewData {
 pub struct View {
     pub transcript: Vec<(String, String)>,
     completion_metadata: BTreeMap<usize, String>,
+    compaction_notices_seen: BTreeSet<(String, String)>,
     pub input: String,
     pub cursor: usize,
     command_completion: Option<CommandCompletion>,
@@ -519,6 +520,7 @@ impl View {
         let show_scene = transcript.is_empty();
         Self {
             completion_metadata: BTreeMap::new(),
+            compaction_notices_seen: BTreeSet::new(),
             transcript,
             input: String::new(),
             cursor: 0,
@@ -832,6 +834,22 @@ impl View {
 
     pub fn event(&mut self, event: Event) {
         let (kind, actor, detail) = match event {
+            Event::Compaction { actor, notice } => {
+                if !self
+                    .compaction_notices_seen
+                    .insert((notice.source_view.clone(), notice.summary_id.clone()))
+                {
+                    return;
+                }
+                let text = notice.text(&actor);
+                self.transcript.push(("kuru".into(), text));
+                self.show_scene = false;
+                (
+                    "compaction".into(),
+                    actor,
+                    "confirmed context checkpoint; original records retained".into(),
+                )
+            }
             Event::Active { actor, detail } => {
                 self.part_activity.insert(actor.clone(), "active".into());
                 ("active".into(), actor, detail)
@@ -2307,6 +2325,33 @@ fn drain_activity(
     drain
 }
 
+fn present_settled_compactions(
+    events: &mut broadcast::Receiver<Event>,
+    view: &mut View,
+    notices: Vec<Event>,
+) {
+    let settled = notices
+        .iter()
+        .filter_map(|event| match event {
+            Event::Compaction { notice, .. } => {
+                Some((notice.source_view.clone(), notice.summary_id.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for notice in notices {
+        view.event(notice);
+    }
+    // Collector acknowledgment publishes synchronously before its entry can
+    // drain, so duplicates of the removed entries are already queued. A later
+    // acknowledgment may also appear here; retain its ID until its own collector
+    // entry drains instead of forgetting every notice at this settlement.
+    drain_activity(events, view, events.len());
+    for identity in settled {
+        view.compaction_notices_seen.remove(&identity);
+    }
+}
+
 async fn project_runtime(harness: &Arc<Mutex<Harness>>) -> RuntimeSnapshot {
     let harness = harness.lock().await;
     project_runtime_snapshot(&harness)
@@ -2366,9 +2411,24 @@ async fn apply_completion(
     }
 
     let activity = drain_activity(events, view, ACTIVITY_DRAIN_CAP);
+    let notices = {
+        let mut harness = harness.lock().await;
+        let recovery = harness.reconcile_compaction_notices().await;
+        let notices = harness.take_compaction_notices();
+        if let Err(error) = recovery {
+            view.transcript.push((
+                "error".into(),
+                format!("Compaction checkpoint recovery remains unresolved: {error:#}"),
+            ));
+            view.show_scene = false;
+        }
+        notices
+    };
     view.busy = false;
     *job = None;
     if quit_pending {
+        present_settled_compactions(events, view, notices);
+        view.settle();
         message?;
         return Ok(CompletionState::Settled {
             quit: true,
@@ -2466,6 +2526,7 @@ async fn apply_completion(
             view.completion_locked = true;
         }
     }
+    present_settled_compactions(events, view, notices);
     if let Some((input, cursor, chips)) = view.saved_input.take() {
         view.input = input;
         view.cursor = cursor;
@@ -2941,6 +3002,9 @@ where
                             activity_closed,
                         } => {
                             activity_open = activity_still_open(activity_open, activity_closed);
+                            let size = terminal.size()?;
+                            render::clamp_scroll(&mut view, size.into());
+                            terminal.draw(|frame| draw(frame, &view))?;
                             return Ok(());
                         }
                         CompletionState::Settled {
@@ -3887,6 +3951,90 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn compaction_live_and_late_queued_events_display_once_with_bounded_settlement_state() {
+        let mut view = fixture();
+        view.transcript.clear();
+        let (sender, mut receiver) = broadcast::channel(8);
+        for operation in 0..2_048 {
+            let event = Event::Compaction {
+                actor: "part-a".into(),
+                notice: kuru_runtime::CompactionNotice {
+                    summary_id: format!("{operation:064x}"),
+                    source_view: "main".into(),
+                    after_sequence: operation,
+                    through_sequence: operation + 1,
+                },
+            };
+            // A live observation and a still-queued duplicate can straddle the
+            // collector drain; both must represent one visible checkpoint.
+            view.event(event.clone());
+            sender.send(event.clone()).unwrap();
+            present_settled_compactions(&mut receiver, &mut view, vec![event]);
+            assert_eq!(view.transcript.len(), operation as usize + 1);
+            assert!(view.compaction_notices_seen.is_empty());
+            assert!(receiver.is_empty());
+        }
+        let late = Event::Compaction {
+            actor: "part-b".into(),
+            notice: kuru_runtime::CompactionNotice {
+                summary_id: format!("{:064x}", 2_048),
+                source_view: "main".into(),
+                after_sequence: 2_048,
+                through_sequence: 2_049,
+            },
+        };
+        // An acknowledgment after the collector snapshot can reach the queued
+        // event drain first. Keep its dedup entry until its own later settlement.
+        sender.send(late.clone()).unwrap();
+        present_settled_compactions(&mut receiver, &mut view, vec![]);
+        assert_eq!(view.transcript.len(), 2_049);
+        assert_eq!(view.compaction_notices_seen.len(), 1);
+        present_settled_compactions(&mut receiver, &mut view, vec![late]);
+        assert_eq!(view.transcript.len(), 2_049);
+        assert!(view.compaction_notices_seen.is_empty());
+        let lagged = Event::Compaction {
+            actor: "part-c".into(),
+            notice: kuru_runtime::CompactionNotice {
+                summary_id: format!("{:064x}", 2_049),
+                source_view: "main".into(),
+                after_sequence: 2_049,
+                through_sequence: 2_050,
+            },
+        };
+        sender.send(lagged.clone()).unwrap();
+        for _ in 0..8 {
+            sender
+                .send(Event::Idle {
+                    actor: "part-c".into(),
+                    detail: "settled".into(),
+                })
+                .unwrap();
+        }
+        // Receiver lag can evict the live notice, but its accepted collector
+        // entry still produces exactly one transcript message at settlement.
+        present_settled_compactions(&mut receiver, &mut view, vec![lagged]);
+        assert_eq!(view.transcript.len(), 2_050);
+        assert!(view.compaction_notices_seen.is_empty());
+        assert!(
+            view.activity
+                .iter()
+                .any(|line| line.contains("activity events omitted"))
+        );
+        assert!(
+            view.transcript
+                .last()
+                .unwrap()
+                .1
+                .contains("original records remain stored")
+        );
+        let frame = rendered(&view);
+        assert!(
+            frame.contains("Compacted") && frame.contains("remain stored"),
+            "{frame}"
+        );
     }
 
     #[test]

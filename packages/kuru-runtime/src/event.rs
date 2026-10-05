@@ -20,6 +20,42 @@ pub struct StateReport {
     pub note: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionNotice {
+    pub summary_id: String,
+    pub source_view: String,
+    pub after_sequence: i64,
+    pub through_sequence: i64,
+}
+
+impl CompactionNotice {
+    fn valid(&self) -> bool {
+        self.summary_id.len() == 64
+            && self
+                .summary_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && !self.source_view.is_empty()
+            && self.source_view.len() <= 64
+            && !self.source_view.chars().any(char::is_control)
+            && self.after_sequence >= 0
+            && self.through_sequence > self.after_sequence
+    }
+
+    pub fn text(&self, actor: &str) -> String {
+        let candidate = if self.source_view == "main" {
+            ""
+        } else {
+            "Candidate checkpoint: "
+        };
+        format!(
+            "{candidate}Compacted {actor} source sequences ({}, {}] as {}; original records remain stored.",
+            self.after_sequence, self.through_sequence, self.summary_id
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 /// A concrete resource limit reached while producing a turn.
@@ -169,6 +205,10 @@ impl ToolObservation {
 /// compatible `{kind, actor, detail}` wire adapter.
 #[derive(Debug, Clone)]
 pub enum Event {
+    Compaction {
+        actor: String,
+        notice: CompactionNotice,
+    },
     Active {
         actor: String,
         detail: String,
@@ -244,6 +284,7 @@ pub enum Event {
 impl Event {
     pub fn kind(&self) -> &str {
         match self {
+            Self::Compaction { .. } => "compaction",
             Self::Active { .. } => "active",
             Self::Idle { .. } => "idle",
             Self::SpeakerSelection { .. } => "speaker-selection",
@@ -265,7 +306,8 @@ impl Event {
 
     pub fn actor(&self) -> &str {
         match self {
-            Self::Active { actor, .. }
+            Self::Compaction { actor, .. }
+            | Self::Active { actor, .. }
             | Self::Idle { actor, .. }
             | Self::SpeakerSelection { actor, .. }
             | Self::Speaker { actor, .. }
@@ -287,6 +329,7 @@ impl Event {
 
     pub fn detail(&self) -> String {
         match self {
+            Self::Compaction { notice, .. } => wire_json(notice),
             Self::Active { detail, .. }
             | Self::Idle { detail, .. }
             | Self::Mcp { detail, .. }
@@ -316,6 +359,16 @@ impl Event {
     pub fn projected(self) -> Self {
         let actor = project_detail(self.actor().into());
         match self {
+            Self::Compaction { notice, .. } => {
+                if notice.valid() {
+                    Self::Compaction { actor, notice }
+                } else {
+                    Self::Withheld {
+                        kind: "compaction".into(),
+                        actor,
+                    }
+                }
+            }
             Self::Active { detail, .. } => Self::Active {
                 actor,
                 detail: project_detail(detail),
@@ -471,6 +524,14 @@ impl Event {
 
     pub fn from_wire_v2(kind: String, actor: String, detail: String) -> Self {
         let event = match kind.as_str() {
+            "compaction" => serde_json::from_str::<CompactionNotice>(&detail)
+                .ok()
+                .filter(CompactionNotice::valid)
+                .map(|notice| Self::Compaction {
+                    actor: actor.clone(),
+                    notice,
+                })
+                .unwrap_or_else(|| Self::Withheld { kind, actor }),
             "tool-observation" => serde_json::from_str::<ToolObservation>(&detail)
                 .ok()
                 .filter(ToolObservation::valid)

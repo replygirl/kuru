@@ -221,6 +221,15 @@ model window, compaction refuses before inference. A compaction request is
 accounted provider work. It retains every original history row and publishes a
 rolling summary only after its exact source revision and cursor still match.
 
+Each accepted automatic compaction shows a context-maintenance notice in the
+TUI, or on stderr for `kuru run`, identifying the actor, covered source range
+and summary identity. `/compact` reports the same checkpoint information for
+manual maintenance. Notices contain no private summary or history text; original
+records remain stored. A checkpoint accepted before cancellation still produces
+its notice. Candidate notices identify candidate work and do not imply promotion.
+Ctrl-C in `kuru run` cancels and settles the active operation before memory cleanup;
+confirmed compaction notices still reach stderr without a partial answer on stdout.
+
 After at most one eligible compaction attempt, older optional cross-session
 summaries and history can still be omitted as complete records to fit a request;
 the interface reports each actual omission count. The current session's rolling

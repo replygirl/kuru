@@ -30,7 +30,7 @@ pub use rpc::{ServiceCall, ServiceReply, ServiceRequest, ServiceResponse, Servic
 pub const PROTOCOL_MAJOR: u16 = 1;
 // Exact-ref recovery and session-provenance calls require this owner version.
 // Older owners reject the new client before a mutating frame.
-pub const PROTOCOL_MINOR: u16 = 9;
+pub const PROTOCOL_MINOR: u16 = 10;
 pub const HANDSHAKE_LIMIT: usize = 16 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest single accept wait before the serve loop re-verifies its owner
