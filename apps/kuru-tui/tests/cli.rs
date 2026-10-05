@@ -3650,7 +3650,7 @@ fn cli_open_is_unchanged_when_the_owner_cannot_publish_its_activity() {
     use kuru::memory_activity::OPENING;
     use kuru_memory::test_support::WRITE_FAILURE_ENV;
 
-    let env = Sandbox::fresh_cache();
+    let env = Sandbox::new();
     let output = env
         .command()
         .env(WRITE_FAILURE_ENV, "1")
