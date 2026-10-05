@@ -871,6 +871,7 @@ async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_h
                 input,
                 Some(notice),
                 crate::commands::Registry::default(),
+                None,
             )
             .await;
             let buffer = terminal.backend().buffer();
@@ -983,6 +984,7 @@ async fn failed_initial_tui_draw_never_marks_the_notice_shown() {
             input,
             Some(notice),
             crate::commands::Registry::default(),
+            None,
         )
         .await
         .unwrap_err();
@@ -1026,6 +1028,7 @@ async fn notice_text_never_reaches_the_provider_request_for_a_real_tui_turn() {
                 input,
                 Some(notice),
                 crate::commands::Registry::default(),
+                None,
             )
             .await
         });
@@ -1132,7 +1135,7 @@ async fn real_loop_eof_read_and_draw_failures_abort_the_owned_provider_before_re
 #[tokio::test]
 async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations() {
     kuru_memory::test_support::closing(async {
-        let (_directory, harness, _) = fixture().await;
+        let (_directory, harness, models) = fixture().await;
         let mut events = harness.subscribe();
         let harness = Arc::new(tokio::sync::Mutex::new(harness));
         let initial = {
@@ -1233,8 +1236,12 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
 
         seed_stale_runtime(&mut view);
         view.begin_operation();
+        let successful_selection = {
+            let mut harness = harness.lock().await;
+            dispatch(&mut harness, &models, "/mode freudian").await
+        };
         let outcome = apply_completion(
-            (5, Ok(DispatchOutcome::Command("Mode: freudian".into()))),
+            (5, successful_selection),
             5,
             &mut events,
             &mut view,
@@ -1249,6 +1256,7 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
             CompletionState::Settled { quit: false, .. }
         ));
         assert_eq!(view.status, "Complete");
+        assert_eq!(view.mode, "freudian");
         assert!(
             view.notice
                 .as_deref()
@@ -1259,8 +1267,12 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
 
         seed_stale_runtime(&mut view);
         view.begin_operation();
+        let refused_selection = {
+            let mut harness = harness.lock().await;
+            dispatch(&mut harness, &models, "/mode unknown").await
+        };
         let outcome = apply_completion(
-            (6, Err(anyhow::anyhow!("controlled dispatch failure"))),
+            (6, refused_selection),
             6,
             &mut events,
             &mut view,
@@ -1275,9 +1287,12 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
             CompletionState::Settled { quit: false, .. }
         ));
         assert_eq!(view.status, "Failed · details in conversation");
-        assert!(view.transcript.last().is_some_and(
-            |(role, text)| role == "error" && text.contains("controlled dispatch failure")
-        ));
+        assert_eq!(view.mode, "freudian");
+        assert!(
+            view.transcript
+                .last()
+                .is_some_and(|(role, text)| role == "error" && text.contains("unknown"))
+        );
         assert!(view.operation_start.is_none());
         assert_runtime_projection(&view, &harness).await;
 

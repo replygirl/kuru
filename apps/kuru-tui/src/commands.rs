@@ -13,6 +13,7 @@ pub(crate) const CANDIDATE_PAGE_LIMIT: usize = 16;
 pub(crate) enum CommandId {
     Clear,
     Compact,
+    Config,
     Cost,
     Dream,
     Effort,
@@ -72,6 +73,12 @@ pub(crate) const BUILT_INS: &[CommandSpec] = &[
         name: "/compact",
         usage: "/compact [ID]",
         summary: "Compact retained context for one or all active identities",
+    },
+    CommandSpec {
+        id: CommandId::Config,
+        name: "/config",
+        usage: "/config",
+        summary: "Inspect captured effective configuration and provenance",
     },
     CommandSpec {
         id: CommandId::Cost,
@@ -486,7 +493,7 @@ mod tests {
             assert!(help.contains(spec.usage));
             assert!(names_matching(spec.name).contains(&spec.name));
         }
-        for unavailable in ["/config", "/instruction-once", "/approval-always"] {
+        for unavailable in ["/instruction-once", "/approval-always"] {
             assert!(parse(unavailable).is_none());
             assert!(!names_matching(unavailable).contains(&unavailable));
         }
