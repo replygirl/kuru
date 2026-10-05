@@ -4,18 +4,31 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 
 ## Terminal keys
 
-| Key                                              | Action                                                       |
-| ------------------------------------------------ | ------------------------------------------------------------ |
-| <kbd>Enter</kbd>                                 | Send the input or select the highlighted picker item         |
-| <kbd>Alt</kbd>+<kbd>Enter</kbd>                  | Insert a newline                                             |
-| <kbd>F2</kbd>                                    | Choose a model                                               |
-| <kbd>F3</kbd>                                    | Choose reasoning effort                                      |
-| <kbd>F4</kbd>                                    | Choose a framework                                           |
-| Type or paste in a picker                        | Filter its choices                                           |
-| <kbd>Escape</kbd>                                | Close a picker or cancel active work                         |
-| <kbd>Ctrl</kbd>+<kbd>C</kbd>                     | Cancel work; quit while idle                                 |
-| <kbd>Page Up</kbd> / <kbd>Page Down</kbd>        | Scroll the transcript                                        |
-| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Cycle matching slash-command names before the first argument |
+| Key                                              | Action                                                                           |
+| ------------------------------------------------ | -------------------------------------------------------------------------------- |
+| <kbd>Enter</kbd>                                 | Send the input or select the highlighted picker item                             |
+| <kbd>Alt</kbd>+<kbd>Enter</kbd>                  | Insert a newline                                                                 |
+| <kbd>Left</kbd> / <kbd>Right</kbd>               | Move one displayed character (grapheme)                                          |
+| <kbd>Up</kbd> / <kbd>Down</kbd>                  | Move vertically; at the first/last line, browse this session's submitted prompts |
+| <kbd>Ctrl</kbd>+<kbd>R</kbd>                     | Search this session's in-memory submitted prompts; repeat to cycle matches       |
+| <kbd>Escape</kbd> during prompt search           | Restore the unsent draft                                                         |
+| <kbd>Ctrl</kbd>+<kbd>G</kbd> on a paste chip     | Expand or compact its display                                                    |
+| <kbd>Ctrl</kbd>+<kbd>X</kbd> on a paste chip     | Remove exactly the pasted text                                                   |
+| <kbd>F2</kbd>                                    | Choose a model                                                                   |
+| <kbd>F3</kbd>                                    | Choose reasoning effort                                                          |
+| <kbd>F4</kbd>                                    | Choose a framework                                                               |
+| Type or paste in a picker                        | Filter its choices                                                               |
+| <kbd>Escape</kbd>                                | Close a picker or cancel active work                                             |
+| <kbd>Ctrl</kbd>+<kbd>C</kbd>                     | Cancel work; quit while idle                                                     |
+| <kbd>Page Up</kbd> / <kbd>Page Down</kbd>        | Scroll the transcript                                                            |
+| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Cycle matching slash-command names before the first argument                     |
+
+Prompt history is bounded and held only in memory for the current run. It is
+separate from durable conversation history and is grouped by session. Pasted
+text larger than 512 bytes or containing at least three line breaks appears as
+a compact chip; expand it to inspect the text or remove the exact pasted span.
+The composer accepts at most 128 KiB of draft text. An oversized paste is
+rejected in full, leaving the draft unchanged.
 
 ## Slash commands
 

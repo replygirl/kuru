@@ -68,6 +68,7 @@ usage-argv = { version = "=6.12.0", features = ["complete"] }
 tempfile = "=3.27.0"
 url = "=2.5.8"
 unicode-width = "=0.2.2"
+unicode-segmentation = "=1.13.3"
 jsonschema = { version = "=0.58.5", default-features = false }
 cap-std = "=4.0.3"
 cap-fs-ext = "=4.0.3"

@@ -52,6 +52,7 @@ uuid.workspace = true
 
 sha2.workspace = true
 unicode-width.workspace = true
+unicode-segmentation.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
