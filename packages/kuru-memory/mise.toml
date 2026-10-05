@@ -1,5 +1,5 @@
 [vars]
-kuru_go_version = "1.26.2"
+kuru_go_version = "1.27.1"
 kuru_llvm_mingw_version = "20260922"
 # Capture the consumer target before the preparation task clears Cargo's target.
 kuru_memory_bundle_target = "{{env.CARGO_BUILD_TARGET | default(value='host')}}"

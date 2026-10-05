@@ -5,7 +5,7 @@ RUST_TEST_THREADS = "2"
 
 [tasks.setup]
 description = "Install only the pinned Rust components for platform package checks"
-run = "rustup component add rustfmt clippy llvm-tools-preview --toolchain 1.98.1"
+run = "rustup component add rustfmt clippy llvm-tools-preview --toolchain 1.99.0"
 
 [tasks."deps:lock"]
 description = "Resolve exact workspace dependency changes for the platform boundary"
@@ -13,7 +13,7 @@ run = "cargo generate-lockfile"
 
 [tasks."setup:windows"]
 description = "Install the pinned Windows standard library for cross-target type checking"
-run = "rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1"
+run = "rustup target add x86_64-pc-windows-msvc --toolchain 1.99.0"
 
 [tasks."typecheck:windows"]
 description = "Type-check Windows code; native behavior remains a Windows CI requirement"
@@ -25,7 +25,7 @@ run = "cargo clippy -p kuru-platform --target x86_64-pc-windows-msvc --all-targe
 
 [tasks."setup:windows-arm64"]
 description = "Install the pinned Windows on Arm standard library for cross-target type checking"
-run = "rustup target add aarch64-pc-windows-msvc --toolchain 1.98.1"
+run = "rustup target add aarch64-pc-windows-msvc --toolchain 1.99.0"
 
 [tasks."typecheck:windows-arm64"]
 description = "Type-check Windows on Arm code; native behavior remains a Windows on Arm CI requirement"

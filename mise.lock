@@ -3,59 +3,34 @@
 lockfile_version = 1
 
 [[tools."aqua:jdx/hk"]]
-version = "2.2.0"
+version = "2.5.0"
 backend = "aqua:jdx/hk"
-specifiers = ["2.2.0"]
+specifiers = ["2.5.0"]
 
 [tools."aqua:jdx/hk"."platforms.linux-arm64"]
-checksum = "sha256:8f6f86adae8d9b40ce47815af1b7a2f43a5b02d8abda7a831c8fcb9d5619e878"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-aarch64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/jdx/hk/releases/assets/587160956"
-
-[tools."aqua:jdx/hk"."platforms.linux-arm64-musl"]
-checksum = "sha256:7914940ab8ebbdfcda2a4315e9efbc419d1c65828d26be04310362649aa47162"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-aarch64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/jdx/hk/releases/assets/587160958"
+checksum = "sha256:c800091c414e1c8e8628137275d88c257bcfe0c35dd31d2762923a71dae7df7f"
+url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/jdx/hk/releases/assets/609776357"
 
 [tools."aqua:jdx/hk"."platforms.linux-x64"]
-checksum = "sha256:ffb90603d1aeb6c545ff64087372c136d46bb6d820164d63b352b1c189f40053"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-x86_64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/jdx/hk/releases/assets/587160975"
-
-[tools."aqua:jdx/hk"."platforms.linux-x64-baseline"]
-checksum = "sha256:ffb90603d1aeb6c545ff64087372c136d46bb6d820164d63b352b1c189f40053"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-x86_64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/jdx/hk/releases/assets/587160975"
-
-[tools."aqua:jdx/hk"."platforms.linux-x64-musl"]
-checksum = "sha256:bf359f72335b99c872d7de28ccdd51cea2e5311c9200414a2409d5bfcd06c595"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-x86_64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/jdx/hk/releases/assets/587160979"
-
-[tools."aqua:jdx/hk"."platforms.linux-x64-musl-baseline"]
-checksum = "sha256:bf359f72335b99c872d7de28ccdd51cea2e5311c9200414a2409d5bfcd06c595"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-x86_64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/jdx/hk/releases/assets/587160979"
+checksum = "sha256:449b83c35ac3a460f80a4c9a41ad99430add8cf6caa6ceadc27e810feac3647d"
+url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/jdx/hk/releases/assets/609776378"
 
 [tools."aqua:jdx/hk"."platforms.macos-arm64"]
-checksum = "sha256:82da7ae00554222568ea4115939e13fca640c2fae426ea828176b5b08ea45f68"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-aarch64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/jdx/hk/releases/assets/587160957"
+checksum = "sha256:fabbed3a44e72c601759fa81d56f3c9403ca466853bdf77e87cc69d986cb151a"
+url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/jdx/hk/releases/assets/609776358"
 
 [tools."aqua:jdx/hk"."platforms.windows-arm64"]
-checksum = "sha256:63d4f0263f18aff2099c14bb63b3c4398b044becab35fc8ca1f9b9d24f4777ed"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-aarch64-pc-windows-msvc.zip"
-url_api = "https://api.github.com/repos/jdx/hk/releases/assets/587160955"
+checksum = "sha256:159a5586ddd3519eb3d497b0537ec7c78eefccfcf5378b9599530ee0900707d1"
+url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-aarch64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/jdx/hk/releases/assets/609776360"
 
 [tools."aqua:jdx/hk"."platforms.windows-x64"]
-checksum = "sha256:f265c9cadfbb2ded37328f7248dc5879804b5e460746bab5039765ee0e23eaf2"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-x86_64-pc-windows-msvc.zip"
-url_api = "https://api.github.com/repos/jdx/hk/releases/assets/587160954"
-
-[tools."aqua:jdx/hk"."platforms.windows-x64-baseline"]
-checksum = "sha256:f265c9cadfbb2ded37328f7248dc5879804b5e460746bab5039765ee0e23eaf2"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-x86_64-pc-windows-msvc.zip"
-url_api = "https://api.github.com/repos/jdx/hk/releases/assets/587160954"
+checksum = "sha256:9d3063f0eadb316415dc2aaea51608f436eb6ffe44e00c2e460294c66f269a54"
+url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/jdx/hk/releases/assets/609776356"
 
 [[tools."aqua:koalaman/shellcheck"]]
 version = "0.11.0"
@@ -300,138 +275,79 @@ url = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-windows-x
 url_api = "https://api.github.com/repos/tamasfe/taplo/releases/assets/257323062"
 
 [[tools."github:aligned-team/cospec"]]
-version = "0.8.2"
+version = "0.8.3"
 backend = "github:aligned-team/cospec"
-specifiers = ["0.8.2"]
+specifiers = ["0.8.3"]
 
 [tools."github:aligned-team/cospec"."platforms.linux-arm64"]
-checksum = "sha256:1c28a151e9955a27076c6def53dfbdca643399ec8f45933f321e8a7fdf127b3b"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-linux-arm64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199686"
-provenance = "github-attestations"
-provenance_verified = true
-
-[tools."github:aligned-team/cospec"."platforms.linux-arm64-musl"]
-checksum = "sha256:67b3262251d0e51044ab172cfd00d284c6935cf3a0cf5bf4d0e489e05bab263e"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-linux-arm64-musl.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199690"
+checksum = "sha256:e4d2f83df241b904c3f0d7dbfdb6cc63cbfd67deec7670f6d03363745c177b61"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.3/cospec-0.8.3-linux-arm64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/598960262"
 provenance = "github-attestations"
 
 [tools."github:aligned-team/cospec"."platforms.linux-x64"]
-checksum = "sha256:ec14d37a5e18b4603d88427e0f892cf8e0ea0787e45ddc64aac636d9fef3e185"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-linux-x64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199687"
-provenance = "github-attestations"
-provenance_verified = true
-
-[tools."github:aligned-team/cospec"."platforms.linux-x64-baseline"]
-checksum = "sha256:ec14d37a5e18b4603d88427e0f892cf8e0ea0787e45ddc64aac636d9fef3e185"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-linux-x64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199687"
-provenance = "github-attestations"
-
-[tools."github:aligned-team/cospec"."platforms.linux-x64-musl"]
-checksum = "sha256:9d30b71a35fd9dc1b5bc3b77e422163461f4b9c404948d19da3bb55ada975bb9"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-linux-x64-musl.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199685"
-provenance = "github-attestations"
-
-[tools."github:aligned-team/cospec"."platforms.linux-x64-musl-baseline"]
-checksum = "sha256:9d30b71a35fd9dc1b5bc3b77e422163461f4b9c404948d19da3bb55ada975bb9"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-linux-x64-musl.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199685"
+checksum = "sha256:e7f4e05a3c1e8e9b1b04419c5ea612ca02e5dae3e56f1ed46285114d34febd96"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.3/cospec-0.8.3-linux-x64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/598960260"
 provenance = "github-attestations"
 
 [tools."github:aligned-team/cospec"."platforms.macos-arm64"]
-checksum = "sha256:cc1e73d0d5396566cb23c52095ed72378da57090c7532b4871e9d2717d6c907f"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-macos-arm64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199684"
+checksum = "sha256:73da67dce774ae97d2dff9939ede972eed8b276395feaa65f4253cc574564daf"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.3/cospec-0.8.3-macos-arm64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/598960259"
 provenance = "github-attestations"
-provenance_verified = true
 
 [tools."github:aligned-team/cospec"."platforms.windows-x64"]
-checksum = "sha256:13e900c386f17a4daa2a3d32e36659d6cdf0a1dbb79fec7bb41f49042d6d3c2f"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-windows-x64.zip"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199765"
-provenance = "github-attestations"
-provenance_verified = true
-
-[tools."github:aligned-team/cospec"."platforms.windows-x64-baseline"]
-checksum = "sha256:13e900c386f17a4daa2a3d32e36659d6cdf0a1dbb79fec7bb41f49042d6d3c2f"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-windows-x64.zip"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199765"
+checksum = "sha256:d4f1ceaa35e1444b66bab5869fa243b85c86dd9ce8a9b4097be936bc392247b3"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.3/cospec-0.8.3-windows-x64.zip"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/598960345"
 provenance = "github-attestations"
 
 [[tools."github:aligned-team/cospec"]]
-version = "0.8.2"
+version = "0.8.3"
 backend = "github:aligned-team/cospec"
-specifiers = ["0.8.2"]
+specifiers = ["0.8.3"]
 
 [tools."github:aligned-team/cospec".options]
 asset_pattern = "cospec-*-windows-x64.zip"
 
 [tools."github:aligned-team/cospec"."platforms.windows-arm64"]
-checksum = "sha256:13e900c386f17a4daa2a3d32e36659d6cdf0a1dbb79fec7bb41f49042d6d3c2f"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.8.2/cospec-0.8.2-windows-x64.zip"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/584199765"
+checksum = "sha256:d4f1ceaa35e1444b66bab5869fa243b85c86dd9ce8a9b4097be936bc392247b3"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.8.3/cospec-0.8.3-windows-x64.zip"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/598960345"
 provenance = "github-attestations"
 
 [[tools.mr-boxington]]
-version = "1.18.0"
+version = "1.22.0"
 backend = "packslip:github.com/jdx/mr-boxington"
-specifiers = ["1.18.0"]
+specifiers = ["1.22.0"]
 
 [tools.mr-boxington."platforms.linux-arm64"]
-checksum = "sha256:ab0f4af3e98295bc35f448d453cfe15931bb02342d48163b2ede94583f937cdc"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-aarch64-unknown-linux-gnu.tar.gz"
-signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
-
-[tools.mr-boxington."platforms.linux-arm64-musl"]
-checksum = "sha256:3df879fdd6ea854b0c06a19eb345e735617fcda50b05814a1eaf4ea211120672"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-aarch64-unknown-linux-musl.tar.gz"
+checksum = "sha256:b7a23503d9efcb31941e1e68b78f8b33643a056f22d39cff745dab6f17edb652"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.22.0/mbx-aarch64-unknown-linux-gnu.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.linux-x64"]
-checksum = "sha256:92833c87261ea0c65fee52898ea67605b152b516fc0a3d8dee5a276601a8924c"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-x86_64-unknown-linux-gnu.tar.gz"
-signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
-
-[tools.mr-boxington."platforms.linux-x64-baseline"]
-checksum = "sha256:92833c87261ea0c65fee52898ea67605b152b516fc0a3d8dee5a276601a8924c"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-x86_64-unknown-linux-gnu.tar.gz"
-signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
-
-[tools.mr-boxington."platforms.linux-x64-musl"]
-checksum = "sha256:ef52bb50f593f749d513d98cb222d72006bfac743d11a5431b4494ed2bb128f3"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-x86_64-unknown-linux-musl.tar.gz"
-signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
-
-[tools.mr-boxington."platforms.linux-x64-musl-baseline"]
-checksum = "sha256:ef52bb50f593f749d513d98cb222d72006bfac743d11a5431b4494ed2bb128f3"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-x86_64-unknown-linux-musl.tar.gz"
+checksum = "sha256:eb3e8c74277dcc8314227ba2cd32ef00a9a362ec8a90cd06ef6580eb48a6b375"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.22.0/mbx-x86_64-unknown-linux-gnu.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.macos-arm64"]
-checksum = "sha256:70ab23933b3745205125174120bd930c0116c1ef3ac38786122e5651636b9aea"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-aarch64-apple-darwin.tar.gz"
+checksum = "sha256:e548b5758498cf822a180b6328597e6aded8fe9bb3046cd918399172ae30dde2"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.22.0/mbx-aarch64-apple-darwin.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.windows-arm64"]
-checksum = "sha256:1208ec2f61af53d76c892c1ad4603294f49e62ad4c50ad1f8401aa5f3567b1b8"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-aarch64-pc-windows-msvc.zip"
+checksum = "sha256:8f7a16340f69cebe1110f30c123fc8bccb32c9025f343b83d26c49137143da5f"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.22.0/mbx-aarch64-pc-windows-msvc.zip"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.windows-x64"]
-checksum = "sha256:6f3e761a18946b7d17ab54d4021773144ff7b9203b99b2df1ccddbebed6e1828"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-x86_64-pc-windows-msvc.zip"
-signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
-
-[tools.mr-boxington."platforms.windows-x64-baseline"]
-checksum = "sha256:6f3e761a18946b7d17ab54d4021773144ff7b9203b99b2df1ccddbebed6e1828"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.18.0/mbx-x86_64-pc-windows-msvc.zip"
+checksum = "sha256:09500d06c0230b9cda1e051c5795b08804d93fbbcb41ba8e18c1f56454b80e00"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.22.0/mbx-x86_64-pc-windows-msvc.zip"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [[tools.rust]]
-version = "1.98.1"
+version = "1.99.0"
 backend = "core:rust"
-specifiers = ["1.98.1"]
+specifiers = ["1.99.0"]

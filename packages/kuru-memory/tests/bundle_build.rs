@@ -405,7 +405,7 @@ fn committed_manifest_is_schema_two_with_one_pinned_built_entry() {
     let build = asset.build.as_ref().unwrap();
     assert_eq!(build.host, "linux-x64");
     assert_eq!(build.sources.icu.version, "78.3");
-    assert_eq!(build.toolchain.go.version, "go1.26.2");
+    assert_eq!(build.toolchain.go.version, "go1.27.1");
     assert_eq!(build.toolchain.llvm_mingw.version, "20260922");
     let names: Vec<_> = asset.notices().iter().map(|notice| &*notice.name).collect();
     assert_eq!(
@@ -605,7 +605,7 @@ fn schema_two_provenance_build_and_notice_rules_fail_closed() {
             with(
                 &valid,
                 "/assets/4/build/toolchain/go/version",
-                json!("1.26.2"),
+                json!("1.27.1"),
             ),
             "invalid Go toolchain pin",
         ),

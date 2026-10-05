@@ -1,22 +1,16 @@
 # Development
 
-Install pinned tooling with `mise install`, then run `mise run setup`. Rust 1.98.1
+Install pinned tooling with `mise install`, then run `mise run setup`. Rust 1.99.0
 is declared in both mise and rust-toolchain.toml. Cargo.lock pins runtime
 transitives. The [dependency audit](dependencies.md) records latest stable
 versions and the exact upstream constraints on transitive updates. mise.lock contains platform-specific tool URLs and checksums.
 Cospec is a standalone executable with embedded OpenSpec. Its validate/apply
 JSON and managed-file checks run without a project OpenSpec dependency. The
-pinned 0.8.2 release still needs the compatibility fix for its embedded
-OpenSpec 1.13.1 bundle: duplicate entrypoint execution makes the unpatched
-instructions command fail to return one JSON document. The cospec mise task scopes a small
-[compatibility preload](../packages/kuru-delivery/support/cospec-preload.cjs) to
-that exact bundle hash using cospec's own runtime. It preserves command arguments
-and the original gate; standalone contract tests cover clear, hard-blocked,
-soft-blocked and missing-artifact outcomes. Remove the preload only after an
-upstream release fixes vendoring and passes those tests without it. The 0.8.x
-OpenSpec 1.13.1 update and archive-gate corrections do not satisfy that removal
-condition; without the preload, 0.8.2's apply gate cannot parse the embedded
-instructions output.
+pinned 0.8.3 release fixes duplicate execution of its embedded OpenSpec 1.13.1
+entrypoint. Its standalone contract passes without the former compatibility
+preload: clear, hard-blocked, soft-blocked and missing-artifact outcomes return
+one JSON document with their required exit codes. No project OpenSpec or
+external Bun installation is needed.
 
 The architecture follows this order: apps/ and packages/ ownership, mise
 monorepo tasks, Rust, then other tools. Every app/package owns a mise.toml;
@@ -39,7 +33,7 @@ repair only that cache with `mise -C apps/kuru-docs install --force npm`.
 The delivery package activates Cocogitto and Communiqué only for its tests,
 combined coverage and release tasks. Its `setup` task preinstalls those tools
 with mise's `--include-task-tools` option; lean CI jobs use `setup:test-tools`
-to install only those two exact package-owned pins. Communiqué 1.4.2 provides Linux x86_64
+to install only those two exact package-owned pins. Communiqué 1.5.0 provides Linux x86_64
 and arm64, macOS arm64 and Windows x86_64 and arm64 binaries, which cover every supported
 platform for the full maintainer gate.
 
@@ -96,8 +90,8 @@ mapped and the most covered lines of any of its instantiations. Summed profiles
 cannot be recombined from per-file LCOV, so each partition also writes
 `coverage-lines.json`: every instantiation's source file, name, group location
 and mapped and covered lines, derived from its full `llvm-cov export` JSON with
-a port of llvm-cov's line statistics (LLVM 22.1.8, the pinned toolchain's
-`llvm-tools`). Before its receipt is written the partition runs
+a port of llvm-cov's line statistics (originally ported from LLVM 22.1.8; Rust 1.99's installed
+`llvm-tools` reports LLVM 23.1.1). Before its receipt is written the partition runs
 cargo-llvm-cov's `--json --summary-only` report over the same profiles and
 requires the export to reproduce it exactly, per file and in total; a mismatch
 fails the partition, names the first mismatching files and keeps the summary in
@@ -262,8 +256,8 @@ and completeness on Ubuntu without LCOV or a threshold. Their receipts record
 gate, which x64, macOS and Ubuntu keep enforcing. Instrumented Windows on Arm
 partitions are held until a pinned Rust toolchain carries the fix for
 [rust-lang/rust#150123](https://github.com/rust-lang/rust/issues/150123), whose
-`llvm-profdata merge` failure on `aarch64-pc-windows-msvc` the pinned 1.98.1
-reproduces; `coverage::PARTITIONS` rejects an instrumented `windows-11-arm` set.
+`llvm-profdata merge` failure on `aarch64-pc-windows-msvc` the previous 1.98.1 toolchain
+reproduced; `coverage::PARTITIONS` rejects an instrumented `windows-11-arm` set.
 `native-platform` is a two-leg matrix: the x64 leg keeps
 `//packages/kuru-platform:coverage` and its 90% gate, and the arm64 leg,
 `Native platform behavior (aarch64-pc-windows-msvc)`, runs
@@ -317,32 +311,32 @@ behind the platform, not a timeout.
 
 ## Commands
 
-| Command | What it checks or runs |
-| --- | --- |
-| `mise run build` | Locked debug workspace build |
-| `mise run build:release` | Optimized release build |
-| `mise run run -- --provider demo` | Interactive offline harness |
-| `mise run format:fix` | Rust, TOML and documentation formatting |
-| `mise run format:check` | Rust, TOML and documentation formatting |
-| `mise run lint` | All-target Clippy with warnings as errors |
-| `mise run lint:windows` | The same Clippy for `x86_64-pc-windows-msvc`, so `cfg(windows)` code is linted ([details](#lint-configuration-and-windows-target-lint)) |
-| `mise run typecheck` | Rust compilation checks for all targets/features on the host |
-| `mise run test` | Workspace behavioral and protocol tests |
-| `mise run coverage` | Run the behavioral suite under LLVM instrumentation, minimum 90% workspace line coverage |
-| `mise run test:install` | Native archive tests and, on macOS/Linux, real Bash bootstrap tests |
-| `mise run //packages/kuru-delivery:test` | Delivery contracts, including native PowerShell bootstrap/update fixtures on Windows |
-| `mise run //packages/kuru-delivery:coverage:shard` | One fail-closed CI coverage partition, configured by `KURU_COVERAGE_*` ([by hand](#running-a-coverage-partition-by-hand)) |
-| `mise run //packages/kuru-delivery:coverage:merge` | Require agreeing receipts from every partition of one OS and, when instrumented, enforce the 90% gate by cargo-llvm-cov's line metric over its partitions' line exports |
-| `mise run //packages/kuru-delivery:test:partition` | One uninstrumented checked partition of the `KURU_COVERAGE_PACKAGES` test suite (CI arm64 memory) |
-| `mise run //apps/kuru-tui:test:embedded-runtime` | Package, install, update and reopen actual Kuru with cold offline memory |
-| `mise run //packages/kuru-delivery:test:previous-release-update` | [Previous published release's updater](release.md#previous-release-update-acceptance) installs `KURU_UPDATE_CANDIDATE_BINARY`; optional `GITHUB_TOKEN` |
-| `mise run lint:tooling` | Shell, GitHub Actions and metadata validation |
-| `mise run docs:dev` | Local VitePress server |
-| `mise run docs:check` | Docs formatting/lint, production build, local links, anchors and public content boundary |
-| `mise run release:version` | Conventional-commit version calculation without publication |
-| `mise run cospec:validate` | Strict validation of changes and durable specs |
-| `mise run cospec:managed:check` | Generated cospec-file drift |
-| `mise run check` | Optional local aggregate of independently schedulable quality checks |
+| Command                                                          | What it checks or runs                                                                                                                                                  |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mise run build`                                                 | Locked debug workspace build                                                                                                                                            |
+| `mise run build:release`                                         | Optimized release build                                                                                                                                                 |
+| `mise run run -- --provider demo`                                | Interactive offline harness                                                                                                                                             |
+| `mise run format:fix`                                            | Rust, TOML and documentation formatting                                                                                                                                 |
+| `mise run format:check`                                          | Rust, TOML and documentation formatting                                                                                                                                 |
+| `mise run lint`                                                  | All-target Clippy with warnings as errors                                                                                                                               |
+| `mise run lint:windows`                                          | The same Clippy for `x86_64-pc-windows-msvc`, so `cfg(windows)` code is linted ([details](#lint-configuration-and-windows-target-lint))                                 |
+| `mise run typecheck`                                             | Rust compilation checks for all targets/features on the host                                                                                                            |
+| `mise run test`                                                  | Workspace behavioral and protocol tests                                                                                                                                 |
+| `mise run coverage`                                              | Run the behavioral suite under LLVM instrumentation, minimum 90% workspace line coverage                                                                                |
+| `mise run test:install`                                          | Native archive tests and, on macOS/Linux, real Bash bootstrap tests                                                                                                     |
+| `mise run //packages/kuru-delivery:test`                         | Delivery contracts, including native PowerShell bootstrap/update fixtures on Windows                                                                                    |
+| `mise run //packages/kuru-delivery:coverage:shard`               | One fail-closed CI coverage partition, configured by `KURU_COVERAGE_*` ([by hand](#running-a-coverage-partition-by-hand))                                               |
+| `mise run //packages/kuru-delivery:coverage:merge`               | Require agreeing receipts from every partition of one OS and, when instrumented, enforce the 90% gate by cargo-llvm-cov's line metric over its partitions' line exports |
+| `mise run //packages/kuru-delivery:test:partition`               | One uninstrumented checked partition of the `KURU_COVERAGE_PACKAGES` test suite (CI arm64 memory)                                                                       |
+| `mise run //apps/kuru-tui:test:embedded-runtime`                 | Package, install, update and reopen actual Kuru with cold offline memory                                                                                                |
+| `mise run //packages/kuru-delivery:test:previous-release-update` | [Previous published release's updater](release.md#previous-release-update-acceptance) installs `KURU_UPDATE_CANDIDATE_BINARY`; optional `GITHUB_TOKEN`                  |
+| `mise run lint:tooling`                                          | Shell, GitHub Actions and metadata validation                                                                                                                           |
+| `mise run docs:dev`                                              | Local VitePress server                                                                                                                                                  |
+| `mise run docs:check`                                            | Docs formatting/lint, production build, local links, anchors and public content boundary                                                                                |
+| `mise run release:version`                                       | Conventional-commit version calculation without publication                                                                                                             |
+| `mise run cospec:validate`                                       | Strict validation of changes and durable specs                                                                                                                          |
+| `mise run cospec:managed:check`                                  | Generated cospec-file drift                                                                                                                                             |
+| `mise run check`                                                 | Optional local aggregate of independently schedulable quality checks                                                                                                    |
 
 Choose individual commands for focused work. To request several independent
 checks together, use mise's task separator, for example
@@ -636,18 +630,18 @@ and written only on evidence this process observed itself:
   acceptance fixture, which join their cleanup threads, need no outer
   backstop. The close budget's expiry
   (`managed owner did not release its lock within its close budget of 32s;
-  <N>ms since the first retirement request found it closing (<reading>);
-  <owner state>; <trace>`) and the asking phase's expiry (`managed owner
-  retirement asking phase: no request found the owner closing within the
-  maintenance request budget (32s; <N>ms since the first request); <owner
-  state>; <trace>; active-client refusals=<R>`, also for an attempt failing at
+<N>ms since the first retirement request found it closing (<reading>);
+<owner state>; <trace>`) and the asking phase's expiry (`managed owner
+retirement asking phase: no request found the owner closing within the
+maintenance request budget (32s; <N>ms since the first request); <owner
+state>; <trace>; active-client refusals=<R>`, also for an attempt failing at
   that budget) both name the state of the owner they waited
   behind, read at expiry from that owner's records without taking a lock:
   `owner published` (endpoint record present), `owner still opening; last
-  stage = X; no endpoint record present` (an open-activity record
+stage = X; no endpoint record present` (an open-activity record
   and no endpoint record: it has not published), `owner open failed ...;
-  reason = ...` (a failing record), or `owner closing; last phase = endpoint
-  and activity records retired` (its store close, Dolt reap or lock release
+reason = ...` (a failing record), or `owner closing; last phase = endpoint
+and activity records retired` (its store close, Dolt reap or lock release
   outstanding). A served owner reads as opening only between its two record
   retirements (a close stalled exactly there is asked until the maintenance
   request budget and reported as opening), and an owner without a starter token, or
@@ -1199,23 +1193,25 @@ timelines, owner logs and ageing logs are uploaded as
 `ci-usage-scan-attempt-<n>` on any outcome.
 
 **The fixture is aged in-job on every run and never cached.**
+
 - **Rule.** The fixture may occupy the repository's shared Actions cache
   only if, after `CALL DOLT_GC()` on each store, both stores together stay
   under about 1 GB on disk.
 - **Measured (2026-10-01).** On macOS arm64, freshly aged stores measured
   with `du -sk data-<n>/memory`:
 
-  | Stores | Before GC | After `DOLT_GC()` | After `DOLT_GC('--full')` |
-  | --- | --- | --- | --- |
-  | 1k | 259,908 KiB | 222,420 KiB | 209,212 KiB |
-  | 5k | 1,450,004 KiB | 1,425,852 KiB | 1,366,200 KiB |
-  | Total | 1.63 GiB | 1.57 GiB (1.69 GB) | 1.50 GiB |
+  | Stores | Before GC     | After `DOLT_GC()`  | After `DOLT_GC('--full')` |
+  | ------ | ------------- | ------------------ | ------------------------- |
+  | 1k     | 259,908 KiB   | 222,420 KiB        | 209,212 KiB               |
+  | 5k     | 1,450,004 KiB | 1,425,852 KiB      | 1,366,200 KiB             |
+  | Total  | 1.63 GiB      | 1.57 GiB (1.69 GB) | 1.50 GiB                  |
 
   Almost all of it is live history in `noms/oldgen`. The engine already runs
   with automatic GC, so a manual GC reclaims only 2 to 4%. Before GC, the
   ubuntu-latest stores are larger still: 335 to 340 MB at 1k and 2.1 GB at
   5k. The total is over the budget, so the job keeps no cache entry for the
   fixture.
+
 - **Stored size.** The one entry `main` saved before this decision held the
   pre-GC Ubuntu fixture in 495,129,806 bytes, compressed. At the time, the
   repository's caches held 63.79 GB in 490 entries; before that save,
@@ -1287,9 +1283,9 @@ separate from deterministic fixture tests and must be reported accurately.
 ## Lint configuration and Windows-target lint
 
 The root `clippy.toml` is the workspace's only Clippy configuration. Clippy
-1.98.1 searches `CLIPPY_CONF_DIR`, else the package directory, and walks up to
+1.99.0 searches `CLIPPY_CONF_DIR`, else the package directory, and walks up to
 the first directory holding `clippy.toml` or `.clippy.toml`
-([Clippy 1.98.1 configuration](https://github.com/rust-lang/rust/blob/1.98.1/src/tools/clippy/book/src/configuration.md)).
+([Clippy 1.99.0 configuration](https://github.com/rust-lang/rust/blob/1.99.0/src/tools/clippy/book/src/configuration.md)).
 A package-level file would therefore replace the root file and drop its bans.
 
 The file bans methods through
@@ -1344,7 +1340,7 @@ never sees them. Every package with such code owns a `lint:windows` task. It
 runs Clippy for `x86_64-pc-windows-msvc` with warnings as errors, and the root
 `lint:windows` aggregates those tasks. Install the target first with
 `mise run setup`, or with
-`rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1`.
+`rustup target add x86_64-pc-windows-msvc --toolchain 1.99.0`.
 
 Off Windows, the tasks point `CC_x86_64_pc_windows_msvc` and
 `AR_x86_64_pc_windows_msvc` at stand-ins in `packages/kuru-delivery/support`.
@@ -1674,14 +1670,14 @@ none it is report only, and setting some but not all is an error before
 anything is measured. The gate applies to the main series only (file
 observation and retirement waits on). `ci.yml` sets, in the job's `env`:
 
-| variable | CI value | checks |
-|---|---|---|
-| `KURU_OPEN_TIME_EXPECT_FIRST_LAUNCH_STARTS` | `3` | engine starts of every `first-launch` run |
-| `KURU_OPEN_TIME_EXPECT_COLD_EXISTING_STARTS` | `1` | engine starts of every `cold-existing` run |
-| `KURU_OPEN_TIME_EXPECT_WARM_REOPEN_STARTS` | `attached=0,spawned-owner=1` | engine starts of every `warm-reopen` run, keyed on its owner path; a path not listed fails |
-| `KURU_OPEN_TIME_EXPECT_NEW_PROJECT_STARTS` | `2` | engine starts of every `new-project` run |
-| `KURU_OPEN_TIME_BUDGET_NEW_PROJECT_MS` | `890` | median `new-project` open to ready |
-| `KURU_OPEN_TIME_BUDGET_COLD_EXISTING_MS` | `585` | median `cold-existing` open to ready |
+| variable                                     | CI value                     | checks                                                                                     |
+| -------------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------ |
+| `KURU_OPEN_TIME_EXPECT_FIRST_LAUNCH_STARTS`  | `3`                          | engine starts of every `first-launch` run                                                  |
+| `KURU_OPEN_TIME_EXPECT_COLD_EXISTING_STARTS` | `1`                          | engine starts of every `cold-existing` run                                                 |
+| `KURU_OPEN_TIME_EXPECT_WARM_REOPEN_STARTS`   | `attached=0,spawned-owner=1` | engine starts of every `warm-reopen` run, keyed on its owner path; a path not listed fails |
+| `KURU_OPEN_TIME_EXPECT_NEW_PROJECT_STARTS`   | `2`                          | engine starts of every `new-project` run                                                   |
+| `KURU_OPEN_TIME_BUDGET_NEW_PROJECT_MS`       | `890`                        | median `new-project` open to ready                                                         |
+| `KURU_OPEN_TIME_BUDGET_COLD_EXISTING_MS`     | `585`                        | median `cold-existing` open to ready                                                       |
 
 The checks run in order. First, over every case: the case has runs, every run
 opened (a readiness signal), and every run's engine starts equal its
@@ -2184,6 +2180,7 @@ statement or operation it serves, never by a shorter window of its own:
   it. Past the client's wait, the outcome query (see
   [memory service protocol](#memory-service-protocol)) and the uncertain-write
   fence recover the write's outcome.
+
 - **Creation budget.** A pool created after memory is open (a candidate's or
   other branch's pool) runs its first acquisition, its first connection's
   return and identity verification under one `QUERY_TIMEOUT` budget, nested
@@ -2252,7 +2249,7 @@ The diagnostic contains no SQL text, credentials, endpoints or paths. Where it
 appears in an error chain:
 
 - **Statement budget.** A `pool::BudgetElapsed` (`memory statement budget of
-  0.500 s elapsed while acquiring a pool session`) whose source is the
+0.500 s elapsed while acquiring a pool session`) whose source is the
   diagnostic. SQLx did not time out, so its `PoolTimedOut` is not in the
   chain.
 - **Pool ceiling, through the pool's own `acquire`.** Context over SQLx's
@@ -2337,11 +2334,11 @@ rebases, takes the next minor and regenerates.
 `CLAUDE.md` imports it using `@AGENTS.md`, so instructions are maintained once.
 Cospec generates the same change workflow for the supported assistants:
 
-| Assistant | Generated workflows |
-| --- | --- |
-| Claude Code | `.claude/commands/cospec/` and `.claude/skills/cospec-*/SKILL.md` |
-| Codex | `.agents/skills/cospec-*/SKILL.md` and `.codex/rules/cospec.rules` |
-| OpenCode | `.opencode/commands/cospec-*.md` and `.opencode/skills/cospec-*/SKILL.md` |
+| Assistant   | Generated workflows                                                       |
+| ----------- | ------------------------------------------------------------------------- |
+| Claude Code | `.claude/commands/cospec/` and `.claude/skills/cospec-*/SKILL.md`         |
+| Codex       | `.agents/skills/cospec-*/SKILL.md` and `.codex/rules/cospec.rules`        |
+| OpenCode    | `.opencode/commands/cospec-*.md` and `.opencode/skills/cospec-*/SKILL.md` |
 
 To regenerate these integrations while preserving Kuru's existing mise/hk gate:
 

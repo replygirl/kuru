@@ -16,11 +16,11 @@ write** and the automatically included **Metadata: read** permission. Disable
 webhooks, request no organization or account permissions, and install the app
 only on `replygirl/kuru`. Configure these repository Actions values:
 
-| Name | Kind | Purpose |
-| --- | --- | --- |
-| `RELEASE_APP_ID` | Variable | Numeric ID of the dedicated app |
-| `RELEASE_APP_PRIVATE_KEY` | Secret | App key used to mint a short-lived installation token |
-| `ANTHROPIC_API_KEY_COMMUNIQUE` | Secret | Dedicated API key used only by release-notes generation |
+| Name                           | Kind     | Purpose                                                 |
+| ------------------------------ | -------- | ------------------------------------------------------- |
+| `RELEASE_APP_ID`               | Variable | Numeric ID of the dedicated app                         |
+| `RELEASE_APP_PRIVATE_KEY`      | Secret   | App key used to mint a short-lived installation token   |
+| `ANTHROPIC_API_KEY_COMMUNIQUE` | Secret   | Dedicated API key used only by release-notes generation |
 
 The notes step exposes the scoped Anthropic secret to Communiqué as
 `OPENAI_API_KEY` for its OpenAI-compatible wire adapter, which calls Anthropic.
@@ -42,7 +42,7 @@ The build job has `contents: read` and `pages: read`; only the deploy job receiv
 `pages: write` and `id-token: write`. There is no standalone Pages workflow.
 
 Release notes run on Ubuntu with the delivery package's task-scoped Cocogitto
-7.0.0 and Communiqué 1.4.2 pins. Native archive build jobs use only the Rust
+7.0.0 and Communiqué 1.5.0 pins. Native archive build jobs use only the Rust
 packaging task and do not need the notes toolchain. Full maintainer tests and notes generation run on
 Linux, Apple Silicon macOS or Windows x86_64. App installation does not require these tools.
 
@@ -51,12 +51,12 @@ Linux, Apple Silicon macOS or Windows x86_64. App installation does not require 
 After the change is reviewed, merged, and main's checks are green, open Actions →
 Release → Run workflow, select `main`, and choose:
 
-| Bump | Behavior |
-| --- | --- |
-| `auto` | Derive the version from conventional commits since the last release |
-| `major` | Explicitly advance the major version |
-| `minor` | Advance the minor version |
-| `patch` | Advance the patch version |
+| Bump    | Behavior                                                            |
+| ------- | ------------------------------------------------------------------- |
+| `auto`  | Derive the version from conventional commits since the last release |
+| `major` | Explicitly advance the major version                                |
+| `minor` | Advance the minor version                                           |
+| `patch` | Advance the patch version                                           |
 
 The repository's `cog.toml` makes `feat` a minor bump and other recognized
 conventional types a patch bump. Breaking changes advance the major version
@@ -374,14 +374,14 @@ gets no new "protocol is incompatible" refusal.
   executable from before that change (a downgrade under a running client)
   rejects its format 1 record, so it never sees progress and gives up one
   `startup_timeout_secs` after spawn with `memory service readiness deadline
-  exceeded`. It still reports an owner exit at once, but it cannot observe that
+exceeded`. It still reports an owner exit at once, but it cannot observe that
   owner's retirement or a failing open, so those end only at the owner's exit
   or the timeout.
 
 ## Notes model and configuration
 
 `communique.toml` uses top-level `context` and `system_extra` plus `[defaults]`.
-The pinned tool is Communiqué 1.4.2. It uses `claude-sonnet-5` through
+The pinned tool is Communiqué 1.5.0. It uses `claude-sonnet-5` through
 Anthropic's official OpenAI-compatible endpoint. `provider = "openai"` selects
 the wire format; requests go directly to `https://api.anthropic.com/v1`, and the
 model and credentials remain Anthropic's. Only the notes step maps the existing
@@ -414,8 +414,8 @@ the selected source, including defaults, provider identities and configuration
 persistence. A successful notes job is not evidence that every claim is accurate.
 
 Upstream contracts: [Cocogitto versioning](https://docs.cocogitto.io/guide/bump.html),
-[Communiqué configuration](https://github.com/jdx/communique/blob/v1.4.2/src/config.rs),
-[Communiqué OpenAI adapter](https://github.com/jdx/communique/blob/v1.4.2/src/providers/openai.rs),
+[Communiqué configuration](https://github.com/jdx/communique/blob/v1.5.0/src/config.rs),
+[Communiqué OpenAI adapter](https://github.com/jdx/communique/blob/v1.5.0/src/providers/openai.rs),
 [Anthropic API compatibility](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk),
 [Claude Sonnet 5 response changes](https://platform.claude.com/docs/en/models/sonnet-5/whats-new-sonnet-5).
 

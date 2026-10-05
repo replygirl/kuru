@@ -130,7 +130,7 @@ jobs:
         run: time cospec --version
       - name: Install coverage components
         if: env.KURU_NATIVE_MODE == 'instrumented'
-        run: rustup component add llvm-tools-preview --toolchain 1.98.1
+        run: rustup component add llvm-tools-preview --toolchain 1.99.0
       - name: Install package-owned test tools
         run: mise run //packages/kuru-delivery:setup:test-tools
       - name: Install Ubuntu native secret-store fixture tools

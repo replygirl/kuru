@@ -507,7 +507,7 @@ impl Writes {
         #[cfg(test)]
         if let Some(failures) = &self.failures
             && failures
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |left| left.checked_sub(1),
