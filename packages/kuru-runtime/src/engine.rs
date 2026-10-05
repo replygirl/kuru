@@ -3067,6 +3067,9 @@ impl Harness {
     }
 
     async fn publish_recovered_dream(&mut self, report: &crate::dream::DreamReport) -> Result<()> {
+        // Typed promotion recovery may have retired the old generation. Use
+        // its checked successor before publishing or reading shared state.
+        self.rebind_main_if_retired().await?;
         self.publish_pending();
         self.report_inventory = None;
         self.refresh_topology_for_turn().await?;
