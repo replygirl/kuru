@@ -329,8 +329,27 @@ expectations and writes its complete batch in one transaction; a stale
 expectation changes no values, messages, receipts or revisions. Dream writes
 advance only their candidate's versions until exact promotion. Historical views
 retain their schema; older binaries refuse a schema they do not understand.
-This storage primitive does not enable concurrent conversation admission or
-change the runtime's existing topology representation.
+Concurrent conversation admission remains gated by the conversation-driver lease.
+
+Schema 10 separates each mode's membership from its identity reports. Membership
+changes compare the loaded row version before publishing; a report replaces only
+that identity's last report. Focus belongs to the session row, so another session's
+checkpoint cannot replace it. Dreams change membership on their candidate, and
+undo adds a compensating membership revision without rewriting reports or session
+state. Retired identities and their reports remain
+available for inspection.
+
+The upgrade reads the latest legacy topology inside its staged migration and
+materializes membership and every report, including extra report identities. It
+keeps the original topology bytes unchanged. Malformed input or a conflicting
+destination refuses the whole upgrade. Legacy project-wide focus is not assigned
+to a session. Historical candidates retain their schema.
+
+Complete topology reads use one captured committed revision. Small reads use a
+bounded versioned batch; larger inventories use bounded pages from an immutable
+read cut. Updates between pages cannot mix revisions, and closing a cut releases
+only its own reader. Page bounds do not limit the number of retained identities;
+individual larger records remain subject to the existing service envelope.
 
 Writable opens apply compatible Dolt schema upgrades in order before making a
 store available. Each step is built on an isolated internal branch and reaches
@@ -404,7 +423,7 @@ happens, a read-only command on the project, such as inspection or export,
 fails with `memory schema version 7 requires writable upgrade to 8`.
 This is the same refusal every pending schema step produces, and it changes
 nothing. Projects created from the store template after the update start at
-schema 9 with their publication records and state versions.
+schema 10 with their publication records, state versions and split topology storage.
 
 The SQL schema version is independent from the format-1 `ready.json` activation
 record, the database identity record, and the supervisor protocol. An old dream
@@ -496,7 +515,7 @@ template format, the pinned engine version and this platform's engine digest,
 the schema versions and every schema step, the format of the migration
 publication records, and the statements and settings that create a store. A
 release that changes any of them uses a new key and builds a new template once;
-old templates stay, as old engine versions do. The release that adds schema 9
+old templates stay, as old engine versions do. The release that adds schema 10
 is one of these: the first new project after updating builds the template
 once, running every schema step once.
 Nothing removes a template or its lock file during ordinary use.

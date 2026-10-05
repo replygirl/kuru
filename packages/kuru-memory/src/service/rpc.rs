@@ -34,7 +34,7 @@ use crate::{
 
 // JSON can escape a valid 16 MiB typed message by up to six times. Keep the
 // frame bounded while leaving the existing message limit representable.
-const OPERATION_FRAME_LIMIT: usize = 100 * 1024 * 1024;
+pub(crate) const OPERATION_FRAME_LIMIT: usize = 100 * 1024 * 1024;
 pub(crate) const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
 pub(super) const FRAME_BUDGET_MIB: usize = 128;
 const MIB: usize = 1024 * 1024;
@@ -146,6 +146,28 @@ pub enum ServiceCall {
         handle: Uuid,
         cursor: Option<ExportCursor>,
     },
+    BeginStateReadCut {
+        candidate: Option<StateReadCandidate>,
+    },
+    StateReadCutGet {
+        handle: Uuid,
+        key: String,
+    },
+    StateReadCutPage {
+        handle: Uuid,
+        prefix: String,
+        cursor: Option<crate::store::StateReadCursor>,
+    },
+    CloseStateReadCut {
+        handle: Uuid,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateReadCandidate {
+    pub branch: String,
+    pub revision: String,
 }
 
 /// Whether a lost reply may conceal an accepted effect.
@@ -245,6 +267,10 @@ impl ServiceCall {
             Self::LedgerOutcome { .. } => C::READ,
             Self::BeginExport => C::READ,
             Self::ExportPage { .. } => C::READ,
+            Self::BeginStateReadCut { .. }
+            | Self::StateReadCutGet { .. }
+            | Self::StateReadCutPage { .. }
+            | Self::CloseStateReadCut { .. } => C::READ,
         }
     }
 
@@ -631,6 +657,11 @@ pub enum ServiceValue {
         provenance: ExportProvenance,
     },
     ExportPage(ExportPage),
+    StateReadCutStarted {
+        handle: Uuid,
+        provenance: crate::store::StateReadProvenance,
+    },
+    StateReadPage(crate::store::StateReadPage),
     SessionUsage(SessionUsage),
 }
 
@@ -699,13 +730,14 @@ pub enum ServiceFault {
 struct AttachmentState {
     candidates: HashMap<Uuid, Candidate>,
     exports: HashMap<Uuid, ActiveExportSnapshot>,
+    state_cuts: HashMap<Uuid, crate::store::StateReadCut>,
     dream_lease: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl AttachmentState {
     /// Connection-local candidate or export handles.
     fn holds_handles(&self) -> bool {
-        !self.candidates.is_empty() || !self.exports.is_empty()
+        !self.candidates.is_empty() || !self.exports.is_empty() || !self.state_cuts.is_empty()
     }
 
     /// Every attachment-held resource. An attachment holding any of them
@@ -1312,6 +1344,96 @@ pub(crate) fn validate_context_summary_checkpoint_request(
     Ok(())
 }
 
+/// Count exact JSON bytes without retaining an additional encoded payload.
+pub(crate) fn encoded_bytes(value: &impl Serialize) -> Result<usize> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("encoded operation size overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
+pub(crate) fn validate_conditional_request(
+    expected: &[(String, crate::StateExpectation)],
+    values: &[(String, Value)],
+    candidate: bool,
+) -> Result<()> {
+    // All request IDs and checked generation tokens are UUIDs. Serialize the
+    // real operation envelope with empty arrays, then count the borrowed arrays
+    // in their places; do not clone a potentially large membership payload.
+    let empty = ServiceRequest::with_id(
+        "00000000-0000-0000-0000-000000000000",
+        Uuid::nil(),
+        ServiceCall::View {
+            candidate: candidate.then(Uuid::nil),
+            operation: Box::new(ViewOperation::PutManyConditional {
+                expected: Vec::new(),
+                values: Vec::new(),
+            }),
+        },
+    );
+    let bytes = encoded_bytes(&empty)? - 4 + encoded_bytes(&expected)? + encoded_bytes(&values)?;
+    ensure!(
+        bytes <= OPERATION_FRAME_LIMIT,
+        "conditional state request exceeds the managed operation frame"
+    );
+    Ok(())
+}
+
+fn state_cut_reply_bytes(kind: &str, value: &impl Serialize) -> Result<usize> {
+    #[derive(Serialize)]
+    struct Tagged<'a, T> {
+        kind: &'a str,
+        value: &'a T,
+    }
+    #[derive(Serialize)]
+    struct Response<'a, T> {
+        status: &'a str,
+        value: Tagged<'a, T>,
+    }
+    #[derive(Serialize)]
+    struct Reply<'a, T> {
+        id: Uuid,
+        generation: &'a str,
+        response: Response<'a, T>,
+    }
+    encoded_bytes(&Reply {
+        id: Uuid::nil(),
+        generation: "00000000-0000-0000-0000-000000000000",
+        response: Response {
+            status: "success",
+            value: Tagged { kind, value },
+        },
+    })
+}
+
+pub(crate) fn validate_state_cut_value_reply(value: &Option<crate::VersionedValue>) -> Result<()> {
+    ensure!(
+        state_cut_reply_bytes("versioned_value", value)? <= OPERATION_FRAME_LIMIT,
+        "state cut value exceeds the managed operation frame"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_state_cut_page_reply(page: &crate::store::StateReadPage) -> Result<()> {
+    ensure!(
+        state_cut_reply_bytes("state_read_page", page)? <= OPERATION_FRAME_LIMIT,
+        "state cut page exceeds the managed operation frame"
+    );
+    Ok(())
+}
+
 /// One request at a time per authenticated connection keeps reply ownership
 /// unambiguous. The service can concurrently serve independent connections;
 /// `MemoryStore` itself serializes short mutations.
@@ -1763,6 +1885,10 @@ fn unit_receipt_view(call: &ServiceCall, state: &AttachmentState) -> Result<Stri
         | ServiceCall::LedgerOutcome { .. }
         | ServiceCall::BeginExport
         | ServiceCall::ExportPage { .. } => "main".to_owned(),
+        ServiceCall::BeginStateReadCut { .. }
+        | ServiceCall::StateReadCutGet { .. }
+        | ServiceCall::StateReadCutPage { .. }
+        | ServiceCall::CloseStateReadCut { .. } => "main".to_owned(),
     })
 }
 
@@ -2490,6 +2616,50 @@ async fn dispatch(
                 .get(&handle)
                 .context("export does not belong to this attachment")?;
             ServiceValue::ExportPage(snapshot.page(cursor).await?)
+        }
+        ServiceCall::BeginStateReadCut { candidate } => {
+            ensure!(
+                state.state_cuts.len() < 8,
+                "too many state cuts on this attachment"
+            );
+            let cut = match candidate {
+                Some(selected) => {
+                    store
+                        .candidate_state_read_cut(&selected.branch, selected.revision)
+                        .await?
+                }
+                None => store.begin_state_read_cut().await?,
+            };
+            let provenance = cut.provenance().clone();
+            let handle = Uuid::new_v4();
+            state.state_cuts.insert(handle, cut);
+            ServiceValue::StateReadCutStarted { handle, provenance }
+        }
+        ServiceCall::StateReadCutGet { handle, key } => {
+            let cut = state
+                .state_cuts
+                .get(&handle)
+                .context("state cut does not belong to this attachment")?;
+            ServiceValue::VersionedValue(cut.get_versioned(&key).await?)
+        }
+        ServiceCall::StateReadCutPage {
+            handle,
+            prefix,
+            cursor,
+        } => {
+            let cut = state
+                .state_cuts
+                .get(&handle)
+                .context("state cut does not belong to this attachment")?;
+            ServiceValue::StateReadPage(cut.page(&prefix, cursor).await?)
+        }
+        ServiceCall::CloseStateReadCut { handle } => {
+            let cut = state
+                .state_cuts
+                .remove(&handle)
+                .context("state cut does not belong to this attachment")?;
+            cut.close().await?;
+            ServiceValue::Unit
         }
     };
     Ok(value)

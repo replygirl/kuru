@@ -2119,12 +2119,17 @@ async fn failed_dream_save_restores_topology_and_leaves_undo_state_untouched() {
             harness
                 .memory
                 .get(&format!(
-                    "{}/{}/topology",
+                    "{}/{}/membership",
                     harness.scope, harness.config.mode
                 ))
                 .await
                 .unwrap(),
-            Some(before)
+            Some(
+                serde_json::to_value(crate::topology_state::MembershipRecord::from_topology(
+                    &harness.topology
+                ))
+                .unwrap()
+            )
         );
         assert!(
             harness

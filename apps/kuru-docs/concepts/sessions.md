@@ -46,6 +46,13 @@ identity show unknown values; Kuru does not guess from current topology.
 P11 still allows one conversation driver per project. Concurrent drivers and
 live-session presence are covered by the separate concurrent-session work.
 
+Parts and relationships are shared by the project's sessions in each framework.
+Modeled-state reports are saved per identity, with the last accepted report for
+that identity winning. Focus is saved with its own session. If that identity is
+retired, its session clears the focus when it next loads current membership;
+another session's focus is unchanged. Archived parts and their reports remain
+available for inspection.
+
 When Kuru chooses a speaker automatically, it selects an eligible peer with the
 highest reported activation. Equal activations keep the session's previously
 completed speaker when that peer is still tied; otherwise the first stable
@@ -96,7 +103,7 @@ Dreaming consolidates memory and considers changes to membership. Parts propose 
 - Additions must fit the `max_parts` limit.
 - Retirements must preserve at least one active member of each role.
 - Retired parts are archived with their memory intact.
-- A saved prior topology makes the latest accepted topology change reversible.
+- Saved prior membership makes the latest accepted membership change reversible.
 
 Run a dream in the terminal with `/dream`, or target a saved session:
 
@@ -105,9 +112,9 @@ kuru --resume SESSION_ID dream
 kuru --resume SESSION_ID undo-dream
 ```
 
-The terminal command `/undo-dream` restores the previous topology change. It is not an undo of every action or tool effect from a session.
+The terminal command `/undo-dream` restores the previous membership change. It is not an undo of every action or tool effect from a session.
 
-Every dream writes to an isolated Dolt candidate branch. Its histories, summaries and proposed membership become active together after validation. Cancellation before promotion leaves live memory unchanged. An accepted promotion may finish after cancellation; Kuru reconciles its result before further work. An outdated candidate cannot overwrite later conversations. Undo adds a compensating revision while preserving chats and preferences written afterward. Inspect revisions with `/memory-history` or `kuru memory history`.
+Every dream reads membership from its isolated Dolt candidate before inference. Its histories, summaries and proposed membership become active together after validation. Dream writes leave session focus and modeled-state reports unchanged. Cancellation before promotion leaves live memory unchanged. An accepted promotion may finish after cancellation; Kuru reconciles its result before further work. An outdated candidate cannot overwrite later conversations. Undo adds a compensating revision while preserving chats, modeled-state reports and preferences written afterward. Inspect revisions with `/memory-history` or `kuru memory history`.
 
 Dreaming uses provider calls and can add to the cost of a session. It is a bounded consolidation operation, not an unbounded background process.
 

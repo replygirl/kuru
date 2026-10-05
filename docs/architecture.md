@@ -55,7 +55,9 @@ consultations and shared drafts; facing chooses the speaking identity. The
 runtime validates those decisions against live identities, actual pending input
 and the caller's target before acting. Selecting a peer grants no extra tool
 authority. A mode change publishes its profile together with the configuration,
-session and topology only after the memory checkpoint settles.
+session and selected topology after the mode checkpoint settles and an absent
+destination membership is initialized. A refused checkpoint leaves membership
+and the selected live mode unchanged.
 
 Visibility selects an actor's optional context before any of those sources are
 read and gates peer delivery alongside peering. The selected sources feed the
@@ -99,6 +101,14 @@ available by the session. Other actors' private histories are not combined in
 its prompt. The shared user conversation is a separate namespace. Model
 reports of feelings or intentions are recorded as modeled state.
 
+Membership and relationships are shared within a project and framework. Each
+identity has its own modeled-state row; the last accepted report for that
+identity wins without rewriting other reports. Focus belongs to its session.
+A retired focus is cleared when that session next loads current membership and
+is saved by its next checkpoint. Retained and archived reports remain available
+through the public topology view. A coherent batch or immutable revision read
+cut loads these records without imposing a new graph-size limit.
+
 Protection, polarization and alliance relationships contain two to four
 unique active members. Canonical relationship IDs are independent of member
 ordering. A relationship can become the speaking identity and retain its own
@@ -115,7 +125,7 @@ Each admitted turn writes one user transcript row together with a session-scoped
 journal entry. A local CLI or TUI admission also replaces the session's single
 last-submission reference with that turn's exact ID, prompt and target. Before
 actor work, the runtime records that external dispatch is possible. A completed
-answer, its assistant row and the matching session and topology state commit
+answer, its assistant row and the matching session state, including focus, commit
 together. An interrupted outcome instead commits one fixed internal-role
 transcript marker; that role is visible as a Kuru marker but excluded from model
 conversation context.
@@ -132,15 +142,19 @@ the bounded operational diagnostics ring.
 Dreaming solicits bounded proposals from parts using their isolated context.
 The runtime validates proposed additions and retirements, enforces `max_parts`
 and preserves at least one active part for each role. Retired parts are archived;
-their memories are retained. Saved prior topology permits undo. Explicit,
+their memories are retained. Saved prior membership permits undo. Explicit,
 periodic and session-end triggers share the same validation path.
 
 Each dream runs on a candidate branch, including its actor histories, summaries,
-tool receipts and proposed topology. Promotion requires the recorded live base;
+tool receipts and proposed membership. The candidate's coherent membership is
+read before proposal inference; its writes do not change session focus or live
+modeled-state reports. Promotion requires the recorded live base;
 an interruption before promotion or a stale candidate leaves active memory intact.
 An accepted promotion may finish after cancellation; the runtime reconciles its
 durable result before further work. Undo adds a new
-revision restoring membership while retaining later conversations and choices.
+revision restoring membership while retaining later conversations, modeled-state
+reports and choices. Historical full-topology undo records remain readable, but
+their old focus and reports are not restored.
 `kuru-memory` owns branch-pinned SQL views, verified engine installation and the
 authenticated local sidecar. A lifetime supervisor reaps the sidecar on exit or
 writer crash. No database process becomes a cognitive supervisor.

@@ -35,7 +35,7 @@ use kuru_memory::{
     HistoryWindow, LegacySessionTurnResume, MemoryStatus, MemoryStore, PublicTranscriptEntry,
     PublicTurnSettlement, Revision, SelectedAbandonResolution, SessionCatalogRecord,
     SessionLifecycleOutcome, SessionLifecycleState, SessionModeCheckpoint, SessionTurnCheckpoint,
-    StoredNote, public_turn_node_id,
+    StateExpectation, StateStale, StoredNote, public_turn_node_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -50,6 +50,7 @@ use crate::{
     bus::PeerMessage,
     event::{Event, HookObservation, ToolObservation, ToolOutcome, TurnLimitReason},
     progress::{ContextSnapshot, FacingProgress, ProgressDescriptor, ProgressTurn},
+    topology_state::{self, MembershipRecord, ReportInventory},
 };
 
 const SHUTDOWN_DREAM_TIMEOUT: Duration = Duration::from_secs(30);
@@ -120,6 +121,8 @@ pub struct Session {
     pub last_completed_speaker: Option<String>,
     #[serde(default)]
     pub lifecycle_generation: u64,
+    #[serde(default)]
+    pub focus: Option<Focus>,
 }
 
 /// Backward-readable session listing enriched with the complete typed catalog.
@@ -479,6 +482,7 @@ struct AskControl<'a> {
     phase: ActorPhase,
     operation_id: Option<&'a str>,
     public_input_override: Option<&'a PublicInputOverride>,
+    topology: Option<&'a Topology>,
 }
 
 /// A bounded, current-mode projection of one identity's durable notes.
@@ -516,6 +520,7 @@ pub struct Harness {
     pub(crate) profile: ModeProfile,
     pub topology: Topology,
     pub session: Session,
+    report_inventory: Option<ReportInventory>,
     pub(crate) memory: MemoryStore,
     pub(crate) scope: String,
     pub(crate) provider: Arc<dyn Provider>,
@@ -545,6 +550,8 @@ pub struct Harness {
     invocation_ordinal: AtomicU64,
     pub(crate) operation_id: String,
     aborted_turn: Arc<Mutex<Option<AbortedTurn>>>,
+    active_turn: Arc<AtomicBool>,
+    deferred_topology_refresh: Arc<AtomicBool>,
     trace: Vec<Event>,
     pub(crate) pending_publication: Option<PendingPublication>,
     pub(crate) pending_candidate: Option<Candidate>,
@@ -585,11 +592,16 @@ struct AbortedTurn {
 /// Only a dropped foreground invocation can authorize same-Harness recovery.
 struct TurnDropGuard {
     slot: Arc<Mutex<Option<AbortedTurn>>>,
+    active: Arc<AtomicBool>,
+    refresh: Arc<AtomicBool>,
     turn: Option<AbortedTurn>,
 }
 
 impl Drop for TurnDropGuard {
     fn drop(&mut self) {
+        if self.active.swap(false, Ordering::AcqRel) {
+            self.refresh.store(true, Ordering::Release);
+        }
         if let Some(turn) = self.turn.take() {
             turn.cancellation.cancel();
             *self.slot.lock().expect("aborted turn lock poisoned") = Some(turn);
@@ -605,12 +617,23 @@ pub(crate) struct PendingPublication {
     pub session: Session,
     pub updates: Vec<(String, Value)>,
     pub proof: PublicationProof,
+    pub scope: PublicationScope,
+}
+
+pub(crate) enum PublicationScope {
+    Session,
+    Report(String),
+    Membership { session: bool },
+    Relationship(Relationship),
 }
 
 #[derive(Clone)]
 pub(crate) enum PublicationProof {
     LiveValues,
-    LiveValuesAndCatalogMode(Mode),
+    LiveValuesAndCatalogMode {
+        mode: Mode,
+        checkpoint_accepted: bool,
+    },
     CandidatePromotion {
         base: String,
         target: String,
@@ -786,6 +809,7 @@ impl Harness {
                 label: String::new(),
                 last_completed_speaker: None,
                 lifecycle_generation: 0,
+                focus: None,
             }
         };
         let mut config = config;
@@ -797,15 +821,38 @@ impl Harness {
             "mode profile does not match saved session mode"
         );
         profile.validate(config.max_parts)?;
-        let topology = read_topology_with_profile(&memory, &scope, &profile).await?;
+        let mut snapshot = topology_state::load(
+            &memory,
+            &checked_state_keys(&scope, &profile)?,
+            &profile,
+            Some(&format!("{scope}/session/{}", session.id)),
+            None,
+        )
+        .await?;
+        let topology = snapshot.topology.clone();
         validate_topology_with_profile(&topology, &config, &profile)?;
-        let actor_namespaces = prepared_actor_namespaces(&scope, &profile, &topology)?;
         checked_transcript_key(&scope, &session.id, &profile)?;
         // Recheck the caller-retained workspace before this constructor can
         // publish its initial state. Instructions are already owned bytes and
         // are never reopened here.
         tools.revalidate_root()?;
         tools.validate_permission_context(&config)?;
+        if snapshot.expectation == StateExpectation::Absent {
+            seed_membership(&memory, &scope, &profile, &config).await?;
+            snapshot = topology_state::load(
+                &memory,
+                &checked_state_keys(&scope, &profile)?,
+                &profile,
+                Some(&format!("{scope}/session/{}", session.id)),
+                None,
+            )
+            .await?;
+        }
+        let topology = snapshot.topology;
+        validate_topology_with_profile(&topology, &config, &profile)?;
+        let actor_namespaces = prepared_actor_namespaces(&scope, &profile, &topology)?;
+        let mut session = session;
+        session.focus = topology.focus.clone();
         // A new or resumed runtime starts a new grant session. The checked
         // store may still supply matching persistent grants after this reset.
         tools.permission_service().reset_session()?;
@@ -825,6 +872,7 @@ impl Harness {
             profile,
             topology,
             session,
+            report_inventory: Some(snapshot.inventory),
             memory,
             scope,
             provider,
@@ -842,6 +890,8 @@ impl Harness {
             invocation_ordinal: AtomicU64::new(0),
             operation_id: Uuid::new_v4().to_string(),
             aborted_turn: Arc::new(Mutex::new(None)),
+            active_turn: Arc::new(AtomicBool::new(false)),
+            deferred_topology_refresh: Arc::new(AtomicBool::new(false)),
             trace: vec![],
             pending_publication: None,
             pending_candidate: None,
@@ -866,7 +916,15 @@ impl Harness {
             step_timings: crate::step_timings::StepTimings::default(),
         };
         harness.sync_actors_with(&actor_namespaces);
-        harness.save().await?;
+        harness
+            .persist_state_with_scope(
+                harness.config.clone(),
+                harness.topology.clone(),
+                harness.session.clone(),
+                vec![],
+                PublicationScope::Session,
+            )
+            .await?;
         Ok(harness)
     }
 
@@ -1217,7 +1275,17 @@ impl Harness {
             ModeProfile::builtin(session.mode)
         };
         profile.validate(config.max_parts)?;
-        let topology = read_topology_with_profile(&self.memory, &self.scope, &profile).await?;
+        let snapshot = topology_state::load(
+            &self.memory,
+            &checked_state_keys(&self.scope, &profile)?,
+            &profile,
+            Some(&format!("{}/session/{}", self.scope, session.id)),
+            None,
+        )
+        .await?;
+        let topology = snapshot.topology;
+        let mut session = session;
+        session.focus = topology.focus.clone();
         validate_topology_with_profile(&topology, &config, &profile)?;
         let namespaces = prepared_actor_namespaces(&self.scope, &profile, &topology)?;
         checked_transcript_key(&self.scope, &session.id, &profile)?;
@@ -1237,6 +1305,7 @@ impl Harness {
         self.profile = profile;
         self.topology = topology;
         self.session = session;
+        self.report_inventory = Some(snapshot.inventory);
         self.operation_id = Uuid::new_v4().to_string();
         self.invocation_ordinal.store(0, Ordering::Release);
         self.sync_actors_with(&namespaces);
@@ -1246,7 +1315,7 @@ impl Harness {
 
     /// Create and select one fresh session without invoking a provider.
     pub async fn new_session(&mut self) -> Result<String> {
-        self.reconcile().await?;
+        self.reconcile_with_refresh(false).await?;
         let session = Session {
             id: Uuid::new_v4().to_string(),
             mode: self.config.mode,
@@ -1254,6 +1323,7 @@ impl Harness {
             label: String::new(),
             last_completed_speaker: None,
             lifecycle_generation: 0,
+            focus: None,
         };
         self.memory
             .create_session(&session.id, session.mode, &session.label)
@@ -1264,6 +1334,7 @@ impl Harness {
             .await?;
         self.tools.permission_service().reset_session()?;
         self.session = session;
+        self.topology.focus = None;
         self.operation_id = Uuid::new_v4().to_string();
         self.invocation_ordinal.store(0, Ordering::Release);
         self.reset_context_snapshot();
@@ -2182,6 +2253,32 @@ impl Harness {
         }
     }
 
+    pub(crate) fn prepare_candidate_actors(&mut self, topology: &Topology) -> Result<()> {
+        let namespaces = prepared_actor_namespaces(&self.scope, &self.profile, topology)?;
+        // Candidate work can need an actor absent from the stale live roster.
+        // Adding its private worker does not publish candidate membership.
+        for (id, namespace) in namespaces {
+            if let Some(actor) = self.actors.get(&id) {
+                ensure!(
+                    actor.namespace() == namespace,
+                    "candidate actor namespace changed"
+                );
+            } else {
+                self.actors.insert(
+                    id,
+                    Actor::spawn(namespace, self.provider.clone(), self.permits.clone()),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_live_actors(&mut self) -> Result<()> {
+        let namespaces = prepared_actor_namespaces(&self.scope, &self.profile, &self.topology)?;
+        self.sync_actors_with(&namespaces);
+        Ok(())
+    }
+
     pub(crate) async fn save(&mut self) -> Result<()> {
         self.save_with(vec![]).await
     }
@@ -2189,7 +2286,7 @@ impl Harness {
     pub(crate) async fn state_updates(
         &self,
         profile: &ModeProfile,
-        topology: &Topology,
+        _topology: &Topology,
         session: &Session,
         mut updates: Vec<(String, Value)>,
     ) -> Result<Vec<(String, Value)>> {
@@ -2197,14 +2294,10 @@ impl Harness {
             profile.mode == session.mode,
             "state profile does not match session mode"
         );
-        let keys = checked_state_keys(&self.scope, profile)?;
-        updates.extend([
-            (keys.topology, serde_json::to_value(topology)?),
-            (
-                format!("{}/session/{}", self.scope, session.id),
-                serde_json::to_value(session)?,
-            ),
-        ]);
+        updates.extend([(
+            format!("{}/session/{}", self.scope, session.id),
+            serde_json::to_value(session)?,
+        )]);
         Ok(updates)
     }
 
@@ -2221,9 +2314,41 @@ impl Harness {
     pub(crate) async fn persist_state(
         &mut self,
         config: Config,
-        topology: Topology,
+        mut topology: Topology,
         session: Session,
         updates: Vec<(String, Value)>,
+    ) -> Result<()> {
+        ensure!(
+            self.pending_publication.is_none(),
+            "pending memory publication must be reconciled before another state change"
+        );
+        config.validate()?;
+        if config.mode == self.config.mode && !self.active_turn.load(Ordering::Acquire) {
+            // Idle session writes own the proposed focus, but validate it
+            // against current shared membership before staging their row.
+            let focus = topology.focus.take();
+            self.refresh_topology_for_turn().await?;
+            topology = self.topology.clone();
+            topology.focus = focus;
+            topology_state::clear_inactive_focus(&mut topology);
+        }
+        self.persist_state_with_scope(
+            config,
+            topology,
+            session,
+            updates,
+            PublicationScope::Session,
+        )
+        .await
+    }
+
+    async fn persist_state_with_scope(
+        &mut self,
+        config: Config,
+        mut topology: Topology,
+        mut session: Session,
+        updates: Vec<(String, Value)>,
+        scope: PublicationScope,
     ) -> Result<()> {
         ensure!(
             self.pending_publication.is_none(),
@@ -2236,6 +2361,8 @@ impl Harness {
         };
         profile.validate(config.max_parts)?;
         validate_topology_with_profile(&topology, &config, &profile)?;
+        topology_state::clear_inactive_focus(&mut topology);
+        session.focus = topology.focus.clone();
         let actor_namespaces = prepared_actor_namespaces(&self.scope, &profile, &topology)?;
         let updates = self
             .state_updates(&profile, &topology, &session, updates)
@@ -2255,8 +2382,12 @@ impl Harness {
             proof: mode_change
                 .as_ref()
                 .map_or(PublicationProof::LiveValues, |mode| {
-                    PublicationProof::LiveValuesAndCatalogMode(mode.mode)
+                    PublicationProof::LiveValuesAndCatalogMode {
+                        mode: mode.mode,
+                        checkpoint_accepted: false,
+                    }
                 }),
+            scope,
         });
         if let Some(mode) = mode_change {
             self.memory
@@ -2267,9 +2398,156 @@ impl Harness {
                     &mode,
                 )
                 .await?;
+            if let Some(PendingPublication {
+                proof:
+                    PublicationProof::LiveValuesAndCatalogMode {
+                        checkpoint_accepted,
+                        ..
+                    },
+                ..
+            }) = &mut self.pending_publication
+            {
+                *checkpoint_accepted = true;
+            }
+            self.initialize_pending_mode().await?;
         } else {
             self.memory.put_many(&updates).await?;
         }
+        #[cfg(test)]
+        self.pause_after_memory_write().await?;
+        self.publish_pending();
+        Ok(())
+    }
+
+    async fn initialize_pending_mode(&mut self) -> Result<()> {
+        let pending = self
+            .pending_publication
+            .as_ref()
+            .context("mode initialization lost its accepted checkpoint")?;
+        ensure!(
+            matches!(
+                pending.proof,
+                PublicationProof::LiveValuesAndCatalogMode {
+                    checkpoint_accepted: true,
+                    ..
+                }
+            ),
+            "mode checkpoint must settle before destination initialization"
+        );
+        let profile = pending.profile.clone();
+        let config = pending.config.clone();
+        let session_key = format!("{}/session/{}", self.scope, pending.session.id);
+        seed_membership(&self.memory, &self.scope, &profile, &config).await?;
+        let snapshot = topology_state::load(
+            &self.memory,
+            &checked_state_keys(&self.scope, &profile)?,
+            &profile,
+            Some(&session_key),
+            None,
+        )
+        .await?;
+        validate_topology_with_profile(&snapshot.topology, &config, &profile)?;
+        let namespaces = prepared_actor_namespaces(&self.scope, &profile, &snapshot.topology)?;
+        let pending = self
+            .pending_publication
+            .as_mut()
+            .context("mode initialization lost its publication")?;
+        pending.session.focus = snapshot.topology.focus.clone();
+        pending.topology = snapshot.topology;
+        pending.actor_namespaces = namespaces;
+        Ok(())
+    }
+
+    pub(crate) async fn persist_membership(
+        &mut self,
+        mut topology: Topology,
+        expectation: StateExpectation,
+        mut updates: Vec<(String, Value)>,
+        write_session: bool,
+        relation: Option<Relationship>,
+    ) -> Result<()> {
+        ensure!(
+            self.pending_publication.is_none(),
+            "pending memory publication must be reconciled before another membership change"
+        );
+        topology_state::clear_inactive_focus(&mut topology);
+        validate_topology_with_profile(&topology, &self.config, &self.profile)?;
+        let actor_namespaces = prepared_actor_namespaces(&self.scope, &self.profile, &topology)?;
+        let keys = checked_state_keys(&self.scope, &self.profile)?;
+        updates.push((
+            keys.membership.clone(),
+            serde_json::to_value(MembershipRecord::from_topology(&topology))?,
+        ));
+        let mut session = self.session.clone();
+        if write_session {
+            session.focus = topology.focus.clone();
+            updates.push((
+                format!("{}/session/{}", self.scope, session.id),
+                serde_json::to_value(&session)?,
+            ));
+        }
+        self.pending_publication = Some(PendingPublication {
+            config: self.config.clone(),
+            profile: self.profile.clone(),
+            actor_namespaces,
+            topology,
+            session,
+            updates: updates.clone(),
+            proof: PublicationProof::LiveValues,
+            scope: relation.map_or(
+                PublicationScope::Membership {
+                    session: write_session,
+                },
+                PublicationScope::Relationship,
+            ),
+        });
+        if let Err(error) = self
+            .memory
+            .put_many_conditional(&[(keys.membership, expectation)], &updates)
+            .await
+        {
+            if error.is::<StateStale>() {
+                self.pending_publication = None;
+            }
+            return Err(error);
+        }
+        #[cfg(test)]
+        self.pause_after_memory_write().await?;
+        self.publish_pending();
+        Ok(())
+    }
+
+    async fn persist_report(
+        &mut self,
+        identity: &str,
+        topology: Topology,
+        report: &StateReport,
+    ) -> Result<()> {
+        ensure!(
+            self.pending_publication.is_none(),
+            "pending memory publication must be reconciled before another report"
+        );
+        let keys = checked_state_keys(&self.scope, &self.profile)?;
+        let key = keys.state_report(identity);
+        if let Some(existing) = self.memory.get(&key).await? {
+            let (stored_identity, _) = topology_state::decode_report(&keys, &key, existing)?;
+            ensure!(
+                stored_identity == identity,
+                "state report identity collision"
+            );
+        }
+        let updates = vec![(key, topology_state::report_value(identity, report)?)];
+        self.pending_publication = Some(PendingPublication {
+            config: self.config.clone(),
+            profile: self.profile.clone(),
+            actor_namespaces: BTreeMap::new(),
+            topology,
+            session: self.session.clone(),
+            updates: updates.clone(),
+            proof: PublicationProof::LiveValues,
+            scope: PublicationScope::Report(identity.into()),
+        });
+        self.memory.put_many(&updates).await?;
         #[cfg(test)]
         self.pause_after_memory_write().await?;
         self.publish_pending();
@@ -2427,11 +2705,62 @@ impl Harness {
                 self.pending_candidate = None;
                 self.pending_candidate_resolution = PendingCandidateResolution::AutomaticCleanup;
             }
-            self.config = pending.config;
-            self.profile = pending.profile;
-            self.topology = pending.topology;
-            self.session = pending.session;
-            self.sync_actors_with(&pending.actor_namespaces);
+            match pending.scope {
+                PublicationScope::Session => {
+                    let changed_mode = self.profile.mode != pending.profile.mode;
+                    self.config = pending.config;
+                    self.profile = pending.profile;
+                    self.session = pending.session;
+                    if changed_mode {
+                        self.topology = pending.topology;
+                        self.report_inventory = None;
+                    }
+                    self.topology.focus = self.session.focus.clone();
+                    topology_state::clear_inactive_focus(&mut self.topology);
+                    self.session.focus = self.topology.focus.clone();
+                    self.sync_actors_with(&pending.actor_namespaces);
+                }
+                PublicationScope::Report(identity) => {
+                    if let Some(report) = pending.topology.states.get(&identity) {
+                        self.topology.states.insert(identity, report.clone());
+                    }
+                }
+                PublicationScope::Membership { session } => {
+                    self.topology.parts = pending.topology.parts;
+                    self.topology.relationships = pending.topology.relationships;
+                    if session {
+                        self.session = pending.session;
+                    }
+                    self.topology.focus = self.session.focus.clone();
+                    topology_state::clear_inactive_focus(&mut self.topology);
+                    self.session.focus = self.topology.focus.clone();
+                    self.sync_actors_with(&pending.actor_namespaces);
+                }
+                PublicationScope::Relationship(relation) => {
+                    if self.active_turn.load(Ordering::Acquire) {
+                        if !self
+                            .topology
+                            .relationships
+                            .iter()
+                            .any(|item| item.id == relation.id)
+                        {
+                            self.topology.relationships.push(relation);
+                        }
+                        self.session = pending.session;
+                        self.topology.focus = self.session.focus.clone();
+                        self.restore_live_actors()
+                            .expect("published relationship has checked namespaces");
+                    } else {
+                        self.topology.parts = pending.topology.parts;
+                        self.topology.relationships = pending.topology.relationships;
+                        self.session = pending.session;
+                        self.topology.focus = self.session.focus.clone();
+                        topology_state::clear_inactive_focus(&mut self.topology);
+                        self.session.focus = self.topology.focus.clone();
+                        self.sync_actors_with(&pending.actor_namespaces);
+                    }
+                }
+            }
         }
     }
 
@@ -2439,6 +2768,12 @@ impl Harness {
     /// dream requires its exact candidate outcome; live values cannot prove a
     /// promotion because a sibling may have written the same values later.
     pub async fn reconcile(&mut self) -> Result<()> {
+        self.reconcile_with_refresh(true).await
+    }
+
+    /// Turn admission checks immutable completed output before loading a new
+    /// shared topology; ordinary commands consume any deferred refresh here.
+    async fn reconcile_with_refresh(&mut self, refresh: bool) -> Result<()> {
         self.rebind_main_if_retired().await?;
         if let Some(candidate) = self.memory.recover_candidate_begin().await? {
             ensure!(
@@ -2477,7 +2812,7 @@ impl Harness {
             match status {
                 CandidatePromotionStatus::Confirmed(revision) => {
                     ensure!(revision == target, "dream promoted a different revision");
-                    self.publish_recovered_dream(&report);
+                    self.publish_recovered_dream(&report).await?;
                     return Ok(());
                 }
                 CandidatePromotionStatus::OpenUnchanged if !abandonment => {
@@ -2537,7 +2872,7 @@ impl Harness {
                         "dream candidate was promoted outside pending abandonment"
                     );
                     ensure!(revision == target, "dream promoted a different revision");
-                    self.publish_recovered_dream(&report);
+                    self.publish_recovered_dream(&report).await?;
                     return Ok(());
                 }
                 CandidateTransitionResolution::Abandoned => {
@@ -2658,21 +2993,31 @@ impl Harness {
                 }
             }
         }
-        self.memory.reconcile().await?;
+        let receipt = self.memory.reconcile().await?;
         self.rebind_main_if_retired().await?;
         if let Some(pending) = &self.pending_publication {
             ensure!(
                 matches!(
                     pending.proof,
-                    PublicationProof::LiveValues | PublicationProof::LiveValuesAndCatalogMode(_)
+                    PublicationProof::LiveValues
+                        | PublicationProof::LiveValuesAndCatalogMode { .. }
                 ),
                 "candidate promotion requires exact outcome proof"
             );
-            let mut committed = true;
-            for (key, value) in &pending.updates {
-                committed &= self.memory.get(key).await?.as_ref() == Some(value);
+            let checkpoint_accepted = matches!(
+                pending.proof,
+                PublicationProof::LiveValuesAndCatalogMode {
+                    checkpoint_accepted: true,
+                    ..
+                }
+            );
+            let mut committed = checkpoint_accepted || receipt.unwrap_or(true);
+            if receipt.is_none() {
+                for (key, value) in &pending.updates {
+                    committed &= self.memory.get(key).await?.as_ref() == Some(value);
+                }
             }
-            if let PublicationProof::LiveValuesAndCatalogMode(mode) = pending.proof {
+            if let PublicationProof::LiveValuesAndCatalogMode { mode, .. } = pending.proof {
                 committed &= self
                     .memory
                     .session_catalog_record(&pending.session.id)
@@ -2683,10 +3028,30 @@ impl Harness {
                     });
             }
             if committed {
+                if let Some(PendingPublication {
+                    proof:
+                        PublicationProof::LiveValuesAndCatalogMode {
+                            checkpoint_accepted,
+                            ..
+                        },
+                    ..
+                }) = &mut self.pending_publication
+                {
+                    *checkpoint_accepted = true;
+                    self.initialize_pending_mode().await?;
+                }
                 self.publish_pending();
             } else {
                 self.pending_publication = None;
             }
+            self.deferred_topology_refresh
+                .store(true, Ordering::Release);
+        }
+        if refresh
+            && !self.active_turn.load(Ordering::Acquire)
+            && self.deferred_topology_refresh.load(Ordering::Acquire)
+        {
+            self.refresh_topology_for_turn().await?;
         }
         Ok(())
     }
@@ -2694,12 +3059,17 @@ impl Harness {
     async fn rebind_main_if_retired(&mut self) -> Result<()> {
         if let Some(fresh) = self.memory.reopen_after_checked_recovery().await? {
             self.memory = fresh;
+            self.report_inventory = None;
+            self.deferred_topology_refresh
+                .store(true, Ordering::Release);
         }
         Ok(())
     }
 
-    fn publish_recovered_dream(&mut self, report: &crate::dream::DreamReport) {
+    async fn publish_recovered_dream(&mut self, report: &crate::dream::DreamReport) -> Result<()> {
         self.publish_pending();
+        self.report_inventory = None;
+        self.refresh_topology_for_turn().await?;
         self.emit_event(Event::Dream {
             actor: "pool".into(),
             detail: format!(
@@ -2709,10 +3079,11 @@ impl Harness {
                 report.rejected.len()
             ),
         });
+        Ok(())
     }
 
     pub async fn set_mode(&mut self, mode: Mode) -> Result<()> {
-        self.reconcile().await?;
+        self.reconcile_with_refresh(false).await?;
         let mut config = self.config.clone();
         config.mode = mode;
         config.validate()?;
@@ -2722,15 +3093,31 @@ impl Harness {
             ModeProfile::builtin(mode)
         };
         profile.validate(config.max_parts)?;
-        let topology = read_topology_with_profile(&self.memory, &self.scope, &profile).await?;
+        let mut topology = if mode == self.profile.mode && !self.active_turn.load(Ordering::Acquire)
+        {
+            self.refresh_topology_for_turn().await?;
+            self.topology.clone()
+        } else {
+            read_topology_with_profile(&self.memory, &self.scope, &profile).await?
+        };
+        if mode == self.profile.mode {
+            topology.focus = self.session.focus.clone();
+        }
         validate_topology_with_profile(&topology, &config, &profile)?;
         let mut preferences = read_preferences(&self.memory, &self.scope).await?;
         preferences.mode = Some(mode);
         let update = self.preference_update(&preferences)?;
         let mut session = self.session.clone();
         session.mode = mode;
-        self.persist_state(config, topology, session, vec![update])
-            .await
+        session.focus = None;
+        self.persist_state_with_scope(
+            config,
+            topology,
+            session,
+            vec![update],
+            PublicationScope::Session,
+        )
+        .await
     }
 
     /// Commit the provider-specific pair before exposing the new live choice.
@@ -2740,7 +3127,7 @@ impl Harness {
         model: impl Into<String>,
         effort: Option<String>,
     ) -> Result<()> {
-        self.reconcile().await?;
+        self.reconcile_with_refresh(false).await?;
         let mut config = self.config.clone();
         config.model = model.into();
         config.effort = effort;
@@ -2763,7 +3150,7 @@ impl Harness {
     }
 
     pub async fn set_effort(&mut self, effort: Option<String>) -> Result<()> {
-        self.reconcile().await?;
+        self.reconcile_with_refresh(false).await?;
         self.set_model(self.config.model.clone(), effort).await
     }
 
@@ -2780,14 +3167,23 @@ impl Harness {
     }
 
     pub async fn focus(&mut self, identity: Option<&str>) -> Result<()> {
-        self.reconcile().await?;
+        self.reconcile_with_refresh(false).await?;
+        if !self.active_turn.load(Ordering::Acquire) {
+            self.refresh_topology_for_turn().await?;
+        }
         let next = identity
             .map(|i| self.resolve(i).map(|id| Focus { id, remaining: 3 }))
             .transpose()?;
         let mut topology = self.topology.clone();
         topology.focus = next;
-        self.persist_state(self.config.clone(), topology, self.session.clone(), vec![])
-            .await
+        self.persist_state_with_scope(
+            self.config.clone(),
+            topology,
+            self.session.clone(),
+            vec![],
+            PublicationScope::Session,
+        )
+        .await
     }
 
     pub async fn relate(
@@ -2805,18 +3201,52 @@ impl Harness {
         kind: RelationshipKind,
         members: Vec<String>,
     ) -> Result<Relationship> {
-        self.reconcile().await?;
+        for attempt in 0..3 {
+            self.reconcile().await?;
+            match self
+                .relate_once(origin.clone(), kind, members.clone())
+                .await
+            {
+                Err(error) if error.is::<StateStale>() && attempt < 2 => continue,
+                result => return result,
+            }
+        }
+        unreachable!("bounded relationship attempts always return")
+    }
+
+    async fn relate_once(
+        &mut self,
+        origin: RelationshipOrigin,
+        kind: RelationshipKind,
+        members: Vec<String>,
+    ) -> Result<Relationship> {
+        let keys = checked_state_keys(&self.scope, &self.profile)?;
+        let snapshot = topology_state::load(
+            &self.memory,
+            &keys,
+            &self.profile,
+            Some(&format!("{}/session/{}", self.scope, self.session.id)),
+            self.report_inventory.as_ref(),
+        )
+        .await?;
+        validate_topology_with_profile(&snapshot.topology, &self.config, &self.profile)?;
+        if !self.active_turn.load(Ordering::Acquire) {
+            self.topology = snapshot.topology.clone();
+        }
+        self.report_inventory = Some(snapshot.inventory);
         let members = members
             .iter()
             .map(|m| self.resolve(m))
             .collect::<Result<Vec<_>>>()?;
         ensure!(
-            members
+            members.iter().all(|id| snapshot
+                .topology
+                .parts
                 .iter()
-                .all(|id| self.topology.parts.iter().any(|p| p.active && &p.id == id)),
+                .any(|p| p.active && &p.id == id)),
             "relationships contain parts, not other relationships"
         );
-        let active_parts = self
+        let active_parts = snapshot
             .topology
             .parts
             .iter()
@@ -2831,7 +3261,7 @@ impl Harness {
             let participates = if sender_members.is_empty() {
                 active_parts.contains(sender) && members.contains(sender)
             } else {
-                self.topology.relationships.iter().any(|relation| {
+                snapshot.topology.relationships.iter().any(|relation| {
                     relation.id == *sender
                         && self.actors.contains_key(sender)
                         && relation.members == *sender_members
@@ -2852,28 +3282,45 @@ impl Harness {
             .relationship(&origin, kind, members, &active_parts)?;
         validate_relationship_members(&relation, &active_parts)?;
         ensure!(relation == proposed, "mode changed a relationship proposal");
-        let mut topology = self.topology.clone();
-        if !topology.relationships.iter().any(|r| r.id == relation.id) {
+        let mut topology = snapshot.topology;
+        let changed = !topology.relationships.iter().any(|r| r.id == relation.id);
+        if changed {
             topology.relationships.push(relation.clone());
         }
         topology.focus = Some(Focus {
             id: relation.id.clone(),
             remaining: 3,
         });
-        self.persist_state(self.config.clone(), topology, self.session.clone(), vec![])
+        if changed {
+            self.persist_membership(
+                topology,
+                snapshot.expectation,
+                vec![],
+                true,
+                Some(relation.clone()),
+            )
             .await?;
+        } else {
+            self.persist_state_with_scope(
+                self.config.clone(),
+                topology,
+                self.session.clone(),
+                vec![],
+                PublicationScope::Relationship(relation.clone()),
+            )
+            .await?;
+        }
         Ok(relation)
     }
 
-    fn instruction_parts(&self, id: &str, phase: &str) -> Result<String> {
-        let identity = if let Some(part) = self.topology.parts.iter().find(|p| p.id == id) {
+    fn instruction_parts(&self, topology: &Topology, id: &str, phase: &str) -> Result<String> {
+        let identity = if let Some(part) = topology.parts.iter().find(|p| p.id == id) {
             format!(
                 "You are {} (role {}, ID {}). {}",
                 part.name, part.role, part.id, part.instruction
             )
         } else {
-            let relation = self
-                .topology
+            let relation = topology
                 .relationships
                 .iter()
                 .find(|r| r.id == id)
@@ -2881,7 +3328,7 @@ impl Harness {
             let parts = relation
                 .members
                 .iter()
-                .filter_map(|id| self.topology.parts.iter().find(|p| &p.id == id))
+                .filter_map(|id| topology.parts.iter().find(|p| &p.id == id))
                 .collect::<Vec<_>>();
             format!(
                 "You embody this temporary {} relationship, ID {}. Its members are {}. Express their interaction as one conversational perspective. You have only relationship memory and explicitly shared contributions, not members' private memory.",
@@ -2890,8 +3337,7 @@ impl Harness {
                 serde_json::to_string(&parts)?
             )
         };
-        let roster = self
-            .topology
+        let roster = topology
             .parts
             .iter()
             .filter(|p| p.active)
@@ -2995,6 +3441,7 @@ impl Harness {
                 phase: phase_kind,
                 operation_id: None,
                 public_input_override,
+                topology: None,
             },
         )
         .await
@@ -3028,6 +3475,7 @@ impl Harness {
                 phase: phase.1,
                 operation_id: None,
                 public_input_override,
+                topology: None,
             },
         )
         .await
@@ -3057,15 +3505,21 @@ impl Harness {
                     phase: phase.1,
                     operation_id: None,
                     public_input_override: None,
+                    topology: None,
                 },
             )
             .await?
             .0)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "candidate topology stays distinct from the live runtime and memory view"
+    )]
     pub(crate) async fn ask_in_controlled_with_invocation(
         &self,
         memory: &MemoryStore,
+        topology: &Topology,
         id: &str,
         inputs: Vec<Message>,
         phase: (&str, ActorPhase),
@@ -3085,6 +3539,7 @@ impl Harness {
                 phase: phase.1,
                 operation_id: None,
                 public_input_override: None,
+                topology: Some(topology),
             },
         )
         .await
@@ -3147,6 +3602,7 @@ impl Harness {
                         phase: ActorPhase::Compact,
                         operation_id: Some(&operation_id),
                         public_input_override: None,
+                        topology: None,
                     },
                 )
                 .await?;
@@ -3238,7 +3694,8 @@ impl Harness {
             .max_tool_calls
             .max(inputs.len())
             .saturating_add(64);
-        let instructions = self.instruction_parts(id, phase)?;
+        let instructions =
+            self.instruction_parts(control.topology.unwrap_or(&self.topology), id, phase)?;
         let work = Work {
             memory: memory.clone(),
             scope: self.scope.clone(),
@@ -3474,6 +3931,8 @@ impl Harness {
         self.recover_aborted_turn().await?;
         let mut guard = TurnDropGuard {
             slot: self.aborted_turn.clone(),
+            active: self.active_turn.clone(),
+            refresh: self.deferred_topology_refresh.clone(),
             turn: Some(AbortedTurn {
                 session_id: self.session.id.clone(),
                 turn_id: turn_id.into(),
@@ -3520,7 +3979,7 @@ impl Harness {
         .context("aborted turn actor cleanup exceeded 30 seconds")?
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
-        self.reconcile().await?;
+        self.reconcile_with_refresh(false).await?;
         let key = self.turn_journal_key(&aborted.turn_id);
         let stored = self.memory.get(&key).await?;
         let catalog = self
@@ -3582,7 +4041,7 @@ impl Harness {
         cancellation: &CancellationToken,
         reviews: TurnReviewChannels<'_>,
     ) -> Result<ControlledTurnOutput> {
-        self.reconcile().await?;
+        self.reconcile_with_refresh(false).await?;
         ensure!(
             !prompt.trim().is_empty() && prompt.len() <= 131_072,
             "prompt must contain 1–131072 bytes"
@@ -3653,11 +4112,23 @@ impl Harness {
     }
 
     async fn refresh_topology_for_turn(&mut self) -> Result<()> {
-        let topology = read_topology_with_profile(&self.memory, &self.scope, &self.profile).await?;
+        let snapshot = topology_state::load(
+            &self.memory,
+            &checked_state_keys(&self.scope, &self.profile)?,
+            &self.profile,
+            Some(&format!("{}/session/{}", self.scope, self.session.id)),
+            self.report_inventory.as_ref(),
+        )
+        .await?;
+        let topology = snapshot.topology;
         validate_topology_with_profile(&topology, &self.config, &self.profile)?;
         let namespaces = prepared_actor_namespaces(&self.scope, &self.profile, &topology)?;
         self.topology = topology;
+        self.session.focus = self.topology.focus.clone();
+        self.report_inventory = Some(snapshot.inventory);
         self.sync_actors_with(&namespaces);
+        self.deferred_topology_refresh
+            .store(false, Ordering::Release);
         Ok(())
     }
 
@@ -3675,6 +4146,7 @@ impl Harness {
         cancellation: &CancellationToken,
         reviews: TurnReviewChannels<'_>,
     ) -> Result<TurnOutput> {
+        self.active_turn.store(true, Ordering::Release);
         self.trace.clear();
         self.reset_context_snapshot();
         self.operation_id = journal.id.clone();
@@ -4421,6 +4893,7 @@ impl Harness {
                 topology.focus = None;
             }
         }
+        session.focus = topology.focus.clone();
         let response = Event::Response {
             actor: speaker.clone(),
         }
@@ -4458,6 +4931,7 @@ impl Harness {
             session,
             updates: updates.clone(),
             proof: PublicationProof::LiveValues,
+            scope: PublicationScope::Session,
         });
         let expected_generation = self.session.lifecycle_generation;
         #[cfg(test)]
@@ -4488,6 +4962,9 @@ impl Harness {
         #[cfg(test)]
         self.pause_after_memory_write().await?;
         self.publish_pending();
+        self.active_turn.store(false, Ordering::Release);
+        self.deferred_topology_refresh
+            .store(true, Ordering::Release);
         let _ = self.events.send(response.clone());
         self.trace.push(response);
         progress_turn.finish();
@@ -4750,8 +5227,7 @@ impl Harness {
                 );
                 let mut topology = self.topology.clone();
                 topology.states.insert(sender.into(), report.clone());
-                self.persist_state(self.config.clone(), topology, self.session.clone(), vec![])
-                    .await?;
+                self.persist_report(sender, topology, &report).await?;
                 cancellation.check()?;
                 self.emit_event(Event::State {
                     actor: sender.into(),
@@ -4968,6 +5444,7 @@ async fn session_from_catalog(
         label: catalog.label,
         last_completed_speaker,
         lifecycle_generation: catalog.lifecycle_generation,
+        focus: None,
     })
 }
 
@@ -5013,7 +5490,9 @@ pub(crate) fn checked_state_keys(scope: &str, profile: &ModeProfile) -> Result<S
     let keys = profile.memory.state_keys(scope, profile.mode);
     ensure!(
         keys.topology == format!("{scope}/{}/topology", profile.mode)
-            && keys.dream_undo == format!("{scope}/{}/dream-undo", profile.mode),
+            && keys.dream_undo == format!("{scope}/{}/dream-undo", profile.mode)
+            && keys.membership == format!("{scope}/{}/membership", profile.mode)
+            && keys.state_prefix == format!("{scope}/{}/state/", profile.mode),
         "mode selected invalid state keys"
     );
     Ok(keys)
@@ -5276,13 +5755,26 @@ async fn resolve_notes_namespace_with_profile(
     );
     let scope = project_scope(cwd)?;
     let keys = checked_state_keys(&scope, profile)?;
-    let topology: Topology = memory
-        .get(&keys.topology)
-        .await?
-        .context("no persisted topology exists for the selected mode")
-        .and_then(|value| {
-            serde_json::from_value(value).context("invalid persisted topology for selected mode")
-        })?;
+    let topology = if let Some(value) = memory.get(&keys.membership).await? {
+        let members = MembershipRecord::decode(value, false)?;
+        Topology {
+            parts: members.parts,
+            relationships: members.relationships,
+            states: BTreeMap::new(),
+            focus: None,
+        }
+    } else {
+        // Older read-only memory remains inspectable without initializing or
+        // rewriting its legacy topology. Current writers use membership only.
+        memory
+            .get(&keys.topology)
+            .await?
+            .context("no persisted topology exists for the selected mode")
+            .and_then(|value| {
+                serde_json::from_value(value)
+                    .context("invalid persisted topology for selected mode")
+            })?
+    };
     let identity = resolve_human_identity(&topology, identity)?;
     let namespace = format!(
         "{}/notes",
@@ -5305,7 +5797,7 @@ fn resolve_human_identity(topology: &Topology, identity: &str) -> Result<String>
     resolve_active_identity(topology, identity)
 }
 
-fn resolve_active_identity(topology: &Topology, identity: &str) -> Result<String> {
+pub(crate) fn resolve_active_identity(topology: &Topology, identity: &str) -> Result<String> {
     if topology.relationships.iter().any(|relationship| {
         relationship.id == identity
             && relationship.members.iter().all(|id| {
@@ -5349,20 +5841,41 @@ pub(crate) async fn read_topology_with_profile(
     profile: &ModeProfile,
 ) -> Result<Topology> {
     let keys = checked_state_keys(scope, profile)?;
-    memory
-        .get(&keys.topology)
+    Ok(topology_state::load(memory, &keys, profile, None, None)
         .await?
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(Into::into)
-        .map(|topology| {
-            topology.unwrap_or_else(|| Topology {
-                parts: profile.roles.seeds(),
-                relationships: vec![],
-                states: BTreeMap::new(),
-                focus: None,
-            })
-        })
+        .topology)
+}
+
+async fn seed_membership(
+    memory: &MemoryStore,
+    scope: &str,
+    profile: &ModeProfile,
+    config: &Config,
+) -> Result<()> {
+    let keys = checked_state_keys(scope, profile)?;
+    if memory.get_versioned(&keys.membership).await?.is_some() {
+        return Ok(());
+    }
+    let topology = Topology {
+        parts: profile.roles.seeds(),
+        relationships: vec![],
+        states: BTreeMap::new(),
+        focus: None,
+    };
+    validate_topology_with_profile(&topology, config, profile)?;
+    let write = memory
+        .put_many_conditional(
+            &[(keys.membership.clone(), StateExpectation::Absent)],
+            &[(
+                keys.membership,
+                serde_json::to_value(MembershipRecord::from_topology(&topology))?,
+            )],
+        )
+        .await;
+    match write {
+        Err(error) if error.is::<StateStale>() => Ok(()),
+        result => result,
+    }
 }
 
 async fn read_preferences(memory: &MemoryStore, scope: &str) -> Result<ProjectPreferences> {
@@ -5508,7 +6021,7 @@ mod publication_tests {
             );
             assert!(
                 memory
-                    .get(&format!("{}/jungian/topology", harness.scope))
+                    .get(&format!("{}/jungian/membership", harness.scope))
                     .await
                     .unwrap()
                     .is_some()
@@ -5592,6 +6105,13 @@ mod publication_tests {
                     .unwrap()
                     .is_none()
             );
+            assert!(
+                memory
+                    .get(&format!("{}/jungian/membership", harness.scope))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             harness.reconcile().await.unwrap();
             assert!(harness.pending_publication.is_none());
             drop(harness);
@@ -5634,14 +6154,14 @@ mod publication_tests {
             .await
             .unwrap();
             let selected = harness.topology.parts[1].id.clone();
-            let mut refreshed = harness.topology.clone();
+            let mut refreshed = harness.session.clone();
             refreshed.focus = Some(Focus {
                 id: selected.clone(),
                 remaining: 3,
             });
             memory
                 .put(
-                    &format!("{}/{}/topology", harness.scope, harness.profile.mode),
+                    &format!("{}/session/{}", harness.scope, harness.session.id),
                     &serde_json::to_value(&refreshed).unwrap(),
                 )
                 .await
@@ -5702,7 +6222,7 @@ mod publication_tests {
                 .unwrap();
             let serialized = serde_json::to_string(&output).unwrap();
             let sends = provider.calls.load(Ordering::SeqCst);
-            let topology_key = format!("{}/{}/topology", first.scope, first.profile.mode);
+            let topology_key = format!("{}/{}/membership", first.scope, first.profile.mode);
             let valid_topology = memory.get(&topology_key).await.unwrap().unwrap();
             memory
                 .put(&topology_key, &json!({"malformed-after-completion": true}))
@@ -7323,13 +7843,13 @@ mod publication_tests {
             assert_eq!(
                 memory
                     .get(&format!(
-                        "{}/{}/topology",
+                        "{}/{}/membership",
                         harness.scope, harness.session.mode
                     ))
                     .await
                     .unwrap()
                     .unwrap(),
-                serde_json::to_value(&harness.topology).unwrap()
+                serde_json::to_value(MembershipRecord::from_topology(&harness.topology)).unwrap()
             );
             assert_eq!(
                 memory
@@ -7434,10 +7954,11 @@ mod publication_tests {
                     note: note.into(),
                 },
             );
-            let updates = harness
-                .state_updates(&harness.profile, &topology, &harness.session, vec![])
-                .await
-                .unwrap();
+            let keys = checked_state_keys(&harness.scope, &harness.profile).unwrap();
+            let updates = vec![(
+                keys.state_report(&first),
+                topology_state::report_value(&first, &topology.states[&first]).unwrap(),
+            )];
             memory.put_many(&updates).await.unwrap();
             // The SQL write became durable, but its caller did not publish the snapshot.
             harness.pending_publication = Some(PendingPublication {
@@ -7453,6 +7974,7 @@ mod publication_tests {
                 session: harness.session.clone(),
                 updates,
                 proof: PublicationProof::LiveValues,
+                scope: PublicationScope::Report(first.clone()),
             });
             let before = memory.revision().await.unwrap();
             let error = harness
@@ -7497,17 +8019,21 @@ mod publication_tests {
             }
             assert_eq!(harness.topology.states[&first].note, note);
             let stored = memory
-                .get(&format!("{}/freudian/topology", harness.scope))
+                .get(&keys.state_report(&first))
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(stored["states"][&first]["note"], note);
+            assert_eq!(stored["report"]["note"], note);
             assert!(harness.pending_publication.is_none());
         }
         harness.shutdown(false).await.unwrap();
         crate::tests::close_stores([memory]).await;
     }
 }
+
+#[cfg(test)]
+#[path = "topology_state_tests.rs"]
+mod topology_state_tests;
 
 #[cfg(test)]
 mod tool_result_tests {

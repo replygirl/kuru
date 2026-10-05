@@ -4,6 +4,7 @@ use kuru_memory::{MemoryStore, StoredNote};
 use serde_json::to_value;
 use tempfile::TempDir;
 
+use crate::topology_state::MembershipRecord;
 use crate::{NotesView, Topology, forget_note, project_scope, read_notes};
 
 async fn seeded(mode: Mode) -> (TempDir, MemoryStore, String, Topology) {
@@ -18,8 +19,8 @@ async fn seeded(mode: Mode) -> (TempDir, MemoryStore, String, Topology) {
     };
     memory
         .put(
-            &format!("{scope}/{mode}/topology"),
-            &to_value(&topology).unwrap(),
+            &format!("{scope}/{mode}/membership"),
+            &to_value(MembershipRecord::from_topology(&topology)).unwrap(),
         )
         .await
         .unwrap();
@@ -28,6 +29,44 @@ async fn seeded(mode: Mode) -> (TempDir, MemoryStore, String, Topology) {
 
 fn notes_key(scope: &str, mode: Mode, identity: &str) -> String {
     format!("{scope}/{mode}/identity/{identity}/notes")
+}
+
+#[tokio::test]
+async fn historical_topology_notes_inspection_does_not_initialize_membership() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir()?;
+        let memory = MemoryStore::temporary().await?;
+        let scope = project_scope(project.path())?;
+        let topology = Topology {
+            parts: Framework::builtin(Mode::Ifs).parts,
+            relationships: vec![],
+            states: Default::default(),
+            focus: None,
+        };
+        let identity = topology.parts[0].id.clone();
+        memory
+            .put(&format!("{scope}/ifs/topology"), &to_value(&topology)?)
+            .await?;
+        memory
+            .append(
+                &notes_key(&scope, Mode::Ifs, &identity),
+                "note",
+                "historical note",
+            )
+            .await?;
+        let before = memory.revision().await?;
+        let inspected = read_notes(&memory, project.path(), Mode::Ifs, &identity, 100).await?;
+        assert_eq!(inspected.notes[0].content, "historical note");
+        assert_eq!(memory.revision().await?, before);
+        assert!(
+            memory
+                .get(&format!("{scope}/ifs/membership"))
+                .await?
+                .is_none()
+        );
+        memory.close().await
+    })
+    .await
 }
 
 #[tokio::test]
@@ -145,8 +184,8 @@ async fn notes_view_reads_exact_archived_part_and_relationship_only() {
         topology.relationships.push(relationship.clone());
         memory
             .put(
-                &format!("{scope}/ifs/topology"),
-                &to_value(&topology).unwrap(),
+                &format!("{scope}/ifs/membership"),
+                &to_value(MembershipRecord::from_topology(&topology)).unwrap(),
             )
             .await
             .unwrap();
@@ -211,7 +250,7 @@ async fn notes_view_reports_n_plus_one_and_validates_its_live_mode() -> Result<(
             );
         }
         let revision = memory.revision().await?;
-        let missing_key = format!("{scope}/freudian/topology");
+        let missing_key = format!("{scope}/freudian/membership");
         assert!(memory.get(&missing_key).await?.is_none());
         assert!(
             read_notes(&memory, project.path(), Mode::Freudian, &identity, 1)

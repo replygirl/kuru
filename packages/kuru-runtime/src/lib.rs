@@ -7,6 +7,7 @@ mod engine;
 mod event;
 mod progress;
 pub mod server;
+mod topology_state;
 
 pub use bus::PeerMessage;
 pub use dream::{DreamProposal, DreamReport, undo_dream};

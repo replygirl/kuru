@@ -379,7 +379,7 @@ async fn read_only_open_of_v7_store_requires_writable_upgrade() -> Result<()> {
         Err(error) => format!("{error:#}"),
     };
     ensure!(
-        error.contains("memory schema version 7 requires writable upgrade to 9"),
+        error.contains("memory schema version 7 requires writable upgrade to 10"),
         "unexpected read-only refusal: {error}"
     );
     let server = super::super::tests::released_server(&options).await?;
@@ -1002,8 +1002,8 @@ async fn reused_completed_v8_attempt_with_disagreeing_backfill_fails_closed() ->
     after_cleanup(checked, server.close().await)
 }
 
-/// The test-only v10 step records its own publication like every step after
-/// the introducing one: its commit holds main's v2..v9 records and its own.
+/// The test-only v11 step records its own publication like every step after
+/// the introducing one: its commit holds main's v2..v10 records and its own.
 #[tokio::test]
 async fn later_step_records_itself_over_the_base_records() -> Result<()> {
     let store = MemoryStore::temporary_cold().await?;
@@ -1018,23 +1018,23 @@ async fn later_step_records_itself_over_the_base_records() -> Result<()> {
         )
         .await?;
         validate_active_with(TEST_REGISTRY, main).await?;
-        let (v10, v10_head) = sole_branch(main, 10).await?;
+        let (v11, v11_head) = sole_branch(main, 11).await?;
         let records = records_in(main).await?;
         ensure!(
             records[..records.len() - 1] == base_records[..],
-            "the v10 step changed earlier records"
+            "the v11 step changed earlier records"
         );
-        let own = records.last().context("no v10 record")?;
+        let own = records.last().context("no v11 record")?;
         ensure!(
-            own.version == 10
-                && own.branch == v10
-                && own.base == sole_parent(main, &v10_head).await?,
-            "the v10 record differs: {own:?}"
+            own.version == 11
+                && own.branch == v11
+                && own.base == sole_parent(main, &v11_head).await?,
+            "the v11 record differs: {own:?}"
         );
         let classified =
-            classify_historical_attempts_in(TEST_REGISTRY, main, 10, RESERVED_PREFIX).await?;
+            classify_historical_attempts_in(TEST_REGISTRY, main, 11, RESERVED_PREFIX).await?;
         ensure!(
-            classified.full == 0 && classified.by_record == 9,
+            classified.full == 0 && classified.by_record == 10,
             "classified {classified:?}"
         );
         Ok(())

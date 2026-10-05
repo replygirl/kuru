@@ -5,7 +5,7 @@ use super::*;
 use sqlx::{MySql, QueryBuilder};
 
 pub const MAX_STATE_BATCH_KEYS: usize = 256;
-/// Exact JSON encoding of the expectations and values, including escaped text.
+/// Cumulative stored JSON in the small coherent read batch.
 pub const MAX_STATE_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -56,6 +56,7 @@ pub(crate) fn validate_keys(keys: &[String]) -> Result<()> {
 pub(crate) fn validate_conditional(
     expected: &[(String, StateExpectation)],
     values: &[(String, Value)],
+    candidate: bool,
 ) -> Result<()> {
     ensure!(
         !expected.is_empty() && !values.is_empty(),
@@ -77,12 +78,7 @@ pub(crate) fn validate_conditional(
             );
         }
     }
-    encode_state(values)?;
-    ensure!(
-        serde_json::to_vec(&(expected, values))?.len() <= MAX_STATE_BATCH_BYTES,
-        "conditional state batch exceeds {MAX_STATE_BATCH_BYTES} encoded bytes"
-    );
-    Ok(())
+    crate::service::rpc::validate_conditional_request(expected, values, candidate)
 }
 
 fn checked_version(version: i64) -> Result<u64> {
@@ -205,7 +201,7 @@ impl MemoryStore {
         expected: &[(String, StateExpectation)],
         values: &[(String, Value)],
     ) -> Result<()> {
-        validate_conditional(expected, values)?;
+        validate_conditional(expected, values, self.branch != "main")?;
         self.writable()?;
         ensure!(
             self.schema_version().await? >= migrations::STATE_VERSION,
@@ -311,17 +307,29 @@ mod tests {
 
     #[test]
     fn conditional_state_exact_encoded_byte_boundary() -> Result<()> {
+        use crate::service::rpc::{
+            OPERATION_FRAME_LIMIT, ServiceCall, ServiceRequest, ViewOperation, encoded_bytes,
+        };
         let expected = vec![("key".into(), StateExpectation::Absent)];
         let mut values = vec![("key".into(), json!(""))];
-        let overhead = serde_json::to_vec(&(&expected, &values))?.len();
-        values[0].1 = json!("x".repeat(MAX_STATE_BATCH_BYTES - overhead));
-        assert_eq!(
-            serde_json::to_vec(&(&expected, &values))?.len(),
-            MAX_STATE_BATCH_BYTES
-        );
-        validate_conditional(&expected, &values)?;
-        values[0].1 = json!("x".repeat(MAX_STATE_BATCH_BYTES - overhead + 1));
-        assert!(validate_conditional(&expected, &values).is_err());
+        for candidate in [false, true] {
+            let request = ServiceRequest::with_id(
+                "00000000-0000-0000-0000-000000000000",
+                Uuid::nil(),
+                ServiceCall::View {
+                    candidate: candidate.then(Uuid::nil),
+                    operation: Box::new(ViewOperation::PutManyConditional {
+                        expected: expected.clone(),
+                        values: vec![("key".into(), json!(""))],
+                    }),
+                },
+            );
+            let overhead = encoded_bytes(&request)?;
+            values[0].1 = json!("x".repeat(OPERATION_FRAME_LIMIT - overhead));
+            validate_conditional(&expected, &values, candidate)?;
+            values[0].1 = json!("x".repeat(OPERATION_FRAME_LIMIT - overhead + 1));
+            assert!(validate_conditional(&expected, &values, candidate).is_err());
+        }
         Ok(())
     }
 
@@ -563,7 +571,13 @@ mod tests {
                 store
                     .put_many_conditional(
                         &[("valid".into(), StateExpectation::Absent)],
-                        &[("valid".into(), json!("x".repeat(MAX_STATE_BATCH_BYTES)))]
+                        &[(
+                            "valid".into(),
+                            json!(
+                                "\u{0001}"
+                                    .repeat(crate::service::rpc::OPERATION_FRAME_LIMIT / 6 + 1)
+                            )
+                        )]
                     )
                     .await
                     .is_err()

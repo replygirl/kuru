@@ -4,7 +4,7 @@ use kuru_core::{
     ActorPhase, Config, Mode, Part, ToolSpec, canonical_peer_instruction,
     validate_consolidation_plan,
 };
-use kuru_memory::{Candidate, CandidateConflict, MemoryStore};
+use kuru_memory::{Candidate, CandidateConflict, MemoryStore, StateExpectation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -13,11 +13,11 @@ use crate::{
     Event,
     engine::{
         CancellationToken, CandidatePromotionStatus, Harness, OfferedTools,
-        PendingCandidateResolution, PendingPublication, PublicationProof, Session,
-        ToolHookAdmission, Topology, checked_state_keys, prepared_actor_namespaces,
-        read_topology_with_profile, run_post_tool_hooks, spec, turn_was_cancelled, user,
-        validate_topology_with_profile,
+        PendingCandidateResolution, PendingPublication, PublicationProof, PublicationScope,
+        Session, ToolHookAdmission, Topology, checked_state_keys, prepared_actor_namespaces,
+        run_post_tool_hooks, spec, turn_was_cancelled, user, validate_topology_with_profile,
     },
+    topology_state::{self, MembershipRecord},
 };
 
 #[cfg(test)]
@@ -83,15 +83,6 @@ impl Harness {
         #[cfg(test)]
         self.step_timings.mark("dream lease acquired");
         cancellation.check()?;
-        let active = self
-            .topology
-            .parts
-            .iter()
-            .filter(|part| part.active)
-            .map(|part| part.id.clone())
-            .collect::<Vec<_>>();
-        let plan = self.profile.memory.consolidation_plan(&active);
-        validate_consolidation_plan(&plan, &active.iter().cloned().collect())?;
         self.operation_id = format!("dream-{}", Uuid::new_v4());
         let hook_host = self.hook_host();
         let hook_budget = hook_host.budget();
@@ -106,9 +97,15 @@ impl Harness {
         let outcome = async {
             cancellation.check()?;
             let memory = candidate.view();
+            let snapshot = topology_state::load(&memory, &checked_state_keys(&self.scope, &self.profile)?, &self.profile, None, None).await?;
+            validate_topology_with_profile(&snapshot.topology, &self.config, &self.profile)?;
+            self.prepare_candidate_actors(&snapshot.topology)?;
+            let active = snapshot.topology.parts.iter().filter(|part| part.active).map(|part| part.id.clone()).collect::<Vec<_>>();
+            let plan = self.profile.memory.consolidation_plan(&active);
+            validate_consolidation_plan(&plan, &active.iter().cloned().collect())?;
             self.emit_event(Event::Dream { actor: "pool".into(), detail: "parts are consolidating their own memories".into() });
             let ids = &plan.participants;
-            let replies = join_all(ids.iter().map(|id| self.ask_in_controlled_with_invocation(&memory, id,
+            let replies = join_all(ids.iter().map(|id| self.ask_in_controlled_with_invocation(&memory, &snapshot.topology, id,
                 vec![user(&plan.prompt)],
                 (&plan.phase, ActorPhase::Dream), dream_tools.clone(), cancellation))).await;
             let mut report = DreamReport::default();
@@ -226,10 +223,10 @@ impl Harness {
                     }
                 }
             }
-            let (topology, changes) = self.plan_dream(proposals)?;
+            let (topology, changes) = self.plan_dream(&snapshot.topology, proposals)?;
             report.accepted = changes.accepted;
             report.rejected.extend(changes.rejected);
-            self.finish_dream(&candidate, topology, &report, cancellation)
+            self.finish_dream(&candidate, &snapshot.topology, snapshot.expectation, topology, &report, cancellation)
                 .await?;
             self.emit_event(Event::Dream {
                 actor: "pool".into(),
@@ -251,13 +248,29 @@ impl Harness {
     pub async fn apply_dream(&mut self, proposals: Vec<DreamProposal>) -> Result<DreamReport> {
         self.reconcile().await?;
         let _dream_lease = self.memory.acquire_dream_lease().await?;
-        let (topology, report) = self.plan_dream(proposals)?;
         let candidate = self.memory.begin_candidate("dream").await?;
         self.pending_candidate = Some(candidate.clone());
         let cancellation = CancellationToken::new();
         let outcome = async {
-            self.finish_dream(&candidate, topology, &report, &cancellation)
-                .await?;
+            let snapshot = topology_state::load(
+                &candidate.view(),
+                &checked_state_keys(&self.scope, &self.profile)?,
+                &self.profile,
+                None,
+                None,
+            )
+            .await?;
+            validate_topology_with_profile(&snapshot.topology, &self.config, &self.profile)?;
+            let (topology, report) = self.plan_dream(&snapshot.topology, proposals)?;
+            self.finish_dream(
+                &candidate,
+                &snapshot.topology,
+                snapshot.expectation,
+                topology,
+                &report,
+                &cancellation,
+            )
+            .await?;
             Ok(report)
         }
         .await;
@@ -267,6 +280,8 @@ impl Harness {
     async fn finish_dream(
         &mut self,
         candidate: &Candidate,
+        original: &Topology,
+        expectation: StateExpectation,
         topology: Topology,
         report: &DreamReport,
         cancellation: &CancellationToken,
@@ -280,13 +295,24 @@ impl Harness {
             json!({"id":Uuid::new_v4(), "base":candidate.base()}),
         )];
         if !report.accepted.is_empty() {
-            extra.push((keys.dream_undo, serde_json::to_value(&self.topology)?));
+            extra.push((
+                keys.dream_undo.clone(),
+                serde_json::to_value(MembershipRecord::from_topology(original))?,
+            ));
+            extra.push((
+                keys.membership.clone(),
+                serde_json::to_value(MembershipRecord::from_topology(&topology))?,
+            ));
         }
-        let updates = self
-            .state_updates(&self.profile, &topology, &self.session, extra)
-            .await?;
+        let updates = extra;
         cancellation.check()?;
-        memory.put_many(&updates).await?;
+        if report.accepted.is_empty() {
+            memory.put_many(&updates).await?;
+        } else {
+            memory
+                .put_many_conditional(&[(keys.membership, expectation)], &updates)
+                .await?;
+        }
         cancellation.check()?;
         memory
             .append(
@@ -310,6 +336,7 @@ impl Harness {
                 report: report.clone(),
                 status: CandidatePromotionStatus::Pending,
             },
+            scope: PublicationScope::Membership { session: false },
         });
         #[cfg(test)]
         self.pause_before_dream_promotion().await?;
@@ -451,15 +478,20 @@ impl Harness {
         self.pending_candidate = None;
         self.pending_publication = None;
         self.pending_candidate_resolution = PendingCandidateResolution::AutomaticCleanup;
+        self.restore_live_actors()?;
         Ok(())
     }
 
-    fn plan_dream(&self, proposals: Vec<DreamProposal>) -> Result<(Topology, DreamReport)> {
+    fn plan_dream(
+        &self,
+        original: &Topology,
+        proposals: Vec<DreamProposal>,
+    ) -> Result<(Topology, DreamReport)> {
         ensure!(
             proposals.len() <= self.config.max_parts * 2,
             "too many dream proposals"
         );
-        let mut topology = self.topology.clone();
+        let mut topology = original.clone();
         let mut report = DreamReport::default();
         for proposal in proposals {
             let mut candidate = topology.clone();
@@ -528,11 +560,12 @@ impl Harness {
             Some(&self.profile),
         )
         .await?;
-        self.persist_state(
-            self.config.clone(),
+        self.persist_membership(
             undo.topology,
-            self.session.clone(),
+            undo.expectation,
             vec![(undo.key, json!(null))],
+            false,
+            None,
         )
         .await
     }
@@ -549,17 +582,24 @@ pub async fn undo_dream(
 ) -> Result<()> {
     let undo = prepare_undo_dream(config, scope, memory, resume, None).await?;
     memory
-        .put_many(&[
-            (undo.topology_key, serde_json::to_value(&undo.topology)?),
-            (undo.key, json!(null)),
-        ])
+        .put_many_conditional(
+            &[(undo.membership_key.clone(), undo.expectation)],
+            &[
+                (
+                    undo.membership_key,
+                    serde_json::to_value(MembershipRecord::from_topology(&undo.topology))?,
+                ),
+                (undo.key, json!(null)),
+            ],
+        )
         .await?;
     memory.reconcile().await?;
     Ok(())
 }
 
 struct UndoDream {
-    topology_key: String,
+    membership_key: String,
+    expectation: StateExpectation,
     topology: Topology,
     key: String,
 }
@@ -588,20 +628,28 @@ async fn prepare_undo_dream(
         builtin = kuru_core::ModeProfile::builtin(mode);
         &builtin
     };
-    let current = read_topology_with_profile(memory, scope, profile).await?;
     let keys = checked_state_keys(scope, profile)?;
+    let snapshot = topology_state::load(memory, &keys, profile, None, None).await?;
+    let current = snapshot.topology;
     let key = keys.dream_undo;
     let value = memory
         .get(&key)
         .await?
         .filter(|value| !value.is_null())
         .context("no dreaming change to undo")?;
-    let previous: Topology = serde_json::from_value(value)?;
+    let previous = MembershipRecord::decode(value, true)?;
+    let previous = Topology {
+        parts: previous.parts,
+        relationships: previous.relationships,
+        states: current.states.clone(),
+        focus: None,
+    };
     validate_topology_with_profile(&previous, &config, profile)?;
     let restored = restore_topology(previous, &current);
     validate_topology_with_profile(&restored, &config, profile)?;
     Ok(UndoDream {
-        topology_key: keys.topology,
+        membership_key: keys.membership,
+        expectation: snapshot.expectation,
         topology: restored,
         key,
     })
@@ -708,6 +756,8 @@ mod cancellation_tests {
             let error = harness
                 .finish_dream(
                     &candidate,
+                    &harness.topology.clone(),
+                    StateExpectation::Absent,
                     harness.topology.clone(),
                     &DreamReport::default(),
                     &cancellation,
@@ -764,15 +814,33 @@ mod cancellation_tests {
             let scope = harness.scope.clone();
             let role = harness.topology.parts[0].role.clone();
             let (topology, report) = harness
-                .plan_dream(vec![DreamProposal::Add {
-                    name: "Accepted promotion".into(),
-                    role,
-                    instruction: "Remain durable when cancellation loses the promotion race".into(),
-                }])
+                .plan_dream(
+                    &harness.topology,
+                    vec![DreamProposal::Add {
+                        name: "Accepted promotion".into(),
+                        role,
+                        instruction: "Remain durable when cancellation loses the promotion race"
+                            .into(),
+                    }],
+                )
                 .unwrap();
             let expected = serde_json::to_value(&topology).unwrap();
             let before = memory.revision().await.unwrap();
             let candidate = memory.begin_candidate("accepted promotion").await.unwrap();
+            let original = harness.topology.clone();
+            let expectation = StateExpectation::Version(
+                candidate
+                    .view()
+                    .get_versioned(
+                        &checked_state_keys(&harness.scope, &harness.profile)
+                            .unwrap()
+                            .membership,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version,
+            );
             let (promoted, release) = harness.pause_after_next_memory_write();
             let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
             let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
@@ -780,7 +848,14 @@ mod cancellation_tests {
             let controlled = cancellation.clone();
             let mut task = tokio::spawn(async move {
                 let result = harness
-                    .finish_dream(&candidate, topology, &report, &controlled)
+                    .finish_dream(
+                        &candidate,
+                        &original,
+                        expectation,
+                        topology,
+                        &report,
+                        &controlled,
+                    )
                     .await;
                 (harness, candidate, result)
             });
@@ -970,20 +1045,25 @@ mod cancellation_tests {
             .unwrap();
             let role = harness.topology.parts[0].role.clone();
             let (topology, report) = harness
-                .plan_dream(vec![DreamProposal::Add {
-                    name: "Proven later".into(),
-                    role,
-                    instruction: "Keep the exact promoted result".into(),
-                }])
+                .plan_dream(
+                    &harness.topology,
+                    vec![DreamProposal::Add {
+                        name: "Proven later".into(),
+                        role,
+                        instruction: "Keep the exact promoted result".into(),
+                    }],
+                )
                 .unwrap();
             let candidate = memory.begin_candidate("settled promotion").await.unwrap();
             let base = candidate.base().to_owned();
             let actor_namespaces =
                 prepared_actor_namespaces(&harness.scope, &harness.profile, &topology).unwrap();
-            let updates = harness
-                .state_updates(&harness.profile, &topology, &harness.session, vec![])
-                .await
-                .unwrap();
+            let updates = vec![(
+                checked_state_keys(&harness.scope, &harness.profile)
+                    .unwrap()
+                    .membership,
+                serde_json::to_value(MembershipRecord::from_topology(&topology)).unwrap(),
+            )];
             candidate.view().put_many(&updates).await.unwrap();
             let target = candidate.view().revision().await.unwrap();
             let promoted = candidate.promote().await.unwrap();
@@ -1012,6 +1092,7 @@ mod cancellation_tests {
                     report,
                     status: CandidatePromotionStatus::Confirmed(promoted),
                 },
+                scope: PublicationScope::Membership { session: false },
             });
             harness.reconcile().await.unwrap();
             assert!(harness.pending_candidate.is_none());
