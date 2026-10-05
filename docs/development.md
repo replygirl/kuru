@@ -2307,9 +2307,11 @@ actual version. It is a definite refusal and clears the remote uncertainty
 fence. Accepted writes use the existing exact logical receipt and recovery path.
 Negative stored versions and signed-64-bit overflow abort the whole transaction.
 
-Conditional batches accept at most 256 distinct keys and 16 MiB for the exact
-JSON encoding of `(expectations, values)`, including escaping. The local and
-remote facades validate before mutation acceptance. `get_many` accepts at most
+Conditional batches accept at most 256 distinct keys within the existing 100 MiB
+service request envelope. The bound counts the exact complete request encoding,
+including generation, operation identifiers, candidate selection and JSON
+escaping; it is not a payload-only allowance. The local and remote facades
+validate before mutation acceptance. `get_many` accepts at most
 256 distinct keys, reads one consistent snapshot in request order, and retains
 an explicit `None` for missing keys. `get_many_versioned` returns each value and
 its version from that same bounded snapshot on schema 9; the value-only batch
@@ -2319,6 +2321,23 @@ oversized values in SQL before transfer. Scalar reads and legacy unconditional
 writes keep their existing size contract. Keys retain exact binary identity;
 case and accents do not alias. Versioned APIs require schema 9. The separate
 private usage ledger remains on its own schema-4 branch and SQL contract.
+
+`begin_state_read_cut` captures one committed live or candidate revision, with
+its project, branch and schema provenance. `get_versioned` and prefix `page`
+read only that revision; opaque cursors belong to that cut and exact prefix.
+Pages contain at most 256 rows and normally target 16 MiB. A larger first row
+can advance the page if its complete encoded reply fits the existing 100 MiB
+service envelope. SQL suppresses an individually oversized stored value before
+decoding, and exact reply encoding is checked before returning a page. Paging
+holds no write transaction or writer lease between calls.
+
+Every remote cut has a dedicated read-only attachment. Candidate selection
+checks the exact captured open ref and head; it cannot transfer candidate write
+authority. `close` is idempotent, and cancellation or last-drop disconnect
+releases that attachment's handles. Interrupted close remains retryable. Handles
+are bound to the attachment and owner generation, so a foreign reader or a
+restarted owner refuses them. Closing a cut releases its revision-pool reference
+without closing another cut or export that shares the pool.
 
 Each typed memory service operation (`ServiceCall`, `ViewOperation` and
 `LedgerOperation` in `packages/kuru-memory/src/service/rpc.rs`) has one entry in

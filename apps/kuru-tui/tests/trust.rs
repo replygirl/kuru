@@ -15,12 +15,12 @@ use async_trait::async_trait;
 use axum::{Router, body::Bytes, extract::State, routing::any};
 use kuru_connectors::{DemoProvider, Provider, ToolHost};
 use kuru_core::{
-    CompletionRequest, Config, ConfigSnapshot, InvocationOverrides, McpConfig, ModelInfo,
+    CompletionRequest, Config, ConfigSnapshot, InvocationOverrides, McpConfig, ModelInfo, Part,
     ProjectPreferences,
 };
 use kuru_delivery::command::BlockingCommand as Command;
 use kuru_memory::MemoryStore;
-use kuru_runtime::{DreamProposal, Harness, Topology};
+use kuru_runtime::{DreamProposal, Harness};
 use serde_json::{Value, json};
 
 #[allow(dead_code)] // The shared HTTPS fixture's token counters are used by cli.rs and terminal.rs.
@@ -1549,17 +1549,15 @@ async fn reached_undo_uses_only_approved_memory_authority_and_no_provider_route(
                 .iter()
                 .any(|message| message.plain_text() == Some("later private conversation"))
         );
-        let topology: Topology = serde_json::from_value(
-            memory
-                .get(&format!("{scope}/ifs/topology"))
-                .await
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+        let membership = memory
+            .get(&format!("{scope}/ifs/membership"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(membership["record_format"], "membership.v1");
+        let parts: Vec<Part> = serde_json::from_value(membership["parts"].clone()).unwrap();
         assert!(
-            !topology
-                .parts
+            !parts
                 .iter()
                 .find(|part| part.id == added)
                 .unwrap()

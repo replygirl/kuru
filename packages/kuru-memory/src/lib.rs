@@ -17,7 +17,7 @@ mod store;
 pub use facade::{
     ActiveExportSnapshot, Candidate, CandidateTransitionRecovery, CandidateTransitionResolution,
     CandidateUnitRecovery, DreamLease, ExportCursor, ExportPage, MemoryStore, MemoryView,
-    SelectedAbandonResolution, SelectedAbandonUncertain, UsageLedger,
+    SelectedAbandonResolution, SelectedAbandonUncertain, StateReadCut, UsageLedger,
 };
 pub use progress::{MemoryOpenProgress, MemoryOpenStage};
 pub use store::purge::PurgeOutcome;
@@ -39,7 +39,8 @@ pub use store::{
     public_turn_legacy_continuation_node_id, public_turn_node_id,
 };
 pub use store::{
-    MAX_STATE_BATCH_BYTES, MAX_STATE_BATCH_KEYS, StateExpectation, StateStale, VersionedValue,
+    MAX_STATE_BATCH_BYTES, MAX_STATE_BATCH_KEYS, StateExpectation, StateReadCursor, StateReadPage,
+    StateReadProvenance, StateStale, VersionedValue,
 };
 
 #[cfg(any(test, feature = "test-support"))]

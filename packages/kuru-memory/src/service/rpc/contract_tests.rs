@@ -8,6 +8,69 @@ use serde_json::json;
 const HANDLE: Uuid = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
 const GENERATION: &str = "01234567-89ab-cdef-0123-456789abcdef";
 
+#[test]
+fn state_cut_and_conditional_envelope_counts_match_actual_wire_serialization() -> Result<()> {
+    let expected = vec![("escaped/\"key".into(), crate::StateExpectation::Absent)];
+    let values = vec![("escaped/\"key".into(), json!({"text":"\u{1}\\\"é"}))];
+    for candidate in [None, Some(HANDLE)] {
+        let request = ServiceRequest::with_id(
+            GENERATION,
+            HANDLE,
+            ServiceCall::View {
+                candidate,
+                operation: Box::new(ViewOperation::PutManyConditional {
+                    expected: expected.clone(),
+                    values: values.clone(),
+                }),
+            },
+        );
+        let empty = ServiceRequest::with_id(
+            GENERATION,
+            HANDLE,
+            ServiceCall::View {
+                candidate,
+                operation: Box::new(ViewOperation::PutManyConditional {
+                    expected: vec![],
+                    values: vec![],
+                }),
+            },
+        );
+        assert_eq!(
+            encoded_bytes(&request)?,
+            encoded_bytes(&empty)? - 4 + encoded_bytes(&expected)? + encoded_bytes(&values)?
+        );
+        validate_conditional_request(&expected, &values, candidate.is_some())?;
+    }
+    let value = crate::VersionedValue {
+        value: json!({"escaped":"\u{1}é"}),
+        version: i64::MAX as u64,
+    };
+    let point = Some(value.clone());
+    let actual = ServiceReply {
+        id: HANDLE,
+        generation: GENERATION.into(),
+        response: ServiceResponse::Success(Box::new(ServiceValue::VersionedValue(point.clone()))),
+    };
+    assert_eq!(
+        state_cut_reply_bytes("versioned_value", &point)?,
+        encoded_bytes(&actual)?
+    );
+    let page = crate::store::StateReadPage {
+        values: vec![("key".into(), value)],
+        next: Some(serde_json::from_value(
+            json!({"snapshot":HANDLE,"prefix":"prefix/","after":[1,2]}),
+        )?),
+    };
+    let counted = state_cut_reply_bytes("state_read_page", &page)?;
+    let actual = ServiceReply {
+        id: HANDLE,
+        generation: GENERATION.into(),
+        response: ServiceResponse::Success(Box::new(ServiceValue::StateReadPage(page))),
+    };
+    assert_eq!(counted, encoded_bytes(&actual)?);
+    Ok(())
+}
+
 fn message() -> Message {
     Message::text("user", "hello")
 }
@@ -369,6 +432,24 @@ pub(super) fn service_call_samples() -> Result<Vec<ServiceCall>> {
             handle: HANDLE,
             cursor: Some(export_cursor),
         },
+        ServiceCall::BeginStateReadCut {
+            candidate: Some(StateReadCandidate {
+                branch: "candidate_exact".into(),
+                revision: "revision".into(),
+            }),
+        },
+        ServiceCall::StateReadCutGet {
+            handle: HANDLE,
+            key: "key".into(),
+        },
+        ServiceCall::StateReadCutPage {
+            handle: HANDLE,
+            prefix: "prefix/".into(),
+            cursor: Some(serde_json::from_value(json!({
+                "snapshot": HANDLE, "prefix": "prefix/", "after": [1],
+            }))?),
+        },
+        ServiceCall::CloseStateReadCut { handle: HANDLE },
     ])
 }
 
@@ -442,6 +523,10 @@ const CLASSIFICATION: &[(&str, bool, Option<&str>)] = &[
     ("ledger_outcome", false, None),
     ("begin_export", false, None),
     ("export_page", false, None),
+    ("begin_state_read_cut", false, None),
+    ("state_read_cut_get", false, None),
+    ("state_read_cut_page", false, None),
+    ("close_state_read_cut", false, None),
     ("view.append", true, Some("view.append")),
     ("view.append_message", true, Some("view.append_message")),
     (

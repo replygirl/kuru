@@ -532,6 +532,8 @@ impl MemoryPolicy for OtherMemory {
     fn state_keys(&self, scope: &str, mode: Mode) -> StateKeys {
         StateKeys {
             topology: format!("{scope}/{mode}/topology"),
+            membership: format!("{scope}/{mode}/membership"),
+            state_prefix: format!("{scope}/{mode}/state/"),
             dream_undo: format!("{scope}/{mode}/dream-undo"),
         }
     }

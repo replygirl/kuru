@@ -30,6 +30,8 @@ impl MemoryPolicy for OrderedOneProposal {
         StateKeys {
             topology: format!("{scope}/{mode}/topology"),
             dream_undo: format!("{scope}/{mode}/dream-undo"),
+            membership: format!("{scope}/{mode}/membership"),
+            state_prefix: format!("{scope}/{mode}/state/"),
         }
     }
 

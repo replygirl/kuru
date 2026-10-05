@@ -58,6 +58,8 @@ impl MemoryPolicy for AlternateMemory {
         StateKeys {
             topology: format!("{scope}/{mode}/topology"),
             dream_undo: format!("{scope}/{mode}/dream-undo"),
+            membership: format!("{scope}/{mode}/membership"),
+            state_prefix: format!("{scope}/{mode}/state/"),
         }
     }
 
@@ -536,7 +538,9 @@ fn builtin_memory_namespaces_and_consolidation_plans_remain_exact() {
             profile.memory.state_keys(scope, mode),
             StateKeys {
                 topology: format!("{scope}/{mode}/topology"),
-                dream_undo: format!("{scope}/{mode}/dream-undo")
+                dream_undo: format!("{scope}/{mode}/dream-undo"),
+                membership: format!("{scope}/{mode}/membership"),
+                state_prefix: format!("{scope}/{mode}/state/"),
             }
         );
         assert_eq!(

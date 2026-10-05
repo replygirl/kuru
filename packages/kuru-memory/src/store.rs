@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit};
 use uuid::Uuid;
 
+mod state_read_cut;
 pub(crate) mod versioned_state;
+pub use state_read_cut::{StateReadCursor, StateReadCut, StateReadPage, StateReadProvenance};
 pub use versioned_state::{
     MAX_STATE_BATCH_BYTES, MAX_STATE_BATCH_KEYS, StateExpectation, StateStale, VersionedValue,
 };
@@ -11197,7 +11199,7 @@ mod tests {
                 (Some(6), false) => "attempt newer than its schema",
                 (Some(7), false) => "attempt newer than its schema",
                 (Some(8), false) => "attempt newer than its schema",
-                (None, true) => "unsupported Dolt memory schema version 10",
+                (None, true) => "unsupported Dolt memory schema version 11",
                 _ => unreachable!(),
             };
             assert!(rendered.contains(expected), "{case}: {rendered}");

@@ -16,7 +16,7 @@ use serde_json::json;
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::{
-    CancellationToken, DreamProposal, Harness, Topology,
+    CancellationToken, DreamProposal, Harness,
     engine::{
         CandidatePromotionStatus, CandidateResolutionRequired, PendingPublication,
         PublicationProof, turn_was_cancelled,
@@ -386,7 +386,7 @@ async fn stale_periodic_dream_failure_preserves_the_exact_completed_output() {
                     serde_json::to_value(report).unwrap(),
                 )
             }
-            PublicationProof::LiveValues | PublicationProof::LiveValuesAndCatalogMode(_) => {
+            PublicationProof::LiveValues | PublicationProof::LiveValuesAndCatalogMode { .. } => {
                 panic!("stale periodic dream changed its publication proof")
             }
         };
@@ -755,7 +755,23 @@ async fn canonical_dream_additions_survive_promotion_stopped_reload_and_reversal
             .find(|part| part.id == legacy_id)
             .unwrap()
             .instruction = legacy_instruction.into();
-        harness.save().await.unwrap();
+        let keys = crate::engine::checked_state_keys(&harness.scope, &harness.profile).unwrap();
+        let version = memory
+            .get_versioned(&keys.membership)
+            .await
+            .unwrap()
+            .unwrap()
+            .version;
+        harness
+            .persist_membership(
+                harness.topology.clone(),
+                kuru_memory::StateExpectation::Version(version),
+                vec![],
+                false,
+                None,
+            )
+            .await
+            .unwrap();
         let role = harness.topology.parts[0].role.clone();
         let tendency = "Keep the reviewed tendency bytes unchanged 🪶";
         let canonical = canonical_peer_instruction(tendency).unwrap();
@@ -941,17 +957,9 @@ async fn cancelled_live_undo_reconciles_before_a_later_save() {
                 .active
         );
         harness.set_effort(Some("high".into())).await.unwrap();
-        let durable: Topology = serde_json::from_value(
-            memory
-                .get(&format!(
-                    "{}/{}/topology",
-                    harness.scope, harness.config.mode
-                ))
-                .await
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+        let durable = crate::engine::read_topology(&memory, &harness.scope, harness.config.mode)
+            .await
+            .unwrap();
         assert!(
             !durable
                 .parts
@@ -1007,6 +1015,7 @@ async fn reconciliation_publishes_only_durable_choices_before_the_next_mutation(
             session: harness.session.clone(),
             updates: updates.clone(),
             proof: super::engine::PublicationProof::LiveValues,
+            scope: super::engine::PublicationScope::Session,
         });
         memory.put_many(&updates).await.unwrap();
         assert_eq!(harness.config.model, "demo");
@@ -1028,6 +1037,7 @@ async fn reconciliation_publishes_only_durable_choices_before_the_next_mutation(
             session: harness.session.clone(),
             updates: vec![("missing-write".into(), json!(true))],
             proof: super::engine::PublicationProof::LiveValues,
+            scope: super::engine::PublicationScope::Session,
         });
         harness.reconcile().await.unwrap();
         assert_eq!(harness.config.model, "durable-model");

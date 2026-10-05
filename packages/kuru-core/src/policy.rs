@@ -114,6 +114,20 @@ pub trait VisibilityPolicy: Send + Sync {
 pub struct StateKeys {
     pub topology: String,
     pub dream_undo: String,
+    pub membership: String,
+    pub state_prefix: String,
+}
+
+impl StateKeys {
+    /// Bound SQL keys without changing the exact retained identity.
+    pub fn state_report(&self, identity: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let suffix = Sha256::digest(identity.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("{}{suffix}", self.state_prefix)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,7 +249,9 @@ impl ModeProfile {
         let state = self.memory.state_keys("project/example", self.mode);
         ensure!(
             state.topology == format!("project/example/{}/topology", self.mode)
-                && state.dream_undo == format!("project/example/{}/dream-undo", self.mode),
+                && state.dream_undo == format!("project/example/{}/dream-undo", self.mode)
+                && state.membership == format!("project/example/{}/membership", self.mode)
+                && state.state_prefix == format!("project/example/{}/state/", self.mode),
             "invalid mode state keys"
         );
         let active = seeds.iter().map(|part| part.id.clone()).collect::<Vec<_>>();
@@ -579,6 +595,8 @@ impl MemoryPolicy for ReferenceMemory {
         StateKeys {
             topology: format!("{scope}/{mode}/topology"),
             dream_undo: format!("{scope}/{mode}/dream-undo"),
+            membership: format!("{scope}/{mode}/membership"),
+            state_prefix: format!("{scope}/{mode}/state/"),
         }
     }
     fn consolidation_plan(&self, active_parts: &[String]) -> ConsolidationPlan {

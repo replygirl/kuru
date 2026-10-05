@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::server::Server;
 
-pub(super) const CURRENT_VERSION: i32 = 9;
+pub(super) const CURRENT_VERSION: i32 = 10;
 pub(super) const STATE_VERSION: i32 = 9;
 pub(super) const USAGE_CURRENT_VERSION: i32 = 4;
 /// The main schema step that introduces publication records: every main step
@@ -538,7 +538,21 @@ const V9: Definition = Definition {
     }],
 };
 
-const DEFINITIONS: &[Definition] = &[V2, V3, V4, V5, V6, V7, V8, V9];
+mod topology_state;
+
+const V10: Definition = Definition {
+    from: 9,
+    to: 10,
+    id: "kuru.memory.split-topology.v10",
+    sql: &[],
+    transform: "then-latest mode topology materializes membership.v1 and SHA256 exact-identity state_report.v1 rows; legacy bytes stay unchanged; project focus is not assigned to sessions",
+    postcondition: "version=10;all legacy mode topology destinations materialized atomically with conflict refusal;new rows have version zero;existing equal destinations retain their versions",
+    // This step has no nontransactional DDL. A refused transform rolls back to
+    // its pristine source; dirty state is never a permitted failed attempt.
+    failed_status: &[],
+};
+
+const DEFINITIONS: &[Definition] = &[V2, V3, V4, V5, V6, V7, V8, V9, V10];
 
 #[derive(Clone, Copy)]
 struct Registry {
@@ -612,7 +626,8 @@ impl Registry {
                 );
             }
             ensure!(
-                !definition.sql.is_empty() && definition.sql.len() <= DEFINITION_LIMIT,
+                (!definition.sql.is_empty() || definition.id == V10.id)
+                    && definition.sql.len() <= DEFINITION_LIMIT,
                 "invalid compiled Dolt migration SQL"
             );
             for statement in definition.sql {
@@ -878,9 +893,9 @@ async fn validate_schema_on(
         );
     }
     #[cfg(test)]
-    if registry.current >= 10 && found >= 10 {
+    if registry.current >= 11 && found >= 11 {
         bounded_query(
-            sqlx::query("SELECT marker FROM kuru_migration_test_v10 LIMIT 0")
+            sqlx::query("SELECT marker FROM kuru_migration_test_v11 LIMIT 0")
                 .fetch_all(&mut *connection),
         )
         .await?;
@@ -2688,6 +2703,9 @@ async fn build_attempt(
         if let Some(source_revision) = source_revision.as_deref() {
             migrate_legacy_session_catalog(&mut connection, source_revision).await?;
         }
+        if definition.id == V10.id {
+            topology_state::materialize(&mut connection).await?;
+        }
         let advanced = bounded_query(
             sqlx::query(ATTEMPT_ADVANCE)
                 .bind(definition.to)
@@ -3025,15 +3043,15 @@ mod tests {
 
     /// A test-only step after the real publication-record step: it records
     /// its own publication like every later main step.
-    const V10: Definition = Definition {
-        from: 9,
-        to: 10,
-        id: "kuru.memory.test-marker.v10",
-        sql: &["CREATE TABLE kuru_migration_test_v10 (marker INT PRIMARY KEY)"],
+    const V11: Definition = Definition {
+        from: 10,
+        to: 11,
+        id: "kuru.memory.test-marker.v11",
+        sql: &["CREATE TABLE kuru_migration_test_v11 (marker INT PRIMARY KEY)"],
         transform: "none",
-        postcondition: "version=10;test marker table exists;v8 publication records remain exact",
+        postcondition: "version=11;test marker table exists;v8 publication records remain exact",
         failed_status: &[StatusRow {
-            table: "kuru_migration_test_v10",
+            table: "kuru_migration_test_v11",
             staged: 0,
             status: "new table",
         }],
@@ -3047,11 +3065,25 @@ mod tests {
         super::V7,
         super::V8,
         super::V9,
-        V10,
+        super::V10,
+        V11,
     ];
     pub(super) const TEST_REGISTRY: Registry = Registry {
-        current: 10,
+        current: 11,
         definitions: TEST_DEFINITIONS,
+    };
+    pub(super) const RELEASED_V9_REGISTRY: Registry = Registry {
+        current: 9,
+        definitions: &[
+            V2,
+            super::V3,
+            super::V4,
+            super::V5,
+            super::V6,
+            super::V7,
+            super::V8,
+            super::V9,
+        ],
     };
     pub(super) const RELEASED_V8_REGISTRY: Registry = Registry {
         current: 8,
@@ -3125,19 +3157,303 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v8_registry_rejects_v9_store_without_mutating_it() -> Result<()> {
+    async fn v8_registry_rejects_current_store_without_mutating_it() -> Result<()> {
         let store = super::super::MemoryStore::temporary_cold().await?;
         let before = durable_snapshot(&store.pool).await?;
         let error = validate_active_with(RELEASED_V8_REGISTRY, &store.pool)
             .await
-            .expect_err("a v8 binary must reject v9 memory before opening it for writes");
+            .expect_err("a v8 binary must reject current memory before opening it for writes");
         assert!(
-            format!("{error:#}").contains("unsupported Dolt memory schema version 9"),
+            format!("{error:#}").contains(&format!(
+                "unsupported Dolt memory schema version {CURRENT_VERSION}"
+            )),
             "unexpected older-registry refusal: {error:#}"
         );
         assert_eq!(durable_snapshot(&store.pool).await?, before);
         store.close().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn topology_state_v9_upgrade_materializes_then_latest_all_modes_and_retains_bytes()
+    -> Result<()> {
+        crate::test_support::closing(async {
+        use serde_json::json;
+        let root = crate::test_support::tempdir()?;
+        let scope = format!("project/{}", "a".repeat(64));
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope.clone())
+                .await?;
+        super::super::tests::released_v1(&options).await?;
+        let server = super::super::tests::released_server(&options).await?;
+        crate::test_support::closing::register(server.clone());
+        let main = server.pool("main").await?;
+        upgrade_with(
+            RELEASED_V9_REGISTRY,
+            &server,
+            &main,
+            &MigrationRunnerHooks::none(),
+        )
+        .await?;
+        let mut originals = Vec::new();
+        let long_identity = format!("extra/slash/\u{1}/{}", "x".repeat(2048));
+        for mode in Mode::ALL {
+            let parts = kuru_core::Framework::builtin(mode).parts;
+            let mut raw_parts = serde_json::to_value(&parts)?;
+            raw_parts[0]["unknown_nested"] = json!({"retained":true});
+            let mut archived = raw_parts[0].clone();
+            archived["id"] = json!("archived-extra");
+            archived["active"] = json!(false);
+            raw_parts.as_array_mut().unwrap().push(archived);
+            let relationships = vec![kuru_core::Relationship::new(
+                kuru_core::RelationshipKind::Alliance,
+                vec![parts[0].id.clone(), parts[1].id.clone()],
+            )?];
+            let mut topology = json!({"parts":raw_parts,"relationships":relationships,"states":{},"focus":{"id":parts[0].id,"remaining":3},"future_top_level":true});
+            topology["states"][&long_identity] =
+                json!({"activation":0.75,"note":"then latest","future_report":17});
+            topology["states"]["archived-extra"] =
+                json!({"activation":0.1,"note":"retained archived"});
+            let raw = format!(" {} \n", serde_json::to_string(&topology)?);
+            let key = format!("{scope}/{mode}/topology");
+            bounded_query(
+                sqlx::query("INSERT INTO state (`key`, value, version) VALUES (?, ?, 4)")
+                    .bind(key.as_bytes())
+                    .bind(&raw)
+                    .execute(main.as_ref()),
+            )
+            .await?;
+            originals.push((mode, key, raw, topology));
+        }
+        // Simulate a legacy writer after initial staging preparation: migration
+        // must decode this latest durable blob, not an earlier inventory copy.
+        originals[0].3["states"][&long_identity]["note"] = json!("last legacy writer");
+        originals[0].2 = format!(" {} \n", serde_json::to_string(&originals[0].3)?);
+        bounded_query(
+            sqlx::query("UPDATE state SET value = ?, version = version + 1 WHERE `key` = ?")
+                .bind(&originals[0].2)
+                .bind(originals[0].1.as_bytes())
+                .execute(main.as_ref()),
+        )
+        .await?;
+        commit_fixture(&main, "Then-latest legacy topologies").await?;
+        let historical = revision(&main).await?;
+        bounded_query(
+            sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                .bind("historical_schema9")
+                .bind(&historical)
+                .fetch_all(main.as_ref()),
+        )
+        .await?;
+        // Equal materialized destinations are accepted without resetting a
+        // held nonzero version token. Keep the historical ref before these rows.
+        let equal_mode = originals[0].0;
+        let equal_membership = json!({"record_format":"membership.v1","parts":originals[0].3["parts"],"relationships":originals[0].3["relationships"]});
+        let suffix = Sha256::digest(long_identity.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let equal_report = json!({"record_format":"state_report.v1","identity":long_identity,"report":originals[0].3["states"][&long_identity]});
+        for (key, value) in [
+            (format!("{scope}/{equal_mode}/membership"), equal_membership),
+            (format!("{scope}/{equal_mode}/state/{suffix}"), equal_report),
+        ] {
+            bounded_query(
+                sqlx::query("INSERT INTO state (`key`, value, version) VALUES (?, ?, 7)")
+                    .bind(key.as_bytes())
+                    .bind(serde_json::to_string(&value)?)
+                    .execute(main.as_ref()),
+            ).await?;
+        }
+        commit_fixture(&main, "Equal preexisting topology destinations").await?;
+        upgrade_with(REGISTRY, &server, &main, &MigrationRunnerHooks::none()).await?;
+        assert_eq!(version(&main).await?, 10);
+        for (mode, key, raw, topology) in originals {
+            let original: String = bounded_query(
+                sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
+                    .bind(key.as_bytes())
+                    .fetch_one(main.as_ref()),
+            )
+            .await?;
+            assert_eq!(original, raw);
+            let membership: String = bounded_query(
+                sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
+                    .bind(format!("{scope}/{mode}/membership").as_bytes())
+                    .fetch_one(main.as_ref()),
+            )
+            .await?;
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&membership)?,
+                json!({"record_format":"membership.v1","parts":topology["parts"],"relationships":topology["relationships"]})
+            );
+            let member_version: i64 = bounded_query(
+                sqlx::query_scalar("SELECT version FROM state WHERE `key` = ?")
+                    .bind(format!("{scope}/{mode}/membership").as_bytes())
+                    .fetch_one(main.as_ref()),
+            ).await?;
+            assert_eq!(member_version, if mode == equal_mode { 7 } else { 0 });
+            let rows = bounded_query(
+                sqlx::query("SELECT `key`, value, version FROM state WHERE LEFT(`key`, ?) = ?")
+                    .bind(format!("{scope}/{mode}/state/").len() as i64)
+                    .bind(format!("{scope}/{mode}/state/").as_bytes())
+                    .fetch_all(main.as_ref()),
+            )
+            .await?;
+            assert_eq!(rows.len(), 2);
+            for row in rows {
+                let record: serde_json::Value =
+                    serde_json::from_str(&row.try_get::<String, _>("value")?)?;
+                let identity = record["identity"].as_str().unwrap();
+                assert_eq!(record["record_format"], "state_report.v1");
+                assert_eq!(record["report"], topology["states"][identity]);
+                let suffix = Sha256::digest(identity.as_bytes())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                assert_eq!(
+                    row.try_get::<Vec<u8>, _>("key")?,
+                    format!("{scope}/{mode}/state/{suffix}").into_bytes()
+                );
+                assert_eq!(
+                    row.try_get::<i64, _>("version")?,
+                    if mode == equal_mode && identity == long_identity { 7 } else { 0 }
+                );
+            }
+        }
+        let before = durable_snapshot(&main).await?;
+        let refusal = validate_active_with(RELEASED_V9_REGISTRY, &main)
+            .await
+            .unwrap_err();
+        assert!(format!("{refusal:#}").contains("unsupported Dolt memory schema version 10"));
+        assert_eq!(durable_snapshot(&main).await?, before);
+        let historical_pool = server.pool("historical_schema9").await?;
+        assert_eq!(validate_historical(&historical_pool).await?, 9);
+        let missing: i64 = bounded_query(
+            sqlx::query_scalar("SELECT COUNT(*) FROM state WHERE RIGHT(`key`, 11) = ?")
+                .bind(b"/membership".as_slice())
+                .fetch_one(historical_pool.as_ref()),
+        )
+        .await?;
+        assert_eq!(missing, 0);
+        historical_pool.close().await;
+        drop(historical_pool);
+        main.close().await;
+        drop(main);
+        server.close().await
+        }).await
+    }
+
+    #[tokio::test]
+    async fn topology_state_v9_upgrade_refuses_malformed_or_conflicting_destinations_atomically()
+    -> Result<()> {
+        crate::test_support::closing(async {
+            for refusal in ["membership", "report", "malformed"] {
+                let malformed = refusal == "malformed";
+                let root = crate::test_support::tempdir()?;
+                let scope = format!("project/{}", "b".repeat(64));
+                let options = crate::test_support::warmed_open_options(
+                    root.path().join("private"),
+                    scope.clone(),
+                )
+                .await?;
+                super::super::tests::released_v1(&options).await?;
+                let server = super::super::tests::released_server(&options).await?;
+                crate::test_support::closing::register(server.clone());
+                let main = server.pool("main").await?;
+                upgrade_with(
+                    RELEASED_V9_REGISTRY,
+                    &server,
+                    &main,
+                    &MigrationRunnerHooks::none(),
+                )
+                .await?;
+                for (mode, value) in [
+                    (
+                        "freudian",
+                        r#"{"parts":[],"relationships":[],"states":{},"focus":null}"#,
+                    ),
+                    (
+                        "ifs",
+                        if malformed {
+                            "{}"
+                        } else {
+                            r#"{"parts":[],"relationships":[],"states":{"extra/slash":{"activation":0.5,"note":"retained"}},"focus":null}"#
+                        },
+                    ),
+                ] {
+                    bounded_query(
+                        sqlx::query("INSERT INTO state (`key`, value, version) VALUES (?, ?, 0)")
+                            .bind(format!("{scope}/{mode}/topology").as_bytes())
+                            .bind(value)
+                            .execute(main.as_ref()),
+                    )
+                    .await?;
+                }
+                if !malformed {
+                    let destination = if refusal == "report" {
+                        let suffix = Sha256::digest(b"extra/slash")
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>();
+                        format!("{scope}/ifs/state/{suffix}")
+                    } else {
+                        format!("{scope}/ifs/membership")
+                    };
+                    bounded_query(
+                        sqlx::query(
+                            "INSERT INTO state (`key`, value, version) VALUES (?, 'null', 7)",
+                        )
+                        .bind(destination.as_bytes())
+                        .execute(main.as_ref()),
+                    )
+                    .await?;
+                }
+                commit_fixture(&main, "Refused topology migration source").await?;
+                let before = durable_snapshot(&main).await?;
+                let error = upgrade_with(REGISTRY, &server, &main, &MigrationRunnerHooks::none())
+                    .await
+                    .unwrap_err();
+                let diagnostic = format!("{error:#}");
+                assert!(
+                    diagnostic.contains(if malformed {
+                        "invalid legacy mode topology"
+                    } else {
+                        "conflicting topology migration destination"
+                    }),
+                    "unexpected migration refusal: {diagnostic}"
+                );
+                assert_eq!(revision(&main).await?, before.head);
+                assert_eq!(version(&main).await?, 9);
+                let partial: i64 = bounded_query(
+                    sqlx::query_scalar("SELECT COUNT(*) FROM state WHERE `key` = ?")
+                        .bind(format!("{scope}/freudian/membership").as_bytes())
+                        .fetch_one(main.as_ref()),
+                )
+                .await?;
+                assert_eq!(partial, 0);
+                let receipts: i64 = bounded_query(
+                    sqlx::query_scalar("SELECT COUNT(*) FROM kuru_migrations WHERE version = 10")
+                        .fetch_one(main.as_ref()),
+                )
+                .await?;
+                assert_eq!(receipts, 0);
+                // The retained exact-source attempt is clean, and retry refuses the
+                // same input rather than accepting a partially materialized graph.
+                let retry = upgrade_with(REGISTRY, &server, &main, &MigrationRunnerHooks::none())
+                    .await
+                    .unwrap_err();
+                assert!(format!("{retry:#}").contains(if malformed {
+                    "invalid legacy mode topology"
+                } else {
+                    "conflicting topology migration destination"
+                }));
+                main.close().await;
+                drop(main);
+                server.close().await?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     #[tokio::test]
@@ -3819,7 +4135,7 @@ mod tests {
                         let built = build_attempt(
                             TEST_REGISTRY,
                             &attempt,
-                            &V10,
+                            &V11,
                             *operation,
                             &AttemptRecord {
                                 branch: name,
@@ -3839,7 +4155,7 @@ mod tests {
                     let built = build_attempt(
                         TEST_REGISTRY,
                         &attempt,
-                        &V10,
+                        &V11,
                         mismatched,
                         &AttemptRecord {
                             branch: &attempts[0].0,
@@ -3953,7 +4269,7 @@ mod tests {
             )
             .await?;
             let attempt = server.pool(&name).await?;
-            let prepared = bounded_query(sqlx::query(V10.sql[0]).execute(attempt.as_ref())).await;
+            let prepared = bounded_query(sqlx::query(V11.sql[0]).execute(attempt.as_ref())).await;
             after_cleanup(prepared.map(|_| ()), close_branch_pool(&attempt).await)?;
             names.push(name);
         }
@@ -4039,7 +4355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v10_receipt_order_and_operation_uniqueness_are_enforced() -> Result<()> {
+    async fn test_v11_receipt_order_and_operation_uniqueness_are_enforced() -> Result<()> {
         for repeated_operation in [false, true] {
             let store = super::super::MemoryStore::temporary_cold().await?;
             upgrade_with(
@@ -4061,7 +4377,7 @@ mod tests {
                 )
                 .await?;
                 bounded_query(
-                    sqlx::query("UPDATE kuru_migrations SET operation = ? WHERE version = 10")
+                    sqlx::query("UPDATE kuru_migrations SET operation = ? WHERE version = 11")
                         .bind(operation)
                         .execute(store.pool.as_ref()),
                 )
@@ -4329,7 +4645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_v2_attempts_and_candidate_survive_test_v10_progression() -> Result<()> {
+    async fn retained_v2_attempts_and_candidate_survive_test_v11_progression() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let mut options = crate::test_support::warmed_open_options(
             root.path().join("private"),
@@ -4344,7 +4660,7 @@ mod tests {
         store
             .append("conversation", "user", "written after the v2 upgrade")
             .await?;
-        let candidate = store.begin_candidate("pre-v10 candidate").await?;
+        let candidate = store.begin_candidate("pre-v11 candidate").await?;
         candidate
             .view()
             .append(
@@ -4393,12 +4709,12 @@ mod tests {
             validate_ready_with(TEST_REGISTRY, &store.pool).await?,
             CURRENT_VERSION
         );
-        let v10_operation = Uuid::new_v4();
-        let v10_name = attempt_name(10, v10_operation);
+        let v11_operation = Uuid::new_v4();
+        let v11_name = attempt_name(11, v11_operation);
         let current_base = store.revision().await?;
         bounded_query(
             sqlx::query("CALL DOLT_BRANCH(?, ?)")
-                .bind(&v10_name)
+                .bind(&v11_name)
                 .bind(&current_base)
                 .fetch_all(store.pool.as_ref()),
         )
@@ -4407,7 +4723,7 @@ mod tests {
             validate_ready_with(TEST_REGISTRY, &store.pool)
                 .await
                 .is_err(),
-            "a ready v10 stage must reject while an earlier failed attempt remains"
+            "a ready v11 stage must reject while an earlier failed attempt remains"
         );
 
         upgrade_with(
@@ -4418,25 +4734,25 @@ mod tests {
         )
         .await?;
         validate_active_with(TEST_REGISTRY, &store.pool).await?;
-        assert_eq!(version(&store.pool).await?, 10);
-        let v10_attempt = store.shared.server.pool(&v10_name).await?;
-        assert_eq!(revision(&v10_attempt).await?, store.revision().await?);
-        let v10_receipt: String = bounded_query(
-            sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = 10")
-                .fetch_one(v10_attempt.as_ref()),
+        assert_eq!(version(&store.pool).await?, 11);
+        let v11_attempt = store.shared.server.pool(&v11_name).await?;
+        assert_eq!(revision(&v11_attempt).await?, store.revision().await?);
+        let v11_receipt: String = bounded_query(
+            sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = 11")
+                .fetch_one(v11_attempt.as_ref()),
         )
         .await?;
-        assert_eq!(v10_receipt, v10_operation.hyphenated().to_string());
-        v10_attempt.close().await;
-        drop(v10_attempt);
+        assert_eq!(v11_receipt, v11_operation.hyphenated().to_string());
+        v11_attempt.close().await;
+        drop(v11_attempt);
         assert_eq!(
             reserved_names(&store.pool)
                 .await?
                 .into_iter()
-                .filter(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 10))
+                .filter(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 11))
                 .count(),
             1,
-            "the pristine exact-base v10 attempt must be reused"
+            "the pristine exact-base v11 attempt must be reused"
         );
         // This is a synthetic future schema, beyond the current store API's
         // validated open contract. Inspect the test-registry-backed SQL view.
@@ -4479,11 +4795,11 @@ mod tests {
             )
             .await
             .is_err(),
-            "pre-v10 candidate unexpectedly fast-forwarded into v10 main"
+            "pre-v11 candidate unexpectedly fast-forwarded into v11 main"
         );
         assert_eq!(durable_snapshot(&store.pool).await?, before_stale_merge);
 
-        // Model a future v10 writer through its test registry and SQL view.
+        // Model a future v11 writer through its test registry and SQL view.
         // Released-v5 reopen refusal is checked in the separate old-registry fixture.
         let fresh_name = format!("candidate_{}", Uuid::new_v4().simple());
         let fresh_base = revision(&store.pool).await?;
@@ -4495,15 +4811,15 @@ mod tests {
         )
         .await?;
         let fresh = store.shared.server.pool(&fresh_name).await?;
-        assert_eq!(validate_supported_with(TEST_REGISTRY, &fresh).await?, 10);
+        assert_eq!(validate_supported_with(TEST_REGISTRY, &fresh).await?, 11);
         bounded_query(
             sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
-                .bind(b"post-v10".as_slice())
+                .bind(b"post-v11".as_slice())
                 .bind(json!({"preserved": true}).to_string())
                 .execute(fresh.as_ref()),
         )
         .await?;
-        commit_fixture(&fresh, "Test future-v10 candidate write").await?;
+        commit_fixture(&fresh, "Test future-v11 candidate write").await?;
         let fresh_head = revision(&fresh).await?;
         fresh.close().await;
         drop(fresh);
@@ -4521,16 +4837,16 @@ mod tests {
             .bind(b"conversation".as_slice())
             .bind(b"assistant".as_slice())
             .bind("text-v1")
-            .bind("written after schema v10")
+            .bind("written after schema v11")
             .execute(store.pool.as_ref()),
         )
         .await?;
-        commit_fixture(&store.pool, "Test future-v10 conversation write").await?;
+        commit_fixture(&store.pool, "Test future-v11 conversation write").await?;
         validate_active_with(TEST_REGISTRY, &store.pool).await?;
-        assert_eq!(version(&store.pool).await?, 10);
+        assert_eq!(version(&store.pool).await?, 11);
         let promoted_value: String = bounded_query(
             sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
-                .bind(b"post-v10".as_slice())
+                .bind(b"post-v11".as_slice())
                 .fetch_one(store.pool.as_ref()),
         )
         .await?;
@@ -4590,11 +4906,11 @@ mod tests {
         .await?;
         assert_eq!(
             messages,
-            ["written after the v2 upgrade", "written after schema v10"]
+            ["written after the v2 upgrade", "written after schema v11"]
         );
         let value: String = bounded_query(
             sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
-                .bind(b"post-v10".as_slice())
+                .bind(b"post-v11".as_slice())
                 .fetch_one(main.as_ref()),
         )
         .await?;
@@ -5301,9 +5617,9 @@ mod tests {
         let exported_before_refusal = serde_json::to_value(&records)?;
         let error = validate_active_with(RELEASED_V7_REGISTRY, &store.pool)
             .await
-            .expect_err("a v7 validator must refuse this populated v9 store");
+            .expect_err("a v7 validator must refuse this populated v10 store");
         assert!(
-            format!("{error:#}").contains("unsupported Dolt memory schema version 9"),
+            format!("{error:#}").contains("unsupported Dolt memory schema version 10"),
             "unexpected v7-validator refusal: {error:#}"
         );
         assert_eq!(durable_snapshot(&store.pool).await?, before_refusal);

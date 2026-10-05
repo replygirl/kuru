@@ -268,7 +268,7 @@ last time, records the ones it accepted, then reopens the upgraded store. Until
 that writable open, a read-only command reports
 `memory schema version 7 requires writable upgrade to 8` and changes nothing,
 just as it does for any pending schema step. Projects created after the update
-start at schema 9.
+start at schema 10.
 
 Schema 9 adds a version to each project state row. Existing values keep their
 exact bytes and start at version zero; every overwrite advances the version,
@@ -278,6 +278,18 @@ stale expectation leaves values and revision history unchanged. Dream writes
 advance only their candidate's versions until exact promotion. Historical views
 keep their schema, and older binaries refuse an upgraded schema they do not
 understand. Concurrent conversation admission remains gated.
+
+Schema 10 stores each mode's membership separately from its identity reports.
+Membership changes check the version they loaded; ordinary reports replace only
+that identity's last report. Focus belongs to the session. Dreams and undo change
+membership without replacing current reports or another session's state, and
+retired identities remain inspectable.
+
+The upgrade materializes the latest legacy topology and preserves its original
+bytes. Malformed input or conflicting split records stops the upgrade without
+publishing a partial result. Legacy project-wide focus is left unassigned.
+Complete topology reads use a single committed revision, with bounded pages for
+larger inventories, so updates during inspection cannot mix old and new records.
 
 Revision history shares the database's disk. For a backup, close all Kuru processes using the data directory, let their database processes finish, then copy the entire data directory. Restore the copy into a separate location and open it with `--data-dir`. Keep the same canonical workspace path to retain the project identity. Do not copy a live `.dolt` directory or remove a held lockfile.
 

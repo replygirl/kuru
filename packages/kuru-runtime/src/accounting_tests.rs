@@ -1150,8 +1150,11 @@ async fn manual_compaction_refuses_a_target_deactivated_in_persisted_topology() 
             .active = false;
         memory
             .put(
-                &format!("{}/{}/topology", harness.scope, harness.profile.mode),
-                &serde_json::to_value(changed).unwrap(),
+                &format!("{}/{}/membership", harness.scope, harness.profile.mode),
+                &serde_json::to_value(crate::topology_state::MembershipRecord::from_topology(
+                    &changed,
+                ))
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -1662,7 +1665,7 @@ async fn completed_turn_retry_returns_stored_output_without_replaying_its_compac
         assert!(ordinary_before > 0);
         assert_eq!(usage.invocation_count, 1 + ordinary_before as u64);
 
-        let topology_key = format!("{}/{}/topology", harness.scope, harness.profile.mode);
+        let topology_key = format!("{}/{}/membership", harness.scope, harness.profile.mode);
         let valid_topology = memory.get(&topology_key).await.unwrap().unwrap();
         memory
             .put(

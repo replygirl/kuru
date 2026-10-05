@@ -2484,7 +2484,11 @@ impl MemoryStore {
         expected: &[(String, crate::StateExpectation)],
         values: &[(String, Value)],
     ) -> Result<()> {
-        store::versioned_state::validate_conditional(expected, values)?;
+        let candidate = match &self.backend {
+            Backend::Local(store) => store.pinned_view() != "main",
+            Backend::Remote(view) => view.candidate.is_some(),
+        };
+        store::versioned_state::validate_conditional(expected, values, candidate)?;
         #[cfg(any(test, feature = "test-support"))]
         self.check_state_write_fixture()?;
         match &self.backend {
@@ -8147,3 +8151,6 @@ mod tests {
         Ok(())
     }
 }
+#[path = "facade/state_read_cut.rs"]
+mod state_read_cut;
+pub use state_read_cut::StateReadCut;

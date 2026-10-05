@@ -418,14 +418,20 @@ async fn all_four_modes_keep_pre_extraction_requests_and_facing_outcomes() {
                 assert!(input.contains(&format!(r#""sender":"{member}","text":"draft:{member}""#)));
             }
             harness.focus(None).await.unwrap();
-            harness.topology.states.insert(
-                ids[1].clone(),
-                StateReport {
-                    activation: 0.9,
-                    note: "baseline unique maximum".into(),
-                },
-            );
-            harness.save().await.unwrap();
+            let report = StateReport {
+                activation: 0.9,
+                note: "baseline unique maximum".into(),
+            };
+            let keys = crate::engine::checked_state_keys(&harness.scope, &harness.profile).unwrap();
+            // Session saves no longer publish the complete shared topology.
+            // Seed the report's owned row so turn admission reloads this maximum.
+            harness
+                .save_with(vec![(
+                    keys.state_report(&ids[1]),
+                    crate::topology_state::report_value(&ids[1], &report).unwrap(),
+                )])
+                .await
+                .unwrap();
             let activated = harness.run("baseline activation").await.unwrap();
             assert_eq!(activated.speaker, ids[1]);
             assert_eq!(selection(&activated), "maximum-activation");
