@@ -4,7 +4,6 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 pub const CHILD: &str = "KURU_TEST_FOREIGN_REPOSITORY_CHILD";
@@ -135,10 +134,15 @@ impl ForeignRepository {
             .env_remove("GITHUB_TOKEN")
             .env_remove("GH_TOKEN")
             .kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(60), command.output())
-            .await
-            .expect("foreign-repository child timed out")
-            .unwrap();
+        // The re-executed test has no product budget of its own; the release
+        // Git and `cog` steps (180 s each) and Communique run (600 s) inside it
+        // are private to the library, and the job deadline exceeds them
+        // (`launch_budget.rs`, the includer's sibling module).
+        let output =
+            tokio::time::timeout(super::launch_budget::until_job_deadline(), command.output())
+                .await
+                .expect("foreign-repository child timed out")
+                .unwrap();
         let after = snapshot(&root);
         let changed: Vec<_> = self
             .before

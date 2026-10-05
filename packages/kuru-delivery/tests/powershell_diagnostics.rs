@@ -454,6 +454,99 @@ fn launch_bounds_take_their_recorded_derivations() {
                 1,
             )][..],
         ),
+        // The remaining delivery fixture launches: each waits for its event
+        // until the job deadline, or the update handoff, and its former flat
+        // literal (or finite keep-alive) is gone.
+        (
+            "tests/bootstrap_install.rs",
+            &[
+                (include, 1),
+                ("launch_budget::until_job_deadline()", 6),
+                ("Duration::from_secs(30)", 0),
+                ("/bin/sleep60", 0),
+            ][..],
+        ),
+        (
+            "tests/advisory.rs",
+            &[
+                (include, 1),
+                ("launch_budget::until_job_deadline()", 7),
+                ("launch_budget::CHILD_START_ALLOWANCE", 2),
+                ("Duration::from_secs(30)", 0),
+                ("Duration::from_millis(250)", 0),
+                ("Duration::from_secs(60)", 0),
+            ][..],
+        ),
+        (
+            "tests/support/fixture_git.rs",
+            &[
+                (
+                    "pubfnbound()->Duration{super::launch_budget::until_job_deadline()}",
+                    1,
+                ),
+                ("from_secs(10)", 0),
+            ][..],
+        ),
+        (
+            "tests/fixtures/delivery.rs",
+            &[
+                (
+                    "#[path=\"../support/launch_budget.rs\"]modlaunch_budget;",
+                    1,
+                ),
+                ("hold_until_released()?;", 4),
+                ("from_secs(60)", 0),
+            ][..],
+        ),
+        (
+            "src/lib.rs",
+            &[(
+                "externcrateselfaskuru_delivery;#[cfg(all(test,feature=\"tooling\"))]#[path=\"../tests/support/launch_budget.rs\"]modlaunch_budget;",
+                1,
+            )][..],
+        ),
+        (
+            "tests/bundle_prepare.rs",
+            &[
+                (include, 1),
+                (
+                    "kuru_delivery::command::output(command,launch_budget::until_job_deadline())",
+                    1,
+                ),
+                ("from_secs(15)", 0),
+            ][..],
+        ),
+        (
+            "tests/release_notes.rs",
+            &[
+                (include, 1),
+                (
+                    "fntest_timeout()->Duration{launch_budget::until_job_deadline()}",
+                    1,
+                ),
+                ("test_timeout(),", 4),
+                ("from_secs(30)", 0),
+            ][..],
+        ),
+        ("tests/release_workflow.rs", &[(include, 1)][..]),
+        (
+            "tests/support/repository_environment.rs",
+            &[
+                (
+                    "tokio::time::timeout(super::launch_budget::until_job_deadline(),command.output())",
+                    1,
+                ),
+                ("from_secs(60)", 0),
+            ][..],
+        ),
+        (
+            "tests/windows_update.rs",
+            &[
+                (include, 1),
+                ("constTIMEOUT:Duration=launch_budget::update_handoff();", 1),
+                ("from_secs(30)", 0),
+            ][..],
+        ),
         (
             "tests/previous_release_update.rs",
             &[

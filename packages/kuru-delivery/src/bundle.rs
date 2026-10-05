@@ -1133,38 +1133,43 @@ mod tests {
                 assert!(request.len() < 8192);
             }
             socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nveri\r\n").await.unwrap();
-            tokio::time::timeout(Duration::from_secs(10), released)
-                .await
-                .unwrap()
-                .unwrap();
+            // Resolves when the test releases the connection, or drops the
+            // sender on failure.
+            released.await.unwrap();
         });
+        // The production client's total bound, so the product's own budget
+        // decides how long the first chunk may take.
         let client = reqwest::Client::builder()
             .no_proxy()
-            .timeout(Duration::from_secs(10))
+            .timeout(DOWNLOAD_TIMEOUT)
             .build()
             .unwrap();
         let download =
             tokio::spawn(async move { prepare_asset(&options, &asset, Some(&client)).await });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let staged = fs::read_dir(&cache)
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Result::ok)
-                    .any(|entry| {
-                        entry.file_name().to_string_lossy().starts_with(".bundle-")
-                            && fs::metadata(entry.path().join("archive"))
-                                .is_ok_and(|metadata| metadata.len() == 4)
-                    });
-                if staged {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        // Ends on the written partial chunk, or on the download ending first,
+        // which the product bounds by DOWNLOAD_TIMEOUT.
+        loop {
+            let staged = fs::read_dir(&cache)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry.file_name().to_string_lossy().starts_with(".bundle-")
+                        && fs::metadata(entry.path().join("archive"))
+                            .is_ok_and(|metadata| metadata.len() == 4)
+                });
+            if staged {
+                break;
             }
-        })
-        .await
-        .expect("fixture never observed the written partial download");
+            if download.is_finished() {
+                panic!(
+                    "fixture never observed the written partial download: {:?}",
+                    download.await
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         let before = regular_file_info(&File::open(cache.join(LOCK_NAME)).unwrap())
             .unwrap()
             .identity;

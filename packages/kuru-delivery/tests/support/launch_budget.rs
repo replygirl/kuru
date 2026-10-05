@@ -22,6 +22,25 @@
 //! - Native mise launches (`mise_acceptance.rs`) take mise's stalled-request
 //!   budget, [`mise_stalled_request`], plus the memory package's backstop for
 //!   one Kuru lifecycle that creates its store.
+//! - The other delivery fixture launches also wait for their event until
+//!   [`until_job_deadline`]: the shell bootstrap under its stub `curl`
+//!   (`bootstrap_install.rs`; the stub ignores the script's `--max-time`, so no
+//!   product budget runs on that path), the advisory scanner CLI and its
+//!   fixture binary (`advisory.rs`), each fixture Git call (`fixture_git.rs`),
+//!   the bundle-prepare CLI (`bundle_prepare.rs`), Communique-backed release
+//!   notes (`release_notes.rs`) and the re-executed foreign-repository test
+//!   (`repository_environment.rs`). The product budgets these launches can
+//!   reach are private to the delivery library: the advisory Git bound (60 s)
+//!   and scan bound (180 s), the bundle cache lock (180 s) and download
+//!   (120 s), the Communique run (600 s) and each release Git or `cog` step
+//!   (180 s). None of them can be named here without exposing product code,
+//!   and the job deadline is longer than every one of them, so a launch that
+//!   reaches one of those bounds reports the product's own error first.
+//! - The native Windows update fixtures (`windows_update.rs`) drive the
+//!   trusted helper's handoff, so they take [`update_handoff`].
+//! - Where the bound is the stimulus (a test that requires the product's
+//!   timeout path to fire), it is [`CHILD_START_ALLOWANCE`]: the timeout only
+//!   needs to follow the fixture's start, and a longer one costs only time.
 //!
 //! Trade at the job deadline: a launch bounded by [`until_job_deadline`] that
 //! stalls ends at the same deadline the coverage orchestrator enforces on the
@@ -49,6 +68,13 @@
 
 use kuru_delivery::update_budget::{CLEANUP, PUBLICATION, STARTUP};
 use std::{sync::LazyLock, time::Duration};
+
+/// Allowance for a fixture child to start (exec, its runtime, its first
+/// marker) before a bound that must fire after that start, stated as the
+/// memory package's `CHILD_START_MARGIN` is. It is used only where the bound
+/// is the stimulus: the product's timeout path is what the test requires, so
+/// every run waits it out, and a longer allowance costs time, never a result.
+pub const CHILD_START_ALLOWANCE: Duration = Duration::from_secs(5);
 
 /// The Windows updating parent's waits on its trusted helper, in series, each
 /// with the wait it bounds as it reads in `src/update.rs` with whitespace

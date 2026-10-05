@@ -20,7 +20,14 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const TIMEOUT: Duration = Duration::from_secs(30);
+/// These fixtures drive the trusted helper's handoff, whose longest product
+/// path is the updating parent's serial waits on it, including the 120 s
+/// verify-and-copy publication: each pipe, checkpoint, exit and close here
+/// waits for its event within that series (`launch_budget.rs`).
+const TIMEOUT: Duration = launch_budget::update_handoff();
+
+#[path = "support/launch_budget.rs"]
+mod launch_budget;
 
 #[path = "support/update_trace.rs"]
 mod update_trace;

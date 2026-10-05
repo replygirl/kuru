@@ -14,6 +14,13 @@ pub mod docs;
 #[cfg(all(test, feature = "tooling"))]
 #[path = "../tests/support/fixture_git.rs"]
 mod fixture_git;
+// The fixtures' launch budgets, which name this crate as an integration
+// test does.
+#[cfg(all(test, feature = "tooling"))]
+extern crate self as kuru_delivery;
+#[cfg(all(test, feature = "tooling"))]
+#[path = "../tests/support/launch_budget.rs"]
+mod launch_budget;
 #[cfg(any(feature = "tooling", windows))]
 mod lease;
 #[cfg(feature = "tooling")]

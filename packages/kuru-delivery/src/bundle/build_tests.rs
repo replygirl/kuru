@@ -393,9 +393,11 @@ impl Fixture {
                 let _ = socket.write_all(&response).await;
             }
         });
+        // The production ICU client's total bound, which the build's own
+        // download budget equals.
         let client = reqwest::Client::builder()
             .no_proxy()
-            .timeout(Duration::from_secs(10))
+            .timeout(ICU_DOWNLOAD)
             .build()
             .unwrap();
         let result = build_with(options, runner, &client, Some(&url)).await;

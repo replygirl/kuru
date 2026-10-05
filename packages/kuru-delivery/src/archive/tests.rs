@@ -709,12 +709,29 @@ mod download_timeouts {
         );
     }
 
+    /// The send phase's idle timer starts with the request, before the
+    /// fixture can answer, and `download` exposes no event between its send
+    /// and body phases. So this test takes the production bounds: headers
+    /// late past `READ_IDLE_TIMEOUT` would fail the product the same way, and
+    /// the stalled body then fails on that same idle bound. The outer bound
+    /// exceeds the most those bounds allow (the connect bound, then one idle
+    /// bound for each phase), and the fixture holds the connection until the
+    /// client abandons it, so only the client's own timer can end the read.
     #[tokio::test]
     async fn a_body_stalled_past_idle_fails_naming_the_read_phase() {
         let server = PacedServer::start(Pace::StallBody).await;
-        let error = bounded_download(&idle_client(Duration::from_millis(200)), server.url.clone())
-            .await
-            .unwrap_err();
+        let client = bounded_builder(CONNECT_TIMEOUT, READ_IDLE_TIMEOUT)
+            .no_proxy()
+            .build()
+            .unwrap();
+        let production = CONNECT_TIMEOUT.saturating_add(READ_IDLE_TIMEOUT.saturating_mul(2));
+        let error = tokio::time::timeout(
+            production,
+            download(&client, server.url.clone(), MAX_ARCHIVE_BYTES),
+        )
+        .await
+        .expect("download must end within its production idle bounds")
+        .unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("read release asset body"), "{message}");
         assert!(!message.contains("send release asset request"), "{message}");

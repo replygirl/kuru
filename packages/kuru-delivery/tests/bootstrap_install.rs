@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "tooling"))]
 
 use std::{
     fs::{self, File},
@@ -20,9 +20,10 @@ use tokio::process::Command;
 
 #[path = "support/bootstrap_process.rs"]
 mod bootstrap_process;
+#[path = "support/launch_budget.rs"]
+mod launch_budget;
 
 const LIMIT: u64 = 128 * 1024 * 1024;
-const TIMEOUT: Duration = Duration::from_secs(30);
 const PREVIOUS: &[u8] = b"previous executable";
 const CANDIDATE: &[u8] = b"#!/bin/sh\nprintf executed > \"$KURU_EXECUTION_MARKER\"\n";
 
@@ -33,6 +34,11 @@ struct Fixture {
     tools: PathBuf,
     version: &'static str,
     target: &'static str,
+    /// The stalled producers' release: a loopback listener that never accepts.
+    /// A producer connects before its ready marker and blocks reading until
+    /// the bootstrap's cleanup stops it or this listener is dropped.
+    hold: Option<std::net::TcpListener>,
+    hold_port: u16,
 }
 
 impl Fixture {
@@ -105,6 +111,8 @@ impl Fixture {
             root.path().join("latest-manifest"),
         )
         .unwrap();
+        let hold = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let hold_port = hold.local_addr().unwrap().port();
         Self {
             root: Arc::new(root),
             release,
@@ -112,7 +120,14 @@ impl Fixture {
             tools,
             version,
             target,
+            hold: Some(hold),
+            hold_port,
         }
+    }
+
+    /// Release any stalled producer still holding its connection.
+    fn release_producers(&mut self) {
+        self.hold = None;
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -182,6 +197,7 @@ impl Fixture {
             .env("FIXTURE_VERSION", self.version)
             .env("FIXTURE_OS", "Darwin")
             .env("FIXTURE_ARCH", "arm64")
+            .env("FIXTURE_HOLD_PORT", self.hold_port.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -212,7 +228,10 @@ impl Fixture {
             command.as_std().get_args().collect::<Vec<_>>(),
         );
         let child = command.spawn().unwrap();
-        self.capture(child, TIMEOUT, &case).await
+        // The bootstrap under its stub `curl` has no product budget; it waits
+        // for its exit until the job deadline (`launch_budget.rs`).
+        self.capture(child, launch_budget::until_job_deadline(), &case)
+            .await
     }
 
     fn capture(
@@ -437,14 +456,20 @@ case "$url" in
     asset="$FIXTURE_ROOT/release files/${url##*/}" ;;
   *) printf 'unexpected fixture URL: %s\n' "$url" >&2; exit 92 ;;
 esac
+# A stalled producer connects to the test's release listener before its
+# ready marker, then blocks reading that connection until the bootstrap's
+# cleanup stops it or the test drops the listener.
+hold() { exec -a "$FIXTURE_ROOT/producer" cat <&3; }
 case ${FIXTURE_TRANSPORT:-ok} in
   block)
+    exec 3<>"/dev/tcp/127.0.0.1/$FIXTURE_HOLD_PORT"
     printf '%s\n' "$$" > "$FIXTURE_ROOT/producer-ready"
-    exec -a "$FIXTURE_ROOT/producer" /bin/sleep 60 ;;
+    hold ;;
   overflow-hold)
+    exec 3<>"/dev/tcp/127.0.0.1/$FIXTURE_HOLD_PORT"
     printf '%s\n' "$$" > "$FIXTURE_ROOT/producer-ready"
     printf '%65537s' ''
-    exec -a "$FIXTURE_ROOT/producer" /bin/sleep 60 ;;
+    hold ;;
   fail-after-data)
     cat "$asset"
     exit 22 ;;
@@ -850,7 +875,11 @@ async fn bounded_capture_drains_past_its_retained_prefix_and_preserves_exit_stat
         .kill_on_drop(false);
     let child = command.spawn().unwrap();
     let output = fixture
-        .capture(child, TIMEOUT, "bounded stdout control")
+        .capture(
+            child,
+            launch_budget::until_job_deadline(),
+            "bounded stdout control",
+        )
         .await;
     assert_eq!(output.status.code(), Some(17));
     assert_eq!(output.stdout.len(), 4 * 1024 * 1024);
@@ -911,7 +940,11 @@ exit 0
     .await
     .expect("control root did not exit before capture");
     assert_eq!(status.exit_status(), Some(0));
-    let capture = fixture.capture(child, TIMEOUT, "output-closed descendant control");
+    let capture = fixture.capture(
+        child,
+        launch_budget::until_job_deadline(),
+        "output-closed descendant control",
+    );
     startup_group.0 = None;
     let result = tokio::spawn(capture).await;
 
@@ -1383,7 +1416,7 @@ async fn sigterm_during_download_reaps_both_children_and_preserves_the_previous_
     let child = command.spawn().unwrap();
     let pid = child.id().unwrap();
     let mut group = ProcessGroup(Some(pid), Arc::clone(&fixture.root));
-    let producer = tokio::time::timeout(TIMEOUT, async {
+    let producer = tokio::time::timeout(launch_budget::until_job_deadline(), async {
         loop {
             if let Ok(value) = fs::read_to_string(fixture.path("producer-ready"))
                 && value.trim().parse::<u32>().is_ok()
@@ -1436,4 +1469,48 @@ async fn sigterm_during_download_reaps_both_children_and_preserves_the_previous_
         "bootstrap left a live child in group {pid}: {group}"
     );
     fixture.unchanged();
+}
+
+/// A stalled producer ends on its release, not on a timer: once it is ready
+/// it holds a connection to the fixture's release listener, and dropping that
+/// listener without accepting ends it. The wait is for the producer's own
+/// exit; nothing here measures time.
+#[tokio::test]
+async fn a_stalled_producer_ends_when_the_fixture_releases_it() {
+    let mut fixture = Fixture::new(TARGETS[0], "0.2.0");
+    let mut command = fixture.configure(Command::new(fixture.tools.join("curl")));
+    command
+        .args(["-q", "https://fixture.invalid/releases/0.2.0/SHA256SUMS"])
+        .env("FIXTURE_TRANSPORT", "block");
+    let child = command.spawn().unwrap();
+    let pid = child.id().unwrap();
+    let mut group = ProcessGroup(Some(pid), Arc::clone(&fixture.root));
+    let ready = tokio::time::timeout(launch_budget::until_job_deadline(), async {
+        loop {
+            if let Ok(value) = fs::read_to_string(fixture.path("producer-ready"))
+                && value.trim().parse::<u32>().is_ok()
+            {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stalled producer never reported ready");
+    assert_eq!(ready.trim(), pid.to_string(), "the stub is the producer");
+    let capture = fixture.capture(
+        child,
+        launch_budget::until_job_deadline(),
+        "released stalled producer",
+    );
+    fixture.release_producers();
+    group.0 = None;
+    // The capture returns only on the producer's own exit and EOF; it
+    // reports a producer that outlives its release at the job deadline.
+    capture.await;
+    let survivors = producer_listed(&fixture, &ready);
+    assert!(
+        survivors.is_empty(),
+        "released producer survived: {survivors:?}"
+    );
 }

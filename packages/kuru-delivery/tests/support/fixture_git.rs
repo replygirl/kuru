@@ -2,7 +2,8 @@
 //!
 //! The delivery library (for its advisory unit tests), `tests/advisory.rs`
 //! and the scanner fixture binary include this file with `#[path]`; each
-//! includer has the delivery crate's `command` module in its own scope.
+//! includer has the delivery crate's `command` module and the sibling
+//! `launch_budget` module (`launch_budget.rs`) in its own scope.
 //!
 //! A fixture Git process reads no system, global, ProgramData or XDG
 //! configuration, runs no hook, credential helper, signing program, fsmonitor
@@ -19,9 +20,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// One fixture Git process, which starts no child. Not derived from the
-/// production advisory bound.
-pub const BOUND: Duration = Duration::from_secs(10);
+/// The bound of one fixture Git process, which starts no child and has no
+/// product budget of its own: it waits for its exit and EOF until the coverage
+/// job's inner test deadline (`launch_budget.rs`). Each includer has the
+/// sibling `launch_budget` module in its own scope.
+pub fn bound() -> Duration {
+    super::launch_budget::until_job_deadline()
+}
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const TRACE_TAIL_LINES: usize = 40;
 
@@ -107,7 +112,7 @@ impl FixtureGit {
             .await
     }
 
-    /// Run `command` (from [`FixtureGit::command`]) within [`BOUND`]. A
+    /// Run `command` (from [`FixtureGit::command`]) within [`bound`]. A
     /// failure panics with the arguments, directory, elapsed time, the
     /// bounded runner's diagnostic and the call's Trace2 tail.
     pub async fn run(
@@ -120,7 +125,7 @@ impl FixtureGit {
         let trace = self.trace(&mut command);
         command.args(arguments).envs(environment.iter().copied());
         let started = Instant::now();
-        let output = command::bounded_output(&mut command, BOUND, OUTPUT_LIMIT)
+        let output = command::bounded_output(&mut command, bound(), OUTPUT_LIMIT)
             .await
             .unwrap_or_else(|error| {
                 panic!(

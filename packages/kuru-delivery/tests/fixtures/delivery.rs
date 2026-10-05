@@ -5,6 +5,8 @@ use std::io::{self, Read, Write};
 
 #[path = "../support/fixture_git.rs"]
 mod fixture_git;
+#[path = "../support/launch_budget.rs"]
+mod launch_budget;
 
 use sha2::Digest as _;
 
@@ -60,7 +62,7 @@ async fn main() -> io::Result<()> {
             let trace = git.trace(&mut command);
             command.args(git_arguments);
             let started = std::time::Instant::now();
-            let output = command::bounded_output(&mut command, fixture_git::BOUND, 64 * 1024)
+            let output = command::bounded_output(&mut command, fixture_git::bound(), 64 * 1024)
                 .await
                 .map_err(|error| {
                     io::Error::other(format!(
@@ -201,7 +203,7 @@ async fn main() -> io::Result<()> {
         Some("bounded-held-output") => {
             io::stdout().write_all(b"descendant retained inherited output\n")?;
             io::stdout().flush()?;
-            std::thread::sleep(std::time::Duration::from_secs(60));
+            hold_until_released()?;
         }
         #[cfg(unix)]
         Some("bounded-timeout-descendant") => {
@@ -254,13 +256,13 @@ async fn main() -> io::Result<()> {
                 }
                 _ => return Err(io::Error::other("unknown blocking tree trigger")),
             }
-            std::thread::sleep(std::time::Duration::from_secs(60));
+            hold_until_released()?;
         }
         #[cfg(unix)]
         Some("bounded-ready-descendant") => {
             io::stdout().write_all(b"ready\n")?;
             io::stdout().flush()?;
-            std::thread::sleep(std::time::Duration::from_secs(60));
+            hold_until_released()?;
         }
         #[cfg(unix)]
         Some("bounded-close-output-before-exit") => {
@@ -279,7 +281,7 @@ async fn main() -> io::Result<()> {
                 .next()
                 .ok_or_else(|| io::Error::other("missing silent descendant readiness marker"))?;
             std::fs::write(ready, b"ready")?;
-            std::thread::sleep(std::time::Duration::from_secs(60));
+            hold_until_released()?;
         }
         #[cfg(unix)]
         Some("bounded-silent-descendant-root") => {
@@ -518,5 +520,16 @@ async fn main() -> io::Result<()> {
         }
         Some(other) => return Err(io::Error::other(format!("unknown fixture mode {other}"))),
     }
+    Ok(())
+}
+
+/// Keep-alive for the bounded-output fixtures: block until stdin, a pipe whose
+/// write end the test holds and every descendant inherits, reaches EOF. The
+/// product's owned-group cleanup under test is meant to stop this process
+/// first; if it does not, the test's release (its writer dropped, or its exit)
+/// ends it, never a timer.
+#[cfg(unix)]
+fn hold_until_released() -> io::Result<()> {
+    io::copy(&mut io::stdin().lock(), &mut io::sink())?;
     Ok(())
 }

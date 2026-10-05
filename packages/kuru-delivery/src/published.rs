@@ -1459,12 +1459,29 @@ mod tests {
             assert!(started.elapsed() > OLD_TOTAL, "{:?}", started.elapsed());
         }
 
-        #[tokio::test]
+        /// The idle timer of the send phase starts with the request, before
+        /// the fixture can answer, so its expiry is ordered after the headers
+        /// by an event rather than a margin: the clock is paused and held
+        /// (a running blocking task stops Tokio advancing it) until `send`
+        /// returns the response, the event that the headers arrived. Only
+        /// then may time advance, and the client is idle in the body phase.
+        #[tokio::test(start_paused = true)]
         async fn a_body_stalled_past_idle_fails_naming_the_read_phase() {
             let server = PacedServer::start(Pace::StallBody).await;
-            let error = fetch(&github(Duration::from_millis(200)), server.url.clone())
-                .await
-                .unwrap_err();
+            let github = github(Duration::from_millis(200));
+            let error = tokio::time::timeout(BOUND, async {
+                let (release, released) = std::sync::mpsc::channel::<()>();
+                let held = tokio::task::spawn_blocking(move || {
+                    let _ = released.recv();
+                });
+                let response = send(github.checked_request(server.url.clone())).await;
+                drop(release);
+                held.await.unwrap();
+                bounded_body(response?, METADATA_LIMIT).await
+            })
+            .await
+            .expect("published read must end within its idle bound")
+            .unwrap_err();
             let message = format!("{error:#}");
             assert!(
                 message.contains("read published release response body"),
