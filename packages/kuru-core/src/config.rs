@@ -3614,7 +3614,13 @@ mod config_display_projection_tests {
             .find(|row| row.path == "model")
             .unwrap();
         assert_eq!(model.value, "local-model");
-        assert_eq!(model.source, local.to_string_lossy());
+        let expected_source = local
+            .to_string_lossy()
+            .chars()
+            .flat_map(char::escape_default)
+            .take(160)
+            .collect::<String>();
+        assert_eq!(model.source, expected_source);
         assert!(
             !projection
                 .layers
