@@ -9,10 +9,22 @@ use std::{
     os::unix::process::CommandExt,
     path::Path,
     process::{Command, Stdio},
+    sync::{Mutex, MutexGuard},
 };
+
+// These fixtures require admitted snapshots, rather than concurrent spawn
+// contention. Keep their setup isolated without spending observation deadlines.
+static SNAPSHOT_FIXTURE: Mutex<()> = Mutex::new(());
+
+fn snapshot_fixture() -> MutexGuard<'static, ()> {
+    SNAPSHOT_FIXTURE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
 
 #[test]
 fn snapshot_lists_a_blocked_root_its_child_and_grandchild() {
+    let _fixture = snapshot_fixture();
     // The subshell forks its sleeping child before printing readiness, so all
     // three processes exist once the line arrives.
     let mut root = Command::new("/bin/sh")
@@ -75,6 +87,7 @@ fn snapshot_lists_a_blocked_root_its_child_and_grandchild() {
 
 #[test]
 fn snapshot_failure_is_reported_as_text() {
+    let _fixture = snapshot_fixture();
     let text = snapshot::describe_with(Path::new("/nonexistent/kuru-ps"), std::process::id());
     assert!(text.starts_with("snapshot unavailable: spawn "), "{text}");
     let failing = snapshot::describe_with(Path::new("/usr/bin/false"), std::process::id());
@@ -109,6 +122,7 @@ fn write_executable_from_child(path: &Path, script: &str) {
 
 #[test]
 fn membership_selector_is_exact_under_an_inherited_legacy_environment() {
+    let _fixture = snapshot_fixture();
     const CHILD: &str = "KURU_PS_SELECTOR_FIXTURE";
     if std::env::var_os(CHILD).is_none() {
         let output = Command::new(std::env::current_exe().unwrap())
@@ -157,6 +171,7 @@ fn membership_selector_is_exact_under_an_inherited_legacy_environment() {
 
 #[test]
 fn membership_rejects_success_status_with_stderr_while_diagnostics_keep_it() {
+    let _fixture = snapshot_fixture();
     let root = tempfile::tempdir().unwrap();
     let program = root.path().join("failed-sysctl-ps");
     write_executable_from_child(
@@ -204,6 +219,7 @@ fn descriptors_referring_to(path: &Path) -> Vec<String> {
 
 #[test]
 fn snapshot_helper_is_bounded_when_ps_does_not_finish() {
+    let _fixture = snapshot_fixture();
     let root = tempfile::tempdir().unwrap();
     // `exec` keeps the stand-in a single process, like `ps`, so stopping it
     // through its owned handle also closes both pipes.
@@ -229,6 +245,7 @@ fn snapshot_helper_is_bounded_when_ps_does_not_finish() {
 
 #[test]
 fn absolute_snapshot_deadline_reaps_its_stalled_helper() {
+    let _fixture = snapshot_fixture();
     let root = tempfile::tempdir().unwrap();
     let stalled = root.path().join("deadline-ps");
     let marker = root.path().join("helper-id");
@@ -263,6 +280,7 @@ fn absolute_snapshot_deadline_reaps_its_stalled_helper() {
 
 #[test]
 fn expired_absolute_snapshot_admission_does_not_spawn() {
+    let _fixture = snapshot_fixture();
     let error = snapshot::group_members_until_with(
         Path::new("/nonexistent/kuru-late-ps"),
         std::process::id(),
@@ -275,6 +293,7 @@ fn expired_absolute_snapshot_admission_does_not_spawn() {
 #[cfg(target_os = "linux")]
 #[test]
 fn descriptor_scan_sees_exactly_the_descriptors_held_here() {
+    let _fixture = snapshot_fixture();
     // The scan in the bounded test is only evidence if it can find a descriptor.
     let root = tempfile::tempdir().unwrap();
     let file = root.path().join("held");
@@ -290,6 +309,7 @@ fn descriptor_scan_sees_exactly_the_descriptors_held_here() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_write_descriptor_inherited_by_a_live_child_blocks_exec_of_the_file() {
+    let _fixture = snapshot_fixture();
     // The mechanism behind the stand-in's creation rule, without the fork race:
     // a live child holds a write descriptor to the file (as a sibling's child does
     // between fork and exec), so the kernel refuses to execute it. Only the first
@@ -323,6 +343,7 @@ fn a_write_descriptor_inherited_by_a_live_child_blocks_exec_of_the_file() {
 
 #[test]
 fn still_listed_reports_recorded_processes_until_they_are_gone() {
+    let _fixture = snapshot_fixture();
     // No shell: the ID and command are final the moment `spawn` returns.
     let mut root = Command::new("/bin/sleep")
         .arg("37")
@@ -357,6 +378,7 @@ fn still_listed_reports_recorded_processes_until_they_are_gone() {
 
 #[test]
 fn an_unreaped_child_is_listed_under_its_parent_but_not_as_its_recorded_row() {
+    let _fixture = snapshot_fixture();
     // A killed child no longer runs its command (macOS lists `<defunct>`), so
     // a check that an owned child was reaped must key on its ID and this
     // parent, not on the row recorded while it ran.
@@ -434,6 +456,7 @@ fn foreign_group() -> u32 {
 
 #[test]
 fn foreign_group_is_classified_as_recycled_without_error() {
+    let _fixture = snapshot_fixture();
     let group = foreign_group();
     let observed = observe_group_after_reap(group);
     let GroupObservation::Recycled(members) = &observed else {
@@ -457,6 +480,7 @@ fn foreign_group_is_classified_as_recycled_without_error() {
 
 #[test]
 fn live_group_of_ours_is_classified_as_a_survivor_with_its_listing() {
+    let _fixture = snapshot_fixture();
     let mut root = Command::new("/bin/sleep")
         .arg("41")
         .stdin(Stdio::null())
