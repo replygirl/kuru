@@ -19,7 +19,8 @@ use uuid::Uuid;
 
 use crate::server::Server;
 
-pub(super) const CURRENT_VERSION: i32 = 8;
+pub(super) const CURRENT_VERSION: i32 = 9;
+pub(super) const STATE_VERSION: i32 = 9;
 pub(super) const USAGE_CURRENT_VERSION: i32 = 4;
 /// The main schema step that introduces publication records: every main step
 /// at or above it records its own publication inside its attempt commit.
@@ -523,7 +524,21 @@ const V8: Definition = Definition {
     }],
 };
 
-const DEFINITIONS: &[Definition] = &[V2, V3, V4, V5, V6, V7, V8];
+const V9: Definition = Definition {
+    from: 8,
+    to: 9,
+    id: "kuru.memory.state-versions.v9",
+    sql: &["ALTER TABLE state ADD COLUMN version BIGINT NOT NULL DEFAULT 0"],
+    transform: "existing state values remain byte-for-byte unchanged and acquire version zero; topology remains owned by legacy writers until split publication lands",
+    postcondition: "version=9;state.version is signed BIGINT NOT NULL DEFAULT 0;v8 publication records remain exact",
+    failed_status: &[StatusRow {
+        table: "state",
+        staged: 0,
+        status: "modified",
+    }],
+};
+
+const DEFINITIONS: &[Definition] = &[V2, V3, V4, V5, V6, V7, V8, V9];
 
 #[derive(Clone, Copy)]
 struct Registry {
@@ -849,10 +864,23 @@ async fn validate_schema_on(
     if found >= PUBLICATION_VERSION {
         validate_publication_shape(connection).await?;
     }
+    if found >= STATE_VERSION {
+        let row = bounded_query(sqlx::query("SELECT data_type, column_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = DATABASE() AND BINARY table_name = BINARY 'state' AND BINARY column_name = BINARY 'version'").fetch_one(&mut *connection)).await?;
+        ensure!(
+            row.try_get::<String, _>(0)?.eq_ignore_ascii_case("bigint")
+                && !row
+                    .try_get::<String, _>(1)?
+                    .to_ascii_lowercase()
+                    .contains("unsigned")
+                && row.try_get::<String, _>(2)? == "NO"
+                && row.try_get::<String, _>(3)?.trim_matches('\'') == "0",
+            "state version column differs from schema v9"
+        );
+    }
     #[cfg(test)]
-    if registry.current >= 9 && found >= 9 {
+    if registry.current >= 10 && found >= 10 {
         bounded_query(
-            sqlx::query("SELECT marker FROM kuru_migration_test_v9 LIMIT 0")
+            sqlx::query("SELECT marker FROM kuru_migration_test_v10 LIMIT 0")
                 .fetch_all(&mut *connection),
         )
         .await?;
@@ -2997,15 +3025,15 @@ mod tests {
 
     /// A test-only step after the real publication-record step: it records
     /// its own publication like every later main step.
-    const V9: Definition = Definition {
-        from: 8,
-        to: 9,
-        id: "kuru.memory.test-marker.v9",
-        sql: &["CREATE TABLE kuru_migration_test_v9 (marker INT PRIMARY KEY)"],
+    const V10: Definition = Definition {
+        from: 9,
+        to: 10,
+        id: "kuru.memory.test-marker.v10",
+        sql: &["CREATE TABLE kuru_migration_test_v10 (marker INT PRIMARY KEY)"],
         transform: "none",
-        postcondition: "version=9;test marker table exists;v8 publication records remain exact",
+        postcondition: "version=10;test marker table exists;v8 publication records remain exact",
         failed_status: &[StatusRow {
-            table: "kuru_migration_test_v9",
+            table: "kuru_migration_test_v10",
             staged: 0,
             status: "new table",
         }],
@@ -3018,11 +3046,24 @@ mod tests {
         super::V6,
         super::V7,
         super::V8,
-        V9,
+        super::V9,
+        V10,
     ];
     pub(super) const TEST_REGISTRY: Registry = Registry {
-        current: 9,
+        current: 10,
         definitions: TEST_DEFINITIONS,
+    };
+    pub(super) const RELEASED_V8_REGISTRY: Registry = Registry {
+        current: 8,
+        definitions: &[
+            V2,
+            super::V3,
+            super::V4,
+            super::V5,
+            super::V6,
+            super::V7,
+            super::V8,
+        ],
     };
     pub(super) const RELEASED_V7_REGISTRY: Registry = Registry {
         current: 7,
@@ -3084,19 +3125,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v7_registry_rejects_v8_store_without_mutating_it() -> Result<()> {
+    async fn v8_registry_rejects_v9_store_without_mutating_it() -> Result<()> {
         let store = super::super::MemoryStore::temporary_cold().await?;
         let before = durable_snapshot(&store.pool).await?;
-        let error = validate_active_with(RELEASED_V7_REGISTRY, &store.pool)
+        let error = validate_active_with(RELEASED_V8_REGISTRY, &store.pool)
             .await
-            .expect_err("a v7 binary must reject v8 memory before opening it for writes");
+            .expect_err("a v8 binary must reject v9 memory before opening it for writes");
         assert!(
-            format!("{error:#}").contains("unsupported Dolt memory schema version 8"),
+            format!("{error:#}").contains("unsupported Dolt memory schema version 9"),
             "unexpected older-registry refusal: {error:#}"
         );
         assert_eq!(durable_snapshot(&store.pool).await?, before);
         store.close().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn conditional_state_v8_upgrade_preserves_bytes_and_historical_contract() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::warmed_open_options(
+            root.path().join("private"),
+            format!("project/{}", "d".repeat(64)),
+        )
+        .await?;
+        super::super::tests::released_v1(&options).await?;
+        let server = super::super::tests::released_server(&options).await?;
+        let main = server.pool("main").await?;
+        let legacy = r#"{ "parts": [], "unknown": { "future": true } }"#;
+        let prepared = async {
+            upgrade_with(
+                RELEASED_V8_REGISTRY,
+                &server,
+                &main,
+                &MigrationRunnerHooks::none(),
+            )
+            .await?;
+            bounded_query(
+                sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+                    .bind(b"topology".as_slice())
+                    .bind(legacy)
+                    .execute(main.as_ref()),
+            )
+            .await?;
+            commit_fixture(&main, "Preserve legacy topology bytes").await?;
+            bounded_query(
+                sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                    .bind("historical_schema8")
+                    .bind(revision(&main).await?)
+                    .fetch_all(main.as_ref()),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        main.close().await;
+        after_cleanup(prepared, server.close().await)?;
+        let store = super::super::MemoryStore::open(options).await?;
+        let verified = async {
+            let raw: String = bounded_query(
+                sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
+                    .bind(b"topology".as_slice())
+                    .fetch_one(store.pool.as_ref()),
+            )
+            .await?;
+            assert_eq!(raw, legacy);
+            assert_eq!(store.get_versioned("topology").await?.unwrap().version, 0);
+            let before = durable_snapshot(&store.pool).await?;
+            assert!(
+                validate_active_with(RELEASED_V8_REGISTRY, &store.pool)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(durable_snapshot(&store.pool).await?, before);
+            let old_pool = store.shared.server.pool("historical_schema8").await?;
+            let old = super::super::MemoryStore {
+                shared: store.shared.clone(),
+                pool: old_pool.clone(),
+                branch: "historical_schema8".into(),
+                logical_receipt: None,
+            };
+            let before = durable_snapshot(&old_pool).await?;
+            assert_eq!(
+                old.get_many(&["topology".into()]).await?,
+                vec![("topology".into(), Some(serde_json::from_str(legacy)?))]
+            );
+            assert!(old.get_versioned("topology").await.is_err());
+            assert!(old.get_many_versioned(&["topology".into()]).await.is_err());
+            assert!(
+                old.put_many_conditional(
+                    &[("topology".into(), crate::StateExpectation::Version(0))],
+                    &[("topology".into(), serde_json::json!({}))]
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(durable_snapshot(&old_pool).await?, before);
+            old_pool.close().await;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        after_cleanup(verified, store.close().await)
     }
 
     /// Produce the exact released v2 shape without letting ordinary open
@@ -3691,7 +3819,7 @@ mod tests {
                         let built = build_attempt(
                             TEST_REGISTRY,
                             &attempt,
-                            &V9,
+                            &V10,
                             *operation,
                             &AttemptRecord {
                                 branch: name,
@@ -3711,7 +3839,7 @@ mod tests {
                     let built = build_attempt(
                         TEST_REGISTRY,
                         &attempt,
-                        &V9,
+                        &V10,
                         mismatched,
                         &AttemptRecord {
                             branch: &attempts[0].0,
@@ -3825,7 +3953,7 @@ mod tests {
             )
             .await?;
             let attempt = server.pool(&name).await?;
-            let prepared = bounded_query(sqlx::query(V9.sql[0]).execute(attempt.as_ref())).await;
+            let prepared = bounded_query(sqlx::query(V10.sql[0]).execute(attempt.as_ref())).await;
             after_cleanup(prepared.map(|_| ()), close_branch_pool(&attempt).await)?;
             names.push(name);
         }
@@ -3911,7 +4039,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v9_receipt_order_and_operation_uniqueness_are_enforced() -> Result<()> {
+    async fn test_v10_receipt_order_and_operation_uniqueness_are_enforced() -> Result<()> {
         for repeated_operation in [false, true] {
             let store = super::super::MemoryStore::temporary_cold().await?;
             upgrade_with(
@@ -3933,7 +4061,7 @@ mod tests {
                 )
                 .await?;
                 bounded_query(
-                    sqlx::query("UPDATE kuru_migrations SET operation = ? WHERE version = 9")
+                    sqlx::query("UPDATE kuru_migrations SET operation = ? WHERE version = 10")
                         .bind(operation)
                         .execute(store.pool.as_ref()),
                 )
@@ -4201,7 +4329,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_v2_attempts_and_candidate_survive_test_v9_progression() -> Result<()> {
+    async fn retained_v2_attempts_and_candidate_survive_test_v10_progression() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let mut options = crate::test_support::warmed_open_options(
             root.path().join("private"),
@@ -4216,10 +4344,14 @@ mod tests {
         store
             .append("conversation", "user", "written after the v2 upgrade")
             .await?;
-        let candidate = store.begin_candidate("pre-v9 candidate").await?;
+        let candidate = store.begin_candidate("pre-v10 candidate").await?;
         candidate
             .view()
-            .append("candidate", "assistant", "kept on schema v8")
+            .append(
+                "candidate",
+                "assistant",
+                "kept on current pre-future schema",
+            )
             .await?;
         let candidate_head = candidate.view().revision().await?;
 
@@ -4257,13 +4389,16 @@ mod tests {
         failed.close().await;
         drop(failed);
 
-        assert_eq!(validate_ready_with(TEST_REGISTRY, &store.pool).await?, 8);
-        let v9_operation = Uuid::new_v4();
-        let v9_name = attempt_name(9, v9_operation);
+        assert_eq!(
+            validate_ready_with(TEST_REGISTRY, &store.pool).await?,
+            CURRENT_VERSION
+        );
+        let v10_operation = Uuid::new_v4();
+        let v10_name = attempt_name(10, v10_operation);
         let current_base = store.revision().await?;
         bounded_query(
             sqlx::query("CALL DOLT_BRANCH(?, ?)")
-                .bind(&v9_name)
+                .bind(&v10_name)
                 .bind(&current_base)
                 .fetch_all(store.pool.as_ref()),
         )
@@ -4272,7 +4407,7 @@ mod tests {
             validate_ready_with(TEST_REGISTRY, &store.pool)
                 .await
                 .is_err(),
-            "a ready v9 stage must reject while an earlier failed attempt remains"
+            "a ready v10 stage must reject while an earlier failed attempt remains"
         );
 
         upgrade_with(
@@ -4283,25 +4418,25 @@ mod tests {
         )
         .await?;
         validate_active_with(TEST_REGISTRY, &store.pool).await?;
-        assert_eq!(version(&store.pool).await?, 9);
-        let v9_attempt = store.shared.server.pool(&v9_name).await?;
-        assert_eq!(revision(&v9_attempt).await?, store.revision().await?);
-        let v9_receipt: String = bounded_query(
-            sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = 9")
-                .fetch_one(v9_attempt.as_ref()),
+        assert_eq!(version(&store.pool).await?, 10);
+        let v10_attempt = store.shared.server.pool(&v10_name).await?;
+        assert_eq!(revision(&v10_attempt).await?, store.revision().await?);
+        let v10_receipt: String = bounded_query(
+            sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = 10")
+                .fetch_one(v10_attempt.as_ref()),
         )
         .await?;
-        assert_eq!(v9_receipt, v9_operation.hyphenated().to_string());
-        v9_attempt.close().await;
-        drop(v9_attempt);
+        assert_eq!(v10_receipt, v10_operation.hyphenated().to_string());
+        v10_attempt.close().await;
+        drop(v10_attempt);
         assert_eq!(
             reserved_names(&store.pool)
                 .await?
                 .into_iter()
-                .filter(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 9))
+                .filter(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 10))
                 .count(),
             1,
-            "the pristine exact-base v9 attempt must be reused"
+            "the pristine exact-base v10 attempt must be reused"
         );
         // This is a synthetic future schema, beyond the current store API's
         // validated open contract. Inspect the test-registry-backed SQL view.
@@ -4333,7 +4468,7 @@ mod tests {
         );
         assert_eq!(
             old_view.history("candidate", 10).await?[0].plain_text(),
-            Some("kept on schema v8")
+            Some("kept on current pre-future schema")
         );
         let before_stale_merge = durable_snapshot(&store.pool).await?;
         assert!(
@@ -4344,11 +4479,11 @@ mod tests {
             )
             .await
             .is_err(),
-            "pre-v9 candidate unexpectedly fast-forwarded into v9 main"
+            "pre-v10 candidate unexpectedly fast-forwarded into v10 main"
         );
         assert_eq!(durable_snapshot(&store.pool).await?, before_stale_merge);
 
-        // Model a future v9 writer through its test registry and SQL view.
+        // Model a future v10 writer through its test registry and SQL view.
         // Released-v5 reopen refusal is checked in the separate old-registry fixture.
         let fresh_name = format!("candidate_{}", Uuid::new_v4().simple());
         let fresh_base = revision(&store.pool).await?;
@@ -4360,15 +4495,15 @@ mod tests {
         )
         .await?;
         let fresh = store.shared.server.pool(&fresh_name).await?;
-        assert_eq!(validate_supported_with(TEST_REGISTRY, &fresh).await?, 9);
+        assert_eq!(validate_supported_with(TEST_REGISTRY, &fresh).await?, 10);
         bounded_query(
             sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
-                .bind(b"post-v9".as_slice())
+                .bind(b"post-v10".as_slice())
                 .bind(json!({"preserved": true}).to_string())
                 .execute(fresh.as_ref()),
         )
         .await?;
-        commit_fixture(&fresh, "Test future-v9 candidate write").await?;
+        commit_fixture(&fresh, "Test future-v10 candidate write").await?;
         let fresh_head = revision(&fresh).await?;
         fresh.close().await;
         drop(fresh);
@@ -4386,16 +4521,16 @@ mod tests {
             .bind(b"conversation".as_slice())
             .bind(b"assistant".as_slice())
             .bind("text-v1")
-            .bind("written after schema v9")
+            .bind("written after schema v10")
             .execute(store.pool.as_ref()),
         )
         .await?;
-        commit_fixture(&store.pool, "Test future-v9 conversation write").await?;
+        commit_fixture(&store.pool, "Test future-v10 conversation write").await?;
         validate_active_with(TEST_REGISTRY, &store.pool).await?;
-        assert_eq!(version(&store.pool).await?, 9);
+        assert_eq!(version(&store.pool).await?, 10);
         let promoted_value: String = bounded_query(
             sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
-                .bind(b"post-v9".as_slice())
+                .bind(b"post-v10".as_slice())
                 .fetch_one(store.pool.as_ref()),
         )
         .await?;
@@ -4455,11 +4590,11 @@ mod tests {
         .await?;
         assert_eq!(
             messages,
-            ["written after the v2 upgrade", "written after schema v9"]
+            ["written after the v2 upgrade", "written after schema v10"]
         );
         let value: String = bounded_query(
             sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
-                .bind(b"post-v9".as_slice())
+                .bind(b"post-v10".as_slice())
                 .fetch_one(main.as_ref()),
         )
         .await?;
@@ -4492,7 +4627,7 @@ mod tests {
                 .fetch_one(old_candidate.as_ref()),
         )
         .await?;
-        assert_eq!(old_content, "kept on schema v8");
+        assert_eq!(old_content, "kept on current pre-future schema");
         old_candidate.close().await;
         drop(old_candidate);
         main.close().await;
@@ -5166,9 +5301,9 @@ mod tests {
         let exported_before_refusal = serde_json::to_value(&records)?;
         let error = validate_active_with(RELEASED_V7_REGISTRY, &store.pool)
             .await
-            .expect_err("a v7 validator must refuse this populated v8 store");
+            .expect_err("a v7 validator must refuse this populated v9 store");
         assert!(
-            format!("{error:#}").contains("unsupported Dolt memory schema version 8"),
+            format!("{error:#}").contains("unsupported Dolt memory schema version 9"),
             "unexpected v7-validator refusal: {error:#}"
         );
         assert_eq!(durable_snapshot(&store.pool).await?, before_refusal);

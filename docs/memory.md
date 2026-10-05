@@ -321,6 +321,17 @@ correct the reported exact path before retrying.
 
 ## Schema upgrades
 
+Schema 9 adds a monotonically increasing version to each project state row.
+Existing values retain their exact bytes and start at version zero. Every
+overwrite, including an equal-value write or a turn checkpoint, advances that
+row's version. Conditional publication compares explicit absent/version
+expectations and writes its complete batch in one transaction; a stale
+expectation changes no values, messages, receipts or revisions. Dream writes
+advance only their candidate's versions until exact promotion. Historical views
+retain their schema; older binaries refuse a schema they do not understand.
+This storage primitive does not enable concurrent conversation admission or
+change the runtime's existing topology representation.
+
 Writable opens apply compatible Dolt schema upgrades in order before making a
 store available. Each step is built on an isolated internal branch and reaches
 `main` only through a checked fast-forward after its committed receipt and
@@ -393,7 +404,7 @@ happens, a read-only command on the project, such as inspection or export,
 fails with `memory schema version 7 requires writable upgrade to 8`.
 This is the same refusal every pending schema step produces, and it changes
 nothing. Projects created from the store template after the update start at
-schema 8 with their records and never need this upgrade.
+schema 9 with their publication records and state versions.
 
 The SQL schema version is independent from the format-1 `ready.json` activation
 record, the database identity record, and the supervisor protocol. An old dream
@@ -485,7 +496,7 @@ template format, the pinned engine version and this platform's engine digest,
 the schema versions and every schema step, the format of the migration
 publication records, and the statements and settings that create a store. A
 release that changes any of them uses a new key and builds a new template once;
-old templates stay, as old engine versions do. The release that adds schema 8
+old templates stay, as old engine versions do. The release that adds schema 9
 is one of these: the first new project after updating builds the template
 once, running every schema step once.
 Nothing removes a template or its lock file during ordinary use.

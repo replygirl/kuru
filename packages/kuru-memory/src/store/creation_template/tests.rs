@@ -367,7 +367,7 @@ fn template_key_tracks_schema_engine_statements_and_format_only() {
         })
     );
     let [main, usage] = migrations::template_key_definitions();
-    assert_eq!(main.len(), 7, "every main definition is keyed");
+    assert_eq!(main.len(), 8, "every main definition is keyed");
     assert_eq!(usage.len(), 3, "every usage definition is keyed");
 }
 

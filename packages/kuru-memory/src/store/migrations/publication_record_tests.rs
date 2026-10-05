@@ -11,8 +11,8 @@
 //! axis a record is checked on.
 use super::super::MemoryStore;
 use super::tests::{
-    DurableSnapshot, RELEASED_V7_REGISTRY, TEST_REGISTRY, assert_attempts_unchanged,
-    assert_failed_runner_unchanged, durable_snapshot, snapshot_attempts,
+    DurableSnapshot, RELEASED_V7_REGISTRY, RELEASED_V8_REGISTRY, TEST_REGISTRY,
+    assert_attempts_unchanged, assert_failed_runner_unchanged, durable_snapshot, snapshot_attempts,
 };
 use super::*;
 use crate::store::OpenOptions;
@@ -191,7 +191,13 @@ async fn publication_record_is_in_the_attempt_commit_and_reaches_main_with_the_f
         let (hooks, control) = MigrationRunnerHooks::paused(MigrationBoundary::BeforePublish);
         let (migrating_server, migrating_main) = (server.clone(), main.clone());
         let upgrading = tokio::spawn(async move {
-            upgrade_with_hooks(&migrating_server, &migrating_main, &hooks).await
+            upgrade_with(
+                RELEASED_V8_REGISTRY,
+                &migrating_server,
+                &migrating_main,
+                &hooks,
+            )
+            .await
         });
         let _abort = AbortOnDrop(upgrading.abort_handle());
         tokio::time::timeout(TEST_DEADLINE, control.reached())
@@ -253,7 +259,7 @@ async fn publication_record_is_in_the_attempt_commit_and_reaches_main_with_the_f
             records_in(&main).await? == expected,
             "main's records differ"
         );
-        validate_active(&main).await?;
+        validate_active_with(RELEASED_V8_REGISTRY, &main).await?;
         eprintln!(
             "P6 attempt commit {target} on base {base}: records {:?}",
             expected
@@ -309,8 +315,16 @@ async fn v8_backfills_every_published_branch_from_classification() -> Result<()>
             "a v7 store classified {before:?}"
         );
 
-        upgrade_with(REGISTRY, &server, &main, &MigrationRunnerHooks::none()).await?;
-        let after = classify(&main).await.map_err(anyhow::Error::msg)?;
+        upgrade_with(
+            RELEASED_V8_REGISTRY,
+            &server,
+            &main,
+            &MigrationRunnerHooks::none(),
+        )
+        .await?;
+        let after =
+            classify_historical_attempts_in(RELEASED_V8_REGISTRY, &main, 8, RESERVED_PREFIX)
+                .await?;
         ensure!(
             after.by_record == 7 && after.full == 1,
             "the upgraded store classified {after:?}"
@@ -365,7 +379,7 @@ async fn read_only_open_of_v7_store_requires_writable_upgrade() -> Result<()> {
         Err(error) => format!("{error:#}"),
     };
     ensure!(
-        error.contains("memory schema version 7 requires writable upgrade to 8"),
+        error.contains("memory schema version 7 requires writable upgrade to 9"),
         "unexpected read-only refusal: {error}"
     );
     let server = super::super::tests::released_server(&options).await?;
@@ -400,7 +414,7 @@ async fn v7_store_upgrades_once_with_two_starts_then_uses_records() -> Result<()
         let made = starts_under(root.path())? - starts;
         ensure!(made == 2, "the upgrading open made {made} engine starts");
         ensure!(
-            version(&upgraded.pool).await? == 8,
+            version(&upgraded.pool).await? == CURRENT_VERSION,
             "the open did not upgrade"
         );
         let classified = classify(&upgraded.pool).await.map_err(anyhow::Error::msg)?;
@@ -425,7 +439,7 @@ async fn v7_store_upgrades_once_with_two_starts_then_uses_records() -> Result<()
         );
         let classified = classify(&reopened.pool).await.map_err(anyhow::Error::msg)?;
         ensure!(
-            classified.full == 0 && classified.by_record == 7,
+            classified.full == 0 && classified.by_record == usize::try_from(CURRENT_VERSION - 1)?,
             "the reopened store classified {classified:?}"
         );
         Ok(())
@@ -458,7 +472,7 @@ async fn ready_v7_stage_from_previous_binary_is_classified_then_upgraded() -> Re
         validate_active(&main).await?;
         let classified = classify(&main).await.map_err(anyhow::Error::msg)?;
         ensure!(
-            classified.full == 0 && classified.by_record == 7,
+            classified.full == 0 && classified.by_record == usize::try_from(CURRENT_VERSION - 1)?,
             "the upgraded stage classified {classified:?}"
         );
         Ok(())
@@ -480,7 +494,7 @@ async fn unrecorded_failed_attempt_is_still_fully_classified() -> Result<()> {
         let main = store.pool.as_ref();
         let clean = classify(main).await.map_err(anyhow::Error::msg)?;
         ensure!(
-            clean.full == 0 && clean.by_record == 7,
+            clean.full == 0 && clean.by_record == usize::try_from(CURRENT_VERSION - 1)?,
             "a cold store classified {clean:?}"
         );
         expected_records(main, &clean.published).await?;
@@ -508,7 +522,8 @@ async fn unrecorded_failed_attempt_is_still_fully_classified() -> Result<()> {
             let verdict = classify(main).await;
             match (accepted, &verdict) {
                 (true, Ok(classified)) => ensure!(
-                    classified.full == 1 && classified.by_record == 7,
+                    classified.full == 1
+                        && classified.by_record == usize::try_from(CURRENT_VERSION - 1)?,
                     "{label}: classified {classified:?}"
                 ),
                 (false, Err(message)) => ensure!(
@@ -540,7 +555,7 @@ async fn recorded_branch_deleted_is_tolerated() -> Result<()> {
         branch_call(main, &["-D", &v3]).await?;
         let classified = classify(main).await.map_err(anyhow::Error::msg)?;
         ensure!(
-            classified.by_record == 6 && classified.full == 0,
+            classified.by_record == usize::try_from(CURRENT_VERSION - 2)? && classified.full == 0,
             "classified {classified:?} with a deleted recorded branch"
         );
         Ok(())
@@ -987,8 +1002,8 @@ async fn reused_completed_v8_attempt_with_disagreeing_backfill_fails_closed() ->
     after_cleanup(checked, server.close().await)
 }
 
-/// The test-only v9 step records its own publication like every step after
-/// the introducing one: its commit holds main's v2..v8 records and its own.
+/// The test-only v10 step records its own publication like every step after
+/// the introducing one: its commit holds main's v2..v9 records and its own.
 #[tokio::test]
 async fn later_step_records_itself_over_the_base_records() -> Result<()> {
     let store = MemoryStore::temporary_cold().await?;
@@ -1003,21 +1018,23 @@ async fn later_step_records_itself_over_the_base_records() -> Result<()> {
         )
         .await?;
         validate_active_with(TEST_REGISTRY, main).await?;
-        let (v9, v9_head) = sole_branch(main, 9).await?;
+        let (v10, v10_head) = sole_branch(main, 10).await?;
         let records = records_in(main).await?;
         ensure!(
             records[..records.len() - 1] == base_records[..],
-            "the v9 step changed earlier records"
+            "the v10 step changed earlier records"
         );
-        let own = records.last().context("no v9 record")?;
+        let own = records.last().context("no v10 record")?;
         ensure!(
-            own.version == 9 && own.branch == v9 && own.base == sole_parent(main, &v9_head).await?,
-            "the v9 record differs: {own:?}"
+            own.version == 10
+                && own.branch == v10
+                && own.base == sole_parent(main, &v10_head).await?,
+            "the v10 record differs: {own:?}"
         );
         let classified =
-            classify_historical_attempts_in(TEST_REGISTRY, main, 9, RESERVED_PREFIX).await?;
+            classify_historical_attempts_in(TEST_REGISTRY, main, 10, RESERVED_PREFIX).await?;
         ensure!(
-            classified.full == 0 && classified.by_record == 8,
+            classified.full == 0 && classified.by_record == 9,
             "classified {classified:?}"
         );
         Ok(())
@@ -1036,7 +1053,7 @@ async fn template_born_store_carries_records_and_passes_the_shape_check() -> Res
         let main = store.pool.as_ref();
         let classified = classify(main).await.map_err(anyhow::Error::msg)?;
         ensure!(
-            classified.full == 0 && classified.by_record == 7,
+            classified.full == 0 && classified.by_record == usize::try_from(CURRENT_VERSION - 1)?,
             "a template copy classified {classified:?}"
         );
         expected_records(main, &classified.published).await?;
