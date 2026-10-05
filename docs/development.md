@@ -899,6 +899,18 @@ and, when its start fails, appends that file (at most 1 MiB) to the owner
 diagnostic. Owners that the test process elects itself, through an in-process
 open, are not covered: the test runner's own environment is never changed.
 
+That same exact test-support gate emits bounded `memory cold-probe` lines to
+the owner's stderr. They identify checked source hashing, copy writes/sync,
+copied-file verification, private-home preparation, native child creation,
+version wait refusal and cleanup/reap. Each preparation or probe has its own
+elapsed clock. Refusal lines report only pipe byte counts and actual EOF flags;
+Windows also samples the retained root handle and owned Job accounting. No pipe
+body or private path is included, and these observations never advance readiness.
+The cold source hash, copy writes and copied-file hash instead advance the
+existing progress counter for each completed 8 MiB of actual work. A last
+completed phase narrows a stall; an owner-running observation alone does not
+establish the version child's state. The probe and readiness bounds are unchanged.
+
 With `KURU_OPEN_MARKERS=1` (exactly `1`; unset or any other value changes
 nothing) the command line writes open-time marker lines to standard error for
 the open-time harness. This is a release-binary feature, not test support, and

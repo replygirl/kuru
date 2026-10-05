@@ -24,6 +24,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 #[cfg(unix)]
 use tokio::process::Command;
 
+mod probe_diagnostics;
+use probe_diagnostics::{PipeFacts, ProbeDiagnostics};
+
 pub(crate) const LOCK_TIMEOUT: Duration = Duration::from_secs(180);
 pub(crate) const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTPUT_LIMIT: u64 = 4096;
@@ -171,11 +174,18 @@ async fn provision_with_extractor_observed(
     let probe_home = lease.path().join("probe");
     let candidate_path = candidate.clone();
     let probe_path = probe_home.clone();
+    let probe_ticks = progress.ticks().cloned();
     let (probe, lease) = tokio::task::spawn_blocking(move || {
         // On cancellation, the completed output drops in this field order:
         // the checked probe, then the lease (its stage, then the lock).
         (
-            prepare_cold_probe(&candidate_path, &probe_path, asset),
+            prepare_cold_probe_with(
+                &candidate_path,
+                &probe_path,
+                asset,
+                probe_ticks.as_ref(),
+                |_| Ok(()),
+            ),
             lease,
         )
     })
@@ -767,12 +777,13 @@ impl CheckedColdProbe {
     }
 }
 
+#[cfg(all(test, unix))]
 fn prepare_cold_probe(
     candidate: &Path,
     probe_home: &Path,
     asset: Asset<'_>,
 ) -> Result<CheckedColdProbe> {
-    prepare_cold_probe_with(candidate, probe_home, asset, |_| Ok(()))
+    prepare_cold_probe_with(candidate, probe_home, asset, None, |_| Ok(()))
 }
 
 #[cfg(test)]
@@ -782,28 +793,34 @@ fn prepare_cold_probe_observed(
     asset: Asset<'_>,
     observer: impl FnOnce(&mut File) -> Result<()>,
 ) -> Result<CheckedColdProbe> {
-    prepare_cold_probe_with(candidate, probe_home, asset, observer)
+    prepare_cold_probe_with(candidate, probe_home, asset, None, observer)
 }
 
 fn prepare_cold_probe_with(
     candidate: &Path,
     probe_home: &Path,
     asset: Asset<'_>,
+    ticks: Option<&OpenTicks>,
     observer: impl FnOnce(&mut File) -> Result<()>,
 ) -> Result<CheckedColdProbe> {
+    let diagnostics = ProbeDiagnostics::new();
+    diagnostics.phase("checked-copy-enter");
+    let mut bytes = ByteTicks::new(ticks);
     private_directory(probe_home)?;
     let source_directory = files::directory(candidate)?;
     let executable_name = std::ffi::OsStr::new(asset.executable_name);
     let source_path = candidate.join(executable_name);
     let mut source = source_directory.read(executable_name)?;
-    verify_payload_file(
+    verify_payload_file_ticking(
         &mut source,
         asset.executable_bytes,
         asset.executable_sha256,
         true,
         &source_path,
+        &mut bytes,
     )?;
     source_directory.verify(executable_name, &source)?;
+    diagnostics.phase("source-verified");
     source.rewind()?;
 
     let probe_directory = files::directory(probe_home)?;
@@ -812,12 +829,14 @@ fn prepare_cold_probe_with(
     ensure!(
         std::io::copy(
             &mut (&mut source).take(asset.executable_bytes + 1),
-            &mut probe_writer,
+            &mut TickingWriter::new(&mut probe_writer, &mut bytes),
         )? == asset.executable_bytes,
         "Dolt cold probe copy size mismatch"
     );
+    diagnostics.phase("copy-written");
     seal_private(&probe_writer, true)?;
     probe_writer.sync_all()?;
+    diagnostics.phase("copy-synced");
     observer(&mut probe_writer)?;
     probe_writer.sync_all()?;
     drop(probe_writer);
@@ -825,12 +844,13 @@ fn prepare_cold_probe_with(
     // Retain only read authority after the test seam and before execution.
     let mut probe = probe_directory.read(executable_name)?;
     probe.rewind()?;
-    verify_payload_file(
+    verify_payload_file_ticking(
         &mut probe,
         asset.executable_bytes,
         asset.executable_sha256,
         true,
         &probe_path,
+        &mut bytes,
     )?;
     source_directory.verify(executable_name, &source)?;
     probe_directory.verify(executable_name, &probe)?;
@@ -838,6 +858,7 @@ fn prepare_cold_probe_with(
         regular_file_info(&source)?.identity != regular_file_info(&probe)?.identity,
         "Dolt cold probe copy unexpectedly retained the source identity"
     );
+    diagnostics.phase("copy-verified");
     Ok(CheckedColdProbe {
         directory: probe_directory,
         executable_name: executable_name.to_owned(),
@@ -1985,8 +2006,12 @@ async fn verify_version_recorded(
     timeout: Duration,
     probe_child: &mut Option<ProbeChildStamp>,
 ) -> Result<()> {
+    let diagnostics = ProbeDiagnostics::new();
+    diagnostics.phase("private-home-enter");
     checked_regular(binary, true)?;
     prepare_private_home(home)?;
+    diagnostics.phase("private-home-ready");
+    diagnostics.phase("native-create-enter");
     let mut child = crate::engine::spawn(
         binary,
         home,
@@ -1997,6 +2022,7 @@ async fn verify_version_recorded(
     )
     .await
     .context("start configured Dolt executable")?;
+    diagnostics.phase("native-create-returned");
     #[cfg(windows)]
     {
         *probe_child = Some(
@@ -2013,11 +2039,14 @@ async fn verify_version_recorded(
     let _ = probe_child;
     let stdout = child.stdout().context("Dolt version stdout is missing")?;
     let stderr = child.stderr().context("Dolt version stderr is missing")?;
+    let stdout_facts = PipeFacts::default();
+    let stderr_facts = PipeFacts::default();
+    diagnostics.phase("wait-enter");
     let result = tokio::time::timeout(timeout, async {
         let (status, stdout, _stderr) = tokio::try_join!(
             async { Ok::<_, anyhow::Error>(child.wait().await?) },
-            bounded_output(stdout),
-            bounded_output(stderr),
+            bounded_output(stdout, &stdout_facts),
+            bounded_output(stderr, &stderr_facts),
         )?;
         ensure!(status.success(), "Dolt version probe failed");
         ensure!(
@@ -2027,8 +2056,11 @@ async fn verify_version_recorded(
         Ok(())
     })
     .await;
+    let timed_out = result.is_err();
     let result = result.unwrap_or_else(|_| Err(anyhow::anyhow!("Dolt version probe timed out")));
     if result.is_err() {
+        diagnostics.refusal(&child, &stdout_facts, &stderr_facts, timed_out);
+        diagnostics.phase("cleanup-enter");
         let _ = child.kill();
         if child.wait().await.is_err() {
             eprintln!(
@@ -2041,21 +2073,29 @@ async fn verify_version_recorded(
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
+        diagnostics.phase("cleanup-reaped");
+    } else {
+        diagnostics.phase("verified-reaped");
     }
     result
 }
 
-async fn bounded_output(reader: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
+async fn bounded_output(mut reader: impl AsyncRead + Unpin, facts: &PipeFacts) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    reader
-        .take(OUTPUT_LIMIT + 1)
-        .read_to_end(&mut bytes)
-        .await?;
-    ensure!(
-        bytes.len() as u64 <= OUTPUT_LIMIT,
-        "Dolt version output exceeded its limit"
-    );
-    Ok(bytes)
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let remaining = ((OUTPUT_LIMIT + 1) as usize - bytes.len()).min(buffer.len());
+        let read = reader.read(&mut buffer[..remaining]).await?;
+        facts.read(read);
+        if read == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        ensure!(
+            bytes.len() as u64 <= OUTPUT_LIMIT,
+            "Dolt version output exceeded its limit"
+        );
+    }
 }
 
 #[cfg(test)]

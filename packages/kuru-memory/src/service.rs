@@ -97,7 +97,7 @@ fn forward_startup_diagnostic(diagnostic: &mut File, forward: &mut File) {
 }
 
 #[cfg(feature = "test-support")]
-fn fixture_startup_stages_enabled() -> bool {
+pub(crate) fn fixture_startup_stages_enabled() -> bool {
     std::env::var_os(STARTUP_STAGE_DIAGNOSTIC_ENV).as_deref() == Some(OsStr::new("1"))
 }
 

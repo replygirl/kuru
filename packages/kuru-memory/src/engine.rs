@@ -87,6 +87,42 @@ pub(crate) fn environment(home: &Path) -> Result<Vec<(OsString, OsString)>> {
 }
 
 impl Child {
+    /// Bounded read-only facts from retained authority, never a control input.
+    pub(crate) fn probe_diagnostic(&self) -> String {
+        #[cfg(unix)]
+        {
+            format!("retained-child={}", self.inner.id().is_some())
+        }
+        #[cfg(windows)]
+        {
+            let snapshot = self.inner.diagnostic_snapshot();
+            let root = match snapshot.root {
+                Ok(kuru_platform::windows::process::RootObservation::Running) => "running".into(),
+                Ok(kuru_platform::windows::process::RootObservation::Exited(code)) => {
+                    format!("exited({code})")
+                }
+                Err(_) => "unavailable".into(),
+            };
+            let mut facts = format!("root-id={} root={root}", snapshot.root_id);
+            if let Ok(sample) = snapshot.root_sample {
+                facts.push_str(&format!(
+                    " cpu-ns={} working-set={}",
+                    (sample.kernel_time + sample.user_time).as_nanos(),
+                    sample.working_set_bytes
+                ));
+            }
+            match snapshot.job {
+                Some(Ok(job)) => facts.push_str(&format!(
+                    " job-active={} job-total={} job-terminated={}",
+                    job.active_processes, job.total_processes, job.terminated_processes
+                )),
+                Some(Err(_)) => facts.push_str(" job=unavailable"),
+                None => facts.push_str(" job=none"),
+            }
+            facts
+        }
+    }
+
     /// The owned child's process ID, while it has not been reaped.
     #[cfg(all(test, unix))]
     pub(crate) fn id(&self) -> Option<u32> {
