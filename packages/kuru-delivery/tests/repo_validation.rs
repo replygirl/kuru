@@ -475,8 +475,9 @@ const WORKFLOWS: [&str; 6] = [
     "release.yml",
 ];
 
-/// The fixed apt step text in native-tests.yml and release.yml.
-const FIXED_APT: &str = "          # These packages come from the Ubuntu archive. apt reads only its deb822
+/// The fixed apt step text in native-tests.yml and release.yml: each fetch is
+/// bounded and the update and install pair runs at most twice.
+const FIXED_APT: &str = r#"          # These packages come from the Ubuntu archive. apt reads only its deb822
           # list and no other sources.list.d entry, so an outage of a third-party
           # repository on the runner image cannot fail this step; errors from the
           # archive still fail it.
@@ -484,10 +485,36 @@ const FIXED_APT: &str = "          # These packages come from the Ubuntu archive
             echo 'The runner image has no Ubuntu archive list at /etc/apt/sources.list.d/ubuntu.sources' >&2
             exit 1
           fi
-          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null update
-          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null \\
-            install -y --no-install-recommends dbus gnome-keyring libsecret-tools
-";
+          # Job 110454097537 stalled 42 minutes inside apt-get update, past apt's
+          # own bounds, so coreutils timeout caps each fetch. The cap lets apt's
+          # bounds end a failure first, with apt's own error; derivation in the
+          # Measured basis of openspec change bound-apt-fixture-tools-step:
+          #   127 s  one stalled item under apt 2.8.3 defaults: (1 + 3 retries)
+          #          x 30 s per wait + 1 + 2 + 4 s retry delays (basehttp.cc
+          #          TimeOut(30), acquire-item.cc Acquire::Retries 3,
+          #          acquire-worker.cc Acquire::Retries::Delay)
+          #  + 17 s  that hang's mirror fallback, mirror list to first Hit:
+          #  + 43 s  slowest whole step over 200 healthy partition jobs
+          #  = 187 s for each fetch
+          budget=187
+          # The update and install pair runs at most twice; nothing else retries.
+          for attempt in 1 2; do
+            echo "Ubuntu archive apt attempt $attempt of 2"
+            status=0
+            timeout "$budget" sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null update || status=$?
+            if [ "$status" -eq 0 ]; then
+              timeout "$budget" sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=/dev/null \
+                install -y --no-install-recommends dbus gnome-keyring libsecret-tools || status=$?
+            fi
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            elif [ "$attempt" -eq 1 ]; then
+              echo "::warning::Ubuntu archive apt attempt 1 of 2 failed with exit status $status (124 = timed out after $budget s), retrying once"
+            fi
+          done
+          echo "::error::Ubuntu archive apt attempt 2 of 2 failed with exit status $status (124 = timed out after $budget s)"
+          exit "$status"
+"#;
 /// The same step before the fix, as run 36453397286 partition 7 ran it.
 const INCIDENT_APT: &str = "          sudo apt-get update
           sudo apt-get install -y --no-install-recommends dbus gnome-keyring libsecret-tools
@@ -759,6 +786,41 @@ fn incident_apt_update_over_every_source_is_rejected() {
     })
     .collect();
     assert_eq!(errors, expected);
+    // The bounded retry loop hides neither fetch in either workflow: each
+    // begins its own command after only the `timeout "$budget" sudo` prefix,
+    // so reading the parts directory again in one of them is still rejected.
+    let list = "-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources";
+    let parts = " -o Dir::Etc::sourceparts=/dev/null";
+    let fetches = [
+        (
+            format!(
+                "            timeout \"$budget\" sudo apt-get {list}{parts} update || status=$?\n"
+            ),
+            format!("apt-get {list} update"),
+        ),
+        (
+            format!("              timeout \"$budget\" sudo apt-get {list}{parts} \\\n"),
+            format!(
+                "apt-get {list} install -y --no-install-recommends dbus gnome-keyring libsecret-tools"
+            ),
+        ),
+    ];
+    for (name, job) in [("native-tests.yml", "shard"), ("release.yml", "tests")] {
+        for (line, command) in &fetches {
+            let repo = Repository::with_workflows();
+            repo.replace(
+                &format!(".github/workflows/{name}"),
+                line,
+                &line.replacen(parts, "", 1),
+            );
+            assert_eq!(
+                repo.workflow_errors(),
+                [format!(
+                    ".github/workflows/{name}: job {job} step Install Ubuntu native secret-store fixture tools runs `{command}` over every configured apt source; name the needed list with one -o Dir::Etc::sourcelist=/..., make the last -o Dir::Etc::sourceparts=/dev/null, and pass no -c"
+                )]
+            );
+        }
+    }
     // Naming a list is not enough while the parts directory is still read,
     // and the `apt` front end fetches the same way.
     let repo = Repository::with_workflows();

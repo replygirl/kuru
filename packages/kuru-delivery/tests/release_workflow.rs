@@ -124,6 +124,18 @@ fn required_release_checks_precede_the_only_publication_job() {
         session(&tests, "mise run test"),
         session(&native, "mise run //packages/kuru-delivery:coverage:shard")
     );
+    // The apt step is CI's shard copy, including the backstop its run body
+    // does not carry; only CI's runner.os selection differs.
+    let apt = "Install Ubuntu native secret-store fixture tools";
+    let linux = "\n        if: runner.os == 'Linux'\n";
+    let release_steps = workflow_steps(&tests);
+    let shard_steps = workflow_steps(workflow_job(&native, "shard", "merge"));
+    let shard_apt = named_step(&shard_steps, apt);
+    assert!(shard_apt.contains(linux));
+    assert_eq!(
+        named_step(&release_steps, apt),
+        shard_apt.replacen(linux, "\n", 1)
+    );
 
     let assembly = job("assemble-candidate");
     assert!(assembly.contains("mise run release:tool -- assemble"));
@@ -1497,11 +1509,18 @@ fn native_workflow_partitions_every_os_and_keeps_the_aggregate_fail_closed() {
     // derives from the same limit the host enforces.
     assert!(steps[0].starts_with("name: Record the job start for the inner test deadline\n"));
     assert!(steps[0].contains("KURU_COVERAGE_JOB_STARTED=%s"));
+    // The job's own limit, at job indentation; a step's bound is not the job's.
     let timeout: Vec<_> = shards
         .lines()
-        .filter_map(|line| line.trim().strip_prefix("timeout-minutes: "))
+        .filter_map(|line| line.strip_prefix("    timeout-minutes: "))
         .collect();
     assert_eq!(timeout, ["45"]);
+    // The apt step's backstop, at step indentation; its derivation lives at the site.
+    let backstop: Vec<_> = shards
+        .lines()
+        .filter_map(|line| line.strip_prefix("        timeout-minutes: "))
+        .collect();
+    assert_eq!(backstop, ["13"]);
     let deadlines: Vec<_> = shards
         .lines()
         .filter_map(|line| line.trim().strip_prefix("KURU_COVERAGE_JOB_MINUTES: \""))
