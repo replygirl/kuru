@@ -16,6 +16,24 @@ use serde_json::{Value, json};
 #[path = "support/memory.rs"]
 mod memory;
 
+#[cfg(unix)]
+#[allow(dead_code)]
+#[path = "support/terminal.rs"]
+mod terminal;
+
+#[path = "support/turn_budget.rs"]
+mod turn_budget;
+
+/// The server's exit after its interrupt: `serve` returns on the signal, then
+/// the CLI runs `harness.shutdown(false)` (src/cli.rs `Command::Serve`). As for
+/// `EXIT_TIMEOUT` in tests/terminal.rs, its waits are two `reconcile()` calls,
+/// each one Remote `ViewOperation::Reconcile` under the memory client's reply
+/// deadline `OPERATION_TIMEOUT` (kuru-memory src/facade.rs `reconcile`), and
+/// `memory.close()` only drains the client's attachments. `--no-dream` leaves
+/// no exit dream, and this server configures no MCP alias, shell or hook, so
+/// `tools.shutdown()` has nothing to join.
+const SHUTDOWN_BUDGET: Duration = kuru_memory::test_budgets::OPERATION_TIMEOUT.saturating_mul(2);
+
 struct Server(Child);
 
 const MAX_STARTUP_LINES: usize = 16;
@@ -98,7 +116,13 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
             })();
             let _ = sender.send(result);
         });
-        let line = receiver.recv_timeout(Duration::from_secs(10))??;
+        // The server opens its memory owner before it listens (src/cli.rs
+        // `open_memory` through `attach_or_start_observed`), from the default
+        // `startup_timeout_secs` that `configuration_with` writes, so its line
+        // has the same staged startup budget as a terminal's first frame.
+        let line = receiver.recv_timeout(terminal::startup_timeout(Duration::from_secs(
+            kuru_core::MemoryConfig::default().startup_timeout_secs,
+        )))??;
         reader.join().expect("server readiness reader panicked");
         (child, line)
     };
@@ -182,7 +206,11 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
         .context("missing server address")?;
     let base = format!("http://{address}");
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        // Each request (the card reads, the refused POST and the
+        // `SendMessage` turn) is bounded by the runtime's ingress budget for
+        // one turn; a hung request reports after about 635 s, inside the
+        // native test job's timeout.
+        .timeout(turn_budget::TURN_BUDGET)
         .build()?;
     let card: Value = client
         .get(format!("{base}/.well-known/agent-card.json"))
@@ -241,7 +269,7 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
     )?;
     #[cfg(windows)]
     child.0.interrupt()?;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SHUTDOWN_BUDGET;
     loop {
         if let Some(status) = child.0.try_wait()? {
             ensure!(

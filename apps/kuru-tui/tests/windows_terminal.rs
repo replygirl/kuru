@@ -262,7 +262,10 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
     )?;
     terminal.text(&["KURU", "enter send"], sandbox.startup)?;
     let animated = terminal.output.len();
-    terminal.read_for(Duration::from_millis(700))?;
+    // The next ambient frame is due within the frame allowance in `READY`.
+    terminal.wait("ambient animation frame", READY, |terminal| {
+        terminal.output.len() > animated
+    })?;
     ensure!(
         terminal.output.len() > animated,
         "native ambient animation did not draw"
@@ -278,7 +281,9 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
     terminal.send(b"!")?;
     terminal.composer("focus draft!")?;
     let resumed_frame = terminal.output.len();
-    terminal.read_for(Duration::from_millis(700))?;
+    terminal.wait("resumed animation frame", READY, |terminal| {
+        terminal.output.len() > resumed_frame
+    })?;
     ensure!(
         terminal.output.len() > resumed_frame,
         "native focus return did not resume animation after a completed frame"

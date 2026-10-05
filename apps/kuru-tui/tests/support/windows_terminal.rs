@@ -8,7 +8,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const READY: Duration = Duration::from_secs(10);
+/// Default bound for a frame or input wait, derived as the Unix
+/// `READY_TIMEOUT` is in tests/support/terminal.rs (a Unix-only module, so the
+/// expression is restated here): the ConPTY child opens memory on the managed
+/// Remote backend, and the longest product step a frame wait encloses is one
+/// Remote reply, bounded by the client's reply deadline `OPERATION_TIMEOUT`
+/// (kuru-memory src/service/rpc.rs:38). The frame then trails it by at most
+/// the idle ambient interval (250 ms, `View::advance_animation` in src/ui.rs)
+/// plus the idle animation wake (100 ms). Every use is event-driven.
+pub const READY: Duration =
+    kuru_memory::test_budgets::OPERATION_TIMEOUT.saturating_add(Duration::from_millis(250 + 100));
 // Includes the actual memory shutdown grace/escalation and one pending commit.
 // Also bounds closing the console to drain output after an observed exit.
 pub const EXIT: Duration = Duration::from_secs(30);

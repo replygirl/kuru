@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use kuru_memory::test_budgets::OPERATION_TIMEOUT;
 use nix::{
     sys::signal::{Signal, kill},
     unistd::Pid,
@@ -16,7 +17,31 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use rustix::process::{Pid as RustixPid, WaitId, WaitIdOptions, waitid};
 
 const TICK: Duration = Duration::from_millis(20);
-pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// The longest a due frame trails the event that makes it due: the idle
+/// ambient interval (250 ms, `View::advance_animation` in src/ui.rs; "capped
+/// at 4 FPS" in docs/interface.md) plus the idle animation wake (100 ms, the
+/// `Wake::Animation` arm of the UI loop). Input, completion and activity wakes
+/// mark the view dirty and draw on the next loop pass.
+pub const FRAME_ALLOWANCE: Duration = Duration::from_millis(250 + 100);
+/// Default bound for a frame or input wait. The PTY child opens memory on the
+/// managed Remote backend (src/cli.rs `open_memory`), so the frame after a
+/// memory command (`/memory-candidates`, compact, abandon, export, fork) or
+/// after the first-run notice record (`notice.record()` in the UI loop) waits
+/// on one Remote reply, bounded by the client's reply deadline
+/// `OPERATION_TIMEOUT` (kuru-memory src/service/rpc.rs:38, applied by
+/// `ReplyBudget::deadline` and `exchange_attached_with_id`). That reply is the
+/// longest product step a frame wait encloses, and its frame trails it by at
+/// most `FRAME_ALLOWANCE`. Every use is event-driven, so a passing run is
+/// unchanged and only a real hang takes longer to report. `startup_timeout`
+/// adds this bound, and trust.rs follows through this module.
+pub const READY_TIMEOUT: Duration = OPERATION_TIMEOUT.saturating_add(FRAME_ALLOWANCE);
+const _: () = assert!(READY_TIMEOUT.as_nanos() > OPERATION_TIMEOUT.as_nanos());
+/// kuru-connectors `IO_TIMEOUT` (60 s, `pub(crate)` at src/lib.rs:74): the
+/// per-request bound of `http::client()` (src/http.rs:9) and of the MCP host's
+/// shutdown join (`McpHosts::shutdown`, src/mcp.rs:1203). Documented in
+/// docs/protocols.md (model catalog requests "bounded to 60 seconds", MCP calls
+/// "bounded to 60 seconds"). Restated once here because it is not public.
+pub const IO_TIMEOUT: Duration = Duration::from_secs(60);
 type RestorationCheck = dyn Fn(&dyn MasterPty) -> Result<bool>;
 const OUTPUT_QUEUE: usize = 8;
 // Escaped PTY output shown whole in an unexpected-end report, and the bound on
@@ -24,6 +49,77 @@ const OUTPUT_QUEUE: usize = 8;
 const REPORT_OUTPUT_LIMIT: usize = 16 * 1024;
 const LATE_OUTPUT_WINDOW: Duration = Duration::from_millis(500);
 type OutputReceiver = mpsc::Receiver<std::io::Result<Vec<u8>>>;
+
+fn drain_exit_output(
+    receive: &OutputReceiver,
+    parser: &mut vt100::Parser,
+    output: &mut Vec<u8>,
+    deadline: Instant,
+) -> Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), "PTY output drain deadline expired");
+        let message = receive.recv_timeout(remaining.min(TICK));
+        // A receive can finish after its requested wait if this thread was
+        // descheduled. Bytes and EOF/EIO must obey the same deadline as a
+        // timeout; the next iteration also bounds processing of queued data.
+        ensure!(
+            Instant::now() < deadline,
+            "PTY output drain deadline expired"
+        );
+        match message {
+            Ok(Ok(bytes)) => {
+                parser.process(&bytes);
+                output.extend(bytes);
+            }
+            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+pub fn exit_drain_deadline_probe() -> Result<()> {
+    for eio in [false, true] {
+        let queued = || -> Result<OutputReceiver> {
+            let (send, receive) = mpsc::sync_channel(OUTPUT_QUEUE);
+            send.send(Ok(b"QUEUED\r\n".to_vec()))?;
+            send.send(Ok(b"FINAL".to_vec()))?;
+            if eio {
+                send.send(Err(std::io::Error::from_raw_os_error(nix::libc::EIO)))?;
+            }
+            // With no EIO message, dropping the sender is the EOF/disconnect.
+            drop(send);
+            Ok(receive)
+        };
+        let receive = queued()?;
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        let mut output = Vec::new();
+        // The complete queued sequence exists before the already-expired
+        // deadline is supplied. No scheduler delay or positive sleep decides
+        // whether bytes/completion can wrongly win over expiry.
+        let error = drain_exit_output(&receive, &mut parser, &mut output, Instant::now())
+            .expect_err("expired drain accepted queued output and completion");
+        ensure!(error.to_string().contains("deadline expired"), "{error}");
+        ensure!(output.is_empty(), "expired drain consumed queued output");
+
+        let receive = queued()?;
+        drain_exit_output(
+            &receive,
+            &mut parser,
+            &mut output,
+            Instant::now() + READY_TIMEOUT,
+        )?;
+        ensure!(
+            output == b"QUEUED\r\nFINAL",
+            "timely drain lost byte ordering"
+        );
+        ensure!(
+            parser.screen().contents().contains("FINAL"),
+            "timely drain did not update the terminal screen"
+        );
+    }
+    Ok(())
+}
 
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
@@ -586,37 +682,53 @@ impl Terminal {
         let deadline = Instant::now() + timeout;
         let status = loop {
             self.read_for(TICK)?;
-            if let Some(status) = self.child.try_wait()? {
-                break status;
-            }
+            // Read the clock after the observation: an exit seen past the
+            // deadline fails here as a late exit, so the drain below starts
+            // only after a timely exit, with part of the budget left.
+            let status = self.child.try_wait()?;
             ensure!(
                 Instant::now() < deadline,
-                "process exits: timed out after {timeout:?}; process {} is still running\n{}\n{}",
+                "process exits: timed out after {timeout:?}; process {} {}\n{}\n{}",
                 self.child_id()?,
+                match &status {
+                    Some(status) => format!(
+                        "did not exit within {timeout:?}: its exit ({status:?}) was seen after the deadline"
+                    ),
+                    None => "is still running".to_owned(),
+                },
                 self.diagnostics(),
                 self.report()
             );
+            if let Some(status) = status {
+                break status;
+            }
         };
         // Process exit closes the final slave descriptor. Drain until the
         // reader observes that close so no queued final frame or large payload
-        // is lost merely because waitpid won the race.
-        let drain_deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            match self.receive_output(TICK)? {
-                Ok(Ok(bytes)) => {
-                    self.parser.process(&bytes);
-                    self.output.extend(bytes);
-                }
-                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    ensure!(
-                        Instant::now() < drain_deadline,
-                        "PTY output did not close after process exit\n{}",
-                        self.diagnostics()
-                    );
-                }
-            }
-        }
+        // is lost merely because waitpid won the race. No product wait sits
+        // inside this drain: the kernel closes an exiting process's
+        // descriptors before its exit can be waited for, and no descendant of
+        // the child inherits the slave (the memory owner and the browser
+        // opener get null stdio, kuru-memory `spawn_service` and
+        // src/authentication.rs `open_browser`; tool shells, hooks and MCP
+        // stdio servers get pipes). EOF is therefore already due when the exit
+        // is seen, and only this process's reader thread stands between them.
+        // The drain spends what remains of the caller's `timeout`, not a flat
+        // window a descheduled reader could miss. The loop above admits only
+        // an exit seen before the deadline, so reaching it here reports output
+        // still open after a timely exit: a leaked holder.
+        drain_exit_output(
+            self.receive.as_ref().context("terminal output is closed")?,
+            &mut self.parser,
+            &mut self.output,
+            deadline,
+        )
+        .with_context(|| {
+            format!(
+                "PTY output did not close after process exit within the {timeout:?} wait\n{}",
+                self.diagnostics()
+            )
+        })?;
         ensure!(
             status.success(),
             "child failed: {status:?}\n{}\n{}",

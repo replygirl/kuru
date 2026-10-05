@@ -735,12 +735,22 @@ async fn mcp_cli_no_browser_prints_local_callback_guidance_and_settles_once() {
             "browser",
             "--no-browser",
         ]);
+        // Before printing, the `mcp` command opens no memory (src/cli.rs returns
+        // from its `Command::Mcp` branch before any memory scope) and makes three
+        // sequential OAuth discovery requests against this fixture, each bounded by
+        // `IO_TIMEOUT` through `http::client()` (kuru-connectors
+        // `McpHosts::oauth_authority`): the protected-resource probe (401 with a
+        // challenge naming its metadata URL), that one metadata document, then the
+        // first authorization-server well-known candidate, which the fixture serves.
+        // The fallback candidates and bounded redirects in src/mcp_oauth.rs are not
+        // taken here.
+        let discovery = terminal::IO_TIMEOUT * 3;
         let (url_send, url_receive) = std::sync::mpsc::sync_channel(1);
         let child = std::thread::spawn(move || -> anyhow::Result<String> {
             let mut terminal = terminal::Terminal::spawn(command, 24, 120)?;
             terminal.wait(
                 "no-browser URL and forwarded-loopback guidance",
-                std::time::Duration::from_secs(15),
+                discovery,
                 |terminal| {
                     let output = String::from_utf8_lossy(&terminal.output);
                     Ok(output.contains("Sign in to MCP browser:")
@@ -755,11 +765,21 @@ async fn mcp_cli_no_browser_prints_local_callback_guidance_and_settles_once() {
                 .ok_or_else(|| anyhow::anyhow!("CLI did not print its authorization URL"))?
                 .to_owned();
             url_send.send(url).unwrap();
-            terminal.wait_exit(std::time::Duration::from_secs(15))?;
+            // Three phases, each within one `IO_TIMEOUT`: this test's callback
+            // delivery (its forwarder's 5 s accept and 5 s connect below, and the
+            // child's 5 s callback read, kuru-connectors `CALLBACK_IO_TIMEOUT`; the
+            // child replies before exchanging), the one token-exchange POST
+            // (`exchange_authorization_code` over `http::client()`), then the
+            // tool host's shutdown, whose MCP join is bounded by `IO_TIMEOUT`
+            // (`McpHosts::shutdown`). Credential publication is local.
+            terminal.wait_exit(terminal::IO_TIMEOUT * 3)?;
             Ok(String::from_utf8_lossy(&terminal.output).into_owned())
         });
+        // Strictly above the thread's `discovery` wait, which starts later (after
+        // the synchronous PTY spawn), so that labelled failure, with its PTY
+        // report, is the one this test shows. One more `IO_TIMEOUT` is the margin.
         let authorization = tokio::task::spawn_blocking(move || {
-            url_receive.recv_timeout(std::time::Duration::from_secs(20))
+            url_receive.recv_timeout(discovery + terminal::IO_TIMEOUT)
         })
         .await
         .unwrap()
@@ -3572,8 +3592,15 @@ fn cli_new_project_shows_engine_preparation_then_creation_and_keeps_json_on_stdo
     std::fs::create_dir(&holds).unwrap();
     let extracting = holds.join("ExtractingEmbeddedRuntime.hold");
     let creating = holds.join("CreatingDatabase.hold");
-    std::fs::write(&extracting, b"").unwrap();
-    std::fs::write(&creating, b"").unwrap();
+    // Each marker carries the budget of the wait that ends in its removal
+    // (kuru-memory `OPEN_HOLD_DIR_ENV`): the `until` before it, which starts
+    // its own `WAIT` before the owner can reach the stage it holds. The
+    // extracting wait starts at spawn; the creating one when the extracting
+    // marker goes, with the extraction and the stages after it still ahead
+    // of the owner.
+    let budget = Streaming::WAIT.as_millis().to_string();
+    std::fs::write(&extracting, &budget).unwrap();
+    std::fs::write(&creating, &budget).unwrap();
 
     let mut run = Streaming::spawn(env.command().env(OPEN_HOLD_DIR_ENV, &holds).args([
         "run",
