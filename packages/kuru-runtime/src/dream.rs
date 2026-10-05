@@ -1109,24 +1109,35 @@ mod cancellation_tests {
     async fn managed_lost_promotion_reply_keeps_report_and_publishes_only_typed_revision()
     -> Result<()> {
         kuru_memory::test_support::closing(async {
-            tokio::time::timeout(std::time::Duration::from_secs(150), async {
-                for restart_owner in [false, true] {
+            use futures::FutureExt as _;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(150);
+            for restart_owner in [false, true] {
                 let project = tempfile::tempdir()?;
                 let project_path = project.path().canonicalize()?;
                 let data = kuru_memory::test_support::tempdir()?;
+                // Retain fixture ownership outside the fallible body: its
+                // primary error must survive cleanup and TempDir destruction.
+                let mut opened = Vec::new();
+                let mut retained_options = None;
+                let mut retained_harness = None;
+                let outcome = std::panic::AssertUnwindSafe(tokio::time::timeout_at(deadline, async {
                 let options = kuru_memory::test_support::warmed_open_options(
                     data.path().to_owned(),
                     crate::project_scope(&project_path)?,
                 ).await?;
+                retained_options = Some(options.clone());
                 let executable = options.supervisor.clone().context("fixture supervisor absent")?;
                 let open = || MemoryStore::open_managed_observed(
                     options.clone(), project_path.clone(), executable.clone()
                 ).1;
                 let memory = open().await?;
+                opened.push(memory.clone());
                 let sibling = open().await?;
-                let mut harness = Harness::new(
+                opened.push(sibling.clone());
+                retained_harness = Some(Harness::new(
                     config(), &project_path, memory.clone(), Arc::new(DemoProvider), None,
-                ).await?;
+                ).await?);
+                let harness = retained_harness.as_mut().context("fixture harness absent")?;
                 let original_parts = harness.topology.parts.len();
                 let role = harness.topology.parts[0].role.clone();
                 if !restart_owner {
@@ -1212,6 +1223,7 @@ mod cancellation_tests {
                 }
                 harness.reconcile().await?;
                 let observer = if restart_owner { open().await? } else { memory.clone() };
+                opened.push(observer.clone());
                 assert_eq!(observer.revision().await?, later);
                 let dream_log = observer
                     .history(
@@ -1230,17 +1242,49 @@ mod cancellation_tests {
                         .await?;
                     assert_eq!(observer.history("continuation", 10).await?.len(), 1);
                 }
-                harness.shutdown(false).await?;
-                harness.memory.clone().close().await?;
-                observer.close().await?;
-                sibling.close().await?;
-                memory.close().await?;
-                // The managed owner may still be closing after its last client;
-                // release `data` only after that owner has reaped its Dolt.
-                kuru_memory::test_support::await_managed_quiescence(&options).await?;
-                }
                 Ok::<(), anyhow::Error>(())
-            }).await.context("managed lost-promotion fixture exceeded 150 seconds")??;
+                })).catch_unwind().await;
+                let outcome = outcome.map(|result| {
+                    result.context("managed lost-promotion fixture exceeded 150 seconds")?
+                });
+                if let Ok(Err(error)) = &outcome {
+                    eprintln!("managed lost-promotion fixture (restart_owner={restart_owner}) failed before cleanup: {error:#}");
+                }
+                let mut cleanup_errors = Vec::new();
+                if let Some(harness) = &mut retained_harness {
+                    if let Err(error) = harness.shutdown(false).await {
+                        cleanup_errors.push(format!("harness shutdown: {error:#}"));
+                    }
+                    opened.push(harness.memory.clone());
+                    if let Some(candidate) = &harness.pending_candidate {
+                        opened.push(candidate.view());
+                    }
+                }
+                for memory in opened {
+                    if let Err(error) = memory.close().await {
+                        cleanup_errors.push(format!("memory close: {error:#}"));
+                    }
+                }
+                // Always await the checked owner/Dolt before releasing data,
+                // even when a result, timeout or assertion ends the body early.
+                if let Some(options) = &retained_options
+                    && let Err(error) = kuru_memory::test_support::await_managed_quiescence(options).await
+                {
+                    cleanup_errors.push(format!("managed quiescence: {error:#}"));
+                }
+                if !cleanup_errors.is_empty() {
+                    eprintln!("managed lost-promotion fixture cleanup: {}", cleanup_errors.join("; "));
+                }
+                match outcome {
+                    Ok(result) => result.with_context(|| format!("restart_owner={restart_owner}; cleanup: {}", cleanup_errors.join("; ")) )?,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+                ensure!(cleanup_errors.is_empty(), "{}", cleanup_errors.join("; "));
+            }
+            ensure!(
+                tokio::time::Instant::now() <= deadline,
+                "managed lost-promotion fixture exceeded 150 seconds including cleanup"
+            );
             Ok(())
         })
         .await
