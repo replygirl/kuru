@@ -426,6 +426,19 @@ pub enum ViewOperation {
     PutMany {
         values: Vec<(String, Value)>,
     },
+    PutManyConditional {
+        expected: Vec<(String, crate::StateExpectation)>,
+        values: Vec<(String, Value)>,
+    },
+    GetVersioned {
+        key: String,
+    },
+    GetMany {
+        keys: Vec<String>,
+    },
+    GetManyVersioned {
+        keys: Vec<String>,
+    },
     Get {
         key: String,
     },
@@ -473,6 +486,10 @@ impl ViewOperation {
             Self::Notes { .. } => C::READ,
             Self::ForgetNote { .. } => C::write(Receipt::Unit("view.forget_note")),
             Self::PutMany { .. } => C::write(Receipt::Unit("view.put_many")),
+            Self::PutManyConditional { .. } => C::write(Receipt::Unit("view.put_many_conditional")),
+            Self::GetVersioned { .. } => C::READ,
+            Self::GetMany { .. } => C::READ,
+            Self::GetManyVersioned { .. } => C::READ,
             Self::Get { .. } => C::READ,
             Self::Clear { .. } => C::write(Receipt::Unit("view.clear")),
             Self::Reconcile => C::READ,
@@ -592,6 +609,9 @@ pub enum ServiceValue {
     ContextSummaryWindow(crate::ContextSummaryWindow),
     Notes(Vec<StoredNote>),
     StoredValue(Option<Value>),
+    VersionedValue(Option<crate::VersionedValue>),
+    StoredValues(Vec<(String, Option<Value>)>),
+    VersionedValues(Vec<(String, Option<crate::VersionedValue>)>),
     Reconciled(Option<bool>),
     Outcome(OutcomeStatus),
     Revision(String),
@@ -660,13 +680,14 @@ pub enum CandidateTransitionResult {
     StillUncertain,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceFault {
     GenerationChanged,
     StorageFailed,
     CandidateConflict,
     ContextSummaryStale,
+    StateStale(crate::StateStale),
     ReasoningSummaryConflict,
     ReceiptConflict,
     CandidateRefRejected(CandidateRefRefusal),
@@ -1463,6 +1484,8 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(
                     .is_some()
                 {
                     ServiceFault::CandidateConflict
+                } else if let Some(stale) = error.downcast_ref::<crate::StateStale>() {
+                    ServiceFault::StateStale(stale.clone())
                 } else if error
                     .downcast_ref::<crate::store::ContextSummaryStale>()
                     .is_some()
@@ -1495,6 +1518,7 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(
                         ServiceFault::CandidateRefRejected(_) => "ref_rejected",
                         ServiceFault::CandidateConflict => "candidate_conflict",
                         ServiceFault::ContextSummaryStale => "context_summary_stale",
+                        ServiceFault::StateStale(_) => "state_stale",
                         ServiceFault::ReasoningSummaryConflict => "reasoning_summary_conflict",
                         ServiceFault::ReceiptConflict => "receipt_conflict",
                         ServiceFault::SessionLifecycleRejected(_) => "session_lifecycle_rejected",
@@ -2257,6 +2281,7 @@ pub(super) fn resolve_response(response: ServiceResponse) -> Result<ServiceValue
         ServiceResponse::Rejected(ServiceFault::ContextSummaryStale) => {
             Err(crate::store::ContextSummaryStale.into())
         }
+        ServiceResponse::Rejected(ServiceFault::StateStale(stale)) => Err(stale.into()),
         ServiceResponse::Rejected(ServiceFault::ReasoningSummaryConflict) => {
             Err(crate::store::ReasoningSummaryConflict.into())
         }
@@ -2706,6 +2731,17 @@ async fn dispatch_view(store: &MemoryStore, operation: ViewOperation) -> Result<
         ViewOperation::PutMany { values } => {
             store.put_many(&values).await?;
             ServiceValue::Unit
+        }
+        ViewOperation::PutManyConditional { expected, values } => {
+            store.put_many_conditional(&expected, &values).await?;
+            ServiceValue::Unit
+        }
+        ViewOperation::GetVersioned { key } => {
+            ServiceValue::VersionedValue(store.get_versioned(&key).await?)
+        }
+        ViewOperation::GetMany { keys } => ServiceValue::StoredValues(store.get_many(&keys).await?),
+        ViewOperation::GetManyVersioned { keys } => {
+            ServiceValue::VersionedValues(store.get_many_versioned(&keys).await?)
         }
         ViewOperation::Get { key } => ServiceValue::StoredValue(store.get(&key).await?),
         ViewOperation::Clear { namespace } => {

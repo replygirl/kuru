@@ -19,6 +19,11 @@ use sqlx::{Connection, MySqlConnection, Row};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit};
 use uuid::Uuid;
+
+pub(crate) mod versioned_state;
+pub use versioned_state::{
+    MAX_STATE_BATCH_BYTES, MAX_STATE_BATCH_KEYS, StateExpectation, StateStale, VersionedValue,
+};
 #[cfg(any(test, feature = "test-support"))]
 use {std::sync::OnceLock, tokio::sync::Semaphore};
 
@@ -4871,6 +4876,10 @@ enum Mutation {
         format: Option<&'static str>,
     },
     State(Vec<(String, String)>),
+    StateConditional {
+        expected: Vec<(String, StateExpectation)>,
+        values: Vec<(String, String)>,
+    },
     PrivateReasoningSummaries(Vec<(String, String)>),
     Checkpoint {
         namespace: String,
@@ -4981,6 +4990,9 @@ async fn apply(
     #[cfg(test)] pause: Option<&ApplyPause>,
 ) -> Result<()> {
     let mut transaction = connection.begin().await?;
+    let version: i32 = sqlx::query_scalar("SELECT version FROM kuru_schema WHERE id = 1")
+        .fetch_one(&mut *transaction)
+        .await?;
     match mutation {
         Mutation::Append {
             namespace,
@@ -5018,9 +5030,20 @@ async fn apply(
             }
         }
         Mutation::State(values) => {
-            for (key, value) in values {
-                sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)").bind(key.as_bytes()).bind(value).execute(&mut *transaction).await?;
-            }
+            versioned_state::upsert(
+                &mut transaction,
+                version >= migrations::STATE_VERSION,
+                values,
+            )
+            .await?;
+        }
+        Mutation::StateConditional { expected, values } => {
+            ensure!(
+                version >= migrations::STATE_VERSION,
+                "conditional state requires an upgraded memory view"
+            );
+            versioned_state::compare(&mut transaction, &expected).await?;
+            versioned_state::upsert(&mut transaction, true, values).await?;
         }
         Mutation::PrivateReasoningSummaries(values) => {
             for (key, value) in values {
@@ -5094,9 +5117,12 @@ async fn apply(
                         .await?;
                 }
             }
-            for (key, value) in values {
-                sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)").bind(key.as_bytes()).bind(value).execute(&mut *transaction).await?;
-            }
+            versioned_state::upsert(
+                &mut transaction,
+                version >= migrations::STATE_VERSION,
+                values,
+            )
+            .await?;
         }
         Mutation::Clear(namespace) => {
             sqlx::query("DELETE FROM messages WHERE namespace = ?")
@@ -5216,9 +5242,6 @@ async fn apply(
     // Historical candidate views keep their committed schema and sole-receipt
     // behavior. Current writable views retain every indexed receipt so a later
     // sibling mutation cannot erase evidence of an accepted operation.
-    let version: i32 = sqlx::query_scalar("SELECT version FROM kuru_schema WHERE id = 1")
-        .fetch_one(&mut *transaction)
-        .await?;
     if version <= 4 {
         sqlx::query("DELETE FROM operations")
             .execute(&mut *transaction)
@@ -11042,51 +11065,14 @@ mod tests {
             "{\"retained\":true}"
         );
         let upgraded = store.revision().await?;
-        let parent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&upgraded)
-        .fetch_one(store.pool.as_ref())
-        .await?;
-        let grandparent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&parent)
-        .fetch_one(store.pool.as_ref())
-        .await?;
-        let great_grandparent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&grandparent)
-        .fetch_one(store.pool.as_ref())
-        .await?;
-        let fourth_parent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&great_grandparent)
-        .fetch_one(store.pool.as_ref())
-        .await?;
-        let fifth_parent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&fourth_parent)
-        .fetch_one(store.pool.as_ref())
-        .await?;
-        let sixth_parent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&fifth_parent)
-        .fetch_one(store.pool.as_ref())
-        .await?;
-        let seventh_parent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&sixth_parent)
-        .fetch_one(store.pool.as_ref())
-        .await?;
+        let mut ancestor = upgraded.clone();
+        for _ in 1..migrations::CURRENT_VERSION {
+            ancestor = sqlx::query_scalar("SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0")
+                .bind(&ancestor).fetch_one(store.pool.as_ref()).await?;
+        }
         assert_eq!(
-            seventh_parent, base,
-            "v1 to v8 must contain seven ordered upgrades"
+            ancestor, base,
+            "v1 to current must contain one ordered commit per upgrade"
         );
         let commits: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'",
@@ -11182,7 +11168,8 @@ mod tests {
                     Some(name)
                 }
                 None if future_schema => {
-                    sqlx::query("UPDATE kuru_schema SET version = 9 WHERE id = 1")
+                    sqlx::query("UPDATE kuru_schema SET version = ? WHERE id = 1")
+                        .bind(migrations::CURRENT_VERSION + 1)
                         .execute(pool.as_ref())
                         .await?;
                     None
@@ -11210,7 +11197,7 @@ mod tests {
                 (Some(6), false) => "attempt newer than its schema",
                 (Some(7), false) => "attempt newer than its schema",
                 (Some(8), false) => "attempt newer than its schema",
-                (None, true) => "unsupported Dolt memory schema version 9",
+                (None, true) => "unsupported Dolt memory schema version 10",
                 _ => unreachable!(),
             };
             assert!(rendered.contains(expected), "{case}: {rendered}");
@@ -11466,51 +11453,14 @@ mod tests {
             migrations::CURRENT_VERSION
         );
         let first = store.revision().await?;
-        let parent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&first)
-        .fetch_one(store.pool.as_ref())
-        .await?;
-        let grandparent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&parent)
-        .fetch_one(store.pool.as_ref())
-        .await?;
-        let great_grandparent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&grandparent)
-        .fetch_one(store.pool.as_ref())
-        .await?;
-        let fourth_parent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&great_grandparent)
-        .fetch_one(store.pool.as_ref())
-        .await?;
-        let fifth_parent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&fourth_parent)
-        .fetch_one(store.pool.as_ref())
-        .await?;
-        let sixth_parent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&fifth_parent)
-        .fetch_one(store.pool.as_ref())
-        .await?;
-        let seventh_parent: String = sqlx::query_scalar(
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-        )
-        .bind(&sixth_parent)
-        .fetch_one(store.pool.as_ref())
-        .await?;
+        let mut ancestor = first.clone();
+        for _ in 1..migrations::CURRENT_VERSION {
+            ancestor = sqlx::query_scalar("SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0")
+                .bind(&ancestor).fetch_one(store.pool.as_ref()).await?;
+        }
         assert_eq!(
-            seventh_parent, base,
-            "upgrade must retain all seven ordered commits"
+            ancestor, base,
+            "upgrade must retain one ordered commit per schema step"
         );
         assert_eq!(
             sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, String)>(
@@ -11544,7 +11494,7 @@ mod tests {
         .await?;
         assert_eq!(
             receipt.iter().map(|row| row.0).collect::<Vec<_>>(),
-            [2, 3, 4, 5, 6, 7, 8]
+            (2..=migrations::CURRENT_VERSION).collect::<Vec<_>>()
         );
         assert!(receipt.iter().all(|row| Uuid::parse_str(&row.3).is_ok()));
         store.close().await?;

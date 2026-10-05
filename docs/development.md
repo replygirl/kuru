@@ -455,7 +455,8 @@ lives beside the engine in the shared test cache: `KURU_DOLT_CACHE`, or
 only, keyed by the schema, the engine and the creation statements, not by the
 supervisor executable, so an instrumented and an ordinary supervisor build
 interchangeable templates. The key also covers the migration publication
-record format. Fixtures are at schema 8, whose step records each published
+record format. Fixtures are at schema 9, including state-row versions and the
+schema-8 step that records each published
 migration branch, so a change that adds a schema step or changes the record
 format changes the key. The next `prefetch` or first fixture open then builds
 the template once more; nothing has to be removed by hand. It differs from the test template above, which is
@@ -2284,6 +2285,28 @@ a 30 s bound, such a terminal fault is reported as the acquisition's timeout
 at its bound rather than after 2 s.
 
 ## Memory service protocol
+
+Project `MemoryStore::get_versioned` returns a value and its row version, or
+`None` for absence. `put_many_conditional` compares `StateExpectation::Absent`
+or `Version(version)` before publishing every value atomically. Every expected
+key must be written; extra unconditional companion values share the transaction.
+`StateStale` names the first failed expectation in request order and reports its
+actual version. It is a definite refusal and clears the remote uncertainty
+fence. Accepted writes use the existing exact logical receipt and recovery path.
+Negative stored versions and signed-64-bit overflow abort the whole transaction.
+
+Conditional batches accept at most 256 distinct keys and 16 MiB for the exact
+JSON encoding of `(expectations, values)`, including escaping. The local and
+remote facades validate before mutation acceptance. `get_many` accepts at most
+256 distinct keys, reads one consistent snapshot in request order, and retains
+an explicit `None` for missing keys. `get_many_versioned` returns each value and
+its version from that same bounded snapshot on schema 9; the value-only batch
+reader remains available on historical schemas. Both stream their single SELECT inside a read
+transaction with a 16 MiB cumulative stored-JSON bound, suppressing individually
+oversized values in SQL before transfer. Scalar reads and legacy unconditional
+writes keep their existing size contract. Keys retain exact binary identity;
+case and accents do not alias. Versioned APIs require schema 9. The separate
+private usage ledger remains on its own schema-4 branch and SQL contract.
 
 Each typed memory service operation (`ServiceCall`, `ViewOperation` and
 `LedgerOperation` in `packages/kuru-memory/src/service/rpc.rs`) has one entry in

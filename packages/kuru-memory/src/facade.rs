@@ -2424,6 +2424,85 @@ impl MemoryStore {
         }
     }
 
+    pub async fn get_versioned(&self, key: &str) -> Result<Option<crate::VersionedValue>> {
+        store::identifier("state key", key, 1024)?;
+        match &self.backend {
+            Backend::Local(store) => store.get_versioned(key).await,
+            Backend::Remote(remote) => match remote
+                .call(ViewOperation::GetVersioned { key: key.into() })
+                .await?
+            {
+                ServiceValue::VersionedValue(value) => Ok(value),
+                _ => bail!("memory service returned the wrong versioned state response"),
+            },
+        }
+    }
+
+    /// Read at most 256 distinct keys in one snapshot, retaining request order
+    /// and an explicit `None` for each missing key.
+    pub async fn get_many(&self, keys: &[String]) -> Result<Vec<(String, Option<Value>)>> {
+        store::versioned_state::validate_keys(keys)?;
+        match &self.backend {
+            Backend::Local(store) => store.get_many(keys).await,
+            Backend::Remote(remote) => match remote
+                .call(ViewOperation::GetMany {
+                    keys: keys.to_vec(),
+                })
+                .await?
+            {
+                ServiceValue::StoredValues(values) => Ok(values),
+                _ => bail!("memory service returned the wrong state batch response"),
+            },
+        }
+    }
+
+    /// Read values and their CAS versions in one bounded, consistent snapshot.
+    pub async fn get_many_versioned(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<(String, Option<crate::VersionedValue>)>> {
+        store::versioned_state::validate_keys(keys)?;
+        match &self.backend {
+            Backend::Local(store) => store.get_many_versioned(keys).await,
+            Backend::Remote(remote) => match remote
+                .call(ViewOperation::GetManyVersioned {
+                    keys: keys.to_vec(),
+                })
+                .await?
+            {
+                ServiceValue::VersionedValues(values) => Ok(values),
+                _ => bail!("memory service returned the wrong versioned state batch response"),
+            },
+        }
+    }
+
+    /// Compare every expectation and publish every value atomically. Each
+    /// expectation must name a written key; extra values are unconditional
+    /// companions in that same transaction. A `StateStale` has no effects.
+    pub async fn put_many_conditional(
+        &self,
+        expected: &[(String, crate::StateExpectation)],
+        values: &[(String, Value)],
+    ) -> Result<()> {
+        store::versioned_state::validate_conditional(expected, values)?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.check_state_write_fixture()?;
+        match &self.backend {
+            Backend::Local(store) => store.put_many_conditional(expected, values).await,
+            Backend::Remote(remote) => {
+                remote.ensure_writable()?;
+                unit(
+                    remote
+                        .call(ViewOperation::PutManyConditional {
+                            expected: expected.to_vec(),
+                            values: values.to_vec(),
+                        })
+                        .await?,
+                )
+            }
+        }
+    }
+
     pub async fn clear(&self, namespace: &str) -> Result<()> {
         match &self.backend {
             Backend::Local(store) => store.clear(namespace).await,
@@ -4996,6 +5075,212 @@ mod tests {
                             None,
                             owner_reap_within(),
                             "cancelled write fixture owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(outcome)
+    }
+
+    #[tokio::test]
+    async fn conditional_state_managed_race_stale_and_lost_reply() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        // Real lifecycles: one fresh service owner.
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "remote conditional state lost-reply fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    async {
+                        let executable = std::env::current_exe()?;
+                        let open = || {
+                            MemoryStore::open_managed_observed(
+                                options.clone(),
+                                project.clone(),
+                                executable.clone(),
+                            )
+                            .1
+                        };
+                        let memory = open().await?;
+                        let sibling = open().await?;
+                        let Backend::Remote(remote) = &memory.backend else {
+                            bail!("conditional state fixture did not attach to the managed service")
+                        };
+                        let expected = vec![("shared".into(), crate::StateExpectation::Absent)];
+                        let a_values =
+                            vec![("shared".into(), json!(1)), ("first".into(), json!(true))];
+                        let b_values =
+                            vec![("shared".into(), json!(2)), ("second".into(), json!(true))];
+                        let (a, b) = tokio::join!(
+                            memory.put_many_conditional(&expected, &a_values),
+                            sibling.put_many_conditional(&expected, &b_values)
+                        );
+                        ensure!(
+                            a.is_ok() != b.is_ok(),
+                            "managed compare/publication did not have exactly one winner"
+                        );
+                        let (loser, error) = if let Err(error) = a {
+                            (&memory, error)
+                        } else {
+                            (&sibling, b.unwrap_err())
+                        };
+                        let stale = error
+                            .downcast_ref::<crate::StateStale>()
+                            .context("managed stale lost typed metadata")?;
+                        ensure!(
+                            stale.key == "shared"
+                                && stale.actual == Some(0)
+                                && stale.expected == crate::StateExpectation::Absent,
+                            "managed stale metadata differs"
+                        );
+                        loser
+                            .put_many_conditional(
+                                &[("loser-retry".into(), crate::StateExpectation::Absent)],
+                                &[("loser-retry".into(), json!(true))],
+                            )
+                            .await?;
+                        let before = memory.revision().await?;
+                        let mixed = loser
+                            .put_many_conditional(
+                                &[("shared".into(), crate::StateExpectation::Absent)],
+                                &[
+                                    ("shared".into(), json!(99)),
+                                    ("stale-companion".into(), json!(true)),
+                                ],
+                            )
+                            .await
+                            .unwrap_err();
+                        ensure!(
+                            mixed.downcast_ref::<crate::StateStale>().is_some()
+                                && memory.get("stale-companion").await?.is_none()
+                                && memory.revision().await? == before,
+                            "managed mixed-stale batch had effects"
+                        );
+
+                        let invalid = memory
+                            .put_many_conditional(
+                                &[("new".into(), crate::StateExpectation::Absent)],
+                                &[("new".into(), json!(0)), ("x".repeat(1025), json!(0))],
+                            )
+                            .await;
+                        ensure!(
+                            invalid.is_err() && memory.revision().await? == before,
+                            "invalid managed input mutated"
+                        );
+                        ensure!(
+                            memory
+                                .get_many(&["missing".into(), "shared".into()])
+                                .await?[0]
+                                .1
+                                .is_none(),
+                            "managed missing/order changed"
+                        );
+                        let versioned = memory
+                            .get_many_versioned(&["missing".into(), "shared".into()])
+                            .await?;
+                        ensure!(
+                            versioned[0] == ("missing".into(), None)
+                                && versioned[1].0 == "shared"
+                                && versioned[1].1.as_ref().is_some_and(|row| row.version == 0),
+                            "managed versioned batch lost ordering/versions"
+                        );
+                        let pause = Arc::new(service::rpc::ReplyPause::default());
+                        remote
+                            .attachment
+                            .lock()
+                            .await
+                            .pause_after_next_send(pause.clone());
+                        let writer = tokio::spawn({
+                            let memory = memory.clone();
+                            async move {
+                                memory
+                                    .put_many_conditional(
+                                        &[("shared".into(), crate::StateExpectation::Version(0))],
+                                        &[
+                                            ("shared".into(), json!(3)),
+                                            ("companion".into(), json!(true)),
+                                        ],
+                                    )
+                                    .await
+                            }
+                        });
+                        let _writer_cleanup = AbortOnDrop(writer.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                            .await
+                            .context("conditional request was not flushed")?;
+                        tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
+                            loop {
+                                if sibling.get("companion").await? == Some(json!(true)) {
+                                    break Ok::<(), anyhow::Error>(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .context("owner did not commit conditional batch")??;
+                        writer.abort();
+                        ensure!(
+                            tokio::time::timeout(Duration::from_secs(5), writer)
+                                .await?
+                                .is_err_and(|error| error.is_cancelled()),
+                            "paused writer was not cancelled"
+                        );
+                        ensure!(
+                            memory.put("later", &json!(true)).await.is_err(),
+                            "uncertain conditional mutation failed to fence"
+                        );
+                        ensure!(
+                            memory.reconcile().await? == Some(true),
+                            "conditional exact receipt did not recover"
+                        );
+                        ensure!(
+                            memory
+                                .get_versioned("shared")
+                                .await?
+                                .context("shared value absent")?
+                                .version
+                                == 1,
+                            "recovery replayed conditional write"
+                        );
+                        memory
+                            .put_many_conditional(
+                                &[("shared".into(), crate::StateExpectation::Version(1))],
+                                &[("shared".into(), json!(4))],
+                            )
+                            .await?;
+                        memory.close().await?;
+                        sibling.close().await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            owner_reap_within(),
+                            "conditional state fixture owner did not reap",
                         )
                         .await
                 },

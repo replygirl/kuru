@@ -30,7 +30,7 @@ pub use rpc::{ServiceCall, ServiceReply, ServiceRequest, ServiceResponse, Servic
 pub const PROTOCOL_MAJOR: u16 = 1;
 // Exact-ref recovery and session-provenance calls require this owner version.
 // Older owners reject the new client before a mutating frame.
-pub const PROTOCOL_MINOR: u16 = 7;
+pub const PROTOCOL_MINOR: u16 = 8;
 pub const HANDSHAKE_LIMIT: usize = 16 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest single accept wait before the serve loop re-verifies its owner
@@ -496,7 +496,7 @@ impl ServiceAttachment {
             rpc::exchange_attached_with_id(in_flight.stream(), &self.authority, id, call).await?;
         let stream = in_flight.complete();
         self.last_fault = match &response {
-            rpc::ServiceResponse::Rejected(fault) => Some(*fault),
+            rpc::ServiceResponse::Rejected(fault) => Some(fault.clone()),
             rpc::ServiceResponse::Success(_) => None,
         };
         self.stream = Some(stream);
@@ -10648,7 +10648,7 @@ mod tests {
         let hello = authority().hello();
         ensure!(
             serde_json::to_string(&hello)?
-                == r#"{"version":{"major":1,"minor":7},"project_path":[47,112,114,105,118,97,116,101,47,112,114,111,106,101,99,116],"project_scope":"scope","store_instance":"store","service_generation":"generation","connection_secret":"test-secret","schema_version":4}"#,
+                == r#"{"version":{"major":1,"minor":8},"project_path":[47,112,114,105,118,97,116,101,47,112,114,111,106,101,99,116],"project_scope":"scope","store_instance":"store","service_generation":"generation","connection_secret":"test-secret","schema_version":4}"#,
             "a hello without a starter token changed its wire form"
         );
         let mut presented = hello;

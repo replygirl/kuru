@@ -38,6 +38,9 @@ pub use store::{
     UsageLedgerStateChanged, UsageProof, context_summary_id, public_turn_continuation_node_id,
     public_turn_legacy_continuation_node_id, public_turn_node_id,
 };
+pub use store::{
+    MAX_STATE_BATCH_BYTES, MAX_STATE_BATCH_KEYS, StateExpectation, StateStale, VersionedValue,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_budgets;

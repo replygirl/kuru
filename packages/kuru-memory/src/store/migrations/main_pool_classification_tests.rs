@@ -358,7 +358,7 @@ async fn main_pool_classification_agrees_with_branch_pool_classification() -> Re
                 "ref force-moved to main",
                 &roles,
                 // The current schema's head, checked as v3.
-                Expect::Fail("schema version 8, expected 3"),
+                Expect::Fail("schema version 9, expected 3"),
             )
             .await,
         );

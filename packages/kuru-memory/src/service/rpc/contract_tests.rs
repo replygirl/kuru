@@ -216,6 +216,17 @@ pub(super) fn view_operation_samples() -> Result<Vec<ViewOperation>> {
             sequence: 1,
         },
         ViewOperation::PutMany { values: values() },
+        ViewOperation::PutManyConditional {
+            expected: vec![("key".into(), crate::StateExpectation::Absent)],
+            values: values(),
+        },
+        ViewOperation::GetVersioned { key: "key".into() },
+        ViewOperation::GetMany {
+            keys: vec!["key".into()],
+        },
+        ViewOperation::GetManyVersioned {
+            keys: vec!["key".into()],
+        },
         ViewOperation::Get { key: "key".into() },
         ViewOperation::Clear {
             namespace: "actor".into(),
@@ -467,6 +478,14 @@ const CLASSIFICATION: &[(&str, bool, Option<&str>)] = &[
     ("view.notes", false, None),
     ("view.forget_note", true, Some("view.forget_note")),
     ("view.put_many", true, Some("view.put_many")),
+    (
+        "view.put_many_conditional",
+        true,
+        Some("view.put_many_conditional"),
+    ),
+    ("view.get_versioned", false, None),
+    ("view.get_many", false, None),
+    ("view.get_many_versioned", false, None),
     ("view.get", false, None),
     ("view.clear", true, Some("view.clear")),
     ("view.reconcile", false, None),
@@ -696,6 +715,10 @@ fn wire_enums() -> Result<Vec<(&'static str, Vec<String>)>> {
         (
             "usage_proof",
             serde_variants::<UsageProof>("UsageProof", unknown_tag("kind"))?,
+        ),
+        (
+            "state_expectation",
+            serde_variants::<crate::StateExpectation>("StateExpectation", unknown_unit())?,
         ),
         (
             // Private to store/export.rs; probed through its cursor carrier.
