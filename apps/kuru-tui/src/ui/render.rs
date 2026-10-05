@@ -46,6 +46,20 @@ fn style(color: Color) -> Style {
     Style::default().fg(color)
 }
 
+fn update_transcript_cache(cache: &mut TranscriptCache, view: &View, width: u16) {
+    if cache.width != width
+        || cache.source != view.transcript
+        || cache.completion_metadata != view.completion_metadata
+    {
+        cache.lines = wrap_lines(conversation_lines(view), usize::from(width.max(1)));
+        cache.source.clone_from(&view.transcript);
+        cache
+            .completion_metadata
+            .clone_from(&view.completion_metadata);
+        cache.width = width;
+    }
+}
+
 fn bold(color: Color) -> Style {
     style(color).add_modifier(Modifier::BOLD)
 }
@@ -147,9 +161,10 @@ pub fn draw(frame: &mut Frame<'_>, view: &View) {
     } else {
         3
     };
+    let (projected_input, projected_cursor) = view.paste_chips.project(&view.input, view.cursor);
     let input_rows = editor_layout(
-        &view.input,
-        view.cursor,
+        &projected_input,
+        projected_cursor,
         usize::from(area.width.saturating_sub(6)).max(1),
     )
     .0
@@ -203,6 +218,56 @@ pub fn draw(frame: &mut Frame<'_>, view: &View) {
     } else if view.permission_rows.is_some() {
         draw_permission_inspector(frame, view, overlay);
     }
+}
+
+pub(super) fn clamp_scroll(view: &mut View, size: Rect) {
+    if view.transcript.is_empty() || size.width < 14 || size.height < 7 {
+        view.scroll = 0;
+        return;
+    }
+    let control_rows = 2 + if size.width >= 72 {
+        1
+    } else if size.width >= 38 {
+        2
+    } else {
+        3
+    };
+    let (projected_input, projected_cursor) = view.paste_chips.project(&view.input, view.cursor);
+    let input_rows = editor_layout(
+        &projected_input,
+        projected_cursor,
+        usize::from(size.width.saturating_sub(6)).max(1),
+    )
+    .0
+    .len()
+    .clamp(2, 5) as u16;
+    let dock_height = (input_rows + control_rows + 2).min(size.height.saturating_sub(3));
+    let preview_height = if view.preview.is_some() {
+        6.min(size.height.saturating_sub(dock_height + 5))
+    } else {
+        0
+    };
+    let rows = Layout::vertical([
+        Constraint::Length(if size.height >= 16 { 2 } else { 1 }),
+        Constraint::Min(0),
+        Constraint::Length(preview_height),
+        Constraint::Length(1),
+        Constraint::Length(dock_height),
+        Constraint::Length(1),
+    ])
+    .split(size);
+    let conversation = if size.width >= 108 && rows[1].height >= 17 {
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(34)]).split(rows[1])[0]
+    } else {
+        rows[1]
+    };
+    let content = inset(conversation, u16::from(conversation.width >= 12) * 2, 1);
+    let total_lines = TRANSCRIPT.with_borrow_mut(|cache| {
+        update_transcript_cache(cache, view, content.width);
+        cache.lines.len()
+    });
+    let maximum = total_lines.saturating_sub(usize::from(content.height));
+    view.scroll = view.scroll.min(maximum.min(u16::MAX as usize) as u16);
 }
 
 fn draw_preview(frame: &mut Frame<'_>, view: &View, area: Rect) {
@@ -321,10 +386,18 @@ fn safe_preview_line(text: &str) -> String {
 }
 
 fn draw_tiny(frame: &mut Frame<'_>, view: &View, area: Rect) {
-    let (lines, x, y) = editor_layout(&view.input, view.cursor, usize::from(area.width));
+    let (projected_input, projected_cursor) = view.paste_chips.project(&view.input, view.cursor);
+    let (lines, x, y) = editor_layout(&projected_input, projected_cursor, usize::from(area.width));
     let scroll = y.saturating_sub(usize::from(area.height.saturating_sub(1)));
     frame.render_widget(
-        Paragraph::new(lines).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        Paragraph::new(
+            lines
+                .iter()
+                .skip(scroll)
+                .take(usize::from(area.height))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
         area,
     );
     frame.set_cursor_position((
@@ -367,22 +440,12 @@ fn draw_conversation(frame: &mut Frame<'_>, view: &View, area: Rect) {
     }
     let content = inset(area, u16::from(area.width >= 12) * 2, 1);
     TRANSCRIPT.with_borrow_mut(|cache| {
-        if cache.width != content.width
-            || cache.source != view.transcript
-            || cache.completion_metadata != view.completion_metadata
-        {
-            cache.lines = wrap_lines(conversation_lines(view), usize::from(content.width.max(1)));
-            cache.source.clone_from(&view.transcript);
-            cache
-                .completion_metadata
-                .clone_from(&view.completion_metadata);
-            cache.width = content.width;
-        }
-        let offset = cache
-            .lines
-            .len()
-            .saturating_sub(usize::from(content.height))
-            .saturating_sub(usize::from(view.scroll));
+        update_transcript_cache(cache, view, content.width);
+        let offset = transcript_offset(
+            cache.lines.len(),
+            usize::from(content.height),
+            usize::from(view.scroll),
+        );
         let visible = cache
             .lines
             .iter()
@@ -398,6 +461,15 @@ fn draw_conversation(frame: &mut Frame<'_>, view: &View, area: Rect) {
             Rect::new(area.right() - 28, area.y, 26, 1),
         );
     }
+}
+
+fn transcript_offset(
+    total_lines: usize,
+    viewport_lines: usize,
+    requested_from_bottom: usize,
+) -> usize {
+    let maximum_from_bottom = total_lines.saturating_sub(viewport_lines);
+    maximum_from_bottom - requested_from_bottom.min(maximum_from_bottom)
 }
 
 fn conversation_lines(view: &View) -> Vec<Line<'static>> {
@@ -1252,7 +1324,8 @@ fn draw_composer(frame: &mut Frame<'_>, view: &View, area: Rect) {
         Paragraph::new("›").style(bold(accent)),
         Rect::new(inner.x, input.y, 1, 1),
     );
-    let (lines, x, y) = editor_layout(&view.input, view.cursor, usize::from(input.width));
+    let (projected_input, projected_cursor) = view.paste_chips.project(&view.input, view.cursor);
+    let (lines, x, y) = editor_layout(&projected_input, projected_cursor, usize::from(input.width));
     let scroll = y.saturating_sub(usize::from(input.height.saturating_sub(1)));
     if view.input.is_empty() {
         frame.render_widget(
@@ -1266,7 +1339,14 @@ fn draw_composer(frame: &mut Frame<'_>, view: &View, area: Rect) {
         );
     } else {
         frame.render_widget(
-            Paragraph::new(lines).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+            Paragraph::new(
+                lines
+                    .iter()
+                    .skip(scroll)
+                    .take(usize::from(input.height))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
             input,
         );
     }
@@ -1279,6 +1359,17 @@ fn draw_composer(frame: &mut Frame<'_>, view: &View, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    if let Some(hint) = view.recall_hint() {
+        frame.render_widget(Paragraph::new(hint).style(style(AMBER)), area);
+        return;
+    }
+    if view.paste_chips.get_at(&view.input, view.cursor).is_some() {
+        frame.render_widget(
+            Paragraph::new("  paste · Ctrl+G expand/compact · Ctrl+X remove").style(style(MUTED)),
+            area,
+        );
+        return;
+    }
     let hint = if view.busy {
         "  esc cancel  ·  alt+enter newline"
     } else {
@@ -1559,5 +1650,13 @@ mod tests {
         assert!(lines[3].spans.is_empty());
         assert_eq!(clipped("猫猫", 3), "猫…");
         assert_eq!(clipped("word", 0), "");
+    }
+
+    #[test]
+    fn transcript_offset_clamps_after_content_and_viewport_shrink() {
+        assert_eq!(transcript_offset(10, 3, 0), 7);
+        assert_eq!(transcript_offset(10, 3, 2), 5);
+        assert_eq!(transcript_offset(10, 3, usize::MAX), 0);
+        assert_eq!(transcript_offset(2, 5, usize::MAX), 0);
     }
 }

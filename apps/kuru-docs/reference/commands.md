@@ -4,54 +4,70 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 
 ## Terminal keys
 
-| Key                                              | Action                                                       |
-| ------------------------------------------------ | ------------------------------------------------------------ |
-| <kbd>Enter</kbd>                                 | Send the input or select the highlighted picker item         |
-| <kbd>Alt</kbd>+<kbd>Enter</kbd>                  | Insert a newline                                             |
-| <kbd>F2</kbd>                                    | Choose a model                                               |
-| <kbd>F3</kbd>                                    | Choose reasoning effort                                      |
-| <kbd>F4</kbd>                                    | Choose a framework                                           |
-| Type or paste in a picker                        | Filter its choices                                           |
-| <kbd>Escape</kbd>                                | Close a picker or cancel active work                         |
-| <kbd>Ctrl</kbd>+<kbd>C</kbd>                     | Cancel work; quit while idle                                 |
-| <kbd>Page Up</kbd> / <kbd>Page Down</kbd>        | Scroll the transcript                                        |
-| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Cycle matching slash-command names before the first argument |
+| Key                                              | Action                                                                           |
+| ------------------------------------------------ | -------------------------------------------------------------------------------- |
+| <kbd>Enter</kbd>                                 | Send the input or select the highlighted picker item                             |
+| <kbd>Alt</kbd>+<kbd>Enter</kbd>                  | Insert a newline                                                                 |
+| <kbd>Left</kbd> / <kbd>Right</kbd>               | Move one displayed character (grapheme)                                          |
+| <kbd>Up</kbd> / <kbd>Down</kbd>                  | Move vertically; at the first/last line, browse this session's submitted prompts |
+| <kbd>Ctrl</kbd>+<kbd>R</kbd>                     | Search this session's in-memory submitted prompts; repeat to cycle matches       |
+| <kbd>Escape</kbd> during prompt search           | Restore the unsent draft                                                         |
+| <kbd>Ctrl</kbd>+<kbd>G</kbd> on a paste chip     | Expand or compact its display                                                    |
+| <kbd>Ctrl</kbd>+<kbd>X</kbd> on a paste chip     | Remove exactly the pasted text                                                   |
+| <kbd>F2</kbd>                                    | Choose a model                                                                   |
+| <kbd>F3</kbd>                                    | Choose reasoning effort                                                          |
+| <kbd>F4</kbd>                                    | Choose a framework                                                               |
+| Type or paste in a picker                        | Filter its choices                                                               |
+| <kbd>Escape</kbd>                                | Close a picker or cancel active work                                             |
+| <kbd>Ctrl</kbd>+<kbd>C</kbd>                     | Cancel work; quit while idle                                                     |
+| <kbd>Page Up</kbd> / <kbd>Page Down</kbd>        | Scroll the transcript                                                            |
+| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Cycle matching slash-command names before the first argument                     |
+
+Prompt history is bounded and held only in memory for the current run. It is
+separate from durable conversation history and is grouped by session. Pasted
+text larger than 512 bytes or containing at least three line breaks appears as
+a compact chip; expand it to inspect the text or remove the exact pasted span.
+The composer accepts at most 128 KiB of draft text. An oversized paste is
+rejected in full, leaving the draft unchanged.
 
 ## Slash commands
 
-| Command                                      | Action                                                                        |
-| -------------------------------------------- | ----------------------------------------------------------------------------- |
-| `/help`                                      | Show terminal help                                                            |
-| `/clear`                                     | Clear the visible conversation; keep stored turns and the session             |
-| `/new`                                       | Start another session using current shared project memory                     |
-| `/sessions`                                  | Open the session picker for resume, rename, remove, restore and fork          |
-| `/resume SESSION_ID`                         | Resume one exact active session                                               |
-| `/export [PATH]`                             | Export this public session as Markdown                                        |
-| `/status`                                    | Show the current session, project, selections, turns, and known usage locally |
-| `/compact [ID]`                              | Compact retained context for one or all active identities                     |
-| `/parts`                                     | Inspect active parts and relationships                                        |
-| `/mode ifs`                                  | Select `ifs`, `polyvagal`, `freudian`, or `jungian`                           |
-| `/model MODEL_ID`                            | Select a model and its advertised default effort                              |
-| `/effort LEVEL`                              | Select effort; `default` clears an explicit value                             |
-| `/focus NAME_OR_ID`                          | Select a speaking identity                                                    |
-| `/focus auto`                                | Return to contextual speaker selection                                        |
-| `/relate KIND ID,ID`                         | Activate protection, polarization, or alliance among 2–4 members              |
-| `/memory NAME_OR_ID`                         | Inspect an identity's stored memory                                           |
-| `/notes NAME_OR_ID`                          | Inspect an identity's separate bounded durable notes                          |
-| `/memory-candidates [CURSOR]`                | List one bounded page of retained dream candidate refs                        |
-| `/memory-candidate-status BRANCH`            | Recheck one exact retained candidate ref                                      |
-| `/memory-candidate-abandon BRANCH BASE HEAD` | Explicitly abandon the exact inspected candidate                              |
-| `/retry`                                     | Safely retry the last durably retained local submission                       |
-| `/cost`                                      | Show this session's reported usage and estimated API cost                     |
-| `/permissions`                               | Inspect session and saved tool grants                                         |
-| `/tools`                                     | Inspect built-in and effective MCP tool aliases and their current status      |
-| `/memory-status`                             | Inspect the project's memory store and current revision                       |
-| `/memory-history`                            | List committed memory revisions                                               |
-| `/dream`                                     | Run bounded consolidation                                                     |
-| `/undo-dream`                                | Restore the previous accepted topology change                                 |
-| `/quit`                                      | End the session                                                               |
+| Command                                      | Action                                                                                   |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `/help`                                      | Show terminal help                                                                       |
+| `/clear`                                     | Clear the visible conversation; keep stored turns and the session                        |
+| `/new`                                       | Start another session using current shared project memory                                |
+| `/sessions`                                  | Open the session picker for resume, rename, remove, restore and fork                     |
+| `/resume SESSION_ID`                         | Resume one exact active session                                                          |
+| `/export [PATH]`                             | Export this public session as Markdown                                                   |
+| `/status`                                    | Show the current session, project, selections, turns, and known usage locally            |
+| `/config`                                    | Inspect the captured effective configuration, source layers, and leaf provenance locally |
+| `/compact [ID]`                              | Compact retained context for one or all active identities                                |
+| `/parts`                                     | Inspect active parts and relationships                                                   |
+| `/mode ifs`                                  | Select `ifs`, `polyvagal`, `freudian`, or `jungian`                                      |
+| `/model MODEL_ID`                            | Select a model and its advertised default effort                                         |
+| `/effort LEVEL`                              | Select effort; `default` clears an explicit value                                        |
+| `/focus NAME_OR_ID`                          | Select a speaking identity                                                               |
+| `/focus auto`                                | Return to contextual speaker selection                                                   |
+| `/relate KIND ID,ID`                         | Activate protection, polarization, or alliance among 2–4 members                         |
+| `/memory NAME_OR_ID`                         | Inspect an identity's stored memory                                                      |
+| `/notes NAME_OR_ID`                          | Inspect an identity's separate bounded durable notes                                     |
+| `/memory-candidates [CURSOR]`                | List one bounded page of retained dream candidate refs                                   |
+| `/memory-candidate-status BRANCH`            | Recheck one exact retained candidate ref                                                 |
+| `/memory-candidate-abandon BRANCH BASE HEAD` | Explicitly abandon the exact inspected candidate                                         |
+| `/retry`                                     | Safely retry the last durably retained local submission                                  |
+| `/cost`                                      | Show this session's reported usage and estimated API cost                                |
+| `/permissions`                               | Inspect session and saved tool grants                                                    |
+| `/tools`                                     | Inspect built-in and effective MCP tool aliases and their current status                 |
+| `/memory-status`                             | Inspect the project's memory store and current revision                                  |
+| `/memory-history`                            | List committed memory revisions                                                          |
+| `/dream`                                     | Run bounded consolidation                                                                |
+| `/undo-dream`                                | Restore the previous accepted topology change                                            |
+| `/quit`                                      | End the session                                                                          |
 
 Model, effort, and framework selections made here are [saved for the project](./configuration#remembered-choices). Identity names must be unambiguous; `/parts` provides IDs.
+
+`/config` is read-only and uses the configuration snapshot captured when the TUI started; it does not reread configuration files or activate new workspace authority. It shows bounded per-layer and final-leaf sources, redacts secret-bearing values, and leaves named environment-variable references visible without resolving them. The captured saved mode/model/effort and the current live runtime selection are labeled separately. `/config` takes no arguments and does not open an editor.
 
 Tab completes only the leading command name and leaves its arguments unchanged. `/clear` affects only the current terminal view: stored conversation, usage, and session identity remain available, including after resume. `/status` uses the local session snapshot and makes no provider request.
 
@@ -69,7 +85,7 @@ Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/
 | `kuru auth`                                                    | Print redacted local authentication status as JSON                                          |
 | `kuru logout`                                                  | Clear Kuru's stored ChatGPT credentials                                                     |
 | `kuru models`                                                  | Discover provider models and advertised efforts                                             |
-| `kuru config`                                                  | Print configured values with MCP environment values redacted and saved preferences omitted  |
+| `kuru config`                                                  | Print captured base configuration with secret values redacted and saved preferences omitted |
 | `kuru trust status`                                            | Inspect exact-workspace authority and complete-manifest approval without creating state     |
 | `kuru trust approve [--yes]`                                   | Review and persist approval for the complete current authority manifest                     |
 | `kuru trust revoke`                                            | Remove the exact workspace's approval without confirmation                                  |

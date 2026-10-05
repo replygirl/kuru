@@ -46,6 +46,18 @@ Type in a picker to filter, use the arrow keys to move, and press <kbd>Enter</kb
 
 Use <kbd>Alt</kbd>+<kbd>Enter</kbd> for a newline. <kbd>Page Up</kbd> and <kbd>Page Down</kbd> scroll the transcript. During work, <kbd>Escape</kbd> or <kbd>Ctrl</kbd>+<kbd>C</kbd> cancels the operation. While idle, <kbd>Ctrl</kbd>+<kbd>C</kbd> quits.
 
+The composer moves by grapheme, so combining marks and joined emoji stay
+together. At the top or bottom line, <kbd>Up</kbd> and <kbd>Down</kbd> browse
+submitted prompts from this session. <kbd>Ctrl</kbd>+<kbd>R</kbd> searches those
+prompts; <kbd>Escape</kbd> restores the unsent draft. This bounded history is
+temporary in-memory state, separate from the saved conversation.
+
+Large or multiline pastes appear as compact chips while the provider still
+receives the exact pasted text. Put the cursor on a chip and press
+<kbd>Ctrl</kbd>+<kbd>G</kbd> to expand or compact it, or <kbd>Ctrl</kbd>+<kbd>X</kbd>
+to remove only that pasted span. Drafts are limited to 128 KiB; a paste that
+would exceed the limit is rejected as a whole.
+
 Cancellation waits for the active operation to settle and keeps your submitted
 prompt in the transcript. If an answer completed first, Kuru shows it. Otherwise
 Kuru stores a fixed interruption marker that remains visible after later work and

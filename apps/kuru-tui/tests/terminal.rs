@@ -856,6 +856,163 @@ fn real_event_stream_preserves_co_ready_resize_and_paste() -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
+struct ComposerProvider {
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+async fn composer_complete(
+    State(state): State<ComposerProvider>,
+    Json(request): Json<Value>,
+) -> Response {
+    state.requests.lock().unwrap().push(request);
+    (
+        [(CONTENT_TYPE, "text/event-stream")],
+        format!(
+            "data: {}\n\n",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"composer-fixture",
+                    "status":"completed",
+                    "output":[{"type":"message","content":[{
+                        "type":"output_text","text":"COMPOSER_FINAL"
+                    }]}],
+                    "usage":{"input_tokens":8,"output_tokens":5}
+                }
+            })
+        ),
+    )
+        .into_response()
+}
+
+fn json_contains_exact_text(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(text) => text == expected,
+        Value::Array(items) => items
+            .iter()
+            .any(|item| json_contains_exact_text(item, expected)),
+        Value::Object(fields) => fields
+            .values()
+            .any(|item| json_contains_exact_text(item, expected)),
+        _ => false,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_composer_recall_and_paste_chips_keep_literal_prompts_at_120_and_80() -> Result<()>
+{
+    kuru_memory::test_support::closing(async {
+        let sandbox = Sandbox::warmed().await?;
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+            )
+            .route("/v1/responses", post(composer_complete))
+            .with_state(ComposerProvider {
+                requests: requests.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = sandbox.root.path().join("composer-provider.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=1\n",
+                listener.local_addr()?
+            ),
+        )?;
+        let _server = Server(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let mut command = sandbox.command("responses");
+        command
+            .args(["--model", "fixture", "--config"])
+            .arg(&config)
+            .env("KURU_FIXTURE_KEY", "fixture")
+            .env("KURU_REDUCED_MOTION", "1");
+        let mut terminal = Terminal::spawn(command, 35, 120)?;
+        terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+        terminal.send(b"history seed\r")?;
+        terminal.wait_composer_frame(&["COMPOSER_FINAL", "enter send"], READY_TIMEOUT)?;
+        terminal.send("draft 猫".as_bytes())?;
+        terminal.wait_composer_frame(&["draft 猫", "enter send"], READY_TIMEOUT)?;
+        terminal.send(b"\x1bOQ")?;
+        terminal.wait("completed model picker frame", READY_TIMEOUT, |terminal| {
+            let screen = terminal.screen();
+            Ok(screen.contains("Models")
+                && screen.contains("fixture")
+                && terminal.output.ends_with(b"\x1b[?25l"))
+        })?;
+        terminal.send(b"\x1b")?;
+        terminal.wait_composer_frame(&["draft 猫", "enter send"], READY_TIMEOUT)?;
+        terminal.send(b"\x12history")?;
+        terminal.wait_composer_frame(&["reverse search", "history seed"], READY_TIMEOUT)?;
+        terminal.send(b"\x1b")?;
+        terminal.wait_composer_frame(&["draft 猫", "enter send"], READY_TIMEOUT)?;
+        terminal.send(b"\x1b[A")?;
+        terminal.wait_composer_frame(&["history 1/1", "history seed"], READY_TIMEOUT)?;
+        terminal.send(b"\x1b[B")?;
+        terminal.wait_composer_frame(&["draft 猫", "enter send"], READY_TIMEOUT)?;
+
+        let pasted = "猫\n".repeat(300);
+        terminal.send(b"pre")?;
+        terminal.send(format!("\x1b[200~{pasted}\x1b[201~").as_bytes())?;
+        terminal.send(b"post")?;
+        terminal.wait_composer_frame(&["pre[paste ·", "post"], READY_TIMEOUT)?;
+        terminal.resize(24, 80)?;
+        terminal.wait_composer_frame(&["[paste ·", "post"], READY_TIMEOUT)?;
+        terminal.send(b"\x1b[D\x1b[D\x1b[D\x1b[D")?;
+        terminal.wait_composer_frame(&["Ctrl+G expand/compact"], READY_TIMEOUT)?;
+        terminal.send(b"\x07")?;
+        terminal.wait_composer_frame(&["Paste expanded", "猫"], READY_TIMEOUT)?;
+        terminal.send(b"\x07")?;
+        terminal.wait_composer_frame(&["[paste ·"], READY_TIMEOUT)?;
+        terminal.send(b"\x18")?;
+        terminal.wait_composer_frame(&["draft 猫prepost"], READY_TIMEOUT)?;
+        ensure!(
+            !terminal.screen().contains("[paste ·"),
+            "removed chip remained: {}",
+            terminal.screen()
+        );
+        terminal.send(b"\r")?;
+        terminal.wait(
+            "provider received exact post-removal prompt",
+            READY_TIMEOUT,
+            |_| {
+                Ok(requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| json_contains_exact_text(request, "draft 猫prepost")))
+            },
+        )?;
+        terminal.wait_composer_frame(&["COMPOSER_FINAL", "enter send"], READY_TIMEOUT)?;
+
+        terminal.send(b"pre")?;
+        terminal.send(format!("\x1b[200~{pasted}\x1b[201~").as_bytes())?;
+        terminal.send(b"post\r")?;
+        let literal = format!("pre{pasted}post");
+        terminal.wait(
+            "provider received exact compact-paste literal",
+            READY_TIMEOUT,
+            |_| {
+                Ok(requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| json_contains_exact_text(request, &literal)))
+            },
+        )?;
+        terminal.wait_composer_frame(&["COMPOSER_FINAL", "enter send"], READY_TIMEOUT)?;
+        terminal.send(b"\x03")?;
+        terminal.wait_exit(EXIT_TIMEOUT)?;
+        terminal.assert_restored()
+    })
+    .await
+}
+
 #[test]
 fn real_pty_parallel_activity_tracks_each_same_name_call() -> Result<()> {
     let mut terminal = fixture("parallel-tool-activity")?;

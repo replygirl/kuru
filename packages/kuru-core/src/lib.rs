@@ -18,10 +18,11 @@ pub use accounting::{
     UnappliedPriceTerm, UsageCompleteness, UsageObservation, UsagePhase,
 };
 pub use config::{
-    AuthorityClaim, AuthorityClaimCategory, AuthorityManifest, ClaimDigest, Config, ConfigSnapshot,
-    HookCommand, HookEvent, InvocationOverrides, LifecycleHooks, ManifestDigest, McpConfig,
-    McpOAuthConfig, MemoryConfig, ModelPreference, ProjectPreferences, ResponsesRouteConfig,
-    SafeClaimDisplay, SafeManifest, SafeSource, SelectionOverrides, load_instructions,
+    AuthorityClaim, AuthorityClaimCategory, AuthorityManifest, ClaimDigest, Config,
+    ConfigDisplayBounds, ConfigDisplayProjection, ConfigDisplayRow, ConfigSnapshot, HookCommand,
+    HookEvent, InvocationOverrides, LifecycleHooks, ManifestDigest, McpConfig, McpOAuthConfig,
+    MemoryConfig, ModelPreference, ProjectPreferences, ResponsesRouteConfig, SafeClaimDisplay,
+    SafeManifest, SafeSource, SelectionOverrides, load_instructions,
 };
 pub use context::{
     ContextBudget, ContextCompactionPolicy, ContextEstimate, ContextSizing, ContextSourceKind,

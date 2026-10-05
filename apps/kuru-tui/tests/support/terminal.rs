@@ -353,6 +353,42 @@ impl Terminal {
         self.parser.screen().contents()
     }
 
+    #[allow(dead_code)] // Used by cli.rs; each integration target compiles this support module alone.
+    pub fn completed_frame_after(&self, previous_output_len: usize) -> bool {
+        let Some(output) = self.output.get(previous_output_len..) else {
+            return false;
+        };
+        let show = b"\x1b[?25h";
+        output
+            .windows(show.len())
+            .enumerate()
+            .any(|(index, window)| {
+                if window != show {
+                    return false;
+                }
+                let Some(cursor) = output.get(index + show.len()..) else {
+                    return false;
+                };
+                if !cursor.starts_with(b"\x1b[") {
+                    return false;
+                }
+                let cursor = &cursor[2..];
+                let Some(end) = cursor.iter().position(|byte| *byte == b'H') else {
+                    return false;
+                };
+                let position = &cursor[..end];
+                let Some(separator) = position.iter().position(|byte| *byte == b';') else {
+                    return false;
+                };
+                !position[..separator].is_empty()
+                    && !position[separator + 1..].is_empty()
+                    && position
+                        .iter()
+                        .enumerate()
+                        .all(|(index, byte)| index == separator || byte.is_ascii_digit())
+            })
+    }
+
     fn diagnostics(&self) -> String {
         let tail = &self.output[self.output.len().saturating_sub(512)..];
         let escaped: Vec<u8> = tail
