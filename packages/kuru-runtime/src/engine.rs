@@ -48,6 +48,7 @@ pub use crate::event::StateReport;
 use crate::{
     actor::{Actor, ActorCommand, PublicInputOverride, Work},
     bus::PeerMessage,
+    context_compaction::CompactionNotices,
     event::{Event, HookObservation, ToolObservation, ToolOutcome, TurnLimitReason},
     progress::{ContextSnapshot, FacingProgress, ProgressDescriptor, ProgressTurn},
     topology_state::{self, MembershipRecord, ReportInventory},
@@ -530,6 +531,7 @@ pub struct Harness {
     cwd: PathBuf,
     instructions: String,
     events: broadcast::Sender<Event>,
+    compaction_notices: CompactionNotices,
     progress: watch::Sender<Option<FacingProgress>>,
     context: watch::Sender<ContextSnapshot>,
     context_epoch: Arc<AtomicU64>,
@@ -881,6 +883,7 @@ impl Harness {
             cwd,
             instructions,
             events,
+            compaction_notices: CompactionNotices::default(),
             progress,
             context,
             context_epoch: Arc::new(AtomicU64::new(0)),
@@ -1800,6 +1803,21 @@ impl Harness {
         let event = event.projected();
         let _ = self.events.send(event.clone());
         self.trace.push(event);
+    }
+
+    /// Confirmed compaction metadata survives live activity lag and failed or
+    /// cancelled work. Applications drain it after existing operation recovery.
+    pub fn take_compaction_notices(&self) -> Vec<Event> {
+        self.compaction_notices.drain()
+    }
+
+    /// Use existing exact recovery only when a compaction reply is unresolved.
+    /// Confirmed notices can still be drained if another recovery remains fenced.
+    pub async fn reconcile_compaction_notices(&mut self) -> Result<()> {
+        if self.compaction_notices.has_unresolved(None) {
+            self.reconcile().await?;
+        }
+        Ok(())
     }
 
     pub(crate) fn hook_host(&self) -> Arc<HookHost> {
@@ -2791,6 +2809,20 @@ impl Harness {
             self.pending_candidate_resolution = PendingCandidateResolution::Explicit;
             self.rebind_main_if_retired().await?;
         }
+        if let Some(candidate) = &self.pending_candidate {
+            // Preserve the existing candidate recovery ordering; no new mutable
+            // candidate authority is retained by the notice collection.
+            let view = candidate.view();
+            if self
+                .compaction_notices
+                .has_unresolved(Some(candidate.branch()))
+            {
+                view.reconcile().await?;
+                self.compaction_notices
+                    .confirm_on(&view, candidate.branch(), &self.events)
+                    .await?;
+            }
+        }
         if let Some(PublicationProof::CandidatePromotion {
             base,
             target,
@@ -2995,6 +3027,9 @@ impl Harness {
         }
         let receipt = self.memory.reconcile().await?;
         self.rebind_main_if_retired().await?;
+        self.compaction_notices
+            .confirm_on(&self.memory, "main", &self.events)
+            .await?;
         if let Some(pending) = &self.pending_publication {
             ensure!(
                 matches!(
@@ -3611,6 +3646,7 @@ impl Harness {
                 .await?;
             notices.push(completion.text_projection());
         }
+        self.compaction_notices.consume_manual(&operation_id);
         Ok(notices)
     }
 
@@ -3701,6 +3737,8 @@ impl Harness {
             self.instruction_parts(control.topology.unwrap_or(&self.topology), id, phase)?;
         let work = Work {
             memory: memory.clone(),
+            compaction_notices: self.compaction_notices.clone(),
+            events: self.events.clone(),
             scope: self.scope.clone(),
             ledger: self.memory.usage_ledger()?,
             invocation,

@@ -258,6 +258,9 @@ pub(super) fn view_operation_samples() -> Result<Vec<ViewOperation>> {
             },
             private_reasoning: vec![reasoning_summary()],
         },
+        ViewOperation::ContextSummaryConfirmation {
+            summary_id: "a".repeat(64),
+        },
         ViewOperation::ContextSummaryCursor {
             actor_namespace: "actor".into(),
             session_id: "session".into(),
@@ -558,6 +561,7 @@ const CLASSIFICATION: &[(&str, bool, Option<&str>)] = &[
         true,
         Some("view.checkpoint_context_summary"),
     ),
+    ("view.context_summary_confirmation", false, None),
     ("view.context_summary_cursor", false, None),
     ("view.context_summary_window", false, None),
     ("view.notes", false, None),
@@ -1144,6 +1148,21 @@ fn wire_surface() -> Result<String> {
     lines.push(format!(
         "envelope reply {}",
         shape(&serde_json::to_value(&reply)?)
+    ));
+    let confirmation = crate::ContextSummaryConfirmation {
+        summary_id: "a".repeat(64),
+        actor_namespace: "actor".into(),
+        session_id: "session".into(),
+        source_namespace: "source".into(),
+        summary_namespace: "summary".into(),
+        source_view: "main".into(),
+        source_revision: "revision".into(),
+        after_sequence: 0,
+        through_sequence: 1,
+    };
+    lines.push(format!(
+        "projection context_summary_confirmation {}",
+        shape(&serde_json::to_value(confirmation)?)
     ));
     let rejected = ServiceResponse::Rejected(ServiceFault::StorageFailed);
     lines.push(format!(

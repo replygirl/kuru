@@ -18,7 +18,8 @@ pub use engine::{
     project_scope, read_notes, turn_was_cancelled,
 };
 pub use event::{
-    Event, HookObservation, StateReport, ToolObservation, ToolOutcome, TurnLimitReason,
+    CompactionNotice, Event, HookObservation, StateReport, ToolObservation, ToolOutcome,
+    TurnLimitReason,
 };
 pub use progress::{ContextSnapshot, FacingProgress, RequestContext};
 

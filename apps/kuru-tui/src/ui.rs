@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{self, IsTerminal},
     sync::Arc,
     time::{Duration, Instant},
@@ -42,7 +42,8 @@ use tokio::{
     task::JoinHandle,
     time::{Instant as TokioInstant, sleep_until},
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     cli::validate_effort,
@@ -50,6 +51,7 @@ use crate::{
     memory_notice::MemoryNotice,
 };
 
+mod composer;
 mod render;
 #[cfg(test)]
 mod runtime_tests;
@@ -88,6 +90,23 @@ struct CommandCompletion {
     matches: Vec<String>,
     selected: usize,
     rendered: String,
+}
+
+type SavedDraft = (String, usize, composer::PasteChips);
+
+#[derive(Debug, Clone)]
+enum Recall {
+    Browse {
+        saved: SavedDraft,
+        choices: Vec<String>,
+        selected: usize,
+    },
+    Search {
+        saved: SavedDraft,
+        query: String,
+        choices: Vec<String>,
+        selected: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -205,11 +224,15 @@ pub struct InitialViewData {
 pub struct View {
     pub transcript: Vec<(String, String)>,
     completion_metadata: BTreeMap<usize, String>,
+    compaction_notices_seen: BTreeSet<(String, String)>,
     pub input: String,
     pub cursor: usize,
     command_completion: Option<CommandCompletion>,
     command_registry: Arc<commands::Registry>,
-    saved_input: Option<(String, usize)>,
+    saved_input: Option<SavedDraft>,
+    paste_chips: composer::PasteChips,
+    history: composer::SubmittedHistory,
+    recall: Option<Recall>,
     pub mode: String,
     pub model: String,
     pub effort: String,
@@ -268,6 +291,223 @@ pub struct View {
 }
 
 impl View {
+    fn cancel_recall(&mut self) {
+        let saved = match self.recall.take() {
+            Some(Recall::Browse { saved, .. } | Recall::Search { saved, .. }) => saved,
+            None => return,
+        };
+        (self.input, self.cursor, self.paste_chips) = saved;
+    }
+
+    fn select_session(&mut self, session: String) {
+        if self.session != session {
+            self.cancel_recall();
+            self.session = session;
+        }
+    }
+
+    fn record_submitted_prompt(&mut self, session: &str, prompt: &str) {
+        self.recall = None;
+        if self.history.record(session, prompt) {
+            self.notify("Oldest in-memory prompt history discarded at its limit");
+        }
+    }
+
+    fn browse_history(&mut self) {
+        let choices = self.history.matches(&self.session, "");
+        if let Some(first) = choices.first() {
+            self.recall = Some(Recall::Browse {
+                saved: (self.input.clone(), self.cursor, self.paste_chips.clone()),
+                choices: choices.clone(),
+                selected: 0,
+            });
+            self.paste_chips.clear();
+            self.input = first.clone();
+            self.cursor = self.input.len();
+        }
+    }
+
+    fn search_history(&mut self, saved: SavedDraft) {
+        let choices = self.history.matches(&self.session, "");
+        self.input = choices.first().cloned().unwrap_or_else(|| saved.0.clone());
+        self.cursor = self.input.len();
+        self.paste_chips.clear();
+        self.recall = Some(Recall::Search {
+            saved,
+            query: String::new(),
+            choices,
+            selected: 0,
+        });
+    }
+
+    fn update_search(&mut self, saved: SavedDraft, query: String) {
+        let choices = self.history.matches(&self.session, &query);
+        self.input = choices.first().cloned().unwrap_or_else(|| saved.0.clone());
+        self.cursor = self.input.len();
+        self.recall = Some(Recall::Search {
+            saved,
+            query,
+            choices,
+            selected: 0,
+        });
+    }
+
+    fn handle_recall_key(&mut self, key: KeyEvent) -> bool {
+        let Some(recall) = self.recall.take() else {
+            if matches!(key.code, KeyCode::Up | KeyCode::Down)
+                && let Some(target) =
+                    composer::vertical_target(&self.input, self.cursor, key.code == KeyCode::Up)
+            {
+                self.cursor = self.paste_chips.snap_cursor(&self.input, target);
+                return true;
+            }
+            if !self.busy && key.code == KeyCode::Up {
+                self.browse_history();
+                return self.recall.is_some();
+            }
+            if !self.busy
+                && key.code == KeyCode::Char('r')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                self.search_history((self.input.clone(), self.cursor, self.paste_chips.clone()));
+                return true;
+            }
+            return false;
+        };
+
+        match recall {
+            Recall::Browse {
+                saved,
+                choices,
+                selected,
+            } => match key.code {
+                KeyCode::Esc => {
+                    (self.input, self.cursor, self.paste_chips) = saved;
+                    true
+                }
+                KeyCode::Up => {
+                    let selected = (selected + 1).min(choices.len() - 1);
+                    self.input = choices[selected].clone();
+                    self.cursor = self.input.len();
+                    self.recall = Some(Recall::Browse {
+                        saved,
+                        choices,
+                        selected,
+                    });
+                    true
+                }
+                KeyCode::Down => {
+                    if selected == 0 {
+                        (self.input, self.cursor, self.paste_chips) = saved;
+                    } else {
+                        let selected = selected - 1;
+                        self.input = choices[selected].clone();
+                        self.cursor = self.input.len();
+                        self.recall = Some(Recall::Browse {
+                            saved,
+                            choices,
+                            selected,
+                        });
+                    }
+                    true
+                }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.search_history(saved);
+                    true
+                }
+                KeyCode::F(_) | KeyCode::PageUp | KeyCode::PageDown => {
+                    self.recall = Some(Recall::Browse {
+                        saved,
+                        choices,
+                        selected,
+                    });
+                    false
+                }
+                _ => false,
+            },
+            Recall::Search {
+                saved,
+                mut query,
+                choices,
+                selected,
+            } => match key.code {
+                KeyCode::Esc => {
+                    (self.input, self.cursor, self.paste_chips) = saved;
+                    true
+                }
+                KeyCode::Enter => {
+                    if choices.is_empty() {
+                        (self.input, self.cursor, self.paste_chips) = saved;
+                    }
+                    true
+                }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let selected = if choices.is_empty() {
+                        0
+                    } else {
+                        (selected + 1) % choices.len()
+                    };
+                    if let Some(choice) = choices.get(selected) {
+                        self.input = choice.clone();
+                        self.cursor = self.input.len();
+                    }
+                    self.recall = Some(Recall::Search {
+                        saved,
+                        query,
+                        choices,
+                        selected,
+                    });
+                    true
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    self.update_search(saved, query);
+                    true
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if query.len() + c.len_utf8() <= 256 {
+                        query.push(c);
+                    }
+                    self.update_search(saved, query);
+                    true
+                }
+                _ => {
+                    self.recall = Some(Recall::Search {
+                        saved,
+                        query,
+                        choices,
+                        selected,
+                    });
+                    false
+                }
+            },
+        }
+    }
+
+    fn recall_hint(&self) -> Option<String> {
+        match &self.recall {
+            Some(Recall::Browse {
+                choices, selected, ..
+            }) => Some(format!(
+                "history {}/{} · ↑ older ↓ newer esc draft",
+                selected + 1,
+                choices.len()
+            )),
+            Some(Recall::Search {
+                query,
+                choices,
+                selected,
+                ..
+            }) => Some(format!(
+                "reverse search ‘{}’ · {}/{} · enter use esc draft",
+                query.chars().take(24).collect::<String>(),
+                usize::from(!choices.is_empty()) + selected,
+                choices.len()
+            )),
+            None => None,
+        }
+    }
+
     pub fn from_initial(initial: InitialViewData, models: Vec<ModelInfo>) -> Self {
         let InitialViewData {
             transcript,
@@ -280,12 +520,16 @@ impl View {
         let show_scene = transcript.is_empty();
         Self {
             completion_metadata: BTreeMap::new(),
+            compaction_notices_seen: BTreeSet::new(),
             transcript,
             input: String::new(),
             cursor: 0,
             command_completion: None,
             command_registry: Arc::new(commands::Registry::default()),
             saved_input: None,
+            paste_chips: composer::PasteChips::default(),
+            history: composer::SubmittedHistory::default(),
+            recall: None,
             mode: runtime.mode,
             model: runtime.model,
             effort: runtime.effort,
@@ -465,8 +709,18 @@ impl View {
             let selected = if backwards { matches.len() - 1 } else { 0 };
             (prefix, matches, selected)
         };
-        self.input.replace_range(0..token_end, &matches[selected]);
-        self.cursor = matches[selected].len();
+        let completed_len = self
+            .input
+            .len()
+            .saturating_sub(token_end)
+            .saturating_add(matches[selected].len());
+        if completed_len > composer::DRAFT_BYTE_LIMIT {
+            self.notify("Draft is at its 128 KiB limit");
+            return;
+        }
+        if !self.edit_range(0, token_end, &matches[selected]) {
+            return;
+        }
         self.command_completion = Some(CommandCompletion {
             original_prefix,
             matches,
@@ -580,6 +834,22 @@ impl View {
 
     pub fn event(&mut self, event: Event) {
         let (kind, actor, detail) = match event {
+            Event::Compaction { actor, notice } => {
+                if !self
+                    .compaction_notices_seen
+                    .insert((notice.source_view.clone(), notice.summary_id.clone()))
+                {
+                    return;
+                }
+                let text = notice.text(&actor);
+                self.transcript.push(("kuru".into(), text));
+                self.show_scene = false;
+                (
+                    "compaction".into(),
+                    actor,
+                    "confirmed context checkpoint; original records retained".into(),
+                )
+            }
             Event::Active { actor, detail } => {
                 self.part_activity.insert(actor.clone(), "active".into());
                 ("active".into(), actor, detail)
@@ -1020,7 +1290,11 @@ impl View {
                         .sessions
                         .iter()
                         .find(|session| session_picker_label(session) == selected)?;
-                    self.saved_input = Some((std::mem::take(&mut self.input), self.cursor));
+                    self.saved_input = Some((
+                        std::mem::take(&mut self.input),
+                        self.cursor,
+                        std::mem::take(&mut self.paste_chips),
+                    ));
                     self.input = format!("/session-rename {} ", session.id);
                     self.cursor = self.input.len();
                     self.picker = None;
@@ -1044,16 +1318,21 @@ impl View {
         }
         if key.code == KeyCode::Esc
             && !self.busy
-            && let Some((input, cursor)) = self.saved_input.take()
+            && let Some((input, cursor, chips)) = self.saved_input.take()
         {
             self.input = input;
             self.cursor = cursor;
+            self.paste_chips = chips;
             self.status = "Session rename cancelled".into();
+            return None;
+        }
+        if self.permission_prompt.is_none() && self.handle_recall_key(key) {
             return None;
         }
         if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.command_completion = None;
         }
+        self.cursor = composer::grapheme_at_or_after(&self.input, self.cursor);
         match key.code {
             KeyCode::Tab if !self.busy => self.complete_command(false),
             KeyCode::BackTab if !self.busy => self.complete_command(true),
@@ -1075,48 +1354,96 @@ impl View {
                     .modifiers
                     .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
             {
-                self.insert('\n')
+                self.insert("\n")
             }
             KeyCode::Enter if !self.busy => {
                 let text = std::mem::take(&mut self.input);
                 self.cursor = 0;
+                self.paste_chips.clear();
                 self.command_completion = None;
                 if !text.trim().is_empty() {
                     return Some(text);
                 }
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => self.insert(c),
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.paste_chips.toggle_at(&self.input, self.cursor) {
+                    let expanded = self
+                        .paste_chips
+                        .get_at(&self.input, self.cursor)
+                        .is_some_and(|chip| chip.expanded);
+                    self.notify(if expanded {
+                        "Paste expanded · literal text visible"
+                    } else {
+                        "Paste compacted · literal text retained"
+                    });
+                }
+            }
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(chip) = self.paste_chips.remove_at(&self.input, self.cursor) {
+                    self.input.replace_range(chip.start..chip.end, "");
+                    self.paste_chips.apply_edit(chip.start, chip.end, 0);
+                    self.cursor = composer::grapheme_at_or_after(&self.input, chip.start);
+                    self.notify("Selected paste removed · surrounding draft retained");
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let mut utf8 = [0; 4];
+                self.insert(c.encode_utf8(&mut utf8));
+            }
             KeyCode::Backspace if self.cursor > 0 => {
-                let previous = self.input[..self.cursor]
-                    .char_indices()
-                    .last()
-                    .map_or(0, |(i, _)| i);
-                self.input.drain(previous..self.cursor);
-                self.cursor = previous;
+                let previous = composer::previous_grapheme(&self.input, self.cursor);
+                let _ = self.edit_range(previous, self.cursor, "");
             }
             KeyCode::Delete if self.cursor < self.input.len() => {
-                let next =
-                    self.cursor + self.input[self.cursor..].chars().next().unwrap().len_utf8();
-                self.input.drain(self.cursor..next);
+                let next = composer::next_grapheme(&self.input, self.cursor);
+                let _ = self.edit_range(self.cursor, next, "");
             }
             KeyCode::Left => {
-                self.cursor = self.input[..self.cursor]
-                    .char_indices()
-                    .last()
-                    .map_or(0, |(i, _)| i)
+                self.cursor = self
+                    .paste_chips
+                    .collapsed_ending_at(self.cursor)
+                    .map_or_else(
+                        || composer::previous_grapheme(&self.input, self.cursor),
+                        |chip| composer::grapheme_at_or_after(&self.input, chip.start),
+                    );
             }
             KeyCode::Right if self.cursor < self.input.len() => {
-                self.cursor += self.input[self.cursor..].chars().next().unwrap().len_utf8()
+                self.cursor = self
+                    .paste_chips
+                    .collapsed_starting_at(self.cursor)
+                    .map_or_else(
+                        || composer::next_grapheme(&self.input, self.cursor),
+                        |chip| composer::grapheme_at_or_after(&self.input, chip.end),
+                    );
             }
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.len(),
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => self.cursor = 0,
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor = self.input.len();
+            }
+            KeyCode::Home | KeyCode::Char('a')
+                if key.code == KeyCode::Home || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.cursor = composer::line_start(&self.input, self.cursor);
+            }
+            KeyCode::End | KeyCode::Char('e')
+                if key.code == KeyCode::End || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.cursor = composer::line_end(&self.input, self.cursor);
+            }
             _ => {}
         }
+        self.cursor = self.paste_chips.snap_cursor(&self.input, self.cursor);
         None
     }
 
     pub fn paste(&mut self, text: &str) {
         self.command_completion = None;
+        if self.instruction_prompt.is_some()
+            || self.permission_prompt.is_some()
+            || self.permission_rows.is_some()
+        {
+            return;
+        }
         if self.picker.is_some() {
             for c in text.chars().filter(|c| !c.is_control()) {
                 if self.query.len() + c.len_utf8() > 256 {
@@ -1126,17 +1453,44 @@ impl View {
             }
             self.selected = 0;
         } else {
-            for c in text.chars() {
-                self.insert(c);
+            if matches!(self.recall, Some(Recall::Search { .. })) {
+                self.notify("Leave prompt search before pasting");
+                return;
+            }
+            if self.input.len().saturating_add(text.len()) > composer::DRAFT_BYTE_LIMIT {
+                self.notify("Paste exceeds the 128 KiB draft limit · nothing inserted");
+                return;
+            }
+            self.recall = None;
+            self.cursor = composer::grapheme_at_or_after(&self.input, self.cursor);
+            let start = self.cursor;
+            if self.edit_range(start, start, text) {
+                let large =
+                    text.len() >= 512 || text.bytes().filter(|byte| *byte == b'\n').count() >= 3;
+                if large && !self.paste_chips.add_paste(start, text) {
+                    self.notify("Paste inserted as literal text · compact chip limit reached");
+                }
             }
         }
     }
 
-    fn insert(&mut self, c: char) {
-        if self.input.len() + c.len_utf8() <= 131_072 {
-            self.input.insert(self.cursor, c);
-            self.cursor += c.len_utf8();
+    fn insert(&mut self, text: &str) {
+        if self.input.len().saturating_add(text.len()) <= composer::DRAFT_BYTE_LIMIT {
+            let _ = self.edit_range(self.cursor, self.cursor, text);
+        } else {
+            self.notify("Draft is at its 128 KiB limit");
         }
+    }
+
+    fn edit_range(&mut self, start: usize, end: usize, replacement: &str) -> bool {
+        if self.paste_chips.expand_before_edit(start, end) {
+            self.notify("Paste expanded · repeat edit to change its literal text");
+            return false;
+        }
+        self.paste_chips.apply_edit(start, end, replacement.len());
+        self.input.replace_range(start..end, replacement);
+        self.cursor = composer::grapheme_at_or_after(&self.input, start + replacement.len());
+        true
     }
 }
 
@@ -1562,20 +1916,28 @@ fn editor_layout(input: &str, cursor: usize, width: usize) -> (Vec<Line<'static>
     let mut lines = vec![String::new()];
     let mut x = 0;
     let mut position = (0, 0);
-    for (index, c) in input.char_indices() {
-        let cells = c.width().unwrap_or(0).min(width);
-        if c != '\n' && x + cells > width {
+    for (index, grapheme) in input.grapheme_indices(true) {
+        let newline = matches!(grapheme, "\n" | "\r\n");
+        let display = if grapheme == "\t" {
+            "    "
+        } else if grapheme.chars().any(char::is_control) && !newline {
+            "�"
+        } else {
+            grapheme
+        };
+        let cells = display.width().min(width);
+        if !newline && x + cells > width {
             lines.push(String::new());
             x = 0;
         }
         if index == cursor {
             position = (x, lines.len() - 1);
         }
-        if c == '\n' {
+        if newline {
             lines.push(String::new());
             x = 0;
         } else {
-            lines.last_mut().unwrap().push(c);
+            lines.last_mut().unwrap().push_str(display);
             x += cells;
         }
     }
@@ -1963,6 +2325,33 @@ fn drain_activity(
     drain
 }
 
+fn present_settled_compactions(
+    events: &mut broadcast::Receiver<Event>,
+    view: &mut View,
+    notices: Vec<Event>,
+) {
+    let settled = notices
+        .iter()
+        .filter_map(|event| match event {
+            Event::Compaction { notice, .. } => {
+                Some((notice.source_view.clone(), notice.summary_id.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for notice in notices {
+        view.event(notice);
+    }
+    // Collector acknowledgment publishes synchronously before its entry can
+    // drain, so duplicates of the removed entries are already queued. A later
+    // acknowledgment may also appear here; retain its ID until its own collector
+    // entry drains instead of forgetting every notice at this settlement.
+    drain_activity(events, view, events.len());
+    for identity in settled {
+        view.compaction_notices_seen.remove(&identity);
+    }
+}
+
 async fn project_runtime(harness: &Arc<Mutex<Harness>>) -> RuntimeSnapshot {
     let harness = harness.lock().await;
     project_runtime_snapshot(&harness)
@@ -2022,9 +2411,26 @@ async fn apply_completion(
     }
 
     let activity = drain_activity(events, view, ACTIVITY_DRAIN_CAP);
+    let notices = {
+        let mut harness = harness.lock().await;
+        let recovery = harness.reconcile_compaction_notices().await;
+        let notices = harness.take_compaction_notices();
+        if let Err(error) = recovery {
+            view.transcript.push((
+                "error".into(),
+                format!("Compaction checkpoint recovery remains unresolved: {error:#}"),
+            ));
+            view.show_scene = false;
+        }
+        notices
+    };
     view.busy = false;
     *job = None;
     if quit_pending {
+        if !notices.is_empty() {
+            present_settled_compactions(events, view, notices);
+        }
+        view.settle();
         message?;
         return Ok(CompletionState::Settled {
             quit: true,
@@ -2047,7 +2453,7 @@ async fn apply_completion(
         }
         Ok(DispatchOutcome::Session { initial, notice }) => {
             view.transcript = initial.transcript;
-            view.session = initial.session;
+            view.select_session(initial.session);
             view.project = initial.project;
             view.motion = initial.motion;
             view.apply_runtime(initial.runtime);
@@ -2122,9 +2528,13 @@ async fn apply_completion(
             view.completion_locked = true;
         }
     }
-    if let Some((input, cursor)) = view.saved_input.take() {
+    if !notices.is_empty() {
+        present_settled_compactions(events, view, notices);
+    }
+    if let Some((input, cursor, chips)) = view.saved_input.take() {
         view.input = input;
         view.cursor = cursor;
+        view.paste_chips = chips;
     }
     view.apply_runtime(project_runtime(harness).await);
     view.usage = Some(harness.lock().await.session_usage().await?);
@@ -2259,6 +2669,10 @@ where
     let result: Result<()> = async {
         loop {
             if dirty {
+                let size = terminal
+                    .size()
+                    .map_err(|error| anyhow::anyhow!("terminal size: {error}"))?;
+                render::clamp_scroll(&mut view, size.into());
                 terminal
                     .draw(|frame| draw(frame, &view))
                     .map_err(|error| anyhow::anyhow!("terminal draw: {error}"))?;
@@ -2498,6 +2912,8 @@ where
                                 continue;
                             }
                             if !command.starts_with('/') || custom_prompt.is_some() {
+                                let submitted_session = view.session.clone();
+                                view.record_submitted_prompt(&submitted_session, &command);
                                 view.transcript.push(("user".into(), command.clone()));
                                 view.show_scene = false;
                                 view.scroll = 0;
@@ -2590,6 +3006,9 @@ where
                             activity_closed,
                         } => {
                             activity_open = activity_still_open(activity_open, activity_closed);
+                            let size = terminal.size()?;
+                            render::clamp_scroll(&mut view, size.into());
+                            terminal.draw(|frame| draw(frame, &view))?;
                             return Ok(());
                         }
                         CompletionState::Settled {
@@ -3539,6 +3958,90 @@ mod tests {
     }
 
     #[test]
+    fn compaction_live_and_late_queued_events_display_once_with_bounded_settlement_state() {
+        let mut view = fixture();
+        view.transcript.clear();
+        let (sender, mut receiver) = broadcast::channel(8);
+        for operation in 0..2_048 {
+            let event = Event::Compaction {
+                actor: "part-a".into(),
+                notice: kuru_runtime::CompactionNotice {
+                    summary_id: format!("{operation:064x}"),
+                    source_view: "main".into(),
+                    after_sequence: operation,
+                    through_sequence: operation + 1,
+                },
+            };
+            // A live observation and a still-queued duplicate can straddle the
+            // collector drain; both must represent one visible checkpoint.
+            view.event(event.clone());
+            sender.send(event.clone()).unwrap();
+            present_settled_compactions(&mut receiver, &mut view, vec![event]);
+            assert_eq!(view.transcript.len(), operation as usize + 1);
+            assert!(view.compaction_notices_seen.is_empty());
+            assert!(receiver.is_empty());
+        }
+        let late = Event::Compaction {
+            actor: "part-b".into(),
+            notice: kuru_runtime::CompactionNotice {
+                summary_id: format!("{:064x}", 2_048),
+                source_view: "main".into(),
+                after_sequence: 2_048,
+                through_sequence: 2_049,
+            },
+        };
+        // An acknowledgment after the collector snapshot can reach the queued
+        // event drain first. Keep its dedup entry until its own later settlement.
+        sender.send(late.clone()).unwrap();
+        present_settled_compactions(&mut receiver, &mut view, vec![]);
+        assert_eq!(view.transcript.len(), 2_049);
+        assert_eq!(view.compaction_notices_seen.len(), 1);
+        present_settled_compactions(&mut receiver, &mut view, vec![late]);
+        assert_eq!(view.transcript.len(), 2_049);
+        assert!(view.compaction_notices_seen.is_empty());
+        let lagged = Event::Compaction {
+            actor: "part-c".into(),
+            notice: kuru_runtime::CompactionNotice {
+                summary_id: format!("{:064x}", 2_049),
+                source_view: "main".into(),
+                after_sequence: 2_049,
+                through_sequence: 2_050,
+            },
+        };
+        sender.send(lagged.clone()).unwrap();
+        for _ in 0..8 {
+            sender
+                .send(Event::Idle {
+                    actor: "part-c".into(),
+                    detail: "settled".into(),
+                })
+                .unwrap();
+        }
+        // Receiver lag can evict the live notice, but its accepted collector
+        // entry still produces exactly one transcript message at settlement.
+        present_settled_compactions(&mut receiver, &mut view, vec![lagged]);
+        assert_eq!(view.transcript.len(), 2_050);
+        assert!(view.compaction_notices_seen.is_empty());
+        assert!(
+            view.activity
+                .iter()
+                .any(|line| line.contains("activity events omitted"))
+        );
+        assert!(
+            view.transcript
+                .last()
+                .unwrap()
+                .1
+                .contains("original records remain stored")
+        );
+        let frame = rendered(&view);
+        assert!(
+            frame.contains("Compacted") && frame.contains("remain stored"),
+            "{frame}"
+        );
+    }
+
+    #[test]
     fn config_command_frame_shows_captured_sources_and_live_selection_safely() {
         let mut view = fixture();
         view.config_projection = Some(ConfigDisplayProjection {
@@ -3814,6 +4317,31 @@ mod tests {
         view.picker = Some(Picker::Models);
         view.key(key(KeyCode::Tab));
         assert_eq!(view.input, "/mem");
+
+        view.picker = None;
+        view.input = "/he ".into();
+        view.cursor = 4;
+        view.paste(&"猫\n".repeat(100));
+        view.cursor = 3;
+        view.key(key(KeyCode::Tab));
+        assert!(view.input.starts_with("/help"));
+        view.cursor = "/help ".len();
+        view.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(view.input, "/help ");
+
+        let mut full = fixture();
+        full.input = "/he ".into();
+        full.cursor = full.input.len();
+        full.paste(&"x".repeat(composer::DRAFT_BYTE_LIMIT - full.input.len()));
+        assert_eq!(full.input.len(), composer::DRAFT_BYTE_LIMIT);
+        full.cursor = 3;
+        let before = full.input.clone();
+        let chip = full.paste_chips.get_at(&full.input, 4).cloned();
+        full.key(key(KeyCode::Tab));
+        assert_eq!(full.input, before);
+        assert_eq!(full.cursor, 3);
+        assert_eq!(full.paste_chips.get_at(&full.input, 4), chip.as_ref());
+        assert!(full.notice.as_deref().unwrap().contains("128 KiB"));
     }
 
     #[test]
@@ -4858,8 +5386,9 @@ mod tests {
         view.key(key(KeyCode::Char('b')));
         assert_eq!(view.input, "a\nb");
         view.key(key(KeyCode::Home));
+        assert_eq!(view.cursor, 2);
         view.key(key(KeyCode::Right));
-        assert_eq!(view.cursor, 1);
+        assert_eq!(view.cursor, 3);
         view.key(key(KeyCode::End));
         assert_eq!(view.cursor, 3);
         assert_eq!(view.key(key(KeyCode::Enter)).unwrap(), "a\nb");
@@ -5006,6 +5535,39 @@ mod tests {
     }
 
     #[test]
+    fn stored_scroll_clamps_after_transcript_and_viewport_shrink() {
+        let mut view = fixture();
+        view.show_scene = false;
+        view.transcript = (0..80)
+            .map(|index| {
+                (
+                    "user".into(),
+                    format!("turn {index} {}", "detail ".repeat(8)),
+                )
+            })
+            .collect();
+        view.scroll = u16::MAX;
+        render::clamp_scroll(&mut view, ratatui::layout::Rect::new(0, 0, 120, 35));
+        assert!(view.scroll > 0 && view.scroll < u16::MAX);
+        view.transcript.truncate(1);
+        render::clamp_scroll(&mut view, ratatui::layout::Rect::new(0, 0, 80, 24));
+        assert_eq!(view.scroll, 0);
+    }
+
+    #[test]
+    fn large_accepted_draft_renders_its_tail_with_cursor_visible() {
+        let mut view = fixture();
+        view.input = format!("{}END", "\n".repeat(70_000));
+        view.cursor = view.input.len();
+        assert!(view.input.len() <= composer::DRAFT_BYTE_LIMIT);
+        let frame = rendered(&view);
+        assert!(
+            frame.contains("END"),
+            "cursor tail was not in the visible frame"
+        );
+    }
+
+    #[test]
     fn applying_runtime_snapshot_preserves_initial_editor_and_completion_state() {
         let initial_runtime = runtime_snapshot();
         let original_parts = initial_runtime.parts.clone();
@@ -5067,5 +5629,132 @@ mod tests {
         assert_eq!(view.effort, "high");
         assert_eq!(view.turns, 9);
         assert_ne!(view.parts, original_parts);
+    }
+
+    #[test]
+    fn submitted_history_is_ephemeral_session_owned_and_cancel_restores_draft() {
+        let mut view = fixture();
+        view.input = "unsent draft".into();
+        view.cursor = 4;
+        // Recording at dispatch is independent of later model completion.
+        view.record_submitted_prompt("plain-session", "needle prompt");
+        view.search_history((view.input.clone(), view.cursor, view.paste_chips.clone()));
+        view.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(view.input, "needle prompt");
+        view.key(key(KeyCode::Esc));
+        assert_eq!(view.input, "unsent draft");
+        assert_eq!(view.cursor, 4);
+
+        view.browse_history();
+        assert_eq!(view.input, "needle prompt");
+        view.select_session("other-session".into());
+        assert_eq!(view.input, "unsent draft");
+        view.key(key(KeyCode::Up));
+        assert_eq!(view.input, "unsent draft");
+    }
+
+    #[test]
+    fn composer_grapheme_motion_and_cursor_rendering_keep_clusters_whole() {
+        let mut view = fixture();
+        view.input = "e\u{301}👩‍💻tail\r\n猫x".into();
+        view.cursor = view.input.len();
+        view.key(key(KeyCode::Up));
+        assert_eq!(view.cursor, "e\u{301}👩‍💻".len());
+        view.key(key(KeyCode::Left));
+        assert_eq!(
+            &view.input[view.cursor..composer::next_grapheme(&view.input, view.cursor)],
+            "👩‍💻"
+        );
+        for width in [80, 120] {
+            let (lines, x, y) = editor_layout(&view.input, view.cursor, width);
+            assert!(y < lines.len());
+            assert!(x < width);
+        }
+    }
+
+    #[test]
+    fn paste_chips_keep_canonical_crlf_and_remove_exact_combining_span() {
+        let mut view = fixture();
+        let pasted = "line\r\n".repeat(80);
+        view.input = "beforeafter".into();
+        view.cursor = "before".len();
+        view.paste(&pasted);
+        let canonical = format!("before{pasted}after");
+        assert_eq!(view.input, canonical);
+        assert!(rendered(&view).contains("paste ·"));
+        assert!(view.paste_chips.toggle_at(&view.input, view.cursor));
+        let (expanded, _) = view.paste_chips.project(&view.input, view.cursor);
+        assert_eq!(expanded, canonical);
+        assert_eq!(
+            view.key(key(KeyCode::Enter)).as_deref(),
+            Some(canonical.as_str())
+        );
+
+        view.input = "eTAIL".into();
+        view.cursor = 1;
+        let combining = "\u{301}".repeat(300);
+        view.paste(&combining);
+        let end = 1 + combining.len();
+        assert_eq!(view.cursor, end);
+        view.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(view.input, "eTAIL");
+        assert!(view.paste_chips.get_at(&view.input, view.cursor).is_none());
+
+        view.input = "👩TAIL".into();
+        view.cursor = "👩".len();
+        let joined = "\u{200d}👩".repeat(110);
+        view.paste(&joined);
+        assert_eq!(view.cursor, "👩".len() + joined.len());
+        let global_boundary = composer::grapheme_at_or_after(&view.input, "👩".len());
+        assert_eq!(global_boundary, "👩".len() + joined.len());
+        view.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(view.input, "👩TAIL");
+    }
+
+    #[test]
+    fn oversized_paste_is_atomic_for_draft_and_chip_ranges() {
+        let mut view = fixture();
+        view.input = "headtail".into();
+        view.cursor = 4;
+        let large = format!("{}\n", "x".repeat(composer::DRAFT_BYTE_LIMIT - 21));
+        view.paste(&large);
+        assert!(view.input.len() < composer::DRAFT_BYTE_LIMIT);
+        let input = view.input.clone();
+        let cursor = view.cursor;
+        let chip = view.paste_chips.get_at(&view.input, cursor).cloned();
+        assert!(chip.is_some());
+        view.paste("1234567890123");
+        assert_eq!(view.input, input);
+        assert_eq!(view.cursor, cursor);
+        assert_eq!(view.paste_chips.get_at(&view.input, cursor), chip.as_ref());
+        assert!(view.notice.as_deref().unwrap().contains("nothing inserted"));
+        assert!(rendered(&view).contains("nothing inserted"));
+    }
+
+    #[test]
+    fn paste_does_not_mutate_draft_under_approval_or_picker_priority() {
+        let mut view = fixture();
+        view.input = "draft".into();
+        view.cursor = view.input.len();
+        view.permission_prompt = Some(PermissionPrompt {
+            display: PermissionDisplay {
+                label: "native file write".into(),
+                scope: "project file notes/exact.txt".into(),
+                preview: "bounded preview".into(),
+                rememberable: true,
+                remember_disabled_reason: None,
+            },
+            whole_tool: false,
+            scroll: 0,
+        });
+        view.paste("ignored approval paste");
+        assert_eq!(view.input, "draft");
+        view.permission_prompt = None;
+
+        view.open_picker(Picker::Models);
+        view.query.clear();
+        view.paste("demo");
+        assert_eq!(view.input, "draft");
+        assert_eq!(view.query, "demo");
     }
 }

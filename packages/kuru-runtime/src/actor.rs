@@ -18,20 +18,22 @@ use kuru_core::{
     validate_context_sources,
 };
 use kuru_memory::{
-    ContextSummaryCheckpoint, ContextSummaryRecord, ContextSummaryStale, MemoryStore,
-    PublicTranscriptEntry, PublicTurnKind, PublicTurnRecord, PublicTurnSettlement,
-    ReasoningSummaryRecord, UsageLedger, context_summary_id, public_turn_continuation_node_id,
+    ContextSummaryCheckpoint, ContextSummaryConfirmation, ContextSummaryRecord,
+    ContextSummaryStale, MemoryStore, PublicTranscriptEntry, PublicTurnKind, PublicTurnRecord,
+    PublicTurnSettlement, ReasoningSummaryRecord, UsageLedger, public_turn_continuation_node_id,
     public_turn_node_id,
 };
 use serde_json::Value;
 use tokio::{
-    sync::{Semaphore, mpsc, oneshot, watch},
+    sync::{Semaphore, broadcast, mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use tracing::Instrument;
 
 use crate::{
-    context_compaction::{CompactionSource, load_compaction_source, revalidate_compaction_source},
+    context_compaction::{
+        CompactionNotices, CompactionSource, load_compaction_source, revalidate_compaction_source,
+    },
     engine::{CancellationToken, turn_was_cancelled},
     progress::{ContextSnapshot, ProgressDescriptor, ProgressObserver, RequestContext},
 };
@@ -164,6 +166,8 @@ impl std::error::Error for AccountingFailure {}
 
 pub(crate) struct Work {
     pub memory: MemoryStore,
+    pub compaction_notices: CompactionNotices,
+    pub events: broadcast::Sender<crate::Event>,
     /// Project scope of this work's durable state keys.
     pub scope: String,
     pub ledger: UsageLedger,
@@ -1261,7 +1265,9 @@ async fn run_context_compaction(
         invocation_id: invocation_id.clone(),
         summary,
     };
-    let summary_id = context_summary_id(&record)?;
+    let confirmation = ContextSummaryConfirmation::from_record(&record)?;
+    let summary_id = confirmation.summary_id.clone();
+    let source_view = confirmation.source_view.clone();
     let checkpoint = ContextSummaryCheckpoint {
         record,
         private_reasoning: compact_reasoning_records(
@@ -1273,12 +1279,21 @@ async fn run_context_compaction(
     // Successful usage settlement is the final cancellation cutoff before the
     // receipted atomic mutation. Once sent, drain its exact reply/recovery path
     // rather than dropping an accepted checkpoint between summary and sidecars.
+    work.compaction_notices.register(
+        confirmation,
+        &work.invocation.actor_id,
+        &work.invocation.operation_id,
+        work.manual_compaction,
+    );
     if let Err(error) = work.memory.checkpoint_context_summary(&checkpoint).await {
         if error.downcast_ref::<ContextSummaryStale>().is_some() {
+            work.compaction_notices.reject(&source_view, &summary_id);
             return Err(error);
         }
         return Err(MemoryFailure(error).into());
     }
+    work.compaction_notices
+        .acknowledge(&source_view, &summary_id, &work.events);
     work.cancellation.check()?;
     Ok(Some(CompactionOutcome {
         after_sequence: source.after_exclusive,

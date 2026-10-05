@@ -30,7 +30,7 @@ pub use rpc::{ServiceCall, ServiceReply, ServiceRequest, ServiceResponse, Servic
 pub const PROTOCOL_MAJOR: u16 = 1;
 // Exact-ref recovery and session-provenance calls require this owner version.
 // Older owners reject the new client before a mutating frame.
-pub const PROTOCOL_MINOR: u16 = 9;
+pub const PROTOCOL_MINOR: u16 = 10;
 pub const HANDSHAKE_LIMIT: usize = 16 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest single accept wait before the serve loop re-verifies its owner
@@ -10646,9 +10646,12 @@ mod tests {
         ensure!(parse_service_arguments(invalid).is_err());
 
         let hello = authority().hello();
+        let expected = format!(
+            r#"{{"version":{{"major":{},"minor":{}}},"project_path":[47,112,114,105,118,97,116,101,47,112,114,111,106,101,99,116],"project_scope":"scope","store_instance":"store","service_generation":"generation","connection_secret":"test-secret","schema_version":4}}"#,
+            PROTOCOL_MAJOR, PROTOCOL_MINOR
+        );
         ensure!(
-            serde_json::to_string(&hello)?
-                == r#"{"version":{"major":1,"minor":9},"project_path":[47,112,114,105,118,97,116,101,47,112,114,111,106,101,99,116],"project_scope":"scope","store_instance":"store","service_generation":"generation","connection_secret":"test-secret","schema_version":4}"#,
+            serde_json::to_string(&hello)? == expected,
             "a hello without a starter token changed its wire form"
         );
         let mut presented = hello;

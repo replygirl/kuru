@@ -4,18 +4,31 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 
 ## Terminal keys
 
-| Key                                              | Action                                                       |
-| ------------------------------------------------ | ------------------------------------------------------------ |
-| <kbd>Enter</kbd>                                 | Send the input or select the highlighted picker item         |
-| <kbd>Alt</kbd>+<kbd>Enter</kbd>                  | Insert a newline                                             |
-| <kbd>F2</kbd>                                    | Choose a model                                               |
-| <kbd>F3</kbd>                                    | Choose reasoning effort                                      |
-| <kbd>F4</kbd>                                    | Choose a framework                                           |
-| Type or paste in a picker                        | Filter its choices                                           |
-| <kbd>Escape</kbd>                                | Close a picker or cancel active work                         |
-| <kbd>Ctrl</kbd>+<kbd>C</kbd>                     | Cancel work; quit while idle                                 |
-| <kbd>Page Up</kbd> / <kbd>Page Down</kbd>        | Scroll the transcript                                        |
-| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Cycle matching slash-command names before the first argument |
+| Key                                              | Action                                                                           |
+| ------------------------------------------------ | -------------------------------------------------------------------------------- |
+| <kbd>Enter</kbd>                                 | Send the input or select the highlighted picker item                             |
+| <kbd>Alt</kbd>+<kbd>Enter</kbd>                  | Insert a newline                                                                 |
+| <kbd>Left</kbd> / <kbd>Right</kbd>               | Move one displayed character (grapheme)                                          |
+| <kbd>Up</kbd> / <kbd>Down</kbd>                  | Move vertically; at the first/last line, browse this session's submitted prompts |
+| <kbd>Ctrl</kbd>+<kbd>R</kbd>                     | Search this session's in-memory submitted prompts; repeat to cycle matches       |
+| <kbd>Escape</kbd> during prompt search           | Restore the unsent draft                                                         |
+| <kbd>Ctrl</kbd>+<kbd>G</kbd> on a paste chip     | Expand or compact its display                                                    |
+| <kbd>Ctrl</kbd>+<kbd>X</kbd> on a paste chip     | Remove exactly the pasted text                                                   |
+| <kbd>F2</kbd>                                    | Choose a model                                                                   |
+| <kbd>F3</kbd>                                    | Choose reasoning effort                                                          |
+| <kbd>F4</kbd>                                    | Choose a framework                                                               |
+| Type or paste in a picker                        | Filter its choices                                                               |
+| <kbd>Escape</kbd>                                | Close a picker or cancel active work                                             |
+| <kbd>Ctrl</kbd>+<kbd>C</kbd>                     | Cancel work; quit while idle                                                     |
+| <kbd>Page Up</kbd> / <kbd>Page Down</kbd>        | Scroll the transcript                                                            |
+| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Cycle matching slash-command names before the first argument                     |
+
+Prompt history is bounded and held only in memory for the current run. It is
+separate from durable conversation history and is grouped by session. Pasted
+text larger than 512 bytes or containing at least three line breaks appears as
+a compact chip; expand it to inspect the text or remove the exact pasted span.
+The composer accepts at most 128 KiB of draft text. An oversized paste is
+rejected in full, leaving the draft unchanged.
 
 ## Slash commands
 
@@ -55,6 +68,10 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 Model, effort, and framework selections made here are [saved for the project](./configuration#remembered-choices). Identity names must be unambiguous; `/parts` provides IDs.
 
 `/config` is read-only and uses the configuration snapshot captured when the TUI started; it does not reread configuration files or activate new workspace authority. It shows bounded per-layer and final-leaf sources, redacts secret-bearing values, and leaves named environment-variable references visible without resolving them. The captured saved mode/model/effort and the current live runtime selection are labeled separately. `/config` takes no arguments and does not open an editor.
+
+`/compact` reports the actor, covered source range and accepted summary identity; automatic compaction shows the same checkpoint information. These notices contain no private summary or history text, and the original records remain stored. Accepted checkpoints still produce a notice if the surrounding operation is cancelled. A candidate checkpoint notice does not mean the candidate was promoted. Headless `kuru run` writes compaction notices to stderr, preserving stdout's answer or JSON.
+
+Ctrl-C cancels an active headless run and waits for its operation and memory cleanup. Confirmed compaction notices remain on stderr; an interrupted answer does not become partial stdout output.
 
 Tab completes only the leading command name and leaves its arguments unchanged. `/clear` affects only the current terminal view: stored conversation, usage, and session identity remain available, including after resume. `/status` uses the local session snapshot and makes no provider request.
 
