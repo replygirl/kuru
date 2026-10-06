@@ -141,6 +141,13 @@ pub(super) async fn run(job: TemplateCreation, startup: File) -> Result<(File, O
 
 impl TemplateCreation {
     async fn create(mut self, startup: File) -> Result<(File, Outcome)> {
+        // The observer's hold cannot stop this independent task. Retain the
+        // startup lock here and honor the same test marker before any stage or
+        // template effects. Release builds neither read the marker nor wait.
+        #[cfg(any(test, feature = "test-support"))]
+        if let Err(error) = hold_before_effects(self.engine.timeout).await {
+            tracing::error!("memory creation hold failed: {error:#}");
+        }
         let stage = files::ensure_private_directory(&self.stage)?;
         let created = Box::pin(creation_template::create_in(
             &self.root,
@@ -307,5 +314,104 @@ impl TemplateCreation {
         )
         .await
         .context("preserve the interrupted memory template copy")
+    }
+}
+
+/// Reuse the owner fixture's existing marker, budget and removal semantics.
+#[cfg(any(test, feature = "test-support"))]
+async fn hold_before_effects(limit: Duration) -> Result<()> {
+    use crate::service::activity::{MarkerHold, OPEN_HOLD_DIR_ENV};
+
+    #[cfg(test)]
+    let scoped = creation_template::hooks::captured().and_then(|hooks| hooks.creation_hold);
+    let marker = std::env::var_os(OPEN_HOLD_DIR_ENV)
+        .filter(|directory| !directory.is_empty())
+        .map(|directory| PathBuf::from(directory).join("CreatingDatabase.hold"));
+    #[cfg(test)]
+    let marker = scoped.as_ref().map(|(marker, _)| marker.clone()).or(marker);
+    let Some(marker) = marker.filter(|marker| marker.exists()) else {
+        return Ok(());
+    };
+    let hold = MarkerHold::new(Some(marker), MemoryOpenStage::CreatingDatabase, limit)?;
+    #[cfg(test)]
+    if let Some((_, entered)) = scoped {
+        entered.notify_one();
+    }
+    hold.wait().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use creation_template::hooks::{HOOKS, Hooks, LockStep};
+
+    /// Observe the independently spawned worker itself, rather than its progress
+    /// waiter, before the first filesystem effect. An injected lock refusal
+    /// returns the startup lock without starting an engine after release.
+    #[tokio::test]
+    async fn creation_worker_holds_before_stage_and_template_effects() -> Result<()> {
+        let fixture = crate::test_support::tempdir()?;
+        let root = fixture.path().join("templates");
+        let stage = fixture.path().join("stage");
+        let marker = fixture.path().join("CreatingDatabase.hold");
+        let limit = crate::test_budgets::OPERATION_TIMEOUT;
+        fs::write(&marker, limit.as_millis().to_string())?;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let hooks = Hooks {
+            creation_hold: Some((marker.clone(), entered.clone())),
+            lock: Some(LockStep::Verify),
+            ..Hooks::default()
+        };
+        let startup = File::create(fixture.path().join("startup.lock"))?;
+        let job = TemplateCreation {
+            root: root.clone(),
+            engine: creation_template::Engine {
+                binary: PathBuf::from("/nonexistent/dolt"),
+                supervisor: PathBuf::from("/nonexistent/supervisor"),
+                timeout: limit,
+                ticks: None,
+            },
+            base: ServerOptions {
+                expected_instance: None,
+                binary: PathBuf::from("/nonexistent/dolt"),
+                directory: stage.clone(),
+                project_scope: "project/fixture".to_owned(),
+                supervisor: PathBuf::from("/nonexistent/supervisor"),
+                timeout: limit,
+                read_only: false,
+                retained: None,
+                lifecycle_root: None,
+                ticks: None,
+            },
+            stage: stage.clone(),
+            parent: fixture.path().to_owned(),
+            project_scope: "project/fixture".to_owned(),
+            marker_pause: None,
+        };
+        let worker = tokio::spawn(HOOKS.scope(hooks, run(job, startup)));
+        let observed: Result<()> = async {
+            tokio::time::timeout(limit, entered.notified())
+                .await
+                .context("the actual creation worker did not enter its marker wait")?;
+            ensure!(!root.exists(), "template effects preceded hold release");
+            ensure!(!stage.exists(), "stage effects preceded hold release");
+            Ok(())
+        }
+        .await;
+        // Release and await the same worker even when the observation fails.
+        let released = fs::remove_file(&marker);
+        let completed = worker.await.context("creation worker task failed")?;
+        let outcome = (|| {
+            observed?;
+            released?;
+            let (startup, outcome) = completed?;
+            ensure!(
+                matches!(outcome, Outcome::Cold(_)),
+                "lock refusal was not cold"
+            );
+            drop(startup);
+            Ok(())
+        })();
+        fixture.release(outcome)
     }
 }

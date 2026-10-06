@@ -1,6 +1,7 @@
 use std::{
     ffi::OsStr,
     fs::File,
+    future::Future,
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -509,6 +510,14 @@ pub fn doctor_exit_code(error: &anyhow::Error) -> Option<i32> {
 
 #[derive(Debug, Subcommand)]
 pub enum MemoryCommand {
+    /// List bounded project scopes in the legacy SQLite source without opening Dolt.
+    Inventory,
+    /// Import one inventoried source scope into this canonical project.
+    Import {
+        /// Opaque source scope from `kuru memory inventory`; omit for exact-scope import.
+        #[arg(long)]
+        source_scope: Option<String>,
+    },
     /// Show the active project, engine version and revision.
     Status,
     /// List recent committed memory revisions.
@@ -870,7 +879,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
 }
 
 async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
-    let mut run_signal = None;
+    let mut invocation_signal = None;
     // Input completes before paths, configuration/trust or any configured
     // provider, tool, memory or diagnostic authority can activate.
     if let Some(Command::Run {
@@ -886,11 +895,11 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         }
         let (input, signal) = crate::headless::read_input(prompt.take()).await?;
         *prompt = Some(input);
-        run_signal = Some(signal);
+        invocation_signal = Some(signal);
     }
     #[cfg(unix)]
     if !matches!(cli.command, Some(Command::Update { .. })) {
-        recover_unix_installation(run_signal.as_mut()).await?;
+        recover_unix_installation(&mut invocation_signal).await?;
     }
     if let Some(command @ (Command::Completions { .. } | Command::Man)) = &cli.command {
         return write_stdout_ignoring_broken_pipe(&shell_support_output(command)?);
@@ -917,6 +926,34 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
             .context("workspace directory could not be retained safely")?,
     );
     let cwd = root.path().to_path_buf();
+
+    // Inventory is a fixed, non-provisioning inspection. It must not parse or
+    // activate automatic workspace configuration to list old scopes.
+    if matches!(
+        cli.command,
+        Some(Command::Memory {
+            command: MemoryCommand::Inventory,
+        })
+    ) {
+        let inventory = match MemoryStore::legacy_inventory(&data) {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                if let Some(refusal) = error.downcast_ref::<kuru_memory::LegacyInventoryRefusal>() {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "refusal": refusal,
+                        }))?
+                    );
+                }
+                return Err(error.context(
+                    "legacy inventory could not be verified; preserve the source and inspect it",
+                ));
+            }
+        };
+        println!("{}", serde_json::to_string_pretty(&inventory)?);
+        return Ok(());
+    }
 
     // Login and logout are fixed ChatGPT account operations. In particular,
     // they neither parse workspace-selected Responses configuration nor read
@@ -1145,6 +1182,38 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
 
     let scope = kuru_runtime::project_scope(&cwd)?;
     let memory_config = snapshot.memory_config().clone();
+    if let Some(Command::Memory {
+        command: MemoryCommand::Import { source_scope },
+    }) = &cli.command
+    {
+        let _retained_data = Directory::open(&data, Privacy::OwnerOnly, NameRetention::Movable)
+            .map_err(|error| data_directory_error(&data, error))?;
+        ensure_outside_workspace(&data, &cwd)?;
+        root.revalidate()
+            .context("workspace changed before explicit legacy import")?;
+        let mut options = MemoryOptions::new(data.clone(), scope.clone());
+        options.config = memory_config;
+        let operation = MemoryStore::import_legacy(options, source_scope.clone());
+        let outcome = match finish_memory_operation(operation, || {}, &mut invocation_signal).await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(rejected) = error.downcast_ref::<kuru_memory::LegacyImportRejected>() {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "refusal": rejected.0,
+                        }))?
+                    );
+                }
+                return Err(error.context(
+                    "legacy import did not complete; inspect the target before retrying",
+                ));
+            }
+        };
+        println!("{}", serde_json::to_string_pretty(&outcome)?);
+        return Ok(());
+    }
     let session_writer = matches!(
         &cli.command,
         Some(Command::Sessions {
@@ -1389,10 +1458,16 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
                 return Ok(());
             }
             Some(Command::Memory { command }) => {
+                if matches!(command, MemoryCommand::Inventory | MemoryCommand::Import { .. }) {
+                    unreachable!("legacy inventory/import returned before ordinary memory open")
+                }
                 let memory = existing_memory
                     .as_ref()
                     .context("this project has no memory yet; start a conversation first")?;
                 match command {
+                    MemoryCommand::Inventory | MemoryCommand::Import { .. } => {
+                        unreachable!("legacy inventory/import returned before ordinary memory open")
+                    }
                     MemoryCommand::Status => {
                         println!("{}", serde_json::to_string_pretty(&memory.status().await?)?)
                     }
@@ -1612,7 +1687,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
                     &turn_id,
                     json,
                     output_format,
-                    run_signal.take().expect("Run retains its input-registered signal"),
+                    invocation_signal.take().expect("Run retains its input-registered signal"),
                 ).await;
                 let succeeded = delivery.as_ref().is_ok_and(|delivery| delivery.result.is_ok());
                 let cleanup = match &mut delivery {
@@ -1787,6 +1862,37 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         delivery.finish(settled).await
     } else {
         settled
+    }
+}
+
+/// Retain the first-polled Ctrl-C listener and settle one already-owned memory
+/// operation before returning. The callback can request cooperative cancel for
+/// cancellable operations; explicit import intentionally settles to its receipt
+/// or an honest unconfirmed error.
+async fn finish_memory_operation<T>(
+    operation: impl Future<Output = Result<T>>,
+    on_interrupt: impl FnOnce(),
+    signal: &mut Option<crate::headless::RunSignal>,
+) -> Result<T> {
+    let interrupt = signal.get_or_insert_with(|| Box::pin(ctrl_c_cancellation()));
+    if let std::task::Poll::Ready(result) = futures::poll!(&mut *interrupt) {
+        result.context("listen for memory operation cancellation")?;
+        bail!("memory operation cancelled before it started");
+    }
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        result = &mut operation => result,
+        _signal_result = &mut *interrupt => {
+            on_interrupt();
+            let outcome = operation.await;
+            match outcome {
+                Ok(value) => Ok(value),
+                Err(error) => Err(error.context(
+                    "memory operation interrupted; owned settlement awaited; effects may already be durable",
+                )),
+            }
+        }
     }
 }
 
@@ -2243,7 +2349,7 @@ async fn update(
 
 #[cfg(unix)]
 async fn recover_unix_installation(
-    existing_signal: Option<&mut crate::headless::RunSignal>,
+    existing_signal: &mut Option<crate::headless::RunSignal>,
 ) -> Result<()> {
     let Ok(executable) = std::env::current_exe() else {
         return Ok(());
@@ -2261,10 +2367,10 @@ async fn recover_unix_installation(
         }
         Ok(true) => {}
     }
-    let mut local_signal: crate::headless::RunSignal = Box::pin(ctrl_c_cancellation());
-    let signal = existing_signal.unwrap_or(&mut local_signal);
+    let signal = existing_signal.get_or_insert_with(|| Box::pin(ctrl_c_cancellation()));
     // A pending transaction can mutate the installed image. Register before
-    // that worker starts and reuse Run's input listener when it already exists.
+    // that worker starts. Retain it through dispatch so a queued signal cannot
+    // disappear between recovery and a later owned memory operation.
     if let std::task::Poll::Ready(result) = futures::poll!(&mut *signal) {
         result?;
         return Err(crate::headless::RunExit(130).into());
@@ -2652,6 +2758,60 @@ mod candidate_command_tests {
 #[cfg(test)]
 mod cleanup_combination_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retained_startup_signal_refuses_memory_before_admission() {
+        kuru_memory::test_support::closing(async {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let mut signal: Option<crate::headless::RunSignal> = Some(Box::pin(async move {
+                receive.await.context("retained fixture signal")
+            }));
+            // Startup recovery registered this receiver before returning. A
+            // signal queued during subsequent configuration remains observable.
+            assert!(futures::poll!(signal.as_mut().unwrap()).is_pending());
+            send.send(()).unwrap();
+            let admitted = std::cell::Cell::new(false);
+            let operation = async {
+                admitted.set(true);
+                Ok(7)
+            };
+            let error = finish_memory_operation(operation, || {}, &mut signal)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "memory operation cancelled before it started"
+            );
+            assert!(!admitted.get());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn retained_startup_signal_awaits_accepted_memory_receipt() {
+        kuru_memory::test_support::closing(async {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let mut signal: Option<crate::headless::RunSignal> = Some(Box::pin(async move {
+                receive.await.context("retained fixture signal")
+            }));
+            assert!(futures::poll!(signal.as_mut().unwrap()).is_pending());
+            let settle = tokio::sync::Semaphore::new(0);
+            let confirmed = std::cell::Cell::new(false);
+            let operation = async {
+                // The operation was actually polled before the signal arrived.
+                send.send(()).unwrap();
+                settle.acquire().await.unwrap().forget();
+                confirmed.set(true);
+                Ok("confirmed import receipt")
+            };
+            let receipt = finish_memory_operation(operation, || settle.add_permits(1), &mut signal)
+                .await
+                .unwrap();
+            assert!(confirmed.get());
+            assert_eq!(receipt, "confirmed import receipt");
+        })
+        .await;
+    }
 
     #[test]
     fn success_with_clean_cleanup_returns_the_value() {

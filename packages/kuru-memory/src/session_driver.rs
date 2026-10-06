@@ -27,6 +27,26 @@ pub(crate) struct NativeMaintenanceLease {
     _directory: Directory,
 }
 
+/// A definite refusal because another session owns or is draining the native
+/// project barrier. Other lock I/O failures retain their original error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeMaintenanceBusy;
+
+impl std::fmt::Display for NativeMaintenanceBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a project session is active or draining")
+    }
+}
+
+impl std::error::Error for NativeMaintenanceBusy {}
+
+fn maintenance_lock_error(error: std::fs::TryLockError) -> anyhow::Error {
+    match error {
+        std::fs::TryLockError::WouldBlock => NativeMaintenanceBusy.into(),
+        std::fs::TryLockError::Error(error) => error.into(),
+    }
+}
+
 impl NativeMaintenanceLease {
     pub(crate) fn acquire(data: &Path, scope: &str) -> Result<Self> {
         let digest = scope
@@ -42,7 +62,9 @@ impl NativeMaintenanceLease {
         let directory = files::ensure_private_directory(&data.join("locks"))?;
         let name = OsString::from(format!("{digest}.lock"));
         let file = directory.lock_file(&name)?;
-        file.try_lock().map_err(|error| anyhow::anyhow!("project still has checked driver ownership or draining work; memory maintenance cannot proceed: {error}"))?;
+        file.try_lock()
+            .map_err(maintenance_lock_error)
+            .context("acquire native project maintenance barrier")?;
         if let Err(error) = directory.verify(&name, &file) {
             files::release_lock(file);
             return Err(error.into());
@@ -161,13 +183,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn maintenance_lock_error_distinguishes_contention_from_io() {
+        let busy = maintenance_lock_error(std::fs::TryLockError::WouldBlock);
+        assert!(busy.is::<NativeMaintenanceBusy>());
+
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let io = maintenance_lock_error(std::fs::TryLockError::Error(denied));
+        assert_eq!(
+            io.downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::PermissionDenied)
+        );
+    }
+
+    #[test]
     fn session_native_barriers_exclude_same_driver_and_maintenance() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let project = root.path().join("project");
-        std::fs::create_dir(&project)?;
+        let uncanonical_project = root.path().join("project");
+        std::fs::create_dir(&uncanonical_project)?;
+        let project = uncanonical_project.canonicalize()?;
         let data = root.path().join("private");
         let first = NativeSessionLease::acquire(&data, &project, "first")?;
         let second = NativeSessionLease::acquire(&data, &project, "second")?;
+        let scope = crate::service::canonical_project_scope(&project)?;
+        let busy = match NativeMaintenanceLease::acquire(&data, &scope) {
+            Ok(_) => anyhow::bail!("maintenance passed while real native sessions were admitted"),
+            Err(error) => error,
+        };
+        assert!(busy.is::<NativeMaintenanceBusy>());
         first.verify()?;
         second.verify()?;
         let error = match NativeSessionLease::acquire(&data, &project, "first") {

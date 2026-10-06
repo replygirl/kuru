@@ -18,10 +18,12 @@ mod store;
 pub use facade::{
     ActiveExportSnapshot, Candidate, CandidateReconciliation, CandidateReconciliationRecovery,
     CandidateReconciliationResolution, CandidateTransitionRecovery, CandidateTransitionResolution,
-    CandidateUnitRecovery, DreamLease, DriverPresence, ExportCursor, ExportPage, MemoryStore,
-    MemoryView, SelectedAbandonResolution, SelectedAbandonUncertain, SessionDriver, StateReadCut,
-    UsageLedger,
+    CandidateUnitRecovery, DreamLease, DriverPresence, ExportCursor, ExportPage,
+    LegacyImportOutcome, LegacyInventoryScope, LegacyProjectInventory, LegacyScopeStatus,
+    MemoryStore, MemoryView, SelectedAbandonResolution, SelectedAbandonUncertain, SessionDriver,
+    StateReadCut, UsageLedger,
 };
+pub use migration::{LegacyImportRefusal, LegacyImportRejected, LegacyInventoryRefusal};
 pub use progress::{MemoryOpenProgress, MemoryOpenStage};
 pub use store::purge::PurgeOutcome;
 pub use store::{

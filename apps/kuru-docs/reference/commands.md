@@ -114,6 +114,8 @@ Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/
 | `kuru login --device`                                          | Use device authorization                                                                                                    |
 | `kuru auth`                                                    | Print redacted local authentication status as JSON                                                                          |
 | `kuru doctor [--json]`                                         | Inspect bounded local configuration, routes, trust, memory, and embedded-engine status                                      |
+| `kuru memory inventory`                                        | List bounded legacy SQLite project scopes and import status without opening Dolt                                            |
+| `kuru memory import [--source-scope SCOPE]`                    | Explicitly import the exact project scope, or a selected inventoried scope for a moved project                              |
 | `kuru canary --model MODEL_ID`                                 | Optionally check the fixed ChatGPT route with one bounded no-tool request                                                   |
 | `kuru logout`                                                  | Clear Kuru's stored ChatGPT credentials                                                                                     |
 | `kuru models`                                                  | Discover provider models and advertised efforts                                                                             |
@@ -127,6 +129,8 @@ Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/
 | `kuru sessions restore ID`                                     | Restore one removed session with its identity and transcript                                                                |
 | `kuru sessions fork ID SETTLED_NODE_ID`                        | Fork the public prefix through one settled boundary, sharing current project memory                                         |
 | `kuru sessions export ID --format jsonl --output PATH`         | Export one public transcript as chronological JSONL; Markdown is also supported                                             |
+| `kuru memory inventory`                                        | List bounded legacy SQLite project scopes and import status without opening Dolt                                            |
+| `kuru memory import [--source-scope SCOPE]`                    | Explicitly import the exact project scope, or a selected inventoried scope for a moved project                              |
 | `kuru memory status`                                           | Inspect the project store, branch and revision                                                                              |
 | `kuru memory history`                                          | List committed memory updates; use `--limit` to select 1–1000 entries                                                       |
 | `kuru memory candidates`                                       | List retained dream candidate refs; use `--limit` and the opaque `--after` cursor                                           |

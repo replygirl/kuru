@@ -875,6 +875,83 @@ impl Publisher {
     }
 }
 
+/// The existing test marker's read-once budget and removal wait. The observer
+/// publishes before waiting; an independent creation worker waits before effects.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct MarkerHold {
+    marker: Option<PathBuf>,
+    stage: MemoryOpenStage,
+    deadline: tokio::time::Instant,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl MarkerHold {
+    pub(crate) fn new(
+        marker: Option<PathBuf>,
+        stage: MemoryOpenStage,
+        limit: Duration,
+    ) -> Result<Self> {
+        let start = tokio::time::Instant::now();
+        let mut deadline = start + limit;
+        // The marker's content, read once at the stage's start, is its holder's
+        // observation budget in place of `limit`; empty content supplies none.
+        if let Some(marker) = &marker {
+            match std::fs::read_to_string(marker) {
+                Ok(text) if !text.trim_ascii().is_empty() => {
+                    let text = text.trim_ascii();
+                    ensure!(
+                        text.bytes().all(|byte| byte.is_ascii_digit()),
+                        "open hold marker {} holds content other than decimal milliseconds",
+                        marker.display()
+                    );
+                    deadline = text
+                        .parse()
+                        .ok()
+                        .and_then(|millis| start.checked_add(Duration::from_millis(millis)))
+                        .with_context(|| {
+                            format!(
+                                "the budget in open hold marker {} exceeds u64 milliseconds \
+                             or overflows the clock",
+                                marker.display()
+                            )
+                        })?;
+                }
+                Ok(_) => {}
+                // Removed since it was found: the wait below finds it released.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("open hold marker {} could not be read", marker.display())
+                    });
+                }
+            }
+        }
+        Ok(Self {
+            marker,
+            stage,
+            deadline,
+        })
+    }
+
+    pub(crate) async fn wait(self) -> Result<()> {
+        let Self {
+            marker,
+            stage,
+            deadline,
+        } = self;
+        if let Some(marker) = marker {
+            while marker.exists() {
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "open hold on {stage:?} was not released"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Wait at a test hold on `stage`, after a record holding it was written.
 #[cfg(any(test, feature = "test-support"))]
 async fn hold(
@@ -899,45 +976,11 @@ async fn hold(
     if marker.is_none() && barrier.is_none() {
         return Ok(());
     }
-    let start = tokio::time::Instant::now();
-    let mut deadline = start + limit;
-    // The marker's content, read once at the stage's start, is its holder's
-    // observation budget in place of `limit`; empty content supplies none.
-    if let Some(marker) = &marker {
-        match std::fs::read_to_string(marker) {
-            Ok(text) if !text.trim_ascii().is_empty() => {
-                let text = text.trim_ascii();
-                ensure!(
-                    text.bytes().all(|byte| byte.is_ascii_digit()),
-                    "open hold marker {} holds content other than decimal milliseconds",
-                    marker.display()
-                );
-                deadline = text
-                    .parse()
-                    .ok()
-                    .and_then(|millis| start.checked_add(Duration::from_millis(millis)))
-                    .with_context(|| {
-                        format!(
-                            "the budget in open hold marker {} exceeds u64 milliseconds \
-                             or overflows the clock",
-                            marker.display()
-                        )
-                    })?;
-            }
-            Ok(_) => {}
-            // Removed since it was found: the wait below finds it released.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("open hold marker {} could not be read", marker.display())
-                });
-            }
-        }
-    }
+    let marker = MarkerHold::new(marker, stage, limit)?;
     if !hooks.writes.fail {
         let published = feed.stages.len();
         tokio::time::timeout_at(
-            deadline,
+            marker.deadline,
             feed.written
                 .clone()
                 .wait_for(|written| *written >= published),
@@ -952,16 +995,7 @@ async fn hold(
         barrier.entered.notify_one();
         barrier.release.notified().await;
     }
-    if let Some(marker) = marker {
-        while marker.exists() {
-            ensure!(
-                tokio::time::Instant::now() < deadline,
-                "open hold on {stage:?} was not released"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-    Ok(())
+    marker.wait().await
 }
 
 /// Open the owner's store, publishing its stages when it was started with a

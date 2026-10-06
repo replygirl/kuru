@@ -1090,7 +1090,10 @@ mod tests {
                         let directory =
                             store::project_directory(&options.data_dir, &options.project_scope)?;
                         let refused = MemoryStore::purge(options.clone()).await.unwrap_err();
-                        ensure!(refused.to_string().contains("draining work"));
+                        ensure!(
+                            refused.is::<crate::session_driver::NativeMaintenanceBusy>(),
+                            "unexpected purge refusal: {refused:#}"
+                        );
                         ensure!(
                             directory.exists(),
                             "retained cleanup allowed purge to move the store"

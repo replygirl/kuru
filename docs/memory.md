@@ -8,6 +8,8 @@ allows checked Kuru clients to attach, and stops once no client is attached and
 accepted work has settled.
 
 ```sh
+kuru memory inventory
+kuru memory import [--source-scope SCOPE]
 kuru memory status
 kuru memory history
 kuru memory candidates --limit 16
@@ -18,6 +20,24 @@ kuru memory forget ID --note SEQUENCE
 kuru memory purge --yes
 kuru memory export --format json --output committed-memory.json
 ```
+
+`kuru memory inventory` reads one bounded, read-only SQLite/WAL snapshot from
+the legacy source and reports opaque project scopes, row counts, and whether a
+scope is unimported, already imported, suppressed, or unresolved. It does not
+open Dolt projects, activate workspace configuration or trust, or print legacy
+rows. An unresolved inventory is incomplete evidence; preserve the source and
+inspect it rather than treating absent rows as proof that no data exists.
+
+`kuru memory import` explicitly imports the exact current-project scope shown
+by inventory. Use `--source-scope SCOPE` only to select a different inventoried
+scope for a moved project. Import refuses ambiguous or changed sources,
+unsupported state, collisions, an existing or suppressed target, and active or
+draining project ownership. These refusals do not activate the target. A
+successful import retains the original SQLite database and WAL and a validated
+consistent snapshot, and returns a bounded receipt with source and target
+scopes, counts, snapshot digest, and resulting revision. SQLite may rebuild its
+SHM sidecar while taking a snapshot; SHM bytes are not promised to remain
+identical. Imported content and receipts remain private project data.
 
 Status identifies the current project store, branch and revision. History lists
 committed memory updates in Dolt graph order, newest first; timestamps do not

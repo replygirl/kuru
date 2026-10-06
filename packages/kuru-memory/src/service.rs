@@ -2617,6 +2617,18 @@ pub(crate) struct MaintenancePermit {
     _native: crate::session_driver::NativeMaintenanceLease,
 }
 
+/// The checked owner refused maintenance because clients remain attached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MaintenanceActiveClients;
+
+impl std::fmt::Display for MaintenanceActiveClients {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("memory service has active clients; close them before maintenance")
+    }
+}
+
+impl std::error::Error for MaintenanceActiveClients {}
+
 /// Where a maintenance permit acquisition is, for a caller whose own bound
 /// may cancel it: that caller can name the step it was cancelled in instead
 /// of reporting only that its deadline elapsed.
@@ -2917,10 +2929,9 @@ pub(crate) async fn acquire_maintenance_permit_traced(
                 RetirementReply::Accepted => retirement_requested = true,
                 RetirementReply::Busy => {
                     busy_observations += 1;
-                    ensure!(
-                        busy_observations < 10,
-                        "memory service has active clients; close them before maintenance"
-                    );
+                    if busy_observations >= 10 {
+                        return Err(MaintenanceActiveClients.into());
+                    }
                 }
                 // Neither is owner authority: wait for the owner lock.
                 RetirementReply::NoEndpoint | RetirementReply::PeerClosed => {}

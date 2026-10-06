@@ -4585,6 +4585,105 @@ fn cli_imports_a_real_legacy_wal_without_changing_its_layout() {
     drop(connection);
 }
 
+#[test]
+fn cli_inventories_and_explicitly_imports_one_moved_legacy_scope() {
+    let env = Sandbox::new();
+    kuru_platform::fs::Directory::ensure_private(&env.data).unwrap();
+    let source_scope = format!("project/{}", "f".repeat(64));
+    let target_scope = kuru_runtime::project_scope(&env.project).unwrap();
+    let legacy_path = env.data.join("memory.sqlite3");
+    let source = rusqlite::Connection::open(&legacy_path).unwrap();
+    source
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             PRAGMA application_id=1263882837;
+             PRAGMA user_version=1;
+             CREATE TABLE messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL);
+             CREATE TABLE state (`key` TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
+        )
+        .unwrap();
+    source
+        .execute(
+            "INSERT INTO messages (namespace, role, content) VALUES (?1, 'user', 'private legacy sentinel')",
+            [format!("{source_scope}/transcript/old")],
+        )
+        .unwrap();
+    let original_db = std::fs::read(&legacy_path).unwrap();
+    let original_wal = std::fs::read(env.data.join("memory.sqlite3-wal")).unwrap();
+
+    // Fixed inventory is independent of malformed workspace configuration.
+    let invalid_config = env.root.path().join("invalid-config.toml");
+    std::fs::write(&invalid_config, b"not valid = [").unwrap();
+    let inventory_output = env
+        .command()
+        .arg("--config")
+        .arg(&invalid_config)
+        .args(["memory", "inventory"])
+        .output()
+        .unwrap();
+    assert!(
+        inventory_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inventory_output.stderr)
+    );
+    let inventory: Value = serde_json::from_slice(&inventory_output.stdout).unwrap();
+    assert_eq!(inventory["scopes"][0]["scope"], source_scope);
+    assert_eq!(inventory["scopes"][0]["status"], "unimported");
+    assert!(!String::from_utf8_lossy(&inventory_output.stdout).contains("private legacy sentinel"));
+    assert!(!env.data.join("memory").exists());
+    assert_eq!(std::fs::read(&legacy_path).unwrap(), original_db);
+    assert_eq!(
+        std::fs::read(env.data.join("memory.sqlite3-wal")).unwrap(),
+        original_wal
+    );
+
+    let refused = env.run(&["memory", "import"]);
+    assert!(!refused.status.success());
+    let refusal: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refusal["refusal"], "source_scope_unproved");
+    assert!(!String::from_utf8_lossy(&refused.stdout).contains("private legacy sentinel"));
+    assert!(!env.data.join("memory").exists());
+
+    let imported = env.run(&["memory", "import", "--source-scope", &source_scope]);
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&imported.stdout).unwrap();
+    assert_eq!(receipt["source_scope"], source_scope);
+    assert_eq!(receipt["target_scope"], target_scope);
+    assert_eq!(receipt["messages"], 1);
+    assert!(!String::from_utf8_lossy(&imported.stdout).contains("private legacy sentinel"));
+    assert_eq!(std::fs::read(&legacy_path).unwrap(), original_db);
+    assert_eq!(
+        std::fs::read(env.data.join("memory.sqlite3-wal")).unwrap(),
+        original_wal
+    );
+    assert_eq!(legacy_snapshot_count(&env.data), 1);
+
+    let replay = env.run(&["memory", "import", "--source-scope", &source_scope]);
+    assert!(!replay.status.success());
+    let refusal: Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(refusal["refusal"], "already_active");
+    assert_eq!(legacy_snapshot_count(&env.data), 1);
+    drop(source);
+}
+
+fn legacy_snapshot_count(data: &Path) -> usize {
+    std::fs::read_dir(data.join("memory/legacy"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "sqlite3")
+        })
+        .count()
+}
+
 /// Each command's memory service retires as soon as that command's last client
 /// detaches, so back-to-back commands each start a fresh service; nothing stays
 /// warm between them. After every command the fixture awaits the service's own
