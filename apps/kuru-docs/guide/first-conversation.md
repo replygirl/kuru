@@ -32,6 +32,15 @@ private peer messages; they do not determine the final reply.
 
 ## Make it yours
 
+For a one-shot script, use `kuru run "PROMPT" --json`, or pipe UTF-8 text into
+`kuru run`. An argument plus a nonempty pipe sends the argument followed by
+separately labeled literal data. Input is limited to 128 KiB before project
+authority starts. `--output-format stream-json` gives bounded public status,
+replaceable facing-text snapshots and a terminal outcome; it is not a lossless
+token stream. Errors, hooks and compaction notices stay on stderr. See
+[headless input and output](../reference/commands#headless-input-and-output) for
+precedence, gaps, exit codes and exact retry after interrupted output.
+
 The controls beside the composer show your current choices:
 
 | Key           | Choice           |
