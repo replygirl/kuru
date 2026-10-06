@@ -208,6 +208,11 @@ ChatGPT credentials in the private `auth/openai` directory beneath its data
 directory. Use the same `--data-dir` or `KURU_DATA_DIR` for login and chat, and
 keep this state outside project tool roots. See [authentication](/guide/authentication).
 
+Use [`kuru doctor`](/guide/troubleshooting) for a bounded local view of
+configuration, workspace trust, separate authentication routes, project
+memory, and the embedded engine. It does not test provider connectivity or
+repair local state.
+
 The former `codex_command` setting has been removed. Delete it from existing
 TOML, retain `provider = "codex"`, and run `kuru login` to establish Kuru's own
 session. No external Codex executable or credential-store import is needed.

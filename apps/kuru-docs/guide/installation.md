@@ -99,6 +99,12 @@ curl -fsSL https://raw.githubusercontent.com/replygirl/kuru/v0.9.0/packages/kuru
 
 Release archives use `kuru-VERSION-TARGET.tar.gz` for macOS/Linux and `kuru-VERSION-TARGET.zip` for both Windows targets (`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`), alongside `SHA256SUMS`. Archives contain the executable, `LICENSE` and `README.md`. To use a mirror, pass its HTTPS version directory and an explicit version:
 
+Archive size depends on release and target. For example, the v0.9.0 release
+assets published on 2026-09-25 ranged from about 45 to 49 MiB compressed.
+That is a dated example of complete release-archive downloads, not the
+installed executable or the expanded engine cache; use the current [release
+assets](https://github.com/replygirl/kuru/releases) for the selected target.
+
 ```sh
 bash /tmp/kuru-install.sh --version VERSION \
   --release-base https://github.com/replygirl/kuru/releases/download/vVERSION

@@ -36,6 +36,8 @@ export default defineConfig({
           { text: "Installation & updates", link: "/guide/installation" },
           { text: "Authentication & models", link: "/guide/authentication" },
           { text: "Your first conversation", link: "/guide/first-conversation" },
+          { text: "Troubleshooting", link: "/guide/troubleshooting" },
+          { text: "FAQ", link: "/guide/faq" },
         ],
       },
       {
@@ -43,6 +45,8 @@ export default defineConfig({
         items: [
           { text: "Frameworks", link: "/concepts/frameworks" },
           { text: "Parts, relationships & memory", link: "/concepts/memory" },
+          { text: "Data and privacy", link: "/concepts/data-privacy" },
+          { text: "Threat model", link: "/concepts/threat-model" },
           { text: "Sessions & dreaming", link: "/concepts/sessions" },
         ],
       },

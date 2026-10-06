@@ -1558,6 +1558,34 @@ fn session_lifecycle_outcome(value: ServiceValue) -> Result<store::SessionLifecy
 }
 
 impl MemoryStore {
+    /// Inspect the exact project's existing activation without opening Dolt
+    /// or creating any project state.
+    pub fn inspect_project_structure(
+        data_dir: &Path,
+        project_scope: &str,
+    ) -> store::ProjectStructure {
+        store::MemoryStore::inspect_project_structure(data_dir, project_scope)
+    }
+
+    /// Attach only to an already-published compatible owner. A miss or
+    /// retiring owner remains inconclusive; this method never elects, starts,
+    /// probes an owner lock, or falls back to a local store open.
+    pub async fn attach_existing_for_inspection(
+        options: OpenOptions,
+        project: std::path::PathBuf,
+        executable: std::path::PathBuf,
+    ) -> Result<Option<Self>> {
+        let Some(attachment) = service::inspect_existing(&options, &project).await? else {
+            return Ok(None);
+        };
+        let remote = RemoteSession::new_view(attachment, options, project, executable)?;
+        Ok(Some(Self {
+            backend: Backend::Remote(remote),
+            #[cfg(any(test, feature = "test-support"))]
+            reject_next_state_write: Arc::new(AtomicBool::new(false)),
+        }))
+    }
+
     /// One instance-scoped definite pre-send state-save refusal for fixtures.
     #[cfg(any(test, feature = "test-support"))]
     pub fn reject_next_state_write_for_test(&self) {

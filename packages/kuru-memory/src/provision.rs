@@ -35,6 +35,29 @@ const ACTIVATION_RETRY_LIMIT: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const ACTIVATION_RETRY_SPACING: Duration = Duration::from_millis(20);
 
+/// Verify the selected embedded archive against its bounded target catalog
+/// metadata without extracting or provisioning it.
+pub fn verify_embedded_asset() -> Result<()> {
+    ensure!(
+        EMBEDDED_ARCHIVE.len() as u64 == BUNDLED_ASSET.compressed_bytes,
+        "embedded engine archive length does not match its catalog"
+    );
+    ensure!(
+        EMBEDDED_ARCHIVE.len() as u64 <= MAX_COMPRESSED,
+        "embedded engine archive exceeds its compressed-size limit"
+    );
+    let digest = Sha256::digest(EMBEDDED_ARCHIVE);
+    let actual = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    ensure!(
+        actual == BUNDLED_ASSET.archive_sha256,
+        "embedded engine archive digest does not match its catalog"
+    );
+    Ok(())
+}
+
 /// Extract the bundled engine or reuse its verified cache, including offline
 /// first use. An explicit development binary still passes the exact version
 /// guard. Managed entries pass their immutable payload checksums on every open;

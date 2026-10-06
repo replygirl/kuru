@@ -113,6 +113,7 @@ Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/
 | `kuru login --no-browser`                                      | Print the browser sign-in URL for you to open                                                       |
 | `kuru login --device`                                          | Use device authorization                                                                            |
 | `kuru auth`                                                    | Print redacted local authentication status as JSON                                                  |
+| `kuru doctor [--json]`                                         | Inspect bounded local configuration, routes, trust, memory, and embedded-engine status              |
 | `kuru canary --model MODEL_ID`                                 | Optionally check the fixed ChatGPT route with one bounded no-tool request                           |
 | `kuru logout`                                                  | Clear Kuru's stored ChatGPT credentials                                                             |
 | `kuru models`                                                  | Discover provider models and advertised efforts                                                     |
@@ -154,6 +155,15 @@ application's tokens. `auth` does not create credentials or open project memory;
 it is not a live access check. `logout` leaves environment-supplied API keys
 unchanged. For API-key access, set `OPENAI_API_KEY` and select
 `--provider responses --model MODEL_ID`. See [authentication](/guide/authentication).
+
+`kuru doctor` reports fixed human or JSON observations without contacting a
+provider, refreshing credentials, starting memory, provisioning Dolt, or
+repairing data. A selected Responses environment variable is only checked for
+non-empty presence after applicable workspace authority is approved; the key
+is not validated. A valid cold memory store can remain unverified because the
+doctor only queries an already-published owner through a bounded read-only
+connection. See [Troubleshooting](/guide/troubleshooting) for states and exit
+codes.
 
 ## Headless input and output
 

@@ -56,6 +56,9 @@ mod recovery_tests;
 #[path = "store/candidate_reconciliation_tests.rs"]
 mod candidate_reconciliation_tests;
 #[cfg(test)]
+#[path = "store/doctor_tests.rs"]
+mod doctor_tests;
+#[cfg(test)]
 #[path = "store/engine_contract_tests.rs"]
 mod engine_contract_tests;
 #[cfg(test)]
@@ -1702,6 +1705,16 @@ pub struct MemoryStatus {
     pub read_only: bool,
 }
 
+/// A bounded, non-provisioning observation of the current project's
+/// activation metadata. `Activated` does not attest to cold SQL health.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectStructure {
+    Absent,
+    Activated,
+    InvalidActivation,
+    Unverified,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Activation {
@@ -1736,6 +1749,50 @@ pub(crate) const SCHEMA_VERSIONS: [i32; 2] = [
 ];
 
 impl MemoryStore {
+    /// Inspect only the existing project directory and bounded activation
+    /// record. This creates no lock, engine cache, service, migration, or
+    /// staging path.
+    pub fn inspect_project_structure(data_dir: &Path, project_scope: &str) -> ProjectStructure {
+        use ProjectStructure::{Absent, Activated, InvalidActivation, Unverified};
+
+        if purge::ensure_open_allowed(data_dir, project_scope).is_err() {
+            return Unverified;
+        }
+        let Ok(path) = project_directory(data_dir, project_scope) else {
+            return Unverified;
+        };
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Absent,
+            Err(_) => return Unverified,
+            Ok(metadata) if !metadata.is_dir() => return InvalidActivation,
+            Ok(_) => {}
+        }
+        if files::directory(&path).is_err() {
+            return Unverified;
+        }
+        let marker = path.join("ready.json");
+        match fs::symlink_metadata(&marker) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return InvalidActivation;
+            }
+            Err(_) => return Unverified,
+            Ok(metadata) if !metadata.is_file() || metadata.len() > 16 * 1024 => {
+                return InvalidActivation;
+            }
+            Ok(_) => {}
+        }
+        let Ok(bytes) = files::read_bytes(&marker, 16 * 1024) else {
+            return Unverified;
+        };
+        let Ok(activation) = serde_json::from_slice::<Activation>(&bytes) else {
+            return InvalidActivation;
+        };
+        if activation.format != 1 || activation.project_scope != project_scope {
+            return InvalidActivation;
+        }
+        Activated
+    }
+
     /// `error`'s own text with this store's identity secrets replaced, for
     /// an owner's failing mark.
     pub(crate) fn failure_reason(&self, error: &anyhow::Error) -> String {
