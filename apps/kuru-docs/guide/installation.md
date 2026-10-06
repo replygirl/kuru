@@ -180,6 +180,22 @@ kuru update --version VERSION --release-base https://github.com/replygirl/kuru/r
 
 Replace `VERSION` in both places with the desired version. This command also works in PowerShell; a local release directory also works. The updater validates the archive in Rust and replaces the running executable. It keeps the running executable's target, so an x64 `kuru.exe` running under emulation on Windows on Arm keeps updating to x64 builds. No compiler or interpreter is required. Updates are explicit; Kuru does not install background updates.
 
+On macOS and Linux, the native updater records checked replacement evidence
+beside the installation before preparing either image. An ordinary later Kuru
+invocation automatically reconciles a pending update before loading configuration
+or opening memory; recovery notices and retained-evidence refusals go to stderr.
+A confirmed replacement finishes forward and removes its displaced copy. Recovery
+never opens memory or rolls back a possibly published new version. Unknown or
+changed files remain untouched. A settled update leaves no backup executable.
+
+If a pending update still has an installed Kuru, run that executable once before
+rerunning the shell installer. If the installed name is missing, the installer
+preserves the pending directory separately and installs only your requested
+release; it does not execute or restore the retained backup. The shell installers
+check again before replacement but do not share the native transaction lock.
+An already-running Linux Kuru keeps self-launching its own mapped build for memory
+services after its installation pathname is replaced.
+
 On Windows, a verified copy of the current running executable performs publication and records its result before success is reported. It waits for the original process to exit before deleting the displaced image. The trusted helper stays in a private cache for recovery. Close other old Kuru instances if cleanup remains pending, then rerun the normal PowerShell installer. It reconciles the receipt even if an interrupted update left `kuru.exe` absent, and refuses an unknown occupant at that path. `-Recover` performs recovery alone.
 
 For a source installation, select the desired revision and install again, or run:
@@ -187,6 +203,12 @@ For a source installation, select the desired revision and install again, or run
 ```sh
 kuru update --source /path/to/kuru
 ```
+
+The native Unix source updater builds through the selected checkout's package-owned
+mise task and copies its verified output without executing it or modifying Cargo
+hardlinks. Ctrl-C waits for that same owned build and its children, or an already
+started installation transaction, to settle before exit. The source first-install
+script still runs its installed `--version` smoke check after publication.
 
 ## If the first launch fails
 

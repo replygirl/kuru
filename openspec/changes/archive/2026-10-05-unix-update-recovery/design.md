@@ -1,0 +1,54 @@
+# Design
+
+## Context
+
+The delivery archive verifier already returns checked release core bytes and paired support. `archive::open_build_input`/`verify_build_snapshot` preserve Cargo hardlinks, and platform Directory retains native identity and separates rejected from uncertain publication. Unix update currently calls either archive installation or checkout bash; Windows has a different two-rename/helper receipt and remains unchanged. CLI `open_memory` and Store supervisor defaults still select `current_exe()`; production remote read-cut reattachment carries that retained selected executable rather than selecting a new path. Linux can report its unlinked name after replacement.
+
+## Goals / Non-Goals
+
+Implement the proposal's transaction and compatible self-launch guarantees using existing boundaries. Do not refactor Windows, add schema/wire versions, run candidate/backup/build output for validation, add recovery commands or enumerate running sessions. User-facing opt-in update notices are a separate change. Native previous-release and full platform release acceptance remain integrated release evidence rather than repeated local prerequisites.
+
+## Decisions
+
+### One checked Unix transaction
+
+Add `unix_update::{transact,recover}` around retained Installation, Candidate::Bytes/BuildInput and optional verified shell support. The CLI runs synchronous filesystem work on an owned blocking task and awaits settlement. A private same-filesystem `.kuru-update` contains a persistent install.lock, bounded versioned receipt and exclusively derived operation filenames. The lock object remains after settlement. Reject symlinks, wrong ownership/privacy, extra hardlinks, mismatched parent identity and unrecognized receipt shape/version. Without either receipt, only an empty retained state directory or a checked empty owned install.lock is accepted; unknown orphan names refuse before creating a lock or new intent. Original and backup hashing/copying stream exactly the retained original length; candidate release/build input keeps the existing archive bound, so large legal installed binaries acquire no new cap. Serialize full identity, SHA256 and length for each complete image; diagnostics carry optional version/target only, never memory authority.
+
+Capture and hash the installed original before writing `preparing`; the first receipt records its exact identity and derived candidate/backup names before either is created. This avoids an unaccounted crash orphan and avoids treating an arbitrary new occupant as the original. Candidate bytes are bounded and verified; BuildInput uses the existing read-only snapshot validation, never changes its links/mode and is not executed. Backup is a private verified copy of the retained original. Incomplete preparing files may be removed only under the exact receipt-derived names after checked ownership/single-link/size validation and unchanged original proof.
+
+Receipt writes use one fixed `receipt.next` draft: a complete same-operation draft can be checked/recovered, an incomplete or incompatible draft refuses and is retained, and no random draft cleanup is attempted. Startup/bootstrap pending checks include that draft. Save and sync `prepared`, stage checked support, then revalidate original name/bytes and publish candidate over installed `kuru` by one same-filesystem checked atomic rename. `Rejected`/`Uncertain` publication is reconciled from actual identities rather than guessed. Verify installed replacement before recording `published`, publish stable man support, remove only the exact verified backup, save terminal receipt and retire it. Errors retain attributable receipt/state; a stable-man failure retains the existing partial-success distinction while executable settlement still completes. Alternatives of hardlink/exchange or unconditional cleanup would violate ownership or obscure uncertain effects.
+
+### Structural forward-only recovery
+
+Under the same retained state/installation lock: replacement identity means finish forward, original/restored identity means clean unpublished candidate and backup, unknown occupant or changed evidence means refuse without effects. An absent installed name can restore the verified original only with a still-present verified candidate proving it was never published. Persist a narrow `restoring` intent before creating its exact derived restored copy; partial restoration then belongs to this same operation, while a complete restored identity is recorded before publication. `published` or `prepared` with candidate consumed and installed absent retains everything and refuses; no old executable is restored after a newer one might have opened memory. If the actual original reappears, recovery removes a recorded exact restored copy, or a bounded attributable partial only while its durable `restoring` intent remains. Unknown or changed restored objects refuse before receipt mutation; no receipt is retired with a settled rollback image left behind. Recovery never reads or migrates memory. Complete receipts only retire exact matching evidence; unknown formats require a compatible newer updater.
+
+The synchronous engine saves payloads/receipts and syncs both directories at publication. First parent sync persists the state-directory entry: losing earlier preparing state cannot expose a replacement. Actual platform publication errors are retained as rejected/uncertain; no durability claim relies on successful rename alone.
+
+### Automatic checked startup and bootstrap guard
+
+Before ordinary dispatch/config/trust, inspect only the current installation's pending receipt without creating state. No receipt is silent and creates no state; a busy install.lock is skipped. When recovery exists, first-poll and retain the same Ctrl-C listener through its blocking transaction, await that exact settlement before exit130, and preserve the Run input listener into later admission. Existing pending work is recovered under checked installation identity and any reconciliation/refusal is escaped, bounded stderr only. Internal service/supervisor/helper modes do not perform installation recovery. A retained refusal does not turn unrelated inspection into installation authority or stop the intact running command.
+
+Unix bootstrap and source first-install scripts check pending state before work and again immediately before replacement. With installed Kuru present they refuse and request one ordinary run to reconcile. If the installed name is absent, preserve the entire checked pending directory under a unique adjacent abandoned name and install only the explicitly requested release; never execute/restore its backup. These shell entrypoints do not parse or delete receipt contents. Keep their existing shell race limitation explicit rather than claiming native transactional coordination.
+
+### Native source update
+
+Preserve the existing Windows source-build command contract; Unix uses direct platform-owned mise invocations on the explicit retained checkout with concurrently drained bounded diagnostic streams and retained cleanup/reap: install pinned Rust, then the package-owned release build for the native target, with existing hook/auto-install/cache overrides. First-poll the CLI Ctrl-C listener before any owned build. Cancellation awaits the same build owner; a cleanup deadline records an operational failure but retains that owner and pipes until actual root/group settlement. An already-started filesystem worker is awaited before process exit. Resolve the resulting native executable from its known target path and consume it as a bounded read-only BuildInput. Preserve argument boundaries for spaces/metacharacters; no checkout install script or output version probe executes. Preserve Windows helper/receipt behavior and original destination spelling; only Unix installs through this transaction.
+
+### Linux compatible self-image launch
+
+Keep ordinary self-spawns on the kernel's actual running image after installed pathname replacement. A narrow platform-selected Linux self-executable path uses `/proc/self/exe`, not a trimmed deleted pathname or a guessed new occupant. This is the trusted calling executable, not an installation candidate or validation probe. Each service/supervisor self-launch selects its own mapped image, while explicit prepared supervisor overrides remain exact. MacOS/Windows retain their existing selection unless the concrete platform proof requires a narrowly equivalent guard.
+
+Apply the selection through CLI managed opens, memory's default supervisor and remote read-cut reconnect, not merely updater source capture. Route the concrete Unix piped lifetime-supervisor child through the platform spawn lock with retained child/stdin/stdout and existing cleanup/reap semantics. Null-I/O independent service launch already uses that lock. No new process policy or general execution framework. Native Linux replacement-while-running acceptance must prove actual service and its supervisor build identity; cross-target compilation is not that proof.
+
+## Operational surface
+
+This executes on the native installed macOS/Linux host, not in a container or CI-only path. Use the existing supported target from `targets::host`; the running build's pinned engine/service compatibility remains authoritative. No bind address, service endpoint, connection limit, credential or secret is added. Release checksum/support transport retains its existing HTTPS/local-directory interface. Explicit source execution is the user's selected checkout authority through native mise arguments. Diagnostics escape paths and remain on stderr during automatic reconciliation. Installation recovery is config-free and does not activate repository, provider, tool or memory authority. Existing managed IPC/lifetime and Windows target/helper behavior remain unchanged.
+
+## Risks / Trade-offs
+
+- [Crash at any publication boundary] -> Receipt first, exclusively derived names, handle/digest checks, same-filesystem sync and real owned-child interruption cases.
+- [Same-user name/byte changes during network or build] -> Ownership is preflight only; retain/revalidate installation and complete image snapshots immediately before publication.
+- [Restore could run an old schema owner] -> Forward-only refusal after possible publication; updater never opens memory.
+- [Linux kernel self path unavailable] -> Fail with an actionable self-launch error; never fall back to an unproved installed occupant.
+- [Shell installers cannot portably share native flock on macOS] -> Two explicit pending-state checks and retained directory, with the residual race documented.
+- [New native behavior differs between macOS/Linux] -> Scoped native fixtures establish only their executing host, and native staged/previous-release gates remain pending until actual delivery.

@@ -202,7 +202,7 @@ fn bounded(reader: impl Read, limit: usize, description: &str) -> Result<Vec<u8>
 // Cargo can hard-link its public executable name to a compiled artifact. Read
 // that source without changing it; installed files and publication destinations
 // continue to use Directory's stricter single-link policy.
-fn open_build_input(parent: &Directory, name: &OsStr) -> Result<File> {
+pub(crate) fn open_build_input(parent: &Directory, name: &OsStr) -> Result<File> {
     validate_component(name)?;
     let current = Directory::open(parent.path(), Privacy::Inherited, NameRetention::Movable)?;
     ensure!(
@@ -234,7 +234,7 @@ fn open_build_input(parent: &Directory, name: &OsStr) -> Result<File> {
     Ok(input)
 }
 
-fn verify_build_snapshot(
+pub(crate) fn verify_build_snapshot(
     parent: &Directory,
     name: &OsStr,
     input: &mut File,

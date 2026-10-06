@@ -468,6 +468,29 @@ async fn main() -> io::Result<()> {
             .await
             .map_err(io::Error::other)?;
         }
+        #[cfg(unix)]
+        Some("unix-update-observed") => {
+            let parent = arguments
+                .next()
+                .ok_or_else(|| io::Error::other("missing installation"))?;
+            let candidate = arguments
+                .next()
+                .ok_or_else(|| io::Error::other("missing candidate"))?;
+            let checkpoint = arguments
+                .next()
+                .ok_or_else(|| io::Error::other("missing checkpoint"))?;
+            if arguments.next().is_some() {
+                return Err(io::Error::other("unexpected fixture arguments"));
+            }
+            kuru_delivery::unix_update::test_support::replace_observed(
+                std::path::Path::new(&parent),
+                std::path::Path::new(&candidate),
+                checkpoint
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("invalid checkpoint"))?,
+            )
+            .map_err(io::Error::other)?;
+        }
         #[cfg(windows)]
         Some(
             mode @ ("update" | "update-observed" | "update-observed-alive" | "update-parent-loss"),

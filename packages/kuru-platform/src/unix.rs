@@ -77,6 +77,21 @@ pub fn spawn_independent(mut command: Command, stderr: Option<std::fs::File>) ->
     child
 }
 
+/// Start one separately retained child with lifetime input/output pipes.
+/// Pipe creation and descriptor copying stay under the shared platform lock;
+/// the caller owns all waiting, lifetime closure and eventual reap.
+pub fn spawn_piped(mut command: Command) -> io::Result<Child> {
+    let spawning = spawn_lock();
+    command.process_group(0);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::null());
+    let child = command.spawn();
+    drop(command);
+    drop(spawning);
+    child
+}
+
 const MAX_EINTR_ATTEMPTS: usize = 8;
 
 /// Why this owner can no longer safely signal its remembered group or root.
@@ -2572,6 +2587,70 @@ mod tests {
         assert!(second.unwrap().success());
         assert_eq!(first_event, Ok(Ok(Second::Blocked)));
         assert_eq!(eof.unwrap(), 0);
+    }
+
+    #[test]
+    fn piped_spawn_waits_for_owned_pipe_creation_and_keeps_lifetime_eof_isolated() {
+        let bound = Duration::from_secs(5);
+        let (entered, in_window) = std::sync::mpsc::channel();
+        let (event, events) = std::sync::mpsc::channel();
+        let (seen, first_seen) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            WINDOW.with(|window| {
+                *window.borrow_mut() = Some(Box::new(move || {
+                    let _ = entered.send(());
+                    let _ = seen.send(events.recv_timeout(bound));
+                }));
+            });
+            let mut command = Command::new("/bin/cat");
+            command.env_clear();
+            OwnedProcessGroup::spawn(
+                command,
+                StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Null),
+            )
+        });
+        let second = std::thread::spawn(move || -> io::Result<Child> {
+            in_window
+                .recv_timeout(bound)
+                .map_err(|error| io::Error::other(format!("owned pipe window absent: {error}")))?;
+            let blocked = event.clone();
+            BLOCKED.with(|seam| {
+                *seam.borrow_mut() = Some(Box::new(move || {
+                    let _ = blocked.send(Second::Blocked);
+                }));
+            });
+            let mut command = Command::new("/bin/cat");
+            command.env_clear();
+            let child = spawn_piped(command);
+            BLOCKED.with(|seam| seam.borrow_mut().take());
+            let _ = event.send(if child.is_ok() {
+                Second::Spawned
+            } else {
+                Second::Failed
+            });
+            child
+        });
+        let (first, second) = (first.join().unwrap(), second.join().unwrap());
+        let (mut first, mut second) = (first.unwrap(), second.unwrap());
+        let first_event = first_seen.try_recv();
+        drop(first.take_stdin().unwrap());
+        let mut output = first.take_stdout().unwrap();
+        let (complete, eof) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = complete.send(output.read_to_end(&mut bytes).map(|_| bytes.len()));
+        });
+        // The separately retained lifetime input is still open. An inherited
+        // copy of the first pipe would prevent this EOF until it closed.
+        let first_eof = eof.recv_timeout(bound);
+        drop(second.stdin.take());
+        let second_status = second.wait();
+        let settled = settle_without_sleep(&mut first, bound);
+        reader.join().unwrap();
+        settled.unwrap();
+        assert!(second_status.unwrap().success());
+        assert_eq!(first_event, Ok(Ok(Second::Blocked)));
+        assert_eq!(first_eof.unwrap().unwrap(), 0);
     }
 
     #[test]

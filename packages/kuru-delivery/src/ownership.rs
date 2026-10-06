@@ -104,6 +104,10 @@ pub struct Installation {
 }
 
 impl Installation {
+    pub(crate) fn into_parts(self) -> (Directory, OsString, File) {
+        (self.parent, self.name, self.file)
+    }
+
     pub fn parent(&self) -> &Path {
         self.parent.path()
     }

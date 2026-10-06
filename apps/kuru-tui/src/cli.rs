@@ -771,7 +771,8 @@ async fn open_memory(
         std::env::var_os(crate::memory_activity::MARKERS_ENV).as_deref(),
     );
     let configured_cache = options.config.cache_dir.is_some();
-    let executable = std::env::current_exe().context("locate the current Kuru executable")?;
+    let executable =
+        kuru_platform::running_executable().context("locate the running Kuru executable")?;
     let (progress, opening) =
         MemoryStore::open_managed_observed(options, project.to_owned(), executable);
     let mut output = crate::memory_activity::ActivityOutput::for_process(interactive, markers);
@@ -886,6 +887,10 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         let (input, signal) = crate::headless::read_input(prompt.take()).await?;
         *prompt = Some(input);
         run_signal = Some(signal);
+    }
+    #[cfg(unix)]
+    if !matches!(cli.command, Some(Command::Update { .. })) {
+        recover_unix_installation(run_signal.as_mut()).await?;
     }
     if let Some(command @ (Command::Completions { .. } | Command::Man)) = &cli.command {
         return write_stdout_ignoring_broken_pipe(&shell_support_output(command)?);
@@ -2181,54 +2186,219 @@ async fn update(
         version.context("provide --version VERSION for a verified release or --source CHECKOUT")?;
     }
     #[cfg(unix)]
-    let executable = std::env::current_exe()?;
-    #[cfg(unix)]
-    let _installation = kuru_delivery::ownership::installed(
-        &executable,
-        &kuru_delivery::ownership::OwnershipEnv::capture(),
-    )?;
-    #[cfg(unix)]
-    let destination = executable.parent().context("executable has no parent")?;
-    if let Some(source) = source {
-        #[cfg(unix)]
-        {
-            let mut command = tokio::process::Command::new("bash");
-            command
-                .arg(source.join("scripts/install.sh"))
-                .arg("--source")
-                .env("KURU_INSTALL_DIR", destination);
-            let status = command.status().await.context("could not launch updater")?;
-            ensure!(status.success(), "source update failed");
-        }
-        #[cfg(windows)]
-        {
+    return update_unix(version, release_base, source).await;
+    #[cfg(windows)]
+    {
+        if let Some(source) = source {
             let candidate = build_windows_source(source).await?;
             let outcome =
                 kuru_delivery::update::replace_running_binary(&candidate, &update_helper_cache()?)
                     .await?;
             println!("Installed source build at {}", outcome.installed.display());
+        } else {
+            let version = version
+                .context("provide --version VERSION for a verified release or --source CHECKOUT")?;
+            let configured_base = std::env::var("KURU_RELEASE_BASE").ok();
+            let base = release_base
+                .or(configured_base.as_deref())
+                .context("--release-base or KURU_RELEASE_BASE is required")?;
+            let path =
+                kuru_delivery::update::replace_running(base, version, &update_helper_cache()?)
+                    .await?
+                    .installed;
+            println!(
+                "Installed Kuru {} at {}",
+                kuru_delivery::archive::checked_version(version)?,
+                path.display()
+            );
         }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+async fn recover_unix_installation(
+    existing_signal: Option<&mut crate::headless::RunSignal>,
+) -> Result<()> {
+    let Ok(executable) = std::env::current_exe() else {
+        return Ok(());
+    };
+    let Some(parent) = executable.parent().map(Path::to_path_buf) else {
+        return Ok(());
+    };
+    match kuru_delivery::unix_update::has_pending(&parent) {
+        Ok(false) => return Ok(()),
+        Err(_) => {
+            eprintln!(
+                "Pending Kuru installation state could not be inspected safely; state retained."
+            );
+            return Ok(());
+        }
+        Ok(true) => {}
+    }
+    let mut local_signal: crate::headless::RunSignal = Box::pin(ctrl_c_cancellation());
+    let signal = existing_signal.unwrap_or(&mut local_signal);
+    // A pending transaction can mutate the installed image. Register before
+    // that worker starts and reuse Run's input listener when it already exists.
+    if let std::task::Poll::Ready(result) = futures::poll!(&mut *signal) {
+        result?;
+        return Err(crate::headless::RunExit(130).into());
+    }
+    let mut recovery =
+        tokio::task::spawn_blocking(move || kuru_delivery::unix_update::recover(&parent));
+    let mut interrupted = None;
+    let result = tokio::select! {
+        biased;
+        result = &mut recovery => result,
+        result = &mut *signal => {
+            interrupted = Some(result);
+            recovery.await
+        }
+    };
+    match result {
+        Ok(Ok(None)) => {}
+        Ok(Err(error))
+            if error
+                .downcast_ref::<kuru_delivery::unix_update::Busy>()
+                .is_some() => {}
+        Ok(Ok(Some(outcome))) => {
+            eprintln!(
+                "Pending Kuru installation {}.",
+                if outcome.published {
+                    "finished forward"
+                } else {
+                    "settled without replacement"
+                }
+            );
+            if outcome.support_incomplete {
+                eprintln!("Executable installed; stable man page publication is incomplete.");
+            }
+        }
+        _ => eprintln!(
+            "Pending Kuru installation recovery refused; state retained for a compatible updater."
+        ),
+    }
+    if let Some(signal) = interrupted {
+        signal?;
+        return Err(crate::headless::RunExit(130).into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn update_unix(
+    version: Option<&str>,
+    release_base: Option<&str>,
+    source: Option<&Path>,
+) -> Result<()> {
+    // Install this one listener before any owned build can launch. Dropping a
+    // future alone cannot clean up after the operating system's default SIGINT.
+    let mut signal: crate::headless::RunSignal = Box::pin(ctrl_c_cancellation());
+    if let std::task::Poll::Ready(result) = futures::poll!(&mut signal) {
+        result?;
+        return Err(crate::headless::RunExit(130).into());
+    }
+    let executable = std::env::current_exe()?;
+    let environment = kuru_delivery::ownership::OwnershipEnv::capture();
+    // Manager refusal and permission preflight precede even recovery state.
+    let mut installation = kuru_delivery::ownership::installed(&executable, &environment)?;
+    let destination = executable
+        .parent()
+        .context("executable has no parent")?
+        .to_path_buf();
+    let parent = destination.clone();
+    let mut recovery =
+        tokio::task::spawn_blocking(move || kuru_delivery::unix_update::recover(&parent));
+    let recovered = tokio::select! {
+        biased;
+        result = &mut recovery => result.context("installation recovery worker failed")??,
+        result = &mut signal => {
+            let settled = recovery.await.context("installation recovery worker failed")?;
+            settled?;
+            result?;
+            return Err(crate::headless::RunExit(130).into());
+        }
+    };
+    if recovered.is_some() {
+        installation = kuru_delivery::ownership::installed(&executable, &environment)?;
+    }
+    let host = kuru_delivery::archive::host_target()?.to_owned();
+    let (candidate, support) = if let Some(source) = source {
+        if let std::task::Poll::Ready(result) = futures::poll!(&mut signal) {
+            result?;
+            return Err(crate::headless::RunExit(130).into());
+        }
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let build = kuru_delivery::unix_source::build(source, cancelled);
+        tokio::pin!(build);
+        let path = tokio::select! {
+            biased;
+            result = &mut build => result?,
+            result = &mut signal => {
+                let _ = cancel.send(());
+                if let Err(error) = build.await
+                    && error.downcast_ref::<kuru_delivery::unix_source::Cancelled>().is_none() {
+                    return Err(error);
+                }
+                result?;
+                return Err(crate::headless::RunExit(130).into());
+            }
+        };
+        (
+            kuru_delivery::unix_update::Candidate::BuildInput(path),
+            None,
+        )
     } else {
-        let version = version
-            .context("provide --version VERSION for a verified release or --source CHECKOUT")?;
+        let version = version.context("verified release version is required")?;
+        kuru_delivery::archive::checked_version(version)?;
         let configured_base = std::env::var("KURU_RELEASE_BASE").ok();
         let base = release_base
             .or(configured_base.as_deref())
             .context("--release-base or KURU_RELEASE_BASE is required")?;
-        #[cfg(unix)]
-        let path = kuru_delivery::archive::install(base, version, destination, None)
-            .await
-            .context("update failed")?;
-        #[cfg(windows)]
-        let path = kuru_delivery::update::replace_running(base, version, &update_helper_cache()?)
-            .await?
-            .installed;
-        println!(
-            "Installed Kuru {} at {}",
-            kuru_delivery::archive::checked_version(version)?,
-            path.display()
-        );
+        let (bytes, support) = tokio::select! {
+            biased;
+            result = kuru_delivery::archive::verified_release(base, version, &host) => result?,
+            result = &mut signal => {
+                result?;
+                return Err(crate::headless::RunExit(130).into());
+            }
+        };
+        (kuru_delivery::unix_update::Candidate::Bytes(bytes), support)
+    };
+    if let std::task::Poll::Ready(result) = futures::poll!(&mut signal) {
+        result?;
+        return Err(crate::headless::RunExit(130).into());
     }
+    let request = kuru_delivery::unix_update::Request {
+        installation,
+        candidate,
+        version: version.map(str::to_owned),
+        target: host,
+        support,
+    };
+    let mut transaction =
+        tokio::task::spawn_blocking(move || kuru_delivery::unix_update::transact(request));
+    let outcome = tokio::select! {
+        biased;
+        result = &mut transaction => result.context("update transaction worker failed")??,
+        result = &mut signal => {
+            // A publication may already have occurred. Await its same durable
+            // settlement/error rather than dropping a live filesystem writer.
+            transaction.await.context("update transaction worker failed")??;
+            result?;
+            return Err(crate::headless::RunExit(130).into());
+        }
+    };
+    if outcome.support_incomplete {
+        anyhow::bail!("executable installed, but stable man page publication is incomplete");
+    }
+    println!(
+        "Installed Kuru{} at {:?}",
+        version
+            .map(|version| format!(" {version}"))
+            .unwrap_or_else(|| " source build".into()),
+        outcome.installed
+    );
     Ok(())
 }
 
