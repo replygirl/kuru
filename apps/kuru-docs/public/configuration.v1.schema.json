@@ -84,12 +84,18 @@
       "additionalProperties": { "type": "string", "format": "uri" },
       "default": {}
     },
+    "update": { "$ref": "#/$defs/update" },
     "memory": {
       "$ref": "#/$defs/memory",
       "default": { "offline": false, "startup_timeout_secs": 30 }
     }
   },
   "$defs": {
+    "update": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "notice": { "type": "boolean", "default": false } }
+    },
     "configValues": { "$ref": "#" },
     "managed": {
       "type": "object",

@@ -95,6 +95,14 @@ pub fn classify(resolved: &Path, environment: &OwnershipEnv) -> Option<Manager> 
         .find_map(|(manager, root)| resolved.starts_with(root).then_some(manager))
 }
 
+/// Read-only resolved ownership for advisory hints; grants no replacement authority.
+pub fn resolved_manager(invoked: &Path, environment: &OwnershipEnv) -> Result<Option<Manager>> {
+    Ok(classify_filesystem_roots(
+        &invoked.canonicalize()?,
+        environment.roots(),
+    ))
+}
+
 /// Held non-manager installation facts. Revalidation is a fresh preflight,
 /// not durable mutation authority through a later network/build operation.
 pub struct Installation {

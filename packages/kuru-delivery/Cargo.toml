@@ -9,6 +9,7 @@ description = "Native Kuru installation, packaging and maintainer tooling"
 
 [features]
 default = []
+test-support = []
 tooling = [
   "dep:clap",
   "dep:toml",

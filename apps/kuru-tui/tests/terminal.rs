@@ -40,6 +40,8 @@ use tokio::sync::watch;
 mod mcp_oauth_https;
 #[path = "support/memory.rs"]
 mod memory;
+#[path = "support/notice_https.rs"]
+mod notice_https;
 #[path = "support/terminal.rs"]
 mod terminal;
 use kuru_memory::test_budgets::OPERATION_TIMEOUT;
@@ -7386,6 +7388,239 @@ async fn terminal_selections_survive_restarts_picker_changes_and_failed_database
                 Mode::Jungian
             ]
         );
+        Ok(())
+    })
+    .await
+}
+
+fn notice_command(sandbox: &Sandbox, peer: &notice_https::NoticeHttps, path: &str) -> Command {
+    let mut command = sandbox.command("demo");
+    command
+        .args(["-c", "update.notice=true"])
+        .env(
+            "KURU_TEST_UPDATE_NOTICE_ENDPOINT",
+            format!("{}{path}", peer.base),
+        )
+        .env("KURU_TEST_UPDATE_NOTICE_CA_PEM", &peer.ca)
+        .env("KURU_REDUCED_MOTION", "1")
+        .env("NO_PROXY", "localhost,127.0.0.1");
+    command
+}
+
+fn notice_cache(sandbox: &Sandbox) -> Result<Option<Value>> {
+    let path = sandbox.data.join("update/notice.json");
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            ensure!(bytes.len() <= 4096);
+            Ok(Some(serde_json::from_slice(&bytes)?))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn assert_notice_restored(terminal: &Terminal, expected: bool) -> Result<()> {
+    terminal.assert_restored()?;
+    let output = String::from_utf8_lossy(&terminal.output);
+    let advice = "Kuru 999.0.0 is available";
+    ensure!(
+        output.matches(advice).count() == usize::from(expected),
+        "unexpected notice output: {output}"
+    );
+    if expected {
+        let restore = output
+            .rfind("\x1b[?1049l")
+            .context("alternate screen restoration absent")?;
+        ensure!(
+            output.find(advice).unwrap() > restore,
+            "notice preceded restoration"
+        );
+    }
+    ensure!(!output.contains("PRIVATE_HOSTILE") && !output.contains("PRIVATE_ERROR_BODY"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_notice_https_bounds_cache_and_restored_120_80_terminal() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        let sandbox = Sandbox::warmed().await?;
+        let peer = notice_https::NoticeHttps::start(sandbox.root.path()).await?;
+        // The first actual TLS check and the fresh-cache continuation use both
+        // practical sizes. Cache publication is observed before quitting.
+        for width in [120, 80] {
+            let before = peer.requests().len();
+            let mut terminal =
+                Terminal::spawn(notice_command(&sandbox, &peer, "/redirect"), 30, width)?;
+            terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+            terminal.wait("completed update cache", READY_TIMEOUT, |_| {
+                Ok(notice_cache(&sandbox)?.is_some())
+            })?;
+            let cache = notice_cache(&sandbox)?.unwrap();
+            ensure!(cache["outcome"] == "newer" && cache["latest"] == "999.0.0");
+            terminal.send(b"/quit\r")?;
+            terminal.wait_exit(EXIT_TIMEOUT)?;
+            assert_notice_restored(&terminal, true)?;
+            if width == 120 {
+                ensure!(
+                    peer.requests().len() == before + 2,
+                    "signed HTTPS redirect was not followed"
+                );
+            } else {
+                ensure!(
+                    peer.requests().len() == before,
+                    "fresh cache caused another request"
+                );
+            }
+        }
+        for (path, failure) in [
+            ("/malformed", "malformed"),
+            ("/oversize", "malformed"),
+            ("/loop", "offline"),
+            ("/downgrade", "offline"),
+            ("/unavailable", "http"),
+        ] {
+            std::fs::remove_file(sandbox.data.join("update/notice.json"))?;
+            let before = peer.requests().len();
+            let mut terminal = Terminal::spawn(notice_command(&sandbox, &peer, path), 30, 80)?;
+            terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+            terminal.wait("bounded failed check", READY_TIMEOUT, |_| {
+                Ok(notice_cache(&sandbox)?.is_some())
+            })?;
+            let cache = notice_cache(&sandbox)?.unwrap();
+            ensure!(
+                cache["outcome"] == "failed" && cache["failure"] == failure,
+                "{cache}"
+            );
+            ensure!(cache["latest"].is_null());
+            terminal.send(b"/quit\r")?;
+            terminal.wait_exit(EXIT_TIMEOUT)?;
+            assert_notice_restored(&terminal, false)?;
+            let after = peer.requests().len();
+            ensure!(after > before && after <= before + 6);
+            // A real second interactive start proves failure caching too.
+            let mut cached = Terminal::spawn(notice_command(&sandbox, &peer, path), 30, 80)?;
+            cached.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+            cached.send(b"/quit\r")?;
+            cached.wait_exit(EXIT_TIMEOUT)?;
+            assert_notice_restored(&cached, false)?;
+            ensure!(
+                peer.requests().len() == after,
+                "failed check was not cached"
+            );
+        }
+        for request in peer.requests() {
+            let lower = request.to_ascii_lowercase();
+            ensure!(lower.contains("user-agent: kuru-update-notice\r\n"));
+            ensure!(request.starts_with("GET "));
+            for forbidden in [
+                "authorization:",
+                "cookie:",
+                "x-api-key:",
+                "project",
+                "session",
+                "provider",
+            ] {
+                ensure!(
+                    !lower.contains(forbidden),
+                    "unexpected identifying request field"
+                );
+            }
+        }
+        peer.close().await;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_notice_held_response_quit_aborts_without_cache_or_exit_wait() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        let sandbox = Sandbox::warmed().await?;
+        let peer = notice_https::NoticeHttps::start(sandbox.root.path()).await?;
+        let mut terminal = Terminal::spawn(notice_command(&sandbox, &peer, "/held"), 30, 120)?;
+        terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+        tokio::time::timeout(READY_TIMEOUT, peer.held.notified()).await?;
+        // The server sends nothing, including no response headers. The client
+        // must release it while normal terminal teardown still completes.
+        terminal.send(b"/quit\r")?;
+        terminal.wait_exit(EXIT_TIMEOUT)?;
+        assert_notice_restored(&terminal, false)?;
+        tokio::time::timeout(READY_TIMEOUT, peer.disconnected.notified()).await?;
+        ensure!(
+            notice_cache(&sandbox)?.is_none(),
+            "unfinished response claimed a completed check"
+        );
+        ensure!(peer.requests().len() == 1);
+        peer.close().await;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_notice_excluded_commands_and_nonterminal_stderr_have_no_effect() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        let sandbox = Sandbox::warmed().await?;
+        let peer = notice_https::NoticeHttps::start(sandbox.root.path()).await?;
+        let mut command = notice_command(&sandbox, &peer, "/manifest");
+        command.arg("config");
+        let output =
+            headless_piped_output(command, Vec::new(), sandbox.startup_timeout + EXIT_TIMEOUT)
+                .await?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config: Config = toml::from_str(std::str::from_utf8(&output.stdout)?)?;
+        ensure!(config.update.notice);
+        let mut command = notice_command(&sandbox, &peer, "/manifest");
+        command.args(["run", "NOTICE_EXCLUDED", "--json"]);
+        let output =
+            headless_piped_output(command, Vec::new(), sandbox.startup_timeout + EXIT_TIMEOUT)
+                .await?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: Value = serde_json::from_slice(&output.stdout)?;
+        ensure!(
+            json["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("NOTICE_EXCLUDED")),
+            "{json}"
+        );
+        ensure!(!String::from_utf8_lossy(&output.stderr).contains("is available"));
+        // A real interactive terminal with stderr redirected remains excluded.
+        // The fixed shell only execs the exact child; no user text is evaluated.
+        let source = notice_command(&sandbox, &peer, "/manifest");
+        let stderr = sandbox.root.path().join("notice-stderr");
+        let mut launch = Command::new("/bin/sh");
+        launch
+            .args([
+                "-c",
+                "exec \"$KURU_NOTICE_BIN\" \"$@\" 2>\"$KURU_NOTICE_STDERR\"",
+                "notice-stderr",
+            ])
+            .args(source.get_args())
+            .env("KURU_NOTICE_BIN", source.get_program())
+            .env("KURU_NOTICE_STDERR", &stderr);
+        for (key, value) in source.get_envs() {
+            if let Some(value) = value {
+                launch.env(key, value);
+            } else {
+                launch.env_remove(key);
+            }
+        }
+        let mut terminal = Terminal::spawn(launch, 30, 80)?;
+        terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+        terminal.send(b"/quit\r")?;
+        terminal.wait_exit(EXIT_TIMEOUT)?;
+        assert_notice_restored(&terminal, false)?;
+        ensure!(!String::from_utf8_lossy(&std::fs::read(stderr)?).contains("is available"));
+        ensure!(peer.requests().is_empty() && notice_cache(&sandbox)?.is_none());
+        peer.close().await;
         Ok(())
     })
     .await

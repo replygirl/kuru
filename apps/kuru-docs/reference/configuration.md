@@ -359,3 +359,44 @@ interactive session whose standard error is redirected shows the sentence on its
 terminal standard output instead, erased before the interface opens. It does not
 estimate duration or establish success, and it never alters command output,
 including JSON. See [how memory works](/concepts/memory) for the sentences.
+
+## Personal update notice
+
+Update notices are off by default. Enable them in your user config, your
+untracked `.kuru/config.local.toml`, an explicit `--config` file, or with
+`-c update.notice=true`:
+
+```toml
+[update]
+notice = true
+```
+
+Automatic ancestor `.kuru/config.toml` files are repository-origin configuration
+and cannot enable this personal network preference, even after workspace trust
+or when a later override disables it. The existing project-local tracking check
+keeps `.kuru/config.local.toml` personal; a tracked local file is rejected.
+Managed constraints may lock `update.notice = false`; conflicting personal
+values are rejected under the normal managed-policy rules.
+
+Only interactive mode with terminal stderr checks for a newer stable host
+release. Kuru makes a bounded HTTPS GET to
+`https://github.com/replygirl/kuru/releases/latest/download/SHA256SUMS`, with the
+fixed `kuru-update-notice` user agent and no account, project, provider,
+authentication or telemetry data. HTTPS redirects and system proxy settings
+are honored; GitHub and the proxy can observe the connecting IP address.
+The request is bounded to five seconds and the manifest to 64 KiB.
+
+A private `<data-directory>/update/notice.json` stores only bounded version,
+time and fixed outcome facts. Both successful and failed checks are cached for
+24 hours; a running-version change, invalid cache or future clock skew makes the
+check due again. Cache read and network work run independently of terminal
+input. Startup and exit never wait for a network response. After terminal
+restoration, one completed advisory may appear on stderr; unfinished checks are
+cancelled. An already completed check may finish its short checked cache
+publication across an exit race; exit does not wait for it. The hint uses mise
+or Homebrew when they own the installation.
+
+Notices never install, download a candidate, invoke a provider or change memory.
+They are suppressed for headless `run`, pure inspection, fixed account commands,
+`update`, `serve` and internal modes, and when stderr is not a terminal. There is
+no update-check command.

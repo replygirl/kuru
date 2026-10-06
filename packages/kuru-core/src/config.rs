@@ -670,6 +670,13 @@ impl MemoryConfig {
     }
 }
 
+/// Personal advisory preference; it grants no installation authority.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    pub notice: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -705,6 +712,7 @@ pub struct Config {
     pub mcp: BTreeMap<String, McpConfig>,
     pub external_agents: BTreeMap<String, String>,
     pub memory: MemoryConfig,
+    pub update: UpdateConfig,
 }
 
 impl Default for Config {
@@ -733,6 +741,7 @@ impl Default for Config {
             mcp: BTreeMap::new(),
             external_agents: BTreeMap::new(),
             memory: MemoryConfig::default(),
+            update: UpdateConfig::default(),
         }
     }
 }
@@ -1121,6 +1130,12 @@ impl ConfigSnapshot {
             let patch: toml::Value = toml::from_str(&source)
                 .map_err(|error| config_parse_error(&path, &source, &error))?;
             reject_removed_settings(&patch).map_err(|_| config_error("validation", &path))?;
+            ensure!(
+                !automatic
+                    || patch.get("update").and_then(|value| value.get("notice"))
+                        != Some(&toml::Value::Boolean(true)),
+                "update.notice is a personal preference and cannot be enabled by repository configuration"
+            );
             merge_with_origins(
                 &mut merged,
                 &mut origins,
