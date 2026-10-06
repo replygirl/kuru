@@ -1641,51 +1641,54 @@ fn explicit_models_skip_legacy_memory_and_unrelated_authority() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_models_http_catalog_preserves_capabilities_without_memory() {
-    let sandbox = Sandbox::new("");
-    kuru_platform::fs::Directory::ensure_private(&sandbox.data).unwrap();
-    let legacy = sandbox.data.join("memory.sqlite3");
-    let sentinel = b"http-catalog-must-not-migrate";
-    std::fs::write(&legacy, sentinel).unwrap();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let observed = calls.clone();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let app = Router::new().route(
-        "/models",
-        axum::routing::get(move || {
-            observed.fetch_add(1, Ordering::SeqCst);
-            async {
-                axum::Json(json!({"data": [{
-                    "id": "future-catalog-model",
-                    "capabilities": {"future-capability": true}
-                }]}))
-            }
-        }),
-    );
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let output = tokio::task::block_in_place(|| {
-        sandbox
-            .command()
-            .env("EXPLICIT_CATALOG_FIXTURE_KEY", "synthetic-catalog-key")
-            .args(["--provider", "responses", "--model", "fixture", "models"])
-            .args(["-c", &format!("api_base={:?}", endpoint)])
-            .args(["-c", "api_key_env='EXPLICIT_CATALOG_FIXTURE_KEY'"])
-            .output()
-            .unwrap()
-    });
-    server.abort();
-    let _ = server.await;
-    assert!(output.status.success(), "{}", text(&output.stderr));
-    let catalog: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(catalog[0]["id"], "future-catalog-model");
-    assert_eq!(
-        catalog[0]["metadata"]["capabilities"]["future-capability"]["value"],
-        true
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(std::fs::read(&legacy).unwrap(), sentinel);
-    assert!(!sandbox.data.join("memory").exists());
-    assert!(!sandbox.data.join("tools").exists());
+    kuru_memory::test_support::closing(async {
+        let sandbox = Sandbox::new("");
+        kuru_platform::fs::Directory::ensure_private(&sandbox.data).unwrap();
+        let legacy = sandbox.data.join("memory.sqlite3");
+        let sentinel = b"http-catalog-must-not-migrate";
+        std::fs::write(&legacy, sentinel).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/models",
+            axum::routing::get(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async {
+                    axum::Json(json!({"data": [{
+                        "id": "future-catalog-model",
+                        "capabilities": {"future-capability": true}
+                    }]}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let output = tokio::task::block_in_place(|| {
+            sandbox
+                .command()
+                .env("EXPLICIT_CATALOG_FIXTURE_KEY", "synthetic-catalog-key")
+                .args(["--provider", "responses", "--model", "fixture", "models"])
+                .args(["-c", &format!("api_base={:?}", endpoint)])
+                .args(["-c", "api_key_env='EXPLICIT_CATALOG_FIXTURE_KEY'"])
+                .output()
+                .unwrap()
+        });
+        server.abort();
+        let _ = server.await;
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        let catalog: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(catalog[0]["id"], "future-catalog-model");
+        assert_eq!(
+            catalog[0]["metadata"]["capabilities"]["future-capability"]["value"],
+            true
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&legacy).unwrap(), sentinel);
+        assert!(!sandbox.data.join("memory").exists());
+        assert!(!sandbox.data.join("tools").exists());
+    })
+    .await;
 }
 
 #[test]
