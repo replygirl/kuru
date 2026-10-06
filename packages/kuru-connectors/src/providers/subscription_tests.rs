@@ -9,6 +9,7 @@ use axum::{
     routing::any,
 };
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{future::Future, pin::Pin};
 use tokio::sync::{mpsc, oneshot};
 
@@ -139,11 +140,14 @@ fn unauthorized() -> Reply {
 }
 
 async fn subscription(peer: &Peer) -> (ResponsesProvider, AuthManager, tempfile::TempDir) {
+    subscription_at(&peer.url).await
+}
+
+async fn subscription_at(base: &str) -> (ResponsesProvider, AuthManager, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
     let project = directory.path().join("project");
     std::fs::create_dir(&project).unwrap();
-    let manager =
-        AuthManager::test_issuer(directory.path().join("data"), project, &peer.url).unwrap();
+    let manager = AuthManager::test_issuer(directory.path().join("data"), project, base).unwrap();
     manager
         .seed_test_session("subscription-access", "subscription-refresh", "account-one")
         .await
@@ -152,8 +156,188 @@ async fn subscription(peer: &Peer) -> (ResponsesProvider, AuthManager, tempfile:
     let mut provider = ResponsesProvider::subscription(manager.clone(), initial).unwrap();
     // This private module alone substitutes a loopback endpoint. Production
     // subscription construction has no configurable base or proxy route.
-    provider.base = peer.url.clone();
+    provider.base = base.to_owned();
     (provider, manager, directory)
+}
+
+struct CountedPeer {
+    url: String,
+    accepted: Arc<AtomicUsize>,
+    bodies: Arc<Mutex<Vec<Value>>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl CountedPeer {
+    async fn new(total_requests: usize) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let server_accepted = accepted.clone();
+        let server_bodies = bodies.clone();
+        let task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+
+            let mut completed = 0;
+            'accept: while completed < total_requests {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                        .await
+                        .expect("loopback peer did not receive the expected connection")
+                        .unwrap();
+                server_accepted.fetch_add(1, Ordering::SeqCst);
+
+                loop {
+                    if completed == total_requests {
+                        break 'accept;
+                    }
+                    let body = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        read_request_json(&mut socket),
+                    )
+                    .await
+                    .expect("loopback peer did not receive a complete request");
+                    let Some(body) = body else {
+                        break;
+                    };
+                    server_bodies.lock().await.push(body);
+                    let response = message(&format!("reply-{completed}")).body;
+                    let wire = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{response}",
+                        response.len()
+                    );
+                    socket.write_all(wire.as_bytes()).await.unwrap();
+                    socket.flush().await.unwrap();
+                    completed += 1;
+                }
+            }
+        });
+        Self {
+            url,
+            accepted,
+            bodies,
+            task: Some(task),
+        }
+    }
+
+    async fn finish(&mut self) {
+        let task = self.task.as_mut().expect("loopback task already joined");
+        match tokio::time::timeout(Duration::from_secs(10), task).await {
+            Ok(result) => {
+                result.unwrap();
+                self.task.take();
+            }
+            Err(_) => {
+                let task = self.task.take().expect("loopback task already joined");
+                task.abort();
+                let _ = task.await;
+                panic!("loopback peer did not finish");
+            }
+        }
+    }
+}
+
+impl Drop for CountedPeer {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+async fn read_request_json(socket: &mut tokio::net::TcpStream) -> Option<Value> {
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = Vec::new();
+    loop {
+        let mut chunk = [0; 4096];
+        let count = socket.read(&mut chunk).await.unwrap();
+        if count == 0 {
+            assert!(bytes.is_empty(), "HTTP request ended before its body");
+            return None;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        assert!(bytes.len() <= crate::MAX_BYTES + 8192);
+        if let Some(end) = bytes.windows(4).position(|value| value == b"\r\n\r\n") {
+            let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+            let length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                .unwrap_or(0);
+            if bytes.len() >= end + 4 + length {
+                return Some(serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn completed_requests_reuse_keepalive_connection_and_isolate_actor_inputs() {
+    let mut reused_peer = CountedPeer::new(2).await;
+    let (provider, _manager, _directory) = subscription_at(&reused_peer.url).await;
+    for (index, (actor, context, input)) in [
+        ("project/ifs/part-a", "context-a", "message-a"),
+        ("project/ifs/part-b", "context-b", "message-b"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut request = request();
+        request.actor = actor.to_owned();
+        request.instructions = context.to_owned();
+        request.messages = vec![Message::text("user", input)];
+        let completion = tokio::time::timeout(Duration::from_secs(10), provider.complete(request))
+            .await
+            .expect("completed Responses request exceeded fixture bound")
+            .unwrap();
+        assert!(
+            completion
+                .text_projection()
+                .contains(&format!("reply-{index}"))
+        );
+    }
+    drop(provider);
+    reused_peer.finish().await;
+
+    let reused_connections = reused_peer.accepted.load(Ordering::SeqCst);
+    let reused_bodies = reused_peer.bodies.lock().await.clone();
+    assert_eq!(reused_connections, 1);
+    assert_eq!(reused_bodies.len(), 2);
+    for (body, context, input) in reused_bodies
+        .iter()
+        .zip(["context-a", "context-b"])
+        .zip(["message-a", "message-b"])
+        .map(|((body, context), input)| (body, context, input))
+    {
+        assert_eq!(body["instructions"], context);
+        assert_eq!(body["input"][0]["content"], input);
+    }
+
+    let mut fresh_peer = CountedPeer::new(2).await;
+    for (index, input) in ["baseline-a", "baseline-b"].into_iter().enumerate() {
+        let (provider, _manager, _directory) = subscription_at(&fresh_peer.url).await;
+        let mut request = request();
+        request.actor = format!("project/ifs/baseline-{index}");
+        request.messages = vec![Message::text("user", input)];
+        tokio::time::timeout(Duration::from_secs(10), provider.complete(request))
+            .await
+            .expect("baseline Responses request exceeded fixture bound")
+            .unwrap();
+        drop(provider);
+    }
+    fresh_peer.finish().await;
+    let fresh_provider_connections = fresh_peer.accepted.load(Ordering::SeqCst);
+    assert_eq!(fresh_provider_connections, 2);
+    let fresh_bodies = fresh_peer.bodies.lock().await;
+    assert_eq!(fresh_bodies.len(), 2);
+    assert_eq!(fresh_bodies[0]["input"][0]["content"], "baseline-a");
+    assert_eq!(fresh_bodies[1]["input"][0]["content"], "baseline-b");
+    assert!(
+        reused_connections < fresh_provider_connections,
+        "reused provider accepted {reused_connections} sockets; fresh-provider baseline accepted {fresh_provider_connections}"
+    );
 }
 
 #[tokio::test]

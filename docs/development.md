@@ -2600,6 +2600,19 @@ The test runner uses two threads and limits
 simultaneous temporary servers. Do not replace these fixtures with SQLite or
 exclude memory modules from coverage.
 
+HTTP connection reuse is verified separately from the memory service lifetime.
+`providers::subscription_tests::completed_requests_reuse_keepalive_connection_and_isolate_actor_inputs`
+counts loopback TCP accepts for two completed requests through one provider and
+for two fresh providers. It proves the socket-pool effect only for completed
+HTTP/1.1 SSE responses; it does not set a latency target or claim reuse after
+cancellation or incomplete streaming. The memory service's overlap and
+zero-client retirement behavior is covered independently by
+`two_fresh_terminals_share_owner_and_keep_private_sessions_through_eof` and
+`independent_clients_elect_one_real_process_and_retire_after_both_detach`.
+Ordinary drivers attach to the same checked per-project service while clients
+overlap, and the owner retires after its last driver detaches rather than
+remaining resident on an arbitrary warm-idle timer.
+
 Windows runtime activation retries access denied only after checked observations
 prove that the verified source directory has not moved and the destination is
 absent. Recovery uses the same source handle, private stage and cache lock for

@@ -56,6 +56,14 @@ own runtime. Subscription service compatibility and account access are separate
 from the public API-key interface; deterministic protocol fixtures do not prove
 live account access.
 
+Each `ResponsesProvider` owns one `reqwest::Client`, so its requests can reuse
+that client's keep-alive pool while the provider instance remains alive. A
+counted loopback fixture proves reuse for two completed HTTP/1.1 SSE requests
+from distinct actors: one accepted socket for the reused provider versus two
+when each request uses a fresh provider. This socket count is not a latency
+measurement or a guarantee for incomplete, cancelled, or otherwise non-reusable
+responses; provider instances do not share a pool.
+
 The `responses` provider uses the [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses)
 and the configured API-key environment variable. It discovers model IDs from
 `/models`, submits messages and function tool schemas to `/responses`, and
