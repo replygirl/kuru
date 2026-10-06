@@ -126,6 +126,12 @@ pub enum Command {
     Logout,
     /// Show authentication status without displaying tokens.
     Auth,
+    /// Inspect local configuration, trust, authentication, memory, and bundled engine status.
+    Doctor {
+        /// Emit the fixed diagnostic report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Check the fixed ChatGPT subscription route without opening workspace tools or memory.
     Canary {
         /// Model to use for the bounded no-tool request.
@@ -495,6 +501,12 @@ pub fn canary_exit_code(error: &anyhow::Error) -> Option<i32> {
         .map(|exit| i32::from(exit.0))
 }
 
+pub fn doctor_exit_code(error: &anyhow::Error) -> Option<i32> {
+    error
+        .downcast_ref::<crate::doctor::DoctorExit>()
+        .map(|exit| exit.0)
+}
+
 #[derive(Debug, Subcommand)]
 pub enum MemoryCommand {
     /// Show the active project, engine version and revision.
@@ -583,7 +595,7 @@ pub fn paths(cli: &Cli) -> Result<(PathBuf, PathBuf, Option<PathBuf>)> {
     Ok((cwd, data, user_config))
 }
 
-fn native_config_directory() -> Option<PathBuf> {
+pub(crate) fn native_config_directory() -> Option<PathBuf> {
     #[cfg(windows)]
     return std::env::var_os("APPDATA").map(PathBuf::from).or_else(|| {
         std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join("AppData/Roaming"))
@@ -603,7 +615,7 @@ fn native_data_directory() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
 }
 
-fn invocation_overrides(cli: &Cli) -> InvocationOverrides {
+pub(crate) fn invocation_overrides(cli: &Cli) -> InvocationOverrides {
     InvocationOverrides {
         typed_config: cli.config_values.clone(),
         mode: cli.mode,
@@ -618,7 +630,7 @@ fn invocation_overrides(cli: &Cli) -> InvocationOverrides {
 
 /// A local file is user authority only when it is demonstrably absent from a
 /// repository index. This query is fixed and read-only; it never invokes shell.
-async fn discovered_local(root: &Directory) -> Result<Option<(PathBuf, String)>> {
+pub(crate) async fn discovered_local(root: &Directory) -> Result<Option<(PathBuf, String)>> {
     let local = root.path().join(".kuru/config.local.toml");
     let metadata = match std::fs::symlink_metadata(&local) {
         Ok(metadata) => metadata,
@@ -877,6 +889,9 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
     }
     if let Some(command @ (Command::Completions { .. } | Command::Man)) = &cli.command {
         return write_stdout_ignoring_broken_pipe(&shell_support_output(command)?);
+    }
+    if let Some(Command::Doctor { json }) = &cli.command {
+        return crate::doctor::run_from_cli(&cli, *json).await;
     }
     if let Some(Command::Update {
         version,
@@ -1920,6 +1935,7 @@ fn command_claim_categories(
             | Command::Login { .. }
             | Command::Logout
             | Command::Canary { .. }
+            | Command::Doctor { .. }
             | Command::Config
             | Command::Update { .. }
             | Command::Trust { .. },

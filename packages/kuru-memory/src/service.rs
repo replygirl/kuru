@@ -1174,6 +1174,21 @@ impl AttachMiss {
     }
 }
 
+/// Inspect an already-published owner only. Unlike `attach_existing`, this
+/// path never probes the owner election lock or waits for a publication.
+pub(crate) async fn inspect_existing(
+    options: &crate::store::OpenOptions,
+    project: &Path,
+) -> Result<Option<ServiceAttachment>> {
+    ensure!(
+        options.read_only,
+        "memory inspection requires read-only options"
+    );
+    ensure_project_scope(project, &options.project_scope)?;
+    options.config.validate()?;
+    try_attach(&options.data_dir, &options.project_scope, project).await
+}
+
 async fn try_attach(data: &Path, scope: &str, project: &Path) -> Result<Option<ServiceAttachment>> {
     Ok(try_attach_observed(data, scope, project, None).await?.ok())
 }

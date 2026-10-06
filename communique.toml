@@ -5,10 +5,13 @@ polyvagal, Freudian and Jungian modes are computational interpretations rather
 than clinical treatment or claims of sentience. It supports OpenAI Codex login,
 OpenAI Responses, MCP, A2A, guarded file tools and explicitly enabled shell tools.
 Users install its kuru binary from source or verified native release archives.
-The demo provider runs in-process without credentials or network access. Codex
-owns its login and credential lifecycle. Explicitly enabled shell tools run with
-the user's process authority; there is no shell-command allowlist or sandbox.
-Messages retain peer provenance. Storage is currently SQLite. IFS is the default
+The demo provider runs in-process without credentials or network access. Kuru
+owns native authentication and credentials: codex selects direct ChatGPT
+subscription access, while responses selects the explicit API-key route.
+Explicitly enabled shell tools run with the user's process authority; there is
+no shell-command allowlist or sandbox. Messages retain peer provenance. Live
+memory uses managed full Dolt; SQLite is a read-only legacy-import dependency.
+IFS is the default
 framework with seven built-in peers; the demo provider uses the selected framework.
 """
 system_extra = """

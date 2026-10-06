@@ -118,7 +118,8 @@ runtime is involved.
    that job. Its output is an artifact for publication, which still waits for
    validation and every native build.
 5. Assemble one attempt-scoped candidate artifact without a release-write token.
-   The delivery tool requires exactly one archive per supported target and their checksum sidecars,
+   The delivery tool requires exactly one core archive and its paired shell-support
+   archive per supported target, with checksum sidecars,
    generates `SHA256SUMS`, validates the bounded notes, and retains `dist/` plus
    `RELEASE_NOTES.md` for the remaining jobs. Invalid or incomplete inputs stop
    here without creating a tag, draft, or public release.
