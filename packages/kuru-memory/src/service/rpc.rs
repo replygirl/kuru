@@ -1535,6 +1535,7 @@ pub(super) async fn serve_attached<S: AsyncRead + AsyncWrite + Unpin>(
         bail!("memory service handshake rejected");
     };
     retirement.admit(presented.as_deref());
+    let store = store.independent_public_reader();
     let mut state = AttachmentState::default();
     let result = async {
         while let Some((request, _bytes)) = read_next(stream, budget.clone()).await? {
@@ -1543,7 +1544,7 @@ pub(super) async fn serve_attached<S: AsyncRead + AsyncWrite + Unpin>(
             respond(
                 stream,
                 authority,
-                store,
+                &store,
                 &mut state,
                 Some(&retirement),
                 &progress,

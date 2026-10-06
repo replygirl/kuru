@@ -16,7 +16,7 @@ fn fixture(mode: Mode) -> View {
     let framework = Framework::builtin(mode);
     View::from_initial(
         InitialViewData {
-            transcript: vec![],
+            transcript: vec![].into(),
             session: "plain-session".into(),
             project: "plain-project".into(),
             motion: true,
@@ -421,7 +421,7 @@ fn rich_answer_preserves_prose_code_and_list_content_when_terminal_wraps() {
             "Self · self".into(),
             "# The next step\nKeep **important words** and `inline_code` readable.\n> A useful observation\n- First item\n* Second item\n```rust\nlet greeting = \"hello 猫\";\n```\nAn unmatched ` stays visible.\nFinal marker: green".into(),
         ),
-    ];
+    ].into();
     for (width, height) in [(120, 40), (54, 32)] {
         let (buffer, _) = render(&view, width, height, &format!("rich-answer-{width}"));
         let screen = text(&buffer);

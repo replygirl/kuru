@@ -22,7 +22,10 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 | Type or paste in a picker                        | Filter its choices                                                               |
 | <kbd>Escape</kbd>                                | Close a picker or cancel active work                                             |
 | <kbd>Ctrl</kbd>+<kbd>C</kbd>                     | Cancel work; quit while idle                                                     |
-| <kbd>Page Up</kbd> / <kbd>Page Down</kbd>        | Scroll the transcript                                                            |
+| <kbd>Page Up</kbd> / <kbd>Page Down</kbd>        | Read older/newer public transcript pages; return to the tail at the newest edge  |
+| Mouse wheel                                      | Scroll the public transcript (enabled by default)                                |
+| <kbd>Ctrl</kbd>+<kbd>F</kbd>                     | Find literal, case-sensitive text in the saved public transcript                 |
+| <kbd>Enter</kbd> / <kbd>Escape</kbd> in find     | Visit the next match / restore the previous reading position                     |
 | <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Cycle matching slash-command names before the first argument                     |
 
 Prompt history is bounded and held only in memory for the current run. It is
@@ -31,6 +34,27 @@ text larger than 512 bytes or containing at least three line breaks appears as
 a compact chip; expand it to inspect the text or remove the exact pasted span.
 The composer accepts at most 128 KiB of draft text. An oversized paste is
 rejected in full, leaving the draft unchanged.
+
+## Read the conversation
+
+Scrollback fetches bounded pages of the saved public transcript. The window
+reports the exact number of public records outside it. Reading an older item
+keeps that item and its wrapped row in view while new activity arrives; reaching
+the newest edge returns to following the tail. Tool-card details remain temporary
+and are not reconstructed from older history.
+
+<kbd>Ctrl</kbd>+<kbd>F</kbd> searches saved public messages, including pages outside
+the viewport. It is separate from <kbd>Ctrl</kbd>+<kbd>R</kbd> prompt recall and
+leaves the unsent draft and paste chips unchanged. The status distinguishes a
+match, a scan still in progress, completion and an unavailable or stale scan.
+Restart a stale search to read the current revision. Search does not inspect
+private peer history or current provisional output.
+
+Mouse navigation and terminal focus reporting are enabled during the interface
+and restored on exit. An unfocused terminal receives a fixed bell after a new
+successful turn, without prompt or answer content. On Unix terminals advertising
+`xterm` or `xterm-256color`, Kuru saves and restores the title through the terminal
+stack and displays a sanitized session suffix. Other terminals keep their title.
 
 ## Slash commands
 

@@ -53,7 +53,7 @@ Below them, a standing row keeps the last prepared request's context estimate an
 
 Type in a picker to filter, use the arrow keys to move, and press <kbd>Enter</kbd> to select. <kbd>Escape</kbd> closes it. Your unsent draft stays in place. Choices persist for this project, including after quitting and relaunching.
 
-Use <kbd>Alt</kbd>+<kbd>Enter</kbd> for a newline. <kbd>Page Up</kbd> and <kbd>Page Down</kbd> scroll the transcript. During work, <kbd>Escape</kbd> or <kbd>Ctrl</kbd>+<kbd>C</kbd> cancels the operation. While idle, <kbd>Ctrl</kbd>+<kbd>C</kbd> quits.
+Use <kbd>Alt</kbd>+<kbd>Enter</kbd> for a newline. <kbd>Page Up</kbd>, <kbd>Page Down</kbd> and the mouse wheel read the public transcript, fetching older pages as needed. <kbd>Ctrl</kbd>+<kbd>F</kbd> finds literal, case-sensitive text beyond the viewport; <kbd>Enter</kbd> visits the next match and <kbd>Escape</kbd> restores your previous reading position without changing the draft. During work, <kbd>Escape</kbd> or <kbd>Ctrl</kbd>+<kbd>C</kbd> cancels the operation. While idle, <kbd>Ctrl</kbd>+<kbd>C</kbd> quits.
 
 The composer moves by grapheme, so combining marks and joined emoji stay
 together. At the top or bottom line, <kbd>Up</kbd> and <kbd>Down</kbd> browse

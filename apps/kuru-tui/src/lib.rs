@@ -10,6 +10,7 @@ pub mod memory_activity;
 mod memory_export;
 mod memory_notice;
 mod permission_store;
+mod public_transcript;
 mod session_export;
 #[cfg(test)]
 mod spawn_gate;

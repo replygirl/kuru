@@ -3298,6 +3298,27 @@ async fn tui_config_inspects_captured_redacted_configuration_in_a_synchronized_p
     assert!(output.contains("%5Bredacted%5D"), "{screen}");
     assert!(output.contains("KURU_FAKE_KEY"), "{screen}");
 
+    // Historical inspection leaves a stable Reading anchor. Return explicitly
+    // to follow-tail before expecting subsequent local command results there.
+    let navigation_deadline = std::time::Instant::now() + terminal::READY_TIMEOUT;
+    while terminal.screen().contains("↑ history") {
+        let output_len = terminal.output.len();
+        terminal.send(b"\x1b[6~").unwrap();
+        let remaining = navigation_deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "PageDown did not return to follow-tail\n{}",
+            terminal.screen()
+        );
+        terminal
+            .wait(
+                "PageDown completes a frame toward follow-tail",
+                remaining,
+                |t| Ok(t.completed_frame_after(output_len)),
+            )
+            .unwrap();
+    }
+
     terminal.submit("/mode freudian").unwrap();
     terminal
         .wait_composer_frame(
