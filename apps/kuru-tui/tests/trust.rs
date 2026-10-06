@@ -1613,6 +1613,96 @@ fn tools_inspection_ignores_memory_authority_and_models_gate_it_before_legacy_pr
     assert!(!sandbox.data.join("trust").exists());
 }
 
+#[test]
+fn explicit_models_skip_legacy_memory_and_unrelated_authority() {
+    let sandbox = Sandbox::new("");
+    let engine = sandbox.root.path().join("must-not-start-dolt");
+    sandbox.write_config(&format!(
+        "provider = 'demo'\n[memory]\ndolt_binary = {:?}\n",
+        engine.to_str().unwrap()
+    ));
+    kuru_platform::fs::Directory::ensure_private(&sandbox.data).unwrap();
+    let legacy = sandbox.data.join("memory.sqlite3");
+    let sentinel = b"explicit-catalog-must-not-migrate";
+    std::fs::write(&legacy, sentinel).unwrap();
+
+    let output = sandbox.success(&["--provider", "demo", "--model", "demo", "models"]);
+    let catalog: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(catalog[0]["id"], "demo");
+    for args in [&["models"][..], &["--provider", "demo", "models"][..]] {
+        assert_claim_labels(&sandbox.run(args), &["memory executable"]);
+    }
+    assert_eq!(std::fs::read(&legacy).unwrap(), sentinel);
+    assert!(!sandbox.data.join("memory").exists());
+    assert!(!sandbox.data.join("tools").exists());
+    assert!(!sandbox.data.join("trust").exists());
+    assert!(!engine.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_models_http_catalog_preserves_capabilities_without_memory() {
+    let sandbox = Sandbox::new("");
+    kuru_platform::fs::Directory::ensure_private(&sandbox.data).unwrap();
+    let legacy = sandbox.data.join("memory.sqlite3");
+    let sentinel = b"http-catalog-must-not-migrate";
+    std::fs::write(&legacy, sentinel).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().route(
+        "/models",
+        axum::routing::get(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async {
+                axum::Json(json!({"data": [{
+                    "id": "future-catalog-model",
+                    "capabilities": {"future-capability": true}
+                }]}))
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let output = tokio::task::block_in_place(|| {
+        sandbox
+            .command()
+            .env("EXPLICIT_CATALOG_FIXTURE_KEY", "synthetic-catalog-key")
+            .args(["--provider", "responses", "--model", "fixture", "models"])
+            .args(["-c", &format!("api_base={:?}", endpoint)])
+            .args(["-c", "api_key_env='EXPLICIT_CATALOG_FIXTURE_KEY'"])
+            .output()
+            .unwrap()
+    });
+    server.abort();
+    let _ = server.await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let catalog: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(catalog[0]["id"], "future-catalog-model");
+    assert_eq!(
+        catalog[0]["metadata"]["capabilities"]["future-capability"]["value"],
+        true
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(&legacy).unwrap(), sentinel);
+    assert!(!sandbox.data.join("memory").exists());
+    assert!(!sandbox.data.join("tools").exists());
+}
+
+#[test]
+fn explicit_models_preserve_responses_route_review_before_activation() {
+    let sandbox = Sandbox::new("provider = 'responses'\napi_base = 'http://127.0.0.1:9/v1'\n");
+    kuru_platform::fs::Directory::ensure_private(&sandbox.data).unwrap();
+    let legacy = sandbox.data.join("memory.sqlite3");
+    let sentinel = b"responses-review-must-not-migrate";
+    std::fs::write(&legacy, sentinel).unwrap();
+    let output = sandbox.run(&["--provider", "responses", "--model", "fixture", "models"]);
+    assert_claim_labels(&output, &["Responses route"]);
+    assert_eq!(std::fs::read(&legacy).unwrap(), sentinel);
+    assert!(!sandbox.data.join("memory").exists());
+    assert!(!sandbox.data.join("tools").exists());
+    assert!(!sandbox.data.join("trust").exists());
+}
+
 #[cfg(unix)]
 fn terminal_command(sandbox: &Sandbox) -> ProcessCommand {
     let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_kuru"));

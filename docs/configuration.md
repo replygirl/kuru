@@ -522,7 +522,7 @@ The activation sets are command-specific:
 | `login`, `logout`, `config`, `trust ...`, `update` | None; login/logout use the fixed ChatGPT route, config omits saved preferences, and revoke does not parse current workspace configuration |
 | `auth` | Active Responses route; under another provider its API-key availability is not checked |
 | `sessions`, `memory ...`, `undo-dream` | Configured memory executable and cache paths |
-| `models` | Configured memory paths used while loading saved selections, plus an active Responses route |
+| `models` | An active Responses route; configured memory paths are also checked when loading saved selections without both `--provider` and `--model` |
 | `tool` | Configured memory paths used while loading saved selections, built-in write/shell defaults, permission rules, and stdio/HTTP MCP configuration |
 | `tools` | Built-in write/shell defaults, permission rules, and stdio/HTTP MCP configuration; catalog inspection does not activate memory paths |
 | `run`, `dream`, `serve`, interactive TUI | All applicable project-instruction, memory, provider, lifecycle-hook, write, shell, permission-rule, MCP and external-agent claims |
@@ -530,6 +530,11 @@ The activation sets are command-specific:
 The other rows do not construct peer prompts, so they do not consume the
 project-instructions claim. Reading a snapshot for `config` or trust inspection
 does not inject its instruction bytes or activate a provider.
+
+`kuru --provider codex --model MODEL models` and the equivalent explicit
+Responses invocation inspect the selected provider's catalog without loading
+saved project preferences, opening memory or migrating legacy data. Other
+`models` invocations retain their saved model and effort selection behavior.
 
 Review output and configuration errors escape and bound source labels and hide
 MCP arguments and environment values, URL queries and credential values. Approval

@@ -1155,6 +1155,18 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         return result;
     }
 
+    // Explicit provider/model catalog inspection does not need saved choices
+    // and must return before any project-memory or legacy activation.
+    if explicitly_selected_models(&cli) {
+        let config = snapshot.finalize(&ProjectPreferences::default())?;
+        let provider = provider(&config, &cwd, &data).await?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&provider.models().await?)?
+        );
+        return Ok(());
+    }
+
     // Catalog inspection needs the reviewed tool/MCP authority, but it must
     // remain independent of project memory and its configured runtime. Use
     // defaults for memory-backed preferences and return before deriving a
@@ -2109,10 +2121,19 @@ fn command_claim_categories(
     categories.iter().copied().collect()
 }
 
+fn explicitly_selected_models(cli: &Cli) -> bool {
+    matches!(cli.command, Some(Command::Models)) && cli.provider.is_some() && cli.model.is_some()
+}
+
 fn preflight(cli: &Cli, root: &Directory, data: &Path, snapshot: &ConfigSnapshot) -> Result<()> {
-    let applicable = snapshot
-        .manifest()
-        .filtered(&command_claim_categories(cli.command.as_ref()));
+    let categories = if explicitly_selected_models(cli) {
+        [AuthorityClaimCategory::ResponsesRoute]
+            .into_iter()
+            .collect()
+    } else {
+        command_claim_categories(cli.command.as_ref())
+    };
+    let applicable = snapshot.manifest().filtered(&categories);
     if applicable.claims().is_empty() {
         return Ok(());
     }
