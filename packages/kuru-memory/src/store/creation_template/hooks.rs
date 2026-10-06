@@ -77,6 +77,9 @@ pub(crate) enum Event {
 #[derive(Clone, Default)]
 pub(crate) struct Hooks {
     pub(crate) lock: Option<LockStep>,
+    /// Isolated marker and observation of the actual creation worker's
+    /// pre-effect wait, without changing the runner's environment.
+    pub(crate) creation_hold: Option<(PathBuf, Arc<tokio::sync::Notify>)>,
     pub(crate) manifest_read_error: bool,
     pub(crate) read: Option<Arc<ReadFault>>,
     pub(crate) refuse_publication: bool,
