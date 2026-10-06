@@ -3217,6 +3217,29 @@ async fn dispatch_controlled(
     turn_id: Option<&str>,
     reviews: DispatchReviews,
 ) -> Result<DispatchOutcome> {
+    // Runtime command branches retain large async states. Keep that state on
+    // the heap instead of embedding it in every interactive caller's future.
+    Box::pin(dispatch_controlled_inner(
+        harness,
+        models,
+        command,
+        registry,
+        cancellation,
+        turn_id,
+        reviews,
+    ))
+    .await
+}
+
+async fn dispatch_controlled_inner(
+    harness: &mut Harness,
+    models: &[ModelInfo],
+    command: &str,
+    registry: &commands::Registry,
+    cancellation: &CancellationToken,
+    turn_id: Option<&str>,
+    reviews: DispatchReviews,
+) -> Result<DispatchOutcome> {
     let DispatchReviews {
         permission: approval,
         instructions: instruction_approval,
