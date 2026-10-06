@@ -365,6 +365,12 @@ mise upgrade github:replygirl/kuru
 For an exact pin, select the new version with `mise use -g
 github:replygirl/kuru@VERSION`. Use mise to update its managed binaries.
 
+On Unix, `kuru update` refuses mise- and Homebrew-owned installations in both
+release and source modes before downloads or builds. Ownership is determined
+from the resolved installation path, including aliases. Use the owning manager:
+`mise upgrade github:replygirl/kuru` or `brew upgrade kuru`. Homebrew distribution
+itself remains deferred.
+
 For a direct installation, rerun the corresponding bootstrap to install latest, or choose an
 explicit release through Kuru's native updater:
 

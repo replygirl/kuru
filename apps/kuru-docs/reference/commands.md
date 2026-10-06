@@ -105,48 +105,48 @@ Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/
 
 ## CLI commands
 
-| Command                                                        | Purpose                                                                                             |
-| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `kuru run ["PROMPT"]`                                          | Run one turn without the TUI; accept piped UTF-8 input and add `--json` for final structured output |
-| `kuru run "PROMPT" --turn-id ID`                               | Use a bounded explicit turn ID for exact retry in the resumed session                               |
-| `kuru login`                                                   | Start browser sign-in for ChatGPT subscription access                                               |
-| `kuru login --no-browser`                                      | Print the browser sign-in URL for you to open                                                       |
-| `kuru login --device`                                          | Use device authorization                                                                            |
-| `kuru auth`                                                    | Print redacted local authentication status as JSON                                                  |
-| `kuru doctor [--json]`                                         | Inspect bounded local configuration, routes, trust, memory, and embedded-engine status              |
-| `kuru canary --model MODEL_ID`                                 | Optionally check the fixed ChatGPT route with one bounded no-tool request                           |
-| `kuru logout`                                                  | Clear Kuru's stored ChatGPT credentials                                                             |
-| `kuru models`                                                  | Discover provider models and advertised efforts                                                     |
-| `kuru config`                                                  | Print captured base configuration with secret values redacted and saved preferences omitted         |
-| `kuru trust status`                                            | Inspect exact-workspace authority and complete-manifest approval without creating state             |
-| `kuru trust approve [--yes]`                                   | Review and persist approval for the complete current authority manifest                             |
-| `kuru trust revoke`                                            | Remove the exact workspace's approval without confirmation                                          |
-| `kuru sessions`                                                | List saved sessions                                                                                 |
-| `kuru sessions rename ID LABEL`                                | Change one session's label                                                                          |
-| `kuru sessions remove ID`                                      | Reversibly remove a session from ordinary listing and resume                                        |
-| `kuru sessions restore ID`                                     | Restore one removed session with its identity and transcript                                        |
-| `kuru sessions fork ID SETTLED_NODE_ID`                        | Fork the public prefix through one settled boundary, sharing current project memory                 |
-| `kuru sessions export ID --format jsonl --output PATH`         | Export one public transcript as chronological JSONL; Markdown is also supported                     |
-| `kuru memory status`                                           | Inspect the project store, branch and revision                                                      |
-| `kuru memory history`                                          | List committed memory updates; use `--limit` to select 1–1000 entries                               |
-| `kuru memory candidates`                                       | List retained dream candidate refs; use `--limit` and the opaque `--after` cursor                   |
-| `kuru memory candidate-status BRANCH`                          | Recheck one exact retained candidate ref                                                            |
-| `kuru memory candidate-abandon BRANCH --base BASE --head HEAD` | Explicitly abandon the exact inspected candidate                                                    |
-| `kuru memory notes ID`                                         | Read newest durable notes for one selected-mode identity; `--limit` is 1–1000 (default 100)         |
-| `kuru memory forget ID --note SEQUENCE`                        | Remove one selected current note and retain prior revision history                                  |
-| `kuru memory purge --yes`                                      | Remove one project's managed current memory and Dolt history after explicit confirmation            |
-| `kuru memory export`                                           | Export every application record from one committed active-memory snapshot                           |
-| `kuru dream`                                                   | Run explicit consolidation                                                                          |
-| `kuru undo-dream`                                              | Restore the previous topology change                                                                |
-| `kuru tools`                                                   | Inspect filtered tools and disabled/live/stale/degraded MCP aliases                                 |
-| `kuru mcp login ALIAS`                                         | Sign in to one OAuth-enabled MCP alias with a loopback browser callback                             |
-| `kuru mcp login ALIAS --no-browser`                            | Print browser and same-host/forwarded-callback guidance                                             |
-| `kuru mcp login ALIAS --device`                                | Use an advertised device authorization flow                                                         |
-| `kuru mcp status ALIAS`                                        | Inspect redacted local MCP authorization and availability state                                     |
-| `kuru mcp logout ALIAS`                                        | Delete the local MCP credential and report remote revocation separately                             |
-| `kuru tool NAME --args '{}'`                                   | Invoke a tool with JSON arguments                                                                   |
-| `kuru serve`                                                   | Start authenticated loopback [A2A ingress](./a2a)                                                   |
-| `kuru update`                                                  | [Install an explicit release or source checkout](/guide/installation#update-deliberately)           |
+| Command                                                        | Purpose                                                                                                                     |
+| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `kuru run ["PROMPT"]`                                          | Run one turn without the TUI; accept piped UTF-8 input and add `--json` for final structured output                         |
+| `kuru run "PROMPT" --turn-id ID`                               | Use a bounded explicit turn ID for exact retry in the resumed session                                                       |
+| `kuru login`                                                   | Start browser sign-in for ChatGPT subscription access                                                                       |
+| `kuru login --no-browser`                                      | Print the browser sign-in URL for you to open                                                                               |
+| `kuru login --device`                                          | Use device authorization                                                                                                    |
+| `kuru auth`                                                    | Print redacted local authentication status as JSON                                                                          |
+| `kuru doctor [--json]`                                         | Inspect bounded local configuration, routes, trust, memory, and embedded-engine status                                      |
+| `kuru canary --model MODEL_ID`                                 | Optionally check the fixed ChatGPT route with one bounded no-tool request                                                   |
+| `kuru logout`                                                  | Clear Kuru's stored ChatGPT credentials                                                                                     |
+| `kuru models`                                                  | Discover provider models and advertised efforts                                                                             |
+| `kuru config`                                                  | Print captured base configuration with secret values redacted and saved preferences omitted                                 |
+| `kuru trust status`                                            | Inspect exact-workspace authority and complete-manifest approval without creating state                                     |
+| `kuru trust approve [--yes]`                                   | Review and persist approval for the complete current authority manifest                                                     |
+| `kuru trust revoke`                                            | Remove the exact workspace's approval without confirmation                                                                  |
+| `kuru sessions`                                                | List saved sessions                                                                                                         |
+| `kuru sessions rename ID LABEL`                                | Change one session's label                                                                                                  |
+| `kuru sessions remove ID`                                      | Reversibly remove a session from ordinary listing and resume                                                                |
+| `kuru sessions restore ID`                                     | Restore one removed session with its identity and transcript                                                                |
+| `kuru sessions fork ID SETTLED_NODE_ID`                        | Fork the public prefix through one settled boundary, sharing current project memory                                         |
+| `kuru sessions export ID --format jsonl --output PATH`         | Export one public transcript as chronological JSONL; Markdown is also supported                                             |
+| `kuru memory status`                                           | Inspect the project store, branch and revision                                                                              |
+| `kuru memory history`                                          | List committed memory updates; use `--limit` to select 1–1000 entries                                                       |
+| `kuru memory candidates`                                       | List retained dream candidate refs; use `--limit` and the opaque `--after` cursor                                           |
+| `kuru memory candidate-status BRANCH`                          | Recheck one exact retained candidate ref                                                                                    |
+| `kuru memory candidate-abandon BRANCH --base BASE --head HEAD` | Explicitly abandon the exact inspected candidate                                                                            |
+| `kuru memory notes ID`                                         | Read newest durable notes for one selected-mode identity; `--limit` is 1–1000 (default 100)                                 |
+| `kuru memory forget ID --note SEQUENCE`                        | Remove one selected current note and retain prior revision history                                                          |
+| `kuru memory purge --yes`                                      | Remove one project's managed current memory and Dolt history after explicit confirmation                                    |
+| `kuru memory export`                                           | Export every application record from one committed active-memory snapshot                                                   |
+| `kuru dream`                                                   | Run explicit consolidation                                                                                                  |
+| `kuru undo-dream`                                              | Restore the previous topology change                                                                                        |
+| `kuru tools`                                                   | Inspect filtered tools and disabled/live/stale/degraded MCP aliases                                                         |
+| `kuru mcp login ALIAS`                                         | Sign in to one OAuth-enabled MCP alias with a loopback browser callback                                                     |
+| `kuru mcp login ALIAS --no-browser`                            | Print browser and same-host/forwarded-callback guidance                                                                     |
+| `kuru mcp login ALIAS --device`                                | Use an advertised device authorization flow                                                                                 |
+| `kuru mcp status ALIAS`                                        | Inspect redacted local MCP authorization and availability state                                                             |
+| `kuru mcp logout ALIAS`                                        | Delete the local MCP credential and report remote revocation separately                                                     |
+| `kuru tool NAME --args '{}'`                                   | Invoke a tool with JSON arguments                                                                                           |
+| `kuru serve`                                                   | Start authenticated loopback [A2A ingress](./a2a)                                                                           |
+| `kuru update`                                                  | [Install an explicit release or source checkout; Unix refuses manager-owned files](/guide/installation#update-deliberately) |
 
 Supply `--resume SESSION_ID` with `dream` or `undo-dream` when targeting a saved conversation.
 

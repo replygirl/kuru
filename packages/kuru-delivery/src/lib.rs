@@ -10,6 +10,8 @@ pub mod command;
 pub mod coverage;
 #[cfg(feature = "tooling")]
 pub mod docs;
+#[cfg(unix)]
+pub mod ownership;
 // Shared with the advisory integration tests and scanner fixture.
 #[cfg(all(test, feature = "tooling"))]
 #[path = "../tests/support/fixture_git.rs"]

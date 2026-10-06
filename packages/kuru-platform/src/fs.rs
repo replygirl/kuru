@@ -518,6 +518,15 @@ impl Directory {
         self.anchor().identity
     }
 
+    /// Check that a held ordinary file belongs to the effective user and its
+    /// retained parent permits replacement. This creates nothing and conveys
+    /// no authority across subsequent filesystem changes.
+    #[cfg(unix)]
+    pub fn require_owned_replacement(&self, name: &OsStr, file: &File) -> io::Result<()> {
+        self.verify(name, file)?;
+        native::require_owned_replacement(&self.anchor().file, file)
+    }
+
     fn check_private(&self) -> io::Result<()> {
         let files: Vec<_> = self.anchors.iter().map(|anchor| &anchor.file).collect();
         native::private_chain(&files)
