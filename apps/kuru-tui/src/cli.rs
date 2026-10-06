@@ -2172,15 +2172,24 @@ async fn update(
     release_base: Option<&str>,
     source: Option<&Path>,
 ) -> Result<()> {
-    #[cfg(unix)]
-    let executable = std::env::current_exe()?;
-    #[cfg(unix)]
-    let destination = executable.parent().context("executable has no parent")?;
-    if let Some(source) = source {
+    if source.is_some() {
         ensure!(
             version.is_none() && release_base.is_none(),
             "--source cannot be combined with release options"
         );
+    } else {
+        version.context("provide --version VERSION for a verified release or --source CHECKOUT")?;
+    }
+    #[cfg(unix)]
+    let executable = std::env::current_exe()?;
+    #[cfg(unix)]
+    let _installation = kuru_delivery::ownership::installed(
+        &executable,
+        &kuru_delivery::ownership::OwnershipEnv::capture(),
+    )?;
+    #[cfg(unix)]
+    let destination = executable.parent().context("executable has no parent")?;
+    if let Some(source) = source {
         #[cfg(unix)]
         {
             let mut command = tokio::process::Command::new("bash");

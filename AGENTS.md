@@ -156,6 +156,9 @@ mechanics behind small shared boundaries and preserve privacy, ownership and
 recovery guarantees when porting them. Document support only after native checks
 demonstrate it.
 
+Unix self-update refuses mise- and Homebrew-owned executables before network,
+build or staging effects; use the owning manager's upgrade command.
+
 Keep platform mechanics independent of domain packages. Windows process creation
 and private asynchronous IPC live behind safe APIs in `kuru-platform`; filesystem
 operations retain handles and distinguish rejected from uncertain publication.

@@ -28,7 +28,8 @@ pub(super) fn finalize_file_access(_: &File, _: &File) -> io::Result<()> {
     Ok(())
 }
 use rustix::fs::{
-    AtFlags, Dir, Mode, OFlags, RenameFlags, mkdirat, openat, renameat, renameat_with, unlinkat,
+    Access, AtFlags, Dir, Mode, OFlags, RenameFlags, accessat, mkdirat, openat, renameat,
+    renameat_with, unlinkat,
 };
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 
@@ -83,6 +84,19 @@ pub(super) fn require_private(file: &File) -> io::Result<()> {
             "private object must belong to the current user with no group or other permissions",
         ));
     }
+    Ok(())
+}
+
+pub(super) fn require_owned_replacement(parent: &File, file: &File) -> io::Result<()> {
+    if file.metadata()?.uid() != rustix::process::geteuid().as_raw() {
+        return Err(denied("installed file must belong to the current user"));
+    }
+    accessat(
+        parent,
+        c".",
+        Access::WRITE_OK | Access::EXEC_OK,
+        AtFlags::EACCESS,
+    )?;
     Ok(())
 }
 
