@@ -2047,6 +2047,18 @@ async fn busy_resume_and_continue_refuse_before_cli_provider_catalog() -> anyhow
         }
         driver.close().await?;
         owned.close().await?;
+        // Local close disposes the presence socket; the owner independently
+        // observes EOF and releases its exact connection claim.
+        tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, async {
+            while !memory.live_session_drivers().await?.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!(
+            "owner did not release the closed fixture driver before competing resumes: {error}"
+        ))??;
         anyhow::ensure!(memory.live_session_drivers().await?.is_empty());
         let make_racer = |label: &str| {
             #[cfg(unix)]
